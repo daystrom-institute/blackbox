@@ -110,6 +110,35 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
         ],
         content: include_str!("side-channel-notes.md"),
     },
+    SystemMemory {
+        id: "sm-transcript-retrieval",
+        title: "Transcript retrieval — search, cite, context, session, messages",
+        tags: &[
+            "transcripts",
+            "search",
+            "cite",
+            "context",
+            "session",
+            "messages",
+            "retrieval",
+            "runbook",
+        ],
+        content: include_str!("transcript-retrieval.md"),
+    },
+    SystemMemory {
+        id: "sm-render-lifecycle",
+        title: "Render lifecycle — render, absorb, review, lint",
+        tags: &[
+            "render",
+            "absorb",
+            "review",
+            "lint",
+            "knowledge",
+            "lifecycle",
+            "runbook",
+        ],
+        content: include_str!("render-lifecycle.md"),
+    },
 ];
 
 /// Lookup by exact ID. Accepts either canonical form (`sm-rule-packets`) or
