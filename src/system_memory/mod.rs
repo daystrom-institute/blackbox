@@ -37,21 +37,80 @@ pub struct SystemMemory {
 
 /// The full catalog. Order is stable; agents fetching by ID are immune to it,
 /// but listings return in this order so hand-curated priority is preserved.
-pub const SYSTEM_MEMORIES: &[SystemMemory] = &[SystemMemory {
-    id: "sm-rule-packets",
-    title: "Rule-packets — when and how",
-    tags: &[
-        "packets",
-        "rule-packets",
-        "compile",
-        "apply",
-        "audit",
-        "review",
-        "procedure",
-        "runbook",
-    ],
-    content: include_str!("rule-packets.md"),
-}];
+pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
+    SystemMemory {
+        id: "sm-rule-packets",
+        title: "Rule-packets — when and how",
+        tags: &[
+            "packets",
+            "rule-packets",
+            "compile",
+            "apply",
+            "audit",
+            "review",
+            "procedure",
+            "runbook",
+        ],
+        content: include_str!("rule-packets.md"),
+    },
+    SystemMemory {
+        id: "sm-persistence-taxonomy",
+        title: "Persistence taxonomy — learn vs remember vs decide vs note",
+        tags: &[
+            "persistence",
+            "taxonomy",
+            "learn",
+            "remember",
+            "decide",
+            "note",
+            "memory",
+            "runbook",
+        ],
+        content: include_str!("persistence-taxonomy.md"),
+    },
+    SystemMemory {
+        id: "sm-bro-dispatch-patterns",
+        title: "Bro dispatch patterns — exec, resume, wait, race, deliberate",
+        tags: &[
+            "bro",
+            "dispatch",
+            "resume",
+            "wait",
+            "orchestration",
+            "patterns",
+            "runbook",
+        ],
+        content: include_str!("bro-dispatch-patterns.md"),
+    },
+    SystemMemory {
+        id: "sm-create-etiquette",
+        title: "Create etiquette — list before create",
+        tags: &[
+            "create",
+            "dedupe",
+            "list",
+            "knowledge",
+            "threads",
+            "bro",
+            "runbook",
+        ],
+        content: include_str!("create-etiquette.md"),
+    },
+    SystemMemory {
+        id: "sm-side-channel-notes",
+        title: "Side-channel notes — what to emit and why",
+        tags: &[
+            "notes",
+            "bbox_note",
+            "orchestrator",
+            "executor",
+            "done",
+            "workflow",
+            "runbook",
+        ],
+        content: include_str!("side-channel-notes.md"),
+    },
+];
 
 /// Lookup by exact ID. Accepts either canonical form (`sm-rule-packets`) or
 /// bare slug (`rule-packets`) for ergonomics.
@@ -71,7 +130,8 @@ pub fn search(query: Option<&str>) -> Vec<&'static SystemMemory> {
             None => true,
             Some(q) if q.is_empty() => true,
             Some(q) => {
-                m.title.to_lowercase().contains(q)
+                m.id.to_lowercase().contains(q)
+                    || m.title.to_lowercase().contains(q)
                     || m.tags.iter().any(|t| t.to_lowercase().contains(q))
                     || m.content.to_lowercase().contains(q)
             }
@@ -109,14 +169,29 @@ mod tests {
             "embedded rule-packets.md too short (got {} bytes)",
             m.content.len()
         );
-        assert!(m.content.contains("bbox_compile"), "runbook must cite bbox_compile");
-        assert!(m.content.contains("bbox_apply"), "runbook must cite bbox_apply");
-        assert!(m.content.contains("bbox_audit"), "runbook must cite bbox_audit");
+        assert!(
+            m.content.contains("bbox_compile"),
+            "runbook must cite bbox_compile"
+        );
+        assert!(
+            m.content.contains("bbox_apply"),
+            "runbook must cite bbox_apply"
+        );
+        assert!(
+            m.content.contains("bbox_audit"),
+            "runbook must cite bbox_audit"
+        );
     }
 
     #[test]
     fn search_finds_by_tag_query() {
         let hits = search(Some("packet"));
+        assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
+    }
+
+    #[test]
+    fn search_finds_by_id_query() {
+        let hits = search(Some("sm-rule-packets"));
         assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
     }
 

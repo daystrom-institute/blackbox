@@ -375,7 +375,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_compile",
-        description = "Compile a set of rules into a rule-packet (a compiled axiomatic theory with a deterministic evaluator). Full workflow in `sm-rule-packets` — query via bbox_knowledge."
+        description = "Compile a set of rules into a rule-packet (a compiled axiomatic theory with a deterministic evaluator). See `sm-rule-packets` via `bbox_knowledge` for the full workflow."
     )]
     fn bbox_compile(&self, Parameters(p): Parameters<CompileParams>) -> CallToolResult {
         Self::run("bbox_compile", || self.state.packets.read().compile(&p))

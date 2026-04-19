@@ -148,7 +148,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
         summary: "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files.",
-        when_to_use: "A standing rule stated by the USER that must outlive the current edit — 'from now on', 'always X', 'never X', 'house rule', 'standing order', 'we (don't) use Y'. Implementation alone (a .gitignore, linter config, deleted code) enforces the rule for *now* but doesn't transmit intent to a future session. Not for one-off task constraints, and not for facts YOU observed — use `bbox_remember` or `bbox_note(kind=learned)` for those. See the 'Persistence hierarchy' in the workflow notes for the full taxonomy. Before calling, `bbox_knowledge(query=<keyword>)` to check for an existing matching entry (see 'Create etiquette').",
+        when_to_use: "Use for standing user rules that must outlive the current edit. Not for one-off task constraints, and not for facts you discovered yourself. Query `bbox_knowledge` first to avoid duplicate entries. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
         ),
@@ -166,7 +166,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_decide",
         category: ToolCategory::Knowledge,
         summary: "Record a durable commitment with required rationale; supports supersession.",
-        when_to_use: "You're locking in a design choice or reversing a prior decision. Rationale is required. Before calling, `bbox_knowledge(query=<keyword>, project=<cwd>)` to find the prior decision this one replaces — pass its ID as `supersedes` to mark it superseded and link the two (see 'Create etiquette'). `id` format for `supersedes` is the bare 8-hex knowledge entry ID (no prefix).",
+        when_to_use: "Use for real commitments or reversals that need rationale and audit trail. Query `bbox_knowledge` first to find the prior decision you may be superseding; `supersedes` takes the bare 8-hex entry ID. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_decide(content="use RocksDB for cache", rationale="SQLite locking conflicted with concurrent writers", supersedes="8a3f12cd")"#,
         ),
@@ -175,7 +175,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
         summary: "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above. Also surfaces matching system memories (code-embedded runbooks) marked `[system]` when the query hits one.",
-        when_to_use: "The start of any task. Default to `query=<one distinctive word>`. Before calling `bbox_decide(supersedes=...)`, add `project=<current-project-dir>` to narrow to *this* repo's prior entries — same-topic entries from other repos can appear and lead to superseding the wrong entry. `category` filter helps when you specifically want decisions, conventions, etc.",
+        when_to_use: "Start here on substantive tasks. Use one distinctive keyword by default; add `project=<cwd>` when looking for a prior decision to supersede. System memories can also be fetched by canonical `sm-*` ID.",
         example: Some(r#"bbox_knowledge(query="retry")"#),
     },
     ToolDoc {
@@ -225,7 +225,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_thread",
         category: ToolCategory::Threads,
         summary: "Open / continue / resolve / promote / rename / link a work thread.",
-        when_to_use: "Investigation or QC walk that may span sessions; deferred work too informal for a finding. Before `action=open`, call `bbox_thread_list` to check for an existing same-topic thread (see 'Create etiquette' in the workflow notes). Use `kind=work_item` for orchestrator-led dispatch loops.",
+        when_to_use: "Use for investigations or QC walks that span sessions. Before `action=open`, call `bbox_thread_list` to avoid duplicate threads. Use `kind=work_item` for orchestrator-led execution loops. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(
             r#"bbox_thread(action="open", topic="audit the dispatch path", project="/repo/x", kind="work_item")"#,
         ),
@@ -242,7 +242,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_note",
         category: ToolCategory::Notes,
         summary: "Record a structured side-channel note while working.",
-        when_to_use: "As an executor: emit throughout a dispatch for the 7 kinds below. As an orchestrator: rarely — you're the reader. Genuine signal only, not stylistic preference. The `done` kind with a one-line acceptance summary is the most important: always emit before returning. Kinds: `dispute` (disagree with brief/premise), `assumption` (ambiguity-resolving judgment), `surprise` (expected X, found Y), `followup` (out-of-scope work deferred), `blocked` (subtask blocked, include reason), `learned` (codebase/environment fact YOU discovered mid-work, e.g. 'this repo uses tabs not spaces', 'cargo check works here' — NOT user-stated rules; those go to `bbox_learn`), `done` (completion + summary).",
+        when_to_use: "Executors emit high-signal notes during work; orchestrators mostly read them. Always emit `done` before returning. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy.",
         example: Some(
             r#"bbox_note(kind="dispute", body="brief assumes schema is additive — migration 0042 makes it subtractive")"#,
         ),
@@ -258,7 +258,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_note_resolve",
         category: ToolCategory::Notes,
         summary: "Mark a note acknowledged or addressed.",
-        when_to_use: "Orchestrator's close-the-loop move. Addressed notes drop from the default inbox view. `id` is the full `note-<8hex>` as returned by `bbox_note` and shown in `bbox_notes` / `bbox_inbox` — pass it verbatim, do not strip the `note-` prefix. Resolutions: `acknowledged` (seen, deferred), `addressed` (acted on — removes from default inbox view), `unresolved` (re-open).",
+        when_to_use: "Orchestrator close-the-loop move. Pass the full `note-<8hex>` ID verbatim. `addressed` removes the note from the default inbox view; `acknowledged` keeps it visible as deferred. See `sm-side-channel-notes` via `bbox_knowledge` for the full loop.",
         example: Some(
             r#"bbox_note_resolve(id="note-a1b2c3d4", resolution="addressed", note="fixed in commit abc123")"#,
         ),
@@ -275,8 +275,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_compile",
         category: ToolCategory::Packets,
-        summary: "Compile a set of rules into a rule-packet (a compiled axiomatic theory with a deterministic evaluator). Full workflow in `sm-rule-packets` — query via bbox_knowledge.",
-        when_to_use: "You have observations of a structured domain (authorization matrix, retry policy, state machine, access policy) and want to transmit the GENERATING RULES rather than the observations. Rules are ordered — first matching antecedent wins. Put anomalies first, general rules later. Predicate ops: `Eq{field,value}`, `Ge/Gt/Le/Lt{field,value}`, `RankGeFieldThreshold{rank_field,threshold_field}`, `All{args}`, `Any{args}`, `Not{arg}`, `True`, `False`. Optional `rank_table` / `threshold_table` lookup tables augment the entity at eval time (e.g. `rank_table={reader:1, editor:2, admin:4}` plus entity `{role: \"editor\"}` makes `role_rank=2` available to predicates).",
+        summary: "Compile a set of rules into a rule-packet (a compiled axiomatic theory with a deterministic evaluator). See `sm-rule-packets` via `bbox_knowledge` for the full workflow.",
+        when_to_use: "Use when a structured observation set is governed by a smaller rule system. Rules are first-match-wins, so put anomalies before general rules. Validate with `bbox_audit` before trusting predictions.",
         example: Some(r#"bbox_compile(domain="retry-policy", rules=[{"id":"transient_retry","antecedent":{"op":"Eq","field":"nature","value":"transient"},"consequent":"RETRY"},{"id":"default_fail","antecedent":{"op":"True"},"consequent":"FAIL"}])"#),
     },
     ToolDoc {
@@ -298,7 +298,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_exec",
         category: ToolCategory::Orchestration,
         summary: "Launch an agent task. Returns {taskId, sessionId} immediately.",
-        when_to_use: "Dispatching work. Prefer `bro: \"name\"` over `provider: \"...\"` — named bros resolve provider/account/lens/sessionId automatically. Bare bro names must be unique across live teams; use `team::bro` when a template is instantiated more than once. Returns immediately; follow with `bro_wait` or `bro_when_all`.",
+        when_to_use: "Use to start a fresh agent session. Prefer `bro:` over raw `provider:` so routing stays stable. Follow with `bro_wait`, `bro_when_all`, or `bro_status` depending on whether you need blocking completion. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
         example: Some(
             r#"bro_exec(bro="executor", prompt="refactor the tail module", project_dir="/repo/x")"#,
         ),
@@ -307,7 +307,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_resume",
         category: ToolCategory::Orchestration,
         summary: "Continue an existing session with a follow-up.",
-        when_to_use: "Multi-turn conversations with a specific bro. NEVER use `bro_exec` again for follow-ups — it starts fresh. Named bro targeting auto-resolves the sessionId. Bare bro names must be unique across live teams; use `team::bro` when needed.",
+        when_to_use: "Use for follow-ups on an existing bro session. Do not use `bro_exec` again when you need continuity. Named bro targeting auto-resolves the session ID. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
         example: Some(
             r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#,
         ),
@@ -379,14 +379,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_brofile",
         category: ToolCategory::Orchestration,
         summary: "Manage brofile templates + accounts (provider+account+lens).",
-        when_to_use: "Create / list / get / delete brofiles; set accounts. Brofiles are reusable team-member blueprints. Before `action=create`, call `action=list` first — a matching brofile may already exist (see 'Create etiquette').",
+        when_to_use: "Create, inspect, and manage reusable bro blueprints. Before `action=create`, call `action=list` first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(r#"bro_brofile(action="list")"#),
     },
     ToolDoc {
         name: "bro_team",
         category: ToolCategory::Orchestration,
         summary: "Manage teamplates and instantiated teams.",
-        when_to_use: "Save / list / delete teamplates; create / list / dissolve teams; show roster. A team = instantiated teamplate with named bro instances tracking their own sessionIds. Before `save_template` run `list_templates`; before `create` run `list`; both are dedupe-sensitive (see 'Create etiquette').",
+        when_to_use: "Save templates, instantiate teams, inspect roster, or tear teams down. Before `save_template` or `create`, list existing objects first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(
             r#"bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")"#,
         ),
@@ -395,7 +395,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_mcp",
         category: ToolCategory::Orchestration,
         summary: "Manage MCP servers + tool filters for dispatched bros.",
-        when_to_use: "Add/remove MCP servers visible to dispatched bros (fans out to Claude/Copilot/Codex/Gemini CLIs on global-scope writes). Allow/disallow tool patterns for mechanical filtering — default disallow `mcp__blackbox__bro_*` replaces the text recursion guard on providers that support dispatch-time filtering (Claude, Copilot). Before `action=add`, call `action=list` to check for an existing entry (see 'Create etiquette'). Actions: list, get, add, remove, allow, disallow, clear_filters, sync.",
+        when_to_use: "Add/remove MCP servers and manage dispatch-time tool filters. Before `action=add`, call `action=list` first. The default bro-tool disallow is mechanical recursion protection, not just prose guidance. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(
             r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#,
         ),
@@ -403,74 +403,45 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
 ];
 
 pub const WORKFLOW_NOTES: &str = "\
-## Create etiquette — check stock before ordering
+## Retrieval cues
 
-Before any create/open/save/add action that could duplicate an existing \
-object, call the list/get/search variant first to look for an existing \
-same-name or same-topic entry. Applies to brofiles (`bro_brofile list`), \
-teamplates and teams (`bro_team list_templates` / `list`), MCP servers \
-(`bro_mcp list`), work threads (`bbox_thread_list`), and dedupe-sensitive \
-knowledge writes (`bbox_knowledge` before `bbox_learn` / `bbox_decide`). \
-Reuse or update an existing match instead of creating a duplicate.
+If a tool stanza says `See: sm-...`, fetch that runbook on demand with \
+`bbox_knowledge(query=\"sm-...\")`. Keep primitive semantics hot; pull deep \
+workflow guidance only when you need it.
 
 ## Roles and the core loop
 
-Blackbox supports a two-role workflow across multi-provider dispatch:
-
-- **Orchestrator** (usually the main-session agent). Proposes work, \
-deliberates with an ensemble, dispatches to executors, reviews output, \
-iterates. Reads `bbox_inbox` at round boundaries. Writes `bbox_decide` \
-when a commitment is made. Marks notes `acknowledged` or `addressed` \
-via `bbox_note_resolve` as the loop progresses.
-
-- **Executor** (dispatched via `bro_exec` / `bro_broadcast`, or the \
-equivalent in a cosession flow). Does the work. Emits `bbox_note` \
-records throughout for the 7 kinds. Always emits `kind=done` with a \
-one-line acceptance summary before returning — this is the \
-orchestrator's primary scan signal.
+- **Orchestrator** — dispatches, reviews, reads `bbox_inbox`, resolves notes, \
+and records durable commitments.
+- **Executor** — does the work, emits sparse high-signal `bbox_note` entries, \
+and always emits `kind=done`.
 
 ## Ambient scope block
 
-Every dispatched agent receives a per-turn ambient prefix containing \
-pre-bound IDs: `session`, `project`, `bro`, and (when applicable) \
-`thread`, `work_item`. Use those IDs in `bbox_note` / `bbox_thread` \
-calls rather than reaching back through the transcript to guess. The \
-daemon may also auto-fill these fields when you omit them.
+Dispatched agents receive pre-bound IDs (`session`, `project`, `bro`, and \
+sometimes `thread` / `work_item`). Use them instead of reconstructing context \
+from transcript history.
 
-## Persistence hierarchy (when to reach for which)
+## Hot-path conventions
 
-**Rule of thumb:** `bbox_learn` / `bbox_remember` / `bbox_decide` capture \
-what the USER told you and should survive future sessions. `bbox_note` \
-captures what YOU observed during the current dispatch. Never use \
-`bbox_note(kind=learned)` for a user-stated rule — that's `bbox_learn`.
-
-- `bbox_remember` — default. Indexed, grep-able, never rendered. \
-Safest choice when unsure.
-- `bbox_learn` — rules / conventions that should bind every future \
-session. Renders into CLAUDE.md / AGENTS.md / GEMINI.md.
-- `bbox_decide` — durable commitments with required rationale. Pass \
-`supersedes` to reverse a prior decision with an auditable chain.
-- `bbox_note` — transient work artifacts during a dispatch. Auto-expires \
-from attention views once addressed.
-
-## Work-item threads
-
-For orchestrator-led propose→execute→review→refine loops, open a \
-thread with `kind=\"work_item\"`. Pass its ID as `thread_id` to \
-`bbox_note` calls so the loop's notes collate automatically. The \
-orchestrator can read the full refinement history with \
-`bbox_notes(thread_id=...)` instead of re-reading transcripts.
-
-## Dispatch etiquette
-
-- Prefer named bro targeting (`bro: \"executor\"`) over raw provider — \
-it resolves provider, account, lens, and sessionId automatically.
-- Always use `bro_resume` (not `bro_exec`) for multi-turn conversations. \
-`bro_exec` starts fresh with no memory.
-- Use maximum timeouts on `bro_wait` / `bro_when_all` / `bro_when_any`.
-- For ensembles: `bro_broadcast` then `bro_when_all` (blind deliberation) \
-or `bro_when_any` (race).
+- List before create.
+- `bro_exec` starts fresh; `bro_resume` continues.
+- `bbox_learn` is for user-stated standing rules; `bbox_note(kind=learned)` is \
+for agent-discovered facts.
 ";
+
+fn system_memory_hint(doc: &ToolDoc) -> Option<String> {
+    let joined = format!("{} {}", doc.summary, doc.when_to_use);
+    let start = joined.find("sm-")?;
+    let suffix = &joined[start..];
+    let end = suffix
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(suffix.len());
+    let id = &suffix[..end];
+    Some(format!(
+        "  _See:_ `{id}` via `bbox_knowledge(query=\"{id}\")`\n"
+    ))
+}
 
 // ── Filter translation helpers ───────────────────────────────────────
 
@@ -543,6 +514,9 @@ pub fn render_markdown() -> String {
             out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
             if let Some(ex) = doc.example {
                 out.push_str(&format!("  _Example:_ `{ex}`\n"));
+            }
+            if let Some(hint) = system_memory_hint(doc) {
+                out.push_str(&hint);
             }
         }
         out.push('\n');
@@ -639,7 +613,14 @@ mod tests {
         let md = render_markdown();
         assert!(md.contains("## Roles and the core loop"));
         assert!(md.contains("Ambient scope"));
-        assert!(md.contains("Persistence hierarchy"));
+        assert!(md.contains("Retrieval cues"));
+    }
+
+    #[test]
+    fn render_includes_system_memory_hint() {
+        let md = render_markdown();
+        assert!(md.contains("sm-rule-packets"));
+        assert!(md.contains("bbox_knowledge(query=\"sm-rule-packets\")"));
     }
 
     /// Parse `#[tool(...)]` attributes from main.rs. Tolerates:
