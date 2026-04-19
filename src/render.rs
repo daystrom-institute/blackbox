@@ -109,16 +109,27 @@ impl PatchPlan {
 
     pub fn summary(&self) -> String {
         match self {
-            Self::Create { path, managed_block } => {
+            Self::Create {
+                path,
+                managed_block,
+            } => {
                 format!("CREATE {} ({} chars)", path.display(), managed_block.len())
             }
-            Self::Append { path, existing_file, managed_block } => format!(
+            Self::Append {
+                path,
+                existing_file,
+                managed_block,
+            } => format!(
                 "APPEND managed region to {} (existing {} chars, adding {} chars)",
                 path.display(),
                 existing_file.len(),
                 managed_block.len()
             ),
-            Self::Replace { path, existing_block, managed_block } => format!(
+            Self::Replace {
+                path,
+                existing_block,
+                managed_block,
+            } => format!(
                 "REPLACE managed region in {} ({} chars → {} chars)",
                 path.display(),
                 existing_block.len(),
@@ -132,11 +143,17 @@ impl PatchPlan {
 /// Compute what a managed-region patch would do without writing anything.
 /// `managed_body` is the bbox-rendered content (without markers).
 pub fn plan_managed_patch(file_path: &Path, managed_body: &str) -> Result<PatchPlan> {
-    let managed_block = format!("{MANAGED_START}\n{}\n{MANAGED_END}", managed_body.trim_end());
+    let managed_block = format!(
+        "{MANAGED_START}\n{}\n{MANAGED_END}",
+        managed_body.trim_end()
+    );
     let path = file_path.to_path_buf();
 
     if !file_path.exists() {
-        return Ok(PatchPlan::Create { path, managed_block });
+        return Ok(PatchPlan::Create {
+            path,
+            managed_block,
+        });
     }
 
     let existing = fs::read_to_string(file_path)
@@ -149,7 +166,11 @@ pub fn plan_managed_patch(file_path: &Path, managed_body: &str) -> Result<PatchP
             if existing_block == managed_block {
                 Ok(PatchPlan::Unchanged { path })
             } else {
-                Ok(PatchPlan::Replace { path, existing_block, managed_block })
+                Ok(PatchPlan::Replace {
+                    path,
+                    existing_block,
+                    managed_block,
+                })
             }
         }
         (None, None) => Ok(PatchPlan::Append {
@@ -172,13 +193,20 @@ pub fn apply_managed_patch(plan: &PatchPlan) -> Result<Option<PathBuf>> {
         // Nothing to do — and no empty backup dir, either.
         PatchPlan::Unchanged { .. } => Ok(None),
 
-        PatchPlan::Create { path, managed_block } => {
+        PatchPlan::Create {
+            path,
+            managed_block,
+        } => {
             create_parent_dir(path);
             write_atomic(path, &format!("{managed_block}\n"))?;
             Ok(None)
         }
 
-        PatchPlan::Append { path, existing_file, managed_block } => {
+        PatchPlan::Append {
+            path,
+            existing_file,
+            managed_block,
+        } => {
             let backup = Some(snapshot_file(path)?);
             let sep = if existing_file.ends_with("\n\n") || existing_file.is_empty() {
                 ""
@@ -192,7 +220,11 @@ pub fn apply_managed_patch(plan: &PatchPlan) -> Result<Option<PathBuf>> {
             Ok(backup)
         }
 
-        PatchPlan::Replace { path, managed_block, .. } => {
+        PatchPlan::Replace {
+            path,
+            managed_block,
+            ..
+        } => {
             let backup = Some(snapshot_file(path)?);
             let full = fs::read_to_string(path)?;
             let (s, e) = find_marker_positions(&full)?;
@@ -226,7 +258,10 @@ fn find_marker_positions(text: &str) -> Result<(Option<usize>, Option<usize>)> {
     if starts.len() > 1 || ends.len() > 1 {
         anyhow::bail!("multiple managed-region markers found");
     }
-    Ok((starts.first().map(|(i, _)| *i), ends.first().map(|(i, _)| *i)))
+    Ok((
+        starts.first().map(|(i, _)| *i),
+        ends.first().map(|(i, _)| *i),
+    ))
 }
 
 /// Extract the body between `<!-- bb:managed-start -->` and
@@ -257,9 +292,7 @@ pub fn snapshot_file(src: &Path) -> Result<PathBuf> {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let dir = backup_root.join(stamp);
     fs::create_dir_all(&dir)?;
-    let name = src
-        .file_name()
-        .context("source path has no file name")?;
+    let name = src.file_name().context("source path has no file name")?;
     let dest = dir.join(name);
     fs::copy(src, &dest)
         .with_context(|| format!("backing up {} → {}", src.display(), dest.display()))?;
@@ -278,8 +311,7 @@ fn backup_root() -> Result<PathBuf> {
 
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
     let tmp = path.with_extension("md.tmp");
-    let mut file = fs::File::create(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
+    let mut file = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
     drop(file);
@@ -332,7 +364,11 @@ mod tests {
         .unwrap();
         let plan = plan_managed_patch(&p, "new body").unwrap();
         match plan {
-            PatchPlan::Replace { existing_block, managed_block, .. } => {
+            PatchPlan::Replace {
+                existing_block,
+                managed_block,
+                ..
+            } => {
                 assert!(existing_block.contains("old body"));
                 assert!(managed_block.contains("new body"));
             }
@@ -393,5 +429,4 @@ mod tests {
         assert!(global_target_path("gemini").is_some());
         assert!(global_target_path("agents").is_some());
     }
-
 }

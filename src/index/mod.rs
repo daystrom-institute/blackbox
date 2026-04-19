@@ -56,7 +56,11 @@ pub struct TranscriptIndex {
 }
 
 impl TranscriptIndex {
-    pub fn open_or_create(index_path: &Path, roots: Vec<(String, PathBuf)>, codex_root: Option<PathBuf>) -> Result<Self> {
+    pub fn open_or_create(
+        index_path: &Path,
+        roots: Vec<(String, PathBuf)>,
+        codex_root: Option<PathBuf>,
+    ) -> Result<Self> {
         let meta_path = index_path.join("_meta.json");
 
         // Build schema
@@ -130,7 +134,6 @@ impl TranscriptIndex {
         let searcher = self.reader.searcher();
         searcher.num_docs() == 0
     }
-
 }
 
 mod helpers;

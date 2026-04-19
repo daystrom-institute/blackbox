@@ -1,8 +1,8 @@
-pub mod providers;
 pub mod brofile;
 pub mod mcp;
-pub mod team;
+pub mod providers;
 pub mod tail;
+pub mod team;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +31,10 @@ pub enum TaskStatus {
 
 impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled)
+        matches!(
+            self,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
     }
 }
 
@@ -76,7 +79,9 @@ pub struct TaskStore {
 
 impl TaskStore {
     pub fn new() -> Self {
-        Self { tasks: HashMap::new() }
+        Self {
+            tasks: HashMap::new(),
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Task>> {
@@ -136,25 +141,36 @@ struct PersistedTask {
 
 impl TaskStore {
     pub fn persist(&self, store_dir: &std::path::Path) {
-        let records: Vec<PersistedTask> = self.tasks.values().map(|t| {
-            let inner = t.inner.lock();
-            PersistedTask {
-                id: inner.id.clone(),
-                provider: inner.provider,
-                session_id: inner.session_id.clone(),
-                events: inner.events.iter().rev().take(MAX_PERSISTED_EVENTS).rev().cloned().collect(),
-                last_assistant_message: inner.last_assistant_message.clone(),
-                usage: inner.usage.clone(),
-                cost_usd: inner.cost_usd,
-                num_turns: inner.num_turns,
-                stderr: inner.stderr.chars().take(2000).collect(),
-                status: inner.status,
-                started_at: inner.started_at,
-                completed_at: inner.completed_at,
-                exit_code: inner.exit_code,
-                cwd: inner.cwd.clone(),
-            }
-        }).collect();
+        let records: Vec<PersistedTask> = self
+            .tasks
+            .values()
+            .map(|t| {
+                let inner = t.inner.lock();
+                PersistedTask {
+                    id: inner.id.clone(),
+                    provider: inner.provider,
+                    session_id: inner.session_id.clone(),
+                    events: inner
+                        .events
+                        .iter()
+                        .rev()
+                        .take(MAX_PERSISTED_EVENTS)
+                        .rev()
+                        .cloned()
+                        .collect(),
+                    last_assistant_message: inner.last_assistant_message.clone(),
+                    usage: inner.usage.clone(),
+                    cost_usd: inner.cost_usd,
+                    num_turns: inner.num_turns,
+                    stderr: inner.stderr.chars().take(2000).collect(),
+                    status: inner.status,
+                    started_at: inner.started_at,
+                    completed_at: inner.completed_at,
+                    exit_code: inner.exit_code,
+                    cwd: inner.cwd.clone(),
+                }
+            })
+            .collect();
 
         let file = store_dir.join("tasks.json");
         let tmp = store_dir.join("tasks.json.tmp");
@@ -179,11 +195,14 @@ impl TaskStore {
         };
         let cutoff = now_ms().saturating_sub(ttl_ms);
         for mut rec in records {
-            if rec.started_at < cutoff { continue; }
+            if rec.started_at < cutoff {
+                continue;
+            }
             if rec.status == TaskStatus::Running {
                 rec.status = TaskStatus::Failed;
                 rec.completed_at = Some(now_ms());
-                rec.stderr.push_str("\n[blackbox] server restarted while task was running");
+                rec.stderr
+                    .push_str("\n[blackbox] server restarted while task was running");
             }
             let task = Arc::new(Task {
                 inner: Mutex::new(TaskInner {
@@ -424,9 +443,18 @@ pub fn spawn_task(
 ) -> Arc<Task> {
     let id = task_id;
 
-    let extra_path = std::env::var("BRO_EXTRA_PATH")
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/bin").to_string_lossy().to_string());
-    let path_env = format!("{}:{}", extra_path, std::env::var("PATH").unwrap_or_default());
+    let extra_path = std::env::var("BRO_EXTRA_PATH").unwrap_or_else(|_| {
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".local/bin")
+            .to_string_lossy()
+            .to_string()
+    });
+    let path_env = format!(
+        "{}:{}",
+        extra_path,
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     // Resolve binary through a login shell so nvm/asdf/rbenv-installed CLIs
     // work even when the daemon was launched by launchctl/systemd with a
@@ -515,6 +543,50 @@ pub fn spawn_task(
         bro_name: None,
     });
 
+    if provider == Provider::Gemini && session_id == "pending" {
+        if let Some(cwd_clone) = cwd.clone() {
+            let task_ref_watch = task.clone();
+            let task_store_watch = task_store.clone();
+            let tail_tx_watch = tail_tx.clone();
+            let store_dir_watch = store_dir.clone();
+            let task_id_watch = id.clone();
+            let started_at = task.inner.lock().started_at;
+            tokio::spawn(async move {
+                loop {
+                    {
+                        let inner = task_ref_watch.inner.lock();
+                        if inner.status != TaskStatus::Running || inner.session_id != "pending" {
+                            break;
+                        }
+                    }
+
+                    if let Some(sid) = providers::discover_gemini_session(started_at, &cwd_clone) {
+                        let discovered = {
+                            let mut inner = task_ref_watch.inner.lock();
+                            if inner.session_id == "pending" {
+                                inner.session_id = sid.clone();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if discovered {
+                            team::propagate_session_id(&task_id_watch, &sid, &store_dir_watch);
+                            task_store_watch.read().persist(&store_dir_watch);
+                            let _ = tail_tx_watch.send(tail::TailEvent::TaskProgress {
+                                task_id: task_id_watch.clone(),
+                                activity: String::new(),
+                            });
+                        }
+                        break;
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            });
+        }
+    }
+
     // Spawn stdout reader — signals completion via oneshot so the process
     // waiter can ensure all output is consumed before marking the task done.
     let stdout = child.stdout.take().unwrap();
@@ -556,7 +628,8 @@ pub fn spawn_task(
                         if let Some(sid) = sink.session_id {
                             if inner.session_id == "pending" {
                                 inner.session_id = sid;
-                            } else if inner.session_id != sid && inner.status != TaskStatus::Failed {
+                            } else if inner.session_id != sid && inner.status != TaskStatus::Failed
+                            {
                                 // Provider emitted a session_id that doesn't
                                 // match the one we asked to resume. Mark failed
                                 // so the caller doesn't trust a forked session
@@ -685,7 +758,11 @@ pub fn spawn_task(
             // on kill, Failed on session fork detection) — don't let a
             // clean exit code flip a detected failure back to Completed.
             if inner.status != TaskStatus::Cancelled && inner.status != TaskStatus::Failed {
-                inner.status = if code == Some(0) { TaskStatus::Completed } else { TaskStatus::Failed };
+                inner.status = if code == Some(0) {
+                    TaskStatus::Completed
+                } else {
+                    TaskStatus::Failed
+                };
             }
             inner.completed_at = Some(now_ms());
 
@@ -769,10 +846,17 @@ pub async fn wait_for_task_with_timeout(task: &Task, timeout_secs: Option<f64>) 
 }
 
 /// Cancel a running task.
-pub fn cancel_task(task: &Task, task_store: &RwLock<TaskStore>, store_dir: &std::path::Path) -> Result<(), String> {
+pub fn cancel_task(
+    task: &Task,
+    task_store: &RwLock<TaskStore>,
+    store_dir: &std::path::Path,
+) -> Result<(), String> {
     let mut inner = task.inner.lock();
     if inner.status != TaskStatus::Running {
-        return Err(format!("Task already {}", serde_json::to_string(&inner.status).unwrap_or_default()));
+        return Err(format!(
+            "Task already {}",
+            serde_json::to_string(&inner.status).unwrap_or_default()
+        ));
     }
     inner.status = TaskStatus::Cancelled;
     inner.completed_at = Some(now_ms());
@@ -803,7 +887,7 @@ pub fn now_ms() -> u64 {
 pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
     let end = completed_at.unwrap_or_else(now_ms);
     let ms = end.saturating_sub(started_at);
-    let s = ms / 1000 ;
+    let s = ms / 1000;
     if s < 60 {
         format!("{s}s")
     } else {
@@ -867,7 +951,11 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
     let event_count = inner.events.len();
     let last_activity = inner.last_assistant_message.as_deref().map(|msg| {
         let clean = msg.replace('\n', " ");
-        if clean.len() > 80 { format!("{}…", &clean[..80]) } else { clean }
+        if clean.len() > 80 {
+            format!("{}…", &clean[..80])
+        } else {
+            clean
+        }
     });
 
     let keep_going = if inner.status.is_terminal() {
@@ -965,7 +1053,10 @@ mod tests {
             ..Default::default()
         };
         let out = apply_ambient("x", &ctx);
-        assert!(!out.contains("session:"), "pending session should be elided");
+        assert!(
+            !out.contains("session:"),
+            "pending session should be elided"
+        );
         assert!(out.contains("project: /repo/x"));
     }
 
@@ -1047,7 +1138,10 @@ mod tests {
                 session_id: "s1".into(),
                 events: vec![],
                 last_assistant_message: Some("Done!".into()),
-                usage: Some(Usage { input_tokens: 100, output_tokens: 50 }),
+                usage: Some(Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                }),
                 cost_usd: Some(0.05),
                 num_turns: Some(3),
                 stderr: String::new(),
@@ -1093,7 +1187,12 @@ mod tests {
 
         let json = task_result_json(&task);
         assert_eq!(json["exitCode"], 1);
-        assert!(json["stderr"].as_str().unwrap().contains("something went wrong"));
+        assert!(
+            json["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("something went wrong")
+        );
     }
 }
 

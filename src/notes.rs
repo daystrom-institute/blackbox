@@ -96,7 +96,9 @@ pub struct NoteResolveParams {
 
 // ── Schema ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum NoteKind {
@@ -116,7 +118,9 @@ pub enum NoteKind {
     Done,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum NoteResolution {
@@ -308,11 +312,7 @@ impl Notes {
         }
 
         self.save()?;
-        Ok(format!(
-            "Note {} → {}",
-            p.id,
-            resolution.as_ref()
-        ))
+        Ok(format!("Note {} → {}", p.id, resolution.as_ref()))
     }
 
     // ── bbox_notes (list) ──────────────────────────────────────────
@@ -414,12 +414,16 @@ impl Notes {
             let ctx_bits = [
                 n.bro.as_deref().map(|b| format!("bro={b}")),
                 n.provider.as_deref().map(|p| format!("provider={p}")),
-                n.task_id.as_deref().map(|t| format!("task={}", &t[..t.len().min(8)])),
-                n.session_id.as_deref().map(|s| format!("session={}", &s[..s.len().min(8)])),
+                n.task_id
+                    .as_deref()
+                    .map(|t| format!("task={}", &t[..t.len().min(8)])),
+                n.session_id
+                    .as_deref()
+                    .map(|s| format!("session={}", &s[..s.len().min(8)])),
                 n.thread_id.as_deref().map(|t| format!("thread={t}")),
-                n.project.as_deref().and_then(|p| {
-                    p.rsplit('/').next().map(|leaf| format!("project={leaf}"))
-                }),
+                n.project
+                    .as_deref()
+                    .and_then(|p| p.rsplit('/').next().map(|leaf| format!("project={leaf}"))),
             ]
             .into_iter()
             .flatten()
@@ -469,7 +473,7 @@ mod tests {
                 session_id: Some("sess-abc".into()),
                 project: Some("/repo/x".into()),
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 provider: Some("claude".into()),
                 bro: Some("executor".into()),
             })
@@ -482,7 +486,7 @@ mod tests {
                 project: None,
                 session_id: None,
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 bro: None,
                 resolution: None,
                 query: None,
@@ -505,7 +509,7 @@ mod tests {
                 session_id: None,
                 project: None,
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 provider: None,
                 bro: None,
             })
@@ -523,7 +527,7 @@ mod tests {
                 session_id: None,
                 project: None,
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 provider: None,
                 bro: None,
             })
@@ -541,7 +545,7 @@ mod tests {
                 session_id: None,
                 project: None,
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 provider: None,
                 bro: None,
             })
@@ -559,7 +563,10 @@ mod tests {
         let n = &notes.store.notes[0];
         assert_eq!(n.resolution, NoteResolution::Acknowledged);
         assert!(n.resolved_at.is_some());
-        assert_eq!(n.resolution_note.as_deref(), Some("will investigate next round"));
+        assert_eq!(
+            n.resolution_note.as_deref(),
+            Some("will investigate next round")
+        );
 
         // Default list excludes addressed but includes acknowledged
         let out = notes
@@ -568,7 +575,7 @@ mod tests {
                 project: None,
                 session_id: None,
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 bro: None,
                 resolution: None,
                 query: None,
@@ -593,7 +600,7 @@ mod tests {
                 project: None,
                 session_id: None,
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 bro: None,
                 resolution: None,
                 query: None,
@@ -602,7 +609,10 @@ mod tests {
                 include_addressed: None,
             })
             .unwrap();
-        assert!(!out.contains(&id), "addressed note should be excluded by default");
+        assert!(
+            !out.contains(&id),
+            "addressed note should be excluded by default"
+        );
 
         let out_all = notes
             .list(&NoteListParams {
@@ -610,7 +620,7 @@ mod tests {
                 project: None,
                 session_id: None,
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 bro: None,
                 resolution: None,
                 query: None,
@@ -663,7 +673,10 @@ mod tests {
             })
             .unwrap_err();
         let msg = e.to_string();
-        assert!(msg.contains("note-<8hex>"), "error should hint at format: {msg}");
+        assert!(
+            msg.contains("note-<8hex>"),
+            "error should hint at format: {msg}"
+        );
     }
 
     #[test]
@@ -679,7 +692,7 @@ mod tests {
                     session_id: None,
                     project: Some("/repo/x".into()),
                     task_id: None,
-            thread_id: None,
+                    thread_id: None,
                     provider: None,
                     bro: None,
                 })

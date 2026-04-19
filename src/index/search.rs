@@ -13,10 +13,10 @@ use tantivy::snippet::SnippetGenerator;
 use tantivy::{IndexWriter, TantivyDocument, Term};
 use walkdir::WalkDir;
 
-use crate::parser;
 use super::helpers::*;
 use super::reindex::*;
 use super::{FileMeta, TranscriptIndex};
+use crate::parser;
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
@@ -25,21 +25,27 @@ pub struct SearchParams {
     /// Search query. Terms ANDed by default. Use quotes for phrases, OR for disjunction.
     pub query: String,
     /// Filter to account: 'claude', 'account2', 'account3', 'codex'
-    #[serde(default)] pub account: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
     /// Filter by project path keywords
-    #[serde(default)] pub project: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
     /// Filter by message role/type
-    #[serde(default)] pub role: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
     /// Include subagent transcripts (default: true)
-    #[serde(default)] pub include_subagents: Option<bool>,
+    #[serde(default)]
+    pub include_subagents: Option<bool>,
     /// Max results (default: 20, max: 100)
-    #[serde(default)] pub limit: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u64>,
     /// Auto-exclude the caller's own session by detecting which active
     /// transcript contains this query as a recent user message
     /// (self-reference suppression). Defaults to false — opt-in. Enable
     /// when an interactive agent is searching for context derived from
     /// its own current turn and would otherwise see itself in results.
-    #[serde(default)] pub exclude_self: Option<bool>,
+    #[serde(default)]
+    pub exclude_self: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -49,7 +55,8 @@ pub struct ContextParams {
     /// Byte offset of the target line (from search results)
     pub byte_offset: u64,
     /// Number of JSONL events before/after to include (default: 5)
-    #[serde(default)] pub context_lines: Option<u64>,
+    #[serde(default)]
+    pub context_lines: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -60,28 +67,41 @@ pub struct SessionParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessagesParams {
-    #[serde(default)] pub session_id: Option<String>,
-    #[serde(default)] pub file_path: Option<String>,
-    #[serde(default)] pub role: Option<String>,
-    #[serde(default)] pub include_subagents: Option<bool>,
-    #[serde(default)] pub max_content_length: Option<u64>,
-    #[serde(default)] pub from_end: Option<bool>,
-    #[serde(default)] pub offset: Option<u64>,
-    #[serde(default)] pub limit: Option<u64>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub include_subagents: Option<bool>,
+    #[serde(default)]
+    pub max_content_length: Option<u64>,
+    #[serde(default)]
+    pub from_end: Option<bool>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReindexParams {
     /// Force full reindex (default: false)
-    #[serde(default)] pub full: Option<bool>,
+    #[serde(default)]
+    pub full: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TopicsParams {
-    #[serde(default)] pub session_id: Option<String>,
-    #[serde(default)] pub file_path: Option<String>,
-    #[serde(default)] pub role: Option<String>,
-    #[serde(default)] pub limit: Option<u64>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -89,23 +109,33 @@ pub struct CiteParams {
     /// The claim, rule, or phrase to trace back to its origin
     pub claim: String,
     /// Filter to account
-    #[serde(default)] pub account: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
     /// Filter by project path keywords
-    #[serde(default)] pub project: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
     /// Role to cite (default: "user" — who said it originally)
-    #[serde(default)] pub role: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
     /// Max citations (default: 5, max: 20)
-    #[serde(default)] pub limit: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionsListParams {
-    #[serde(default)] pub account: Option<String>,
-    #[serde(default)] pub project: Option<String>,
-    #[serde(default)] pub name: Option<String>,
-    #[serde(default)] pub offset: Option<u64>,
-    #[serde(default)] pub exclude_session: Option<String>,
-    #[serde(default)] pub limit: Option<u64>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub exclude_session: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u64>,
 }
 
 impl TranscriptIndex {
@@ -123,14 +153,14 @@ impl TranscriptIndex {
         let searcher = self.reader.searcher();
 
         // Parse the user's text query against content + project fields
-        let mut qp = QueryParser::for_index(&self.index, vec![self.fields.content, self.fields.project]);
+        let mut qp =
+            QueryParser::for_index(&self.index, vec![self.fields.content, self.fields.project]);
         qp.set_conjunction_by_default();
         let text_query = qp.parse_query(query_str)?;
 
         // Build filter clauses
-        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
-            (Occur::Must, text_query.box_clone()),
-        ];
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
+            vec![(Occur::Must, text_query.box_clone())];
 
         if !include_subagents {
             clauses.push((
@@ -212,10 +242,7 @@ impl TranscriptIndex {
             let project = self.doc_text(&doc, self.fields.project);
             let account = self.doc_text(&doc, self.fields.account);
 
-            let excerpt = snippet
-                .to_html()
-                .replace("<b>", "**")
-                .replace("</b>", "**");
+            let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
 
             results.push(format!(
                 "Score: {score:.2} | {account} | {role}\n\
@@ -266,10 +293,13 @@ impl TranscriptIndex {
 
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
             (Occur::Must, text_query.box_clone()),
-            (Occur::Must, Box::new(TermQuery::new(
-                Term::from_field_text(self.fields.role, role),
-                IndexRecordOption::Basic,
-            ))),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.role, role),
+                    IndexRecordOption::Basic,
+                )),
+            ),
         ];
 
         if let Some(account) = p.account.as_deref() {
@@ -306,10 +336,7 @@ impl TranscriptIndex {
         for (_score, addr) in &top_docs {
             let doc: TantivyDocument = searcher.doc(*addr)?;
             let snippet = snippet_gen.snippet_from_doc(&doc);
-            let excerpt = snippet
-                .to_html()
-                .replace("<b>", "**")
-                .replace("</b>", "**");
+            let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
 
             rows.push((
                 self.doc_text(&doc, self.fields.timestamp),
@@ -344,8 +371,8 @@ impl TranscriptIndex {
         let target_offset = p.byte_offset;
         let ctx_lines = p.context_lines.unwrap_or(5) as usize;
 
-        let content = fs::read_to_string(file_path)
-            .with_context(|| format!("Failed to read {file_path}"))?;
+        let content =
+            fs::read_to_string(file_path).with_context(|| format!("Failed to read {file_path}"))?;
 
         let lines: Vec<&str> = content.split('\n').collect();
 
@@ -384,7 +411,9 @@ impl TranscriptIndex {
                 let marker = if i == target_idx { ">>>" } else { "   " };
                 let preview = if ev.content.len() > 400 {
                     let mut end = 400;
-                    while end > 0 && !ev.content.is_char_boundary(end) { end -= 1; }
+                    while end > 0 && !ev.content.is_char_boundary(end) {
+                        end -= 1;
+                    }
                     format!("{}...", &ev.content[..end])
                 } else {
                     ev.content.clone()
@@ -406,11 +435,8 @@ impl TranscriptIndex {
         let raw_id = p.session_id.as_str();
 
         // If it's a friendly name, resolve to UUID
-        let resolved_id = resolve_session_name(
-            raw_id,
-            &self.config.roots,
-            self.config.codex_root.as_ref(),
-        );
+        let resolved_id =
+            resolve_session_name(raw_id, &self.config.roots, self.config.codex_root.as_ref());
         let session_id = resolved_id.as_deref().unwrap_or(raw_id);
 
         // Load name maps for display
@@ -732,7 +758,9 @@ impl TranscriptIndex {
         let main_path = Path::new(&main);
         if let Some(stem) = main_path.file_stem() {
             if let Some(parent) = main_path.parent() {
-                let subagent_dir = parent.join(stem.to_string_lossy().as_ref()).join("subagents");
+                let subagent_dir = parent
+                    .join(stem.to_string_lossy().as_ref())
+                    .join("subagents");
                 if subagent_dir.exists() {
                     for entry in WalkDir::new(&subagent_dir)
                         .into_iter()
@@ -804,10 +832,14 @@ impl TranscriptIndex {
                 };
                 for ev in &events {
                     if let Some(rf) = role_filter {
-                        if ev.role.as_ref() != rf { continue; }
+                        if ev.role.as_ref() != rf {
+                            continue;
+                        }
                     }
                     // Skip tool_result — too noisy for topic extraction
-                    if ev.role == crate::parser::MessageRole::ToolResult { continue; }
+                    if ev.role == crate::parser::MessageRole::ToolResult {
+                        continue;
+                    }
                     all_content.push(' ');
                     all_content.push_str(&ev.content);
                 }
@@ -818,24 +850,31 @@ impl TranscriptIndex {
                 return Ok("Index is empty. Run blackbox_reindex first.".to_string());
             }
             let searcher = self.reader.searcher();
-            let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
-                (Occur::Must, Box::new(TermQuery::new(
+            let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![(
+                Occur::Must,
+                Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.session_id, sid),
                     IndexRecordOption::Basic,
-                ))),
-            ];
+                )),
+            )];
             if let Some(rf) = role_filter {
-                clauses.push((Occur::Must, Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.role, rf),
-                    IndexRecordOption::Basic,
-                ))));
+                clauses.push((
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.role, rf),
+                        IndexRecordOption::Basic,
+                    )),
+                ));
             }
             // Exclude tool_result by default
             if role_filter.is_none() {
-                clauses.push((Occur::MustNot, Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.role, "tool_result"),
-                    IndexRecordOption::Basic,
-                ))));
+                clauses.push((
+                    Occur::MustNot,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.role, "tool_result"),
+                        IndexRecordOption::Basic,
+                    )),
+                ));
             }
             let query = BooleanQuery::new(clauses);
             let top_docs = searcher.search(&query, &TopDocs::with_limit(5000))?;
@@ -891,10 +930,14 @@ impl TranscriptIndex {
         // Claude Code sessions — from session-meta JSON files
         for (account_name, root) in &self.config.roots {
             if let Some(af) = account_filter {
-                if af != account_name { continue; }
+                if af != account_name {
+                    continue;
+                }
             }
             let meta_dir = root.join("usage-data").join("session-meta");
-            if !meta_dir.exists() { continue; }
+            if !meta_dir.exists() {
+                continue;
+            }
 
             let dir_entries = match fs::read_dir(&meta_dir) {
                 Ok(d) => d,
@@ -932,7 +975,9 @@ impl TranscriptIndex {
                 // Truncate first_prompt for display
                 let prompt_preview = if first_prompt.len() > 120 {
                     let mut end = 120;
-                    while end > 0 && !first_prompt.is_char_boundary(end) { end -= 1; }
+                    while end > 0 && !first_prompt.is_char_boundary(end) {
+                        end -= 1;
+                    }
                     format!("{}...", &first_prompt[..end])
                 } else {
                     first_prompt
@@ -988,7 +1033,8 @@ impl TranscriptIndex {
                         }
 
                         // Extract timestamp from filename: rollout-YYYY-MM-DDTHH-MM-SS-...
-                        let stem = path.file_stem()
+                        let stem = path
+                            .file_stem()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_default();
                         let start_time = if stem.starts_with("rollout-") && stem.len() > 27 {
@@ -1035,14 +1081,23 @@ impl TranscriptIndex {
         let page: Vec<&SessionEntry> = entries.iter().skip(offset).take(limit).collect();
         let showing_end = (offset + limit).min(total);
 
-        let mut header = format!("Sessions {}-{} of {} (most recent first)", offset + 1, showing_end, total);
+        let mut header = format!(
+            "Sessions {}-{} of {} (most recent first)",
+            offset + 1,
+            showing_end,
+            total
+        );
         if showing_end < total {
             header.push_str(&format!(" — next: offset={}", showing_end));
         }
 
         let mut lines = Vec::new();
         for e in &page {
-            let date = if e.start_time.len() >= 16 { &e.start_time[..16] } else { &e.start_time };
+            let date = if e.start_time.len() >= 16 {
+                &e.start_time[..16]
+            } else {
+                &e.start_time
+            };
             let dur = if e.duration_minutes > 0 {
                 format!("{}m", e.duration_minutes)
             } else {
@@ -1099,7 +1154,10 @@ impl TranscriptIndex {
         if let Some(ref codex_root) = self.config.codex_root {
             let sessions_dir = codex_root.join("sessions");
             if sessions_dir.exists() {
-                per_account.push(format!("  codex: {} files", count_jsonl_files(&sessions_dir)));
+                per_account.push(format!(
+                    "  codex: {} files",
+                    count_jsonl_files(&sessions_dir)
+                ));
             }
         }
 
@@ -1148,15 +1206,27 @@ impl TranscriptIndex {
             let projects_dir = root.join("projects");
             if projects_dir.exists() {
                 index_directory_standalone(
-                    &projects_dir, account_name, f,
-                    &mut writer, &mut meta, &mut indexed_files, &mut indexed_docs, &mut skipped,
+                    &projects_dir,
+                    account_name,
+                    f,
+                    &mut writer,
+                    &mut meta,
+                    &mut indexed_files,
+                    &mut indexed_docs,
+                    &mut skipped,
                 )?;
             }
             let history = root.join("history.jsonl");
             if history.exists() {
                 index_history_standalone(
-                    &history, account_name, f,
-                    &mut writer, &mut meta, &mut indexed_files, &mut indexed_docs, &mut skipped,
+                    &history,
+                    account_name,
+                    f,
+                    &mut writer,
+                    &mut meta,
+                    &mut indexed_files,
+                    &mut indexed_docs,
+                    &mut skipped,
                 )?;
             }
         }
@@ -1165,15 +1235,25 @@ impl TranscriptIndex {
             let sessions_dir = codex_root.join("sessions");
             if sessions_dir.exists() {
                 index_codex_directory_standalone(
-                    &sessions_dir, f,
-                    &mut writer, &mut meta, &mut indexed_files, &mut indexed_docs, &mut skipped,
+                    &sessions_dir,
+                    f,
+                    &mut writer,
+                    &mut meta,
+                    &mut indexed_files,
+                    &mut indexed_docs,
+                    &mut skipped,
                 )?;
             }
             let history = codex_root.join("history.jsonl");
             if history.exists() {
                 index_codex_history_standalone(
-                    &history, f,
-                    &mut writer, &mut meta, &mut indexed_files, &mut indexed_docs, &mut skipped,
+                    &history,
+                    f,
+                    &mut writer,
+                    &mut meta,
+                    &mut indexed_files,
+                    &mut indexed_docs,
+                    &mut skipped,
                 )?;
             }
         }
@@ -1183,7 +1263,8 @@ impl TranscriptIndex {
         let current_paths: std::collections::HashSet<String> =
             current_files.iter().map(|(p, _, _)| p.clone()).collect();
         let mut purged = 0u64;
-        let stale_paths: Vec<String> = meta.keys()
+        let stale_paths: Vec<String> = meta
+            .keys()
             .filter(|p| !current_paths.contains(p.as_str()))
             .cloned()
             .collect();

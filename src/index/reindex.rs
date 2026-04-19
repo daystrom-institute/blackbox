@@ -5,13 +5,13 @@ use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Result;
-use tantivy::{Index, IndexWriter, TantivyDocument};
 use tantivy::schema::*;
+use tantivy::{Index, IndexWriter, TantivyDocument};
 use walkdir::WalkDir;
 
-use crate::parser;
-use super::{FileMeta, FieldHandles, ReindexConfig};
 use super::helpers::*;
+use super::{FieldHandles, FileMeta, ReindexConfig};
+use crate::parser;
 
 pub(super) fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
     if !path.exists() {
@@ -54,7 +54,11 @@ pub(super) fn count_jsonl_files(dir: &Path) -> usize {
 
 /// Collect (path, mtime, size) for all JSONL files in a directory tree.
 pub(super) fn scan_jsonl_dir(dir: &Path, out: &mut Vec<(String, u64, u64)>) {
-    for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         let path = entry.path();
         if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
             continue;
@@ -74,7 +78,8 @@ pub(super) fn scan_jsonl_dir(dir: &Path, out: &mut Vec<(String, u64, u64)>) {
 /// Stat a single file and push if not too recent.
 pub(super) fn scan_single_file(path: &Path, out: &mut Vec<(String, u64, u64)>) {
     if let Ok(meta) = fs::metadata(path) {
-        let mtime = meta.modified()
+        let mtime = meta
+            .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
@@ -169,15 +174,27 @@ fn try_background_reindex(
         let projects_dir = root.join("projects");
         if projects_dir.exists() {
             index_directory_standalone(
-                &projects_dir, account_name, fields,
-                &mut writer, &mut meta, &mut indexed_files, &mut indexed_docs, &mut skipped,
+                &projects_dir,
+                account_name,
+                fields,
+                &mut writer,
+                &mut meta,
+                &mut indexed_files,
+                &mut indexed_docs,
+                &mut skipped,
             )?;
         }
         let history = root.join("history.jsonl");
         if history.exists() {
             index_history_standalone(
-                &history, account_name, fields,
-                &mut writer, &mut meta, &mut indexed_files, &mut indexed_docs, &mut skipped,
+                &history,
+                account_name,
+                fields,
+                &mut writer,
+                &mut meta,
+                &mut indexed_files,
+                &mut indexed_docs,
+                &mut skipped,
             )?;
         }
     }
@@ -186,15 +203,25 @@ fn try_background_reindex(
         let sessions_dir = codex_root.join("sessions");
         if sessions_dir.exists() {
             index_codex_directory_standalone(
-                &sessions_dir, fields,
-                &mut writer, &mut meta, &mut indexed_files, &mut indexed_docs, &mut skipped,
+                &sessions_dir,
+                fields,
+                &mut writer,
+                &mut meta,
+                &mut indexed_files,
+                &mut indexed_docs,
+                &mut skipped,
             )?;
         }
         let history = codex_root.join("history.jsonl");
         if history.exists() {
             index_codex_history_standalone(
-                &history, fields,
-                &mut writer, &mut meta, &mut indexed_files, &mut indexed_docs, &mut skipped,
+                &history,
+                fields,
+                &mut writer,
+                &mut meta,
+                &mut indexed_files,
+                &mut indexed_docs,
+                &mut skipped,
             )?;
         }
     }
@@ -204,7 +231,8 @@ fn try_background_reindex(
     let current_paths: std::collections::HashSet<String> =
         current_files.iter().map(|(p, _, _)| p.clone()).collect();
     let mut purged = 0u64;
-    let stale_paths: Vec<String> = meta.keys()
+    let stale_paths: Vec<String> = meta
+        .keys()
         .filter(|p| !current_paths.contains(p.as_str()))
         .cloned()
         .collect();
@@ -226,7 +254,10 @@ fn try_background_reindex(
 
     tracing::info!(
         "auto-reindex: indexed {} files ({} docs), skipped {} unchanged, purged {} deleted",
-        indexed_files, indexed_docs, skipped, purged
+        indexed_files,
+        indexed_docs,
+        skipped,
+        purged
     );
     Ok(())
 }
@@ -241,7 +272,10 @@ pub fn spawn_reindex_thread(
     std::thread::Builder::new()
         .name("blackbox-reindex".into())
         .spawn(move || {
-            tracing::info!("background reindex thread started (interval: {:?})", interval);
+            tracing::info!(
+                "background reindex thread started (interval: {:?})",
+                interval
+            );
             // First tick fires after a short delay to let the MCP handshake complete
             std::thread::sleep(Duration::from_secs(5));
             loop {
@@ -272,7 +306,14 @@ pub(super) fn event_to_doc_standalone(
     doc.add_text(f.role, event.role.as_ref());
     doc.add_text(f.file_path, file_path);
     doc.add_u64(f.byte_offset, byte_offset);
-    doc.add_u64(f.is_subagent, if event.is_subagent || is_subagent { 1 } else { 0 });
+    doc.add_u64(
+        f.is_subagent,
+        if event.is_subagent || is_subagent {
+            1
+        } else {
+            0
+        },
+    );
     if let Some(ref ts) = event.timestamp {
         doc.add_text(f.timestamp, ts);
     }
@@ -286,7 +327,9 @@ pub(super) fn event_to_doc_standalone(
 }
 
 pub(super) fn should_skip_file(
-    path_str: &str, mtime: u64, size: u64,
+    path_str: &str,
+    mtime: u64,
+    size: u64,
     meta: &HashMap<String, FileMeta>,
 ) -> bool {
     if let Some(prev) = meta.get(path_str) {
@@ -310,12 +353,21 @@ pub(super) fn index_directory_standalone(
     indexed_docs: &mut u64,
     skipped: &mut u64,
 ) -> Result<()> {
-    for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         let path = entry.path();
-        if path.extension().map(|e| e != "jsonl").unwrap_or(true) { continue; }
+        if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+            continue;
+        }
 
         let path_str = path.to_string_lossy().to_string();
-        let file_meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+        let file_meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
         let mtime = match file_meta.modified() {
             Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             Err(_) => continue,
@@ -332,12 +384,18 @@ pub(super) fn index_directory_standalone(
         let is_subagent = path_str.contains("/subagents/");
         let project = extract_project_from_path(path, dir);
 
-        let file = match fs::File::open(path) { Ok(f) => f, Err(_) => continue };
+        let file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
         let reader = BufReader::new(file);
         let mut offset = 0u64;
 
         for line in reader.lines() {
-            let line = match line { Ok(l) => l, Err(_) => continue };
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
             let line_offset = offset;
             offset += line.len() as u64 + 1;
 
@@ -354,15 +412,27 @@ pub(super) fn index_directory_standalone(
                 doc.add_text(f.file_path, &path_str);
                 doc.add_u64(f.byte_offset, line_offset);
                 doc.add_u64(f.is_subagent, if is_sub { 1 } else { 0 });
-                if let Some(ref ts) = event.timestamp { doc.add_text(f.timestamp, ts); }
-                if let Some(ref branch) = event.git_branch { doc.add_text(f.git_branch, branch); }
-                if let Some(ref slug) = event.agent_slug { doc.add_text(f.agent_slug, slug); }
+                if let Some(ref ts) = event.timestamp {
+                    doc.add_text(f.timestamp, ts);
+                }
+                if let Some(ref branch) = event.git_branch {
+                    doc.add_text(f.git_branch, branch);
+                }
+                if let Some(ref slug) = event.agent_slug {
+                    doc.add_text(f.agent_slug, slug);
+                }
                 writer.add_document(doc)?;
                 *indexed_docs += 1;
             }
         }
 
-        meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
+        meta.insert(
+            path_str,
+            FileMeta {
+                mtime,
+                size: file_meta.len(),
+            },
+        );
         *indexed_files += 1;
         if (*indexed_files).is_multiple_of(500) {
             tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);
@@ -399,16 +469,26 @@ pub(super) fn index_history_standalone(
     let reader = BufReader::new(file);
     let mut offset = 0u64;
     for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => continue };
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
         let line_offset = offset;
         offset += line.len() as u64 + 1;
         for event in parser::parse_history_line(&line) {
-            let doc = event_to_doc_standalone(&event, account_name, &path_str, line_offset, false, f);
+            let doc =
+                event_to_doc_standalone(&event, account_name, &path_str, line_offset, false, f);
             writer.add_document(doc)?;
             *indexed_docs += 1;
         }
     }
-    meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
+    meta.insert(
+        path_str,
+        FileMeta {
+            mtime,
+            size: file_meta.len(),
+        },
+    );
     *indexed_files += 1;
     Ok(())
 }
@@ -422,12 +502,21 @@ pub(super) fn index_codex_directory_standalone(
     indexed_docs: &mut u64,
     skipped: &mut u64,
 ) -> Result<()> {
-    for entry in WalkDir::new(sessions_dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(sessions_dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         let path = entry.path();
-        if path.extension().map(|e| e != "jsonl").unwrap_or(true) { continue; }
+        if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+            continue;
+        }
 
         let path_str = path.to_string_lossy().to_string();
-        let file_meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+        let file_meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
         let mtime = match file_meta.modified() {
             Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             Err(_) => continue,
@@ -444,23 +533,38 @@ pub(super) fn index_codex_directory_standalone(
         let session_id = extract_codex_session_id(path);
         let cwd = extract_codex_cwd(path);
 
-        let file = match fs::File::open(path) { Ok(fl) => fl, Err(_) => continue };
+        let file = match fs::File::open(path) {
+            Ok(fl) => fl,
+            Err(_) => continue,
+        };
         let reader = BufReader::new(file);
         let mut offset = 0u64;
 
         for line in reader.lines() {
-            let line = match line { Ok(l) => l, Err(_) => continue };
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
             let line_offset = offset;
             offset += line.len() as u64 + 1;
             for mut event in parser::parse_codex_line(&line, &session_id) {
-                if event.cwd.is_none() { event.cwd = cwd.clone(); }
-                let doc = event_to_doc_standalone(&event, "codex", &path_str, line_offset, false, f);
+                if event.cwd.is_none() {
+                    event.cwd = cwd.clone();
+                }
+                let doc =
+                    event_to_doc_standalone(&event, "codex", &path_str, line_offset, false, f);
                 writer.add_document(doc)?;
                 *indexed_docs += 1;
             }
         }
 
-        meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
+        meta.insert(
+            path_str,
+            FileMeta {
+                mtime,
+                size: file_meta.len(),
+            },
+        );
         *indexed_files += 1;
         if (*indexed_files).is_multiple_of(500) {
             tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);
@@ -495,7 +599,10 @@ pub(super) fn index_codex_history_standalone(
     let reader = BufReader::new(file);
     let mut offset = 0u64;
     for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => continue };
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
         let line_offset = offset;
         offset += line.len() as u64 + 1;
         for event in parser::parse_codex_history_line(&line) {
@@ -504,7 +611,13 @@ pub(super) fn index_codex_history_standalone(
             *indexed_docs += 1;
         }
     }
-    meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
+    meta.insert(
+        path_str,
+        FileMeta {
+            mtime,
+            size: file_meta.len(),
+        },
+    );
     *indexed_files += 1;
     Ok(())
 }

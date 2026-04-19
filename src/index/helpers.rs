@@ -6,15 +6,13 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::parser;
 use super::ReindexConfig;
+use crate::parser;
 
 /// Extract a human-readable project name from the file path.
 /// Claude Code encodes project paths as directory names: `/home/user/repos/foo` → `-home-user-repos-foo`
 pub(super) fn extract_project_from_path(file_path: &Path, projects_root: &Path) -> String {
-    let relative = file_path
-        .strip_prefix(projects_root)
-        .unwrap_or(file_path);
+    let relative = file_path.strip_prefix(projects_root).unwrap_or(file_path);
 
     // First path component is the encoded project dir
     if let Some(first) = relative.components().next() {
@@ -46,7 +44,9 @@ pub fn find_session_file(
     let claude_filename = format!("{session_id}.jsonl");
     for (_account, root) in roots {
         let projects_dir = root.join("projects");
-        if !projects_dir.exists() { continue; }
+        if !projects_dir.exists() {
+            continue;
+        }
         for entry in WalkDir::new(&projects_dir)
             .follow_links(true)
             .max_depth(3)
@@ -71,8 +71,13 @@ pub fn find_session_file(
                 .filter_map(|e| e.ok())
             {
                 let p = entry.path();
-                if p.extension().map(|e| e != "jsonl").unwrap_or(true) { continue; }
-                let name = p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                if p.extension().map(|e| e != "jsonl").unwrap_or(true) {
+                    continue;
+                }
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 if name.contains(session_id) {
                     return Some(p.to_path_buf());
                 }
@@ -94,8 +99,13 @@ pub fn find_session_file(
                 .filter_map(|e| e.ok())
             {
                 let p = entry.path();
-                if p.extension().map(|e| e != "json").unwrap_or(true) { continue; }
-                let name = p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                if p.extension().map(|e| e != "json").unwrap_or(true) {
+                    continue;
+                }
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 if name.starts_with("session-") && name.ends_with(&needle) {
                     return Some(p.to_path_buf());
                 }
@@ -215,7 +225,9 @@ pub(super) fn extract_codex_first_prompt(path: &Path) -> String {
                             let t = text.trim();
                             if t.len() > 120 {
                                 let mut end = 120;
-                                while end > 0 && !t.is_char_boundary(end) { end -= 1; }
+                                while end > 0 && !t.is_char_boundary(end) {
+                                    end -= 1;
+                                }
                                 return format!("{}...", &t[..end]);
                             }
                             return t.to_string();
@@ -227,8 +239,6 @@ pub(super) fn extract_codex_first_prompt(path: &Path) -> String {
     }
     String::new()
 }
-
-
 
 /// Detect the caller's session by finding the most recently modified transcript
 /// whose tail contains the search query in a user message. Provider-agnostic.
@@ -247,8 +257,12 @@ pub(super) fn detect_caller_session(config: &ReindexConfig, query: &str) -> Opti
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
-            if !p.extension().map(|e| e == "jsonl").unwrap_or(false) { continue; }
-            if p.to_string_lossy().contains("/subagents/") { continue; }
+            if !p.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                continue;
+            }
+            if p.to_string_lossy().contains("/subagents/") {
+                continue;
+            }
             if let Ok(meta) = entry.metadata() {
                 if let Ok(mtime) = meta.modified() {
                     if let Ok(age) = now.duration_since(mtime) {
@@ -263,11 +277,15 @@ pub(super) fn detect_caller_session(config: &ReindexConfig, query: &str) -> Opti
 
     for (_name, root) in &config.roots {
         let projects_dir = root.join("projects");
-        if projects_dir.exists() { scan(&projects_dir, &mut recent); }
+        if projects_dir.exists() {
+            scan(&projects_dir, &mut recent);
+        }
     }
     if let Some(ref codex_root) = config.codex_root {
         let sessions_dir = codex_root.join("sessions");
-        if sessions_dir.exists() { scan(&sessions_dir, &mut recent); }
+        if sessions_dir.exists() {
+            scan(&sessions_dir, &mut recent);
+        }
     }
 
     // Most recently modified first
@@ -443,7 +461,9 @@ pub(super) fn looks_like_uuid(s: &str) -> bool {
 
 /// Shorten a project path for display: /home/user/repos/foo -> foo
 pub(super) fn shorten_project(path: &str) -> String {
-    if path.is_empty() { return String::new(); }
+    if path.is_empty() {
+        return String::new();
+    }
     Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -451,7 +471,8 @@ pub(super) fn shorten_project(path: &str) -> String {
 }
 
 pub(super) fn is_stop_word(w: &str) -> bool {
-    matches!(w,
+    matches!(
+        w,
         // Determiners, pronouns, prepositions, conjunctions
         "the" | "a" | "an" | "and" | "or" | "but" | "in" | "on" | "at" | "to" | "for"
         | "of" | "with" | "by" | "from" | "as" | "into" | "about" | "between" | "through"
@@ -518,8 +539,13 @@ mod tests {
     #[test]
     fn test_extract_project_from_path() {
         let root = Path::new("/home/user/.claude/projects");
-        let path = Path::new("/home/user/.claude/projects/-home-user-repos-my-cool-app/transcripts/abc.jsonl");
-        assert_eq!(extract_project_from_path(path, root), "-home-user-repos-my-cool-app");
+        let path = Path::new(
+            "/home/user/.claude/projects/-home-user-repos-my-cool-app/transcripts/abc.jsonl",
+        );
+        assert_eq!(
+            extract_project_from_path(path, root),
+            "-home-user-repos-my-cool-app"
+        );
 
         let path2 = Path::new("some/other/path/foo.jsonl");
         assert_eq!(extract_project_from_path(path2, root), "some");
@@ -527,8 +553,12 @@ mod tests {
 
     #[test]
     fn test_extract_codex_session_id() {
-        let p1 = Path::new("rollout-2026-04-12T13-09-35-019d8319-6ffe-78b0-904b-4bfdb2a9cdb5.jsonl");
-        assert_eq!(extract_codex_session_id(p1), "019d8319-6ffe-78b0-904b-4bfdb2a9cdb5");
+        let p1 =
+            Path::new("rollout-2026-04-12T13-09-35-019d8319-6ffe-78b0-904b-4bfdb2a9cdb5.jsonl");
+        assert_eq!(
+            extract_codex_session_id(p1),
+            "019d8319-6ffe-78b0-904b-4bfdb2a9cdb5"
+        );
 
         let p2 = Path::new("not-matching-format.jsonl");
         assert_eq!(extract_codex_session_id(p2), "not-matching-format");

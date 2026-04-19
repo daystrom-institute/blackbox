@@ -18,7 +18,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -27,9 +27,9 @@ use serde::Deserialize;
 #[path = "parser.rs"]
 mod parser;
 use parser::{
-    parse_codex_line_rich, parse_copilot_line_rich, parse_gemini_file_rich,
-    parse_transcript_line_rich, parse_vibe_line_rich, EventDetail, MessageRole,
-    SystemSignalKind, TranscriptEvent,
+    EventDetail, MessageRole, SystemSignalKind, TranscriptEvent, parse_codex_line_rich,
+    parse_copilot_line_rich, parse_gemini_file_rich, parse_transcript_line_rich,
+    parse_vibe_line_rich,
 };
 
 // ── Roster fetch ────────────────────────────────────────────────────
@@ -41,7 +41,8 @@ struct RosterEntry {
     provider: String,
     session_id: Option<String>,
     jsonl_path: Option<String>,
-    #[allow(dead_code)] brofile: String,
+    #[allow(dead_code)]
+    brofile: String,
     model: Option<String>,
 }
 
@@ -65,11 +66,38 @@ struct TailSelectors {
 /// Event pushed from the async SSE task into the sync TUI loop.
 #[derive(Debug, Clone)]
 enum LaneSignal {
-    TaskStarted   { bro: Option<String>, session_id: Option<String>, task_id: String },
-    TaskProgress  { bro: Option<String>, session_id: Option<String>, task_id: String, snippet: String },
-    TaskCompleted { bro: Option<String>, session_id: Option<String>, task_id: String },
-    TaskFailed    { bro: Option<String>, session_id: Option<String>, task_id: String, error: String },
-    TaskCancelled { bro: Option<String>, session_id: Option<String>, task_id: String },
+    TaskStarted {
+        bro: Option<String>,
+        session_id: Option<String>,
+        jsonl_path: Option<String>,
+        task_id: String,
+    },
+    TaskProgress {
+        bro: Option<String>,
+        session_id: Option<String>,
+        jsonl_path: Option<String>,
+        task_id: String,
+        snippet: String,
+    },
+    TaskCompleted {
+        bro: Option<String>,
+        session_id: Option<String>,
+        jsonl_path: Option<String>,
+        task_id: String,
+    },
+    TaskFailed {
+        bro: Option<String>,
+        session_id: Option<String>,
+        jsonl_path: Option<String>,
+        task_id: String,
+        error: String,
+    },
+    TaskCancelled {
+        bro: Option<String>,
+        session_id: Option<String>,
+        jsonl_path: Option<String>,
+        task_id: String,
+    },
 }
 
 async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
@@ -78,10 +106,18 @@ async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
         .unwrap_or_else(|_| "7264".into());
     let mut url = format!("http://127.0.0.1:{port}/tail");
     let mut params = Vec::new();
-    if !sel.bros.is_empty()      { params.push(format!("bros={}",      sel.bros.join(","))); }
-    if !sel.teams.is_empty()     { params.push(format!("teams={}",     sel.teams.join(","))); }
-    if !sel.sessions.is_empty()  { params.push(format!("sessions={}",  sel.sessions.join(","))); }
-    if !sel.providers.is_empty() { params.push(format!("providers={}", sel.providers.join(","))); }
+    if !sel.bros.is_empty() {
+        params.push(format!("bros={}", sel.bros.join(",")));
+    }
+    if !sel.teams.is_empty() {
+        params.push(format!("teams={}", sel.teams.join(",")));
+    }
+    if !sel.sessions.is_empty() {
+        params.push(format!("sessions={}", sel.sessions.join(",")));
+    }
+    if !sel.providers.is_empty() {
+        params.push(format!("providers={}", sel.providers.join(",")));
+    }
     if !params.is_empty() {
         url.push('?');
         url.push_str(&params.join("&"));
@@ -91,11 +127,22 @@ async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
     loop {
         let client = match reqwest::Client::builder().build() {
             Ok(c) => c,
-            Err(_) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
         };
-        let resp = match client.get(&url).header("Accept", "text/event-stream").send().await {
+        let resp = match client
+            .get(&url)
+            .header("Accept", "text/event-stream")
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => r,
-            _ => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
+            _ => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
         };
 
         use futures::StreamExt;
@@ -115,10 +162,14 @@ async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
                         payload.push_str(rest.trim_start());
                     }
                 }
-                if payload.is_empty() { continue; }
+                if payload.is_empty() {
+                    continue;
+                }
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
                     if let Some(signal) = parse_lane_signal(&value) {
-                        if tx.send(signal).is_err() { return; }
+                        if tx.send(signal).is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -131,20 +182,62 @@ async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
 fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
     let task_id = v.get("task_id")?.as_str()?.to_string();
     let bro = v.get("bro_name").and_then(|x| x.as_str()).map(String::from);
-    let session_id = v.get("session_id").and_then(|x| x.as_str()).map(String::from);
+    let session_id = v
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .map(String::from);
+    let jsonl_path = v
+        .get("jsonl_path")
+        .and_then(|x| x.as_str())
+        .map(String::from);
     let kind = v.get("type").and_then(|x| x.as_str())?;
     match kind {
-        "task_started"   => Some(LaneSignal::TaskStarted   { bro, session_id, task_id }),
-        "task_progress"  => {
-            let snippet = v.get("activity").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            Some(LaneSignal::TaskProgress { bro, session_id, task_id, snippet })
+        "task_started" => Some(LaneSignal::TaskStarted {
+            bro,
+            session_id,
+            jsonl_path,
+            task_id,
+        }),
+        "task_progress" => {
+            let snippet = v
+                .get("activity")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(LaneSignal::TaskProgress {
+                bro,
+                session_id,
+                jsonl_path,
+                task_id,
+                snippet,
+            })
         }
-        "task_completed" => Some(LaneSignal::TaskCompleted { bro, session_id, task_id }),
-        "task_failed"    => {
-            let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            Some(LaneSignal::TaskFailed { bro, session_id, task_id, error })
+        "task_completed" => Some(LaneSignal::TaskCompleted {
+            bro,
+            session_id,
+            jsonl_path,
+            task_id,
+        }),
+        "task_failed" => {
+            let error = v
+                .get("error")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(LaneSignal::TaskFailed {
+                bro,
+                session_id,
+                jsonl_path,
+                task_id,
+                error,
+            })
         }
-        "task_cancelled" => Some(LaneSignal::TaskCancelled { bro, session_id, task_id }),
+        "task_cancelled" => Some(LaneSignal::TaskCancelled {
+            bro,
+            session_id,
+            jsonl_path,
+            task_id,
+        }),
         _ => None,
     }
 }
@@ -155,10 +248,18 @@ async fn fetch_roster(sel: TailSelectors) -> anyhow::Result<Vec<RosterEntry>> {
         .unwrap_or_else(|_| "7264".into());
     let mut url = format!("http://127.0.0.1:{port}/roster");
     let mut params = Vec::new();
-    if !sel.bros.is_empty()      { params.push(format!("bros={}",      sel.bros.join(","))); }
-    if !sel.teams.is_empty()     { params.push(format!("teams={}",     sel.teams.join(","))); }
-    if !sel.sessions.is_empty()  { params.push(format!("sessions={}",  sel.sessions.join(","))); }
-    if !sel.providers.is_empty() { params.push(format!("providers={}", sel.providers.join(","))); }
+    if !sel.bros.is_empty() {
+        params.push(format!("bros={}", sel.bros.join(",")));
+    }
+    if !sel.teams.is_empty() {
+        params.push(format!("teams={}", sel.teams.join(",")));
+    }
+    if !sel.sessions.is_empty() {
+        params.push(format!("sessions={}", sel.sessions.join(",")));
+    }
+    if !sel.providers.is_empty() {
+        params.push(format!("providers={}", sel.providers.join(",")));
+    }
     if !params.is_empty() {
         url.push('?');
         url.push_str(&params.join("&"));
@@ -265,12 +366,15 @@ impl Lane {
     }
 
     fn apply_signal(&mut self, sig: &LaneSignal) {
+        self.attach_from_signal(sig);
         match sig {
             LaneSignal::TaskStarted { task_id, .. } => {
                 self.active_tasks.insert(task_id.clone());
                 self.last_failure = None;
             }
-            LaneSignal::TaskProgress { task_id, snippet, .. } => {
+            LaneSignal::TaskProgress {
+                task_id, snippet, ..
+            } => {
                 self.active_tasks.insert(task_id.clone());
                 self.last_progress_at = Some(Instant::now());
                 if !snippet.is_empty() {
@@ -290,8 +394,60 @@ impl Lane {
         }
     }
 
+    fn attach_from_signal(&mut self, sig: &LaneSignal) {
+        let (session_id, jsonl_path) = match sig {
+            LaneSignal::TaskStarted {
+                session_id,
+                jsonl_path,
+                ..
+            }
+            | LaneSignal::TaskProgress {
+                session_id,
+                jsonl_path,
+                ..
+            }
+            | LaneSignal::TaskCompleted {
+                session_id,
+                jsonl_path,
+                ..
+            }
+            | LaneSignal::TaskFailed {
+                session_id,
+                jsonl_path,
+                ..
+            }
+            | LaneSignal::TaskCancelled {
+                session_id,
+                jsonl_path,
+                ..
+            } => (session_id.as_deref(), jsonl_path.as_deref()),
+        };
+
+        if self.session_id.is_none() {
+            if let Some(sid) = session_id {
+                self.session_id = Some(sid.to_string());
+            }
+        }
+        if self.jsonl_path.is_none() {
+            if let Some(path) = jsonl_path {
+                self.jsonl_path = Some(PathBuf::from(path));
+            }
+        }
+        if self.status != LaneStatus::Tailing
+            && self.session_id.is_some()
+            && self.jsonl_path.is_some()
+        {
+            self.status = LaneStatus::Tailing;
+            if self.events.is_empty() {
+                self.seed();
+            }
+        }
+    }
+
     fn seed(&mut self) {
-        let Some(path) = self.jsonl_path.clone() else { return };
+        let Some(path) = self.jsonl_path.clone() else {
+            return;
+        };
         if self.provider == "gemini" {
             self.seed_gemini(&path);
         } else {
@@ -353,7 +509,9 @@ impl Lane {
     }
 
     fn poll(&mut self) -> bool {
-        let Some(path) = self.jsonl_path.clone() else { return false };
+        let Some(path) = self.jsonl_path.clone() else {
+            return false;
+        };
         if self.provider == "gemini" {
             self.poll_gemini(&path)
         } else {
@@ -362,7 +520,9 @@ impl Lane {
     }
 
     fn poll_jsonl(&mut self, path: &Path) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else { return false };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
         if meta.len() <= self.file_offset {
             return false;
         }
@@ -370,7 +530,9 @@ impl Lane {
             // Truncation / rotation.
             self.file_offset = 0;
         }
-        let Ok(mut file) = std::fs::File::open(path) else { return false };
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
         if file.seek(SeekFrom::Start(self.file_offset)).is_err() {
             return false;
         }
@@ -401,12 +563,16 @@ impl Lane {
     }
 
     fn poll_gemini(&mut self, path: &Path) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else { return false };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
         let mtime = meta.modified().ok();
         if mtime == self.file_mtime {
             return false;
         }
-        let Ok(raw) = std::fs::read_to_string(path) else { return false };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return false;
+        };
         self.file_mtime = mtime;
         let parsed = parse_gemini_file_rich(&raw);
         let mut added = false;
@@ -418,7 +584,9 @@ impl Lane {
         let mut current_id: Option<String> = None;
         let mut keep_group = false;
         for ev in parsed {
-            let Some(id) = ev.parent_tool_use_id.as_ref().cloned() else { continue };
+            let Some(id) = ev.parent_tool_use_id.as_ref().cloned() else {
+                continue;
+            };
             if current_id.as_ref() != Some(&id) {
                 current_id = Some(id.clone());
                 keep_group = self.seen_ids.insert(id);
@@ -500,7 +668,9 @@ fn parse_tail_args(args: &[String]) -> TailSelectors {
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1] != "tail" {
-        eprintln!("Usage: bro tail [BROS...] [--team NAME]... [--bro NAME]... [--session ID]... [--provider NAME]...");
+        eprintln!(
+            "Usage: bro tail [BROS...] [--team NAME]... [--bro NAME]... [--session ID]... [--provider NAME]..."
+        );
         eprintln!();
         eprintln!("Selectors are unioned. Each flag is repeatable.");
         eprintln!();
@@ -601,17 +771,31 @@ fn run_tui(mut app: App, signals: mpsc::Receiver<LaneSignal>) -> anyhow::Result<
     })();
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     result
 }
 
 fn dispatch_signal(app: &mut App, sig: LaneSignal) {
     let (bro, session_id) = match &sig {
-        LaneSignal::TaskStarted   { bro, session_id, .. }
-        | LaneSignal::TaskProgress  { bro, session_id, .. }
-        | LaneSignal::TaskCompleted { bro, session_id, .. }
-        | LaneSignal::TaskFailed    { bro, session_id, .. }
-        | LaneSignal::TaskCancelled { bro, session_id, .. } => (bro.as_deref(), session_id.as_deref()),
+        LaneSignal::TaskStarted {
+            bro, session_id, ..
+        }
+        | LaneSignal::TaskProgress {
+            bro, session_id, ..
+        }
+        | LaneSignal::TaskCompleted {
+            bro, session_id, ..
+        }
+        | LaneSignal::TaskFailed {
+            bro, session_id, ..
+        }
+        | LaneSignal::TaskCancelled {
+            bro, session_id, ..
+        } => (bro.as_deref(), session_id.as_deref()),
     };
     for lane in &mut app.lanes {
         if lane.matches_signal(bro, session_id) {
@@ -739,7 +923,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
         KeyCode::Tab => app.selected = (app.selected + 1) % n,
         KeyCode::BackTab => {
-            app.selected = if app.selected == 0 { n - 1 } else { app.selected - 1 };
+            app.selected = if app.selected == 0 {
+                n - 1
+            } else {
+                app.selected - 1
+            };
         }
         KeyCode::Char('f') => app.fullscreen = !app.fullscreen,
         KeyCode::Char('a') => app.fullscreen = false,
@@ -785,7 +973,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
         .split(area);
     draw_tab_strip(f, chunks[0], app);
     app.body_y_range = (chunks[1].y, chunks[1].y.saturating_add(chunks[1].height));
@@ -800,7 +992,11 @@ fn draw_tab_strip(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .flat_map(|(i, l)| {
             let selected = i == app.selected;
-            let bg = if selected { Color::DarkGray } else { Color::Reset };
+            let bg = if selected {
+                Color::DarkGray
+            } else {
+                Color::Reset
+            };
             let fg = provider_color(&l.provider);
             let marker = if selected { "▸" } else { " " };
             vec![
@@ -870,7 +1066,11 @@ fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
         .split(inner);
 
     // Header
@@ -891,9 +1091,15 @@ fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u
         Span::styled(model.to_string(), Style::default().fg(Color::White)),
     ]);
     let header_line2 = Line::from(vec![
-        Span::styled(format!("team {}", lane.team), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("team {}", lane.team),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw(" • "),
-        Span::styled(format!("session {sid}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("session {sid}"),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     let header_block = Block::default()
         .borders(Borders::BOTTOM)
@@ -970,7 +1176,11 @@ fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let n = app.lanes.len();
-    let selected = app.lanes.get(app.selected).map(|l| l.bro.as_str()).unwrap_or("-");
+    let selected = app
+        .lanes
+        .get(app.selected)
+        .map(|l| l.bro.as_str())
+        .unwrap_or("-");
     let mode = if app.fullscreen { "FULL" } else { "SPLIT" };
     let help = "click:lane • drag:resize • wheel:scroll • Tab • f full • G live • g top • q quit";
     let line = format!(" bro tail • {n} lanes • {mode}:{selected}   {help}");
@@ -1029,14 +1239,22 @@ fn activity_badge(lane: &Lane) -> Span<'static> {
         .unwrap_or(false);
     if fresh {
         let bright = phase_now(400) < 200;
-        let color = if bright { Color::Green } else { Color::DarkGray };
+        let color = if bright {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
         return Span::styled(
             " ● streaming ",
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         );
     }
     let bright = phase_now(1200) < 600;
-    let color = if bright { Color::Green } else { Color::DarkGray };
+    let color = if bright {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
     Span::styled(" ○ running ", Style::default().fg(color))
 }
 
@@ -1057,7 +1275,8 @@ fn snippet_line(lane: &Lane) -> Line<'static> {
     }
     let snippet = lane.last_progress_snippet.as_deref().unwrap_or("…");
     // Collapse whitespace so multi-line streaming text still fits a single row.
-    let flat: String = snippet.chars()
+    let flat: String = snippet
+        .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect();
     Line::from(Span::styled(
@@ -1109,8 +1328,7 @@ fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ))];
             let md = tui_markdown::from_str(text);
-            let owned: Vec<Line<'static>> =
-                md.lines.into_iter().map(line_into_owned).collect();
+            let owned: Vec<Line<'static>> = md.lines.into_iter().map(line_into_owned).collect();
             lines.extend(stitch_ordered_list_markers(owned));
             lines
         }
@@ -1131,11 +1349,15 @@ fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
             vec![Line::from(vec![
                 Span::styled(
                     "⚙ ",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     name.clone(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(target.clone(), Style::default().fg(Color::White)),
@@ -1150,18 +1372,13 @@ fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
         } => {
             let bad = *is_error || exit_code.is_some_and(|c| c != 0);
             let color = if bad { Color::Red } else { Color::Green };
-            let exit_str = exit_code
-                .map(|c| format!(" exit={c}"))
-                .unwrap_or_default();
+            let exit_str = exit_code.map(|c| format!(" exit={c}")).unwrap_or_default();
             vec![Line::from(vec![
                 Span::styled(
                     "↳ ",
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("{}B{}", size, exit_str),
-                    Style::default().fg(color),
-                ),
+                Span::styled(format!("{}B{}", size, exit_str), Style::default().fg(color)),
                 Span::raw("  "),
                 Span::styled(preview.clone(), Style::default().fg(Color::DarkGray)),
             ])]
@@ -1183,7 +1400,9 @@ fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
             vec![Line::from(vec![
                 Span::styled(
                     format!("── {} ── ", label),
-                    Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(head.to_string(), Style::default().fg(Color::LightYellow)),
             ])]
@@ -1209,7 +1428,9 @@ fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
     // like.
     let mut line_style = convert_core_style(line.style);
     let mut iter = line.spans.into_iter().peekable();
-    let is_heading = iter.peek().is_some_and(|s| is_heading_marker_span(&s.content));
+    let is_heading = iter
+        .peek()
+        .is_some_and(|s| is_heading_marker_span(&s.content));
     if is_heading {
         let _ = iter.next();
         // ANSI Cyan is often indistinct under dark terminal themes; add
@@ -1240,7 +1461,9 @@ fn is_ordered_list_marker_only(line: &Line<'_>) -> bool {
     if t.is_empty() {
         return false;
     }
-    let Some(dot_pos) = t.find('.') else { return false };
+    let Some(dot_pos) = t.find('.') else {
+        return false;
+    };
     if dot_pos == 0 || dot_pos != t.len() - 1 {
         return false;
     }
@@ -1269,8 +1492,12 @@ fn stitch_ordered_list_markers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> 
 
 fn convert_core_style(s: ratatui_core::style::Style) -> Style {
     let mut out = Style::default();
-    if let Some(fg) = s.fg { out = out.fg(convert_core_color(fg)); }
-    if let Some(bg) = s.bg { out = out.bg(convert_core_color(bg)); }
+    if let Some(fg) = s.fg {
+        out = out.fg(convert_core_color(fg));
+    }
+    if let Some(bg) = s.bg {
+        out = out.bg(convert_core_color(bg));
+    }
     out = out.add_modifier(Modifier::from_bits_truncate(s.add_modifier.bits()));
     out = out.remove_modifier(Modifier::from_bits_truncate(s.sub_modifier.bits()));
     out

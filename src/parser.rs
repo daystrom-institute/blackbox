@@ -5,8 +5,7 @@ use serde_json::Value;
 /// fixed set; parsers that encounter a role outside this set return no
 /// event rather than inventing one.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash,
-    strum::EnumString, strum::AsRefStr, strum::Display,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumString, strum::AsRefStr, strum::Display,
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum MessageRole {
@@ -61,8 +60,12 @@ pub struct TranscriptEvent {
 
 #[derive(Debug, Clone)]
 pub enum EventDetail {
-    Text { text: String },
-    Thinking { text: String },
+    Text {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
     ToolUse {
         name: String,
         target: String,
@@ -107,7 +110,11 @@ impl TranscriptEvent {
                 let input_str = serde_json::to_string(input).unwrap_or_default();
                 format!("tool:{} {}", name, truncate(&input_str))
             }
-            EventDetail::ToolResult { tool_use_id, preview, .. } => {
+            EventDetail::ToolResult {
+                tool_use_id,
+                preview,
+                ..
+            } => {
                 format!("result:{} {}", tool_use_id, truncate(preview))
             }
             EventDetail::SystemSignal { .. } => return None,
@@ -200,7 +207,9 @@ fn oneline_snippet(s: &str, max_chars: usize) -> String {
 fn extract_exit_code(text: &str) -> Option<i32> {
     // Match "exit code <N>", "exit_code=<N>", "(exit code <N>)"
     let lower = text.to_ascii_lowercase();
-    let marker = lower.find("exit code").or_else(|| lower.find("exit_code"))?;
+    let marker = lower
+        .find("exit code")
+        .or_else(|| lower.find("exit_code"))?;
     let rest = &lower[marker..];
     let digits: String = rest
         .chars()
@@ -261,7 +270,10 @@ pub fn parse_transcript_line_rich(line: &str) -> Vec<TranscriptEvent> {
         session_id: v["sessionId"].as_str().unwrap_or("").to_string(),
         timestamp: v["timestamp"].as_str().map(String::from),
         git_branch: v["gitBranch"].as_str().map(String::from),
-        is_subagent: v.get("isSidechain").and_then(|x| x.as_bool()).unwrap_or(false)
+        is_subagent: v
+            .get("isSidechain")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false)
             || v.get("agentId").is_some(),
         agent_slug: v["slug"].as_str().map(String::from),
         cwd: v["cwd"].as_str().map(String::from),
@@ -275,7 +287,10 @@ pub fn parse_transcript_line_rich(line: &str) -> Vec<TranscriptEvent> {
             MessageRole::Developer,
             EventDetail::SystemSignal {
                 kind: SystemSignalKind::Compaction,
-                summary: v["summary"].as_str().unwrap_or("context compacted").to_string(),
+                summary: v["summary"]
+                    .as_str()
+                    .unwrap_or("context compacted")
+                    .to_string(),
             },
             &base,
         )],
@@ -289,11 +304,18 @@ fn parse_user_message_rich(message: &Value, base: &RichBase) -> Vec<TranscriptEv
             if let Some(kind) = detect_user_signal(s) {
                 return vec![make_rich(
                     MessageRole::User,
-                    EventDetail::SystemSignal { kind, summary: s.clone() },
+                    EventDetail::SystemSignal {
+                        kind,
+                        summary: s.clone(),
+                    },
                     base,
                 )];
             }
-            vec![make_rich(MessageRole::User, EventDetail::Text { text: s.clone() }, base)]
+            vec![make_rich(
+                MessageRole::User,
+                EventDetail::Text { text: s.clone() },
+                base,
+            )]
         }
         Value::Array(blocks) => {
             let mut out = Vec::new();
@@ -305,7 +327,10 @@ fn parse_user_message_rich(message: &Value, base: &RichBase) -> Vec<TranscriptEv
                                 if let Some(kind) = detect_user_signal(text) {
                                     out.push(make_rich(
                                         MessageRole::User,
-                                        EventDetail::SystemSignal { kind, summary: text.into() },
+                                        EventDetail::SystemSignal {
+                                            kind,
+                                            summary: text.into(),
+                                        },
                                         base,
                                     ));
                                 } else {
@@ -328,7 +353,11 @@ fn parse_user_message_rich(message: &Value, base: &RichBase) -> Vec<TranscriptEv
                         out.push(make_rich(
                             MessageRole::ToolResult,
                             EventDetail::ToolResult {
-                                tool_use_id, is_error, exit_code, size, preview,
+                                tool_use_id,
+                                is_error,
+                                exit_code,
+                                size,
+                                preview,
                             },
                             base,
                         ));
@@ -383,7 +412,12 @@ fn parse_assistant_message_rich(message: &Value, base: &RichBase) -> Vec<Transcr
                 let target = extract_tool_target(&name, &input);
                 out.push(make_rich(
                     MessageRole::ToolUse,
-                    EventDetail::ToolUse { name, target, tool_use_id, input },
+                    EventDetail::ToolUse {
+                        name,
+                        target,
+                        tool_use_id,
+                        input,
+                    },
                     base,
                 ));
             }
@@ -419,7 +453,10 @@ fn parse_system_event_rich(v: &Value, base: &RichBase) -> Vec<TranscriptEvent> {
             };
             vec![make_rich(
                 MessageRole::Developer,
-                EventDetail::SystemSignal { kind: SystemSignalKind::HookFired, summary },
+                EventDetail::SystemSignal {
+                    kind: SystemSignalKind::HookFired,
+                    summary,
+                },
                 base,
             )]
         }
@@ -445,8 +482,12 @@ pub fn parse_codex_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEven
             let cwd = v["payload"]["cwd"].as_str().map(String::from);
             let model = v["payload"]["model"].as_str().unwrap_or("?");
             let base = RichBase {
-                session_id: session_id.into(), timestamp,
-                git_branch: None, is_subagent: false, agent_slug: None, cwd,
+                session_id: session_id.into(),
+                timestamp,
+                git_branch: None,
+                is_subagent: false,
+                agent_slug: None,
+                cwd,
                 parent_tool_use_id: None,
             };
             vec![make_rich(
@@ -461,8 +502,12 @@ pub fn parse_codex_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEven
         "response_item" => {
             let payload = &v["payload"];
             let base = RichBase {
-                session_id: session_id.into(), timestamp,
-                git_branch: None, is_subagent: false, agent_slug: None, cwd: None,
+                session_id: session_id.into(),
+                timestamp,
+                git_branch: None,
+                is_subagent: false,
+                agent_slug: None,
+                cwd: None,
                 parent_tool_use_id: None,
             };
             // Codex response items dispatch on payload.type: `message` carries
@@ -486,7 +531,12 @@ pub fn parse_codex_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEven
                     let target = extract_tool_target(&name, &input);
                     vec![make_rich(
                         MessageRole::ToolUse,
-                        EventDetail::ToolUse { name, target, tool_use_id, input },
+                        EventDetail::ToolUse {
+                            name,
+                            target,
+                            tool_use_id,
+                            input,
+                        },
                         &base,
                     )]
                 }
@@ -499,7 +549,11 @@ pub fn parse_codex_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEven
                     vec![make_rich(
                         MessageRole::ToolResult,
                         EventDetail::ToolResult {
-                            tool_use_id, is_error: false, exit_code, size, preview,
+                            tool_use_id,
+                            is_error: false,
+                            exit_code,
+                            size,
+                            preview,
                         },
                         &base,
                     )]
@@ -507,7 +561,8 @@ pub fn parse_codex_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEven
                 "reasoning" => {
                     // Codex reasoning content is usually encrypted; surface
                     // readable text when summary/content carries it.
-                    let text = payload["summary"][0]["text"].as_str()
+                    let text = payload["summary"][0]["text"]
+                        .as_str()
                         .or_else(|| payload["content"][0]["text"].as_str())
                         .or_else(|| payload["text"].as_str())
                         .unwrap_or("");
@@ -554,11 +609,18 @@ fn parse_codex_content_rich(
                         if let Some(kind) = detect_user_signal(text) {
                             out.push(make_rich(
                                 role,
-                                EventDetail::SystemSignal { kind, summary: text.into() },
+                                EventDetail::SystemSignal {
+                                    kind,
+                                    summary: text.into(),
+                                },
                                 base,
                             ));
                         } else {
-                            out.push(make_rich(role, EventDetail::Text { text: text.into() }, base));
+                            out.push(make_rich(
+                                role,
+                                EventDetail::Text { text: text.into() },
+                                base,
+                            ));
                         }
                     }
                 }
@@ -571,7 +633,12 @@ fn parse_codex_content_rich(
                 let target = extract_tool_target(&name, &input);
                 out.push(make_rich(
                     MessageRole::ToolUse,
-                    EventDetail::ToolUse { name, target, tool_use_id, input },
+                    EventDetail::ToolUse {
+                        name,
+                        target,
+                        tool_use_id,
+                        input,
+                    },
                     base,
                 ));
             }
@@ -584,7 +651,11 @@ fn parse_codex_content_rich(
                 out.push(make_rich(
                     MessageRole::ToolResult,
                     EventDetail::ToolResult {
-                        tool_use_id, is_error: false, exit_code, size, preview,
+                        tool_use_id,
+                        is_error: false,
+                        exit_code,
+                        size,
+                        preview,
                     },
                     base,
                 ));
@@ -665,11 +736,20 @@ pub fn parse_copilot_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEv
             if let Some(kind) = detect_user_signal(content) {
                 return vec![make_rich(
                     MessageRole::User,
-                    EventDetail::SystemSignal { kind, summary: content.into() },
+                    EventDetail::SystemSignal {
+                        kind,
+                        summary: content.into(),
+                    },
                     &base,
                 )];
             }
-            vec![make_rich(MessageRole::User, EventDetail::Text { text: content.into() }, &base)]
+            vec![make_rich(
+                MessageRole::User,
+                EventDetail::Text {
+                    text: content.into(),
+                },
+                &base,
+            )]
         }
         "assistant.message" => {
             let mut out = Vec::new();
@@ -686,7 +766,9 @@ pub fn parse_copilot_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEv
             if !content.is_empty() {
                 out.push(make_rich(
                     MessageRole::Assistant,
-                    EventDetail::Text { text: content.into() },
+                    EventDetail::Text {
+                        text: content.into(),
+                    },
                     &base,
                 ));
             }
@@ -699,7 +781,12 @@ pub fn parse_copilot_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEv
             let target = extract_tool_target(&name, &input);
             vec![make_rich(
                 MessageRole::ToolUse,
-                EventDetail::ToolUse { name, target, tool_use_id, input },
+                EventDetail::ToolUse {
+                    name,
+                    target,
+                    tool_use_id,
+                    input,
+                },
                 &base,
             )]
         }
@@ -784,11 +871,20 @@ pub fn parse_vibe_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEvent
             if let Some(kind) = detect_user_signal(content) {
                 return vec![make_rich(
                     MessageRole::User,
-                    EventDetail::SystemSignal { kind, summary: content.into() },
+                    EventDetail::SystemSignal {
+                        kind,
+                        summary: content.into(),
+                    },
                     &base,
                 )];
             }
-            vec![make_rich(MessageRole::User, EventDetail::Text { text: content.into() }, &base)]
+            vec![make_rich(
+                MessageRole::User,
+                EventDetail::Text {
+                    text: content.into(),
+                },
+                &base,
+            )]
         }
         "assistant" => {
             let mut out = Vec::new();
@@ -796,20 +892,30 @@ pub fn parse_vibe_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEvent
             if !content.is_empty() {
                 out.push(make_rich(
                     MessageRole::Assistant,
-                    EventDetail::Text { text: content.into() },
+                    EventDetail::Text {
+                        text: content.into(),
+                    },
                     &base,
                 ));
             }
             if let Some(calls) = v["tool_calls"].as_array() {
                 for call in calls {
-                    let name = call["function"]["name"].as_str().unwrap_or("unknown").to_string();
+                    let name = call["function"]["name"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string();
                     let tool_use_id = call["id"].as_str().map(String::from);
                     let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
                     let input: Value = serde_json::from_str(args_str).unwrap_or(Value::Null);
                     let target = extract_tool_target(&name, &input);
                     out.push(make_rich(
                         MessageRole::ToolUse,
-                        EventDetail::ToolUse { name, target, tool_use_id, input },
+                        EventDetail::ToolUse {
+                            name,
+                            target,
+                            tool_use_id,
+                            input,
+                        },
                         &base,
                     ));
                 }
@@ -825,7 +931,8 @@ pub fn parse_vibe_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEvent
             // Vibe doesn't carry an explicit is_error flag — infer from common
             // failure words; conservative default is success.
             let lower = content.to_ascii_lowercase();
-            let is_error = lower.starts_with("error") || lower.contains("traceback")
+            let is_error = lower.starts_with("error")
+                || lower.contains("traceback")
                 || lower.starts_with("failed");
             vec![make_rich(
                 MessageRole::ToolResult,
@@ -928,17 +1035,23 @@ pub fn parse_gemini_file_rich(raw: &str) -> Vec<TranscriptEvent> {
                         let last = segments.len().saturating_sub(1);
                         for (i, seg) in segments.iter().enumerate() {
                             let trimmed = seg.trim();
-                            if trimmed.is_empty() { continue; }
+                            if trimmed.is_empty() {
+                                continue;
+                            }
                             if i == last {
                                 out.push(make_rich(
                                     MessageRole::Assistant,
-                                    EventDetail::Text { text: trimmed.into() },
+                                    EventDetail::Text {
+                                        text: trimmed.into(),
+                                    },
                                     &base,
                                 ));
                             } else {
                                 out.push(make_rich(
                                     MessageRole::Thinking,
-                                    EventDetail::Thinking { text: trimmed.into() },
+                                    EventDetail::Thinking {
+                                        text: trimmed.into(),
+                                    },
                                     &base,
                                 ));
                             }
@@ -1016,7 +1129,10 @@ pub fn parse_transcript_line(line: &str) -> Vec<ParsedEvent> {
     let session_id = v["sessionId"].as_str().unwrap_or("").to_string();
     let timestamp = v["timestamp"].as_str().map(String::from);
     let git_branch = v["gitBranch"].as_str().map(String::from);
-    let is_subagent = v.get("isSidechain").and_then(|v| v.as_bool()).unwrap_or(false)
+    let is_subagent = v
+        .get("isSidechain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
         || v.get("agentId").is_some();
     let agent_slug = v["slug"].as_str().map(String::from);
     let cwd = v["cwd"].as_str().map(String::from);
@@ -1100,9 +1216,7 @@ fn parse_user_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent> {
                     Some("tool_result") => {
                         if let Some(text) = extract_tool_result_text(block) {
                             if !text.is_empty() {
-                                let tool_id = block["tool_use_id"]
-                                    .as_str()
-                                    .unwrap_or("?");
+                                let tool_id = block["tool_use_id"].as_str().unwrap_or("?");
                                 let content = format!("result:{} {}", tool_id, truncate(&text));
                                 events.push(make_event(MessageRole::ToolResult, &content, base));
                             }
@@ -1161,10 +1275,7 @@ pub fn extract_tool_result_text(block: &Value) -> Option<String> {
     match &block["content"] {
         Value::String(s) => Some(s.clone()),
         Value::Array(parts) => {
-            let texts: Vec<&str> = parts
-                .iter()
-                .filter_map(|p| p["text"].as_str())
-                .collect();
+            let texts: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
             if texts.is_empty() {
                 None
             } else {
@@ -1208,7 +1319,11 @@ pub fn parse_codex_line(line: &str, session_id: &str) -> Vec<ParsedEvent> {
                 agent_slug: None,
                 cwd,
             };
-            vec![make_event(MessageRole::Developer, &truncate(base_instructions), &base)]
+            vec![make_event(
+                MessageRole::Developer,
+                &truncate(base_instructions),
+                &base,
+            )]
         }
         "response_item" => {
             let payload = &v["payload"];
@@ -1236,18 +1351,27 @@ pub fn parse_codex_line(line: &str, session_id: &str) -> Vec<ParsedEvent> {
                 "function_call" => {
                     let name = payload["name"].as_str().unwrap_or("unknown");
                     let args = payload["arguments"].as_str().unwrap_or("{}");
-                    vec![make_event(MessageRole::ToolUse, &truncate(&format!("tool:{} {}", name, args)), &base)]
+                    vec![make_event(
+                        MessageRole::ToolUse,
+                        &truncate(&format!("tool:{} {}", name, args)),
+                        &base,
+                    )]
                 }
                 "function_call_output" => {
                     let output = payload["output"].as_str().unwrap_or("");
                     if output.is_empty() {
                         vec![]
                     } else {
-                        vec![make_event(MessageRole::ToolResult, &truncate(&format!("result: {}", output)), &base)]
+                        vec![make_event(
+                            MessageRole::ToolResult,
+                            &truncate(&format!("result: {}", output)),
+                            &base,
+                        )]
                     }
                 }
                 "reasoning" => {
-                    let text = payload["summary"][0]["text"].as_str()
+                    let text = payload["summary"][0]["text"]
+                        .as_str()
                         .or_else(|| payload["content"][0]["text"].as_str())
                         .or_else(|| payload["text"].as_str())
                         .unwrap_or("");
@@ -1291,7 +1415,11 @@ pub fn parse_codex_history_line(line: &str) -> Vec<ParsedEvent> {
     }]
 }
 
-fn parse_codex_content_blocks(payload: &Value, role: MessageRole, base: &EventBase) -> Vec<ParsedEvent> {
+fn parse_codex_content_blocks(
+    payload: &Value,
+    role: MessageRole,
+    base: &EventBase,
+) -> Vec<ParsedEvent> {
     let content = match payload["content"].as_array() {
         Some(c) => c,
         None => {
@@ -1387,7 +1515,8 @@ mod tests {
                       "input": { "command": "git status --short" } }
                 ]
             }
-        }).to_string();
+        })
+        .to_string();
         let events = parse_transcript_line_rich(&line);
         assert_eq!(events.len(), 1);
         match &events[0].detail {
@@ -1406,11 +1535,15 @@ mod tests {
             "sessionId": "s1",
             "message": { "role": "user",
                 "content": "<system-reminder>reset</system-reminder>" }
-        }).to_string();
+        })
+        .to_string();
         let events = parse_transcript_line_rich(&line);
         assert!(matches!(
             events[0].detail,
-            EventDetail::SystemSignal { kind: SystemSignalKind::SystemReminder, .. }
+            EventDetail::SystemSignal {
+                kind: SystemSignalKind::SystemReminder,
+                ..
+            }
         ));
     }
 
@@ -1424,11 +1557,17 @@ mod tests {
                 "toolName": "Bash",
                 "arguments": { "command": "ls" }
             }
-        }).to_string();
+        })
+        .to_string();
         let events = parse_copilot_line_rich(&line, "sess-cop-1");
         assert_eq!(events.len(), 1);
         match &events[0].detail {
-            EventDetail::ToolUse { name, target, tool_use_id, .. } => {
+            EventDetail::ToolUse {
+                name,
+                target,
+                tool_use_id,
+                ..
+            } => {
                 assert_eq!(name, "Bash");
                 assert_eq!(target, "ls");
                 assert_eq!(tool_use_id.as_deref(), Some("call_1"));
@@ -1446,10 +1585,13 @@ mod tests {
                 "success": false,
                 "result": { "content": "permission denied", "detailedContent": "x" }
             }
-        }).to_string();
+        })
+        .to_string();
         let events = parse_copilot_line_rich(&line, "s");
         match &events[0].detail {
-            EventDetail::ToolResult { is_error, preview, .. } => {
+            EventDetail::ToolResult {
+                is_error, preview, ..
+            } => {
                 assert!(*is_error);
                 assert_eq!(preview, "permission denied");
             }
@@ -1470,7 +1612,8 @@ mod tests {
                     "arguments": "{\"command\": \"echo hi\"}"
                 }
             }]
-        }).to_string();
+        })
+        .to_string();
         let events = parse_vibe_line_rich(&line, "sess-vibe-1");
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0].detail, EventDetail::Text { .. }));
@@ -1490,7 +1633,8 @@ mod tests {
             "content": "Error: something broke",
             "tool_call_id": "call_1",
             "name": "shell"
-        }).to_string();
+        })
+        .to_string();
         let events = parse_vibe_line_rich(&line, "s");
         match &events[0].detail {
             EventDetail::ToolResult { is_error, .. } => assert!(*is_error),
@@ -1513,7 +1657,8 @@ mod tests {
                     ]
                 }
             ]
-        }).to_string();
+        })
+        .to_string();
         let events = parse_gemini_file_rich(&raw);
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0].detail, EventDetail::Thinking { .. }));
@@ -1550,7 +1695,8 @@ mod tests {
                 "id": "m1", "timestamp": "t", "type": "gemini",
                 "content": "just the answer"
             }]
-        }).to_string();
+        })
+        .to_string();
         let events = parse_gemini_file_rich(&raw);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].detail, EventDetail::Text { .. }));
@@ -1582,11 +1728,17 @@ mod tests {
                     }
                 ]
             }]
-        }).to_string();
+        })
+        .to_string();
         let events = parse_gemini_file_rich(&raw);
         assert_eq!(events.len(), 4);
         match &events[0].detail {
-            EventDetail::ToolUse { name, target, tool_use_id, .. } => {
+            EventDetail::ToolUse {
+                name,
+                target,
+                tool_use_id,
+                ..
+            } => {
                 assert_eq!(name, "read_file");
                 assert_eq!(target, "foo.rs");
                 assert_eq!(tool_use_id.as_deref(), Some("c1"));
@@ -1594,7 +1746,12 @@ mod tests {
             _ => panic!("expected ToolUse"),
         }
         match &events[1].detail {
-            EventDetail::ToolResult { is_error, preview, tool_use_id, .. } => {
+            EventDetail::ToolResult {
+                is_error,
+                preview,
+                tool_use_id,
+                ..
+            } => {
                 assert!(!is_error);
                 assert_eq!(preview, "file contents");
                 assert_eq!(tool_use_id, "c1");
@@ -1602,7 +1759,9 @@ mod tests {
             _ => panic!("expected ToolResult"),
         }
         match &events[3].detail {
-            EventDetail::ToolResult { is_error, preview, .. } => {
+            EventDetail::ToolResult {
+                is_error, preview, ..
+            } => {
                 assert!(is_error);
                 assert_eq!(preview, "File not found");
             }
@@ -1628,7 +1787,8 @@ mod tests {
                 "role": "user",
                 "content": "Hello world"
             }
-        }).to_string();
+        })
+        .to_string();
 
         let events = parse_transcript_line(&line);
         assert_eq!(events.len(), 1);
@@ -1649,7 +1809,8 @@ mod tests {
                     { "type": "tool_result", "tool_use_id": "call_1", "content": "Success" }
                 ]
             }
-        }).to_string();
+        })
+        .to_string();
 
         let events = parse_transcript_line(&line);
         assert_eq!(events.len(), 2);
@@ -1700,7 +1861,8 @@ mod tests {
             "gitBranch": "main",
             "cwd": "/repo",
             "message": { "content": "hi" }
-        }).to_string();
+        })
+        .to_string();
 
         let events = parse_transcript_line(&line);
         assert_eq!(events[0].session_id, "s1");
@@ -1718,7 +1880,8 @@ mod tests {
             "isSidechain": true,
             "slug": "researcher",
             "message": { "content": "hi" }
-        }).to_string();
+        })
+        .to_string();
 
         let events = parse_transcript_line(&line);
         assert!(events[0].is_subagent);
@@ -1732,7 +1895,8 @@ mod tests {
             "sessionId": "s1",
             "project": "/p",
             "timestamp": 1600000000000u64
-        }).to_string();
+        })
+        .to_string();
 
         let events = parse_history_line(&line);
         assert_eq!(events.len(), 1);
@@ -1746,7 +1910,8 @@ mod tests {
         let meta = json!({
             "type": "session_meta",
             "payload": { "cwd": "/repo", "base_instructions": "Be helpful" }
-        }).to_string();
+        })
+        .to_string();
         let ev1 = parse_codex_line(&meta, "s1");
         assert_eq!(ev1.len(), 1);
         assert_eq!(ev1[0].role, MessageRole::Developer);
@@ -1760,7 +1925,8 @@ mod tests {
                 "role": "assistant",
                 "content": [{ "type": "output_text", "text": "Done" }]
             }
-        }).to_string();
+        })
+        .to_string();
         let ev_msg = parse_codex_line(&msg, "s1");
         assert_eq!(ev_msg.len(), 1);
         assert_eq!(ev_msg[0].role, MessageRole::Assistant);
@@ -1774,7 +1940,8 @@ mod tests {
                 "arguments": "{\"path\": \".\"}",
                 "call_id": "c1"
             }
-        }).to_string();
+        })
+        .to_string();
         let ev_call = parse_codex_line(&call, "s1");
         assert_eq!(ev_call.len(), 1);
         assert_eq!(ev_call[0].role, MessageRole::ToolUse);
@@ -1784,10 +1951,16 @@ mod tests {
     #[test]
     fn test_extract_tool_result_text() {
         let b1 = json!({ "content": "direct string" });
-        assert_eq!(extract_tool_result_text(&b1), Some("direct string".to_string()));
+        assert_eq!(
+            extract_tool_result_text(&b1),
+            Some("direct string".to_string())
+        );
 
         let b2 = json!({ "content": [ { "text": "part1" }, { "text": "part2" } ] });
-        assert_eq!(extract_tool_result_text(&b2), Some("part1\npart2".to_string()));
+        assert_eq!(
+            extract_tool_result_text(&b2),
+            Some("part1\npart2".to_string())
+        );
 
         let b3 = json!({ "content": [] });
         assert_eq!(extract_tool_result_text(&b3), None);
@@ -1804,7 +1977,7 @@ mod tests {
         assert!(tr.len() < 13000);
 
         // UTF-8 boundary test (Emoji is 4 bytes: 🦀 = \u{1F980})
-        let emoji_repeated = "🦀".repeat(4000); 
+        let emoji_repeated = "🦀".repeat(4000);
         let tr_emoji = truncate(&emoji_repeated);
         assert!(tr_emoji.ends_with("...[truncated]"));
         // Ensure it doesn't panic and result is valid string
@@ -1817,7 +1990,8 @@ mod tests {
             "session_id": "s1",
             "ts": 1600000000,
             "text": "Hello Codex"
-        }).to_string();
+        })
+        .to_string();
         let events = parse_codex_history_line(&line);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].content, "Hello Codex");
@@ -1833,7 +2007,8 @@ mod tests {
                 "role": "user",
                 "content": "direct text"
             }
-        }).to_string();
+        })
+        .to_string();
         let events = parse_codex_line(&line, "s1");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].content, "direct text");
@@ -1850,7 +2025,8 @@ mod tests {
                 "type": "reasoning",
                 "summary": [{ "type": "summary_text", "text": "Thinking hard" }]
             }
-        }).to_string();
+        })
+        .to_string();
         let events = parse_codex_line(&with_text, "s1");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].role, MessageRole::Thinking);
@@ -1864,7 +2040,8 @@ mod tests {
                 "content": null,
                 "encrypted_content": "gAAAAA..."
             }
-        }).to_string();
+        })
+        .to_string();
         assert!(parse_codex_line(&encrypted_only, "s1").is_empty());
     }
 
@@ -1877,7 +2054,8 @@ mod tests {
                 "call_id": "c1",
                 "output": "Tool result"
             }
-        }).to_string();
+        })
+        .to_string();
         let events = parse_codex_line(&line, "s1");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].role, MessageRole::ToolResult);
@@ -1890,7 +2068,8 @@ mod tests {
             "type": "assistant",
             "sessionId": "s1",
             "message": { "role": "assistant" }
-        }).to_string();
+        })
+        .to_string();
         assert!(parse_transcript_line(&line).is_empty());
     }
 
@@ -1906,7 +2085,8 @@ mod tests {
                     { "type": "text", "text": "Part 2" }
                 ]
             }
-        }).to_string();
+        })
+        .to_string();
         let events = parse_transcript_line(&line);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].content, "Part 1");
@@ -1925,7 +2105,8 @@ mod tests {
                     { "type": "tool_use", "name": "foo", "input": {"data": long_input} }
                 ]
             }
-        }).to_string();
+        })
+        .to_string();
         let events = parse_transcript_line(&line);
         assert_eq!(events.len(), 1);
         assert!(events[0].content.contains("...[truncated]"));

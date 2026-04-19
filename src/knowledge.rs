@@ -22,21 +22,29 @@ pub struct LearnParams {
     /// Entry category
     pub category: String,
     /// Short title (auto-generated if omitted)
-    #[serde(default)] pub title: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
     /// global or project (default: global)
-    #[serde(default)] pub scope: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Project path for project-scoped entries
-    #[serde(default)] pub project: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
     /// Provider filter (empty = all)
-    #[serde(default)] pub providers: Option<Vec<String>>,
+    #[serde(default)]
+    pub providers: Option<Vec<String>>,
     /// Priority: critical, standard, supplementary
-    #[serde(default)] pub priority: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
     /// Ordering within priority tier
-    #[serde(default)] pub weight: Option<u32>,
+    #[serde(default)]
+    pub weight: Option<u32>,
     /// ISO 8601 expiry time
-    #[serde(default)] pub expires_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
     /// Update existing entry by ID
-    #[serde(default)] pub id: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -44,31 +52,46 @@ pub struct RememberParams {
     /// The fact, observation, or note
     pub content: String,
     /// Category (default: memory)
-    #[serde(default)] pub category: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
     /// Short title
-    #[serde(default)] pub title: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
     /// global or project (default: global)
-    #[serde(default)] pub scope: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Project path
-    #[serde(default)] pub project: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
     /// Set false for invariants (default: true)
-    #[serde(default)] pub decay: Option<bool>,
+    #[serde(default)]
+    pub decay: Option<bool>,
     /// ISO 8601 date to revisit
-    #[serde(default)] pub review_at: Option<String>,
+    #[serde(default)]
+    pub review_at: Option<String>,
     /// ISO 8601 expiry
-    #[serde(default)] pub expires_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct KnowledgeListParams {
-    #[serde(default)] pub category: Option<String>,
-    #[serde(default)] pub scope: Option<String>,
-    #[serde(default)] pub project: Option<String>,
-    #[serde(default)] pub provider: Option<String>,
-    #[serde(default)] pub status: Option<String>,
-    #[serde(default)] pub approval: Option<String>,
-    #[serde(default)] pub query: Option<String>,
-    #[serde(default)] pub limit: Option<u64>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub approval: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -76,15 +99,18 @@ pub struct ForgetParams {
     /// Entry ID to remove
     pub id: String,
     /// Mark as superseded instead of deleted
-    #[serde(default)] pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RenderParams {
     /// Render for specific provider or all
-    #[serde(default)] pub provider: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Project directory path. Required when scope includes "project".
-    #[serde(default)] pub project: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
     /// Which scope to render. "global" surgically patches each provider's
     /// global-memory file (~/.claude-shared/CLAUDE.md, ~/.codex/AGENTS.md,
     /// ~/.gemini/GEMINI.md) inside `<!-- bb:managed-* -->` markers and
@@ -92,9 +118,11 @@ pub struct RenderParams {
     /// "project" writes <project>/{CLAUDE,AGENTS,GEMINI}.md from project-
     /// scope entries + PROJECT.md only (no global content). "both" runs
     /// both. Defaults to "both" if `project` is given, else "global".
-    #[serde(default)] pub scope: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Preview without writing (default: false)
-    #[serde(default)] pub dry_run: Option<bool>,
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -116,9 +144,11 @@ pub struct AbsorbParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewParams {
     /// list, approve, or reject (default: list)
-    #[serde(default)] pub action: Option<String>,
+    #[serde(default)]
+    pub action: Option<String>,
     /// Entry ID (required for approve/reject)
-    #[serde(default)] pub id: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -135,24 +165,37 @@ pub struct DecideParams {
     pub rationale: String,
     /// ID of the decision this one replaces (optional). Marks the old
     /// entry as superseded and links it to this one.
-    #[serde(default)] pub supersedes: Option<String>,
+    #[serde(default)]
+    pub supersedes: Option<String>,
     /// Short title (auto-generated from content if omitted)
-    #[serde(default)] pub title: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
     /// global or project (default: global)
-    #[serde(default)] pub scope: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Project path for project-scoped decisions
-    #[serde(default)] pub project: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
     /// Priority: critical, standard, supplementary (default: standard)
-    #[serde(default)] pub priority: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
     /// Render into provider markdown files (default: true)
-    #[serde(default)] pub render: Option<bool>,
+    #[serde(default)]
+    pub render: Option<bool>,
 }
 
 // ── Schema ─────────────────────────────────────────────────────────
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Serialize, Deserialize,
-    strum::EnumString, strum::AsRefStr, strum::Display,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::AsRefStr,
+    strum::Display,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -267,9 +310,9 @@ pub struct KnowledgeEntry {
     pub status: Status,
     pub approval: Approval,
     #[serde(default = "default_true")]
-    pub render: bool,              // false = indexed only, never rendered into markdown
+    pub render: bool, // false = indexed only, never rendered into markdown
     #[serde(default = "default_true")]
-    pub decay: bool,               // false = invariant, never ages out or gets staleness-reviewed
+    pub decay: bool, // false = invariant, never ages out or gets staleness-reviewed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_at: Option<String>, // soft staleness checkpoint (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -375,9 +418,10 @@ impl Knowledge {
     }
 
     fn active_entries(&self) -> impl Iterator<Item = &KnowledgeEntry> {
-        self.store.entries.iter().filter(|e| {
-            e.status == Status::Active && !Self::is_expired(e)
-        })
+        self.store
+            .entries
+            .iter()
+            .filter(|e| e.status == Status::Active && !Self::is_expired(e))
     }
 
     /// Immutable slice of all stored entries (any status) — used by
@@ -469,7 +513,11 @@ impl Knowledge {
             supersedes: None,
             rationale: None,
             expires_at: p.expires_at.clone(),
-            source: if from_agent { "agent".to_string() } else { "user".to_string() },
+            source: if from_agent {
+                "agent".to_string()
+            } else {
+                "user".to_string()
+            },
             created_at: now.clone(),
             updated_at: now,
             recall_count: 0,
@@ -530,8 +578,9 @@ impl Knowledge {
         // silently landing the entry in the wrong bucket.
         let category = match p.category.as_deref() {
             None => Category::Memory,
-            Some(raw) => Category::from_str(raw)
-                .map_err(|_| anyhow::anyhow!("invalid category: {raw}"))?,
+            Some(raw) => {
+                Category::from_str(raw).map_err(|_| anyhow::anyhow!("invalid category: {raw}"))?
+            }
         };
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
         let scope = Scope::parse_optional(p.scope.as_deref())?;
@@ -554,11 +603,19 @@ impl Knowledge {
             decay: p.decay.unwrap_or(true),
             review_at: p.review_at.clone(),
             status: Status::Active,
-            approval: if from_agent { Approval::AgentInferred } else { Approval::UserConfirmed },
+            approval: if from_agent {
+                Approval::AgentInferred
+            } else {
+                Approval::UserConfirmed
+            },
             supersedes: None,
             rationale: None,
             expires_at: p.expires_at.clone(),
-            source: if from_agent { "agent".to_string() } else { "user".to_string() },
+            source: if from_agent {
+                "agent".to_string()
+            } else {
+                "user".to_string()
+            },
             created_at: now.clone(),
             updated_at: now,
             recall_count: 0,
@@ -566,7 +623,9 @@ impl Knowledge {
         });
 
         self.save()?;
-        Ok(format!("Remembered entry {id} (indexed only, not rendered)"))
+        Ok(format!(
+            "Remembered entry {id} (indexed only, not rendered)"
+        ))
     }
 
     /// Decide — a durable commitment with rationale. When `supersedes`
@@ -577,7 +636,9 @@ impl Knowledge {
             anyhow::bail!("'content' is required");
         }
         if p.rationale.trim().is_empty() {
-            anyhow::bail!("'rationale' is required — a decision without justification is just a command");
+            anyhow::bail!(
+                "'rationale' is required — a decision without justification is just a command"
+            );
         }
 
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
@@ -610,11 +671,19 @@ impl Knowledge {
             decay: false, // decisions are durable by default; invariants until explicitly superseded
             review_at: None,
             status: Status::Active,
-            approval: if from_agent { Approval::AgentInferred } else { Approval::UserConfirmed },
+            approval: if from_agent {
+                Approval::AgentInferred
+            } else {
+                Approval::UserConfirmed
+            },
             supersedes: None,
             rationale: Some(p.rationale.clone()),
             expires_at: None,
-            source: if from_agent { "agent".to_string() } else { "user".to_string() },
+            source: if from_agent {
+                "agent".to_string()
+            } else {
+                "user".to_string()
+            },
             created_at: now.clone(),
             updated_at: now.clone(),
             recall_count: 0,
@@ -773,7 +842,9 @@ impl Knowledge {
                     decay_mark,
                     if e.content.len() > 120 {
                         let mut end = 120;
-                        while end > 0 && !e.content.is_char_boundary(end) { end -= 1; }
+                        while end > 0 && !e.content.is_char_boundary(end) {
+                            end -= 1;
+                        }
                         format!("{}...", &e.content[..end])
                     } else {
                         e.content.clone()
@@ -804,8 +875,11 @@ impl Knowledge {
         let provider = p.provider.as_deref();
         let project_dir = p.project.as_deref();
         let dry_run = p.dry_run.unwrap_or(false);
-        let scope_arg = p.scope.as_deref()
-            .unwrap_or(if project_dir.is_some() { "both" } else { "global" });
+        let scope_arg = p.scope.as_deref().unwrap_or(if project_dir.is_some() {
+            "both"
+        } else {
+            "global"
+        });
 
         let do_global = matches!(scope_arg, "global" | "both");
         let do_project = matches!(scope_arg, "project" | "both") && project_dir.is_some();
@@ -1037,7 +1111,9 @@ impl Knowledge {
         let scope = p.scope.as_deref().unwrap_or("project");
         match scope {
             "project" => {
-                let project_dir = p.project.as_deref()
+                let project_dir = p
+                    .project
+                    .as_deref()
                     .context("'project' is required when scope=project (or default)")?;
                 self.absorb_project(project_dir)
             }
@@ -1060,8 +1136,7 @@ impl Knowledge {
         let mut scanned_providers: Vec<String> = Vec::new();
 
         // Collect all entry IDs found across ALL rendered files
-        let mut all_found_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut all_found_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (filename, provider) in &files {
             let path = Path::new(project_dir).join(filename);
@@ -1127,8 +1202,7 @@ impl Knowledge {
             if !entry.render {
                 continue;
             }
-            let visible_to_scanned = scanned_providers.iter()
-                .any(|p| entry_visible_to(entry, p));
+            let visible_to_scanned = scanned_providers.iter().any(|p| entry_visible_to(entry, p));
             if !visible_to_scanned {
                 continue;
             }
@@ -1158,8 +1232,7 @@ impl Knowledge {
         let mut absorbed = 0u32;
         let mut disabled = 0u32;
         let mut scanned_providers: Vec<String> = Vec::new();
-        let mut all_found_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut all_found_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for prov in &providers {
             let Some(target_res) = crate::render::global_target_path(prov) else {
@@ -1185,9 +1258,15 @@ impl Knowledge {
             }
 
             for section in extract_unmarked_sections(managed) {
-                if section.trim().is_empty() { continue; }
-                if section.contains("Generated by blackbox") { continue; }
-                if is_structural_only(&section) { continue; }
+                if section.trim().is_empty() {
+                    continue;
+                }
+                if section.contains("Generated by blackbox") {
+                    continue;
+                }
+                if is_structural_only(&section) {
+                    continue;
+                }
                 self.import_entry(
                     section.trim().to_string(),
                     Category::Memory,
@@ -1199,12 +1278,19 @@ impl Knowledge {
         }
 
         for entry in &mut self.store.entries {
-            if entry.status != Status::Active { continue; }
-            if entry.scope != Scope::Global { continue; }
-            if !entry.render { continue; }
-            let visible_to_scanned = scanned_providers.iter()
-                .any(|p| entry_visible_to(entry, p));
-            if !visible_to_scanned { continue; }
+            if entry.status != Status::Active {
+                continue;
+            }
+            if entry.scope != Scope::Global {
+                continue;
+            }
+            if !entry.render {
+                continue;
+            }
+            let visible_to_scanned = scanned_providers.iter().any(|p| entry_visible_to(entry, p));
+            if !visible_to_scanned {
+                continue;
+            }
             if !all_found_ids.contains(&entry.id) {
                 entry.status = Status::Disabled;
                 entry.updated_at = Self::now_iso();
@@ -1217,7 +1303,11 @@ impl Knowledge {
             "Absorbed {} new entries, disabled {} removed entries (global scope; scanned {})",
             absorbed,
             disabled,
-            if scanned_providers.is_empty() { "no providers".to_string() } else { scanned_providers.join(", ") }
+            if scanned_providers.is_empty() {
+                "no providers".to_string()
+            } else {
+                scanned_providers.join(", ")
+            }
         ))
     }
 
@@ -1232,9 +1322,10 @@ impl Knowledge {
 
         for entry in &self.store.entries {
             if (entry.approval == Approval::AgentInferred || entry.approval == Approval::Imported)
-                && entry.status == Status::Active {
-                    unverified += 1;
-                }
+                && entry.status == Status::Active
+            {
+                unverified += 1;
+            }
             if Self::is_expired(entry) && entry.status == Status::Active {
                 expired += 1;
                 issues.push(format!("[{}] expired: {}", entry.id, entry.title));
@@ -1245,7 +1336,10 @@ impl Knowledge {
         }
 
         if unverified > 0 {
-            issues.push(format!("{} unverified entries (use blackbox_review)", unverified));
+            issues.push(format!(
+                "{} unverified entries (use blackbox_review)",
+                unverified
+            ));
         }
         if expired > 0 {
             issues.push(format!("{} expired entries", expired));
@@ -1277,7 +1371,10 @@ impl Knowledge {
             }
         }
         if never_recalled > 0 {
-            issues.push(format!("{} entries never recalled (may be dead weight)", never_recalled));
+            issues.push(format!(
+                "{} entries never recalled (may be dead weight)",
+                never_recalled
+            ));
         }
 
         // Check for potential duplicates (same title)
@@ -1366,7 +1463,10 @@ impl Knowledge {
                     Ok(format!("Entry {} not found", id))
                 }
             }
-            other => Ok(format!("Unknown action: {}. Use list, approve, or reject.", other)),
+            other => Ok(format!(
+                "Unknown action: {}. Use list, approve, or reject.",
+                other
+            )),
         }
     }
 }
@@ -1424,10 +1524,7 @@ fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String)
             out.push_str(&format!("**{}**{}\n\n", entry.title, mark));
         }
         // Use provider-specific variant if available, else default content
-        let content = entry
-            .variants
-            .get(provider)
-            .unwrap_or(&entry.content);
+        let content = entry.variants.get(provider).unwrap_or(&entry.content);
         out.push_str(content);
         out.push_str("\n\n");
         out.push_str(&format!("<!-- /bb:entry={} -->\n", entry.id));
@@ -1621,7 +1718,9 @@ impl Knowledge {
                 generated_files.join(", ")
             ));
             if authored_files.is_empty() {
-                out.push_str("All instruction files are already blackbox-generated. Nothing to bootstrap.\n");
+                out.push_str(
+                    "All instruction files are already blackbox-generated. Nothing to bootstrap.\n",
+                );
                 return Ok(out);
             }
             out.push_str("Bootstrapping only the hand-authored files.\n\n");
@@ -1672,7 +1771,9 @@ impl Knowledge {
         out.push_str(project_dir);
         out.push_str("\" to generate the new CLAUDE.md/AGENTS.md/GEMINI.md.\n");
         out.push_str("5. Verify the rendered output includes everything from the originals.\n");
-        out.push_str("6. Delete or git-rm the original hand-authored files that are now generated.\n");
+        out.push_str(
+            "6. Delete or git-rm the original hand-authored files that are now generated.\n",
+        );
 
         Ok(out)
     }
@@ -1691,7 +1792,9 @@ mod tests {
 
     #[test]
     fn structural_only_rejects_heading_with_body() {
-        assert!(!is_structural_only("## New thing\n\nuser-written body text\n"));
+        assert!(!is_structural_only(
+            "## New thing\n\nuser-written body text\n"
+        ));
     }
 
     #[test]
@@ -1763,7 +1866,9 @@ body
         // so the absorb path doesn't need a real ~/.claude-shared.
         let tmpdir = tempfile::tempdir().unwrap();
         let claude_md = tmpdir.path().join("CLAUDE.md");
-        std::fs::write(&claude_md, "\
+        std::fs::write(
+            &claude_md,
+            "\
 @/home/invidious/.claude/RTK.md
 
 ## User-authored steerage outside the managed region
@@ -1788,7 +1893,9 @@ be absorbed as a new Imported entry.
 ## More user content after the managed region
 
 This is also OUTSIDE the markers and must NEVER be absorbed.
-").unwrap();
+",
+        )
+        .unwrap();
 
         // Pre-seed the store with a global entry that won't be found in
         // the file — should get disabled.
@@ -1830,13 +1937,21 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
         std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap());
         // Make sure no other provider files are scanned (set to nonexistent paths).
-        std::env::set_var("BLACKBOX_GLOBAL_CODEX_MD", tmpdir.path().join("nope-codex").to_str().unwrap());
-        std::env::set_var("BLACKBOX_GLOBAL_GEMINI_MD", tmpdir.path().join("nope-gemini").to_str().unwrap());
+        std::env::set_var(
+            "BLACKBOX_GLOBAL_CODEX_MD",
+            tmpdir.path().join("nope-codex").to_str().unwrap(),
+        );
+        std::env::set_var(
+            "BLACKBOX_GLOBAL_GEMINI_MD",
+            tmpdir.path().join("nope-gemini").to_str().unwrap(),
+        );
 
-        let report = kb.absorb(&AbsorbParams {
-            project: None,
-            scope: Some("global".into()),
-        }).unwrap();
+        let report = kb
+            .absorb(&AbsorbParams {
+                project: None,
+                scope: Some("global".into()),
+            })
+            .unwrap();
 
         std::env::remove_var("BLACKBOX_GLOBAL_CLAUDE_MD");
         std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD");
@@ -1844,29 +1959,54 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
         assert!(report.contains("global scope"), "report: {report}");
         // The "New imported section" content should be absorbed.
-        let imported: Vec<_> = kb.store.entries.iter()
+        let imported: Vec<_> = kb
+            .store
+            .entries
+            .iter()
             .filter(|e| e.approval == Approval::Imported && e.scope == Scope::Global)
             .collect();
         assert!(!imported.is_empty(), "expected at least one imported entry");
         assert!(
-            imported.iter().any(|e| e.content.contains("New imported section")),
+            imported
+                .iter()
+                .any(|e| e.content.contains("New imported section")),
             "expected 'New imported section' to be absorbed; got: {:?}",
             imported.iter().map(|e| &e.content).collect::<Vec<_>>()
         );
         // User-authored content OUTSIDE the markers must NOT be absorbed.
         assert!(
-            !kb.store.entries.iter().any(|e| e.content.contains("User-authored steerage outside")),
+            !kb.store
+                .entries
+                .iter()
+                .any(|e| e.content.contains("User-authored steerage outside")),
             "user content outside markers leaked into absorb"
         );
         assert!(
-            !kb.store.entries.iter().any(|e| e.content.contains("More user content after")),
+            !kb.store
+                .entries
+                .iter()
+                .any(|e| e.content.contains("More user content after")),
             "user content after markers leaked into absorb"
         );
         // The missing entry should be disabled.
-        let stale = kb.store.entries.iter().find(|e| e.id == "test-missing").unwrap();
-        assert_eq!(stale.status, Status::Disabled, "missing entry should be disabled");
+        let stale = kb
+            .store
+            .entries
+            .iter()
+            .find(|e| e.id == "test-missing")
+            .unwrap();
+        assert_eq!(
+            stale.status,
+            Status::Disabled,
+            "missing entry should be disabled"
+        );
         // The existing tracked entry should remain Active.
-        let existing = kb.store.entries.iter().find(|e| e.id == "test-existing").unwrap();
+        let existing = kb
+            .store
+            .entries
+            .iter()
+            .find(|e| e.id == "test-existing")
+            .unwrap();
         assert_eq!(existing.status, Status::Active);
     }
 
@@ -1879,20 +2019,33 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         // No markers — entire file is hand-authored. Should not absorb anything.
         std::fs::write(&claude_md, "@RTK.md\n\n## Hand-authored only\n\nbody\n").unwrap();
         std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap());
-        std::env::set_var("BLACKBOX_GLOBAL_CODEX_MD", tmpdir.path().join("nope-codex").to_str().unwrap());
-        std::env::set_var("BLACKBOX_GLOBAL_GEMINI_MD", tmpdir.path().join("nope-gemini").to_str().unwrap());
+        std::env::set_var(
+            "BLACKBOX_GLOBAL_CODEX_MD",
+            tmpdir.path().join("nope-codex").to_str().unwrap(),
+        );
+        std::env::set_var(
+            "BLACKBOX_GLOBAL_GEMINI_MD",
+            tmpdir.path().join("nope-gemini").to_str().unwrap(),
+        );
 
-        let report = kb.absorb(&AbsorbParams {
-            project: None,
-            scope: Some("global".into()),
-        }).unwrap();
+        let report = kb
+            .absorb(&AbsorbParams {
+                project: None,
+                scope: Some("global".into()),
+            })
+            .unwrap();
 
         std::env::remove_var("BLACKBOX_GLOBAL_CLAUDE_MD");
         std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD");
         std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD");
 
         assert!(report.contains("Absorbed 0"), "report: {report}");
-        assert!(kb.store.entries.iter().all(|e| e.approval != Approval::Imported));
+        assert!(
+            kb.store
+                .entries
+                .iter()
+                .all(|e| e.approval != Approval::Imported)
+        );
     }
 
     #[test]
@@ -1920,78 +2073,88 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
     #[test]
     fn decide_requires_rationale() {
         let (_t, mut kb) = mk_kb();
-        let e = kb.decide(
-            &DecideParams {
-                content: "use Tokio runtime everywhere".into(),
-                rationale: "  ".into(),
-                supersedes: None,
-                title: None,
-                scope: None,
-                project: None,
-                priority: None,
-                render: None,
-            },
-            false,
-        ).unwrap_err();
+        let e = kb
+            .decide(
+                &DecideParams {
+                    content: "use Tokio runtime everywhere".into(),
+                    rationale: "  ".into(),
+                    supersedes: None,
+                    title: None,
+                    scope: None,
+                    project: None,
+                    priority: None,
+                    render: None,
+                },
+                false,
+            )
+            .unwrap_err();
         assert!(e.to_string().contains("rationale"));
     }
 
     #[test]
     fn decide_supersedes_marks_prior() {
         let (_t, mut kb) = mk_kb();
-        let r1 = kb.decide(
-            &DecideParams {
-                content: "use SQLite for the cache".into(),
-                rationale: "zero ops, fits in proc".into(),
-                supersedes: None,
-                title: None,
-                scope: None,
-                project: None,
-                priority: None,
-                render: None,
-            },
-            false,
-        ).unwrap();
+        let r1 = kb
+            .decide(
+                &DecideParams {
+                    content: "use SQLite for the cache".into(),
+                    rationale: "zero ops, fits in proc".into(),
+                    supersedes: None,
+                    title: None,
+                    scope: None,
+                    project: None,
+                    priority: None,
+                    render: None,
+                },
+                false,
+            )
+            .unwrap();
         // "Decided entry <id>"
         let old_id = r1.trim_start_matches("Decided entry ").to_string();
 
-        let r2 = kb.decide(
-            &DecideParams {
-                content: "use RocksDB for the cache".into(),
-                rationale: "SQLite locking conflicted with concurrent writers".into(),
-                supersedes: Some(old_id.clone()),
-                title: None,
-                scope: None,
-                project: None,
-                priority: None,
-                render: None,
-            },
-            false,
-        ).unwrap();
+        let r2 = kb
+            .decide(
+                &DecideParams {
+                    content: "use RocksDB for the cache".into(),
+                    rationale: "SQLite locking conflicted with concurrent writers".into(),
+                    supersedes: Some(old_id.clone()),
+                    title: None,
+                    scope: None,
+                    project: None,
+                    priority: None,
+                    render: None,
+                },
+                false,
+            )
+            .unwrap();
         assert!(r2.contains(&format!("supersedes {old_id}")));
 
         let old = kb.store.entries.iter().find(|e| e.id == old_id).unwrap();
         assert_eq!(old.status, Status::Superseded);
-        assert!(old.supersedes.is_some(), "old entry should now point at successor");
+        assert!(
+            old.supersedes.is_some(),
+            "old entry should now point at successor"
+        );
     }
 
     #[test]
     fn decide_supersedes_missing_rejected() {
         let (_t, mut kb) = mk_kb();
-        let e = kb.decide(
-            &DecideParams {
-                content: "x".into(),
-                rationale: "y".into(),
-                supersedes: Some("no-such-id".into()),
-                title: None,
-                scope: None,
-                project: None,
-                priority: None,
-                render: None,
-            },
-            false,
-        ).unwrap_err();
+        let e = kb
+            .decide(
+                &DecideParams {
+                    content: "x".into(),
+                    rationale: "y".into(),
+                    supersedes: Some("no-such-id".into()),
+                    title: None,
+                    scope: None,
+                    project: None,
+                    priority: None,
+                    render: None,
+                },
+                false,
+            )
+            .unwrap_err();
         assert!(e.to_string().contains("not found"));
     }
 }
-

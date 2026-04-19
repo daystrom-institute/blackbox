@@ -117,7 +117,12 @@ pub fn list_brofiles(scope: &str, store_dir: &Path, project_dir: Option<&str>) -
     result
 }
 
-pub fn delete_brofile(name: &str, scope: &str, store_dir: &Path, project_dir: Option<&str>) -> bool {
+pub fn delete_brofile(
+    name: &str,
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> bool {
     let dir = if scope == "project" {
         project_brofiles_dir(Path::new(project_dir.unwrap_or(".")))
     } else {
@@ -220,9 +225,18 @@ mod tests {
             effort: None,
             filters: None,
         };
-        save_brofile(&project_bf, "project", store.path(), Some(project.path().to_str().unwrap()));
+        save_brofile(
+            &project_bf,
+            "project",
+            store.path(),
+            Some(project.path().to_str().unwrap()),
+        );
 
-        let resolved = resolve_brofile("worker", store.path(), Some(project.path().to_str().unwrap()));
+        let resolved = resolve_brofile(
+            "worker",
+            store.path(),
+            Some(project.path().to_str().unwrap()),
+        );
         assert!(resolved.is_some());
         assert_eq!(resolved.unwrap().provider, Provider::Codex);
     }
@@ -234,7 +248,11 @@ mod tests {
             let bf = Brofile {
                 name: name.to_string(),
                 provider: Provider::Claude,
-                account: None, lens: None, model: None, effort: None, filters: None,
+                account: None,
+                lens: None,
+                model: None,
+                effort: None,
+                filters: None,
             };
             save_brofile(&bf, "global", dir.path(), None);
         }
@@ -250,7 +268,11 @@ mod tests {
         let bf = Brofile {
             name: "to_delete".into(),
             provider: Provider::Gemini,
-            account: None, lens: None, model: None, effort: None, filters: None,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: None,
         };
         save_brofile(&bf, "global", dir.path(), None);
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
@@ -262,11 +284,15 @@ mod tests {
     fn test_config_accounts() {
         let dir = temp_store();
         let mut config = load_config(dir.path());
-        config.accounts.insert("work".into(), Account {
-            env: Some(HashMap::from([
-                ("CLAUDE_HOME".into(), "/home/user/.claude-work".into()),
-            ])),
-        });
+        config.accounts.insert(
+            "work".into(),
+            Account {
+                env: Some(HashMap::from([(
+                    "CLAUDE_HOME".into(),
+                    "/home/user/.claude-work".into(),
+                )])),
+            },
+        );
         save_config(&config, dir.path());
 
         let loaded = load_config(dir.path());

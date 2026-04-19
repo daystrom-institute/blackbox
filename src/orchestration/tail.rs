@@ -49,7 +49,6 @@ impl TailEvent {
             | TailEvent::TaskCancelled { task_id, .. } => task_id,
         }
     }
-
 }
 
 #[cfg(test)]
