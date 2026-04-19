@@ -61,15 +61,41 @@ pub struct CompileParams {
     pub project: Option<String>,
 }
 
+/// Apply modes. `First` returns the first matching rule (classification
+/// use case); `All` returns all findings + aggregate verdict (review use
+/// case). Typed enum instead of a `String` field per the project's
+/// stringly-typed-avoidance convention — bros called this out in the
+/// phase-2 review and they were right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, strum::EnumString, strum::AsRefStr)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum ApplyMode {
+    First,
+    All,
+}
+
+impl Default for ApplyMode {
+    fn default() -> Self {
+        ApplyMode::First
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ApplyParams {
     /// Packet ID. Canonical `packet-<8hex>`; bare 8-hex accepted as fallback.
     #[schemars(regex(pattern = r"^(packet-)?[0-9a-f]{8}$"))]
     pub packet_id: String,
     /// Entity to evaluate, as a flat JSON object of field → value. Rules
-    /// evaluate top-to-bottom; first matching antecedent wins. If no rule
-    /// matches, `consequent` is null.
+    /// evaluate top-to-bottom; first matching antecedent wins by default.
+    /// If no rule matches, `consequent` is null.
     pub entity: serde_json::Value,
+    /// `"first"` (default) returns only the first matching rule; `"all"`
+    /// evaluates every rule independently and returns all findings plus
+    /// an aggregate verdict (Fail > Flag > Manual > Pass > Info). Use
+    /// `"all"` for review-style workflows where multiple flags should
+    /// surface in a single pass.
+    #[serde(default)]
+    pub mode: Option<ApplyMode>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -85,21 +111,46 @@ pub struct AuditParams {
 // ── Value (consequent + entity field type) ───────────────────────
 
 /// Field values. Serialized untagged so packets read cleanly:
-/// `"ALLOW"`, `42`, `true`. Ordering is defined for BTreeMap storage
-/// of lookup tables only.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// `"ALLOW"`, `42`, `true`. PartialEq over floats uses bitwise equality
+/// on f64 bits to satisfy Eq/Ord bounds; rule predicates use the
+/// numeric comparison ops (`Ge`/`Gt`/`Le`/`Lt`/`GeF`/`GtF`/...) rather
+/// than reaching for Eq on a float anyway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
     Bool(bool),
     Int(i64),
+    Float(f64),
     String(String),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Bool(a), Bool(b)) => a == b,
+            (Int(a), Int(b)) => a == b,
+            (String(a), String(b)) => a == b,
+            (Float(a), Float(b)) => a.to_bits() == b.to_bits(),
+            // Cross-numeric: treat 1 == 1.0 as equal to keep rule Eq
+            // predicates useful when JSON round-trips widen int → float.
+            (Int(a), Float(b)) | (Float(b), Int(a)) => (*a as f64) == *b,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
     fn from_json(v: &serde_json::Value) -> Option<Value> {
         match v {
             serde_json::Value::Bool(b) => Some(Value::Bool(*b)),
-            serde_json::Value::Number(n) => n.as_i64().map(Value::Int),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Some(Value::Int(i))
+                } else {
+                    n.as_f64().map(Value::Float)
+                }
+            }
             serde_json::Value::String(s) => Some(Value::String(s.clone())),
             _ => None,
         }
@@ -111,6 +162,18 @@ impl Value {
 /// The canonical predicate vocabulary. Rule antecedents are trees of
 /// these nodes; evaluation is a pure function of `(node, entity)`. The
 /// serde tag `op` matches the JSON form produced in E11.
+///
+/// Phase-2 additions (convergent adversarial-bro feedback from
+/// thread-0b20e854):
+/// - Applicability: `IsPresent`, `IsAbsent` — gate rules on whether a
+///   field is even present in the entity, eliminating the
+///   zero-conflated-with-null bug class.
+/// - Field-vs-field comparison: `FieldEq`, `FieldGt/Ge/Lt/Le` — compare
+///   two entity fields directly instead of a field against a literal.
+///   Lets structural rules like "tools added > tool docs added" express
+///   cleanly without hardcoding a constant.
+/// - Float comparison: `GeF`, `GtF`, `LeF`, `LtF` — real-valued
+///   predicates for coverage percentages, confidence scores, rates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub enum Predicate {
@@ -121,8 +184,65 @@ pub enum Predicate {
     Gt { field: String, value: i64 },
     Le { field: String, value: i64 },
     Lt { field: String, value: i64 },
+    /// `entity[field] >= value` (float)
+    GeF { field: String, value: f64 },
+    GtF { field: String, value: f64 },
+    LeF { field: String, value: f64 },
+    LtF { field: String, value: f64 },
+    /// **DEPRECATED.** Applicability predicate that collapses missing
+    /// and null into one state — the bugs both adversarial-review bros
+    /// caught in phase-2. Retained at deserialize time so phase-2
+    /// packets on disk still evaluate, but new rules should use
+    /// `IsNonNull` (same semantics, honest name) instead. A future
+    /// phase will delete this variant after in-flight packets are
+    /// migrated; the evaluator emits a `tracing::warn!` on each use.
+    IsPresent { field: String },
+    /// **DEPRECATED.** Complement of `IsPresent`; fires on either
+    /// missing OR null — a trap both bros flagged. Use `IsMissing`
+    /// (key absent) or `IsNull` (key present, value null) for precise
+    /// semantics. Deletion scheduled after phase-3 migration.
+    IsAbsent { field: String },
+    /// Tri-state applicability (phase-2.5, added per adversarial-review
+    /// convergent critique on thread-cc7ff97d): JSON distinguishes
+    /// `{}` (key missing) from `{x: null}` (key present, value null).
+    /// `null` typically means "known non-applicable"; missing means
+    /// "not computed / extractor failed." The tri-state predicates
+    /// preserve that distinction where `IsPresent` destroys it.
+    ///
+    /// - `KeyExists` — key exists regardless of value (null or otherwise)
+    /// - `IsNull`    — key exists AND value is the JSON `null` literal
+    /// - `IsNonNull` — key exists AND value is NOT null (what the old
+    ///                 `IsPresent` did)
+    /// - `IsMissing` — key does not exist in the entity at all
+    KeyExists { field: String },
+    IsNull { field: String },
+    IsNonNull { field: String },
+    IsMissing { field: String },
+    /// Cross-field comparison (integer). `entity[lhs_field] OP entity[rhs_field]`.
+    /// Returns false when either side is missing or non-integer.
+    FieldEq {
+        lhs_field: String,
+        rhs_field: String,
+    },
+    FieldGt {
+        lhs_field: String,
+        rhs_field: String,
+    },
+    FieldGe {
+        lhs_field: String,
+        rhs_field: String,
+    },
+    FieldLt {
+        lhs_field: String,
+        rhs_field: String,
+    },
+    FieldLe {
+        lhs_field: String,
+        rhs_field: String,
+    },
     /// Common auth-style pattern: `entity[rank_field] >= entity[threshold_field]`.
-    /// Field values must be integers after lookup-table resolution.
+    /// Field values must be integers after lookup-table resolution. Kept as a
+    /// named alias for the rank-threshold idiom that predates FieldGe.
     RankGeFieldThreshold {
         rank_field: String,
         threshold_field: String,
@@ -136,6 +256,91 @@ pub enum Predicate {
     AlwaysFalse {},
 }
 
+// ── Severity ──────────────────────────────────────────────────────
+
+/// First-class rule severity. Lives on the `Rule` so the engine can
+/// aggregate, sort, and threshold mechanically instead of parsing
+/// severity out of the consequent string.
+///
+/// Aggregation precedence (used by `bbox_apply` mode="all" verdict):
+/// Fail > Flag > Manual > Pass > Info.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum Severity {
+    Fail,
+    Flag,
+    Manual,
+    Pass,
+    Info,
+}
+
+impl Severity {
+    /// Ordering for aggregate verdict computation. Higher rank wins.
+    fn rank(self) -> u8 {
+        match self {
+            Severity::Fail => 5,
+            Severity::Flag => 4,
+            Severity::Manual => 3,
+            Severity::Pass => 2,
+            Severity::Info => 1,
+        }
+    }
+}
+
+impl Default for Severity {
+    fn default() -> Self {
+        Severity::Info
+    }
+}
+
+/// Infer a severity from the rule ID when the caller didn't specify one.
+/// Prefix convention makes rule ordering auditable: `fail_*`, `flag_*`,
+/// `manual_*`, `pass_*` map to matching severities. Unrecognized prefixes
+/// fall through to `Info`.
+fn infer_severity_from_id(id: &str) -> Severity {
+    if id.starts_with("fail_") || id.starts_with("fail-") {
+        Severity::Fail
+    } else if id.starts_with("flag_") || id.starts_with("flag-") {
+        Severity::Flag
+    } else if id.starts_with("manual_")
+        || id.starts_with("manual-")
+        || id.starts_with("review_")
+        || id.starts_with("review-")
+    {
+        Severity::Manual
+    } else if id.starts_with("pass_") || id.starts_with("pass-") {
+        Severity::Pass
+    } else {
+        Severity::Info
+    }
+}
+
+// ── Emit (rule firing semantics in apply_all) ────────────────────
+
+/// How a rule participates in `apply_all` evaluation. Addresses the
+/// phase-2 bug where a `pass_all_clean` with `{op: True}` fired
+/// alongside real findings — `Fallback` rules are evaluated only when
+/// no `Independent` rule fired, which is the correct semantics for a
+/// catchall that should disappear when real findings exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum Emit {
+    /// Default: rule fires whenever its antecedent matches.
+    Independent,
+    /// Catchall / default-case rule. In `apply_all`, fires ONLY when no
+    /// `Independent` rule fired. In `apply_first`, behaves like any
+    /// other rule (first-match-wins ordering still applies).
+    Fallback,
+}
+
+impl Default for Emit {
+    fn default() -> Self {
+        Emit::Independent
+    }
+}
+
 // ── Rule ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,10 +348,60 @@ pub struct Rule {
     pub id: String,
     pub antecedent: Predicate,
     pub consequent: Value,
+    /// First-class severity. If omitted at compile time, inferred from the
+    /// id prefix (`fail_*` → Fail, `flag_*` → Flag, `manual_*`/`review_*` →
+    /// Manual, `pass_*` → Pass, otherwise Info). Inference runs only when
+    /// the caller's input lacked a severity field; explicit `severity:
+    /// "info"` is preserved. This is what Codex's phase-2 review caught
+    /// as a bug — the v3 compile loop upgraded every Info to the prefix-
+    /// inferred value, erasing explicit "info". Phase-2.5 fix: RuleInput
+    /// carries `Option<Severity>` and inference only runs on `None`.
+    #[serde(default)]
+    pub severity: Severity,
+    /// Firing semantics in `apply_all`. Default: Independent. Set to
+    /// Fallback on catchall rules (e.g. `pass_all_clean`) so they only
+    /// emit findings when no real rule matched.
+    #[serde(default)]
+    pub emit: Emit,
     #[serde(default = "default_confidence")]
     pub confidence: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<String>,
+}
+
+/// Rules-as-authored. Uses `Option<Severity>` so we can distinguish
+/// "caller said nothing" (infer from id) from "caller said Info"
+/// (preserve). Converted to `Rule` in `compile`.
+#[derive(Debug, Clone, Deserialize)]
+struct RuleInput {
+    id: String,
+    antecedent: Predicate,
+    consequent: Value,
+    #[serde(default)]
+    severity: Option<Severity>,
+    #[serde(default)]
+    emit: Option<Emit>,
+    #[serde(default = "default_confidence")]
+    confidence: f32,
+    #[serde(default)]
+    provenance: Vec<String>,
+}
+
+impl RuleInput {
+    fn materialize(self) -> Rule {
+        let severity = self
+            .severity
+            .unwrap_or_else(|| infer_severity_from_id(&self.id));
+        Rule {
+            id: self.id,
+            antecedent: self.antecedent,
+            consequent: self.consequent,
+            severity,
+            emit: self.emit.unwrap_or_default(),
+            confidence: self.confidence,
+            provenance: self.provenance,
+        }
+    }
 }
 
 fn default_confidence() -> f32 {
@@ -207,6 +462,22 @@ pub struct Prediction {
     pub rule_id: String,
     pub consequent: Value,
     pub confidence: f32,
+    /// Severity of the rule that fired. Lets callers group/filter findings
+    /// mechanically (especially in `apply_all` mode where multiple rules
+    /// fire simultaneously and a reviewer wants all FAILs first).
+    #[serde(default)]
+    pub severity: Severity,
+}
+
+/// Result of `bbox_apply` in mode="all" — every rule whose antecedent
+/// holds emits a finding. `verdict` is the aggregate severity computed
+/// from the findings via Fail > Flag > Manual > Pass > Info precedence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyAllResult {
+    pub packet_id: String,
+    pub findings: Vec<Prediction>,
+    /// Aggregate verdict. `null` when no rule matched at all.
+    pub verdict: Option<Severity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,7 +544,36 @@ fn entity_int(entity: &serde_json::Map<String, serde_json::Value>, field: &str) 
     entity.get(field).and_then(|v| v.as_i64())
 }
 
-/// Evaluate a predicate against a resolved entity. Pure function.
+fn entity_f64(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> Option<f64> {
+    entity.get(field).and_then(|v| v.as_f64())
+}
+
+fn entity_has(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
+    // `IsPresent` semantics: the field exists in the map AND is not the JSON
+    // null literal. Collapses missing and null — preserved for backward
+    // compat with phase-2 packets. Rules that need to distinguish should
+    // use the tri-state predicates (`KeyExists`, `IsNull`, `IsNonNull`,
+    // `IsMissing`) instead.
+    match entity.get(field) {
+        None => false,
+        Some(serde_json::Value::Null) => false,
+        Some(_) => true,
+    }
+}
+
+fn entity_key_exists(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
+    entity.contains_key(field)
+}
+
+fn entity_is_null(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
+    matches!(entity.get(field), Some(serde_json::Value::Null))
+}
+
+/// Evaluate a predicate against a resolved entity. Pure function — no
+/// I/O, no LLM, no side effects. Cross-field and applicability
+/// predicates return `false` on missing / malformed inputs rather than
+/// panicking or erroring; the caller can audit applicability via
+/// `IsPresent` / `IsAbsent` guards in composite rules.
 fn eval_predicate(
     p: &Predicate,
     entity: &serde_json::Map<String, serde_json::Value>,
@@ -293,6 +593,66 @@ fn eval_predicate(
         }
         Predicate::Lt { field, value } => {
             entity_int(entity, field).map(|v| v < *value).unwrap_or(false)
+        }
+        Predicate::GeF { field, value } => {
+            entity_f64(entity, field).map(|v| v >= *value).unwrap_or(false)
+        }
+        Predicate::GtF { field, value } => {
+            entity_f64(entity, field).map(|v| v > *value).unwrap_or(false)
+        }
+        Predicate::LeF { field, value } => {
+            entity_f64(entity, field).map(|v| v <= *value).unwrap_or(false)
+        }
+        Predicate::LtF { field, value } => {
+            entity_f64(entity, field).map(|v| v < *value).unwrap_or(false)
+        }
+        Predicate::IsPresent { field } => {
+            tracing::warn!(
+                field,
+                "packets: IsPresent is deprecated (collapses missing+null); use IsNonNull for same semantics"
+            );
+            entity_has(entity, field)
+        }
+        Predicate::IsAbsent { field } => {
+            tracing::warn!(
+                field,
+                "packets: IsAbsent is deprecated (fires on missing OR null — ambiguous); use IsMissing or IsNull for precise semantics"
+            );
+            !entity_has(entity, field)
+        }
+        Predicate::KeyExists { field } => entity_key_exists(entity, field),
+        Predicate::IsNull { field } => entity_is_null(entity, field),
+        Predicate::IsNonNull { field } => entity_has(entity, field),
+        Predicate::IsMissing { field } => !entity_key_exists(entity, field),
+        Predicate::FieldEq { lhs_field, rhs_field } => {
+            match (entity_get(entity, lhs_field), entity_get(entity, rhs_field)) {
+                (Some(l), Some(r)) => l == r,
+                _ => false,
+            }
+        }
+        Predicate::FieldGt { lhs_field, rhs_field } => {
+            match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
+                (Some(l), Some(r)) => l > r,
+                _ => false,
+            }
+        }
+        Predicate::FieldGe { lhs_field, rhs_field } => {
+            match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
+                (Some(l), Some(r)) => l >= r,
+                _ => false,
+            }
+        }
+        Predicate::FieldLt { lhs_field, rhs_field } => {
+            match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
+                (Some(l), Some(r)) => l < r,
+                _ => false,
+            }
+        }
+        Predicate::FieldLe { lhs_field, rhs_field } => {
+            match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
+                (Some(l), Some(r)) => l <= r,
+                _ => false,
+            }
         }
         Predicate::RankGeFieldThreshold {
             rank_field,
@@ -321,10 +681,87 @@ pub fn apply(packet: &Packet, entity: &serde_json::Value) -> Option<Prediction> 
                 rule_id: rule.id.clone(),
                 consequent: rule.consequent.clone(),
                 confidence: rule.confidence,
+                severity: rule.severity,
             });
         }
     }
     None
+}
+
+/// Evaluate every rule independently against an entity. Returns all
+/// findings in packet-declared order plus an aggregate verdict. This is
+/// the right semantic for review workflows where multiple FLAGs should
+/// surface in a single pass — see the adversarial-review notes on
+/// thread-0b20e854 and thread-cc7ff97d for the motivating critiques.
+///
+/// Two-pass semantics (phase-2.5 addition per Codex's proposed
+/// mechanism): evaluate `Independent` rules first; evaluate `Fallback`
+/// rules only when no `Independent` rule matched. This fixes the
+/// pass_all_clean-fires-alongside-FAILs bug without special-casing the
+/// severity enum. A catchall PASS rule authored as `emit: "fallback"`
+/// now vanishes automatically when any real finding exists.
+pub fn apply_all(packet: &Packet, entity: &serde_json::Value) -> ApplyAllResult {
+    let entity_obj = match entity.as_object() {
+        Some(o) => o,
+        None => {
+            return ApplyAllResult {
+                packet_id: packet.id.clone(),
+                findings: Vec::new(),
+                verdict: None,
+            };
+        }
+    };
+    let resolved = resolve_entity(packet, entity_obj);
+
+    let independent_findings: Vec<Prediction> = packet
+        .rules
+        .iter()
+        .filter(|rule| rule.emit == Emit::Independent)
+        .filter(|rule| eval_predicate(&rule.antecedent, &resolved))
+        .map(|rule| Prediction {
+            rule_id: rule.id.clone(),
+            consequent: rule.consequent.clone(),
+            confidence: rule.confidence,
+            severity: rule.severity,
+        })
+        .collect();
+
+    // Fallback rules fire only when NO Independent rule fired. This is
+    // what makes a `pass_all_clean` catchall do the right thing in
+    // mode="all" without polluting the findings list when real issues
+    // surfaced.
+    let fallback_findings: Vec<Prediction> = if independent_findings.is_empty() {
+        packet
+            .rules
+            .iter()
+            .filter(|rule| rule.emit == Emit::Fallback)
+            .filter(|rule| eval_predicate(&rule.antecedent, &resolved))
+            .map(|rule| Prediction {
+                rule_id: rule.id.clone(),
+                consequent: rule.consequent.clone(),
+                confidence: rule.confidence,
+                severity: rule.severity,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let findings: Vec<Prediction> = independent_findings
+        .into_iter()
+        .chain(fallback_findings)
+        .collect();
+
+    let verdict = findings
+        .iter()
+        .map(|p| p.severity)
+        .max_by_key(|s| s.rank());
+
+    ApplyAllResult {
+        packet_id: packet.id.clone(),
+        findings,
+        verdict,
+    }
 }
 
 /// Apply packet to every entry in `dataset`. Dataset is a JSON array of
@@ -491,12 +928,19 @@ impl Packets {
             anyhow::bail!("'domain' is required and cannot be empty");
         }
 
-        let rules: Vec<Rule> = serde_json::from_value(p.rules.clone())
-            .context("'rules' must be a JSON array of {id, antecedent, consequent, confidence?, provenance?} objects")?;
+        // Deserialize into RuleInput (severity is `Option<Severity>` here),
+        // then materialize into Rule — inferring severity from the id
+        // prefix ONLY when the caller omitted it. Explicit `severity:
+        // "info"` is preserved, which fixes the phase-2 bug where the
+        // compile loop upgraded every Info to the prefix-inferred value.
+        let inputs: Vec<RuleInput> = serde_json::from_value(p.rules.clone())
+            .context("'rules' must be a JSON array of {id, antecedent, consequent, severity?, emit?, confidence?, provenance?} objects")?;
 
-        if rules.is_empty() {
+        if inputs.is_empty() {
             anyhow::bail!("'rules' cannot be empty — at least one rule required");
         }
+
+        let rules: Vec<Rule> = inputs.into_iter().map(RuleInput::materialize).collect();
 
         let rank_table: BTreeMap<String, i64> = match &p.rank_table {
             Some(v) => serde_json::from_value(v.clone())
@@ -555,20 +999,36 @@ impl Packets {
 
     pub fn apply_tool(&self, p: &ApplyParams) -> Result<String> {
         let packet = self.load(&p.packet_id)?;
-        match apply(&packet, &p.entity) {
-            Some(prediction) => Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "packet_id": packet.id,
-                "match": true,
-                "rule_id": prediction.rule_id,
-                "consequent": prediction.consequent,
-                "confidence": prediction.confidence,
-            }))?),
-            None => Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "packet_id": packet.id,
-                "match": false,
-                "consequent": serde_json::Value::Null,
-                "note": "no rule's antecedent matched the entity",
-            }))?),
+        let mode = p.mode.unwrap_or_default();
+        match mode {
+            ApplyMode::First => match apply(&packet, &p.entity) {
+                Some(prediction) => Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "packet_id": packet.id,
+                    "mode": mode,
+                    "match": true,
+                    "rule_id": prediction.rule_id,
+                    "severity": prediction.severity,
+                    "consequent": prediction.consequent,
+                    "confidence": prediction.confidence,
+                }))?),
+                None => Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "packet_id": packet.id,
+                    "mode": mode,
+                    "match": false,
+                    "consequent": serde_json::Value::Null,
+                    "note": "no rule's antecedent matched the entity",
+                }))?),
+            },
+            ApplyMode::All => {
+                let result = apply_all(&packet, &p.entity);
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "packet_id": result.packet_id,
+                    "mode": mode,
+                    "findings": result.findings,
+                    "verdict": result.verdict,
+                    "finding_count": result.findings.len(),
+                }))?)
+            }
         }
     }
 
@@ -664,6 +1124,8 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("DENY".into()),
+                severity: Severity::Info,
+                emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
             },
@@ -686,6 +1148,8 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("DENY".into()),
+                severity: Severity::Info,
+                emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
             },
@@ -709,6 +1173,8 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("DENY".into()),
+                severity: Severity::Info,
+                emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
             },
@@ -731,6 +1197,8 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("DENY".into()),
+                severity: Severity::Info,
+                emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
             },
@@ -753,6 +1221,8 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("ALLOW".into()),
+                severity: Severity::Info,
+                emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
             },
@@ -764,6 +1234,8 @@ mod tests {
                     value: Value::String("GET".into()),
                 },
                 consequent: Value::String("ALLOW".into()),
+                severity: Severity::Info,
+                emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
             },
@@ -775,6 +1247,8 @@ mod tests {
                     threshold_field: "res_threshold".into(),
                 },
                 consequent: Value::String("ALLOW".into()),
+                severity: Severity::Info,
+                emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
             },
@@ -783,6 +1257,8 @@ mod tests {
                 id: "default_deny".into(),
                 antecedent: Predicate::AlwaysTrue {},
                 consequent: Value::String("DENY".into()),
+                severity: Severity::Info,
+                emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
             },
@@ -1019,6 +1495,7 @@ mod tests {
                 "method": "GET",
                 "resource": "team",
             }),
+            mode: None,
         };
         let out = store.apply_tool(&apply_params).unwrap();
         assert!(out.contains("\"consequent\": \"DENY\""));
@@ -1071,6 +1548,7 @@ mod tests {
             .apply_tool(&ApplyParams {
                 packet_id: "packet-deadbeef".into(),
                 entity: json!({}),
+                mode: None,
             })
             .unwrap_err()
             .to_string();
@@ -1093,5 +1571,500 @@ mod tests {
         let p: Predicate = serde_json::from_value(json_rule.clone()).unwrap();
         let back = serde_json::to_value(&p).unwrap();
         assert_eq!(back, json_rule);
+    }
+
+    // ── Phase 2 tests: applicability, field-vs-field, float, severity, evaluate-all ──
+
+    fn bare_packet(rules: Vec<Rule>) -> Packet {
+        let now = Packets::now_iso();
+        Packet {
+            id: "packet-phase2t".into(),
+            domain: "phase2-test".into(),
+            scope: "global".into(),
+            project: None,
+            rank_table: BTreeMap::new(),
+            threshold_table: BTreeMap::new(),
+            rank_lookup_key: "role".into(),
+            threshold_lookup_key: "resource".into(),
+            rules,
+            source_ids: vec![],
+            self_audit_fidelity: None,
+            created_at: now.clone(),
+            updated_at: now,
+            superseded_by: None,
+            merged_from: vec![],
+        }
+    }
+
+    fn rule(id: &str, antecedent: Predicate, consequent: &str, sev: Severity) -> Rule {
+        Rule {
+            id: id.into(),
+            antecedent,
+            consequent: Value::String(consequent.into()),
+            severity: sev,
+            emit: Emit::Independent,
+            confidence: 1.0,
+            provenance: vec![],
+        }
+    }
+
+    fn fallback_rule(id: &str, antecedent: Predicate, consequent: &str, sev: Severity) -> Rule {
+        Rule {
+            id: id.into(),
+            antecedent,
+            consequent: Value::String(consequent.into()),
+            severity: sev,
+            emit: Emit::Fallback,
+            confidence: 1.0,
+            provenance: vec![],
+        }
+    }
+
+    #[test]
+    fn is_present_discriminates_from_zero() {
+        // The decisive phase-2 bug: rule said `Lt(tool_docs, 3)` fires on
+        // a "clean" entity where no docs were added AND no tools were
+        // added. IsPresent lets rules gate on applicability.
+        let p = bare_packet(vec![rule(
+            "fail_undocumented",
+            Predicate::All {
+                args: vec![
+                    Predicate::IsPresent { field: "mcp_tools_added".into() },
+                    Predicate::Gt { field: "mcp_tools_added".into(), value: 0 },
+                    Predicate::FieldLt {
+                        lhs_field: "tool_docs_stanzas_added".into(),
+                        rhs_field: "mcp_tools_added".into(),
+                    },
+                ],
+            },
+            "FAIL",
+            Severity::Fail,
+        )]);
+
+        // No tools added — rule must NOT fire even though
+        // tool_docs_stanzas_added=0 < some-constant.
+        let clean = json!({
+            "mcp_tools_added": 0,
+            "tool_docs_stanzas_added": 0,
+        });
+        assert!(apply(&p, &clean).is_none(), "clean entity must not fire");
+
+        // Tools added with too few docs — rule fires.
+        let undoc = json!({
+            "mcp_tools_added": 3,
+            "tool_docs_stanzas_added": 1,
+        });
+        let pred = apply(&p, &undoc).expect("should fire on undoc");
+        assert_eq!(pred.rule_id, "fail_undocumented");
+
+        // Tools added, docs match — no fire.
+        let ok = json!({
+            "mcp_tools_added": 3,
+            "tool_docs_stanzas_added": 3,
+        });
+        assert!(apply(&p, &ok).is_none(), "fully documented must not fire");
+    }
+
+    #[test]
+    fn is_absent_and_is_present_treat_null_as_absent() {
+        let present_rule = Predicate::IsPresent { field: "x".into() };
+        let absent_rule = Predicate::IsAbsent { field: "x".into() };
+
+        let p = bare_packet(vec![
+            rule("flag_present", present_rule, "HAS_X", Severity::Flag),
+        ]);
+
+        // Field missing: not present.
+        assert!(apply(&p, &json!({})).is_none());
+        // Field null: treated as absent (signal from data source).
+        assert!(apply(&p, &json!({"x": null})).is_none());
+        // Field with real value: present.
+        assert!(apply(&p, &json!({"x": 42})).is_some());
+        assert!(apply(&p, &json!({"x": "foo"})).is_some());
+        assert!(apply(&p, &json!({"x": false})).is_some()); // bool false is still present
+
+        // IsAbsent is the exact complement
+        let ap = bare_packet(vec![rule("flag_absent", absent_rule, "NO_X", Severity::Flag)]);
+        assert!(apply(&ap, &json!({})).is_some(), "missing field → absent → fire");
+        assert!(apply(&ap, &json!({"x": null})).is_some(), "null → absent → fire");
+        assert!(apply(&ap, &json!({"x": 1})).is_none(), "present → no fire");
+    }
+
+    #[test]
+    fn field_comparisons_work_across_all_ops() {
+        let cases: &[(Predicate, &str, serde_json::Value, bool)] = &[
+            (Predicate::FieldEq { lhs_field: "a".into(), rhs_field: "b".into() },
+                "eq-hit", json!({"a": 5, "b": 5}), true),
+            (Predicate::FieldEq { lhs_field: "a".into(), rhs_field: "b".into() },
+                "eq-miss", json!({"a": 5, "b": 6}), false),
+            (Predicate::FieldGt { lhs_field: "a".into(), rhs_field: "b".into() },
+                "gt-hit", json!({"a": 10, "b": 5}), true),
+            (Predicate::FieldGt { lhs_field: "a".into(), rhs_field: "b".into() },
+                "gt-eq", json!({"a": 5, "b": 5}), false),
+            (Predicate::FieldGe { lhs_field: "a".into(), rhs_field: "b".into() },
+                "ge-eq", json!({"a": 5, "b": 5}), true),
+            (Predicate::FieldLt { lhs_field: "a".into(), rhs_field: "b".into() },
+                "lt-hit", json!({"a": 1, "b": 5}), true),
+            (Predicate::FieldLe { lhs_field: "a".into(), rhs_field: "b".into() },
+                "le-eq", json!({"a": 5, "b": 5}), true),
+            // Missing field → false (no panic)
+            (Predicate::FieldGt { lhs_field: "a".into(), rhs_field: "b".into() },
+                "missing-a", json!({"b": 5}), false),
+        ];
+
+        for (pred, label, entity, expect_hit) in cases {
+            let p = bare_packet(vec![rule(label, pred.clone(), "HIT", Severity::Info)]);
+            let fired = apply(&p, entity).is_some();
+            assert_eq!(fired, *expect_hit, "case `{label}` failed; pred={pred:?}, entity={entity}");
+        }
+    }
+
+    #[test]
+    fn float_comparisons_work() {
+        let p = bare_packet(vec![
+            rule("fail_low_coverage", Predicate::LtF { field: "coverage_pct".into(), value: 80.0 },
+                 "FAIL: coverage below 80%", Severity::Fail),
+            rule("pass_high_coverage", Predicate::GeF { field: "coverage_pct".into(), value: 95.0 },
+                 "PASS: coverage above 95%", Severity::Pass),
+        ]);
+
+        let low = apply(&p, &json!({"coverage_pct": 73.5})).unwrap();
+        assert_eq!(low.rule_id, "fail_low_coverage");
+
+        let mid = apply(&p, &json!({"coverage_pct": 85.0}));
+        assert!(mid.is_none(), "mid coverage should match neither rule");
+
+        let high = apply(&p, &json!({"coverage_pct": 96.0})).unwrap();
+        assert_eq!(high.rule_id, "pass_high_coverage");
+    }
+
+    #[test]
+    fn severity_infers_from_id_prefix() {
+        assert_eq!(infer_severity_from_id("fail_warnings"), Severity::Fail);
+        assert_eq!(infer_severity_from_id("flag_readonly_fs"), Severity::Flag);
+        assert_eq!(infer_severity_from_id("manual_review_security"), Severity::Manual);
+        assert_eq!(infer_severity_from_id("review_contract"), Severity::Manual);
+        assert_eq!(infer_severity_from_id("pass_all_clean"), Severity::Pass);
+        assert_eq!(infer_severity_from_id("miscellaneous"), Severity::Info);
+    }
+
+    #[test]
+    fn severity_serde_lowercase() {
+        // Round-trip through JSON.
+        let s = Severity::Fail;
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json, json!("fail"));
+        let back: Severity = serde_json::from_value(json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn rule_deserializes_without_severity_for_backcompat() {
+        // Old packets on disk lack the severity field. They must still
+        // deserialize with severity=Info default. Old packet-890e057d
+        // from thread-0b20e854 was produced before severity existed.
+        let old_json = json!({
+            "id": "fail_warnings",
+            "antecedent": {"op": "Gt", "field": "new_warnings", "value": 0},
+            "consequent": "FAIL",
+            "confidence": 1.0
+        });
+        let r: Rule = serde_json::from_value(old_json).unwrap();
+        assert_eq!(r.severity, Severity::Info); // default
+        assert_eq!(r.id, "fail_warnings");
+    }
+
+    #[test]
+    fn compile_infers_severity_from_id() {
+        let (_dir, store) = tmp_packets();
+        let params = CompileParams {
+            domain: "severity-test".into(),
+            rules: json!([
+                {"id": "fail_a", "antecedent": {"op": "True"}, "consequent": "FAIL"},
+                {"id": "flag_b", "antecedent": {"op": "True"}, "consequent": "FLAG"},
+                {"id": "manual_c", "antecedent": {"op": "True"}, "consequent": "MANUAL"},
+                {"id": "pass_d", "antecedent": {"op": "True"}, "consequent": "PASS"},
+                // Explicit severity survives — even though id prefix would say Info
+                {"id": "misc_e", "severity": "fail", "antecedent": {"op": "True"}, "consequent": "EXPLICIT"},
+            ]),
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        store.compile(&params).unwrap();
+
+        let all = store.list_all().unwrap();
+        let packet = &all[0];
+        let severities: Vec<Severity> = packet.rules.iter().map(|r| r.severity).collect();
+        assert_eq!(
+            severities,
+            vec![
+                Severity::Fail,   // inferred from fail_
+                Severity::Flag,   // inferred from flag_
+                Severity::Manual, // inferred from manual_
+                Severity::Pass,   // inferred from pass_
+                Severity::Fail,   // explicit "fail" beats id-prefix inference
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_all_returns_every_matching_rule() {
+        // The critical phase-2 semantic: apply_all evaluates every rule,
+        // returns all findings, computes aggregate verdict. This is what
+        // the bros called for in thread-0b20e854.
+        let p = bare_packet(vec![
+            rule("fail_a", Predicate::AlwaysTrue {}, "FAIL: always", Severity::Fail),
+            rule("flag_b", Predicate::AlwaysTrue {}, "FLAG: always", Severity::Flag),
+            rule("flag_c", Predicate::Eq { field: "x".into(), value: Value::Int(1) },
+                 "FLAG: on x=1", Severity::Flag),
+            rule("pass_d", Predicate::AlwaysFalse {}, "PASS: never", Severity::Pass),
+        ]);
+
+        let result = apply_all(&p, &json!({"x": 1}));
+        let fired: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(fired, vec!["fail_a", "flag_b", "flag_c"], "every matching rule should appear");
+        assert_eq!(result.verdict, Some(Severity::Fail), "verdict = highest severity that fired");
+
+        // Entity where only the false rule fires → no findings, no verdict
+        let empty = apply_all(&p, &json!({"x": 99}));
+        let fired2: Vec<&str> = empty.findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(fired2, vec!["fail_a", "flag_b"]); // unconditional rules still fire
+    }
+
+    #[test]
+    fn apply_all_verdict_follows_severity_precedence() {
+        // Fail > Flag > Manual > Pass > Info
+        let fail_p = bare_packet(vec![
+            rule("pass_x", Predicate::AlwaysTrue {}, "PASS", Severity::Pass),
+            rule("manual_y", Predicate::AlwaysTrue {}, "MANUAL", Severity::Manual),
+            rule("flag_z", Predicate::AlwaysTrue {}, "FLAG", Severity::Flag),
+        ]);
+        assert_eq!(apply_all(&fail_p, &json!({})).verdict, Some(Severity::Flag));
+
+        let with_fail = bare_packet(vec![
+            rule("pass_x", Predicate::AlwaysTrue {}, "PASS", Severity::Pass),
+            rule("fail_y", Predicate::AlwaysTrue {}, "FAIL", Severity::Fail),
+            rule("info_z", Predicate::AlwaysTrue {}, "INFO", Severity::Info),
+        ]);
+        assert_eq!(apply_all(&with_fail, &json!({})).verdict, Some(Severity::Fail));
+
+        // Nothing fires
+        let nothing = bare_packet(vec![
+            rule("fail_never", Predicate::AlwaysFalse {}, "NOPE", Severity::Fail),
+        ]);
+        assert_eq!(apply_all(&nothing, &json!({})).verdict, None);
+    }
+
+    #[test]
+    fn apply_tool_all_mode_returns_aggregate() {
+        let (_dir, store) = tmp_packets();
+        let params = CompileParams {
+            domain: "all-mode-test".into(),
+            rules: json!([
+                {"id": "flag_a", "antecedent": {"op": "True"}, "consequent": "FLAG_A"},
+                {"id": "flag_b", "antecedent": {"op": "True"}, "consequent": "FLAG_B"},
+                {"id": "pass_c", "antecedent": {"op": "True"}, "consequent": "PASS"},
+            ]),
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        store.compile(&params).unwrap();
+        let all = store.list_all().unwrap();
+        let packet = &all[0];
+
+        let out = store
+            .apply_tool(&ApplyParams {
+                packet_id: packet.id.clone(),
+                entity: json!({}),
+                mode: Some(ApplyMode::All),
+            })
+            .unwrap();
+        assert!(out.contains("\"mode\": \"all\""));
+        assert!(out.contains("\"verdict\": \"flag\""));
+        assert!(out.contains("\"finding_count\": 3"));
+        assert!(out.contains("flag_a"));
+        assert!(out.contains("flag_b"));
+        assert!(out.contains("pass_c"));
+    }
+
+    #[test]
+    fn apply_mode_deserializes_invalid_string_as_error() {
+        // Phase-2.5: mode is now a typed enum, so invalid mode strings
+        // fail at JSON deserialization rather than reaching apply_tool.
+        let bad = json!({"packet_id": "packet-deadbeef", "entity": {}, "mode": "nonsense"});
+        let res: std::result::Result<ApplyParams, _> = serde_json::from_value(bad);
+        assert!(res.is_err(), "invalid mode string should fail deserialization");
+    }
+
+    #[test]
+    fn value_eq_across_int_and_float() {
+        // JSON serde can widen ints to floats on round-trip. Rules
+        // authored as `Eq{value: 5}` must still match `entity.x = 5.0`.
+        assert_eq!(Value::Int(5), Value::Float(5.0));
+        assert_eq!(Value::Float(5.0), Value::Int(5));
+        assert_ne!(Value::Int(5), Value::Int(6));
+        assert_ne!(Value::Float(5.0), Value::Float(6.0));
+    }
+
+    // ── Phase 2.5 tests (convergent adversarial-review fixes) ──
+
+    #[test]
+    fn tri_state_applicability_discriminates_null_vs_missing() {
+        let missing = json!({});                      // no key
+        let nulled = json!({"x": serde_json::Value::Null}); // key present, value null
+        let real = json!({"x": 42});                  // key present, real value
+
+        let key_exists = bare_packet(vec![rule("flag_ke", Predicate::KeyExists { field: "x".into() }, "KE", Severity::Flag)]);
+        let is_null = bare_packet(vec![rule("flag_null", Predicate::IsNull { field: "x".into() }, "NULL", Severity::Flag)]);
+        let is_non_null = bare_packet(vec![rule("flag_nn", Predicate::IsNonNull { field: "x".into() }, "NN", Severity::Flag)]);
+        let is_missing = bare_packet(vec![rule("flag_miss", Predicate::IsMissing { field: "x".into() }, "M", Severity::Flag)]);
+
+        // KeyExists: fires when key exists regardless of value
+        assert!(apply(&key_exists, &missing).is_none());
+        assert!(apply(&key_exists, &nulled).is_some());
+        assert!(apply(&key_exists, &real).is_some());
+
+        // IsNull: ONLY when key exists AND value is null
+        assert!(apply(&is_null, &missing).is_none());
+        assert!(apply(&is_null, &nulled).is_some());
+        assert!(apply(&is_null, &real).is_none());
+
+        // IsNonNull: fires when key exists with a non-null value
+        assert!(apply(&is_non_null, &missing).is_none());
+        assert!(apply(&is_non_null, &nulled).is_none());
+        assert!(apply(&is_non_null, &real).is_some());
+
+        // IsMissing: fires ONLY when key absent
+        assert!(apply(&is_missing, &missing).is_some());
+        assert!(apply(&is_missing, &nulled).is_none());
+        assert!(apply(&is_missing, &real).is_none());
+    }
+
+    #[test]
+    fn severity_info_explicitly_preserved_over_prefix_inference() {
+        // The phase-2 bug Codex caught: compile loop upgraded every Info
+        // from the id prefix, so explicit `severity: "info"` was erased.
+        let (_dir, store) = tmp_packets();
+        let params = CompileParams {
+            domain: "severity-preserve".into(),
+            rules: json!([
+                // Prefix says FAIL, but caller EXPLICITLY says Info — must preserve.
+                {"id": "fail_x", "severity": "info", "antecedent": {"op": "True"}, "consequent": "X"},
+                // No severity declared — infer from prefix.
+                {"id": "fail_y", "antecedent": {"op": "True"}, "consequent": "Y"},
+            ]),
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        store.compile(&params).unwrap();
+        let packet = &store.list_all().unwrap()[0];
+        assert_eq!(packet.rules[0].severity, Severity::Info, "explicit info must survive prefix inference");
+        assert_eq!(packet.rules[1].severity, Severity::Fail, "no severity declared → infer from prefix");
+    }
+
+    #[test]
+    fn fallback_rules_suppressed_when_independent_fires() {
+        // Phase-2.5d: Fallback rules fire ONLY when no Independent rule fired.
+        // This is how pass_all_clean ought to behave: disappear when real
+        // findings exist, present when nothing else has anything to say.
+        let p = bare_packet(vec![
+            rule("flag_x", Predicate::Eq { field: "trigger".into(), value: Value::Bool(true) }, "FLAG", Severity::Flag),
+            fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", Severity::Pass),
+        ]);
+
+        // Trigger fires — fallback is suppressed
+        let result = apply_all(&p, &json!({"trigger": true}));
+        let fired: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(fired, vec!["flag_x"], "fallback must be suppressed when Independent fires");
+        assert_eq!(result.verdict, Some(Severity::Flag));
+
+        // No trigger — fallback fires
+        let result = apply_all(&p, &json!({"trigger": false}));
+        let fired: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(fired, vec!["pass_catchall"], "fallback fires when no Independent matched");
+        assert_eq!(result.verdict, Some(Severity::Pass));
+    }
+
+    #[test]
+    fn fallback_ignored_in_first_mode() {
+        // In apply (mode="first"), emit is irrelevant — first-match-wins
+        // applies regardless. Fallback rules can still fire.
+        let p = bare_packet(vec![
+            rule("flag_x", Predicate::Eq { field: "a".into(), value: Value::Int(1) }, "FLAG_X", Severity::Flag),
+            fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", Severity::Pass),
+        ]);
+
+        // When flag_x matches, first-match-wins picks it
+        let pred = apply(&p, &json!({"a": 1})).unwrap();
+        assert_eq!(pred.rule_id, "flag_x");
+
+        // When flag_x doesn't match, pass_catchall (fallback) fires since we
+        // still walk the rule list top-to-bottom.
+        let pred = apply(&p, &json!({"a": 99})).unwrap();
+        assert_eq!(pred.rule_id, "pass_catchall");
+    }
+
+    #[test]
+    fn apply_mode_enum_serde_lowercase() {
+        assert_eq!(serde_json::to_value(&ApplyMode::First).unwrap(), json!("first"));
+        assert_eq!(serde_json::to_value(&ApplyMode::All).unwrap(), json!("all"));
+        let m: ApplyMode = serde_json::from_value(json!("all")).unwrap();
+        assert_eq!(m, ApplyMode::All);
+    }
+
+    #[test]
+    fn emit_default_is_independent() {
+        // Rule authored without `emit:` field gets Independent.
+        let rule_json = json!({
+            "id": "fail_x",
+            "antecedent": {"op": "True"},
+            "consequent": "X",
+        });
+        let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
+        let r = ri.materialize();
+        assert_eq!(r.emit, Emit::Independent);
+    }
+
+    #[test]
+    fn emit_fallback_deserializes() {
+        let rule_json = json!({
+            "id": "pass_clean",
+            "antecedent": {"op": "True"},
+            "consequent": "PASS",
+            "emit": "fallback",
+        });
+        let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
+        let r = ri.materialize();
+        assert_eq!(r.emit, Emit::Fallback);
+    }
+
+    #[test]
+    fn old_packets_without_emit_default_independent() {
+        // Backward compat: packets compiled before 2.5 lack `emit` on rules.
+        // They must deserialize with Emit::Independent default.
+        let old_rule = json!({
+            "id": "fail_x",
+            "antecedent": {"op": "True"},
+            "consequent": "X",
+            "severity": "fail",
+            "confidence": 1.0
+        });
+        let r: Rule = serde_json::from_value(old_rule).unwrap();
+        assert_eq!(r.emit, Emit::Independent);
     }
 }

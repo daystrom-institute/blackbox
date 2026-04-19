@@ -8,17 +8,80 @@ You have a body of structured observations — an authorization matrix, retry ta
 
 ## The compile → audit → apply loop
 
-1. **`bbox_compile(domain, rules, rank_table?, threshold_table?)`** — store the theory. Rules are ordered; first matching antecedent wins. Put anomalies before general rules. Predicate AST: `Eq{field,value}`, `Ge/Gt/Le/Lt{field,value}`, `RankGeFieldThreshold{rank_field,threshold_field}`, `All{args}`, `Any{args}`, `Not{arg}`, `True`, `False`.
+1. **`bbox_compile(domain, rules, rank_table?, threshold_table?)`** — store the theory. Rules are ordered; first-match-wins by default. Put anomalies before general rules.
 2. **`bbox_audit(packet_id, dataset)`** — apply the packet to every `{entity, expected}` pair; return fidelity + mismatches. **Run this before trusting predictions.** Fidelity < 1.0 means at least one rule over-generalizes; mismatches identify the exact rules and inputs.
-3. **`bbox_apply(packet_id, entity)`** — evaluate a single entity; return the first matching rule's consequent + rule_id + confidence.
+3. **`bbox_apply(packet_id, entity, mode?)`** — evaluate an entity. `mode="first"` (default) returns the first matching rule. `mode="all"` evaluates every rule independently and returns all findings plus an aggregate verdict — use this for review-style workflows where multiple findings should surface in a single pass.
+
+## Predicate AST
+
+**Integer & equality:**
+- `Eq{field, value}` — `entity[field] == value`
+- `Ge/Gt/Le/Lt{field, value}` — integer comparison
+
+**Float:**
+- `GeF/GtF/LeF/LtF{field, value}` — real-valued comparison (coverage %, rates, confidence scores)
+
+**Applicability — prefer the tri-state set for new rules:**
+- `KeyExists{field}` — key exists (value may be null)
+- `IsNull{field}` — key exists AND value is the JSON null literal (signals "known non-applicable")
+- `IsNonNull{field}` — key exists AND value is non-null
+- `IsMissing{field}` — key does not exist ("not computed / extractor failed")
+
+**Deprecated — do not use in new packets:**
+- `IsPresent{field}` — same as `IsNonNull` but dishonestly named; collapses missing+null
+- `IsAbsent{field}` — fires on either missing OR null, so semantically ambiguous; replace with `IsMissing` or `IsNull`
+
+The deprecated predicates still evaluate for backward compat, but the daemon logs a `tracing::warn!` on every use and they'll be removed after phase-3 migration.
+
+**Cross-field comparison (phase-2 — for structural rules):**
+- `FieldEq{lhs_field, rhs_field}` — `entity[lhs] == entity[rhs]`
+- `FieldGt/Ge/Lt/Le{lhs_field, rhs_field}` — integer cross-field comparison
+
+**Named idioms:**
+- `RankGeFieldThreshold{rank_field, threshold_field}` — the auth-style pattern, kept as a named alias (predates FieldGe)
+
+**Logical composition:**
+- `All{args: [...]}` — every sub-predicate must hold
+- `Any{args: [...]}` — at least one sub-predicate must hold
+- `Not{arg: ...}` — negation
+- `True` / `False` — constants (`True` as catchall default)
+
+## Severity is first-class
+
+Each rule has a `severity` field: `fail`, `flag`, `manual`, `pass`, or `info` (default). If omitted at compile time, severity is inferred from the id prefix (`fail_*` → Fail, `flag_*` → Flag, `manual_*`/`review_*` → Manual, `pass_*` → Pass). **Explicit severity beats inferred** — `severity: "info"` survives even if the id prefix is `fail_*`.
+
+**Verdict precedence in `apply(mode="all")`:** `Fail > Flag > Manual > Pass > Info`. The aggregate verdict is the maximum severity that fired.
+
+## Firing semantics: Independent vs Fallback
+
+Each rule has an `emit` field: `independent` (default) or `fallback`.
+
+- **Independent** rules fire whenever their antecedent matches. This is the default and covers nearly everything.
+- **Fallback** rules fire in `apply(mode="all")` ONLY when no Independent rule fired. This is how catchall PASS rules should work — visible when nothing else has anything to say, invisible when real findings exist.
+
+In `apply(mode="first")`, emit is irrelevant — first-match-wins walks the full rule list.
+
+**Canonical pass-catchall pattern:**
+```json
+{"id": "pass_all_clean", "severity": "pass", "emit": "fallback",
+ "antecedent": {"op": "True"}, "consequent": "PASS"}
+```
 
 ## Adversarial-review pattern
 
-The packet's rules *are* the review criteria. Compile a packet whose rules encode "what good looks like" for a change (tests pass, no new warnings, no undocumented tools, no readonly-fs assumptions, etc.). Build an entity from the PR's observable properties. Apply the packet — the consequent is the most-severe finding. To surface more, set the triggering fields to their 'healthy' value and re-apply; walk the flag tower. Dispatch peer bros in parallel to critique the packet ITSELF ("what rules are missing? what's over-specific? wrong ordering?") — meta-review of the review criteria.
+The packet's rules *are* the review criteria. Compile a packet whose rules encode "what good looks like" for a change (tests pass, no new warnings, no undocumented tools, no readonly-fs assumptions, etc.). Build an entity from the PR's observable properties. Apply the packet in `mode="all"` — every matching rule contributes a finding, severities aggregate to a verdict. Dispatch peer bros in parallel to critique the packet ITSELF ("what rules are missing? what's over-specific? wrong ordering?") — meta-review of the review criteria.
+
+Prefer `mode="all"` for review. `mode="first"` is for classification tasks where a single answer is wanted (retry policy, authorization, state transition).
 
 ## Rule ordering
 
-Because the evaluator is first-match-wins, ordering encodes priority. Put stakes ahead of confidence: a 0.6-confidence FAIL should come before a 0.9-confidence FLAG of lesser severity, because FAILs should surface first. Lower-confidence rules placed before higher-confidence ones will shadow them. This is mechanical — not vibes — and worth stating the severity class of each rule in its id prefix (`fail_*`, `flag_*`, `pass_*`, `manual_review_*`) so the ordering is auditable.
+In `mode="first"`, ordering encodes priority — but because severity is now first-class, prefer a tiered approach:
+
+1. Partition by severity tier: FAIL before FLAG before MANUAL before PASS.
+2. Within a tier, order by authoring preference (explicit anomalies before generals).
+3. Catchall (`True`) rules come last in their tier.
+
+In `mode="all"`, ordering encodes display order only — every matching rule fires regardless of position. That's the semantic to reach for when you want a full review.
 
 ## Confidence vs severity
 
@@ -41,9 +104,9 @@ Packets are for *structured domains that admit generators*.
 
 After compiling, always `bbox_audit` against the source observations. A packet with fidelity < 1.0 is lying to you about its training data and will extrapolate badly. The audit call returns the mismatching rule id, so fixes are targeted.
 
-## Known AST gaps (phase-2 followups)
+## Known gaps (phase-3 followups)
 
-- **Field-vs-field comparison.** Currently no primitive like `FieldGtField{lhs, rhs}`. Rules that should encode "mcp_tools_added > tool_docs_stanzas_added" must hardcode a constant, which over-fits. Add `FieldGt/FieldGe/FieldLt/FieldLe/FieldEq{lhs_field, rhs_field}` for cross-field predicates.
-- **`apply_all` mode.** `bbox_apply` currently returns only the first matching rule (first-match-wins). For review-style use where multiple flags should surface, an "apply every rule independently, return all matches" variant is valuable. The walk-the-tower workaround works but is clunky.
 - **`bbox_merge`.** Two packets describing the same domain should merge via behavioral equivalence (evaluate rules on a witness set, cluster by output). Not yet implemented — merge remains manual.
 - **`bbox_packets` listing/filtering.** No first-class list tool yet; packets can only be fetched by ID.
+- **Rule dependency DAG.** Rules can't suppress other rules ("if fail_foo fires, skip flag_bar"). Currently handled by ordering in `mode="first"` or by the aggregate verdict in `mode="all"`, but a proper dependency graph would let authors express "applicable-only-when" cleanly without nesting.
+- **Review-specific dimensions.** The MVP AST handles structural predicates but doesn't model domain-specific review categories (security-sensitive file lists, hot-path symbol tables, coverage deltas computed at evaluation time). These live in the entity, authored by the caller.
