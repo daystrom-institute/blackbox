@@ -1,16 +1,32 @@
-# Rule-packets — universal mechanism
+# Rule-packets — compile a reusable mechanism from examples
 
-A rule-packet is a tiny axiomatic theory stored in bbox: named lookup tables + ordered predicate rules + ad-hoc anomalies, plus a domain-specific **classification lattice** that declares what values rules can emit and how those values aggregate into a verdict. Sender extracts the theory once with an LLM; receiver evaluates deterministically. **No LLM in the receive path** — the evaluator is a pure function of `(packet, entity) → prediction`.
+**If your task looks like this, compile a packet:**
+- "Here are N labeled examples (PRs, errors, access-decisions, proposals...) — build a mechanism that classifies future cases."
+- "Rank these N items against these M criteria."
+- "Compress this table into something reusable."
+- "Judge future X the same way."
 
-This runbook is the universal-mechanism reference. For domain-specific usage patterns, see the domain runbooks:
+The tool you want is **`bbox_compile`**. Not prose. Not Python scripts. Not `bbox_learn` / `bbox_remember` / `bbox_decide` — those capture statements. A packet captures a **generating function** that other agents (or a deterministic evaluator, with no LLM) can apply to future cases.
 
-- `sm-review-packets` — code review (lattice: fail/flag/manual/pass/info)
-- `sm-auth-packets` — authorization (lattice: deny/allow)
-- `sm-design-packets` — design-iteration ensembles (lattice: blocker/concern/suggestion/advantage/neutral)
+**Why this tool exists.** Prose rubrics aren't machine-reusable; pseudocode drifts; per-item hand-judgment doesn't scale. Packets compress 10–50× against the raw observations and generalize to entities you never saw. The evaluator is a pure function of `(packet, entity) → prediction` — deterministic, no LLM in the receive path.
 
-## When to reach for a packet
+**Pick your domain runbook for worked examples:**
 
-You have a body of structured observations — an authorization matrix, retry taxonomy, state-transition table, policy grid, access lattice, review criteria, design-proposal set — and you suspect a small set of rules generates it. The knowledge tiers (`bbox_learn` / `bbox_remember` / `bbox_decide` / `bbox_note`) capture *statements*; a packet captures a *generating function*. Packets compress 10–50× against the raw observations and generalize to entities the sender never saw.
+- `sm-review-packets` — code review / PR triage (lattice: fail/flag/manual/pass/info)
+- `sm-auth-packets` — authorization / access tables (lattice: deny/allow)
+- `sm-design-packets` — ranking proposals / design-iteration (lattice: blocker/concern/suggestion/advantage/neutral)
+
+The rest of this runbook is the universal-mechanism reference: predicate AST, classification lattice, modes, validation.
+
+## When NOT to reach for a packet
+
+- Free-form research / synthesis — prose is the right answer
+- One-shot facts the user told you — `bbox_remember` / `bbox_learn`
+- Durable commitments with rationale — `bbox_decide`
+- Conversational signals mid-dispatch — `bbox_note`
+- Data with inherently subjective criteria (poem quality, narrative consistency) where mechanical predicates don't apply — decline or offer `bbox_remember`
+
+Packets are for *structured domains that admit generators*. If priors already produce the correct answer and the task is a one-off, prose may be the right economy.
 
 ## The compile → audit → apply loop
 

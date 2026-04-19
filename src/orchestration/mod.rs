@@ -270,6 +270,19 @@ Recall: your FIRST tool call on any substantive task must be \
 `bbox_knowledge(query=<one keyword>)`. Justification and fallback \
 procedure are in the managed tool reference.";
 
+/// Ambient nudge for recursive orchestrators (allow_recursion=true).
+/// They're usually fan-out coordinators, and the most common silent
+/// failure mode is writing a prose rubric and pasting it into N
+/// identical sub-agent prompts instead of compiling a packet once and
+/// dispatching the packet_id. Fires in addition to RECALL_DIRECTIVE.
+pub const ORCHESTRATOR_HINT: &str = "\
+Orchestrator note: if your plan involves sending the same rubric / \
+ranking criteria / decision tree / access rules to multiple sub-agents, \
+compile it into a packet first via `bbox_compile` and dispatch the \
+`packet_id` — every sub-agent then produces bit-identical output via \
+`bbox_apply`, and a 4th agent can reproduce the results deterministically \
+without re-reading prose. See `sm-rule-packets` via `bbox_knowledge`.";
+
 /// Default per-dispatch contract requiring a structured completion
 /// signal before the agent returns. Observed empirically: without
 /// this, agents competently complete tasks via prose but never emit
@@ -377,17 +390,21 @@ impl AmbientContext {
 }
 
 /// Wrap a prompt with the per-turn ambient prefix (scope block +
-/// optional completion contract). Skipped entirely when
-/// `allow_recursion` is set. Does NOT touch the brofile lens.
+/// recall directive + optional orchestrator hint + optional completion
+/// contract). Does NOT touch the brofile lens.
 ///
-/// Recursion guarding is done mechanically via provider-specific tool-
-/// filter args (`--disallowedTools`, `--deny-tool`, `-c disabled_tools=…`,
-/// or `--policy <file>`), appended to argv outside this function. No
-/// text guard is emitted.
+/// Recursion guarding (blocking sub-bro dispatch) is done mechanically
+/// via provider-specific tool-filter args (`--disallowedTools`,
+/// `--deny-tool`, `-c disabled_tools=…`, or `--policy <file>`), appended
+/// to argv outside this function. No text recursion guard is emitted.
+///
+/// The ambient prefix fires for every dispatch regardless of
+/// `allow_recursion`: the scope block lets the agent correlate notes,
+/// the recall directive triggers `bbox_knowledge` lookups, and the
+/// orchestrator hint surfaces packet primitives for fan-out coordinators.
+/// These are purely textual — they don't interact with the mechanical
+/// recursion filter.
 pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
-    if ctx.allow_recursion {
-        return prompt.to_string();
-    }
     let mut prefix = String::new();
 
     let fields = ctx.scope_fields();
@@ -403,6 +420,16 @@ pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
     prefix.push_str("[recall before acting]\n");
     prefix.push_str(RECALL_DIRECTIVE);
     prefix.push_str("\n\n");
+
+    // When the caller explicitly enabled recursion, this agent is a
+    // fan-out orchestrator. Surface the packet primitive — the most
+    // common silent miss for these agents is writing a prose rubric
+    // and pasting it into N identical sub-agent prompts.
+    if ctx.allow_recursion {
+        prefix.push_str("[orchestrator]\n");
+        prefix.push_str(ORCHESTRATOR_HINT);
+        prefix.push_str("\n\n");
+    }
 
     if let Some(contract) = &ctx.completion_contract {
         prefix.push_str("[completion contract]\n");
@@ -1072,12 +1099,25 @@ mod tests {
     }
 
     #[test]
-    fn ambient_allow_recursion_skips_everything() {
+    fn ambient_allow_recursion_still_emits_scope_and_recall() {
+        // Ambient prefix fires for every dispatch regardless of
+        // `allow_recursion`. Recursion guarding is mechanical (tool
+        // filter) not textual, and fan-out orchestrators still need
+        // scope correlation + recall guidance + the packet nudge.
         let ctx = AmbientContext {
+            session_id: Some("sess-orch".into()),
             allow_recursion: true,
+            provider: Some(providers::Provider::Claude),
             ..Default::default()
         };
-        assert_eq!(apply_ambient("raw", &ctx), "raw");
+        let out = apply_ambient("coordinate stuff", &ctx);
+        assert!(out.contains("[scope]"));
+        assert!(out.contains("session: sess-orch"));
+        assert!(out.contains("[recall before acting]"));
+        assert!(out.contains("bbox_knowledge"));
+        assert!(out.contains("[orchestrator]"));
+        assert!(out.contains("bbox_compile"));
+        assert!(out.contains("coordinate stuff"));
     }
 
     #[test]
@@ -1103,15 +1143,30 @@ mod tests {
     }
 
     #[test]
-    fn ambient_recall_directive_skipped_under_allow_recursion() {
+    fn ambient_orchestrator_hint_fires_under_allow_recursion() {
+        // Fan-out orchestrators should see the packet-primitive nudge.
+        // It's purely textual; the recursion guard is mechanical and
+        // handled elsewhere via provider-specific tool filters.
         let ctx = AmbientContext {
             allow_recursion: true,
             ..Default::default()
         };
         let out = apply_ambient("work", &ctx);
-        assert!(!out.contains("[recall before acting]"));
-        assert!(!out.contains("bbox_knowledge"));
-        assert_eq!(out, "work");
+        assert!(out.contains("[orchestrator]"));
+        assert!(out.contains("bbox_compile"));
+        assert!(out.contains("packet_id"));
+    }
+
+    #[test]
+    fn ambient_orchestrator_hint_absent_without_recursion() {
+        // Regular executors don't dispatch sub-agents, so the packet
+        // nudge would be noise.
+        let ctx = AmbientContext {
+            allow_recursion: false,
+            ..Default::default()
+        };
+        let out = apply_ambient("work", &ctx);
+        assert!(!out.contains("[orchestrator]"));
     }
 
     #[test]

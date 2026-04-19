@@ -60,7 +60,7 @@ impl ToolCategory {
                 "Attention aggregator: a single read that surfaces unresolved notes, stale threads, unverified knowledge, and failed tasks. Run at round boundaries, morning-brief style, and whenever you're unsure what needs attention next."
             }
             Self::Packets => {
-                "Compressive compilation of observations into portable theories. A rule-packet is a small axiomatic theory (rank/threshold tables + rule trees + anomalies) extracted from a larger observation set. Extract once with an LLM via `bbox_compile`; evaluate arbitrarily many times with a deterministic evaluator via `bbox_apply`. Use when you have a structured dataset (authorization matrix, retry taxonomy, state-transition table) that's likely governed by a small number of rules — the packet compresses 10-50x and generalizes to entities the sender never saw. Validate fidelity via `bbox_audit` before trusting predictions."
+                "Reusable judges compiled from examples or stated rules. If your task involves writing a priority-ordered rubric, ranking a batch against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones — compile a packet. `bbox_compile` authors the mechanism, `bbox_apply` evaluates any entity deterministically (no LLM), `bbox_audit` self-validates against known labels. Packets are portable: dispatch `packet_id` to sub-agents and every one of them produces bit-identical output. See `sm-rule-packets` via `bbox_knowledge` for the full runbook."
             }
             Self::Orchestration => {
                 "Dispatch agents across providers (Claude, Codex, Copilot, Vibe, Gemini). Prefer named `bro` targeting (resolves provider + account + lens + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race)."
@@ -275,23 +275,23 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_compile",
         category: ToolCategory::Packets,
-        summary: "Compile a set of rules into a rule-packet (a compiled axiomatic theory with a deterministic evaluator). See `sm-rule-packets` via `bbox_knowledge` for the full workflow.",
-        when_to_use: "Use when a structured observation set is governed by a smaller rule system. Rules are first-match-wins, so put anomalies before general rules. Validate with `bbox_audit` before trusting predictions.",
-        example: Some(r#"bbox_compile(domain="retry-policy", rules=[{"id":"transient_retry","antecedent":{"op":"Eq","field":"nature","value":"transient"},"consequent":"RETRY"},{"id":"default_fail","antecedent":{"op":"True"},"consequent":"FAIL"}])"#),
+        summary: "Compile a rubric / judge / decision-function into a shareable packet. Inputs are ordered rules (first-match-wins) over a predicate AST; output is a `packet_id` any agent can apply deterministically. Reach here when you're about to write a priority-ordered rubric, a ranking mechanism, an access-control table, a retry taxonomy, or any \"classify future X the same way\" procedure. See `sm-rule-packets` via `bbox_knowledge`.",
+        when_to_use: "Symptoms that mean \"compile a packet\": (1) you're coordinating multiple sub-agents and pasting the same rubric text into each prompt — compile once, dispatch `packet_id` instead, guarantees bit-identical standards; (2) you're ranking a batch of proposals/PRs/incidents against shared criteria; (3) you've got 10+ labeled examples and need a mechanism that generalizes to the 100+ unlabeled ones; (4) you're about to write Python/prose to implement a decision tree. First-match-wins so put anomalies before general rules. Always follow with `bbox_audit` to verify fidelity.",
+        example: Some(r#"bbox_compile(domain="pr-triage", classification_lattice=["fail","flag","manual","pass","info"], rules=[{"id":"fail_tests","classification":"fail","antecedent":{"op":"Eq","field":"tests_pass","value":false},"consequent":"REJECT"},{"id":"flag_api_change","classification":"flag","antecedent":{"op":"Eq","field":"api_surface_changed","value":true},"consequent":"FLAG"},{"id":"pass_default","classification":"pass","emit":"fallback","antecedent":{"op":"True"},"consequent":"ACCEPT"}])"#),
     },
     ToolDoc {
         name: "bbox_apply",
         category: ToolCategory::Packets,
-        summary: "Evaluate a rule-packet against a single entity. Returns the first matching rule's consequent + rule_id.",
-        when_to_use: "Ask whether a specific (role, method, resource) / (nature, origin) / etc. is ALLOW or DENY per a packet's rules. Deterministic, no LLM — cheap at arbitrary scale. If no rule matches, returns `{match: false}` rather than guessing.",
-        example: Some(r#"bbox_apply(packet_id="packet-a1b2c3d4", entity={"role":"editor","method":"POST","resource":"team"})"#),
+        summary: "Evaluate a packet against one entity — deterministic, no LLM. `mode=\"first\"` returns the first matching rule (classification: ALLOW/DENY/RETRY/...); `mode=\"all\"` returns every matching rule plus an aggregate verdict (review / multi-finding shape).",
+        when_to_use: "The receive-side of the packet workflow. Use from a sub-agent that received `packet_id` from its orchestrator — no need to re-read or re-interpret the rubric, just evaluate. Also use yourself after compiling to spot-check on specific entities. If no rule matches, returns `{match: false}` rather than guessing — so missing catchalls surface immediately.",
+        example: Some(r#"bbox_apply(packet_id="packet-a1b2c3d4", entity={"tests_pass":true,"api_surface_changed":true,"migration_note_present":false}, mode="all")"#),
     },
     ToolDoc {
         name: "bbox_audit",
         category: ToolCategory::Packets,
-        summary: "Apply a packet to a `{entity, expected}[]` dataset; return fidelity report.",
-        when_to_use: "Self-verify a packet against its training observations before trusting predictions. Also used to catch sender-side over-generalization: if fidelity < 1.0, the packet has a rule that mis-predicts observed data. Mismatches list names each failing row with its expected vs predicted consequent.",
-        example: Some(r#"bbox_audit(packet_id="packet-a1b2c3d4", dataset=[{"entity":{...}, "expected":"ALLOW"}, ...])"#),
+        summary: "Run a packet against a `{entity, expected}[]` dataset and report fidelity + any mismatching rule ids. The self-verify step — a packet with fidelity < 1.0 is lying to you about its training examples.",
+        when_to_use: "ALWAYS run this after `bbox_compile` against the observations you derived the rules from. Catches (a) rules that mis-generalized beyond the anomalies, (b) ordering bugs where a general rule shadows an anomaly, (c) typos in field names. Use `mode=\"all\"` when the packet is for multi-finding review and expected outputs are rule-id sets.",
+        example: Some(r#"bbox_audit(packet_id="packet-a1b2c3d4", dataset=[{"entity":{"tests_pass":false,...}, "expected":"REJECT"}, ...])"#),
     },
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {

@@ -40,7 +40,7 @@ pub struct SystemMemory {
 pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
     SystemMemory {
         id: "sm-rule-packets",
-        title: "Rule-packets — when and how",
+        title: "Rule-packets — compile a reusable mechanism from examples",
         tags: &[
             "packets",
             "rule-packets",
@@ -50,6 +50,22 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
             "review",
             "procedure",
             "runbook",
+            // Subject-facing vocabulary (phase-2 discovery-layer lever
+            // per thread-f019d73a): cold agents phrase packet-worthy
+            // tasks as "judge", "rubric", "mechanism", "evaluator",
+            // "classifier", "decision", rather than "packet" or "compile".
+            // These tags ensure bbox_knowledge queries from those angles
+            // surface the runbook.
+            "mechanism",
+            "evaluator",
+            "judge",
+            "rubric",
+            "classifier",
+            "classify",
+            "decision-function",
+            "examples-to-rules",
+            "reusable",
+            "derive",
         ],
         content: include_str!("rule-packets.md"),
     },
@@ -141,7 +157,7 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
     },
     SystemMemory {
         id: "sm-review-packets",
-        title: "Review packets — code review via rule-packets",
+        title: "Review packets — reusable judge from example PRs/changes",
         tags: &[
             "packets",
             "review",
@@ -150,12 +166,23 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
             "lattice",
             "domain",
             "runbook",
+            // Discovery vocabulary — subjects query with these:
+            "pr-review",
+            "pr-triage",
+            "judge",
+            "rubric",
+            "mechanism",
+            "evaluator",
+            "triage",
+            "accept-reject-flag",
+            "change-quality",
+            "decision",
         ],
         content: include_str!("review-packets.md"),
     },
     SystemMemory {
         id: "sm-auth-packets",
-        title: "Auth packets — authorization matrices via rule-packets",
+        title: "Auth packets — compress an access table into a reusable policy",
         tags: &[
             "packets",
             "auth",
@@ -165,12 +192,23 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
             "classification",
             "domain",
             "runbook",
+            // Discovery vocabulary:
+            "access-control",
+            "access-table",
+            "permissions",
+            "rbac",
+            "policy",
+            "role",
+            "resource",
+            "mechanism",
+            "decide-at-request-time",
+            "compress-matrix",
         ],
         content: include_str!("auth-packets.md"),
     },
     SystemMemory {
         id: "sm-design-packets",
-        title: "Design packets — ensemble design-iteration via rule-packets",
+        title: "Design packets — rank proposals against shared criteria",
         tags: &[
             "packets",
             "design",
@@ -182,6 +220,17 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
             "classification",
             "domain",
             "runbook",
+            // Discovery vocabulary:
+            "rank-proposals",
+            "evaluate-proposals",
+            "compare-proposals",
+            "score",
+            "rubric",
+            "evaluator",
+            "tradeoff",
+            "which-should-we-pick",
+            "decision",
+            "mechanism",
         ],
         content: include_str!("design-packets.md"),
     },
@@ -195,21 +244,39 @@ pub fn get(id: &str) -> Option<&'static SystemMemory> {
         .find(|m| m.id == id || m.id.strip_prefix("sm-") == Some(id))
 }
 
-/// Substring search. Case-insensitive; matches on title, any tag, or body.
-/// `None` query means "all memories". Returns in catalog order.
+/// Tokenized case-insensitive search. The query is split on whitespace; a memory
+/// matches if ANY token appears as a substring of its id, title, any tag, or body.
+/// Single-token queries behave like ordinary substring search.
+/// Multi-token queries (e.g. "PR triage rubric") recall anything matching at least
+/// one token — natural-language phrasing surfaces runbooks with relevant tags even
+/// when the full phrase isn't a substring anywhere. `None` or empty query returns
+/// all memories. Returns in catalog order.
 pub fn search(query: Option<&str>) -> Vec<&'static SystemMemory> {
-    let needle = query.map(|q| q.to_lowercase());
+    let tokens: Vec<String> = query
+        .map(|q| {
+            q.to_lowercase()
+                .split_whitespace()
+                .map(|t| t.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     SYSTEM_MEMORIES
         .iter()
-        .filter(|m| match &needle {
-            None => true,
-            Some(q) if q.is_empty() => true,
-            Some(q) => {
-                m.id.to_lowercase().contains(q)
-                    || m.title.to_lowercase().contains(q)
-                    || m.tags.iter().any(|t| t.to_lowercase().contains(q))
-                    || m.content.to_lowercase().contains(q)
+        .filter(|m| {
+            if tokens.is_empty() {
+                return true;
             }
+            let id = m.id.to_lowercase();
+            let title = m.title.to_lowercase();
+            let content = m.content.to_lowercase();
+            let tags_lc: Vec<String> =
+                m.tags.iter().map(|t| t.to_lowercase()).collect();
+            tokens.iter().any(|tok| {
+                id.contains(tok)
+                    || title.contains(tok)
+                    || content.contains(tok)
+                    || tags_lc.iter().any(|t| t.contains(tok))
+            })
         })
         .collect()
 }

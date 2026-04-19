@@ -218,7 +218,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_learn",
-        description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files."
+        description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically."
     )]
     fn bbox_learn(&self, Parameters(p): Parameters<LearnParams>) -> CallToolResult {
         Self::run("bbox_learn", || self.state.kb.write().learn(&p, false))
@@ -375,7 +375,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_compile",
-        description = "Compile a set of rules into a rule-packet (a compiled axiomatic theory with a deterministic evaluator). See `sm-rule-packets` via `bbox_knowledge` for the full workflow."
+        description = "Compile a rubric / judge / decision-function into a shareable packet. Reach here when you're writing a priority-ordered rubric, ranking proposals against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones. Symptom: you're about to paste the same rubric text into multiple sub-agent prompts — compile once and dispatch the packet_id instead. Rules are first-match-wins over a predicate AST; validate with bbox_audit before trusting. Full workflow: sm-rule-packets via bbox_knowledge."
     )]
     fn bbox_compile(&self, Parameters(p): Parameters<CompileParams>) -> CallToolResult {
         Self::run("bbox_compile", || self.state.packets.read().compile(&p))
@@ -383,7 +383,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_apply",
-        description = "Evaluate a rule-packet against a single entity. Returns the first matching rule's consequent + rule_id."
+        description = "Evaluate a packet against one entity — deterministic, no LLM. The receive-side of the packet workflow: a sub-agent that received packet_id from its orchestrator calls this to classify without reinterpreting the rubric. mode=\"first\" returns the first matching rule; mode=\"all\" returns every matching rule plus an aggregate verdict (for review / multi-finding shape). Cheap at arbitrary scale."
     )]
     fn bbox_apply(&self, Parameters(p): Parameters<PacketApplyParams>) -> CallToolResult {
         Self::run("bbox_apply", || self.state.packets.read().apply_tool(&p))
@@ -391,7 +391,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_audit",
-        description = "Apply a packet to a `{entity, expected}[]` dataset; return fidelity report."
+        description = "Run a packet against a {entity, expected}[] dataset; report fidelity + mismatching rule ids. The self-verify step: a packet with fidelity < 1.0 is lying about its training data. ALWAYS call this after bbox_compile against the observations you derived the rules from — catches over-generalization, rule-ordering bugs, and field-name typos."
     )]
     fn bbox_audit(&self, Parameters(p): Parameters<AuditParams>) -> CallToolResult {
         Self::run("bbox_audit", || self.state.packets.read().audit_tool(&p))
