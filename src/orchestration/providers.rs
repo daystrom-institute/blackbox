@@ -8,8 +8,16 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
-    strum::EnumString, strum::IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
@@ -45,7 +53,14 @@ impl Provider {
     }
 
     pub fn supports_resume(&self) -> bool {
-        matches!(self, Provider::Claude | Provider::Codex | Provider::Copilot | Provider::Vibe | Provider::Gemini)
+        matches!(
+            self,
+            Provider::Claude
+                | Provider::Codex
+                | Provider::Copilot
+                | Provider::Vibe
+                | Provider::Gemini
+        )
     }
 
     pub fn is_streaming_json(&self) -> bool {
@@ -110,7 +125,11 @@ pub fn resolve_bin(bin: &str) -> Option<String> {
             .to_string_lossy()
             .to_string()
     });
-    let augmented_path = format!("{}:{}", extra_path, std::env::var("PATH").unwrap_or_default());
+    let augmented_path = format!(
+        "{}:{}",
+        extra_path,
+        std::env::var("PATH").unwrap_or_default()
+    );
     let output = std::process::Command::new("bash")
         .args(["-lc", &format!("command -v '{bin}'")])
         .env("PATH", &augmented_path)
@@ -151,22 +170,30 @@ impl Provider {
         match self {
             Provider::Claude => {
                 let mut args = vec![
-                    "-p".into(), prompt.into(),
-                    "--output-format".into(), "stream-json".into(),
+                    "-p".into(),
+                    prompt.into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
                     "--verbose".into(),
                     "--include-partial-messages".into(),
-                    "--session-id".into(), session_id.into(),
+                    "--session-id".into(),
+                    session_id.into(),
                     "--dangerously-skip-permissions".into(),
                 ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
-                if let Some(e) = effort { args.extend(["--effort".into(), e.into()]); }
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
+                if let Some(e) = effort {
+                    args.extend(["--effort".into(), e.into()]);
+                }
                 // Transient MCP inject — ensures dispatched subprocesses
                 // see blackbox regardless of which config file the bare
                 // `claude` CLI happens to load ($HOME/.claude.json vs
                 // account-specific). Augments whatever user config the
                 // subprocess would otherwise inherit.
                 if let Some(url) = transient_blackbox_url() {
-                    args.extend(["--mcp-config".into(), claude_mcp_config_json(&url)]);
+                    let name = transient_blackbox_name();
+                    args.extend(["--mcp-config".into(), claude_mcp_config_json(&name, &url)]);
                 }
                 args
             }
@@ -176,24 +203,38 @@ impl Provider {
                     "--dangerously-bypass-approvals-and-sandbox".into(),
                     "--json".into(),
                 ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
                 if let Some(e) = effort {
                     args.extend(["-c".into(), format!("model_reasoning_effort=\"{e}\"")]);
                 }
-                if let Some(c) = cwd { args.extend(["-C".into(), c.into()]); }
+                if let Some(c) = cwd {
+                    args.extend(["-C".into(), c.into()]);
+                }
                 args.push(prompt.into());
                 args
             }
             Provider::Copilot => {
                 let mut args = vec![
-                    "copilot".into(), "--".into(),
-                    "-p".into(), prompt.into(),
-                    "--yolo".into(), "--autopilot".into(),
-                    "--output-format".into(), "json".into(),
+                    "copilot".into(),
+                    "--".into(),
+                    "-p".into(),
+                    prompt.into(),
+                    "--yolo".into(),
+                    "--autopilot".into(),
+                    "--output-format".into(),
+                    "json".into(),
                 ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
-                if let Some(e) = effort { args.extend(["--effort".into(), e.into()]); }
-                if let Some(c) = cwd { args.extend(["--add-dir".into(), c.into()]); }
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
+                if let Some(e) = effort {
+                    args.extend(["--effort".into(), e.into()]);
+                }
+                if let Some(c) = cwd {
+                    args.extend(["--add-dir".into(), c.into()]);
+                }
                 args
             }
             Provider::Vibe => {
@@ -201,18 +242,19 @@ impl Provider {
                 // out-of-band via `--agent NAME` (~/.vibe/agents/*.toml)
                 // or `vibe --setup`. Ignore opts.model.
                 let _ = model;
-                vec![
-                    "-p".into(), prompt.into(),
-                    "--output".into(), "json".into(),
-                ]
+                vec!["-p".into(), prompt.into(), "--output".into(), "json".into()]
             }
             Provider::Gemini => {
                 let mut args = vec![
-                    "-p".into(), prompt.into(),
+                    "-p".into(),
+                    prompt.into(),
                     "--yolo".into(),
-                    "-o".into(), "json".into(),
+                    "-o".into(),
+                    "json".into(),
                 ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
                 args
             }
         }
@@ -243,27 +285,38 @@ impl Provider {
         match self {
             Provider::Claude => {
                 let mut args = vec![
-                    "--resume".into(), session_id.into(),
-                    "-p".into(), prompt.into(),
-                    "--output-format".into(), "stream-json".into(),
+                    "--resume".into(),
+                    session_id.into(),
+                    "-p".into(),
+                    prompt.into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
                     "--verbose".into(),
                     "--include-partial-messages".into(),
                     "--dangerously-skip-permissions".into(),
                 ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
-                if let Some(e) = effort { args.extend(["--effort".into(), e.into()]); }
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
+                if let Some(e) = effort {
+                    args.extend(["--effort".into(), e.into()]);
+                }
                 if let Some(url) = transient_blackbox_url() {
-                    args.extend(["--mcp-config".into(), claude_mcp_config_json(&url)]);
+                    let name = transient_blackbox_name();
+                    args.extend(["--mcp-config".into(), claude_mcp_config_json(&name, &url)]);
                 }
                 args
             }
             Provider::Codex => {
                 let mut args = vec![
-                    "exec".into(), "resume".into(),
+                    "exec".into(),
+                    "resume".into(),
                     "--dangerously-bypass-approvals-and-sandbox".into(),
                     "--json".into(),
                 ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
                 if let Some(e) = effort {
                     args.extend(["-c".into(), format!("model_reasoning_effort=\"{e}\"")]);
                 }
@@ -273,33 +326,49 @@ impl Provider {
             }
             Provider::Copilot => {
                 let mut args = vec![
-                    "copilot".into(), "--".into(),
+                    "copilot".into(),
+                    "--".into(),
                     format!("--resume={session_id}"),
-                    "-p".into(), prompt.into(),
-                    "--yolo".into(), "--autopilot".into(),
-                    "--output-format".into(), "json".into(),
+                    "-p".into(),
+                    prompt.into(),
+                    "--yolo".into(),
+                    "--autopilot".into(),
+                    "--output-format".into(),
+                    "json".into(),
                 ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
-                if let Some(e) = effort { args.extend(["--effort".into(), e.into()]); }
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
+                if let Some(e) = effort {
+                    args.extend(["--effort".into(), e.into()]);
+                }
                 args
             }
             Provider::Vibe => {
                 // Vibe CLI has no `--model` flag — see build_exec_args.
                 let _ = model;
                 vec![
-                    "--resume".into(), session_id.into(),
-                    "-p".into(), prompt.into(),
-                    "--output".into(), "json".into(),
+                    "--resume".into(),
+                    session_id.into(),
+                    "-p".into(),
+                    prompt.into(),
+                    "--output".into(),
+                    "json".into(),
                 ]
             }
             Provider::Gemini => {
                 let mut args = vec![
-                    "--resume".into(), session_id.into(),
-                    "-p".into(), prompt.into(),
+                    "--resume".into(),
+                    session_id.into(),
+                    "-p".into(),
+                    prompt.into(),
                     "--yolo".into(),
-                    "-o".into(), "json".into(),
+                    "-o".into(),
+                    "json".into(),
                 ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
                 args
             }
         }
@@ -325,7 +394,13 @@ impl Provider {
         url: &str,
         exclude_tools: &[String],
     ) -> Option<Vec<String>> {
-        self.build_mcp_add_http_args_full(name, url, exclude_tools, &std::collections::BTreeMap::new(), "user")
+        self.build_mcp_add_http_args_full(
+            name,
+            url,
+            exclude_tools,
+            &std::collections::BTreeMap::new(),
+            "user",
+        )
     }
 
     /// Scoped form. `scope` is "user" (global, default) or "project" (writes
@@ -339,7 +414,13 @@ impl Provider {
         exclude_tools: &[String],
         scope: &str,
     ) -> Option<Vec<String>> {
-        self.build_mcp_add_http_args_full(name, url, exclude_tools, &std::collections::BTreeMap::new(), scope)
+        self.build_mcp_add_http_args_full(
+            name,
+            url,
+            exclude_tools,
+            &std::collections::BTreeMap::new(),
+            scope,
+        )
     }
 
     /// Full form. Adds custom HTTP headers (e.g. auth tokens) to the
@@ -367,9 +448,12 @@ impl Provider {
                     _ => return None,
                 };
                 let mut args = vec![
-                    "mcp".into(), "add".into(),
-                    "-s".into(), scope_flag.into(),
-                    "--transport".into(), "http".into(),
+                    "mcp".into(),
+                    "add".into(),
+                    "-s".into(),
+                    scope_flag.into(),
+                    "--transport".into(),
+                    "http".into(),
                 ];
                 for (k, v) in headers {
                     args.push("-H".into());
@@ -379,29 +463,40 @@ impl Provider {
                 Some(args)
             }
             Provider::Copilot => {
-                if scope != "user" { return None; }
+                if scope != "user" {
+                    return None;
+                }
                 if !headers.is_empty() {
                     tracing::debug!(target: "blackbox::mcp",
                         "copilot mcp add: dropping {} header(s) (no documented header flag)",
                         headers.len());
                 }
                 Some(vec![
-                    "copilot".into(), "--".into(),
-                    "mcp".into(), "add".into(),
-                    "--transport".into(), "http".into(),
-                    name.into(), url.into(),
+                    "copilot".into(),
+                    "--".into(),
+                    "mcp".into(),
+                    "add".into(),
+                    "--transport".into(),
+                    "http".into(),
+                    name.into(),
+                    url.into(),
                 ])
             }
             Provider::Codex => {
-                if scope != "user" { return None; }
+                if scope != "user" {
+                    return None;
+                }
                 if !headers.is_empty() {
                     tracing::debug!(target: "blackbox::mcp",
                         "codex mcp add: dropping {} header(s) (only --bearer-token-env-var supported)",
                         headers.len());
                 }
                 Some(vec![
-                    "mcp".into(), "add".into(),
-                    name.into(), "--url".into(), url.into(),
+                    "mcp".into(),
+                    "add".into(),
+                    name.into(),
+                    "--url".into(),
+                    url.into(),
                 ])
             }
             Provider::Gemini => {
@@ -410,9 +505,12 @@ impl Provider {
                     _ => return None,
                 };
                 let mut args = vec![
-                    "mcp".into(), "add".into(),
-                    "-t".into(), "http".into(),
-                    "-s".into(), scope_flag.into(),
+                    "mcp".into(),
+                    "add".into(),
+                    "-t".into(),
+                    "http".into(),
+                    "-s".into(),
+                    scope_flag.into(),
                 ];
                 if !exclude_tools.is_empty() {
                     args.extend(["--exclude-tools".into(), exclude_tools.join(",")]);
@@ -435,11 +533,7 @@ impl Provider {
         self.build_mcp_remove_args_scoped(name, "user")
     }
 
-    pub fn build_mcp_remove_args_scoped(
-        &self,
-        name: &str,
-        scope: &str,
-    ) -> Option<Vec<String>> {
+    pub fn build_mcp_remove_args_scoped(&self, name: &str, scope: &str) -> Option<Vec<String>> {
         match self {
             Provider::Claude => {
                 let scope_flag = match scope {
@@ -447,20 +541,29 @@ impl Provider {
                     _ => return None,
                 };
                 Some(vec![
-                    "mcp".into(), "remove".into(),
-                    "-s".into(), scope_flag.into(),
+                    "mcp".into(),
+                    "remove".into(),
+                    "-s".into(),
+                    scope_flag.into(),
                     name.into(),
                 ])
             }
             Provider::Copilot => {
-                if scope != "user" { return None; }
+                if scope != "user" {
+                    return None;
+                }
                 Some(vec![
-                    "copilot".into(), "--".into(),
-                    "mcp".into(), "remove".into(), name.into(),
+                    "copilot".into(),
+                    "--".into(),
+                    "mcp".into(),
+                    "remove".into(),
+                    name.into(),
                 ])
             }
             Provider::Codex => {
-                if scope != "user" { return None; }
+                if scope != "user" {
+                    return None;
+                }
                 Some(vec!["mcp".into(), "remove".into(), name.into()])
             }
             Provider::Gemini => {
@@ -469,8 +572,10 @@ impl Provider {
                     _ => return None,
                 };
                 Some(vec![
-                    "mcp".into(), "remove".into(),
-                    "-s".into(), scope_flag.into(),
+                    "mcp".into(),
+                    "remove".into(),
+                    "-s".into(),
+                    scope_flag.into(),
                     name.into(),
                 ])
             }
@@ -483,8 +588,10 @@ impl Provider {
         match self {
             Provider::Claude => Some(vec!["mcp".into(), "list".into()]),
             Provider::Copilot => Some(vec![
-                "copilot".into(), "--".into(),
-                "mcp".into(), "list".into(),
+                "copilot".into(),
+                "--".into(),
+                "mcp".into(),
+                "list".into(),
             ]),
             Provider::Codex => Some(vec!["mcp".into(), "list".into()]),
             Provider::Gemini => Some(vec!["mcp".into(), "list".into()]),
@@ -517,9 +624,9 @@ impl Provider {
     ///     `--allowedTools` (native glob support).
     ///   - Copilot: pass glob patterns to repeated `--deny-tool=` /
     ///     `--allow-tool=` flags (native glob support).
-    ///   - Codex: no glob support; expand blackbox-prefixed patterns
+    ///   - Codex: no glob support; expand current-blackbox-prefixed patterns
     ///     against the orchestration tool universe and emit a single
-    ///     `-c mcp_servers.blackbox.disabled_tools=[...]` TOML override.
+    ///     `-c mcp_servers.<blackbox-name>.disabled_tools=[...]` TOML override.
     ///     Patterns outside the blackbox namespace are skipped — Codex
     ///     can't filter per-tool outside its own MCP server model.
     ///   - Gemini: returns a placeholder; real policy file is generated
@@ -535,7 +642,8 @@ impl Provider {
                 // Claude's --disallowedTools matches tool names exactly
                 // (or applies Bash-specific argument patterns inside
                 // parentheses). It does NOT accept glob patterns on the
-                // tool name itself. Expand `mcp__blackbox__bro_*` into
+                // tool name itself. Expand the current blackbox MCP
+                // prefix's `bro_*` pattern into
                 // the concrete list of tool names so the filter fires.
                 let expanded = expand_filter_patterns(&filters.disallow);
                 if !expanded.is_empty() {
@@ -552,8 +660,9 @@ impl Provider {
                 // Copilot's --deny-tool / --allow-tool expect
                 // `ServerName(tool_name)` format, not the MCP-prefixed
                 // form Claude accepts. Verified empirically: the
-                // `mcp__blackbox__bro_status` form passed through
-                // without blocking, while `blackbox(bro_status)`
+                // the current `mcp__<blackbox-name>__bro_status` form
+                // passed through without blocking, while
+                // `<blackbox-name>(bro_status)`
                 // correctly denied the invocation.
                 for p in expand_filter_patterns(&filters.disallow) {
                     args.push(format!(
@@ -624,7 +733,7 @@ fn emit_codex_filter_overrides(args: &mut Vec<String>, patterns: &[String], key:
 
 fn codex_group_patterns_by_server(patterns: &[String]) -> Vec<(String, Vec<String>)> {
     let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
-    let bb_prefix = crate::tool_docs::BLACKBOX_MCP_PREFIX; // "mcp__blackbox__"
+    let bb_prefix = crate::tool_docs::blackbox_mcp_prefix();
     let mut by_server: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for p in patterns {
@@ -639,7 +748,7 @@ fn codex_group_patterns_by_server(patterns: &[String]) -> Vec<(String, Vec<Strin
             continue;
         };
         let group = by_server.entry(server.to_string()).or_default();
-        if p.starts_with(bb_prefix) {
+        if p.starts_with(&bb_prefix) {
             let expanded = super::mcp::expand_pattern(tool_pat, &universe);
             if expanded.is_empty() {
                 tracing::warn!(target: "blackbox::filter",
@@ -661,7 +770,10 @@ fn codex_group_patterns_by_server(patterns: &[String]) -> Vec<(String, Vec<Strin
                 "codex glob on non-blackbox server (no tool universe to expand against): {p}");
         }
     }
-    by_server.into_iter().filter(|(_, v)| !v.is_empty()).collect()
+    by_server
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
 }
 
 /// Translate a `mcp__server__tool` full name into Copilot's
@@ -677,16 +789,16 @@ fn copilot_format_mcp_tool(full: &str) -> Option<String> {
 }
 
 /// Expand filter patterns for providers that accept full MCP tool
-/// names (Claude, Copilot). `mcp__blackbox__bro_*` style globs become
-/// concrete `mcp__blackbox__bro_exec`, `mcp__blackbox__bro_resume`, …
+/// names (Claude, Copilot). `mcp__<blackbox-name>__bro_*` style globs become
+/// concrete `mcp__<blackbox-name>__bro_exec`, `mcp__<blackbox-name>__bro_resume`, …
 /// entries. Non-blackbox patterns pass through unchanged — they're
 /// likely already in a valid native form like `Bash(git push *)`.
 fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
     let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
-    let prefix = crate::tool_docs::BLACKBOX_MCP_PREFIX;
+    let prefix = crate::tool_docs::blackbox_mcp_prefix();
     let mut out = Vec::new();
     for p in patterns {
-        if let Some(stripped) = p.strip_prefix(prefix) {
+        if let Some(stripped) = p.strip_prefix(&prefix) {
             for bare in super::mcp::expand_pattern(stripped, &universe) {
                 let full = format!("{prefix}{bare}");
                 if !out.contains(&full) {
@@ -739,16 +851,22 @@ fn toml_basic_string(s: &str) -> String {
 /// surface unchanged and stays consistent across exec/resume/broadcast
 /// paths.
 pub fn transient_blackbox_url() -> Option<String> {
-    std::env::var("BLACKBOX_MCP_URL").ok().filter(|s| !s.is_empty())
+    std::env::var("BLACKBOX_MCP_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+pub fn transient_blackbox_name() -> String {
+    crate::util::blackbox_mcp_name()
 }
 
 /// Render the JSON payload for Claude's `--mcp-config` arg pointing at
 /// the daemon's blackbox endpoint. Single entry — user's own MCP
 /// servers are inherited additively (we don't pass `--strict-mcp-config`).
-pub fn claude_mcp_config_json(url: &str) -> String {
+pub fn claude_mcp_config_json(name: &str, url: &str) -> String {
     serde_json::json!({
         "mcpServers": {
-            "blackbox": { "type": "http", "url": url }
+            name: { "type": "http", "url": url }
         }
     })
     .to_string()
@@ -844,8 +962,14 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         }
         if let Some(usage) = evt["usage"].as_object() {
             sink.usage = Some(Usage {
-                input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                input_tokens: usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                output_tokens: usage
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
             });
         }
         sink.cost_usd = evt["total_cost_usd"].as_f64();
@@ -870,8 +994,14 @@ fn parse_codex_event(evt: &Value, sink: &mut EventSink) {
         "turn.completed" => {
             if let Some(usage) = evt["usage"].as_object() {
                 sink.usage = Some(Usage {
-                    input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    input_tokens: usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    output_tokens: usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
                 });
             }
         }
@@ -910,7 +1040,10 @@ fn parse_copilot_event(evt: &Value, sink: &mut EventSink) {
                 sink.session_id = Some(sid.to_string());
             }
             if let Some(usage) = evt["usage"].as_object() {
-                sink.usage = Some(Usage { input_tokens: 0, output_tokens: 0 });
+                sink.usage = Some(Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                });
                 sink.num_turns = usage.get("premiumRequests").and_then(|v| v.as_u64());
             }
         }
@@ -961,11 +1094,12 @@ fn parse_gemini_event(evt: &Value, sink: &mut EventSink) {
 // ---------------------------------------------------------------------------
 
 pub fn discover_vibe_session(start_ms: u64, project_dir: &str) -> Option<String> {
-    let session_dir = std::env::var("VIBE_SESSION_DIR")
-        .unwrap_or_else(|_| {
-            let home = dirs::home_dir().unwrap_or_default();
-            home.join(".vibe/logs/session").to_string_lossy().to_string()
-        });
+    let session_dir = std::env::var("VIBE_SESSION_DIR").unwrap_or_else(|_| {
+        let home = dirs::home_dir().unwrap_or_default();
+        home.join(".vibe/logs/session")
+            .to_string_lossy()
+            .to_string()
+    });
     let session_path = Path::new(&session_dir);
 
     let entries: Vec<String> = match std::fs::read_dir(session_path) {
@@ -977,18 +1111,22 @@ pub fn discover_vibe_session(start_ms: u64, project_dir: &str) -> Option<String>
         Err(_) => return None,
     };
 
-    let resolved_project = std::fs::canonicalize(project_dir)
-        .unwrap_or_else(|_| Path::new(project_dir).to_path_buf());
+    let resolved_project =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| Path::new(project_dir).to_path_buf());
 
     let mut scored: Vec<(String, u64, bool, bool)> = entries
         .iter()
         .filter_map(|name| {
             let meta_file = session_path.join(name).join("meta.json");
             let stat = std::fs::metadata(&meta_file).ok()?;
-            let mtime_ms = stat.modified().ok()?
-                .duration_since(std::time::UNIX_EPOCH).ok()?
+            let mtime_ms = stat
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
                 .as_millis() as u64;
-            let data: Value = serde_json::from_str(&std::fs::read_to_string(&meta_file).ok()?).ok()?;
+            let data: Value =
+                serde_json::from_str(&std::fs::read_to_string(&meta_file).ok()?).ok()?;
             let env = data.get("environment")?.as_object()?;
             let wd = env.get("working_directory")?.as_str()?;
 
@@ -1004,7 +1142,90 @@ pub fn discover_vibe_session(start_ms: u64, project_dir: &str) -> Option<String>
 
     scored.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
 
-    scored.iter()
+    scored
+        .iter()
+        .find(|(_, _, dir, recent)| *dir && *recent)
+        .or_else(|| scored.iter().find(|(_, _, dir, _)| *dir))
+        .or_else(|| scored.iter().find(|(_, _, _, recent)| *recent))
+        .map(|(sid, _, _, _)| sid.clone())
+}
+
+pub fn discover_gemini_session(start_ms: u64, project_dir: &str) -> Option<String> {
+    let tmp_root = dirs::home_dir()?.join(".gemini").join("tmp");
+    discover_gemini_session_in(&tmp_root, start_ms, project_dir)
+}
+
+pub fn discover_gemini_session_in(
+    tmp_root: &Path,
+    start_ms: u64,
+    project_dir: &str,
+) -> Option<String> {
+    let resolved_project =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| Path::new(project_dir).to_path_buf());
+
+    let mut scored: Vec<(String, u64, bool, bool)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(tmp_root) else {
+        return None;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let proj_dir = entry.path();
+        if !proj_dir.is_dir() {
+            continue;
+        }
+        let root_file = proj_dir.join(".project_root");
+        let chats_dir = proj_dir.join("chats");
+        if !root_file.exists() || !chats_dir.is_dir() {
+            continue;
+        }
+
+        let Ok(root) = std::fs::read_to_string(&root_file) else {
+            continue;
+        };
+        let root = root.trim();
+        let matches_dir = std::fs::canonicalize(root)
+            .map(|c| c == resolved_project)
+            .unwrap_or_else(|_| Path::new(root) == resolved_project);
+
+        let Ok(chats) = std::fs::read_dir(&chats_dir) else {
+            continue;
+        };
+        for chat in chats.filter_map(|e| e.ok()) {
+            let path = chat.path();
+            if path.extension().map(|e| e != "json").unwrap_or(true) {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("session-") {
+                continue;
+            }
+            let Ok(stat) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(modified) = stat.modified() else {
+                continue;
+            };
+            let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) else {
+                continue;
+            };
+            let mtime_ms = duration.as_millis() as u64;
+            let recent = mtime_ms >= start_ms.saturating_sub(2000);
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(data) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let Some(session_id) = data["sessionId"].as_str() else {
+                continue;
+            };
+            let session_id = session_id.to_string();
+            scored.push((session_id, mtime_ms, matches_dir, recent));
+        }
+    }
+
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored
+        .iter()
         .find(|(_, _, dir, recent)| *dir && *recent)
         .or_else(|| scored.iter().find(|(_, _, dir, _)| *dir))
         .or_else(|| scored.iter().find(|(_, _, _, recent)| *recent))
@@ -1068,10 +1289,14 @@ pub fn resolve_claude_session_cwd_in(
     }
     for account in &accounts {
         let projects = account.join("projects");
-        let Ok(slugs) = std::fs::read_dir(&projects) else { continue };
+        let Ok(slugs) = std::fs::read_dir(&projects) else {
+            continue;
+        };
         for slug in slugs.flatten() {
             let path = slug.path().join(&file_name);
-            if !path.is_file() { continue; }
+            if !path.is_file() {
+                continue;
+            }
             if let Some(cwd) = extract_claude_cwd(&path) {
                 return Some(cwd);
             }
@@ -1124,15 +1349,23 @@ pub fn resolve_codex_session_cwd_in(
     // YYYY/MM/DD layout — walk three levels; filename match is cheap.
     let years = std::fs::read_dir(&sessions).ok()?;
     for year in years.flatten() {
-        let Ok(months) = std::fs::read_dir(year.path()) else { continue };
+        let Ok(months) = std::fs::read_dir(year.path()) else {
+            continue;
+        };
         for month in months.flatten() {
-            let Ok(days) = std::fs::read_dir(month.path()) else { continue };
+            let Ok(days) = std::fs::read_dir(month.path()) else {
+                continue;
+            };
             for day in days.flatten() {
-                let Ok(files) = std::fs::read_dir(day.path()) else { continue };
+                let Ok(files) = std::fs::read_dir(day.path()) else {
+                    continue;
+                };
                 for file in files.flatten() {
                     let name = file.file_name();
                     let Some(name) = name.to_str() else { continue };
-                    if !name.starts_with("rollout-") || !name.ends_with(&suffix) { continue; }
+                    if !name.starts_with("rollout-") || !name.ends_with(&suffix) {
+                        continue;
+                    }
                     if let Some(cwd) = extract_codex_cwd(&file.path()) {
                         return Some(cwd);
                     }
@@ -1165,30 +1398,44 @@ pub fn resolve_gemini_session_cwd_in(
     session_id: &str,
 ) -> Option<std::path::PathBuf> {
     use std::io::Read;
-    if session_id.len() < 8 { return None; }
+    if session_id.len() < 8 {
+        return None;
+    }
     let first8 = &session_id[..8];
     let suffix = format!("-{first8}.json");
     let needle = format!("\"sessionId\": \"{session_id}\"");
 
     for entry in std::fs::read_dir(tmp_root).ok()?.flatten() {
         let chats = entry.path().join("chats");
-        let Ok(chat_entries) = std::fs::read_dir(&chats) else { continue };
+        let Ok(chat_entries) = std::fs::read_dir(&chats) else {
+            continue;
+        };
         for chat in chat_entries.flatten() {
             let name = chat.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !name.starts_with("session-") || !name.ends_with(&suffix) { continue; }
+            if !name.starts_with("session-") || !name.ends_with(&suffix) {
+                continue;
+            }
             // The filename suffix is only the UUID's first 8 chars, so
             // confirm the full sessionId via the file header before
             // trusting the match.
-            let Ok(mut f) = std::fs::File::open(chat.path()) else { continue };
+            let Ok(mut f) = std::fs::File::open(chat.path()) else {
+                continue;
+            };
             let mut buf = [0u8; 256];
             let n = f.read(&mut buf).ok()?;
             let header = std::str::from_utf8(&buf[..n]).unwrap_or("");
-            if !header.contains(&needle) { continue; }
+            if !header.contains(&needle) {
+                continue;
+            }
 
-            let Ok(root) = std::fs::read_to_string(entry.path().join(".project_root")) else { continue };
+            let Ok(root) = std::fs::read_to_string(entry.path().join(".project_root")) else {
+                continue;
+            };
             let root = root.trim();
-            if root.is_empty() { continue; }
+            if root.is_empty() {
+                continue;
+            }
             return Some(std::path::PathBuf::from(root));
         }
     }
@@ -1214,55 +1461,191 @@ pub struct EffortInfo {
 }
 
 static CLAUDE_EFFORTS: &[EffortInfo] = &[
-    EffortInfo { id: "low", description: "Light reasoning", default: false },
-    EffortInfo { id: "medium", description: "Balanced speed and depth", default: false },
-    EffortInfo { id: "high", description: "Greater depth for complex problems", default: false },
-    EffortInfo { id: "xhigh", description: "Extended depth (Opus 4.7 only)", default: true },
-    EffortInfo { id: "max", description: "Maximum reasoning depth", default: false },
+    EffortInfo {
+        id: "low",
+        description: "Light reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "medium",
+        description: "Balanced speed and depth",
+        default: false,
+    },
+    EffortInfo {
+        id: "high",
+        description: "Greater depth for complex problems",
+        default: false,
+    },
+    EffortInfo {
+        id: "xhigh",
+        description: "Extended depth (Opus 4.7 only)",
+        default: true,
+    },
+    EffortInfo {
+        id: "max",
+        description: "Maximum reasoning depth",
+        default: false,
+    },
 ];
 
 static CLAUDE_MODELS: &[ModelInfo] = &[
-    ModelInfo { id: "claude-opus-4-7", description: "Frontier model, 1M context built-in", default: true },
-    ModelInfo { id: "claude-opus-4-6[1m]", description: "Previous frontier, 1M context window", default: false },
-    ModelInfo { id: "claude-opus-4-6", description: "Previous frontier, 200K context", default: false },
-    ModelInfo { id: "claude-sonnet-4-6", description: "Fast + capable, balanced cost", default: false },
-    ModelInfo { id: "claude-haiku-4-5-20251001", description: "Fastest, lowest cost", default: false },
+    ModelInfo {
+        id: "claude-opus-4-7",
+        description: "Frontier model, 1M context built-in",
+        default: true,
+    },
+    ModelInfo {
+        id: "claude-opus-4-6[1m]",
+        description: "Previous frontier, 1M context window",
+        default: false,
+    },
+    ModelInfo {
+        id: "claude-opus-4-6",
+        description: "Previous frontier, 200K context",
+        default: false,
+    },
+    ModelInfo {
+        id: "claude-sonnet-4-6",
+        description: "Fast + capable, balanced cost",
+        default: false,
+    },
+    ModelInfo {
+        id: "claude-haiku-4-5-20251001",
+        description: "Fastest, lowest cost",
+        default: false,
+    },
 ];
 
 static CODEX_MODELS: &[ModelInfo] = &[
-    ModelInfo { id: "gpt-5.4", description: "Latest frontier agentic coding model", default: true },
-    ModelInfo { id: "gpt-5.4-mini", description: "Smaller frontier agentic coding model", default: false },
-    ModelInfo { id: "gpt-5.3-codex", description: "Frontier Codex-optimized agentic coding model", default: false },
-    ModelInfo { id: "gpt-5.3-codex-spark", description: "Ultra-fast coding model", default: false },
-    ModelInfo { id: "gpt-5.2-codex", description: "Frontier agentic coding model", default: false },
-    ModelInfo { id: "gpt-5.2", description: "Optimized for professional work and long-running agents", default: false },
-    ModelInfo { id: "gpt-5.1-codex-max", description: "Deep and fast reasoning, xhigh effort", default: false },
-    ModelInfo { id: "gpt-5.1-codex-mini", description: "Cheaper, faster, less capable", default: false },
+    ModelInfo {
+        id: "gpt-5.4",
+        description: "Latest frontier agentic coding model",
+        default: true,
+    },
+    ModelInfo {
+        id: "gpt-5.4-mini",
+        description: "Smaller frontier agentic coding model",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.3-codex",
+        description: "Frontier Codex-optimized agentic coding model",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.3-codex-spark",
+        description: "Ultra-fast coding model",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.2-codex",
+        description: "Frontier agentic coding model",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.2",
+        description: "Optimized for professional work and long-running agents",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.1-codex-max",
+        description: "Deep and fast reasoning, xhigh effort",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.1-codex-mini",
+        description: "Cheaper, faster, less capable",
+        default: false,
+    },
 ];
 
 static CODEX_EFFORTS: &[EffortInfo] = &[
-    EffortInfo { id: "minimal", description: "Fastest, fewest reasoning tokens", default: false },
-    EffortInfo { id: "low", description: "Light reasoning", default: false },
-    EffortInfo { id: "medium", description: "Balanced speed and depth", default: true },
-    EffortInfo { id: "high", description: "Greater depth for complex problems", default: false },
-    EffortInfo { id: "xhigh", description: "Maximum depth (gpt-5.1-codex-max / gpt-5.2-codex only)", default: false },
+    EffortInfo {
+        id: "minimal",
+        description: "Fastest, fewest reasoning tokens",
+        default: false,
+    },
+    EffortInfo {
+        id: "low",
+        description: "Light reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "medium",
+        description: "Balanced speed and depth",
+        default: true,
+    },
+    EffortInfo {
+        id: "high",
+        description: "Greater depth for complex problems",
+        default: false,
+    },
+    EffortInfo {
+        id: "xhigh",
+        description: "Maximum depth (gpt-5.1-codex-max / gpt-5.2-codex only)",
+        default: false,
+    },
 ];
 
 static COPILOT_MODELS: &[ModelInfo] = &[
-    ModelInfo { id: "claude-opus-4-7", description: "Anthropic Opus 4.7", default: true },
-    ModelInfo { id: "claude-opus-4-6", description: "Anthropic Opus 4.6", default: false },
-    ModelInfo { id: "claude-sonnet-4-6", description: "Anthropic Sonnet 4.6", default: false },
-    ModelInfo { id: "gpt-5.3-codex", description: "OpenAI Codex-optimized", default: false },
-    ModelInfo { id: "gpt-5.2-codex", description: "OpenAI Codex", default: false },
-    ModelInfo { id: "gpt-5.1-codex-max", description: "OpenAI deep reasoning", default: false },
-    ModelInfo { id: "gpt-5.2", description: "OpenAI general purpose", default: false },
+    ModelInfo {
+        id: "claude-opus-4-7",
+        description: "Anthropic Opus 4.7",
+        default: true,
+    },
+    ModelInfo {
+        id: "claude-opus-4-6",
+        description: "Anthropic Opus 4.6",
+        default: false,
+    },
+    ModelInfo {
+        id: "claude-sonnet-4-6",
+        description: "Anthropic Sonnet 4.6",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.3-codex",
+        description: "OpenAI Codex-optimized",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.2-codex",
+        description: "OpenAI Codex",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.1-codex-max",
+        description: "OpenAI deep reasoning",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.2",
+        description: "OpenAI general purpose",
+        default: false,
+    },
 ];
 
 static COPILOT_EFFORTS: &[EffortInfo] = &[
-    EffortInfo { id: "low", description: "Fast responses with lighter reasoning", default: false },
-    EffortInfo { id: "medium", description: "Balanced speed and depth", default: true },
-    EffortInfo { id: "high", description: "Greater depth for complex problems", default: false },
-    EffortInfo { id: "xhigh", description: "Maximum reasoning depth", default: false },
+    EffortInfo {
+        id: "low",
+        description: "Fast responses with lighter reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "medium",
+        description: "Balanced speed and depth",
+        default: true,
+    },
+    EffortInfo {
+        id: "high",
+        description: "Greater depth for complex problems",
+        default: false,
+    },
+    EffortInfo {
+        id: "xhigh",
+        description: "Maximum reasoning depth",
+        default: false,
+    },
 ];
 
 // Vibe CLI does not expose per-invocation model selection (no --model
@@ -1272,12 +1655,36 @@ static COPILOT_EFFORTS: &[EffortInfo] = &[
 static VIBE_MODELS: &[ModelInfo] = &[];
 
 static GEMINI_MODELS: &[ModelInfo] = &[
-    ModelInfo { id: "gemini-3.1-pro-preview", description: "Gemini 3.1 Pro, flagship reasoning model (preview)", default: true },
-    ModelInfo { id: "gemini-3-flash-preview", description: "Gemini 3 Flash, fast generalist (preview)", default: false },
-    ModelInfo { id: "gemini-3.1-flash-lite-preview", description: "Gemini 3.1 Flash-Lite, lowest cost (preview)", default: false },
-    ModelInfo { id: "gemini-2.5-pro", description: "Gemini 2.5 Pro, prior-gen flagship (GA)", default: false },
-    ModelInfo { id: "gemini-2.5-flash", description: "Gemini 2.5 Flash, prior-gen fast (GA)", default: false },
-    ModelInfo { id: "gemini-2.5-flash-lite", description: "Gemini 2.5 Flash-Lite, prior-gen low-cost (GA)", default: false },
+    ModelInfo {
+        id: "gemini-3.1-pro-preview",
+        description: "Gemini 3.1 Pro, flagship reasoning model (preview)",
+        default: true,
+    },
+    ModelInfo {
+        id: "gemini-3-flash-preview",
+        description: "Gemini 3 Flash, fast generalist (preview)",
+        default: false,
+    },
+    ModelInfo {
+        id: "gemini-3.1-flash-lite-preview",
+        description: "Gemini 3.1 Flash-Lite, lowest cost (preview)",
+        default: false,
+    },
+    ModelInfo {
+        id: "gemini-2.5-pro",
+        description: "Gemini 2.5 Pro, prior-gen flagship (GA)",
+        default: false,
+    },
+    ModelInfo {
+        id: "gemini-2.5-flash",
+        description: "Gemini 2.5 Flash, prior-gen fast (GA)",
+        default: false,
+    },
+    ModelInfo {
+        id: "gemini-2.5-flash-lite",
+        description: "Gemini 2.5 Flash-Lite, prior-gen low-cost (GA)",
+        default: false,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1318,7 +1725,10 @@ mod tests {
 
     #[test]
     fn test_codex_exec_args_with_effort() {
-        let opts = ExecOpts { model: Some("gpt-5.4".into()), effort: Some("high".into()) };
+        let opts = ExecOpts {
+            model: Some("gpt-5.4".into()),
+            effort: Some("high".into()),
+        };
         let args = Provider::Codex.build_exec_args("do stuff", "", None, Some(&opts));
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"gpt-5.4".to_string()));
@@ -1359,13 +1769,20 @@ mod tests {
 
     #[test]
     fn test_vibe_ignores_model_param() {
-        let opts = ExecOpts { model: Some("devstral-2".into()), effort: None };
+        let opts = ExecOpts {
+            model: Some("devstral-2".into()),
+            effort: None,
+        };
         let exec_args = Provider::Vibe.build_exec_args("hi", "sid", None, Some(&opts));
-        assert!(!exec_args.contains(&"--model".to_string()),
-            "vibe exec must not emit --model (CLI rejects it): {exec_args:?}");
+        assert!(
+            !exec_args.contains(&"--model".to_string()),
+            "vibe exec must not emit --model (CLI rejects it): {exec_args:?}"
+        );
         let resume_args = Provider::Vibe.build_resume_args("sid", "hi", Some(&opts));
-        assert!(!resume_args.contains(&"--model".to_string()),
-            "vibe resume must not emit --model (CLI rejects it): {resume_args:?}");
+        assert!(
+            !resume_args.contains(&"--model".to_string()),
+            "vibe resume must not emit --model (CLI rejects it): {resume_args:?}"
+        );
     }
 
     #[test]
@@ -1394,7 +1811,10 @@ mod tests {
             session_id: None,
         };
         Provider::Claude.parse_event(&evt, &mut sink);
-        assert_eq!(sink.last_assistant_message.as_deref(), Some("The answer is 42"));
+        assert_eq!(
+            sink.last_assistant_message.as_deref(),
+            Some("The answer is 42")
+        );
         assert_eq!(sink.usage.as_ref().unwrap().input_tokens, 100);
         assert_eq!(sink.cost_usd, Some(0.05));
         assert_eq!(sink.num_turns, Some(3));
@@ -1411,11 +1831,17 @@ mod tests {
             }
         });
         let mut sink = EventSink {
-            last_assistant_message: None, usage: None,
-            cost_usd: None, num_turns: None, session_id: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
         };
         Provider::Claude.parse_event(&evt, &mut sink);
-        assert_eq!(sink.last_assistant_message.as_deref(), Some("Working on it..."));
+        assert_eq!(
+            sink.last_assistant_message.as_deref(),
+            Some("Working on it...")
+        );
     }
 
     #[test]
@@ -1425,8 +1851,11 @@ mod tests {
             "thread_id": "codex-thread-123"
         });
         let mut sink = EventSink {
-            last_assistant_message: None, usage: None,
-            cost_usd: None, num_turns: None, session_id: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
         };
         Provider::Codex.parse_event(&evt, &mut sink);
         assert_eq!(sink.session_id.as_deref(), Some("codex-thread-123"));
@@ -1439,8 +1868,11 @@ mod tests {
             "item": { "type": "agent_message", "text": "Done!" }
         });
         let mut sink = EventSink {
-            last_assistant_message: None, usage: None,
-            cost_usd: None, num_turns: None, session_id: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
         };
         Provider::Codex.parse_event(&evt, &mut sink);
         assert_eq!(sink.last_assistant_message.as_deref(), Some("Done!"));
@@ -1453,8 +1885,11 @@ mod tests {
             "usage": { "input_tokens": 200, "output_tokens": 80 }
         });
         let mut sink = EventSink {
-            last_assistant_message: None, usage: None,
-            cost_usd: None, num_turns: None, session_id: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
         };
         Provider::Codex.parse_event(&evt, &mut sink);
         assert_eq!(sink.usage.as_ref().unwrap().input_tokens, 200);
@@ -1468,11 +1903,17 @@ mod tests {
             "data": { "content": "Here's the fix" }
         });
         let mut sink = EventSink {
-            last_assistant_message: None, usage: None,
-            cost_usd: None, num_turns: None, session_id: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
         };
         Provider::Copilot.parse_event(&evt, &mut sink);
-        assert_eq!(sink.last_assistant_message.as_deref(), Some("Here's the fix"));
+        assert_eq!(
+            sink.last_assistant_message.as_deref(),
+            Some("Here's the fix")
+        );
     }
 
     #[test]
@@ -1483,8 +1924,11 @@ mod tests {
             "usage": { "premiumRequests": 5 }
         });
         let mut sink = EventSink {
-            last_assistant_message: None, usage: None,
-            cost_usd: None, num_turns: None, session_id: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
         };
         Provider::Copilot.parse_event(&evt, &mut sink);
         assert_eq!(sink.session_id.as_deref(), Some("copilot-sid"));
@@ -1499,8 +1943,11 @@ mod tests {
             {"role": "assistant", "content": "  Final answer  "}
         ]);
         let mut sink = EventSink {
-            last_assistant_message: None, usage: None,
-            cost_usd: None, num_turns: None, session_id: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
         };
         Provider::Vibe.parse_event(&evt, &mut sink);
         assert_eq!(sink.last_assistant_message.as_deref(), Some("Final answer"));
@@ -1520,8 +1967,11 @@ mod tests {
             }
         });
         let mut sink = EventSink {
-            last_assistant_message: None, usage: None,
-            cost_usd: None, num_turns: None, session_id: None,
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
         };
         Provider::Gemini.parse_event(&evt, &mut sink);
         assert_eq!(sink.last_assistant_message.as_deref(), Some("The answer"));
@@ -1535,15 +1985,23 @@ mod tests {
         for p in Provider::ALL {
             // Vibe has no selectable model surface (CLI lacks --model);
             // catalog is intentionally empty.
-            if matches!(p, Provider::Vibe) { continue; }
-            assert!(!p.models().is_empty(), "{} should have at least one model", p);
+            if matches!(p, Provider::Vibe) {
+                continue;
+            }
+            assert!(
+                !p.models().is_empty(),
+                "{} should have at least one model",
+                p
+            );
         }
     }
 
     #[test]
     fn test_each_provider_has_default_model() {
         for p in Provider::ALL {
-            if matches!(p, Provider::Vibe) { continue; }
+            if matches!(p, Provider::Vibe) {
+                continue;
+            }
             let has_default = p.models().iter().any(|m| m.default);
             assert!(has_default, "{} should have a default model", p);
         }
@@ -1551,34 +2009,48 @@ mod tests {
 
     #[test]
     fn test_vibe_models_empty() {
-        assert!(Provider::Vibe.models().is_empty(),
-            "vibe must not advertise selectable models — CLI has no --model flag");
+        assert!(
+            Provider::Vibe.models().is_empty(),
+            "vibe must not advertise selectable models — CLI has no --model flag"
+        );
     }
 
     #[test]
     fn test_mcp_add_args_shape_per_provider() {
         let u = "http://127.0.0.1:7264/mcp";
-        let c = Provider::Claude.build_mcp_add_http_args("blackbox", u, &[]).unwrap();
+        let c = Provider::Claude
+            .build_mcp_add_http_args("blackbox", u, &[])
+            .unwrap();
         assert_eq!(&c[..4], &["mcp", "add", "-s", "user"]);
         assert!(c.contains(&"--transport".to_string()));
         assert!(c.contains(&"http".to_string()));
         assert!(c.contains(&"blackbox".to_string()));
         assert!(c.contains(&u.to_string()));
 
-        let co = Provider::Copilot.build_mcp_add_http_args("blackbox", u, &[]).unwrap();
+        let co = Provider::Copilot
+            .build_mcp_add_http_args("blackbox", u, &[])
+            .unwrap();
         assert!(co.starts_with(&["copilot".to_string(), "--".to_string()]));
         assert!(co.contains(&"--transport".to_string()));
 
-        let cx = Provider::Codex.build_mcp_add_http_args("blackbox", u, &[]).unwrap();
+        let cx = Provider::Codex
+            .build_mcp_add_http_args("blackbox", u, &[])
+            .unwrap();
         assert!(cx.contains(&"--url".to_string()));
         assert!(cx.contains(&u.to_string()));
 
-        let g = Provider::Gemini.build_mcp_add_http_args("blackbox", u, &[]).unwrap();
+        let g = Provider::Gemini
+            .build_mcp_add_http_args("blackbox", u, &[])
+            .unwrap();
         assert!(g.iter().any(|a| a == "-t"));
         assert!(g.iter().any(|a| a == "-s"));
         assert!(g.contains(&u.to_string()));
 
-        assert!(Provider::Vibe.build_mcp_add_http_args("x", "y", &[]).is_none());
+        assert!(
+            Provider::Vibe
+                .build_mcp_add_http_args("x", "y", &[])
+                .is_none()
+        );
     }
 
     #[test]
@@ -1594,7 +2066,8 @@ mod tests {
 
     #[test]
     fn test_mcp_list_has_detects_states() {
-        let out = "Name        URL\nblackbox    http://127.0.0.1:7264/mcp\nother       http://x/mcp\n";
+        let out =
+            "Name        URL\nblackbox    http://127.0.0.1:7264/mcp\nother       http://x/mcp\n";
         assert_eq!(
             Provider::Claude.mcp_list_has(out, "blackbox", Some("http://127.0.0.1:7264/mcp")),
             MatchState::MatchesName
@@ -1624,7 +2097,11 @@ mod tests {
         assert!(args[1].contains("Bash(rm -rf *)"));
         // The raw glob should NOT appear — it'd be treated as a literal
         // tool name by Claude and match nothing.
-        assert!(!args[1].split_whitespace().any(|t| t == "mcp__blackbox__bro_*"));
+        assert!(
+            !args[1]
+                .split_whitespace()
+                .any(|t| t == "mcp__blackbox__bro_*")
+        );
     }
 
     #[test]
@@ -1651,7 +2128,10 @@ mod tests {
             copilot_format_mcp_tool("mcp__blackbox__bro_exec"),
             Some("blackbox(bro_exec)".to_string())
         );
-        assert_eq!(copilot_format_mcp_tool("mcp__foo__bar"), Some("foo(bar)".to_string()));
+        assert_eq!(
+            copilot_format_mcp_tool("mcp__foo__bar"),
+            Some("foo(bar)".to_string())
+        );
         // Not MCP-shaped → None, caller uses original.
         assert_eq!(copilot_format_mcp_tool("Bash(git *)"), None);
         assert_eq!(copilot_format_mcp_tool("mcp__only_one_underscore"), None);
@@ -1696,7 +2176,10 @@ mod tests {
         // Exact tool name on a non-blackbox MCP server routes to that
         // server's disabled_tools array.
         assert_eq!(args[0], "-c");
-        assert_eq!(args[1], "mcp_servers.github.disabled_tools=[\"create_issue\"]");
+        assert_eq!(
+            args[1],
+            "mcp_servers.github.disabled_tools=[\"create_issue\"]"
+        );
     }
 
     #[test]
@@ -1735,7 +2218,8 @@ mod tests {
         let args = Provider::Codex.build_filter_args(&filters);
         // Two `-c` overrides — one per server. BTreeMap iteration is
         // alphabetical, so blackbox comes before github.
-        let overrides: Vec<&String> = args.iter()
+        let overrides: Vec<&String> = args
+            .iter()
             .filter(|a| a.starts_with("mcp_servers."))
             .collect();
         assert_eq!(overrides.len(), 2);
@@ -1798,7 +2282,10 @@ mod tests {
             .build_mcp_add_http_args_full("blackbox", "http://x/mcp", &[], &headers, "user")
             .unwrap();
         let joined = claude.join(" | ");
-        assert!(joined.contains("-H | Authorization: Bearer xyz"), "got: {joined}");
+        assert!(
+            joined.contains("-H | Authorization: Bearer xyz"),
+            "got: {joined}"
+        );
         assert!(joined.contains("-H | X-Trace: abc123"), "got: {joined}");
 
         // Gemini also emits -H pairs.
@@ -1825,28 +2312,67 @@ mod tests {
     #[test]
     fn test_scoped_arg_builders_honor_scope_capability() {
         // Claude + Gemini support both user and project.
-        assert!(Provider::Claude.build_mcp_add_http_args_scoped("x", "u", &[], "user").is_some());
-        assert!(Provider::Claude.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_some());
-        assert!(Provider::Gemini.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_some());
+        assert!(
+            Provider::Claude
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_some()
+        );
+        assert!(
+            Provider::Claude
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
+        assert!(
+            Provider::Gemini
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
 
         // Codex has no project scope (single config file).
-        assert!(Provider::Codex.build_mcp_add_http_args_scoped("x", "u", &[], "user").is_some());
-        assert!(Provider::Codex.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_none());
-        assert!(Provider::Codex.build_mcp_remove_args_scoped("x", "project").is_none());
+        assert!(
+            Provider::Codex
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_some()
+        );
+        assert!(
+            Provider::Codex
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_none()
+        );
+        assert!(
+            Provider::Codex
+                .build_mcp_remove_args_scoped("x", "project")
+                .is_none()
+        );
 
         // Copilot only user (no documented project flag).
-        assert!(Provider::Copilot.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_none());
+        assert!(
+            Provider::Copilot
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_none()
+        );
 
         // Vibe never.
-        assert!(Provider::Vibe.build_mcp_add_http_args_scoped("x", "u", &[], "user").is_none());
-        assert!(Provider::Vibe.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_none());
+        assert!(
+            Provider::Vibe
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_none()
+        );
+        assert!(
+            Provider::Vibe
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_none()
+        );
 
         // Claude project scope emits -s project.
         let claude_proj = Provider::Claude
             .build_mcp_add_http_args_scoped("x", "http://u/mcp", &[], "project")
             .unwrap();
         let joined = claude_proj.join(" ");
-        assert!(joined.contains("-s project"), "expected -s project in: {joined}");
+        assert!(
+            joined.contains("-s project"),
+            "expected -s project in: {joined}"
+        );
         // Gemini project scope emits -s project.
         let gemini_proj = Provider::Gemini
             .build_mcp_add_http_args_scoped("x", "http://u/mcp", &[], "project")
@@ -1858,10 +2384,7 @@ mod tests {
     fn test_format_toml_string_array_escapes_control_chars() {
         // TOML basic strings forbid raw control chars (0x00-0x1F + 0x7F).
         // Recognised shortforms preferred; everything else \uXXXX.
-        assert_eq!(
-            format_toml_string_array(&["a\tb".into()]),
-            r#"["a\tb"]"#
-        );
+        assert_eq!(format_toml_string_array(&["a\tb".into()]), r#"["a\tb"]"#);
         assert_eq!(
             format_toml_string_array(&["x\ny\rz".into()]),
             r#"["x\ny\rz"]"#
@@ -1882,8 +2405,14 @@ mod tests {
 
     #[test]
     fn resolve_bin_passes_through_paths_with_separators() {
-        assert_eq!(resolve_bin("/usr/local/bin/codex").as_deref(), Some("/usr/local/bin/codex"));
-        assert_eq!(resolve_bin("./relative/bin").as_deref(), Some("./relative/bin"));
+        assert_eq!(
+            resolve_bin("/usr/local/bin/codex").as_deref(),
+            Some("/usr/local/bin/codex")
+        );
+        assert_eq!(
+            resolve_bin("./relative/bin").as_deref(),
+            Some("./relative/bin")
+        );
     }
 
     #[test]
@@ -1929,12 +2458,12 @@ mod tests {
             "13683fa2-df9a-44f3-a068-4520b4dbb55b",
             "2026-04-18T19-18",
         );
-        let cwd = resolve_gemini_session_cwd_in(
-            tmp.path(),
-            "13683fa2-df9a-44f3-a068-4520b4dbb55b",
-        )
-        .expect("should resolve");
-        assert_eq!(cwd, std::path::PathBuf::from("/home/user/repos/daystrom-mk2"));
+        let cwd = resolve_gemini_session_cwd_in(tmp.path(), "13683fa2-df9a-44f3-a068-4520b4dbb55b")
+            .expect("should resolve");
+        assert_eq!(
+            cwd,
+            std::path::PathBuf::from("/home/user/repos/daystrom-mk2")
+        );
     }
 
     #[test]
@@ -1950,11 +2479,8 @@ mod tests {
         // Different UUID — silent fork territory on the real Gemini CLI;
         // here we want None so the caller refuses.
         assert!(
-            resolve_gemini_session_cwd_in(
-                tmp.path(),
-                "bbbbbbbb-1111-2222-3333-444444444444",
-            )
-            .is_none()
+            resolve_gemini_session_cwd_in(tmp.path(), "bbbbbbbb-1111-2222-3333-444444444444",)
+                .is_none()
         );
     }
 
@@ -1978,11 +2504,8 @@ mod tests {
             "13683fa2-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
             "2026-04-18T20-00",
         );
-        let cwd = resolve_gemini_session_cwd_in(
-            tmp.path(),
-            "13683fa2-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-        )
-        .expect("should resolve");
+        let cwd = resolve_gemini_session_cwd_in(tmp.path(), "13683fa2-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+            .expect("should resolve");
         assert_eq!(cwd, std::path::PathBuf::from("/repo/b"));
     }
 
@@ -1990,6 +2513,43 @@ mod tests {
     fn resolve_gemini_session_rejects_short_id() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(resolve_gemini_session_cwd_in(tmp.path(), "short").is_none());
+    }
+
+    #[test]
+    fn discover_gemini_session_prefers_matching_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_gemini_fixture(
+            tmp.path(),
+            "proj-a",
+            "/repo/a",
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            "2026-04-18T10-00",
+        );
+        seed_gemini_fixture(
+            tmp.path(),
+            "proj-b",
+            "/repo/b",
+            "bbbbbbbb-1111-2222-3333-444444444444",
+            "2026-04-18T10-01",
+        );
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let sid =
+            discover_gemini_session_in(tmp.path(), now_ms, "/repo/b").expect("should resolve");
+        assert_eq!(sid, "bbbbbbbb-1111-2222-3333-444444444444");
+    }
+
+    #[test]
+    fn discover_gemini_session_returns_none_when_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(discover_gemini_session_in(tmp.path(), now_ms, "/repo/missing").is_none());
     }
 
     fn seed_claude_fixture(
@@ -2017,11 +2577,8 @@ mod tests {
             "aaaaaaaa-1111-2222-3333-444444444444",
             "/home/user/repos/proj",
         );
-        let cwd = resolve_claude_session_cwd_in(
-            tmp.path(),
-            "aaaaaaaa-1111-2222-3333-444444444444",
-        )
-        .expect("should resolve");
+        let cwd = resolve_claude_session_cwd_in(tmp.path(), "aaaaaaaa-1111-2222-3333-444444444444")
+            .expect("should resolve");
         assert_eq!(cwd, std::path::PathBuf::from("/home/user/repos/proj"));
     }
 
@@ -2043,11 +2600,8 @@ mod tests {
             "22222222-0000-0000-0000-000000000000",
             "/home/user/repos/b",
         );
-        let cwd = resolve_claude_session_cwd_in(
-            tmp.path(),
-            "22222222-0000-0000-0000-000000000000",
-        )
-        .expect("should resolve from secondary account");
+        let cwd = resolve_claude_session_cwd_in(tmp.path(), "22222222-0000-0000-0000-000000000000")
+            .expect("should resolve from secondary account");
         assert_eq!(cwd, std::path::PathBuf::from("/home/user/repos/b"));
     }
 
@@ -2062,11 +2616,8 @@ mod tests {
             "/home/user/repos/a",
         );
         assert!(
-            resolve_claude_session_cwd_in(
-                tmp.path(),
-                "bbbbbbbb-1111-2222-3333-444444444444",
-            )
-            .is_none()
+            resolve_claude_session_cwd_in(tmp.path(), "bbbbbbbb-1111-2222-3333-444444444444",)
+                .is_none()
         );
     }
 
@@ -2097,12 +2648,12 @@ mod tests {
             "019d9f26-e455-7da0-9e6c-460a5bbb223d",
             "/home/user/repos/daystrom-mk2",
         );
-        let cwd = resolve_codex_session_cwd_in(
-            tmp.path(),
-            "019d9f26-e455-7da0-9e6c-460a5bbb223d",
-        )
-        .expect("should resolve");
-        assert_eq!(cwd, std::path::PathBuf::from("/home/user/repos/daystrom-mk2"));
+        let cwd = resolve_codex_session_cwd_in(tmp.path(), "019d9f26-e455-7da0-9e6c-460a5bbb223d")
+            .expect("should resolve");
+        assert_eq!(
+            cwd,
+            std::path::PathBuf::from("/home/user/repos/daystrom-mk2")
+        );
     }
 
     #[test]
@@ -2116,11 +2667,8 @@ mod tests {
             "/home/user/repos/a",
         );
         assert!(
-            resolve_codex_session_cwd_in(
-                tmp.path(),
-                "00000000-0000-0000-0000-000000000000",
-            )
-            .is_none()
+            resolve_codex_session_cwd_in(tmp.path(), "00000000-0000-0000-0000-000000000000",)
+                .is_none()
         );
     }
 

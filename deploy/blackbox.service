@@ -5,12 +5,12 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/home/invidious/.claude-shared/bin/blackboxd
+ExecStart=%h/.local/bin/blackboxd
 Restart=on-failure
 RestartSec=3
 Environment=BBOX_PORT=7264
 Environment=RUST_LOG=blackbox=info
-# bbox state lives under ~/.claude-shared; working dir is incidental.
+# blackbox-owned state defaults to XDG paths under ~/.local/{state,share}.
 WorkingDirectory=%h
 # Keep stderr/stdout in journald.
 StandardOutput=journal

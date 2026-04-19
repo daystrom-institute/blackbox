@@ -23,9 +23,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, IntoContents, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig,
-    StreamableHttpService,
-    session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
@@ -52,7 +50,7 @@ struct SharedState {
     notes: RwLock<Notes>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
-    store_dir: PathBuf, // ~/.bro
+    store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
 }
 
 // ---------------------------------------------------------------------------
@@ -131,74 +129,118 @@ use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
 impl BlackboxServer {
-    #[tool(name = "bbox_search", description = "Full-text search across all indexed transcripts.")]
+    #[tool(
+        name = "bbox_search",
+        description = "Full-text search across all indexed transcripts."
+    )]
     fn bbox_search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
         Self::run("bbox_search", || {
             let mut idx = self.state.idx.write();
             if idx.is_empty() {
-                idx.build_index(false).map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
+                idx.build_index(false)
+                    .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
             drop(idx);
             self.state.idx.read().search(&p)
         })
     }
 
-    #[tool(name = "bbox_cite", description = "Trace a claim back to the turn that established it.")]
+    #[tool(
+        name = "bbox_cite",
+        description = "Trace a claim back to the turn that established it."
+    )]
     fn bbox_cite(&self, Parameters(p): Parameters<CiteParams>) -> CallToolResult {
         Self::run("bbox_cite", || self.state.idx.read().cite(&p))
     }
 
-    #[tool(name = "bbox_context", description = "Conversation context around a specific byte offset.")]
+    #[tool(
+        name = "bbox_context",
+        description = "Conversation context around a specific byte offset."
+    )]
     fn bbox_context(&self, Parameters(p): Parameters<ContextParams>) -> CallToolResult {
         Self::run("bbox_context", || self.state.idx.read().context(&p))
     }
 
-    #[tool(name = "bbox_session", description = "Summary metadata for a single session.")]
+    #[tool(
+        name = "bbox_session",
+        description = "Summary metadata for a single session."
+    )]
     fn bbox_session(&self, Parameters(p): Parameters<SessionParams>) -> CallToolResult {
         Self::run("bbox_session", || self.state.idx.read().session(&p))
     }
 
-    #[tool(name = "bbox_messages", description = "Chronological messages from a session.")]
+    #[tool(
+        name = "bbox_messages",
+        description = "Chronological messages from a session."
+    )]
     fn bbox_messages(&self, Parameters(p): Parameters<MessagesParams>) -> CallToolResult {
         Self::run("bbox_messages", || self.state.idx.read().messages(&p))
     }
 
-    #[tool(name = "bbox_reindex", description = "Build or incrementally update the search index.")]
+    #[tool(
+        name = "bbox_reindex",
+        description = "Build or incrementally update the search index."
+    )]
     fn bbox_reindex(&self, Parameters(p): Parameters<ReindexParams>) -> CallToolResult {
         Self::run("bbox_reindex", || self.state.idx.write().reindex(&p))
     }
 
-    #[tool(name = "bbox_topics", description = "Top terms in a session by frequency.")]
+    #[tool(
+        name = "bbox_topics",
+        description = "Top terms in a session by frequency."
+    )]
     fn bbox_topics(&self, Parameters(p): Parameters<TopicsParams>) -> CallToolResult {
         Self::run("bbox_topics", || self.state.idx.read().topics(&p))
     }
 
-    #[tool(name = "bbox_sessions_list", description = "Browse sessions sorted by recency.")]
+    #[tool(
+        name = "bbox_sessions_list",
+        description = "Browse sessions sorted by recency."
+    )]
     fn bbox_sessions_list(&self, Parameters(p): Parameters<SessionsListParams>) -> CallToolResult {
-        Self::run("bbox_sessions_list", || self.state.idx.read().sessions_list(&p))
+        Self::run("bbox_sessions_list", || {
+            self.state.idx.read().sessions_list(&p)
+        })
     }
 
-    #[tool(name = "bbox_stats", description = "Corpus statistics (doc count, index size, file counts).")]
+    #[tool(
+        name = "bbox_stats",
+        description = "Corpus statistics (doc count, index size, file counts)."
+    )]
     fn bbox_stats(&self) -> CallToolResult {
         Self::run("bbox_stats", || self.state.idx.read().stats())
     }
 
-    #[tool(name = "bbox_learn", description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files.")]
+    #[tool(
+        name = "bbox_learn",
+        description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files."
+    )]
     fn bbox_learn(&self, Parameters(p): Parameters<LearnParams>) -> CallToolResult {
         Self::run("bbox_learn", || self.state.kb.write().learn(&p, false))
     }
 
-    #[tool(name = "bbox_remember", description = "Persist a fact for later recall; indexed but NOT rendered.")]
+    #[tool(
+        name = "bbox_remember",
+        description = "Persist a fact for later recall; indexed but NOT rendered."
+    )]
     fn bbox_remember(&self, Parameters(p): Parameters<RememberParams>) -> CallToolResult {
-        Self::run("bbox_remember", || self.state.kb.write().remember(&p, false))
+        Self::run("bbox_remember", || {
+            self.state.kb.write().remember(&p, false)
+        })
     }
 
-    #[tool(name = "bbox_decide", description = "Record a durable commitment with required rationale; supports supersession.")]
+    #[tool(
+        name = "bbox_decide",
+        description = "Record a durable commitment with required rationale; supports supersession."
+    )]
     fn bbox_decide(&self, Parameters(p): Parameters<DecideParams>) -> CallToolResult {
         Self::run("bbox_decide", || self.state.kb.write().decide(&p, false))
     }
 
-    #[tool(name = "bbox_knowledge", description = "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above.")]
+    #[tool(
+        name = "bbox_knowledge",
+        description = "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above."
+    )]
     fn bbox_knowledge(&self, Parameters(p): Parameters<KnowledgeListParams>) -> CallToolResult {
         Self::run("bbox_knowledge", || self.state.kb.write().list(&p))
     }
@@ -208,32 +250,50 @@ impl BlackboxServer {
         Self::run("bbox_forget", || self.state.kb.write().forget(&p))
     }
 
-    #[tool(name = "bbox_render", description = "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md.")]
+    #[tool(
+        name = "bbox_render",
+        description = "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md."
+    )]
     fn bbox_render(&self, Parameters(p): Parameters<RenderParams>) -> CallToolResult {
         Self::run("bbox_render", || self.state.kb.read().render(&p))
     }
 
-    #[tool(name = "bbox_absorb", description = "Import external edits to rendered files back as unverified entries.")]
+    #[tool(
+        name = "bbox_absorb",
+        description = "Import external edits to rendered files back as unverified entries."
+    )]
     fn bbox_absorb(&self, Parameters(p): Parameters<AbsorbParams>) -> CallToolResult {
         Self::run("bbox_absorb", || self.state.kb.write().absorb(&p))
     }
 
-    #[tool(name = "bbox_lint", description = "Health check for contradictions, stale entries, duplicates.")]
+    #[tool(
+        name = "bbox_lint",
+        description = "Health check for contradictions, stale entries, duplicates."
+    )]
     fn bbox_lint(&self) -> CallToolResult {
         Self::run("bbox_lint", || self.state.kb.read().lint())
     }
 
-    #[tool(name = "bbox_review", description = "Approve or reject entries awaiting review.")]
+    #[tool(
+        name = "bbox_review",
+        description = "Approve or reject entries awaiting review."
+    )]
     fn bbox_review(&self, Parameters(p): Parameters<ReviewParams>) -> CallToolResult {
         Self::run("bbox_review", || self.state.kb.write().review(&p))
     }
 
-    #[tool(name = "bbox_bootstrap", description = "Onboard a new repo into the blackbox knowledge system.")]
+    #[tool(
+        name = "bbox_bootstrap",
+        description = "Onboard a new repo into the blackbox knowledge system."
+    )]
     fn bbox_bootstrap(&self, Parameters(p): Parameters<BootstrapParams>) -> CallToolResult {
         Self::run("bbox_bootstrap", || self.state.kb.read().bootstrap(&p))
     }
 
-    #[tool(name = "bbox_thread", description = "Open / continue / resolve / promote / rename / link a work thread.")]
+    #[tool(
+        name = "bbox_thread",
+        description = "Open / continue / resolve / promote / rename / link a work thread."
+    )]
     fn bbox_thread(&self, Parameters(p): Parameters<ThreadParams>) -> CallToolResult {
         Self::run("bbox_thread", || self.state.threads.write().thread(&p))
     }
@@ -248,22 +308,34 @@ impl BlackboxServer {
         })
     }
 
-    #[tool(name = "bbox_note", description = "Record a structured side-channel note while working.")]
+    #[tool(
+        name = "bbox_note",
+        description = "Record a structured side-channel note while working."
+    )]
     fn bbox_note(&self, Parameters(p): Parameters<NoteParams>) -> CallToolResult {
         Self::run("bbox_note", || self.state.notes.write().create(&p))
     }
 
-    #[tool(name = "bbox_notes", description = "List / filter notes by kind, project, session, thread, resolution.")]
+    #[tool(
+        name = "bbox_notes",
+        description = "List / filter notes by kind, project, session, thread, resolution."
+    )]
     fn bbox_notes(&self, Parameters(p): Parameters<NoteListParams>) -> CallToolResult {
         Self::run("bbox_notes", || self.state.notes.read().list(&p))
     }
 
-    #[tool(name = "bbox_note_resolve", description = "Mark a note acknowledged or addressed.")]
+    #[tool(
+        name = "bbox_note_resolve",
+        description = "Mark a note acknowledged or addressed."
+    )]
     fn bbox_note_resolve(&self, Parameters(p): Parameters<NoteResolveParams>) -> CallToolResult {
         Self::run("bbox_note_resolve", || self.state.notes.write().resolve(&p))
     }
 
-    #[tool(name = "bbox_inbox", description = "Aggregate attention layer across every store.")]
+    #[tool(
+        name = "bbox_inbox",
+        description = "Aggregate attention layer across every store."
+    )]
     fn bbox_inbox(&self, Parameters(p): Parameters<InboxParams>) -> CallToolResult {
         Self::run("bbox_inbox", || {
             let kb = self.state.kb.read();
@@ -382,10 +454,14 @@ struct StatusParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct DashboardParams {
-    #[serde(default)] provider: Option<String>,
-    #[serde(default)] team: Option<String>,
-    #[serde(default)] status: Option<String>,
-    #[serde(default)] limit: Option<usize>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -417,39 +493,58 @@ struct PruneParams {
 struct BrofileParams {
     /// Operation: create, list, get, delete, set_account, list_accounts
     action: String,
-    #[serde(default)] name: Option<String>,
-    #[serde(default)] provider: Option<String>,
-    #[serde(default)] account: Option<String>,
-    #[serde(default)] lens: Option<String>,
-    #[serde(default)] model: Option<String>,
-    #[serde(default)] effort: Option<String>,
-    #[serde(default)] env: Option<std::collections::HashMap<String, String>>,
-    #[serde(default)] scope: Option<String>,
-    #[serde(default)] project_dir: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    lens: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    env: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    project_dir: Option<String>,
     /// Persona-bound allow/disallow patterns embedded in the brofile.
     /// Apply at every dispatch using this brofile, between project
     /// mcp.json and per-dispatch ExecParams overrides.
-    #[serde(default)] allow_tools: Option<Vec<String>>,
-    #[serde(default)] disallow_tools: Option<Vec<String>>,
+    #[serde(default)]
+    allow_tools: Option<Vec<String>>,
+    #[serde(default)]
+    disallow_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct TeamParams {
     /// Operation: save_template, list_templates, delete_template, create, list, dissolve, roster
     action: String,
-    #[serde(default)] name: Option<String>,
-    #[serde(default)] members: Option<Vec<TeamMemberSlot>>,
-    #[serde(default)] template: Option<String>,
-    #[serde(default)] project_dir: Option<String>,
-    #[serde(default)] scope: Option<String>,
-    #[serde(default)] cancel_running: Option<bool>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    members: Option<Vec<TeamMemberSlot>>,
+    #[serde(default)]
+    template: Option<String>,
+    #[serde(default)]
+    project_dir: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    cancel_running: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct TeamMemberSlot {
     brofile: String,
-    #[serde(default)] alias: Option<String>,
-    #[serde(default)] count: Option<u32>,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    count: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -473,23 +568,43 @@ fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, bool) {
     let activity = if terminal {
         format!("{:?}", inner.status)
     } else {
-        inner.last_assistant_message.as_deref()
+        inner
+            .last_assistant_message
+            .as_deref()
             .map(|m| {
                 let c = m.replace('\n', " ");
-                if c.len() > 80 { format!("{}…", &c[..80]) } else { c }
+                if c.len() > 80 {
+                    format!("{}…", &c[..80])
+                } else {
+                    c
+                }
             })
-            .unwrap_or_else(|| if events == 0 { "starting…".into() } else { "working…".into() })
+            .unwrap_or_else(|| {
+                if events == 0 {
+                    "starting…".into()
+                } else {
+                    "working…".into()
+                }
+            })
     };
-    (format!("[{label}] {elapsed} | {events} ev | {activity}"), terminal)
+    (
+        format!("[{label}] {elapsed} | {events} ev | {activity}"),
+        terminal,
+    )
 }
 
 fn format_progress_snapshot(tasks: &[Arc<orch::Task>], store_dir: &Path) -> (String, bool) {
     let mut all_terminal = true;
-    let lines: Vec<String> = tasks.iter().map(|t| {
-        let (line, terminal) = format_bro_line(t, store_dir);
-        if !terminal { all_terminal = false; }
-        line
-    }).collect();
+    let lines: Vec<String> = tasks
+        .iter()
+        .map(|t| {
+            let (line, terminal) = format_bro_line(t, store_dir);
+            if !terminal {
+                all_terminal = false;
+            }
+            line
+        })
+        .collect();
     (lines.join("\n"), all_terminal)
 }
 
@@ -626,36 +741,51 @@ fn spawn_progress_notifier(
 
             let (msg, all_terminal) = format_progress_snapshot(&tasks, &store_dir);
 
-            let send_result = peer.send_notification(rmcp::model::ServerNotification::ProgressNotification(
-                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
-                    progress_token: progress_token.clone(),
-                    progress: tick as f64,
-                    total: None,
-                    message: Some(msg.clone()),
-                }),
-            )).await;
+            let send_result = peer
+                .send_notification(rmcp::model::ServerNotification::ProgressNotification(
+                    rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                        progress_token: progress_token.clone(),
+                        progress: tick as f64,
+                        total: None,
+                        message: Some(msg.clone()),
+                    }),
+                ))
+                .await;
             match send_result {
-                Ok(()) => tracing::debug!(target: "blackbox::progress", tick, terminal = all_terminal, msg_len = msg.len(), "tick sent"),
-                Err(e) => tracing::warn!(target: "blackbox::progress", tick, error = %e, "tick send failed"),
+                Ok(()) => {
+                    tracing::debug!(target: "blackbox::progress", tick, terminal = all_terminal, msg_len = msg.len(), "tick sent")
+                }
+                Err(e) => {
+                    tracing::warn!(target: "blackbox::progress", tick, error = %e, "tick send failed")
+                }
             }
 
-            if all_terminal { break; }
+            if all_terminal {
+                break;
+            }
         }
     })
 }
 
 #[tool_router(router = bro_tools)]
 impl BlackboxServer {
-    #[tool(name = "bro_exec", description = "Launch an agent task. Returns {taskId, sessionId} immediately.")]
+    #[tool(
+        name = "bro_exec",
+        description = "Launch an agent task. Returns {taskId, sessionId} immediately."
+    )]
     async fn bro_exec(&self, Parameters(p): Parameters<ExecParams>) -> CallToolResult {
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let store_dir = self.state.store_dir.clone();
 
-        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
-            match self.resolve_exec_target(p.bro.as_deref(), p.provider.as_deref(), p.project_dir.as_deref()) {
-                Ok(r) => r,
-                Err(e) => return Self::err_text(&e),
-            };
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) = match self
+            .resolve_exec_target(
+                p.bro.as_deref(),
+                p.provider.as_deref(),
+                p.project_dir.as_deref(),
+            ) {
+            Ok(r) => r,
+            Err(e) => return Self::err_text(&e),
+        };
 
         // Pre-generate task_id so it lands in the ambient [scope] block
         // before subprocess launch — the primary correlation key for
@@ -686,15 +816,32 @@ impl BlackboxServer {
             &orch::apply_ambient(&p.prompt, &ambient_ctx),
             lens.as_deref(),
         );
-        let mut args = provider.build_exec_args(&final_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-        let params_extra = extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
+        let mut args = provider.build_exec_args(
+            &final_prompt,
+            &session_id,
+            cwd.as_deref(),
+            exec_opts.as_ref(),
+        );
+        let params_extra =
+            extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
         let extra = combine_dispatch_filters(brofile_filters.as_ref(), params_extra.as_ref());
-        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
+        let dispatch_filters = resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            allow_recursion,
+            &task_id,
+            extra.as_ref(),
+        );
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
-            task_id, provider, args, session_id,
-            cwd, env_overrides, store_dir,
+            task_id,
+            provider,
+            args,
+            session_id,
+            cwd,
+            env_overrides,
+            store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
         );
@@ -715,14 +862,19 @@ impl BlackboxServer {
         }))
     }
 
-    #[tool(name = "bro_resume", description = "Continue an existing session with a follow-up.")]
+    #[tool(
+        name = "bro_resume",
+        description = "Continue an existing session with a follow-up."
+    )]
     async fn bro_resume(&self, Parameters(p): Parameters<ResumeParams>) -> CallToolResult {
         let store_dir = self.state.store_dir.clone();
 
         let (provider, session_id, _lens, exec_opts, env_overrides, cwd, brofile_filters) =
             match self.resolve_resume_target(
-                p.bro.as_deref(), p.session_id.as_deref(),
-                p.provider.as_deref(), p.project_dir.as_deref(),
+                p.bro.as_deref(),
+                p.session_id.as_deref(),
+                p.provider.as_deref(),
+                p.project_dir.as_deref(),
             ) {
                 Ok(r) => r,
                 Err(e) => return Self::err_text(&e),
@@ -741,9 +893,11 @@ impl BlackboxServer {
         // through to the caller's cwd and let them surface the failure.
         let cwd = match provider.resolve_session_cwd(&session_id) {
             Some(p) => Some(p.to_string_lossy().into_owned()),
-            None if provider == Provider::Gemini => return Self::err_text(&format!(
-                "Gemini session {session_id} not found in ~/.gemini/tmp/*/chats. Refusing to resume because Gemini silently forks a new session when the UUID isn't in the cwd's project folder (aliasing the resumed session). Verify the session ID or re-dispatch.",
-            )),
+            None if provider == Provider::Gemini => {
+                return Self::err_text(&format!(
+                    "Gemini session {session_id} not found in ~/.gemini/tmp/*/chats. Refusing to resume because Gemini silently forks a new session when the UUID isn't in the cwd's project folder (aliasing the resumed session). Verify the session ID or re-dispatch.",
+                ));
+            }
             None => cwd,
         };
 
@@ -777,14 +931,26 @@ impl BlackboxServer {
         // disallow) must ride with every dispatch — exec AND resume.
         // Without this, a resumed session re-acquires the orchestration
         // tool surface the recursion guard was meant to deny.
-        let params_extra = extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
+        let params_extra =
+            extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
         let extra = combine_dispatch_filters(brofile_filters.as_ref(), params_extra.as_ref());
-        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
+        let dispatch_filters = resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            allow_recursion,
+            &task_id,
+            extra.as_ref(),
+        );
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
-            task_id, provider, args, session_id,
-            cwd, env_overrides, store_dir,
+            task_id,
+            provider,
+            args,
+            session_id,
+            cwd,
+            env_overrides,
+            store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
         );
@@ -802,7 +968,10 @@ impl BlackboxServer {
         }))
     }
 
-    #[tool(name = "bro_wait", description = "Block until a single task completes.")]
+    #[tool(
+        name = "bro_wait",
+        description = "Block until a single task completes."
+    )]
     async fn bro_wait(
         &self,
         Parameters(p): Parameters<WaitParams>,
@@ -825,7 +994,9 @@ impl BlackboxServer {
         });
 
         let completed = orch::wait_for_task_with_timeout(&task, p.timeout_seconds).await;
-        if let Some(h) = progress_handle { h.abort(); }
+        if let Some(h) = progress_handle {
+            h.abort();
+        }
         if completed {
             Self::ok_json(&orch::task_result_json(&task))
         } else {
@@ -833,7 +1004,10 @@ impl BlackboxServer {
         }
     }
 
-    #[tool(name = "bro_when_all", description = "Block until ALL tasks / team members complete.")]
+    #[tool(
+        name = "bro_when_all",
+        description = "Block until ALL tasks / team members complete."
+    )]
     async fn bro_when_all(
         &self,
         Parameters(p): Parameters<WhenParams>,
@@ -861,34 +1035,42 @@ impl BlackboxServer {
         // Wait concurrently (like Promise.all), not sequentially
         let timeout = p.timeout_seconds;
         let store_dir = self.state.store_dir.clone();
-        let futs: Vec<_> = tasks.iter().map(|task| {
-            let task = task.clone();
-            let sd = store_dir.clone();
-            async move {
-                let completed = orch::wait_for_task_with_timeout(&task, timeout).await;
-                let bro_name = {
-                    let inner = task.inner.lock();
-                    orchestration::team::find_bro_name_for_task(&inner.id, &sd)
-                };
-                let mut r = if completed {
-                    orch::task_result_json(&task)
-                } else {
-                    orch::timeout_snapshot_json(&task)
-                };
-                if let Some(name) = bro_name {
-                    r["bro"] = Value::String(name);
+        let futs: Vec<_> = tasks
+            .iter()
+            .map(|task| {
+                let task = task.clone();
+                let sd = store_dir.clone();
+                async move {
+                    let completed = orch::wait_for_task_with_timeout(&task, timeout).await;
+                    let bro_name = {
+                        let inner = task.inner.lock();
+                        orchestration::team::find_bro_name_for_task(&inner.id, &sd)
+                    };
+                    let mut r = if completed {
+                        orch::task_result_json(&task)
+                    } else {
+                        orch::timeout_snapshot_json(&task)
+                    };
+                    if let Some(name) = bro_name {
+                        r["bro"] = Value::String(name);
+                    }
+                    r
                 }
-                r
-            }
-        }).collect();
+            })
+            .collect();
 
         let results: Vec<Value> = futures::future::join_all(futs).await;
-        if let Some(h) = progress_handle { h.abort(); }
+        if let Some(h) = progress_handle {
+            h.abort();
+        }
         let all_done = results.iter().all(|r| r.get("timed_out").is_none());
         Self::ok_json(&json!({ "all_completed": all_done, "results": results }))
     }
 
-    #[tool(name = "bro_when_any", description = "Block until the FIRST task completes.")]
+    #[tool(
+        name = "bro_when_any",
+        description = "Block until the FIRST task completes."
+    )]
     async fn bro_when_any(
         &self,
         Parameters(p): Parameters<WhenParams>,
@@ -921,10 +1103,15 @@ impl BlackboxServer {
 
         if !any_done && !tasks.is_empty() {
             // Race them
-            let futs: Vec<_> = tasks.iter().map(|t| {
-                let t = t.clone();
-                Box::pin(async move { orch::wait_for_task(&t).await; })
-            }).collect();
+            let futs: Vec<_> = tasks
+                .iter()
+                .map(|t| {
+                    let t = t.clone();
+                    Box::pin(async move {
+                        orch::wait_for_task(&t).await;
+                    })
+                })
+                .collect();
 
             match p.timeout_seconds {
                 Some(secs) => {
@@ -936,12 +1123,15 @@ impl BlackboxServer {
                 }
             }
         }
-        if let Some(h) = progress_handle { h.abort(); }
+        if let Some(h) = progress_handle {
+            h.abort();
+        }
 
         let mut results = Vec::new();
         for task in &tasks {
             let inner = task.inner.lock();
-            let bro_name = orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
+            let bro_name =
+                orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
             drop(inner);
 
             let mut r = if task.inner.lock().status.is_terminal() {
@@ -959,7 +1149,10 @@ impl BlackboxServer {
         Self::ok_json(&json!({ "any_completed": any_completed, "results": results }))
     }
 
-    #[tool(name = "bro_broadcast", description = "Send the same prompt to every team member.")]
+    #[tool(
+        name = "bro_broadcast",
+        description = "Send the same prompt to every team member."
+    )]
     async fn bro_broadcast(&self, Parameters(p): Parameters<BroadcastParams>) -> CallToolResult {
         let _team_lock = orchestration::team::lock_teams();
         let team = match orchestration::team::load_team(&p.team, &self.state.store_dir) {
@@ -971,11 +1164,14 @@ impl BlackboxServer {
         let store_dir = self.state.store_dir.clone();
         let mut launched = Vec::new();
         let mut updated_team = team.clone();
-        let params_extra = extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
+        let params_extra =
+            extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
 
         for (i, member) in team.members.iter().enumerate() {
             let brofile = match orchestration::brofile::resolve_brofile(
-                &member.brofile, &store_dir, team.project_dir.as_deref(),
+                &member.brofile,
+                &store_dir,
+                team.project_dir.as_deref(),
             ) {
                 Some(bf) => bf,
                 None => {
@@ -991,7 +1187,10 @@ impl BlackboxServer {
                 }
             }
             let exec_opts = if brofile.model.is_some() || brofile.effort.is_some() {
-                Some(ExecOpts { model: brofile.model.clone(), effort: brofile.effort.clone() })
+                Some(ExecOpts {
+                    model: brofile.model.clone(),
+                    effort: brofile.effort.clone(),
+                })
             } else {
                 None
             };
@@ -1045,27 +1244,63 @@ impl BlackboxServer {
                         None => cwd.clone(),
                     };
                     let task_id = uuid::Uuid::new_v4().to_string();
-                    let mut args = brofile.provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());
-                    let df = resolve_dispatch_filters(brofile.provider, member_cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
+                    let mut args =
+                        brofile
+                            .provider
+                            .build_resume_args(sid, &p.prompt, exec_opts.as_ref());
+                    let df = resolve_dispatch_filters(
+                        brofile.provider,
+                        member_cwd.as_deref(),
+                        allow_recursion,
+                        &task_id,
+                        extra.as_ref(),
+                    );
                     args.extend(df.args);
                     let t = orch::spawn_task(
-                        task_id, brofile.provider, args, sid.clone(),
-                        member_cwd, env_overrides, store_dir.clone(),
-                        self.state.task_store.clone(), self.state.tail_tx.clone(),
+                        task_id,
+                        brofile.provider,
+                        args,
+                        sid.clone(),
+                        member_cwd,
+                        env_overrides,
+                        store_dir.clone(),
+                        self.state.task_store.clone(),
+                        self.state.tail_tx.clone(),
                     );
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     t
                 } else {
                     let task_id = uuid::Uuid::new_v4().to_string();
-                    let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
+                    let session_id = if brofile.provider == Provider::Claude {
+                        uuid::Uuid::new_v4().to_string()
+                    } else {
+                        "pending".into()
+                    };
                     let exec_prompt = build_exec_prompt(&task_id, &session_id);
-                    let mut args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-                    let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
+                    let mut args = brofile.provider.build_exec_args(
+                        &exec_prompt,
+                        &session_id,
+                        cwd.as_deref(),
+                        exec_opts.as_ref(),
+                    );
+                    let df = resolve_dispatch_filters(
+                        brofile.provider,
+                        cwd.as_deref(),
+                        allow_recursion,
+                        &task_id,
+                        extra.as_ref(),
+                    );
                     args.extend(df.args);
                     let t = orch::spawn_task(
-                        task_id, brofile.provider, args, session_id,
-                        cwd.clone(), env_overrides, store_dir.clone(),
-                        self.state.task_store.clone(), self.state.tail_tx.clone(),
+                        task_id,
+                        brofile.provider,
+                        args,
+                        session_id,
+                        cwd.clone(),
+                        env_overrides,
+                        store_dir.clone(),
+                        self.state.task_store.clone(),
+                        self.state.tail_tx.clone(),
                     );
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
@@ -1073,15 +1308,36 @@ impl BlackboxServer {
                 }
             } else {
                 let task_id = uuid::Uuid::new_v4().to_string();
-                let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
+                let session_id = if brofile.provider == Provider::Claude {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    "pending".into()
+                };
                 let exec_prompt = build_exec_prompt(&task_id, &session_id);
-                let mut args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-                let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
+                let mut args = brofile.provider.build_exec_args(
+                    &exec_prompt,
+                    &session_id,
+                    cwd.as_deref(),
+                    exec_opts.as_ref(),
+                );
+                let df = resolve_dispatch_filters(
+                    brofile.provider,
+                    cwd.as_deref(),
+                    allow_recursion,
+                    &task_id,
+                    extra.as_ref(),
+                );
                 args.extend(df.args);
                 let t = orch::spawn_task(
-                    task_id, brofile.provider, args, session_id,
-                    cwd.clone(), env_overrides, store_dir.clone(),
-                    self.state.task_store.clone(), self.state.tail_tx.clone(),
+                    task_id,
+                    brofile.provider,
+                    args,
+                    session_id,
+                    cwd.clone(),
+                    env_overrides,
+                    store_dir.clone(),
+                    self.state.task_store.clone(),
+                    self.state.tail_tx.clone(),
                 );
                 cleanup_policy_file_when_done(t.clone(), df.policy_file);
                 updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
@@ -1098,7 +1354,10 @@ impl BlackboxServer {
         Self::ok_json(&json!({"team": p.team, "tasks": launched}))
     }
 
-    #[tool(name = "bro_status", description = "Non-blocking progress check on a task.")]
+    #[tool(
+        name = "bro_status",
+        description = "Non-blocking progress check on a task."
+    )]
     fn bro_status(&self, Parameters(p): Parameters<StatusParams>) -> CallToolResult {
         match self.state.task_store.read().get(&p.task_id) {
             Some(task) => Self::ok_json(&orch::task_status_json(&task, p.tail.unwrap_or(0))),
@@ -1111,27 +1370,52 @@ impl BlackboxServer {
         let store = self.state.task_store.read();
         let limit = p.limit.unwrap_or(20);
 
-        let filter_provider = p.provider.as_deref().and_then(|s| s.parse::<Provider>().ok());
-        let filter_status: Option<orch::TaskStatus> = p.status.as_deref().and_then(|s| {
-            serde_json::from_str(&format!("\"{s}\"")).ok()
-        });
+        let filter_provider = p
+            .provider
+            .as_deref()
+            .and_then(|s| s.parse::<Provider>().ok());
+        let filter_status: Option<orch::TaskStatus> = p
+            .status
+            .as_deref()
+            .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok());
 
-        let team_task_ids: Option<std::collections::HashSet<String>> = p.team.as_ref().and_then(|name| {
-            let team = orchestration::team::load_team(name, &self.state.store_dir)?;
-            Some(team.members.iter().flat_map(|m| m.task_history.clone()).collect())
-        });
+        let team_task_ids: Option<std::collections::HashSet<String>> =
+            p.team.as_ref().and_then(|name| {
+                let team = orchestration::team::load_team(name, &self.state.store_dir)?;
+                Some(
+                    team.members
+                        .iter()
+                        .flat_map(|m| m.task_history.clone())
+                        .collect(),
+                )
+            });
 
-        let mut with_ts: Vec<(u64, Value)> = store.all_tasks().iter()
+        let mut with_ts: Vec<(u64, Value)> = store
+            .all_tasks()
+            .iter()
             .filter(|t| {
                 let inner = t.inner.lock();
-                if let Some(fp) = filter_provider { if inner.provider != fp { return false; } }
-                if let Some(fs) = filter_status { if inner.status != fs { return false; } }
-                if let Some(ref ids) = team_task_ids { if !ids.contains(&inner.id) { return false; } }
+                if let Some(fp) = filter_provider {
+                    if inner.provider != fp {
+                        return false;
+                    }
+                }
+                if let Some(fs) = filter_status {
+                    if inner.status != fs {
+                        return false;
+                    }
+                }
+                if let Some(ref ids) = team_task_ids {
+                    if !ids.contains(&inner.id) {
+                        return false;
+                    }
+                }
                 true
             })
             .map(|t| {
                 let inner = t.inner.lock();
-                let bro_name = orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
+                let bro_name =
+                    orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
                 let mut entry = json!({
                     "taskId": inner.id,
                     "provider": inner.provider,
@@ -1152,7 +1436,10 @@ impl BlackboxServer {
         Self::ok_json(&json!({"count": entries.len(), "tasks": entries}))
     }
 
-    #[tool(name = "bro_prune", description = "Drop terminal tasks from the store + persisted tasks.json.")]
+    #[tool(
+        name = "bro_prune",
+        description = "Drop terminal tasks from the store + persisted tasks.json."
+    )]
     fn bro_prune(&self, Parameters(p): Parameters<PruneParams>) -> CallToolResult {
         let target_status = p.status.as_deref().unwrap_or("failed");
         let allowed = ["failed", "completed", "cancelled"];
@@ -1167,37 +1454,60 @@ impl BlackboxServer {
                 Ok(s) => s,
                 Err(e) => return Self::err_text(&format!("status parse: {e}")),
             };
-        let filter_provider = p.provider.as_deref().and_then(|s| s.parse::<Provider>().ok());
+        let filter_provider = p
+            .provider
+            .as_deref()
+            .and_then(|s| s.parse::<Provider>().ok());
         let cutoff_ms = p
             .older_than_hours
             .map(|h| orch::now_ms().saturating_sub(h.saturating_mul(3600 * 1000)));
         let dry_run = p.dry_run.unwrap_or(false);
 
         let dropped: Vec<String> = if dry_run {
-            self.state.task_store.read().all_tasks().iter().filter_map(|t| {
-                let inner = t.inner.lock();
-                if inner.status != parsed_status { return None; }
-                if let Some(fp) = filter_provider {
-                    if inner.provider != fp { return None; }
-                }
-                if let Some(cutoff) = cutoff_ms {
-                    if inner.started_at >= cutoff { return None; }
-                }
-                Some(inner.id.clone())
-            }).collect()
+            self.state
+                .task_store
+                .read()
+                .all_tasks()
+                .iter()
+                .filter_map(|t| {
+                    let inner = t.inner.lock();
+                    if inner.status != parsed_status {
+                        return None;
+                    }
+                    if let Some(fp) = filter_provider {
+                        if inner.provider != fp {
+                            return None;
+                        }
+                    }
+                    if let Some(cutoff) = cutoff_ms {
+                        if inner.started_at >= cutoff {
+                            return None;
+                        }
+                    }
+                    Some(inner.id.clone())
+                })
+                .collect()
         } else {
             let mut store = self.state.task_store.write();
             let dropped = store.retain_drop(|t| {
                 let inner = t.inner.lock();
                 // Keep running tasks always.
-                if inner.status == orch::TaskStatus::Running { return true; }
+                if inner.status == orch::TaskStatus::Running {
+                    return true;
+                }
                 // Keep tasks that don't match the filter.
-                if inner.status != parsed_status { return true; }
+                if inner.status != parsed_status {
+                    return true;
+                }
                 if let Some(fp) = filter_provider {
-                    if inner.provider != fp { return true; }
+                    if inner.provider != fp {
+                        return true;
+                    }
                 }
                 if let Some(cutoff) = cutoff_ms {
-                    if inner.started_at >= cutoff { return true; }
+                    if inner.started_at >= cutoff {
+                        return true;
+                    }
                 }
                 false
             });
@@ -1236,7 +1546,10 @@ impl BlackboxServer {
         }
     }
 
-    #[tool(name = "bro_providers", description = "List configured providers, binaries, models.")]
+    #[tool(
+        name = "bro_providers",
+        description = "List configured providers, binaries, models."
+    )]
     fn bro_providers(&self) -> CallToolResult {
         let mut info = serde_json::Map::new();
         for p in Provider::ALL {
@@ -1261,7 +1574,10 @@ impl BlackboxServer {
         Self::ok_json(&Value::Object(info))
     }
 
-    #[tool(name = "bro_brofile", description = "Manage brofile templates + accounts (provider+account+lens).")]
+    #[tool(
+        name = "bro_brofile",
+        description = "Manage brofile templates + accounts (provider+account+lens)."
+    )]
     fn bro_brofile(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
         use orchestration::brofile;
         let store_dir = &self.state.store_dir;
@@ -1269,19 +1585,32 @@ impl BlackboxServer {
 
         match p.action.as_str() {
             "create" => {
-                let name = match &p.name { Some(n) => n, None => return Self::err_text("name is required") };
+                let name = match &p.name {
+                    Some(n) => n,
+                    None => return Self::err_text("name is required"),
+                };
                 if scope == "project" && p.project_dir.is_none() {
                     return Self::err_text("project_dir required for project scope");
                 }
-                let provider = match p.provider.as_deref().and_then(|s| s.parse::<Provider>().ok()) {
+                let provider = match p
+                    .provider
+                    .as_deref()
+                    .and_then(|s| s.parse::<Provider>().ok())
+                {
                     Some(p) => p,
                     None => return Self::err_text("valid provider is required"),
                 };
-                let filters = extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
+                let filters = extra_filters_from_params(
+                    p.allow_tools.as_deref(),
+                    p.disallow_tools.as_deref(),
+                );
                 let bf = brofile::Brofile {
-                    name: name.clone(), provider,
-                    account: p.account.clone(), lens: p.lens.clone(),
-                    model: p.model.clone(), effort: p.effort.clone(),
+                    name: name.clone(),
+                    provider,
+                    account: p.account.clone(),
+                    lens: p.lens.clone(),
+                    model: p.model.clone(),
+                    effort: p.effort.clone(),
                     filters,
                 };
                 brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref());
@@ -1292,14 +1621,20 @@ impl BlackboxServer {
                 Self::ok_json(&serde_json::to_value(&list).unwrap_or_default())
             }
             "get" => {
-                let name = match &p.name { Some(n) => n, None => return Self::err_text("name is required") };
+                let name = match &p.name {
+                    Some(n) => n,
+                    None => return Self::err_text("name is required"),
+                };
                 match brofile::resolve_brofile(name, store_dir, p.project_dir.as_deref()) {
                     Some(bf) => Self::ok_json(&serde_json::to_value(&bf).unwrap_or_default()),
                     None => Self::err_text(&format!("Brofile not found: {name}")),
                 }
             }
             "delete" => {
-                let name = match &p.name { Some(n) => n, None => return Self::err_text("name is required") };
+                let name = match &p.name {
+                    Some(n) => n,
+                    None => return Self::err_text("name is required"),
+                };
                 if scope == "project" && p.project_dir.is_none() {
                     return Self::err_text("project_dir required for project scope");
                 }
@@ -1310,9 +1645,14 @@ impl BlackboxServer {
                 }
             }
             "set_account" => {
-                let name = match &p.name { Some(n) => n, None => return Self::err_text("name is required") };
+                let name = match &p.name {
+                    Some(n) => n,
+                    None => return Self::err_text("name is required"),
+                };
                 let mut config = brofile::load_config(store_dir);
-                config.accounts.insert(name.clone(), brofile::Account { env: p.env.clone() });
+                config
+                    .accounts
+                    .insert(name.clone(), brofile::Account { env: p.env.clone() });
                 brofile::save_config(&config, store_dir);
                 Self::ok_json(&json!({"account": name, "env": p.env}))
             }
@@ -1324,12 +1664,21 @@ impl BlackboxServer {
         }
     }
 
-    #[tool(name = "bro_mcp", description = "Manage MCP servers + tool filters for dispatched bros.")]
-    fn bro_mcp(&self, Parameters(p): Parameters<orchestration::mcp::McpToolParams>) -> CallToolResult {
+    #[tool(
+        name = "bro_mcp",
+        description = "Manage MCP servers + tool filters for dispatched bros."
+    )]
+    fn bro_mcp(
+        &self,
+        Parameters(p): Parameters<orchestration::mcp::McpToolParams>,
+    ) -> CallToolResult {
         Self::run("bro_mcp", || orchestration::mcp::handle(&p))
     }
 
-    #[tool(name = "bro_team", description = "Manage teamplates and instantiated teams.")]
+    #[tool(
+        name = "bro_team",
+        description = "Manage teamplates and instantiated teams."
+    )]
     fn bro_team(&self, Parameters(p): Parameters<TeamParams>) -> CallToolResult {
         use orchestration::team;
         let store_dir = &self.state.store_dir;
@@ -1337,7 +1686,10 @@ impl BlackboxServer {
 
         match p.action.as_str() {
             "save_template" => {
-                let name = match &p.name { Some(n) => n, None => return Self::err_text("name is required") };
+                let name = match &p.name {
+                    Some(n) => n,
+                    None => return Self::err_text("name is required"),
+                };
                 if scope == "project" && p.project_dir.is_none() {
                     return Self::err_text("project_dir required for project scope");
                 }
@@ -1347,17 +1699,26 @@ impl BlackboxServer {
                 };
                 // Validate brofile names
                 for m in members {
-                    if orchestration::brofile::resolve_brofile(&m.brofile, store_dir, p.project_dir.as_deref()).is_none() {
+                    if orchestration::brofile::resolve_brofile(
+                        &m.brofile,
+                        store_dir,
+                        p.project_dir.as_deref(),
+                    )
+                    .is_none()
+                    {
                         return Self::err_text(&format!("Brofile not found: {}", m.brofile));
                     }
                 }
                 let tp = team::Teamplate {
                     name: name.clone(),
-                    members: members.iter().map(|m| team::TeamplateMember {
-                        brofile: m.brofile.clone(),
-                        alias: m.alias.clone(),
-                        count: m.count.unwrap_or(1),
-                    }).collect(),
+                    members: members
+                        .iter()
+                        .map(|m| team::TeamplateMember {
+                            brofile: m.brofile.clone(),
+                            alias: m.alias.clone(),
+                            count: m.count.unwrap_or(1),
+                        })
+                        .collect(),
                 };
                 team::save_teamplate(&tp, scope, store_dir, p.project_dir.as_deref());
                 Self::ok_json(&json!({"saved": name, "scope": scope}))
@@ -1367,7 +1728,10 @@ impl BlackboxServer {
                 Self::ok_json(&serde_json::to_value(&list).unwrap_or_default())
             }
             "delete_template" => {
-                let name = match &p.name { Some(n) => n, None => return Self::err_text("name is required") };
+                let name = match &p.name {
+                    Some(n) => n,
+                    None => return Self::err_text("name is required"),
+                };
                 if scope == "project" && p.project_dir.is_none() {
                     return Self::err_text("project_dir required for project scope");
                 }
@@ -1378,19 +1742,33 @@ impl BlackboxServer {
                 }
             }
             "create" => {
-                let template = match &p.template { Some(t) => t, None => return Self::err_text("template is required") };
-                let tp = match team::resolve_teamplate(template, store_dir, p.project_dir.as_deref()) {
-                    Some(tp) => tp,
-                    None => return Self::err_text(&format!("Teamplate not found: {template}")),
+                let template = match &p.template {
+                    Some(t) => t,
+                    None => return Self::err_text("template is required"),
                 };
+                let tp =
+                    match team::resolve_teamplate(template, store_dir, p.project_dir.as_deref()) {
+                        Some(tp) => tp,
+                        None => return Self::err_text(&format!("Teamplate not found: {template}")),
+                    };
                 // Validate all brofiles exist before instantiating
                 for m in &tp.members {
-                    if orchestration::brofile::resolve_brofile(&m.brofile, store_dir, p.project_dir.as_deref()).is_none() {
+                    if orchestration::brofile::resolve_brofile(
+                        &m.brofile,
+                        store_dir,
+                        p.project_dir.as_deref(),
+                    )
+                    .is_none()
+                    {
                         return Self::err_text(&format!("Brofile not found: {}", m.brofile));
                     }
                 }
-                let team_name = p.name.clone().unwrap_or_else(|| format!("{template}-{}", orch::now_ms()));
-                let t = team::instantiate_team(&tp, &team_name, p.project_dir.as_deref(), store_dir);
+                let team_name = p
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{template}-{}", orch::now_ms()));
+                let t =
+                    team::instantiate_team(&tp, &team_name, p.project_dir.as_deref(), store_dir);
                 Self::ok_json(&json!({
                     "created": t.name,
                     "teamplate": tp.name,
@@ -1399,17 +1777,25 @@ impl BlackboxServer {
             }
             "list" => {
                 let teams = team::load_all_teams(store_dir);
-                let list: Vec<Value> = teams.iter().map(|t| json!({
-                    "name": t.name,
-                    "teamplate": t.teamplate,
-                    "memberCount": t.members.len(),
-                    "createdAt": t.created_at,
-                    "projectDir": t.project_dir,
-                })).collect();
+                let list: Vec<Value> = teams
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "teamplate": t.teamplate,
+                            "memberCount": t.members.len(),
+                            "createdAt": t.created_at,
+                            "projectDir": t.project_dir,
+                        })
+                    })
+                    .collect();
                 Self::ok_json(&json!(list))
             }
             "dissolve" => {
-                let name = match &p.name { Some(n) => n, None => return Self::err_text("name is required") };
+                let name = match &p.name {
+                    Some(n) => n,
+                    None => return Self::err_text("name is required"),
+                };
                 let loaded_team = match team::load_team(name, store_dir) {
                     Some(t) => t,
                     None => return Self::err_text(&format!("Unknown team: {name}")),
@@ -1419,7 +1805,11 @@ impl BlackboxServer {
                     for member in &loaded_team.members {
                         for tid in &member.task_history {
                             if let Some(task) = task_store.get(tid) {
-                                let _ = orch::cancel_task(&task, &self.state.task_store, &self.state.store_dir);
+                                let _ = orch::cancel_task(
+                                    &task,
+                                    &self.state.task_store,
+                                    &self.state.store_dir,
+                                );
                             }
                         }
                     }
@@ -1428,15 +1818,21 @@ impl BlackboxServer {
                 Self::ok_json(&json!({"dissolved": name}))
             }
             "roster" => {
-                let name = match &p.name { Some(n) => n, None => return Self::err_text("name is required") };
+                let name = match &p.name {
+                    Some(n) => n,
+                    None => return Self::err_text("name is required"),
+                };
                 let loaded_team = match team::load_team(name, store_dir) {
                     Some(t) => t,
                     None => return Self::err_text(&format!("Unknown team: {name}")),
                 };
                 let task_store = self.state.task_store.read();
-                let roster: Vec<Value> = loaded_team.members.iter().map(|m| {
-                    let latest_tid = m.task_history.last();
-                    let latest = latest_tid.and_then(|id| task_store.get(id)).map(|t| {
+                let roster: Vec<Value> = loaded_team
+                    .members
+                    .iter()
+                    .map(|m| {
+                        let latest_tid = m.task_history.last();
+                        let latest = latest_tid.and_then(|id| task_store.get(id)).map(|t| {
                         let inner = t.inner.lock();
                         json!({
                             "taskId": inner.id,
@@ -1444,15 +1840,18 @@ impl BlackboxServer {
                             "elapsed": orch::format_elapsed(inner.started_at, inner.completed_at),
                         })
                     });
-                    json!({
-                        "name": m.name,
-                        "brofile": m.brofile,
-                        "sessionId": m.session_id,
-                        "taskCount": m.task_history.len(),
-                        "latestTask": latest,
+                        json!({
+                            "name": m.name,
+                            "brofile": m.brofile,
+                            "sessionId": m.session_id,
+                            "taskCount": m.task_history.len(),
+                            "latestTask": latest,
+                        })
                     })
-                }).collect();
-                Self::ok_json(&json!({"team": name, "teamplate": loaded_team.teamplate, "members": roster}))
+                    .collect();
+                Self::ok_json(
+                    &json!({"team": name, "teamplate": loaded_team.teamplate, "members": roster}),
+                )
             }
             _ => Self::err_text(&format!("Unknown team action: {}", p.action)),
         }
@@ -1470,39 +1869,85 @@ impl BlackboxServer {
         bro_name: Option<&str>,
         raw_provider: Option<&str>,
         project_dir: Option<&str>,
-    ) -> Result<(Provider, Option<String>, Option<ExecOpts>, Option<std::collections::HashMap<String, String>>, Option<String>, Option<orchestration::mcp::McpFilters>), String> {
+    ) -> Result<
+        (
+            Provider,
+            Option<String>,
+            Option<ExecOpts>,
+            Option<std::collections::HashMap<String, String>>,
+            Option<String>,
+            Option<orchestration::mcp::McpFilters>,
+        ),
+        String,
+    > {
         let store_dir = &self.state.store_dir;
 
         if let Some(name) = bro_name {
             let teams = orchestration::team::load_all_teams(store_dir);
             if let Some(bro_match) = orchestration::team::find_bro(name, &teams) {
                 let member = &bro_match.team.members[bro_match.member_idx];
-                let bf = orchestration::brofile::resolve_brofile(&member.brofile, store_dir, bro_match.team.project_dir.as_deref())
-                    .ok_or(format!("Brofile not found: {}", member.brofile))?;
-                let env = bf.account.as_ref()
+                let bf = orchestration::brofile::resolve_brofile(
+                    &member.brofile,
+                    store_dir,
+                    bro_match.team.project_dir.as_deref(),
+                )
+                .ok_or(format!("Brofile not found: {}", member.brofile))?;
+                let env = bf
+                    .account
+                    .as_ref()
                     .and_then(|a| orchestration::brofile::load_account(a, store_dir))
                     .and_then(|a| a.env);
                 let opts = if bf.model.is_some() || bf.effort.is_some() {
-                    Some(ExecOpts { model: bf.model.clone(), effort: bf.effort.clone() })
-                } else { None };
-                let cwd = project_dir.map(String::from).or(bro_match.team.project_dir.clone());
+                    Some(ExecOpts {
+                        model: bf.model.clone(),
+                        effort: bf.effort.clone(),
+                    })
+                } else {
+                    None
+                };
+                let cwd = project_dir
+                    .map(String::from)
+                    .or(bro_match.team.project_dir.clone());
                 return Ok((bf.provider, bf.lens, opts, env, cwd, bf.filters));
             }
             // Standalone brofile fallback
             let bf = orchestration::brofile::resolve_brofile(name, store_dir, project_dir)
                 .ok_or(format!("Unknown bro or brofile: {name}"))?;
-            let env = bf.account.as_ref()
+            let env = bf
+                .account
+                .as_ref()
                 .and_then(|a| orchestration::brofile::load_account(a, store_dir))
                 .and_then(|a| a.env);
             let opts = if bf.model.is_some() || bf.effort.is_some() {
-                Some(ExecOpts { model: bf.model.clone(), effort: bf.effort.clone() })
-            } else { None };
-            return Ok((bf.provider, bf.lens, opts, env, project_dir.map(String::from), bf.filters));
+                Some(ExecOpts {
+                    model: bf.model.clone(),
+                    effort: bf.effort.clone(),
+                })
+            } else {
+                None
+            };
+            return Ok((
+                bf.provider,
+                bf.lens,
+                opts,
+                env,
+                project_dir.map(String::from),
+                bf.filters,
+            ));
         }
 
         if let Some(p) = raw_provider {
-            let provider = p.parse::<Provider>().map_err(|_| format!("Unknown provider: {p}"))?;
-            return Ok((provider, None, None, None, project_dir.map(String::from), None));
+            let provider = p
+                .parse::<Provider>()
+                .map_err(|_| format!("Unknown provider: {p}"))?;
+            return Ok((
+                provider,
+                None,
+                None,
+                None,
+                project_dir.map(String::from),
+                None,
+            ));
         }
 
         Err("Provide either bro or provider".into())
@@ -1515,7 +1960,18 @@ impl BlackboxServer {
         session_id: Option<&str>,
         raw_provider: Option<&str>,
         project_dir: Option<&str>,
-    ) -> Result<(Provider, String, Option<String>, Option<ExecOpts>, Option<std::collections::HashMap<String, String>>, Option<String>, Option<orchestration::mcp::McpFilters>), String> {
+    ) -> Result<
+        (
+            Provider,
+            String,
+            Option<String>,
+            Option<ExecOpts>,
+            Option<std::collections::HashMap<String, String>>,
+            Option<String>,
+            Option<orchestration::mcp::McpFilters>,
+        ),
+        String,
+    > {
         let store_dir = &self.state.store_dir;
 
         if let Some(name) = bro_name {
@@ -1529,41 +1985,86 @@ impl BlackboxServer {
                     }
                 })?;
             let member = &bro_match.team.members[bro_match.member_idx];
-            let sid = member.session_id.as_deref()
+            let sid = member
+                .session_id
+                .as_deref()
                 .filter(|s| *s != "pending")
-                .ok_or(format!("Bro \"{name}\" has no active session — use exec first"))?;
-            let bf = orchestration::brofile::resolve_brofile(&member.brofile, store_dir, bro_match.team.project_dir.as_deref())
-                .ok_or(format!("Brofile not found: {}", member.brofile))?;
-            let env = bf.account.as_ref()
+                .ok_or(format!(
+                    "Bro \"{name}\" has no active session — use exec first"
+                ))?;
+            let bf = orchestration::brofile::resolve_brofile(
+                &member.brofile,
+                store_dir,
+                bro_match.team.project_dir.as_deref(),
+            )
+            .ok_or(format!("Brofile not found: {}", member.brofile))?;
+            let env = bf
+                .account
+                .as_ref()
                 .and_then(|a| orchestration::brofile::load_account(a, store_dir))
                 .and_then(|a| a.env);
             let opts = if bf.model.is_some() || bf.effort.is_some() {
-                Some(ExecOpts { model: bf.model.clone(), effort: bf.effort.clone() })
-            } else { None };
-            let cwd = project_dir.map(String::from).or(bro_match.team.project_dir.clone());
-            return Ok((bf.provider, sid.to_string(), bf.lens, opts, env, cwd, bf.filters));
+                Some(ExecOpts {
+                    model: bf.model.clone(),
+                    effort: bf.effort.clone(),
+                })
+            } else {
+                None
+            };
+            let cwd = project_dir
+                .map(String::from)
+                .or(bro_match.team.project_dir.clone());
+            return Ok((
+                bf.provider,
+                sid.to_string(),
+                bf.lens,
+                opts,
+                env,
+                cwd,
+                bf.filters,
+            ));
         }
 
         if let (Some(sid), Some(p)) = (session_id, raw_provider) {
-            let provider = p.parse::<Provider>().map_err(|_| format!("Unknown provider: {p}"))?;
-            return Ok((provider, sid.to_string(), None, None, None, project_dir.map(String::from), None));
+            let provider = p
+                .parse::<Provider>()
+                .map_err(|_| format!("Unknown provider: {p}"))?;
+            return Ok((
+                provider,
+                sid.to_string(),
+                None,
+                None,
+                None,
+                project_dir.map(String::from),
+                None,
+            ));
         }
 
         Err("Provide either bro or session_id + provider".into())
     }
 
-    fn resolve_when_targets(&self, team_name: Option<&str>, task_ids: Option<&[String]>) -> Result<Vec<String>, String> {
+    fn resolve_when_targets(
+        &self,
+        team_name: Option<&str>,
+        task_ids: Option<&[String]>,
+    ) -> Result<Vec<String>, String> {
         if let Some(name) = team_name {
             let team = orchestration::team::load_team(name, &self.state.store_dir)
                 .ok_or(format!("Unknown team: {name}"))?;
-            let ids: Vec<String> = team.members.iter()
+            let ids: Vec<String> = team
+                .members
+                .iter()
                 .filter_map(|m| m.task_history.last().cloned())
                 .collect();
-            if ids.is_empty() { return Err(format!("No tasks found for team {name}")); }
+            if ids.is_empty() {
+                return Err(format!("No tasks found for team {name}"));
+            }
             return Ok(ids);
         }
         if let Some(ids) = task_ids {
-            if ids.is_empty() { return Err("Empty task_ids array".into()); }
+            if ids.is_empty() {
+                return Err("Empty task_ids array".into());
+            }
             return Ok(ids.to_vec());
         }
         Err("Provide either team or task_ids".into())
@@ -1641,7 +2142,9 @@ struct BroRosterEntry {
 }
 
 fn split_csv(s: &Option<String>) -> Vec<String> {
-    s.as_deref().unwrap_or("").split(',')
+    s.as_deref()
+        .unwrap_or("")
+        .split(',')
         .map(|x| x.trim().to_string())
         .filter(|x| !x.is_empty())
         .collect()
@@ -1649,12 +2152,19 @@ fn split_csv(s: &Option<String>) -> Vec<String> {
 
 fn infer_provider_from_path(path: &Path) -> Option<Provider> {
     let s = path.to_string_lossy();
-    if s.contains("/.codex/sessions/") { Some(Provider::Codex) }
-    else if s.contains("/.gemini/tmp/") { Some(Provider::Gemini) }
-    else if s.contains("/.copilot/session-state/") { Some(Provider::Copilot) }
-    else if s.contains("/.vibe/logs/session/") { Some(Provider::Vibe) }
-    else if s.contains("/projects/") { Some(Provider::Claude) }
-    else { None }
+    if s.contains("/.codex/sessions/") {
+        Some(Provider::Codex)
+    } else if s.contains("/.gemini/tmp/") {
+        Some(Provider::Gemini)
+    } else if s.contains("/.copilot/session-state/") {
+        Some(Provider::Copilot)
+    } else if s.contains("/.vibe/logs/session/") {
+        Some(Provider::Vibe)
+    } else if s.contains("/projects/") {
+        Some(Provider::Claude)
+    } else {
+        None
+    }
 }
 
 fn build_member_entry(
@@ -1664,19 +2174,26 @@ fn build_member_entry(
     config: &index::ReindexConfig,
 ) -> BroRosterEntry {
     let brofile = orchestration::brofile::resolve_brofile(
-        &member.brofile, store_dir, team.project_dir.as_deref(),
+        &member.brofile,
+        store_dir,
+        team.project_dir.as_deref(),
     );
     let provider = brofile.as_ref().map(|b| b.provider);
-    let session_id = member.session_id.as_ref()
+    let session_id = member
+        .session_id
+        .as_ref()
         .filter(|s| s.as_str() != "pending")
         .cloned();
-    let jsonl_path = session_id.as_deref()
+    let jsonl_path = session_id
+        .as_deref()
         .and_then(|sid| index::find_session_file(sid, &config.roots, config.codex_root.as_deref()))
         .map(|p| p.to_string_lossy().into_owned());
     BroRosterEntry {
         bro: member.name.clone(),
         team: team.name.clone(),
-        provider: provider.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+        provider: provider
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "unknown".into()),
         session_id,
         jsonl_path,
         brofile: member.brofile.clone(),
@@ -1694,13 +2211,13 @@ async fn roster_handler(
     let wanted_teams = split_csv(&query.teams);
     let wanted_bros = split_csv(&query.bros);
     let wanted_sessions = split_csv(&query.sessions);
-    let wanted_providers: Vec<Provider> = split_csv(&query.providers).iter()
+    let wanted_providers: Vec<Provider> = split_csv(&query.providers)
+        .iter()
         .filter_map(|p| p.parse::<Provider>().ok())
         .collect();
 
-    let no_selectors = wanted_teams.is_empty()
-        && wanted_bros.is_empty()
-        && wanted_sessions.is_empty();
+    let no_selectors =
+        wanted_teams.is_empty() && wanted_bros.is_empty() && wanted_sessions.is_empty();
 
     let mut seen = std::collections::HashSet::new();
     let mut entries = Vec::new();
@@ -1711,7 +2228,9 @@ async fn roster_handler(
         if let Some(team) = orchestration::team::load_team(tn, &store_dir) {
             for member in &team.members {
                 let key = format!("{}::{}", team.name, member.name);
-                if !seen.insert(key) { continue; }
+                if !seen.insert(key) {
+                    continue;
+                }
                 entries.push(build_member_entry(&team, member, &store_dir, &config));
             }
         }
@@ -1721,9 +2240,13 @@ async fn roster_handler(
     if !wanted_bros.is_empty() {
         for team in orchestration::team::load_all_teams(&store_dir) {
             for member in &team.members {
-                if !wanted_bros.iter().any(|b| b == &member.name) { continue; }
+                if !wanted_bros.iter().any(|b| b == &member.name) {
+                    continue;
+                }
                 let key = format!("{}::{}", team.name, member.name);
-                if !seen.insert(key) { continue; }
+                if !seen.insert(key) {
+                    continue;
+                }
                 entries.push(build_member_entry(&team, member, &store_dir, &config));
             }
         }
@@ -1732,13 +2255,17 @@ async fn roster_handler(
     // Session selectors — synthetic adhoc lanes.
     for sid in &wanted_sessions {
         let key = format!("adhoc::{sid}");
-        if !seen.insert(key) { continue; }
+        if !seen.insert(key) {
+            continue;
+        }
         let path = index::find_session_file(sid, &config.roots, config.codex_root.as_deref());
         let provider = path.as_deref().and_then(infer_provider_from_path);
         entries.push(BroRosterEntry {
             bro: sid.chars().take(8).collect(),
             team: "adhoc".into(),
-            provider: provider.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+            provider: provider
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".into()),
             session_id: Some(sid.clone()),
             jsonl_path: path.map(|p| p.to_string_lossy().into_owned()),
             brofile: String::new(),
@@ -1751,7 +2278,9 @@ async fn roster_handler(
         for team in orchestration::team::load_all_teams(&store_dir) {
             for member in &team.members {
                 let key = format!("{}::{}", team.name, member.name);
-                if !seen.insert(key) { continue; }
+                if !seen.insert(key) {
+                    continue;
+                }
                 entries.push(build_member_entry(&team, member, &store_dir, &config));
             }
         }
@@ -1759,7 +2288,9 @@ async fn roster_handler(
 
     if !wanted_providers.is_empty() {
         entries.retain(|e| {
-            e.provider.parse::<Provider>().ok()
+            e.provider
+                .parse::<Provider>()
+                .ok()
                 .map(|p| wanted_providers.contains(&p))
                 .unwrap_or(false)
         });
@@ -1793,11 +2324,13 @@ async fn tail_handler(
     Query(query): Query<TailQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let mut rx = state.tail_tx.subscribe();
+    let config = state.idx.read().reindex_config();
 
     let wanted_teams = split_csv(&query.teams);
     let wanted_bros = split_csv(&query.bros);
     let wanted_sessions = split_csv(&query.sessions);
-    let wanted_providers: Vec<Provider> = split_csv(&query.providers).iter()
+    let wanted_providers: Vec<Provider> = split_csv(&query.providers)
+        .iter()
         .filter_map(|p| p.parse::<Provider>().ok())
         .collect();
     let no_selectors = wanted_teams.is_empty()
@@ -1859,6 +2392,14 @@ async fn tail_handler(
                     if let Some(ref sid) = task_session_id {
                         if sid.as_str() != "pending" {
                             evt_json["session_id"] = Value::String(sid.clone());
+                            if let Some(path) = index::find_session_file(
+                                sid,
+                                &config.roots,
+                                config.codex_root.as_deref(),
+                            ) {
+                                evt_json["jsonl_path"] =
+                                    Value::String(path.to_string_lossy().into_owned());
+                            }
                         }
                     }
                     let data = serde_json::to_string(&evt_json).unwrap_or_default();
@@ -1883,9 +2424,11 @@ async fn tail_handler(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let home = dirs::home_dir().expect("cannot determine home directory");
+    let migrated = util::migrate_legacy_defaults(&home)?;
 
     // Logging
-    let log_dir = home.join(".claude-shared");
+    let log_dir = util::blackbox_log_dir(&home);
+    std::fs::create_dir_all(&log_dir).expect("failed to create log directory");
     let file_appender = tracing_appender::rolling::Builder::new()
         .max_log_files(3)
         .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -1902,12 +2445,19 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
-        .with(tracing_subscriber::fmt::layer().with_writer(file_appender).with_ansi(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(file_appender)
+                .with_ansi(false),
+        )
         .init();
 
     std::panic::set_hook(Box::new(|info| {
         tracing::error!("PANIC: {}", info);
     }));
+    for msg in migrated {
+        tracing::info!("migrated legacy blackbox path: {msg}");
+    }
 
     // Transcript index roots
     let roots: Vec<(String, PathBuf)> = if let Ok(val) = std::env::var("TRANSCRIPT_SEARCH_ROOTS") {
@@ -1916,7 +2466,9 @@ async fn main() -> anyhow::Result<()> {
                 let (name, path) = entry.split_once('=')?;
                 let expanded = if path.starts_with('~') {
                     home.join(&path[2..])
-                } else { PathBuf::from(path) };
+                } else {
+                    PathBuf::from(path)
+                };
                 Some((name.to_string(), expanded))
             })
             .collect()
@@ -1948,25 +2500,30 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .or_else(|| {
             let default = home.join(".codex");
-            if default.join("sessions").exists() { Some(default) } else { None }
+            if default.join("sessions").exists() {
+                Some(default)
+            } else {
+                None
+            }
         });
 
-    let index_path = std::env::var("TRANSCRIPT_SEARCH_INDEX_PATH")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let shared = home.join(".claude-shared").join("transcript-index");
-            if shared.parent().map(|p| p.exists()).unwrap_or(false) { shared }
-            else { home.join(".local/share/transcript-search/index") }
-        });
+    let index_path = util::blackbox_index_path(&home);
 
-    tracing::info!("Roots: {:?}", roots.iter().map(|(n, p)| format!("{n}={}", p.display())).collect::<Vec<_>>());
-    if let Some(ref cr) = codex_root { tracing::info!("Codex root: {}", cr.display()); }
+    tracing::info!(
+        "Roots: {:?}",
+        roots
+            .iter()
+            .map(|(n, p)| format!("{n}={}", p.display()))
+            .collect::<Vec<_>>()
+    );
+    if let Some(ref cr) = codex_root {
+        tracing::info!("Codex root: {}", cr.display());
+    }
     tracing::info!("Index path: {}", index_path.display());
 
     let idx = TranscriptIndex::open_or_create(&index_path, roots, codex_root)?;
 
-    let kb_path = home.join(".claude-shared").join("blackbox-knowledge.json");
+    let kb_path = util::blackbox_knowledge_path(&home);
     let mut kb = Knowledge::open(&kb_path)?;
     tracing::info!("Knowledge store: {}", kb_path.display());
 
@@ -1990,12 +2547,18 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(7264);
     let bbox_url = format!("http://127.0.0.1:{bbox_port}/mcp");
+    let bbox_mcp_name = util::blackbox_mcp_name();
     // Export for provider arg-builders so they can inject `--mcp-config`
     // etc. at dispatch time — ensures dispatched subprocesses see
     // blackbox regardless of which config file their CLI inherits.
     std::env::set_var("BLACKBOX_MCP_URL", &bbox_url);
-    let report = orchestration::mcp::self_register_blackbox(&bbox_url);
-    tracing::info!("blackbox MCP self-registration: {}", report.summary());
+    std::env::set_var("BLACKBOX_MCP_NAME", &bbox_mcp_name);
+    let report = orchestration::mcp::self_register_blackbox(&bbox_mcp_name, &bbox_url);
+    tracing::info!(
+        "blackbox MCP self-registration (name={}): {}",
+        bbox_mcp_name,
+        report.summary()
+    );
     for (p, outcome) in &report.per_provider {
         if let orchestration::mcp::SelfRegisterOutcome::Error { detail } = outcome {
             tracing::warn!("self-register {p}: {detail}");
@@ -2011,20 +2574,22 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::debug!("gemini policy sweep: {e:#}"),
     }
 
-    let th_path = home.join(".claude-shared").join("blackbox-threads.json");
+    let th_path = util::blackbox_threads_path(&home);
     let th = Threads::open(&th_path)?;
     tracing::info!("Thread store: {}", th_path.display());
 
-    let notes_path = home.join(".claude-shared").join("blackbox-notes.json");
+    let notes_path = util::blackbox_notes_path(&home);
     let notes_store = Notes::open(&notes_path)?;
     tracing::info!("Notes store: {}", notes_path.display());
 
     // Orchestration state
     let store_dir = PathBuf::from(
-        std::env::var("BRO_STORE").unwrap_or_else(|_| home.join(".bro").to_string_lossy().to_string())
+        std::env::var("BRO_STORE")
+            .unwrap_or_else(|_| util::bro_home_dir(&home).to_string_lossy().to_string()),
     );
     let task_ttl = std::env::var("BRO_TASK_TTL_MS")
-        .ok().and_then(|v| v.parse().ok())
+        .ok()
+        .and_then(|v| v.parse().ok())
         .unwrap_or(86_400_000u64);
     let task_store = TaskStore::load(&store_dir, task_ttl);
 
@@ -2032,7 +2597,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn background reindex thread
     let reindex_interval = std::env::var("BLACKBOX_REINDEX_INTERVAL_SECS")
-        .ok().and_then(|v| v.parse::<u64>().ok())
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(120);
     index::spawn_reindex_thread(
         idx.index_handle(),
@@ -2092,4 +2658,3 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("blackboxd shut down");
     Ok(())
 }
-

@@ -37,6 +37,21 @@ Logs live in journald:
 journalctl --user -u blackbox -f
 ```
 
+Migration note:
+On first start after the XDG-path change, `blackboxd` automatically moves legacy default stores from `~/.claude-shared/blackbox-{knowledge,threads,notes}.json`, `~/.claude-shared/transcript-index`, and `~/.bro/` into the new XDG defaults, but only when the corresponding new target does not already exist. Explicit env overrides disable that automatic migration for the overridden path.
+
+### 2a. Run an isolated dev daemon alongside prod
+
+Use a second unit with a different port, MCP entry name, stores, render targets, and bro runtime dir:
+
+```bash
+cp deploy/blackbox-dev.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now blackbox-dev.service
+```
+
+This sample unit listens on `127.0.0.1:7265/mcp` and self-registers as `blackbox-dev`, while keeping knowledge/threads/notes/index/render backups under dev-specific XDG paths. It is safe for iteration because it does not mutate the prod daemon's port, MCP entry, task store, or canonical bbox JSON files.
+
 ### 3. Connect your CLIs
 
 The daemon listens on `127.0.0.1:7264/mcp` by default. Point every agent CLI at the same URL.
@@ -57,6 +72,17 @@ url = "http://127.0.0.1:7264/mcp"
 ```
 
 Restart each CLI. The first transcript search will auto-build the index (1–3 minutes depending on corpus size).
+
+For a dev daemon, add a separate MCP entry instead of replacing prod:
+
+```json
+{
+  "mcpServers": {
+    "blackbox": { "type": "http", "url": "http://127.0.0.1:7264/mcp" },
+    "blackbox-dev": { "type": "http", "url": "http://127.0.0.1:7265/mcp" }
+  }
+}
+```
 
 ### 4. Bootstrap your first project
 
@@ -304,9 +330,17 @@ Auto-detection works out of the box for most setups. Override via environment va
 |---|---|---|
 | `TRANSCRIPT_SEARCH_ROOTS` | auto-detect `~/.claude` + `~/.claude-*` | Account roots. Format: `name=/path,name2=/path2` |
 | `TRANSCRIPT_SEARCH_CODEX_ROOT` | `~/.codex` if it exists | Codex CLI data directory |
-| `TRANSCRIPT_SEARCH_INDEX_PATH` | `~/.claude-shared/transcript-index` or `~/.local/share/blackbox/index` | Tantivy index location |
+| `TRANSCRIPT_SEARCH_INDEX_PATH` | `~/.local/share/blackbox/index` | Tantivy index location |
+| `BLACKBOX_MCP_NAME` | `blackbox` | MCP server name used for self-registration and transient provider injection |
+| `BLACKBOX_STATE_DIR` | `~/.local/state/blackbox` | Base dir for default bbox JSON stores when explicit per-store paths are unset |
+| `BLACKBOX_KNOWLEDGE_PATH` | `<state-dir>/blackbox-knowledge.json` | Knowledge store path |
+| `BLACKBOX_THREADS_PATH` | `<state-dir>/blackbox-threads.json` | Thread store path |
+| `BLACKBOX_NOTES_PATH` | `<state-dir>/blackbox-notes.json` | Notes store path |
+| `BRO_HOME` | `<state-dir>/bro` | Base dir for task store, MCP registry, and Gemini policy tempfiles |
 | `BLACKBOX_REINDEX_INTERVAL_SECS` | `120` | Background reindex interval (seconds) |
 | `BBOX_PORT` / `BRO_PORT` | `7264` | HTTP port for MCP + `/tail` + `/roster` endpoints |
+| `BLACKBOX_GLOBAL_CLAUDE_MD` / `BLACKBOX_GLOBAL_CODEX_MD` / `BLACKBOX_GLOBAL_GEMINI_MD` | provider defaults | Override global render targets; useful for dev instances that must not touch prod memory files |
+| `BLACKBOX_BACKUP_DIR` | `~/.local/state/blackbox/backups` | Managed-region backup root for `bbox_render(scope=global)` |
 | `CLAUDE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` / `VIBE_BIN` | from `$PATH` | Override provider binary paths |
 | `RUST_LOG` | `blackbox=info` | Tracing filter |
 

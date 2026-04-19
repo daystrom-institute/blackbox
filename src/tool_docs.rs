@@ -449,7 +449,8 @@ or `bro_when_any` (race).
 
 /// Bare names of every orchestration (`bro_*`) tool. Used by provider
 /// filter translators that can't accept glob patterns (Codex,
-/// Gemini's policy engine) to expand `mcp__blackbox__bro_*` into a
+/// Gemini's policy engine) to expand the current blackbox MCP prefix's
+/// `bro_*` pattern into a concrete list.
 /// concrete list.
 pub fn orchestration_tool_names() -> Vec<&'static str> {
     TOOL_DOCS
@@ -460,7 +461,11 @@ pub fn orchestration_tool_names() -> Vec<&'static str> {
 }
 
 /// Prefix convention for blackbox-served tools in provider tool namespaces.
-pub const BLACKBOX_MCP_PREFIX: &str = "mcp__blackbox__";
+/// Defaults to `mcp__blackbox__`, but follows `BLACKBOX_MCP_NAME` at runtime
+/// so dev/prod daemons can coexist with distinct MCP entries.
+pub fn blackbox_mcp_prefix() -> String {
+    crate::util::blackbox_mcp_prefix()
+}
 
 // ── Rendering ────────────────────────────────────────────────────────
 

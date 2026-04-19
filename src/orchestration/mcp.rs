@@ -2,8 +2,9 @@
 //!
 //! Users and the daemon coordinate a single view of which MCP servers
 //! dispatched bros should see, and which tool calls are allowed or
-//! disallowed. The registry lives at `~/.bro/mcp.json` with an optional
-//! project overlay at `<project>/.bro/mcp.json`.
+//! disallowed. The registry lives under `BRO_HOME/mcp.json` (default:
+//! `~/.local/state/blackbox/bro/mcp.json`) with an optional project
+//! overlay at `<project>/.bro/mcp.json`.
 //!
 //! At dispatch time, the effective set is (global entries) merged with
 //! (project entries override), and translated into provider-specific CLI
@@ -14,8 +15,9 @@
 //! effective set per-invocation as well for determinism.
 //!
 //! The recursion guard is now mechanical: the default filter set includes
-//! a disallow pattern matching `mcp__blackbox__bro_*` so dispatched agents
-//! literally cannot see (let alone call) the orchestration tools.
+//! a disallow pattern matching the current blackbox MCP prefix's `bro_*`
+//! tools so dispatched agents literally cannot see (let alone call) the
+//! orchestration surface.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -84,7 +86,7 @@ impl McpServerConfig {
 /// translated at dispatch time.
 ///
 /// Patterns support simple glob: `*` matches any suffix, e.g.
-/// `mcp__blackbox__bro_*` matches every bro_* orchestration tool.
+/// `mcp__<blackbox-name>__bro_*` matches every bro_* orchestration tool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct McpFilters {
     /// Disallow rules — tools matching these patterns are filtered out.
@@ -123,7 +125,7 @@ impl McpFilters {
     /// bros. Callers that pass allow_recursion=true skip this layer.
     pub fn default_recursion_guard() -> Self {
         Self {
-            disallow: vec!["mcp__blackbox__bro_*".to_string()],
+            disallow: vec![format!("{}bro_*", crate::tool_docs::blackbox_mcp_prefix())],
             allow: Vec::new(),
         }
     }
@@ -151,7 +153,8 @@ impl McpStore {
         if !path.exists() {
             return Ok(Self::new());
         }
-        let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
     }
 
@@ -173,7 +176,7 @@ impl McpStore {
 // ── Path helpers ───────────────────────────────────────────────────
 
 pub fn global_store_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".bro").join("mcp.json"))
+    dirs::home_dir().map(|h| crate::util::bro_home_dir(&h).join("mcp.json"))
 }
 
 pub fn project_store_path(project_dir: &Path) -> PathBuf {
@@ -301,11 +304,11 @@ impl SelfRegisterReport {
 }
 
 /// On daemon startup, ensure every provider with MCP CRUD has a
-/// `blackbox` entry pointing at `url`. Idempotent: no-op when the
+/// `name` entry pointing at `url`. Idempotent: no-op when the
 /// entry is already correct; updates on drift. Per-provider failures
 /// are captured and returned in the report — one missing CLI doesn't
 /// block the others.
-pub fn self_register_blackbox(url: &str) -> SelfRegisterReport {
+pub fn self_register_blackbox(name: &str, url: &str) -> SelfRegisterReport {
     let mut report = SelfRegisterReport::default();
     for provider in [
         Provider::Claude,
@@ -314,13 +317,13 @@ pub fn self_register_blackbox(url: &str) -> SelfRegisterReport {
         Provider::Gemini,
         Provider::Vibe,
     ] {
-        let outcome = register_one(provider, url);
+        let outcome = register_one(provider, name, url);
         report.per_provider.push((provider, outcome));
     }
     report
 }
 
-fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
+fn register_one(provider: Provider, name: &str, url: &str) -> SelfRegisterOutcome {
     let Some(list_args) = provider.build_mcp_list_args() else {
         return SelfRegisterOutcome::Unsupported;
     };
@@ -336,7 +339,10 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
                 detail: format!(
                     "{bin} mcp list exited {:?}: {}",
                     o.status.code(),
-                    String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or(""),
+                    String::from_utf8_lossy(&o.stderr)
+                        .lines()
+                        .next()
+                        .unwrap_or(""),
                 ),
             };
         }
@@ -357,26 +363,32 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
     // build_mcp_list_args check). Treat unexpected None as Unsupported
     // rather than spawning the bare binary with zero args, which would
     // open an interactive REPL on most CLIs.
-    let Some(add_args) = provider.build_mcp_add_http_args("blackbox", url, &[]) else {
+    let Some(add_args) = provider.build_mcp_add_http_args(name, url, &[]) else {
         return SelfRegisterOutcome::Unsupported;
     };
-    match provider.mcp_list_has(&stdout, "blackbox", Some(url)) {
+    match provider.mcp_list_has(&stdout, name, Some(url)) {
         MatchState::MatchesName => SelfRegisterOutcome::Unchanged,
         MatchState::Drift => {
-            let Some(rm_args) = provider.build_mcp_remove_args("blackbox") else {
+            let Some(rm_args) = provider.build_mcp_remove_args(name) else {
                 return SelfRegisterOutcome::Unsupported;
             };
             if let Err(e) = run_cli(&provider, &rm_args) {
-                return SelfRegisterOutcome::Error { detail: format!("remove: {e}") };
+                return SelfRegisterOutcome::Error {
+                    detail: format!("remove: {e}"),
+                };
             }
             match run_cli(&provider, &add_args) {
                 Ok(()) => SelfRegisterOutcome::Updated,
-                Err(e) => SelfRegisterOutcome::Error { detail: format!("re-add: {e}") },
+                Err(e) => SelfRegisterOutcome::Error {
+                    detail: format!("re-add: {e}"),
+                },
             }
         }
         MatchState::Missing => match run_cli(&provider, &add_args) {
             Ok(()) => SelfRegisterOutcome::Added,
-            Err(e) => SelfRegisterOutcome::Error { detail: format!("add: {e}") },
+            Err(e) => SelfRegisterOutcome::Error {
+                detail: format!("add: {e}"),
+            },
         },
     }
 }
@@ -445,7 +457,10 @@ fn run_cli_with_timeout(
             "{bin} {} exited {:?}: {}",
             args.join(" "),
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or(""),
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or(""),
         );
     }
     Ok(())
@@ -469,15 +484,11 @@ fn capture_cli_with_timeout(
     let raw_bin = provider.bin();
     let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
     let mut cmd = Command::new(&bin);
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawning {bin}"))?;
+    let mut child = cmd.spawn().with_context(|| format!("spawning {bin}"))?;
 
     let start = Instant::now();
     let status = loop {
@@ -487,11 +498,7 @@ fn capture_cli_with_timeout(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    anyhow::bail!(
-                        "{bin} {} timed out after {:?}",
-                        args.join(" "),
-                        timeout,
-                    );
+                    anyhow::bail!("{bin} {} timed out after {:?}", args.join(" "), timeout,);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -506,7 +513,11 @@ fn capture_cli_with_timeout(
     if let Some(mut s) = child.stderr.take() {
         let _ = s.read_to_end(&mut stderr);
     }
-    Ok(std::process::Output { status, stdout, stderr })
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 // ── Gemini policy file generation ──────────────────────────────────
@@ -514,7 +525,7 @@ fn capture_cli_with_timeout(
 /// Directory where per-dispatch Gemini policy files are written.
 /// Daemon-owned — never touches `~/.gemini/policies/` (user territory).
 pub fn gemini_policy_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".bro").join("gemini-policies"))
+    dirs::home_dir().map(|h| crate::util::bro_home_dir(&h).join("gemini-policies"))
 }
 
 /// Translate `McpFilters` into a Gemini-compatible policy TOML string.
@@ -526,11 +537,12 @@ pub fn gemini_policy_dir() -> Option<PathBuf> {
 /// out of scope for this translator.
 pub fn render_gemini_policy_toml(filters: &McpFilters) -> String {
     let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
-    let prefix = crate::tool_docs::BLACKBOX_MCP_PREFIX;
+    let prefix = crate::tool_docs::blackbox_mcp_prefix();
+    let mcp_name = crate::util::blackbox_mcp_name();
 
     let mut disabled: Vec<String> = Vec::new();
     for p in &filters.disallow {
-        let Some(stripped) = p.strip_prefix(prefix) else {
+        let Some(stripped) = p.strip_prefix(&prefix) else {
             continue;
         };
         for t in expand_pattern(stripped, &universe) {
@@ -549,11 +561,12 @@ pub fn render_gemini_policy_toml(filters: &McpFilters) -> String {
         let quoted: Vec<String> = disabled.iter().map(|t| format!("\"{t}\"")).collect();
         out.push_str(&format!(
             "\n[[rule]]\n\
-             mcpName = \"blackbox\"\n\
+             mcpName = \"{}\"\n\
              toolName = [{}]\n\
              decision = \"deny\"\n\
              priority = 500\n\
              denyMessage = \"Blocked by blackbox dispatch policy\"\n",
+            mcp_name,
             quoted.join(",")
         ));
     }
@@ -766,7 +779,9 @@ fn action_add(p: &McpToolParams) -> Result<String> {
             headers,
             exclude_tools: exclude.clone(),
         },
-        other => anyhow::bail!("Transport {other} not supported via bro_mcp add (use provider CLI for stdio)"),
+        other => anyhow::bail!(
+            "Transport {other} not supported via bro_mcp add (use provider CLI for stdio)"
+        ),
     };
 
     let path = resolve_scope_path(p)?;
@@ -784,7 +799,13 @@ fn action_add(p: &McpToolParams) -> Result<String> {
         None
     };
     let fanout_lines: Vec<String> = fanout_parallel(|provider| {
-        let args = provider.build_mcp_add_http_args_full(name, url, &exclude, &headers_for_cli, cli_scope)?;
+        let args = provider.build_mcp_add_http_args_full(
+            name,
+            url,
+            &exclude,
+            &headers_for_cli,
+            cli_scope,
+        )?;
         // Idempotent: best-effort remove (no-op if absent), then add.
         // The remove error is logged but not surfaced — it's expected
         // to fail when the server isn't already registered. Genuine
@@ -980,7 +1001,10 @@ mod tests {
         );
         match cfg {
             McpServerConfig::Http { headers, .. } => {
-                assert_eq!(headers.get("Authorization"), Some(&"Bearer token".to_string()));
+                assert_eq!(
+                    headers.get("Authorization"),
+                    Some(&"Bearer token".to_string())
+                );
             }
             _ => panic!("expected Http variant"),
         }
@@ -1043,8 +1067,18 @@ mod tests {
     fn self_register_outcome_distinguishes_not_installed_from_list_failed() {
         let r = SelfRegisterReport {
             per_provider: vec![
-                (Provider::Claude, SelfRegisterOutcome::NotInstalled { detail: "spawn err".into() }),
-                (Provider::Codex, SelfRegisterOutcome::ListFailed { detail: "exit 1".into() }),
+                (
+                    Provider::Claude,
+                    SelfRegisterOutcome::NotInstalled {
+                        detail: "spawn err".into(),
+                    },
+                ),
+                (
+                    Provider::Codex,
+                    SelfRegisterOutcome::ListFailed {
+                        detail: "exit 1".into(),
+                    },
+                ),
             ],
         };
         let s = r.summary();
@@ -1097,7 +1131,11 @@ mod tests {
             Some(McpServerConfig::Http { url, .. }) if url == "http://new/mcp"
         ));
         assert_eq!(eff.filters.disallow.len(), 2);
-        assert!(eff.filters.disallow.contains(&"Bash(git push *)".to_string()));
+        assert!(
+            eff.filters
+                .disallow
+                .contains(&"Bash(git push *)".to_string())
+        );
         assert!(eff.filters.disallow.contains(&"Edit(*)".to_string()));
     }
 
@@ -1105,7 +1143,10 @@ mod tests {
     fn default_guard_blocks_bro_tools() {
         let global = McpStore::new();
         let eff = resolve_effective(&global, None, true);
-        assert_eq!(eff.filters.disallow, vec!["mcp__blackbox__bro_*".to_string()]);
+        assert_eq!(
+            eff.filters.disallow,
+            vec!["mcp__blackbox__bro_*".to_string()]
+        );
     }
 
     #[test]
@@ -1124,7 +1165,10 @@ mod tests {
             "Bash",
         ];
         let out = expand_pattern("mcp__blackbox__bro_*", &universe);
-        assert_eq!(out, vec!["mcp__blackbox__bro_exec", "mcp__blackbox__bro_resume"]);
+        assert_eq!(
+            out,
+            vec!["mcp__blackbox__bro_exec", "mcp__blackbox__bro_resume"]
+        );
     }
 
     #[test]
@@ -1137,8 +1181,11 @@ mod tests {
     #[test]
     fn expand_pattern_supports_full_globs() {
         let universe = [
-            "bro_exec", "bro_resume", "bro_status",
-            "bbox_note", "bbox_notes",
+            "bro_exec",
+            "bro_resume",
+            "bro_status",
+            "bbox_note",
+            "bbox_notes",
         ];
         // Trailing `*`
         assert_eq!(expand_pattern("bro_*", &universe).len(), 3);
