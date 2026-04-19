@@ -25,6 +25,7 @@ pub enum ToolCategory {
     Threads,
     Notes,
     Inbox,
+    Packets,
     Orchestration,
 }
 
@@ -36,6 +37,7 @@ impl ToolCategory {
             Self::Threads => "Threads",
             Self::Notes => "Side-channel notes",
             Self::Inbox => "Attention / inbox",
+            Self::Packets => "Rule-packets",
             Self::Orchestration => "Bro orchestration",
         }
     }
@@ -56,6 +58,9 @@ impl ToolCategory {
             }
             Self::Inbox => {
                 "Attention aggregator: a single read that surfaces unresolved notes, stale threads, unverified knowledge, and failed tasks. Run at round boundaries, morning-brief style, and whenever you're unsure what needs attention next."
+            }
+            Self::Packets => {
+                "Compressive compilation of observations into portable theories. A rule-packet is a small axiomatic theory (rank/threshold tables + rule trees + anomalies) extracted from a larger observation set. Extract once with an LLM via `bbox_compile`; evaluate arbitrarily many times with a deterministic evaluator via `bbox_apply`. Use when you have a structured dataset (authorization matrix, retry taxonomy, state-transition table) that's likely governed by a small number of rules — the packet compresses 10-50x and generalizes to entities the sender never saw. Validate fidelity via `bbox_audit` before trusting predictions."
             }
             Self::Orchestration => {
                 "Dispatch agents across providers (Claude, Codex, Copilot, Vibe, Gemini). Prefer named `bro` targeting (resolves provider + account + lens + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race)."
@@ -169,7 +174,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
-        summary: "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above.",
+        summary: "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above. Also surfaces matching system memories (code-embedded runbooks) marked `[system]` when the query hits one.",
         when_to_use: "The start of any task. Default to `query=<one distinctive word>`. Before calling `bbox_decide(supersedes=...)`, add `project=<current-project-dir>` to narrow to *this* repo's prior entries — same-topic entries from other repos can appear and lead to superseding the wrong entry. `category` filter helps when you specifically want decisions, conventions, etc.",
         example: Some(r#"bbox_knowledge(query="retry")"#),
     },
@@ -265,6 +270,28 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Aggregate attention layer across every store.",
         when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view.",
         example: Some(r#"bbox_inbox(project="/repo/x", stale_days=3)"#),
+    },
+    // ── Rule-packets ─────────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_compile",
+        category: ToolCategory::Packets,
+        summary: "Compile a set of rules into a rule-packet (a compiled axiomatic theory with a deterministic evaluator). Full workflow in `sm-rule-packets` — query via bbox_knowledge.",
+        when_to_use: "You have observations of a structured domain (authorization matrix, retry policy, state machine, access policy) and want to transmit the GENERATING RULES rather than the observations. Rules are ordered — first matching antecedent wins. Put anomalies first, general rules later. Predicate ops: `Eq{field,value}`, `Ge/Gt/Le/Lt{field,value}`, `RankGeFieldThreshold{rank_field,threshold_field}`, `All{args}`, `Any{args}`, `Not{arg}`, `True`, `False`. Optional `rank_table` / `threshold_table` lookup tables augment the entity at eval time (e.g. `rank_table={reader:1, editor:2, admin:4}` plus entity `{role: \"editor\"}` makes `role_rank=2` available to predicates).",
+        example: Some(r#"bbox_compile(domain="retry-policy", rules=[{"id":"transient_retry","antecedent":{"op":"Eq","field":"nature","value":"transient"},"consequent":"RETRY"},{"id":"default_fail","antecedent":{"op":"True"},"consequent":"FAIL"}])"#),
+    },
+    ToolDoc {
+        name: "bbox_apply",
+        category: ToolCategory::Packets,
+        summary: "Evaluate a rule-packet against a single entity. Returns the first matching rule's consequent + rule_id.",
+        when_to_use: "Ask whether a specific (role, method, resource) / (nature, origin) / etc. is ALLOW or DENY per a packet's rules. Deterministic, no LLM — cheap at arbitrary scale. If no rule matches, returns `{match: false}` rather than guessing.",
+        example: Some(r#"bbox_apply(packet_id="packet-a1b2c3d4", entity={"role":"editor","method":"POST","resource":"team"})"#),
+    },
+    ToolDoc {
+        name: "bbox_audit",
+        category: ToolCategory::Packets,
+        summary: "Apply a packet to a `{entity, expected}[]` dataset; return fidelity report.",
+        when_to_use: "Self-verify a packet against its training observations before trusting predictions. Also used to catch sender-side over-generalization: if fidelity < 1.0, the packet has a rule that mis-predicts observed data. Mismatches list names each failing row with its expected vs predicted consequent.",
+        example: Some(r#"bbox_audit(packet_id="packet-a1b2c3d4", dataset=[{"entity":{...}, "expected":"ALLOW"}, ...])"#),
     },
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {
@@ -503,6 +530,7 @@ pub fn render_markdown() -> String {
         ToolCategory::Threads,
         ToolCategory::Notes,
         ToolCategory::Inbox,
+        ToolCategory::Packets,
         ToolCategory::Orchestration,
     ];
 

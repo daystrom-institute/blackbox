@@ -3,8 +3,10 @@ mod index;
 mod knowledge;
 mod notes;
 mod orchestration;
+mod packets;
 mod parser;
 mod render;
+mod system_memory;
 mod threads;
 mod tool_docs;
 mod util;
@@ -37,6 +39,7 @@ use notes::Notes;
 use orchestration::providers::{ExecOpts, Provider};
 use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
+use packets::Packets;
 use threads::Threads;
 
 // ---------------------------------------------------------------------------
@@ -48,6 +51,7 @@ struct SharedState {
     kb: RwLock<Knowledge>,
     threads: RwLock<Threads>,
     notes: RwLock<Notes>,
+    packets: RwLock<Packets>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
     store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
@@ -125,6 +129,7 @@ use knowledge::{
     RememberParams, RenderParams, ReviewParams,
 };
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
+use packets::{ApplyParams as PacketApplyParams, AuditParams, CompileParams};
 use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
@@ -239,10 +244,30 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_knowledge",
-        description = "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above."
+        description = "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above. Also surfaces matching system memories (code-embedded runbooks) marked `[system]` when the query hits one."
     )]
     fn bbox_knowledge(&self, Parameters(p): Parameters<KnowledgeListParams>) -> CallToolResult {
-        Self::run("bbox_knowledge", || self.state.kb.write().list(&p))
+        Self::run("bbox_knowledge", || {
+            let runtime = self.state.kb.write().list(&p)?;
+            // Also surface matching code-embedded memories. See
+            // src/system_memory/ — these are static runbooks baked into the
+            // binary via include_str!, queryable but never rendered.
+            let memories = system_memory::search(p.query.as_deref());
+            if memories.is_empty() {
+                Ok(runtime)
+            } else {
+                let mut combined = runtime;
+                if !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str("\n── System memories ──────────────────────────\n");
+                for m in memories {
+                    combined.push_str(&system_memory::format_for_listing(m));
+                    combined.push('\n');
+                }
+                Ok(combined)
+            }
+        })
     }
 
     #[tool(name = "bbox_forget", description = "Retire or supersede an entry.")]
@@ -344,6 +369,32 @@ impl BlackboxServer {
             let task_store = self.state.task_store.read();
             inbox::compute_inbox(&kb, &threads, &notes, &task_store, &p)
         })
+    }
+
+    // ── Rule-packets (compressive compilation of observations) ────────
+
+    #[tool(
+        name = "bbox_compile",
+        description = "Compile a set of rules into a rule-packet (a compiled axiomatic theory with a deterministic evaluator). Full workflow in `sm-rule-packets` — query via bbox_knowledge."
+    )]
+    fn bbox_compile(&self, Parameters(p): Parameters<CompileParams>) -> CallToolResult {
+        Self::run("bbox_compile", || self.state.packets.read().compile(&p))
+    }
+
+    #[tool(
+        name = "bbox_apply",
+        description = "Evaluate a rule-packet against a single entity. Returns the first matching rule's consequent + rule_id."
+    )]
+    fn bbox_apply(&self, Parameters(p): Parameters<PacketApplyParams>) -> CallToolResult {
+        Self::run("bbox_apply", || self.state.packets.read().apply_tool(&p))
+    }
+
+    #[tool(
+        name = "bbox_audit",
+        description = "Apply a packet to a `{entity, expected}[]` dataset; return fidelity report."
+    )]
+    fn bbox_audit(&self, Parameters(p): Parameters<AuditParams>) -> CallToolResult {
+        Self::run("bbox_audit", || self.state.packets.read().audit_tool(&p))
     }
 }
 
@@ -2618,6 +2669,10 @@ async fn main() -> anyhow::Result<()> {
     let notes_store = Notes::open(&notes_path)?;
     tracing::info!("Notes store: {}", notes_path.display());
 
+    let packets_dir = util::blackbox_packets_dir(&home);
+    let packets_store = Packets::open(&packets_dir)?;
+    tracing::info!("Packets store: {}", packets_dir.join("packets").display());
+
     // Orchestration state
     let store_dir = PathBuf::from(
         std::env::var("BRO_STORE")
@@ -2648,6 +2703,7 @@ async fn main() -> anyhow::Result<()> {
         kb: RwLock::new(kb),
         threads: RwLock::new(th),
         notes: RwLock::new(notes_store),
+        packets: RwLock::new(packets_store),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx: tail_tx.clone(),
         store_dir: store_dir.clone(),
@@ -2709,12 +2765,14 @@ mod tests {
         let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
         let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
         let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
+        let packets = Packets::open(tmp.path()).unwrap();
         let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
         let state = Arc::new(SharedState {
             idx: RwLock::new(index),
             kb: RwLock::new(kb),
             threads: RwLock::new(threads),
             notes: RwLock::new(notes),
+            packets: RwLock::new(packets),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,
             store_dir: tmp.path().join("bro"),
