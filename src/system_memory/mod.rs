@@ -139,6 +139,52 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
         ],
         content: include_str!("render-lifecycle.md"),
     },
+    SystemMemory {
+        id: "sm-review-packets",
+        title: "Review packets — code review via rule-packets",
+        tags: &[
+            "packets",
+            "review",
+            "code-review",
+            "classification",
+            "lattice",
+            "domain",
+            "runbook",
+        ],
+        content: include_str!("review-packets.md"),
+    },
+    SystemMemory {
+        id: "sm-auth-packets",
+        title: "Auth packets — authorization matrices via rule-packets",
+        tags: &[
+            "packets",
+            "auth",
+            "authorization",
+            "allow",
+            "deny",
+            "classification",
+            "domain",
+            "runbook",
+        ],
+        content: include_str!("auth-packets.md"),
+    },
+    SystemMemory {
+        id: "sm-design-packets",
+        title: "Design packets — ensemble design-iteration via rule-packets",
+        tags: &[
+            "packets",
+            "design",
+            "iteration",
+            "ensemble",
+            "proposals",
+            "blocker",
+            "concern",
+            "classification",
+            "domain",
+            "runbook",
+        ],
+        content: include_str!("design-packets.md"),
+    },
 ];
 
 /// Lookup by exact ID. Accepts either canonical form (`sm-rule-packets`) or
@@ -232,9 +278,12 @@ mod tests {
 
     #[test]
     fn search_finds_by_body_content() {
-        // The body mentions adversarial-review; search should pick it up.
-        let hits = search(Some("adversarial"));
+        // Universal-mechanism runbook mentions "generating function".
+        let hits = search(Some("generating function"));
         assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
+        // Review-domain runbook mentions "adversarial".
+        let review_hits = search(Some("adversarial"));
+        assert!(review_hits.iter().any(|m| m.id == "sm-review-packets"));
     }
 
     #[test]

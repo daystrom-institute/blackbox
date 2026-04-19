@@ -30,10 +30,23 @@ pub struct CompileParams {
     /// filtering and display; free-form.
     pub domain: String,
     /// Rules serialized as a JSON array. Each rule is
-    /// `{ id, antecedent: <Predicate>, consequent: <Value>, confidence?: f32,
-    ///   provenance?: [string] }`. Predicate AST operators are documented
-    /// in the module-level doc comment for this tool.
+    /// `{ id, antecedent: <Predicate>, consequent: <Value>, classification?: string,
+    ///   emit?: "independent"|"fallback", confidence?: f32, provenance?: [string] }`.
+    /// Predicate AST operators are documented in the module-level doc comment.
     pub rules: serde_json::Value,
+    /// Classification lattice, highest priority first. Defaults to the
+    /// review lattice `["fail", "flag", "manual", "pass", "info"]` when
+    /// omitted. Supply a domain-specific lattice for auth (`["deny","allow"]`),
+    /// retry (`["dlq","fail_fast","backoff","retry","noop"]`), design-
+    /// iteration (`["blocker","concern","suggestion","advantage","neutral"]`),
+    /// etc. Aggregate verdicts respect this ordering.
+    #[serde(default)]
+    pub classification_lattice: Option<Vec<String>>,
+    /// Id-prefix → classification map for inference. Defaults to the
+    /// review prefix map when omitted. Keys are substrings matched at
+    /// the start of the rule id (`"fail_"`, `"deny_"`, etc.).
+    #[serde(default)]
+    pub prefix_inference: Option<BTreeMap<String, String>>,
     /// Named lookup table: role → rank. Optional; used by
     /// `RankGeFieldThreshold` predicates. Entity must carry the role key in
     /// the field named by `rank_lookup_key` (default: `"role"`).
@@ -163,11 +176,12 @@ impl Value {
 /// these nodes; evaluation is a pure function of `(node, entity)`. The
 /// serde tag `op` matches the JSON form produced in E11.
 ///
-/// Phase-2 additions (convergent adversarial-bro feedback from
-/// thread-0b20e854):
-/// - Applicability: `IsPresent`, `IsAbsent` — gate rules on whether a
-///   field is even present in the entity, eliminating the
-///   zero-conflated-with-null bug class.
+/// Additions since v1:
+/// - Tri-state applicability: `KeyExists`, `IsNull`, `IsNonNull`,
+///   `IsMissing` — JSON distinguishes `{}` (key missing) from
+///   `{x: null}` (key present, value null). `null` typically means
+///   "known non-applicable"; missing means "not computed / extractor
+///   failed." Four predicates that preserve this distinction.
 /// - Field-vs-field comparison: `FieldEq`, `FieldGt/Ge/Lt/Le` — compare
 ///   two entity fields directly instead of a field against a literal.
 ///   Lets structural rules like "tools added > tool docs added" express
@@ -189,30 +203,12 @@ pub enum Predicate {
     GtF { field: String, value: f64 },
     LeF { field: String, value: f64 },
     LtF { field: String, value: f64 },
-    /// **DEPRECATED.** Applicability predicate that collapses missing
-    /// and null into one state — the bugs both adversarial-review bros
-    /// caught in phase-2. Retained at deserialize time so phase-2
-    /// packets on disk still evaluate, but new rules should use
-    /// `IsNonNull` (same semantics, honest name) instead. A future
-    /// phase will delete this variant after in-flight packets are
-    /// migrated; the evaluator emits a `tracing::warn!` on each use.
-    IsPresent { field: String },
-    /// **DEPRECATED.** Complement of `IsPresent`; fires on either
-    /// missing OR null — a trap both bros flagged. Use `IsMissing`
-    /// (key absent) or `IsNull` (key present, value null) for precise
-    /// semantics. Deletion scheduled after phase-3 migration.
-    IsAbsent { field: String },
-    /// Tri-state applicability (phase-2.5, added per adversarial-review
-    /// convergent critique on thread-cc7ff97d): JSON distinguishes
-    /// `{}` (key missing) from `{x: null}` (key present, value null).
-    /// `null` typically means "known non-applicable"; missing means
-    /// "not computed / extractor failed." The tri-state predicates
-    /// preserve that distinction where `IsPresent` destroys it.
+    /// Tri-state applicability. Preserves the distinction between
+    /// `{}` (key missing) and `{x: null}` (key present, value null).
     ///
     /// - `KeyExists` — key exists regardless of value (null or otherwise)
     /// - `IsNull`    — key exists AND value is the JSON `null` literal
-    /// - `IsNonNull` — key exists AND value is NOT null (what the old
-    ///                 `IsPresent` did)
+    /// - `IsNonNull` — key exists AND value is NOT null
     /// - `IsMissing` — key does not exist in the entity at all
     KeyExists { field: String },
     IsNull { field: String },
@@ -256,64 +252,75 @@ pub enum Predicate {
     AlwaysFalse {},
 }
 
-// ── Severity ──────────────────────────────────────────────────────
+// ── Classification (user-defined per-packet lattice) ─────────────
 
-/// First-class rule severity. Lives on the `Rule` so the engine can
-/// aggregate, sort, and threshold mechanically instead of parsing
-/// severity out of the consequent string.
+/// Rule classification is a free-form `String` validated against the
+/// packet's `classification_lattice`. Each domain declares its own
+/// lattice and precedence direction, so the AST is domain-neutral
+/// while the Rule/Packet layer carries the domain semantics.
 ///
-/// Aggregation precedence (used by `bbox_apply` mode="all" verdict):
-/// Fail > Flag > Manual > Pass > Info.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
-pub enum Severity {
-    Fail,
-    Flag,
-    Manual,
-    Pass,
-    Info,
+/// Review domain (default): `["fail", "flag", "manual", "pass", "info"]`.
+/// Auth domain: `["deny", "allow"]` — DENY wins.
+/// Retry domain: `["dlq", "fail_fast", "backoff", "retry", "noop"]`.
+/// Design-iteration: `["blocker", "concern", "suggestion", "advantage", "neutral"]`.
+///
+/// Lattice order is *highest priority first*. The aggregate verdict in
+/// `apply(mode="all")` is the first-declared classification that any
+/// rule fired — which is what both adversarial-review bros asked for.
+pub fn default_lattice() -> Vec<String> {
+    ["fail", "flag", "manual", "pass", "info"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
-impl Severity {
-    /// Ordering for aggregate verdict computation. Higher rank wins.
-    fn rank(self) -> u8 {
-        match self {
-            Severity::Fail => 5,
-            Severity::Flag => 4,
-            Severity::Manual => 3,
-            Severity::Pass => 2,
-            Severity::Info => 1,
+/// Default id-prefix → classification map for the review domain.
+/// Domains with different lattices supply their own map at `bbox_compile`
+/// time; unspecified prefixes fall through and rules must declare
+/// classification explicitly.
+pub fn default_prefix_inference() -> BTreeMap<String, String> {
+    let pairs: &[(&str, &str)] = &[
+        ("fail_", "fail"),
+        ("fail-", "fail"),
+        ("flag_", "flag"),
+        ("flag-", "flag"),
+        ("manual_", "manual"),
+        ("manual-", "manual"),
+        ("review_", "manual"),
+        ("review-", "manual"),
+        ("pass_", "pass"),
+        ("pass-", "pass"),
+    ];
+    pairs
+        .iter()
+        .map(|(p, c)| (p.to_string(), c.to_string()))
+        .collect()
+}
+
+/// Infer a classification from the rule ID using the packet's prefix
+/// map. Returns `None` when no prefix matches.
+///
+/// **Longest-match wins.** If the map has both `fail_` → fail and
+/// `fail_critical_` → blocker, a rule id `fail_critical_foo` resolves to
+/// `blocker` (the longer prefix). BTreeMap iteration order would
+/// otherwise resolve by lexicographic key order, which surprises users —
+/// so this function explicitly picks the longest matching prefix.
+/// Codex flagged this as the hidden-policy-most-likely-to-surprise in
+/// phase-3 review (thread-cc7ff97d).
+fn infer_classification(id: &str, prefix_map: &BTreeMap<String, String>) -> Option<String> {
+    let mut best: Option<(&str, &str)> = None;
+    for (prefix, class) in prefix_map {
+        if id.starts_with(prefix.as_str()) {
+            match best {
+                None => best = Some((prefix.as_str(), class.as_str())),
+                Some((best_prefix, _)) if prefix.len() > best_prefix.len() => {
+                    best = Some((prefix.as_str(), class.as_str()));
+                }
+                _ => {}
+            }
         }
     }
-}
-
-impl Default for Severity {
-    fn default() -> Self {
-        Severity::Info
-    }
-}
-
-/// Infer a severity from the rule ID when the caller didn't specify one.
-/// Prefix convention makes rule ordering auditable: `fail_*`, `flag_*`,
-/// `manual_*`, `pass_*` map to matching severities. Unrecognized prefixes
-/// fall through to `Info`.
-fn infer_severity_from_id(id: &str) -> Severity {
-    if id.starts_with("fail_") || id.starts_with("fail-") {
-        Severity::Fail
-    } else if id.starts_with("flag_") || id.starts_with("flag-") {
-        Severity::Flag
-    } else if id.starts_with("manual_")
-        || id.starts_with("manual-")
-        || id.starts_with("review_")
-        || id.starts_with("review-")
-    {
-        Severity::Manual
-    } else if id.starts_with("pass_") || id.starts_with("pass-") {
-        Severity::Pass
-    } else {
-        Severity::Info
-    }
+    best.map(|(_, c)| c.to_string())
 }
 
 // ── Emit (rule firing semantics in apply_all) ────────────────────
@@ -348,16 +355,11 @@ pub struct Rule {
     pub id: String,
     pub antecedent: Predicate,
     pub consequent: Value,
-    /// First-class severity. If omitted at compile time, inferred from the
-    /// id prefix (`fail_*` → Fail, `flag_*` → Flag, `manual_*`/`review_*` →
-    /// Manual, `pass_*` → Pass, otherwise Info). Inference runs only when
-    /// the caller's input lacked a severity field; explicit `severity:
-    /// "info"` is preserved. This is what Codex's phase-2 review caught
-    /// as a bug — the v3 compile loop upgraded every Info to the prefix-
-    /// inferred value, erasing explicit "info". Phase-2.5 fix: RuleInput
-    /// carries `Option<Severity>` and inference only runs on `None`.
-    #[serde(default)]
-    pub severity: Severity,
+    /// Classification in the packet's lattice. If the caller omits it at
+    /// compile time, inferred from the id prefix via the packet's
+    /// `prefix_inference` map. Must be one of the values in the packet's
+    /// `classification_lattice`; compile validates and rejects otherwise.
+    pub classification: String,
     /// Firing semantics in `apply_all`. Default: Independent. Set to
     /// Fallback on catchall rules (e.g. `pass_all_clean`) so they only
     /// emit findings when no real rule matched.
@@ -369,16 +371,17 @@ pub struct Rule {
     pub provenance: Vec<String>,
 }
 
-/// Rules-as-authored. Uses `Option<Severity>` so we can distinguish
-/// "caller said nothing" (infer from id) from "caller said Info"
-/// (preserve). Converted to `Rule` in `compile`.
+/// Rules-as-authored. Uses `Option<String>` for classification so we
+/// can distinguish "caller said nothing" (infer from id prefix) from
+/// "caller said X" (preserve, then validate). Converted to `Rule` in
+/// `compile` once the packet's lattice + prefix map are known.
 #[derive(Debug, Clone, Deserialize)]
 struct RuleInput {
     id: String,
     antecedent: Predicate,
     consequent: Value,
     #[serde(default)]
-    severity: Option<Severity>,
+    classification: Option<String>,
     #[serde(default)]
     emit: Option<Emit>,
     #[serde(default = "default_confidence")]
@@ -388,19 +391,36 @@ struct RuleInput {
 }
 
 impl RuleInput {
-    fn materialize(self) -> Rule {
-        let severity = self
-            .severity
-            .unwrap_or_else(|| infer_severity_from_id(&self.id));
-        Rule {
+    fn materialize(self, lattice: &[String], prefix_map: &BTreeMap<String, String>) -> Result<Rule> {
+        // 1. Explicit classification wins; 2. infer from id prefix;
+        // 3. fall back to the lowest-priority classification in the lattice.
+        let classification = self
+            .classification
+            .or_else(|| infer_classification(&self.id, prefix_map))
+            .or_else(|| lattice.last().cloned())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rule '{}' has no classification and packet lattice is empty",
+                    self.id
+                )
+            })?;
+        if !lattice.iter().any(|c| c == &classification) {
+            anyhow::bail!(
+                "rule '{}' classification '{}' is not in packet lattice {:?}",
+                self.id,
+                classification,
+                lattice
+            );
+        }
+        Ok(Rule {
             id: self.id,
             antecedent: self.antecedent,
             consequent: self.consequent,
-            severity,
+            classification,
             emit: self.emit.unwrap_or_default(),
             confidence: self.confidence,
             provenance: self.provenance,
-        }
+        })
     }
 }
 
@@ -434,6 +454,18 @@ pub struct Packet {
     #[serde(default = "default_threshold_lookup_key")]
     pub threshold_lookup_key: String,
 
+    /// Classification lattice — highest precedence first. Each rule's
+    /// `classification` must be in this list. In `apply(mode="all")`,
+    /// the aggregate verdict is the first-listed class any rule fired.
+    /// Defaults to the review lattice when omitted.
+    #[serde(default = "default_lattice")]
+    pub classification_lattice: Vec<String>,
+    /// Id-prefix → classification map for inference when a rule omits
+    /// classification. Defaults to the review prefixes (`fail_*` → fail,
+    /// `flag_*` → flag, `manual_*`/`review_*` → manual, `pass_*` → pass).
+    #[serde(default = "default_prefix_inference")]
+    pub prefix_inference: BTreeMap<String, String>,
+
     /// Ordered rules — first matching antecedent wins.
     pub rules: Vec<Rule>,
 
@@ -462,22 +494,36 @@ pub struct Prediction {
     pub rule_id: String,
     pub consequent: Value,
     pub confidence: f32,
-    /// Severity of the rule that fired. Lets callers group/filter findings
-    /// mechanically (especially in `apply_all` mode where multiple rules
-    /// fire simultaneously and a reviewer wants all FAILs first).
-    #[serde(default)]
-    pub severity: Severity,
+    /// Classification of the rule that fired. Lets callers group/filter
+    /// findings mechanically — in `apply_all`, multiple rules fire and
+    /// a reviewer typically wants all high-priority classifications first.
+    pub classification: String,
 }
 
 /// Result of `bbox_apply` in mode="all" — every rule whose antecedent
-/// holds emits a finding. `verdict` is the aggregate severity computed
-/// from the findings via Fail > Flag > Manual > Pass > Info precedence.
+/// holds emits a finding. `verdict` is the aggregate classification
+/// computed from the findings via the packet's lattice precedence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyAllResult {
     pub packet_id: String,
     pub findings: Vec<Prediction>,
-    /// Aggregate verdict. `null` when no rule matched at all.
-    pub verdict: Option<Severity>,
+    /// Aggregate verdict: the **highest-priority** classification in the
+    /// packet's lattice that any rule fired. The lattice is ordered
+    /// highest-first, so the verdict is the first lattice entry present
+    /// in the findings list — independent of firing order within the
+    /// rule sequence.
+    ///
+    /// Example: lattice `["fail", "flag", "pass"]`. If findings are
+    /// `[{class: "flag"}, {class: "pass"}, {class: "flag"}]`, verdict =
+    /// `"flag"` because it's the earliest lattice entry that appears.
+    /// If findings only have `pass`, verdict = `"pass"`. If no finding
+    /// fired, verdict = `None`.
+    ///
+    /// Consumers reading `verdict` without knowing the packet's lattice
+    /// still get a meaningful domain-specific string (`"deny"`, `"fail"`,
+    /// `"blocker"`, etc.) — the lattice knowledge is only needed for
+    /// cross-packet comparison, not for acting on a single verdict.
+    pub verdict: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -549,11 +595,8 @@ fn entity_f64(entity: &serde_json::Map<String, serde_json::Value>, field: &str) 
 }
 
 fn entity_has(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
-    // `IsPresent` semantics: the field exists in the map AND is not the JSON
-    // null literal. Collapses missing and null — preserved for backward
-    // compat with phase-2 packets. Rules that need to distinguish should
-    // use the tri-state predicates (`KeyExists`, `IsNull`, `IsNonNull`,
-    // `IsMissing`) instead.
+    // Key exists AND value is non-null. Used by `IsNonNull`. Distinct
+    // from `entity_key_exists` (which counts null as present).
     match entity.get(field) {
         None => false,
         Some(serde_json::Value::Null) => false,
@@ -572,8 +615,9 @@ fn entity_is_null(entity: &serde_json::Map<String, serde_json::Value>, field: &s
 /// Evaluate a predicate against a resolved entity. Pure function — no
 /// I/O, no LLM, no side effects. Cross-field and applicability
 /// predicates return `false` on missing / malformed inputs rather than
-/// panicking or erroring; the caller can audit applicability via
-/// `IsPresent` / `IsAbsent` guards in composite rules.
+/// panicking or erroring; compose with `KeyExists` / `IsMissing` /
+/// `IsNonNull` / `IsNull` inside `All` when applicability guards are
+/// wanted.
 fn eval_predicate(
     p: &Predicate,
     entity: &serde_json::Map<String, serde_json::Value>,
@@ -605,20 +649,6 @@ fn eval_predicate(
         }
         Predicate::LtF { field, value } => {
             entity_f64(entity, field).map(|v| v < *value).unwrap_or(false)
-        }
-        Predicate::IsPresent { field } => {
-            tracing::warn!(
-                field,
-                "packets: IsPresent is deprecated (collapses missing+null); use IsNonNull for same semantics"
-            );
-            entity_has(entity, field)
-        }
-        Predicate::IsAbsent { field } => {
-            tracing::warn!(
-                field,
-                "packets: IsAbsent is deprecated (fires on missing OR null — ambiguous); use IsMissing or IsNull for precise semantics"
-            );
-            !entity_has(entity, field)
         }
         Predicate::KeyExists { field } => entity_key_exists(entity, field),
         Predicate::IsNull { field } => entity_is_null(entity, field),
@@ -681,7 +711,7 @@ pub fn apply(packet: &Packet, entity: &serde_json::Value) -> Option<Prediction> 
                 rule_id: rule.id.clone(),
                 consequent: rule.consequent.clone(),
                 confidence: rule.confidence,
-                severity: rule.severity,
+                classification: rule.classification.clone(),
             });
         }
     }
@@ -722,7 +752,7 @@ pub fn apply_all(packet: &Packet, entity: &serde_json::Value) -> ApplyAllResult 
             rule_id: rule.id.clone(),
             consequent: rule.consequent.clone(),
             confidence: rule.confidence,
-            severity: rule.severity,
+            classification: rule.classification.clone(),
         })
         .collect();
 
@@ -740,7 +770,7 @@ pub fn apply_all(packet: &Packet, entity: &serde_json::Value) -> ApplyAllResult 
                 rule_id: rule.id.clone(),
                 consequent: rule.consequent.clone(),
                 confidence: rule.confidence,
-                severity: rule.severity,
+                classification: rule.classification.clone(),
             })
             .collect()
     } else {
@@ -752,10 +782,13 @@ pub fn apply_all(packet: &Packet, entity: &serde_json::Value) -> ApplyAllResult 
         .chain(fallback_findings)
         .collect();
 
-    let verdict = findings
+    // Aggregate verdict = first classification in the lattice that any
+    // rule fired. Lattice ordering IS the precedence — domain-specific.
+    let verdict = packet
+        .classification_lattice
         .iter()
-        .map(|p| p.severity)
-        .max_by_key(|s| s.rank());
+        .find(|class| findings.iter().any(|p| &&p.classification == class))
+        .cloned();
 
     ApplyAllResult {
         packet_id: packet.id.clone(),
@@ -928,19 +961,35 @@ impl Packets {
             anyhow::bail!("'domain' is required and cannot be empty");
         }
 
-        // Deserialize into RuleInput (severity is `Option<Severity>` here),
-        // then materialize into Rule — inferring severity from the id
-        // prefix ONLY when the caller omitted it. Explicit `severity:
-        // "info"` is preserved, which fixes the phase-2 bug where the
-        // compile loop upgraded every Info to the prefix-inferred value.
+        // Resolve the classification lattice + prefix inference map.
+        // Callers override per-domain; default is the review lattice.
+        let lattice = p
+            .classification_lattice
+            .clone()
+            .unwrap_or_else(default_lattice);
+        if lattice.is_empty() {
+            anyhow::bail!("'classification_lattice' cannot be empty");
+        }
+        let prefix_inference = p
+            .prefix_inference
+            .clone()
+            .unwrap_or_else(default_prefix_inference);
+
+        // Deserialize into RuleInput (classification is Option<String>);
+        // materialize validates each rule's classification is in the
+        // lattice, inferring from id prefix when the caller omitted it.
+        // Explicit classification beats inferred.
         let inputs: Vec<RuleInput> = serde_json::from_value(p.rules.clone())
-            .context("'rules' must be a JSON array of {id, antecedent, consequent, severity?, emit?, confidence?, provenance?} objects")?;
+            .context("'rules' must be a JSON array of {id, antecedent, consequent, classification?, emit?, confidence?, provenance?} objects")?;
 
         if inputs.is_empty() {
             anyhow::bail!("'rules' cannot be empty — at least one rule required");
         }
 
-        let rules: Vec<Rule> = inputs.into_iter().map(RuleInput::materialize).collect();
+        let rules: Vec<Rule> = inputs
+            .into_iter()
+            .map(|ri| ri.materialize(&lattice, &prefix_inference))
+            .collect::<Result<Vec<_>>>()?;
 
         let rank_table: BTreeMap<String, i64> = match &p.rank_table {
             Some(v) => serde_json::from_value(v.clone())
@@ -976,6 +1025,8 @@ impl Packets {
                 .threshold_lookup_key
                 .clone()
                 .unwrap_or_else(default_threshold_lookup_key),
+            classification_lattice: lattice,
+            prefix_inference,
             rules,
             source_ids: p.source_ids.clone().unwrap_or_default(),
             self_audit_fidelity: None,
@@ -1007,7 +1058,7 @@ impl Packets {
                     "mode": mode,
                     "match": true,
                     "rule_id": prediction.rule_id,
-                    "severity": prediction.severity,
+                    "classification": prediction.classification,
                     "consequent": prediction.consequent,
                     "confidence": prediction.confidence,
                 }))?),
@@ -1124,7 +1175,7 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("DENY".into()),
-                severity: Severity::Info,
+                classification: "info".to_string(),
                 emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
@@ -1148,7 +1199,7 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("DENY".into()),
-                severity: Severity::Info,
+                classification: "info".to_string(),
                 emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
@@ -1173,7 +1224,7 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("DENY".into()),
-                severity: Severity::Info,
+                classification: "info".to_string(),
                 emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
@@ -1197,7 +1248,7 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("DENY".into()),
-                severity: Severity::Info,
+                classification: "info".to_string(),
                 emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
@@ -1221,7 +1272,7 @@ mod tests {
                     ],
                 },
                 consequent: Value::String("ALLOW".into()),
-                severity: Severity::Info,
+                classification: "info".to_string(),
                 emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
@@ -1234,7 +1285,7 @@ mod tests {
                     value: Value::String("GET".into()),
                 },
                 consequent: Value::String("ALLOW".into()),
-                severity: Severity::Info,
+                classification: "info".to_string(),
                 emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
@@ -1247,7 +1298,7 @@ mod tests {
                     threshold_field: "res_threshold".into(),
                 },
                 consequent: Value::String("ALLOW".into()),
-                severity: Severity::Info,
+                classification: "info".to_string(),
                 emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
@@ -1257,7 +1308,7 @@ mod tests {
                 id: "default_deny".into(),
                 antecedent: Predicate::AlwaysTrue {},
                 consequent: Value::String("DENY".into()),
-                severity: Severity::Info,
+                classification: "info".to_string(),
                 emit: Emit::Independent,
                 confidence: 1.0,
                 provenance: vec![],
@@ -1273,6 +1324,8 @@ mod tests {
             threshold_table,
             rank_lookup_key: "role".into(),
             threshold_lookup_key: "resource".into(),
+            classification_lattice: default_lattice(),
+            prefix_inference: default_prefix_inference(),
             rules,
             source_ids: vec!["thread-0b20e854".into()],
             self_audit_fidelity: None,
@@ -1463,6 +1516,8 @@ mod tests {
                     "confidence": 1.0
                 }
             ]),
+            classification_lattice: None,
+            prefix_inference: None,
             rank_table: None,
             threshold_table: None,
             rank_lookup_key: None,
@@ -1586,6 +1641,8 @@ mod tests {
             threshold_table: BTreeMap::new(),
             rank_lookup_key: "role".into(),
             threshold_lookup_key: "resource".into(),
+            classification_lattice: default_lattice(),
+            prefix_inference: default_prefix_inference(),
             rules,
             source_ids: vec![],
             self_audit_fidelity: None,
@@ -1596,24 +1653,24 @@ mod tests {
         }
     }
 
-    fn rule(id: &str, antecedent: Predicate, consequent: &str, sev: Severity) -> Rule {
+    fn rule(id: &str, antecedent: Predicate, consequent: &str, class: &str) -> Rule {
         Rule {
             id: id.into(),
             antecedent,
             consequent: Value::String(consequent.into()),
-            severity: sev,
+            classification: class.into(),
             emit: Emit::Independent,
             confidence: 1.0,
             provenance: vec![],
         }
     }
 
-    fn fallback_rule(id: &str, antecedent: Predicate, consequent: &str, sev: Severity) -> Rule {
+    fn fallback_rule(id: &str, antecedent: Predicate, consequent: &str, class: &str) -> Rule {
         Rule {
             id: id.into(),
             antecedent,
             consequent: Value::String(consequent.into()),
-            severity: sev,
+            classification: class.into(),
             emit: Emit::Fallback,
             confidence: 1.0,
             provenance: vec![],
@@ -1621,15 +1678,15 @@ mod tests {
     }
 
     #[test]
-    fn is_present_discriminates_from_zero() {
+    fn applicability_gate_discriminates_from_zero() {
         // The decisive phase-2 bug: rule said `Lt(tool_docs, 3)` fires on
         // a "clean" entity where no docs were added AND no tools were
-        // added. IsPresent lets rules gate on applicability.
+        // added. The tri-state predicates let rules gate on applicability.
         let p = bare_packet(vec![rule(
             "fail_undocumented",
             Predicate::All {
                 args: vec![
-                    Predicate::IsPresent { field: "mcp_tools_added".into() },
+                    Predicate::IsNonNull { field: "mcp_tools_added".into() },
                     Predicate::Gt { field: "mcp_tools_added".into(), value: 0 },
                     Predicate::FieldLt {
                         lhs_field: "tool_docs_stanzas_added".into(),
@@ -1638,7 +1695,7 @@ mod tests {
                 ],
             },
             "FAIL",
-            Severity::Fail,
+            "fail",
         )]);
 
         // No tools added — rule must NOT fire even though
@@ -1665,30 +1722,8 @@ mod tests {
         assert!(apply(&p, &ok).is_none(), "fully documented must not fire");
     }
 
-    #[test]
-    fn is_absent_and_is_present_treat_null_as_absent() {
-        let present_rule = Predicate::IsPresent { field: "x".into() };
-        let absent_rule = Predicate::IsAbsent { field: "x".into() };
-
-        let p = bare_packet(vec![
-            rule("flag_present", present_rule, "HAS_X", Severity::Flag),
-        ]);
-
-        // Field missing: not present.
-        assert!(apply(&p, &json!({})).is_none());
-        // Field null: treated as absent (signal from data source).
-        assert!(apply(&p, &json!({"x": null})).is_none());
-        // Field with real value: present.
-        assert!(apply(&p, &json!({"x": 42})).is_some());
-        assert!(apply(&p, &json!({"x": "foo"})).is_some());
-        assert!(apply(&p, &json!({"x": false})).is_some()); // bool false is still present
-
-        // IsAbsent is the exact complement
-        let ap = bare_packet(vec![rule("flag_absent", absent_rule, "NO_X", Severity::Flag)]);
-        assert!(apply(&ap, &json!({})).is_some(), "missing field → absent → fire");
-        assert!(apply(&ap, &json!({"x": null})).is_some(), "null → absent → fire");
-        assert!(apply(&ap, &json!({"x": 1})).is_none(), "present → no fire");
-    }
+    // The old IsPresent/IsAbsent pair has been removed; tri-state
+    // applicability is tested by `tri_state_applicability_discriminates_null_vs_missing`.
 
     #[test]
     fn field_comparisons_work_across_all_ops() {
@@ -1713,7 +1748,7 @@ mod tests {
         ];
 
         for (pred, label, entity, expect_hit) in cases {
-            let p = bare_packet(vec![rule(label, pred.clone(), "HIT", Severity::Info)]);
+            let p = bare_packet(vec![rule(label, pred.clone(), "HIT", "info")]);
             let fired = apply(&p, entity).is_some();
             assert_eq!(fired, *expect_hit, "case `{label}` failed; pred={pred:?}, entity={entity}");
         }
@@ -1723,9 +1758,9 @@ mod tests {
     fn float_comparisons_work() {
         let p = bare_packet(vec![
             rule("fail_low_coverage", Predicate::LtF { field: "coverage_pct".into(), value: 80.0 },
-                 "FAIL: coverage below 80%", Severity::Fail),
+                 "FAIL: coverage below 80%", "fail"),
             rule("pass_high_coverage", Predicate::GeF { field: "coverage_pct".into(), value: 95.0 },
-                 "PASS: coverage above 95%", Severity::Pass),
+                 "PASS: coverage above 95%", "pass"),
         ]);
 
         let low = apply(&p, &json!({"coverage_pct": 73.5})).unwrap();
@@ -1739,54 +1774,31 @@ mod tests {
     }
 
     #[test]
-    fn severity_infers_from_id_prefix() {
-        assert_eq!(infer_severity_from_id("fail_warnings"), Severity::Fail);
-        assert_eq!(infer_severity_from_id("flag_readonly_fs"), Severity::Flag);
-        assert_eq!(infer_severity_from_id("manual_review_security"), Severity::Manual);
-        assert_eq!(infer_severity_from_id("review_contract"), Severity::Manual);
-        assert_eq!(infer_severity_from_id("pass_all_clean"), Severity::Pass);
-        assert_eq!(infer_severity_from_id("miscellaneous"), Severity::Info);
+    fn classification_infers_from_id_prefix() {
+        let map = default_prefix_inference();
+        assert_eq!(infer_classification("fail_warnings", &map).as_deref(), Some("fail"));
+        assert_eq!(infer_classification("flag_readonly_fs", &map).as_deref(), Some("flag"));
+        assert_eq!(infer_classification("manual_review_security", &map).as_deref(), Some("manual"));
+        assert_eq!(infer_classification("review_contract", &map).as_deref(), Some("manual"));
+        assert_eq!(infer_classification("pass_all_clean", &map).as_deref(), Some("pass"));
+        assert_eq!(infer_classification("miscellaneous", &map).as_deref(), None);
     }
 
     #[test]
-    fn severity_serde_lowercase() {
-        // Round-trip through JSON.
-        let s = Severity::Fail;
-        let json = serde_json::to_value(&s).unwrap();
-        assert_eq!(json, json!("fail"));
-        let back: Severity = serde_json::from_value(json).unwrap();
-        assert_eq!(back, s);
-    }
-
-    #[test]
-    fn rule_deserializes_without_severity_for_backcompat() {
-        // Old packets on disk lack the severity field. They must still
-        // deserialize with severity=Info default. Old packet-890e057d
-        // from thread-0b20e854 was produced before severity existed.
-        let old_json = json!({
-            "id": "fail_warnings",
-            "antecedent": {"op": "Gt", "field": "new_warnings", "value": 0},
-            "consequent": "FAIL",
-            "confidence": 1.0
-        });
-        let r: Rule = serde_json::from_value(old_json).unwrap();
-        assert_eq!(r.severity, Severity::Info); // default
-        assert_eq!(r.id, "fail_warnings");
-    }
-
-    #[test]
-    fn compile_infers_severity_from_id() {
+    fn compile_infers_classification_from_id_prefix() {
         let (_dir, store) = tmp_packets();
         let params = CompileParams {
-            domain: "severity-test".into(),
+            domain: "classification-infer".into(),
             rules: json!([
                 {"id": "fail_a", "antecedent": {"op": "True"}, "consequent": "FAIL"},
                 {"id": "flag_b", "antecedent": {"op": "True"}, "consequent": "FLAG"},
                 {"id": "manual_c", "antecedent": {"op": "True"}, "consequent": "MANUAL"},
                 {"id": "pass_d", "antecedent": {"op": "True"}, "consequent": "PASS"},
-                // Explicit severity survives — even though id prefix would say Info
-                {"id": "misc_e", "severity": "fail", "antecedent": {"op": "True"}, "consequent": "EXPLICIT"},
+                // Explicit classification survives — even though id prefix would say Fail
+                {"id": "fail_e", "classification": "info", "antecedent": {"op": "True"}, "consequent": "EXPLICIT"},
             ]),
+            classification_lattice: None,
+            prefix_inference: None,
             rank_table: None,
             threshold_table: None,
             rank_lookup_key: None,
@@ -1799,17 +1811,123 @@ mod tests {
 
         let all = store.list_all().unwrap();
         let packet = &all[0];
-        let severities: Vec<Severity> = packet.rules.iter().map(|r| r.severity).collect();
+        let classes: Vec<&str> = packet.rules.iter().map(|r| r.classification.as_str()).collect();
         assert_eq!(
-            severities,
+            classes,
             vec![
-                Severity::Fail,   // inferred from fail_
-                Severity::Flag,   // inferred from flag_
-                Severity::Manual, // inferred from manual_
-                Severity::Pass,   // inferred from pass_
-                Severity::Fail,   // explicit "fail" beats id-prefix inference
+                "fail",   // inferred from fail_
+                "flag",   // inferred from flag_
+                "manual", // inferred from manual_
+                "pass",   // inferred from pass_
+                "info",   // explicit "info" preserved even though fail_ prefix would infer "fail"
             ]
         );
+    }
+
+    #[test]
+    fn compile_rejects_classification_not_in_lattice() {
+        let (_dir, store) = tmp_packets();
+        let params = CompileParams {
+            domain: "bad-class".into(),
+            rules: json!([
+                {"id": "r1", "classification": "blocker", "antecedent": {"op": "True"}, "consequent": "X"},
+            ]),
+            classification_lattice: Some(vec!["fail".into(), "pass".into()]),
+            prefix_inference: None,
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        let err = store.compile(&params).unwrap_err().to_string();
+        assert!(err.contains("not in packet lattice"), "got: {err}");
+    }
+
+    #[test]
+    fn prefix_inference_uses_longest_match() {
+        // Overlapping prefixes — longer one wins (not BTreeMap iteration order).
+        let mut map = BTreeMap::new();
+        map.insert("fail_".into(), "fail".into());
+        map.insert("fail_critical_".into(), "blocker".into());
+        map.insert("flag_".into(), "flag".into());
+
+        assert_eq!(
+            infer_classification("fail_critical_foo", &map).as_deref(),
+            Some("blocker"),
+            "longer prefix `fail_critical_` beats shorter `fail_`"
+        );
+        assert_eq!(
+            infer_classification("fail_normal", &map).as_deref(),
+            Some("fail"),
+            "only `fail_` matches — picks that"
+        );
+        assert_eq!(
+            infer_classification("flag_readonly", &map).as_deref(),
+            Some("flag"),
+            "different prefix — picks the matching one"
+        );
+        assert_eq!(
+            infer_classification("unknown_rule", &map).as_deref(),
+            None,
+            "no prefix match returns None"
+        );
+    }
+
+    #[test]
+    fn verdict_is_highest_priority_not_firing_order() {
+        // Lattice: fail > flag > pass. Findings fire in order [flag, pass, fail].
+        // Verdict should be "fail" (highest priority), not "flag" (first fired).
+        let p = bare_packet(vec![
+            rule("flag_first", Predicate::AlwaysTrue {}, "FLAG", "flag"),
+            rule("pass_second", Predicate::AlwaysTrue {}, "PASS", "pass"),
+            rule("fail_third", Predicate::AlwaysTrue {}, "FAIL", "fail"),
+        ]);
+        let result = apply_all(&p, &json!({}));
+        assert_eq!(result.findings.len(), 3);
+        assert_eq!(
+            result.verdict,
+            Some("fail".to_string()),
+            "verdict = highest-priority classification, not firing order"
+        );
+    }
+
+    #[test]
+    fn compile_auth_domain_lattice() {
+        // Auth domain: deny wins; anomalies denoted deny_* or anom_*.
+        let (_dir, store) = tmp_packets();
+        let mut prefix = BTreeMap::new();
+        prefix.insert("deny_".into(), "deny".into());
+        prefix.insert("allow_".into(), "allow".into());
+        prefix.insert("anom_".into(), "deny".into());
+
+        let params = CompileParams {
+            domain: "auth".into(),
+            rules: json!([
+                {"id": "anom_sensitive_resource", "antecedent": {"op": "Eq", "field": "sensitive", "value": true}, "consequent": "DENY"},
+                {"id": "allow_admin", "antecedent": {"op": "Eq", "field": "role", "value": "admin"}, "consequent": "ALLOW"},
+            ]),
+            classification_lattice: Some(vec!["deny".into(), "allow".into()]),
+            prefix_inference: Some(prefix),
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        store.compile(&params).unwrap();
+
+        let packet = &store.list_all().unwrap()[0];
+        let classes: Vec<&str> = packet.rules.iter().map(|r| r.classification.as_str()).collect();
+        assert_eq!(classes, vec!["deny", "allow"], "auth prefixes inferred correctly");
+
+        // Apply in mode=all with a sensitive resource — deny wins.
+        let result = apply_all(packet, &json!({"sensitive": true, "role": "admin"}));
+        assert_eq!(result.verdict, Some("deny".to_string()), "DENY precedes ALLOW in auth lattice");
     }
 
     #[test]
@@ -1818,17 +1936,17 @@ mod tests {
         // returns all findings, computes aggregate verdict. This is what
         // the bros called for in thread-0b20e854.
         let p = bare_packet(vec![
-            rule("fail_a", Predicate::AlwaysTrue {}, "FAIL: always", Severity::Fail),
-            rule("flag_b", Predicate::AlwaysTrue {}, "FLAG: always", Severity::Flag),
+            rule("fail_a", Predicate::AlwaysTrue {}, "FAIL: always", "fail"),
+            rule("flag_b", Predicate::AlwaysTrue {}, "FLAG: always", "flag"),
             rule("flag_c", Predicate::Eq { field: "x".into(), value: Value::Int(1) },
-                 "FLAG: on x=1", Severity::Flag),
-            rule("pass_d", Predicate::AlwaysFalse {}, "PASS: never", Severity::Pass),
+                 "FLAG: on x=1", "flag"),
+            rule("pass_d", Predicate::AlwaysFalse {}, "PASS: never", "pass"),
         ]);
 
         let result = apply_all(&p, &json!({"x": 1}));
         let fired: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
         assert_eq!(fired, vec!["fail_a", "flag_b", "flag_c"], "every matching rule should appear");
-        assert_eq!(result.verdict, Some(Severity::Fail), "verdict = highest severity that fired");
+        assert_eq!(result.verdict, Some("fail".to_string()), "verdict = highest severity that fired");
 
         // Entity where only the false rule fires → no findings, no verdict
         let empty = apply_all(&p, &json!({"x": 99}));
@@ -1840,22 +1958,22 @@ mod tests {
     fn apply_all_verdict_follows_severity_precedence() {
         // Fail > Flag > Manual > Pass > Info
         let fail_p = bare_packet(vec![
-            rule("pass_x", Predicate::AlwaysTrue {}, "PASS", Severity::Pass),
-            rule("manual_y", Predicate::AlwaysTrue {}, "MANUAL", Severity::Manual),
-            rule("flag_z", Predicate::AlwaysTrue {}, "FLAG", Severity::Flag),
+            rule("pass_x", Predicate::AlwaysTrue {}, "PASS", "pass"),
+            rule("manual_y", Predicate::AlwaysTrue {}, "MANUAL", "manual"),
+            rule("flag_z", Predicate::AlwaysTrue {}, "FLAG", "flag"),
         ]);
-        assert_eq!(apply_all(&fail_p, &json!({})).verdict, Some(Severity::Flag));
+        assert_eq!(apply_all(&fail_p, &json!({})).verdict, Some("flag".to_string()));
 
         let with_fail = bare_packet(vec![
-            rule("pass_x", Predicate::AlwaysTrue {}, "PASS", Severity::Pass),
-            rule("fail_y", Predicate::AlwaysTrue {}, "FAIL", Severity::Fail),
-            rule("info_z", Predicate::AlwaysTrue {}, "INFO", Severity::Info),
+            rule("pass_x", Predicate::AlwaysTrue {}, "PASS", "pass"),
+            rule("fail_y", Predicate::AlwaysTrue {}, "FAIL", "fail"),
+            rule("info_z", Predicate::AlwaysTrue {}, "INFO", "info"),
         ]);
-        assert_eq!(apply_all(&with_fail, &json!({})).verdict, Some(Severity::Fail));
+        assert_eq!(apply_all(&with_fail, &json!({})).verdict, Some("fail".to_string()));
 
         // Nothing fires
         let nothing = bare_packet(vec![
-            rule("fail_never", Predicate::AlwaysFalse {}, "NOPE", Severity::Fail),
+            rule("fail_never", Predicate::AlwaysFalse {}, "NOPE", "fail"),
         ]);
         assert_eq!(apply_all(&nothing, &json!({})).verdict, None);
     }
@@ -1870,6 +1988,8 @@ mod tests {
                 {"id": "flag_b", "antecedent": {"op": "True"}, "consequent": "FLAG_B"},
                 {"id": "pass_c", "antecedent": {"op": "True"}, "consequent": "PASS"},
             ]),
+            classification_lattice: None,
+            prefix_inference: None,
             rank_table: None,
             threshold_table: None,
             rank_lookup_key: None,
@@ -1924,10 +2044,10 @@ mod tests {
         let nulled = json!({"x": serde_json::Value::Null}); // key present, value null
         let real = json!({"x": 42});                  // key present, real value
 
-        let key_exists = bare_packet(vec![rule("flag_ke", Predicate::KeyExists { field: "x".into() }, "KE", Severity::Flag)]);
-        let is_null = bare_packet(vec![rule("flag_null", Predicate::IsNull { field: "x".into() }, "NULL", Severity::Flag)]);
-        let is_non_null = bare_packet(vec![rule("flag_nn", Predicate::IsNonNull { field: "x".into() }, "NN", Severity::Flag)]);
-        let is_missing = bare_packet(vec![rule("flag_miss", Predicate::IsMissing { field: "x".into() }, "M", Severity::Flag)]);
+        let key_exists = bare_packet(vec![rule("flag_ke", Predicate::KeyExists { field: "x".into() }, "KE", "flag")]);
+        let is_null = bare_packet(vec![rule("flag_null", Predicate::IsNull { field: "x".into() }, "NULL", "flag")]);
+        let is_non_null = bare_packet(vec![rule("flag_nn", Predicate::IsNonNull { field: "x".into() }, "NN", "flag")]);
+        let is_missing = bare_packet(vec![rule("flag_miss", Predicate::IsMissing { field: "x".into() }, "M", "flag")]);
 
         // KeyExists: fires when key exists regardless of value
         assert!(apply(&key_exists, &missing).is_none());
@@ -1951,18 +2071,22 @@ mod tests {
     }
 
     #[test]
-    fn severity_info_explicitly_preserved_over_prefix_inference() {
+    fn classification_info_explicitly_preserved_over_prefix_inference() {
         // The phase-2 bug Codex caught: compile loop upgraded every Info
-        // from the id prefix, so explicit `severity: "info"` was erased.
+        // from the id prefix, so explicit `classification: "info"` was erased.
+        // Post-phase-3: the field is `classification`, and explicit values
+        // still beat id-prefix inference.
         let (_dir, store) = tmp_packets();
         let params = CompileParams {
-            domain: "severity-preserve".into(),
+            domain: "classification-preserve".into(),
             rules: json!([
                 // Prefix says FAIL, but caller EXPLICITLY says Info — must preserve.
-                {"id": "fail_x", "severity": "info", "antecedent": {"op": "True"}, "consequent": "X"},
-                // No severity declared — infer from prefix.
+                {"id": "fail_x", "classification": "info", "antecedent": {"op": "True"}, "consequent": "X"},
+                // No classification declared — infer from prefix.
                 {"id": "fail_y", "antecedent": {"op": "True"}, "consequent": "Y"},
             ]),
+            classification_lattice: None,
+            prefix_inference: None,
             rank_table: None,
             threshold_table: None,
             rank_lookup_key: None,
@@ -1973,8 +2097,8 @@ mod tests {
         };
         store.compile(&params).unwrap();
         let packet = &store.list_all().unwrap()[0];
-        assert_eq!(packet.rules[0].severity, Severity::Info, "explicit info must survive prefix inference");
-        assert_eq!(packet.rules[1].severity, Severity::Fail, "no severity declared → infer from prefix");
+        assert_eq!(packet.rules[0].classification, "info", "explicit info must survive prefix inference");
+        assert_eq!(packet.rules[1].classification, "fail", "no classification declared → infer from prefix");
     }
 
     #[test]
@@ -1983,21 +2107,21 @@ mod tests {
         // This is how pass_all_clean ought to behave: disappear when real
         // findings exist, present when nothing else has anything to say.
         let p = bare_packet(vec![
-            rule("flag_x", Predicate::Eq { field: "trigger".into(), value: Value::Bool(true) }, "FLAG", Severity::Flag),
-            fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", Severity::Pass),
+            rule("flag_x", Predicate::Eq { field: "trigger".into(), value: Value::Bool(true) }, "FLAG", "flag"),
+            fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", "pass"),
         ]);
 
         // Trigger fires — fallback is suppressed
         let result = apply_all(&p, &json!({"trigger": true}));
         let fired: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
         assert_eq!(fired, vec!["flag_x"], "fallback must be suppressed when Independent fires");
-        assert_eq!(result.verdict, Some(Severity::Flag));
+        assert_eq!(result.verdict, Some("flag".to_string()));
 
         // No trigger — fallback fires
         let result = apply_all(&p, &json!({"trigger": false}));
         let fired: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
         assert_eq!(fired, vec!["pass_catchall"], "fallback fires when no Independent matched");
-        assert_eq!(result.verdict, Some(Severity::Pass));
+        assert_eq!(result.verdict, Some("pass".to_string()));
     }
 
     #[test]
@@ -2005,8 +2129,8 @@ mod tests {
         // In apply (mode="first"), emit is irrelevant — first-match-wins
         // applies regardless. Fallback rules can still fire.
         let p = bare_packet(vec![
-            rule("flag_x", Predicate::Eq { field: "a".into(), value: Value::Int(1) }, "FLAG_X", Severity::Flag),
-            fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", Severity::Pass),
+            rule("flag_x", Predicate::Eq { field: "a".into(), value: Value::Int(1) }, "FLAG_X", "flag"),
+            fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", "pass"),
         ]);
 
         // When flag_x matches, first-match-wins picks it
@@ -2036,7 +2160,7 @@ mod tests {
             "consequent": "X",
         });
         let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
-        let r = ri.materialize();
+        let r = ri.materialize(&default_lattice(), &default_prefix_inference()).unwrap();
         assert_eq!(r.emit, Emit::Independent);
     }
 
@@ -2049,22 +2173,7 @@ mod tests {
             "emit": "fallback",
         });
         let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
-        let r = ri.materialize();
+        let r = ri.materialize(&default_lattice(), &default_prefix_inference()).unwrap();
         assert_eq!(r.emit, Emit::Fallback);
-    }
-
-    #[test]
-    fn old_packets_without_emit_default_independent() {
-        // Backward compat: packets compiled before 2.5 lack `emit` on rules.
-        // They must deserialize with Emit::Independent default.
-        let old_rule = json!({
-            "id": "fail_x",
-            "antecedent": {"op": "True"},
-            "consequent": "X",
-            "severity": "fail",
-            "confidence": 1.0
-        });
-        let r: Rule = serde_json::from_value(old_rule).unwrap();
-        assert_eq!(r.emit, Emit::Independent);
     }
 }
