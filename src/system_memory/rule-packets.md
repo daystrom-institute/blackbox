@@ -15,7 +15,10 @@ You have a body of structured observations — an authorization matrix, retry ta
 ## The compile → audit → apply loop
 
 1. **`bbox_compile(domain, rules, classification_lattice?, prefix_inference?, rank_table?, threshold_table?)`** — store the theory. Rules are ordered; first-match-wins in `mode="first"`. Put anomalies before general rules. Supply a domain-specific lattice and prefix inference map, or omit them to default to the review lattice.
-2. **`bbox_audit(packet_id, dataset)`** — apply the packet to every `{entity, expected}` pair; return fidelity + mismatches. **Run this before trusting predictions.**
+2. **`bbox_audit(packet_id, dataset, mode?)`** — validate the packet against expected outputs.
+   - `mode="first"` (default): dataset is `[{entity, expected}]` — compares single-rule consequent.
+   - `mode="all"`: dataset is `[{entity, expected_verdict?, expected_rule_ids?}]` — compares aggregate verdict + fired-rule-id set (order-invariant). Use this for review/design packets where multi-finding shape matters.
+   **Run this before trusting predictions.**
 3. **`bbox_apply(packet_id, entity, mode?)`** — evaluate an entity. `mode="first"` (default) returns the first matching rule. `mode="all"` evaluates every rule independently and returns all findings plus an aggregate verdict.
 
 ## Predicate AST (domain-neutral)
@@ -43,6 +46,17 @@ You have a body of structured observations — an authorization matrix, retry ta
 **Logical composition:**
 - `All{args: [...]}` / `Any{args: [...]}` / `Not{arg: ...}`
 - `True` / `False` — constants
+
+**Quantified collection predicates (phase 4):**
+- `ForAll{path, pred}` — every element at `path` satisfies `pred`. Empty/missing collection is vacuously true.
+- `Exists{path, pred}` — some element satisfies. Empty/missing is false (no witness).
+- `CountCmp{path, compare, value}` — length of collection at `path` compared with `value`. `compare` is one of `lt/le/eq/ge/gt`. Missing path → count 0.
+
+Path syntax in v1: single field with `[*]` suffix, e.g. `"tools[*]"`. Dotted paths like `"config.rules[*]"` are phase-next; flatten the entity if you need them.
+
+Inside the inner predicate, the sub-entity IS the array element. Object elements are addressable directly by their fields (`IsNonNull{field: "description"}`). Primitive elements (strings, ints, bools) get wrapped as `{"$": value}` — address via the special field `"$"`.
+
+No nested `ForAll` inside `ForAll` in v1.
 
 ## Classification lattice (the domain layer)
 
@@ -101,8 +115,10 @@ Packets are for *structured domains that admit generators*.
 
 ## Phase-next gaps
 
-- `bbox_merge` via behavioral equivalence
-- `bbox_packets` list/filter
-- Quantified collection predicates (`ForAll`, `Exists`, `CountCmp`)
-- Multi-finding `bbox_audit` (accept `expected_verdict + expected_rule_ids`)
+- `bbox_merge` via behavioral equivalence — merge two packets by clustering rules that fire identically on a witness set
+- `bbox_packets` list/filter — discovery tool
+- Dotted paths in quantified predicates (`config.rules[*]`)
+- Nested `ForAll` — currently rejected in v1 to keep evaluator complexity bounded
+- `where` filter on `CountCmp` — "count items matching X"
 - Rule dependency DAG beyond Independent/Fallback
+- Packet-level automation — `bbox_extract_packet(witness_set, domain)` that dispatches an LLM to author rules from examples

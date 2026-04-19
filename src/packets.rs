@@ -115,10 +115,22 @@ pub struct ApplyParams {
 pub struct AuditParams {
     #[schemars(regex(pattern = r"^(packet-)?[0-9a-f]{8}$"))]
     pub packet_id: String,
-    /// JSON array of `{entity, expected}` pairs. Evaluator compares each
-    /// entity's predicted consequent to `expected`. Report lists mismatches
-    /// and returns a fidelity ratio.
+    /// Dataset shape depends on `mode`:
+    /// - `mode="first"` (default): JSON array of `{entity, expected}` pairs
+    ///   where `expected` is the Value the packet's first matching rule
+    ///   should emit. Matches the original audit shape.
+    /// - `mode="all"`: JSON array of
+    ///   `{entity, expected_verdict?: string, expected_rule_ids?: [string]}`
+    ///   pairs. `expected_verdict` matches `ApplyAllResult.verdict`;
+    ///   `expected_rule_ids` is compared as a SET (order-invariant) against
+    ///   the rule IDs that fired. Either can be omitted if you only care
+    ///   about one check; a row with both omitted trivially passes.
     pub dataset: serde_json::Value,
+    /// `"first"` (default) compares single-rule consequent; `"all"`
+    /// compares aggregate verdict + fired-rule-id set. Use `"all"` to
+    /// validate review/design packets that rely on multi-finding shape.
+    #[serde(default)]
+    pub mode: Option<ApplyMode>,
 }
 
 // ── Value (consequent + entity field type) ───────────────────────
@@ -166,6 +178,32 @@ impl Value {
             }
             serde_json::Value::String(s) => Some(Value::String(s.clone())),
             _ => None,
+        }
+    }
+}
+
+// ── Comparison op (used by CountCmp) ─────────────────────────────
+
+/// Comparison operator for `CountCmp`. Named `compare` (not `op`) in
+/// serde to avoid colliding with the Predicate enum's `op` tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CmpOp {
+    Lt,
+    Le,
+    Eq,
+    Ge,
+    Gt,
+}
+
+impl CmpOp {
+    fn apply(self, lhs: usize, rhs: usize) -> bool {
+        match self {
+            CmpOp::Lt => lhs < rhs,
+            CmpOp::Le => lhs <= rhs,
+            CmpOp::Eq => lhs == rhs,
+            CmpOp::Ge => lhs >= rhs,
+            CmpOp::Gt => lhs > rhs,
         }
     }
 }
@@ -246,6 +284,43 @@ pub enum Predicate {
     All { args: Vec<Predicate> },
     Any { args: Vec<Predicate> },
     Not { arg: Box<Predicate> },
+    /// **Quantified universal.** Path resolves to an array in the
+    /// entity; inner predicate must hold for EVERY element. Missing or
+    /// empty collection → `true` (vacuous truth). Non-array path →
+    /// `false` (can't quantify over a scalar).
+    ///
+    /// Path syntax: simple dotted field lookup with a trailing `[*]`:
+    /// `"tools[*]"`, `"config.rules[*]"`. Inside `pred`, the sub-entity
+    /// IS the array element. If the element is a JSON object, its
+    /// fields are directly addressable. If it's a primitive (string,
+    /// int, bool), the predicate sees `{"$": element}` — address via
+    /// the special field name `"$"`.
+    ///
+    /// No nested `ForAll` inside another `ForAll` in v1 — validated at
+    /// `bbox_compile` (see `validate_predicate` below). The restriction
+    /// keeps evaluator complexity bounded; revisit when a real use
+    /// case demands nesting.
+    ForAll {
+        path: String,
+        pred: Box<Predicate>,
+    },
+    /// **Quantified existential.** Path → array; inner predicate must
+    /// hold for SOME element. Missing or empty collection → `false`.
+    /// Same sub-entity shape as `ForAll`.
+    Exists {
+        path: String,
+        pred: Box<Predicate>,
+    },
+    /// **Cardinality.** Compares the length of the array at `path`
+    /// against `value` using `compare`. Missing path → length 0.
+    /// Non-array path → length 0 (treat as "no collection present").
+    /// No `where` filter in v1; if you need "count of items matching X",
+    /// combine `Exists` with multiple rules or compose in the caller.
+    CountCmp {
+        path: String,
+        compare: CmpOp,
+        value: usize,
+    },
     #[serde(rename = "True")]
     AlwaysTrue {},
     #[serde(rename = "False")]
@@ -259,26 +334,36 @@ pub enum Predicate {
 /// lattice and precedence direction, so the AST is domain-neutral
 /// while the Rule/Packet layer carries the domain semantics.
 ///
-/// Review domain (default): `["fail", "flag", "manual", "pass", "info"]`.
+/// Review domain: `["fail", "flag", "manual", "pass", "info"]`.
 /// Auth domain: `["deny", "allow"]` — DENY wins.
 /// Retry domain: `["dlq", "fail_fast", "backoff", "retry", "noop"]`.
 /// Design-iteration: `["blocker", "concern", "suggestion", "advantage", "neutral"]`.
 ///
 /// Lattice order is *highest priority first*. The aggregate verdict in
 /// `apply(mode="all")` is the first-declared classification that any
-/// rule fired — which is what both adversarial-review bros asked for.
-pub fn default_lattice() -> Vec<String> {
+/// rule fired.
+///
+/// The review lattice is the `unwrap_or_else` fallback in `bbox_compile`
+/// when the caller omits `classification_lattice`. This is an opinion
+/// not a truth: review happens to be the most common domain today.
+/// Non-review callers should pass their own lattice explicitly — see
+/// `sm-auth-packets`, `sm-design-packets` for canonical examples.
+/// Named `review_lattice` (not the generic-sounding `default_lattice`
+/// it was before phase 4) so the review privilege is visible at every
+/// callsite rather than hidden behind the word "default."
+pub fn review_lattice() -> Vec<String> {
     ["fail", "flag", "manual", "pass", "info"]
         .iter()
         .map(|s| s.to_string())
         .collect()
 }
 
-/// Default id-prefix → classification map for the review domain.
-/// Domains with different lattices supply their own map at `bbox_compile`
-/// time; unspecified prefixes fall through and rules must declare
-/// classification explicitly.
-pub fn default_prefix_inference() -> BTreeMap<String, String> {
+/// Review-domain id-prefix → classification map. Paired with
+/// `review_lattice` as the fallback when `bbox_compile` is called
+/// without explicit `prefix_inference`. Non-review callers should
+/// supply their own map — see the auth/retry/design runbooks for
+/// domain-appropriate prefix conventions.
+pub fn review_prefix_inference() -> BTreeMap<String, String> {
     let pairs: &[(&str, &str)] = &[
         ("fail_", "fail"),
         ("fail-", "fail"),
@@ -390,8 +475,82 @@ struct RuleInput {
     provenance: Vec<String>,
 }
 
+/// Validate a quantified-predicate path: must be `<field>[*]` with a
+/// single segment before `[*]`. Dotted paths and missing `[*]` are
+/// authoring errors — reject at compile so they don't silently succeed
+/// at runtime (which was the phase-4 bro critique convergent finding).
+fn validate_path(path: &str, context: &str) -> Result<()> {
+    let inner = path.strip_suffix("[*]").ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: path '{}' must end in '[*]' (phase-4 v1 path syntax)",
+            context,
+            path
+        )
+    })?;
+    if inner.is_empty() {
+        anyhow::bail!("{}: path '{}' has empty field name before '[*]'", context, path);
+    }
+    if inner.contains('.') {
+        anyhow::bail!(
+            "{}: dotted path '{}' not supported in v1 — flatten the entity or wait for phase-next",
+            context,
+            path
+        );
+    }
+    if inner.contains('[') || inner.contains(']') {
+        anyhow::bail!(
+            "{}: path '{}' has stray brackets — use exactly one '[*]' at the end",
+            context,
+            path
+        );
+    }
+    Ok(())
+}
+
+/// Walk a predicate tree and reject authoring errors:
+/// - Invalid quantified-predicate paths (see `validate_path`)
+/// - Nested `ForAll` inside another `ForAll` (deliberately banned in v1)
+///
+/// Called during `compile` so packets can't be saved with malformed
+/// predicates. Runtime evaluation then trusts the tree.
+fn validate_predicate(pred: &Predicate, inside_forall: bool) -> Result<()> {
+    match pred {
+        Predicate::ForAll { path, pred: inner } => {
+            validate_path(path, "ForAll")?;
+            if inside_forall {
+                anyhow::bail!(
+                    "ForAll nested inside ForAll at path '{}' — not supported in v1. \
+                     Flatten the structure or wait for phase-next.",
+                    path
+                );
+            }
+            validate_predicate(inner, true)
+        }
+        Predicate::Exists { path, pred: inner } => {
+            validate_path(path, "Exists")?;
+            validate_predicate(inner, inside_forall)
+        }
+        Predicate::CountCmp { path, .. } => validate_path(path, "CountCmp"),
+        Predicate::All { args } | Predicate::Any { args } => {
+            for arg in args {
+                validate_predicate(arg, inside_forall)?;
+            }
+            Ok(())
+        }
+        Predicate::Not { arg } => validate_predicate(arg, inside_forall),
+        _ => Ok(()),
+    }
+}
+
 impl RuleInput {
     fn materialize(self, lattice: &[String], prefix_map: &BTreeMap<String, String>) -> Result<Rule> {
+        // Validate the predicate tree at compile time: reject malformed
+        // quantified paths and nested-ForAll. This is the phase-4 bros'
+        // convergent critique — silent failure on authoring errors was
+        // the blocking issue.
+        validate_predicate(&self.antecedent, false)
+            .with_context(|| format!("in rule '{}'", self.id))?;
+
         // 1. Explicit classification wins; 2. infer from id prefix;
         // 3. fall back to the lowest-priority classification in the lattice.
         let classification = self
@@ -458,12 +617,12 @@ pub struct Packet {
     /// `classification` must be in this list. In `apply(mode="all")`,
     /// the aggregate verdict is the first-listed class any rule fired.
     /// Defaults to the review lattice when omitted.
-    #[serde(default = "default_lattice")]
+    #[serde(default = "review_lattice")]
     pub classification_lattice: Vec<String>,
     /// Id-prefix → classification map for inference when a rule omits
     /// classification. Defaults to the review prefixes (`fail_*` → fail,
     /// `flag_*` → flag, `manual_*`/`review_*` → manual, `pass_*` → pass).
-    #[serde(default = "default_prefix_inference")]
+    #[serde(default = "review_prefix_inference")]
     pub prefix_inference: BTreeMap<String, String>,
 
     /// Ordered rules — first matching antecedent wins.
@@ -543,6 +702,34 @@ pub struct Mismatch {
     pub rule_id: Option<String>,
 }
 
+/// Fidelity report for `audit_mode="all"`. Compares aggregate verdict
+/// and the set of fired rule IDs independently; a row can fail on
+/// either dimension, and the report tags which one so fixes are
+/// targeted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllModeFidelityReport {
+    pub total: usize,
+    pub correct: usize,
+    pub fidelity: f32,
+    pub mismatches: Vec<AllModeMismatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllModeMismatch {
+    pub entity: serde_json::Value,
+    /// `"verdict"` when aggregate verdict diverged; `"rule_ids"` when
+    /// fired-rule-id set diverged; `"both"` when both diverged.
+    pub check: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_rule_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_rule_ids: Option<Vec<String>>,
+}
+
 // ── Evaluator (deterministic, no LLM) ────────────────────────────
 
 /// Augment `entity` with fields derived from `packet.rank_table` /
@@ -610,6 +797,42 @@ fn entity_key_exists(entity: &serde_json::Map<String, serde_json::Value>, field:
 
 fn entity_is_null(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
     matches!(entity.get(field), Some(serde_json::Value::Null))
+}
+
+/// Resolve a path like `"tools[*]"` to the backing array in the entity.
+/// Returns `None` if the path doesn't end in `[*]`, the field is
+/// missing, or the value isn't an array.
+///
+/// Phase-4 path syntax (deliberately limited): a single field name
+/// followed by `[*]`. Dotted paths (`"config.rules[*]"`) are phase-
+/// next; if you need them, flatten the entity before applying.
+fn resolve_collection<'a>(
+    entity: &'a serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Option<&'a [serde_json::Value]> {
+    let field = path.strip_suffix("[*]")?;
+    if field.contains('.') {
+        // Dotted paths rejected in v1 — reserved for phase-next.
+        return None;
+    }
+    entity.get(field)?.as_array().map(|v| v.as_slice())
+}
+
+/// Wrap a JSON value as a sub-entity map suitable for `eval_predicate`.
+/// Objects pass through unchanged. Primitives become `{"$": value}` so
+/// predicates inside `ForAll`/`Exists` can address them via the
+/// special `"$"` field.
+fn as_sub_entity(
+    item: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    match item {
+        serde_json::Value::Object(obj) => obj.clone(),
+        other => {
+            let mut m = serde_json::Map::new();
+            m.insert("$".to_string(), other.clone());
+            m
+        }
+    }
 }
 
 /// Evaluate a predicate against a resolved entity. Pure function — no
@@ -696,6 +919,31 @@ fn eval_predicate(
         Predicate::All { args } => args.iter().all(|arg| eval_predicate(arg, entity)),
         Predicate::Any { args } => args.iter().any(|arg| eval_predicate(arg, entity)),
         Predicate::Not { arg } => !eval_predicate(arg, entity),
+        Predicate::ForAll { path, pred } => match resolve_collection(entity, path) {
+            // Vacuous truth: empty or missing collection → true. Matches
+            // the standard ∀x∈∅: P(x) convention.
+            None => true,
+            Some(items) => items.iter().all(|item| {
+                let sub = as_sub_entity(item);
+                eval_predicate(pred, &sub)
+            }),
+        },
+        Predicate::Exists { path, pred } => match resolve_collection(entity, path) {
+            // Empty set has no witness → ∃x∈∅: P(x) is false.
+            None => false,
+            Some(items) => items.iter().any(|item| {
+                let sub = as_sub_entity(item);
+                eval_predicate(pred, &sub)
+            }),
+        },
+        Predicate::CountCmp {
+            path,
+            compare,
+            value,
+        } => {
+            let n = resolve_collection(entity, path).map(|a| a.len()).unwrap_or(0);
+            compare.apply(n, *value)
+        }
     }
 }
 
@@ -795,6 +1043,97 @@ pub fn apply_all(packet: &Packet, entity: &serde_json::Value) -> ApplyAllResult 
         findings,
         verdict,
     }
+}
+
+/// Apply packet in `mode="all"` to every row of `dataset`. Row shape:
+/// `{entity, expected_verdict?, expected_rule_ids?}`. Compares aggregate
+/// verdict + fired-rule-id set independently; mismatches tag which
+/// check failed so fixes are targeted.
+pub fn verify_all(
+    packet: &Packet,
+    dataset: &serde_json::Value,
+) -> Result<AllModeFidelityReport> {
+    let rows = dataset.as_array().context(
+        "dataset must be a JSON array of {entity, expected_verdict?, expected_rule_ids?} objects",
+    )?;
+
+    let mut total = 0usize;
+    let mut correct = 0usize;
+    let mut mismatches = Vec::new();
+
+    for row in rows {
+        let entity = row.get("entity").cloned().unwrap_or(serde_json::Value::Null);
+        let expected_verdict: Option<String> = row
+            .get("expected_verdict")
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let expected_rule_ids: Option<Vec<String>> = row
+            .get("expected_rule_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
+
+        // Row with no expectation at all trivially passes but doesn't
+        // count toward fidelity — skip.
+        if expected_verdict.is_none() && expected_rule_ids.is_none() {
+            continue;
+        }
+
+        total += 1;
+        let result = apply_all(packet, &entity);
+        let actual_verdict = result.verdict.clone();
+        let mut actual_rule_ids: Vec<String> =
+            result.findings.iter().map(|p| p.rule_id.clone()).collect();
+        actual_rule_ids.sort();
+
+        let verdict_ok = expected_verdict
+            .as_ref()
+            .map(|ev| actual_verdict.as_ref() == Some(ev))
+            .unwrap_or(true);
+
+        let mut expected_ids_sorted = expected_rule_ids.clone();
+        if let Some(ids) = expected_ids_sorted.as_mut() {
+            ids.sort();
+        }
+        let ids_ok = expected_ids_sorted
+            .as_ref()
+            .map(|eids| &actual_rule_ids == eids)
+            .unwrap_or(true);
+
+        if verdict_ok && ids_ok {
+            correct += 1;
+        } else {
+            let check = match (verdict_ok, ids_ok) {
+                (false, false) => "both",
+                (false, true) => "verdict",
+                (true, false) => "rule_ids",
+                _ => unreachable!(),
+            };
+            mismatches.push(AllModeMismatch {
+                entity: entity.clone(),
+                check: check.to_string(),
+                expected_verdict: if !verdict_ok { expected_verdict.clone() } else { None },
+                actual_verdict: if !verdict_ok { actual_verdict } else { None },
+                expected_rule_ids: if !ids_ok { expected_ids_sorted } else { None },
+                actual_rule_ids: if !ids_ok { Some(actual_rule_ids) } else { None },
+            });
+        }
+    }
+
+    let fidelity = if total == 0 {
+        0.0
+    } else {
+        correct as f32 / total as f32
+    };
+
+    Ok(AllModeFidelityReport {
+        total,
+        correct,
+        fidelity,
+        mismatches,
+    })
 }
 
 /// Apply packet to every entry in `dataset`. Dataset is a JSON array of
@@ -966,14 +1305,14 @@ impl Packets {
         let lattice = p
             .classification_lattice
             .clone()
-            .unwrap_or_else(default_lattice);
+            .unwrap_or_else(review_lattice);
         if lattice.is_empty() {
             anyhow::bail!("'classification_lattice' cannot be empty");
         }
         let prefix_inference = p
             .prefix_inference
             .clone()
-            .unwrap_or_else(default_prefix_inference);
+            .unwrap_or_else(review_prefix_inference);
 
         // Deserialize into RuleInput (classification is Option<String>);
         // materialize validates each rule's classification is in the
@@ -1087,15 +1426,32 @@ impl Packets {
 
     pub fn audit_tool(&self, p: &AuditParams) -> Result<String> {
         let packet = self.load(&p.packet_id)?;
-        let report = verify(&packet, &p.dataset)?;
-        Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "packet_id": packet.id,
-            "total": report.total,
-            "correct": report.correct,
-            "fidelity": report.fidelity,
-            "mismatches": report.mismatches,
-            "uncovered_count": report.uncovered.len(),
-        }))?)
+        let mode = p.mode.unwrap_or_default();
+        match mode {
+            ApplyMode::First => {
+                let report = verify(&packet, &p.dataset)?;
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "packet_id": packet.id,
+                    "mode": mode,
+                    "total": report.total,
+                    "correct": report.correct,
+                    "fidelity": report.fidelity,
+                    "mismatches": report.mismatches,
+                    "uncovered_count": report.uncovered.len(),
+                }))?)
+            }
+            ApplyMode::All => {
+                let report = verify_all(&packet, &p.dataset)?;
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "packet_id": packet.id,
+                    "mode": mode,
+                    "total": report.total,
+                    "correct": report.correct,
+                    "fidelity": report.fidelity,
+                    "mismatches": report.mismatches,
+                }))?)
+            }
+        }
     }
 }
 
@@ -1324,8 +1680,8 @@ mod tests {
             threshold_table,
             rank_lookup_key: "role".into(),
             threshold_lookup_key: "resource".into(),
-            classification_lattice: default_lattice(),
-            prefix_inference: default_prefix_inference(),
+            classification_lattice: review_lattice(),
+            prefix_inference: review_prefix_inference(),
             rules,
             source_ids: vec!["thread-0b20e854".into()],
             self_audit_fidelity: None,
@@ -1567,6 +1923,7 @@ mod tests {
         let audit_params = AuditParams {
             packet_id: packet.id.clone(),
             dataset,
+            mode: None,
         };
         let report_text = store.audit_tool(&audit_params).unwrap();
         assert!(report_text.contains("\"total\": 5"));
@@ -1590,6 +1947,7 @@ mod tests {
             .audit_tool(&AuditParams {
                 packet_id: packet.id.clone(),
                 dataset,
+                mode: None,
             })
             .unwrap();
         assert!(report_text.contains("\"total\": 2"));
@@ -1641,8 +1999,8 @@ mod tests {
             threshold_table: BTreeMap::new(),
             rank_lookup_key: "role".into(),
             threshold_lookup_key: "resource".into(),
-            classification_lattice: default_lattice(),
-            prefix_inference: default_prefix_inference(),
+            classification_lattice: review_lattice(),
+            prefix_inference: review_prefix_inference(),
             rules,
             source_ids: vec![],
             self_audit_fidelity: None,
@@ -1775,7 +2133,7 @@ mod tests {
 
     #[test]
     fn classification_infers_from_id_prefix() {
-        let map = default_prefix_inference();
+        let map = review_prefix_inference();
         assert_eq!(infer_classification("fail_warnings", &map).as_deref(), Some("fail"));
         assert_eq!(infer_classification("flag_readonly_fs", &map).as_deref(), Some("flag"));
         assert_eq!(infer_classification("manual_review_security", &map).as_deref(), Some("manual"));
@@ -1874,6 +2232,274 @@ mod tests {
             None,
             "no prefix match returns None"
         );
+    }
+
+    // ── Phase 4A: quantified collection predicates ──
+
+    #[test]
+    fn forall_vacuous_truth_on_empty_and_missing() {
+        let pred = Predicate::ForAll {
+            path: "items[*]".into(),
+            pred: Box::new(Predicate::AlwaysFalse {}),
+        };
+        let p = bare_packet(vec![rule("flag_x", pred, "HIT", "flag")]);
+        // Missing collection → vacuous true → rule fires even though inner is False.
+        assert!(apply(&p, &json!({})).is_some(), "missing collection: ForAll is true vacuously");
+        // Empty collection → also vacuous true.
+        assert!(apply(&p, &json!({"items": []})).is_some(), "empty collection: vacuous true");
+    }
+
+    #[test]
+    fn forall_fires_when_all_elements_satisfy() {
+        // Rule: every tool must have a non-null description.
+        let pred = Predicate::ForAll {
+            path: "tools[*]".into(),
+            pred: Box::new(Predicate::IsNonNull { field: "description".into() }),
+        };
+        let p = bare_packet(vec![rule("ok_all_documented", pred, "ALL_OK", "flag")]);
+
+        let good = json!({"tools": [
+            {"name": "a", "description": "does A"},
+            {"name": "b", "description": "does B"},
+        ]});
+        assert!(apply(&p, &good).is_some(), "all documented → rule fires");
+
+        let bad = json!({"tools": [
+            {"name": "a", "description": "does A"},
+            {"name": "b"},  // missing description
+        ]});
+        assert!(apply(&p, &bad).is_none(), "one undocumented → rule does not fire");
+    }
+
+    #[test]
+    fn exists_false_on_empty_true_on_witness() {
+        let pred = Predicate::Exists {
+            path: "tools[*]".into(),
+            pred: Box::new(Predicate::IsNonNull { field: "critical".into() }),
+        };
+        let p = bare_packet(vec![rule("flag_has_critical", pred, "HAS_CRITICAL", "flag")]);
+
+        // Empty → Exists is false → rule doesn't fire.
+        assert!(apply(&p, &json!({"tools": []})).is_none());
+        // No witness → false.
+        assert!(apply(&p, &json!({"tools": [{"name": "a"}]})).is_none());
+        // Witness present → true.
+        assert!(apply(&p, &json!({"tools": [{"name": "a", "critical": true}]})).is_some());
+    }
+
+    #[test]
+    fn forall_primitive_elements_wrapped_as_dollar() {
+        // Scalars in the array get wrapped as {"$": value}. Predicate
+        // references "$" to read them.
+        let pred = Predicate::ForAll {
+            path: "tags[*]".into(),
+            pred: Box::new(Predicate::IsNonNull { field: "$".into() }),
+        };
+        let p = bare_packet(vec![rule("flag_tags_present", pred, "OK", "flag")]);
+
+        assert!(apply(&p, &json!({"tags": ["a", "b", "c"]})).is_some(), "all non-null strings");
+        // Primitive null in array → IsNonNull("$") is false → ForAll fails.
+        let with_null = json!({"tags": ["a", null, "c"]});
+        assert!(apply(&p, &with_null).is_none(), "any null element breaks ForAll");
+    }
+
+    #[test]
+    fn forall_vacuous_true_when_runtime_data_not_an_array() {
+        // Authoring error (dotted path, bad shape) is rejected at compile.
+        // Runtime shape mismatch (entity has non-array where packet expected
+        // array) is NOT an authoring error — the packet was correctly shaped,
+        // the data just isn't what was expected. ForAll treats this as
+        // "no elements to quantify over" → vacuous true, matching math
+        // convention. Callers who want loud runtime failure should guard
+        // with `IsNonNull{field}` and a separate rule.
+        let pred = Predicate::ForAll {
+            path: "count[*]".into(),
+            pred: Box::new(Predicate::AlwaysTrue {}),
+        };
+        let p = bare_packet(vec![rule("flag_x", pred, "X", "flag")]);
+        assert!(apply(&p, &json!({"count": 42})).is_some(),
+            "non-array at runtime → vacuous true (not an authoring error)");
+    }
+
+    #[test]
+    fn count_cmp_all_ops() {
+        fn probe(op: CmpOp, value: usize, arr_len: usize) -> bool {
+            let pred = Predicate::CountCmp {
+                path: "items[*]".into(),
+                compare: op,
+                value,
+            };
+            let p = bare_packet(vec![rule("flag_x", pred, "X", "flag")]);
+            let arr: Vec<serde_json::Value> = (0..arr_len).map(|i| json!(i)).collect();
+            apply(&p, &json!({"items": arr})).is_some()
+        }
+
+        // Eq
+        assert!(probe(CmpOp::Eq, 3, 3));
+        assert!(!probe(CmpOp::Eq, 3, 2));
+        // Lt
+        assert!(probe(CmpOp::Lt, 5, 3));
+        assert!(!probe(CmpOp::Lt, 3, 3));
+        // Le
+        assert!(probe(CmpOp::Le, 3, 3));
+        assert!(probe(CmpOp::Le, 5, 3));
+        // Gt
+        assert!(probe(CmpOp::Gt, 2, 3));
+        assert!(!probe(CmpOp::Gt, 3, 3));
+        // Ge
+        assert!(probe(CmpOp::Ge, 3, 3));
+        assert!(probe(CmpOp::Ge, 2, 3));
+
+        // Missing path → length 0
+        let pred = Predicate::CountCmp {
+            path: "missing[*]".into(),
+            compare: CmpOp::Eq,
+            value: 0,
+        };
+        let p = bare_packet(vec![rule("flag_zero", pred, "X", "flag")]);
+        assert!(apply(&p, &json!({})).is_some(), "missing path → count 0");
+    }
+
+    #[test]
+    fn quantified_predicate_serde_round_trips() {
+        // Canonical JSON shape for ForAll.
+        let forall_json = json!({
+            "op": "ForAll",
+            "path": "tools[*]",
+            "pred": {"op": "IsNonNull", "field": "description"}
+        });
+        let p: Predicate = serde_json::from_value(forall_json.clone()).unwrap();
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back, forall_json);
+
+        let count_json = json!({
+            "op": "CountCmp",
+            "path": "tools[*]",
+            "compare": "ge",
+            "value": 1
+        });
+        let p: Predicate = serde_json::from_value(count_json.clone()).unwrap();
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back, count_json);
+    }
+
+    #[test]
+    fn compile_rejects_dotted_paths() {
+        // Phase-4 bro critique: silent-failure on authoring errors is the
+        // wrong mode. Compile now rejects dotted paths explicitly rather
+        // than silently returning None at eval time.
+        let (_dir, store) = tmp_packets();
+        let params = CompileParams {
+            domain: "dotted-path-test".into(),
+            rules: json!([{
+                "id": "flag_x",
+                "antecedent": {"op": "ForAll", "path": "config.rules[*]", "pred": {"op": "True"}},
+                "consequent": "X"
+            }]),
+            classification_lattice: None,
+            prefix_inference: None,
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        let err = format!("{:#}", store.compile(&params).unwrap_err());
+        assert!(err.contains("dotted path"), "dotted-path rejection missing: got {err}");
+    }
+
+    #[test]
+    fn compile_rejects_missing_bracket_suffix() {
+        let (_dir, store) = tmp_packets();
+        let params = CompileParams {
+            domain: "no-bracket".into(),
+            rules: json!([{
+                "id": "flag_x",
+                "antecedent": {"op": "ForAll", "path": "tools", "pred": {"op": "True"}},
+                "consequent": "X"
+            }]),
+            classification_lattice: None,
+            prefix_inference: None,
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        let err = format!("{:#}", store.compile(&params).unwrap_err());
+        assert!(err.contains("[*]"), "missing [*] rejection unclear: got {err}");
+    }
+
+    #[test]
+    fn compile_rejects_nested_forall() {
+        let (_dir, store) = tmp_packets();
+        let params = CompileParams {
+            domain: "nested".into(),
+            rules: json!([{
+                "id": "flag_x",
+                "antecedent": {
+                    "op": "ForAll",
+                    "path": "groups[*]",
+                    "pred": {
+                        "op": "ForAll",
+                        "path": "items[*]",
+                        "pred": {"op": "True"}
+                    }
+                },
+                "consequent": "X"
+            }]),
+            classification_lattice: None,
+            prefix_inference: None,
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        let err = format!("{:#}", store.compile(&params).unwrap_err());
+        assert!(
+            err.contains("nested inside ForAll"),
+            "nested-ForAll rejection unclear: got {err}"
+        );
+    }
+
+    #[test]
+    fn compile_allows_exists_inside_forall_inside_exists() {
+        // The nested-ban is specifically ForAll-inside-ForAll.
+        // Exists-inside-ForAll and ForAll-inside-Exists are fine.
+        let (_dir, store) = tmp_packets();
+        let params = CompileParams {
+            domain: "mixed-quantifiers".into(),
+            rules: json!([{
+                "id": "flag_x",
+                "antecedent": {
+                    "op": "Exists",
+                    "path": "groups[*]",
+                    "pred": {
+                        "op": "ForAll",
+                        "path": "items[*]",
+                        "pred": {"op": "IsNonNull", "field": "id"}
+                    }
+                },
+                "consequent": "X"
+            }]),
+            classification_lattice: None,
+            prefix_inference: None,
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        store.compile(&params).expect("Exists over ForAll should compile");
     }
 
     #[test]
@@ -2160,8 +2786,121 @@ mod tests {
             "consequent": "X",
         });
         let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
-        let r = ri.materialize(&default_lattice(), &default_prefix_inference()).unwrap();
+        let r = ri.materialize(&review_lattice(), &review_prefix_inference()).unwrap();
         assert_eq!(r.emit, Emit::Independent);
+    }
+
+    // ── Phase 4B: multi-finding audit ──
+
+    fn multi_find_packet() -> Packet {
+        bare_packet(vec![
+            rule("fail_always", Predicate::AlwaysTrue {}, "FAIL", "fail"),
+            rule("flag_on_x", Predicate::Eq { field: "x".into(), value: Value::Int(1) }, "FLAG_X", "flag"),
+            fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", "pass"),
+        ])
+    }
+
+    #[test]
+    fn verify_all_matches_verdict_and_rule_ids() {
+        let p = multi_find_packet();
+        // Entity with x=1: both fail_always and flag_on_x fire; verdict = fail.
+        let dataset = json!([{
+            "entity": {"x": 1},
+            "expected_verdict": "fail",
+            "expected_rule_ids": ["fail_always", "flag_on_x"]
+        }]);
+        let report = verify_all(&p, &dataset).unwrap();
+        assert_eq!(report.total, 1);
+        assert_eq!(report.correct, 1);
+        assert!(report.mismatches.is_empty());
+    }
+
+    #[test]
+    fn verify_all_flags_verdict_mismatch() {
+        let p = multi_find_packet();
+        let dataset = json!([{
+            "entity": {"x": 1},
+            "expected_verdict": "flag",  // wrong — actual is "fail"
+            "expected_rule_ids": ["fail_always", "flag_on_x"]
+        }]);
+        let report = verify_all(&p, &dataset).unwrap();
+        assert_eq!(report.total, 1);
+        assert_eq!(report.correct, 0);
+        assert_eq!(report.mismatches.len(), 1);
+        assert_eq!(report.mismatches[0].check, "verdict");
+        assert_eq!(report.mismatches[0].expected_verdict.as_deref(), Some("flag"));
+        assert_eq!(report.mismatches[0].actual_verdict.as_deref(), Some("fail"));
+    }
+
+    #[test]
+    fn verify_all_flags_rule_ids_mismatch() {
+        let p = multi_find_packet();
+        let dataset = json!([{
+            "entity": {"x": 1},
+            "expected_verdict": "fail",
+            "expected_rule_ids": ["fail_always"]  // missing flag_on_x
+        }]);
+        let report = verify_all(&p, &dataset).unwrap();
+        assert_eq!(report.correct, 0);
+        assert_eq!(report.mismatches[0].check, "rule_ids");
+    }
+
+    #[test]
+    fn verify_all_flags_both_mismatches() {
+        let p = multi_find_packet();
+        let dataset = json!([{
+            "entity": {"x": 1},
+            "expected_verdict": "pass",
+            "expected_rule_ids": ["nonexistent_rule"]
+        }]);
+        let report = verify_all(&p, &dataset).unwrap();
+        assert_eq!(report.mismatches[0].check, "both");
+    }
+
+    #[test]
+    fn verify_all_rule_ids_order_invariant() {
+        let p = multi_find_packet();
+        // Order of expected_rule_ids differs from firing order — still matches.
+        let dataset = json!([{
+            "entity": {"x": 1},
+            "expected_rule_ids": ["flag_on_x", "fail_always"]  // reversed
+        }]);
+        let report = verify_all(&p, &dataset).unwrap();
+        assert_eq!(report.correct, 1, "rule_ids comparison is a set, not a list");
+    }
+
+    #[test]
+    fn verify_all_partial_expectations_ok() {
+        let p = multi_find_packet();
+        // Only expected_verdict set → only verdict checked.
+        let dataset = json!([
+            {"entity": {"x": 1}, "expected_verdict": "fail"},
+            {"entity": {"x": 99}, "expected_verdict": "fail"}  // fail_always still fires
+        ]);
+        let report = verify_all(&p, &dataset).unwrap();
+        assert_eq!(report.correct, 2);
+    }
+
+    #[test]
+    fn audit_tool_all_mode_via_mcp_surface() {
+        let (_dir, store) = tmp_packets();
+        store.save_packet(&multi_find_packet()).unwrap();
+        let packet_id = multi_find_packet().id;
+
+        let report = store
+            .audit_tool(&AuditParams {
+                packet_id: packet_id.clone(),
+                dataset: json!([{
+                    "entity": {"x": 1},
+                    "expected_verdict": "fail",
+                    "expected_rule_ids": ["fail_always", "flag_on_x"]
+                }]),
+                mode: Some(ApplyMode::All),
+            })
+            .unwrap();
+        assert!(report.contains("\"mode\": \"all\""));
+        assert!(report.contains("\"correct\": 1"));
+        assert!(report.contains("\"fidelity\": 1.0"));
     }
 
     #[test]
@@ -2173,7 +2912,7 @@ mod tests {
             "emit": "fallback",
         });
         let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
-        let r = ri.materialize(&default_lattice(), &default_prefix_inference()).unwrap();
+        let r = ri.materialize(&review_lattice(), &review_prefix_inference()).unwrap();
         assert_eq!(r.emit, Emit::Fallback);
     }
 }
