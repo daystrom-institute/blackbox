@@ -271,7 +271,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_exec",
         category: ToolCategory::Orchestration,
         summary: "Launch an agent task. Returns {taskId, sessionId} immediately.",
-        when_to_use: "Dispatching work. Prefer `bro: \"name\"` over `provider: \"...\"` — named bros resolve provider/account/lens/sessionId automatically. Returns immediately; follow with `bro_wait` or `bro_when_all`.",
+        when_to_use: "Dispatching work. Prefer `bro: \"name\"` over `provider: \"...\"` — named bros resolve provider/account/lens/sessionId automatically. Bare bro names must be unique across live teams; use `team::bro` when a template is instantiated more than once. Returns immediately; follow with `bro_wait` or `bro_when_all`.",
         example: Some(
             r#"bro_exec(bro="executor", prompt="refactor the tail module", project_dir="/repo/x")"#,
         ),
@@ -280,7 +280,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_resume",
         category: ToolCategory::Orchestration,
         summary: "Continue an existing session with a follow-up.",
-        when_to_use: "Multi-turn conversations with a specific bro. NEVER use `bro_exec` again for follow-ups — it starts fresh. Named bro targeting auto-resolves the sessionId.",
+        when_to_use: "Multi-turn conversations with a specific bro. NEVER use `bro_exec` again for follow-ups — it starts fresh. Named bro targeting auto-resolves the sessionId. Bare bro names must be unique across live teams; use `team::bro` when needed.",
         example: Some(
             r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#,
         ),

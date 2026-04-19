@@ -355,7 +355,8 @@ impl BlackboxServer {
 struct ExecParams {
     /// Task instruction for the agent
     prompt: String,
-    /// Named bro instance to target (resolves provider/account/lens)
+    /// Named bro instance to target. Bare names must be unique across live
+    /// teams; use `team::bro` to disambiguate.
     #[serde(default)]
     bro: Option<String>,
     /// Raw provider for ad-hoc tasks
@@ -380,7 +381,8 @@ struct ExecParams {
 struct ResumeParams {
     /// Follow-up instruction
     prompt: String,
-    /// Named bro instance to resume
+    /// Named bro instance to resume. Bare names must be unique across live
+    /// teams; use `team::bro` to disambiguate.
     #[serde(default)]
     bro: Option<String>,
     /// Session ID from a prior task (requires provider)
@@ -1884,33 +1886,37 @@ impl BlackboxServer {
 
         if let Some(name) = bro_name {
             let teams = orchestration::team::load_all_teams(store_dir);
-            if let Some(bro_match) = orchestration::team::find_bro(name, &teams) {
-                let member = &bro_match.team.members[bro_match.member_idx];
-                let bf = orchestration::brofile::resolve_brofile(
-                    &member.brofile,
-                    store_dir,
-                    bro_match.team.project_dir.as_deref(),
-                )
-                .ok_or(format!("Brofile not found: {}", member.brofile))?;
-                let env = bf
-                    .account
-                    .as_ref()
-                    .and_then(|a| orchestration::brofile::load_account(a, store_dir))
-                    .and_then(|a| a.env);
-                let opts = if bf.model.is_some() || bf.effort.is_some() {
-                    Some(ExecOpts {
-                        model: bf.model.clone(),
-                        effort: bf.effort.clone(),
-                    })
-                } else {
-                    None
-                };
-                let cwd = project_dir
-                    .map(String::from)
-                    .or(bro_match.team.project_dir.clone());
-                return Ok((bf.provider, bf.lens, opts, env, cwd, bf.filters));
+            match orchestration::team::resolve_bro_selector(name, &teams)? {
+                Some(bro_match) => {
+                    let member = &bro_match.team.members[bro_match.member_idx];
+                    let bf = orchestration::brofile::resolve_brofile(
+                        &member.brofile,
+                        store_dir,
+                        bro_match.team.project_dir.as_deref(),
+                    )
+                    .ok_or(format!("Brofile not found: {}", member.brofile))?;
+                    let env = bf
+                        .account
+                        .as_ref()
+                        .and_then(|a| orchestration::brofile::load_account(a, store_dir))
+                        .and_then(|a| a.env);
+                    let opts = if bf.model.is_some() || bf.effort.is_some() {
+                        Some(ExecOpts {
+                            model: bf.model.clone(),
+                            effort: bf.effort.clone(),
+                        })
+                    } else {
+                        None
+                    };
+                    let cwd = project_dir
+                        .map(String::from)
+                        .or(bro_match.team.project_dir.clone());
+                    return Ok((bf.provider, bf.lens, opts, env, cwd, bf.filters));
+                }
+                None => {
+                    // Standalone brofile fallback
+                }
             }
-            // Standalone brofile fallback
             let bf = orchestration::brofile::resolve_brofile(name, store_dir, project_dir)
                 .ok_or(format!("Unknown bro or brofile: {name}"))?;
             let env = bf
@@ -1976,10 +1982,14 @@ impl BlackboxServer {
 
         if let Some(name) = bro_name {
             let teams = orchestration::team::load_all_teams(store_dir);
-            let bro_match = orchestration::team::find_bro(name, &teams)
+            let bro_match = orchestration::team::resolve_bro_selector(name, &teams)?
                 .ok_or_else(|| {
-                    if orchestration::brofile::resolve_brofile(name, store_dir, project_dir).is_some() {
-                        format!("Brofile \"{name}\" is not in a team — use exec first or provide session_id + provider")
+                    if orchestration::brofile::resolve_brofile(name, store_dir, project_dir)
+                        .is_some()
+                    {
+                        format!(
+                            "Brofile \"{name}\" is not in a team — use exec first or provide session_id + provider"
+                        )
                     } else {
                         format!("Unknown bro: {name}")
                     }
@@ -2074,23 +2084,29 @@ impl BlackboxServer {
         let _lock = orchestration::team::lock_teams();
         let tid = task.id();
         let teams = orchestration::team::load_all_teams(&self.state.store_dir);
+        let Ok(bro_match_opt) = orchestration::team::resolve_bro_selector(bro_name, &teams) else {
+            return;
+        };
+        let Some(bro_match) = bro_match_opt else {
+            return;
+        };
+        let target_team = bro_match.team.name.clone();
+        let target_member_idx = bro_match.member_idx;
+        let task_sid = task.inner.lock().session_id.clone();
+
         for mut team in teams {
-            let mut dirty = false;
-            for member in &mut team.members {
-                if member.name == bro_name {
-                    member.task_history.push(tid.clone());
-                    // Track the latest launch. Skip "pending" — late propagation
-                    // will fill it in once the provider discovers its session.
-                    let task_sid = task.inner.lock().session_id.clone();
-                    if task_sid != "pending" {
-                        member.session_id = Some(task_sid);
-                    }
-                    dirty = true;
-                }
+            if team.name != target_team {
+                continue;
             }
-            if dirty {
-                orchestration::team::save_team(&team, &self.state.store_dir);
+            let member = &mut team.members[target_member_idx];
+            member.task_history.push(tid.clone());
+            // Track the latest launch. Skip "pending" — late propagation
+            // will fill it in once the provider discovers its session.
+            if task_sid != "pending" {
+                member.session_id = Some(task_sid.clone());
             }
+            orchestration::team::save_team(&team, &self.state.store_dir);
+            break;
         }
     }
 }
@@ -2133,6 +2149,7 @@ struct RosterQuery {
 #[derive(Debug, Serialize)]
 struct BroRosterEntry {
     bro: String,
+    bro_selector: String,
     team: String,
     provider: String,
     session_id: Option<String>,
@@ -2190,6 +2207,7 @@ fn build_member_entry(
         .map(|p| p.to_string_lossy().into_owned());
     BroRosterEntry {
         bro: member.name.clone(),
+        bro_selector: format!("{}::{}", team.name, member.name),
         team: team.name.clone(),
         provider: provider
             .map(|p| p.to_string())
@@ -2198,6 +2216,14 @@ fn build_member_entry(
         jsonl_path,
         brofile: member.brofile.clone(),
         model: brofile.and_then(|b| b.model),
+    }
+}
+
+fn roster_entry_key(entry: &BroRosterEntry) -> String {
+    if let Some(ref sid) = entry.session_id {
+        format!("session::{sid}")
+    } else {
+        format!("member::{}", entry.bro_selector)
     }
 }
 
@@ -2227,11 +2253,12 @@ async fn roster_handler(
     for tn in &wanted_teams {
         if let Some(team) = orchestration::team::load_team(tn, &store_dir) {
             for member in &team.members {
-                let key = format!("{}::{}", team.name, member.name);
+                let candidate = build_member_entry(&team, member, &store_dir, &config);
+                let key = roster_entry_key(&candidate);
                 if !seen.insert(key) {
                     continue;
                 }
-                entries.push(build_member_entry(&team, member, &store_dir, &config));
+                entries.push(candidate);
             }
         }
     }
@@ -2243,18 +2270,19 @@ async fn roster_handler(
                 if !wanted_bros.iter().any(|b| b == &member.name) {
                     continue;
                 }
-                let key = format!("{}::{}", team.name, member.name);
+                let candidate = build_member_entry(&team, member, &store_dir, &config);
+                let key = roster_entry_key(&candidate);
                 if !seen.insert(key) {
                     continue;
                 }
-                entries.push(build_member_entry(&team, member, &store_dir, &config));
+                entries.push(candidate);
             }
         }
     }
 
     // Session selectors — synthetic adhoc lanes.
     for sid in &wanted_sessions {
-        let key = format!("adhoc::{sid}");
+        let key = format!("session::{sid}");
         if !seen.insert(key) {
             continue;
         }
@@ -2262,6 +2290,7 @@ async fn roster_handler(
         let provider = path.as_deref().and_then(infer_provider_from_path);
         entries.push(BroRosterEntry {
             bro: sid.chars().take(8).collect(),
+            bro_selector: sid.clone(),
             team: "adhoc".into(),
             provider: provider
                 .map(|p| p.to_string())
@@ -2277,11 +2306,12 @@ async fn roster_handler(
     if no_selectors {
         for team in orchestration::team::load_all_teams(&store_dir) {
             for member in &team.members {
-                let key = format!("{}::{}", team.name, member.name);
+                let candidate = build_member_entry(&team, member, &store_dir, &config);
+                let key = roster_entry_key(&candidate);
                 if !seen.insert(key) {
                     continue;
                 }
-                entries.push(build_member_entry(&team, member, &store_dir, &config));
+                entries.push(candidate);
             }
         }
     }
@@ -2353,7 +2383,7 @@ async fn tail_handler(
                             })
                             .unwrap_or((None, None))
                     };
-                    let bro_name = orchestration::team::find_bro_name_for_task(tid, &store_dir);
+                    let bro_ref = orchestration::team::find_bro_ref_for_task(tid, &store_dir);
 
                     // Provider is a filter that applies on top of the selector
                     // union. Bros/sessions/teams are OR'd together: match ANY
@@ -2367,8 +2397,11 @@ async fn tail_handler(
                     let selector_match = if !selectors_specified {
                         true
                     } else {
-                        let bro_m = bro_name.as_deref()
-                            .map(|b| wanted_bros.iter().any(|w| w == b))
+                        let bro_m = bro_ref.as_ref()
+                            .map(|r| {
+                                let selector = format!("{}::{}", r.team_name, r.member_name);
+                                wanted_bros.iter().any(|w| w == &r.member_name || w == &selector)
+                            })
                             .unwrap_or(false);
                         let session_m = task_session_id.as_deref()
                             .map(|s| wanted_sessions.iter().any(|w| w == s))
@@ -2386,8 +2419,11 @@ async fn tail_handler(
                     }
 
                     let mut evt_json = serde_json::to_value(&event).unwrap_or_default();
-                    if let Some(ref name) = bro_name {
-                        evt_json["bro_name"] = Value::String(name.clone());
+                    if let Some(ref bro_ref) = bro_ref {
+                        evt_json["bro_name"] = Value::String(bro_ref.member_name.clone());
+                        evt_json["bro_selector"] =
+                            Value::String(format!("{}::{}", bro_ref.team_name, bro_ref.member_name));
+                        evt_json["team_name"] = Value::String(bro_ref.team_name.clone());
                     }
                     if let Some(ref sid) = task_session_id {
                         if sid.as_str() != "pending" {
@@ -2657,4 +2693,113 @@ async fn main() -> anyhow::Result<()> {
     shared.task_store.read().persist(&store_dir);
     tracing::info!("blackboxd shut down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+        let index = TranscriptIndex::open_or_create(
+            &tmp.path().join("index"),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
+        let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
+        let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
+        let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
+        let state = Arc::new(SharedState {
+            idx: RwLock::new(index),
+            kb: RwLock::new(kb),
+            threads: RwLock::new(threads),
+            notes: RwLock::new(notes),
+            task_store: Arc::new(RwLock::new(TaskStore::new())),
+            tail_tx,
+            store_dir: tmp.path().join("bro"),
+        });
+        BlackboxServer::new(state)
+    }
+
+    fn save_test_brofile(tmp: &tempfile::TempDir, name: &str) {
+        orchestration::brofile::save_brofile(
+            &orchestration::brofile::Brofile {
+                name: name.to_string(),
+                provider: Provider::Gemini,
+                account: None,
+                lens: None,
+                model: None,
+                effort: None,
+                filters: None,
+            },
+            "global",
+            &tmp.path().join("bro"),
+            None,
+        );
+    }
+
+    #[test]
+    fn resolve_resume_target_rejects_ambiguous_bro_names_across_live_teams() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        save_test_brofile(&tmp, "reviewer");
+
+        for (team_name, session_id) in [("red", "sid-red"), ("blue", "sid-blue")] {
+            orchestration::team::save_team(
+                &orchestration::team::Team {
+                    name: team_name.to_string(),
+                    teamplate: "review".into(),
+                    members: vec![orchestration::team::TeamMember {
+                        name: "reviewer".into(),
+                        brofile: "reviewer".into(),
+                        session_id: Some(session_id.into()),
+                        task_history: vec![],
+                    }],
+                    project_dir: None,
+                    created_at: 0,
+                },
+                &tmp.path().join("bro"),
+            );
+        }
+
+        let err = server
+            .resolve_resume_target(Some("reviewer"), None, None, None)
+            .unwrap_err();
+        assert!(err.contains("Ambiguous bro name: reviewer"));
+        assert!(err.contains("red"));
+        assert!(err.contains("blue"));
+    }
+
+    #[test]
+    fn resolve_resume_target_accepts_scoped_team_bro_selector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        save_test_brofile(&tmp, "reviewer");
+
+        for (team_name, session_id) in [("red", "sid-red"), ("blue", "sid-blue")] {
+            orchestration::team::save_team(
+                &orchestration::team::Team {
+                    name: team_name.to_string(),
+                    teamplate: "review".into(),
+                    members: vec![orchestration::team::TeamMember {
+                        name: "reviewer".into(),
+                        brofile: "reviewer".into(),
+                        session_id: Some(session_id.into()),
+                        task_history: vec![],
+                    }],
+                    project_dir: Some(format!("/tmp/{team_name}")),
+                    created_at: 0,
+                },
+                &tmp.path().join("bro"),
+            );
+        }
+
+        let (provider, session_id, _lens, _opts, _env, cwd, _filters) = server
+            .resolve_resume_target(Some("blue::reviewer"), None, None, None)
+            .unwrap();
+        assert_eq!(provider, Provider::Gemini);
+        assert_eq!(session_id, "sid-blue");
+        assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
+    }
 }

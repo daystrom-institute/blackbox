@@ -190,30 +190,82 @@ pub fn instantiate_team(
 // Bro resolution — find a named bro across all teams
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct BroMatch<'a> {
     pub team: &'a Team,
     pub member_idx: usize,
 }
 
-pub fn find_bro<'a>(name: &str, teams: &'a [Team]) -> Option<BroMatch<'a>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroRef {
+    pub team_name: String,
+    pub member_name: String,
+}
+
+pub fn find_bro_matches<'a>(name: &str, teams: &'a [Team]) -> Vec<BroMatch<'a>> {
+    let mut matches = Vec::new();
     for team in teams {
         for (i, member) in team.members.iter().enumerate() {
             if member.name == name {
-                return Some(BroMatch {
+                matches.push(BroMatch {
                     team,
                     member_idx: i,
                 });
             }
         }
     }
-    None
+    matches
+}
+
+pub fn find_bro<'a>(name: &str, teams: &'a [Team]) -> Option<BroMatch<'a>> {
+    find_bro_matches(name, teams).into_iter().next()
+}
+
+pub fn resolve_bro_selector<'a>(
+    selector: &str,
+    teams: &'a [Team],
+) -> Result<Option<BroMatch<'a>>, String> {
+    if let Some((team_name, bro_name)) = selector.split_once("::") {
+        let team = teams
+            .iter()
+            .find(|team| team.name == team_name)
+            .ok_or_else(|| format!("Unknown team in bro selector: {team_name}"))?;
+        let member_idx = team
+            .members
+            .iter()
+            .position(|member| member.name == bro_name)
+            .ok_or_else(|| format!("Unknown bro selector: {selector}"))?;
+        return Ok(Some(BroMatch { team, member_idx }));
+    }
+
+    let matches = find_bro_matches(selector, teams);
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => {
+            let mut team_names: Vec<&str> = matches.iter().map(|m| m.team.name.as_str()).collect();
+            team_names.sort_unstable();
+            team_names.dedup();
+            Err(format!(
+                "Ambiguous bro name: {selector}. Matches live team members in [{}]. Use team::bro to disambiguate.",
+                team_names.join(", ")
+            ))
+        }
+    }
 }
 
 pub fn find_bro_name_for_task(task_id: &str, store_dir: &Path) -> Option<String> {
+    find_bro_ref_for_task(task_id, store_dir).map(|r| r.member_name)
+}
+
+pub fn find_bro_ref_for_task(task_id: &str, store_dir: &Path) -> Option<BroRef> {
     for team in load_all_teams(store_dir) {
         for member in &team.members {
             if member.task_history.contains(&task_id.to_string()) {
-                return Some(member.name.clone());
+                return Some(BroRef {
+                    team_name: team.name.clone(),
+                    member_name: member.name.clone(),
+                });
             }
         }
     }
@@ -384,6 +436,66 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_bro_selector_requires_disambiguation_for_duplicates() {
+        let teams = vec![
+            Team {
+                name: "red".into(),
+                teamplate: "tp1".into(),
+                members: vec![TeamMember {
+                    name: "reviewer".into(),
+                    brofile: "reviewer".into(),
+                    session_id: Some("sid-red".into()),
+                    task_history: vec![],
+                }],
+                project_dir: None,
+                created_at: 0,
+            },
+            Team {
+                name: "blue".into(),
+                teamplate: "tp1".into(),
+                members: vec![TeamMember {
+                    name: "reviewer".into(),
+                    brofile: "reviewer".into(),
+                    session_id: Some("sid-blue".into()),
+                    task_history: vec![],
+                }],
+                project_dir: None,
+                created_at: 0,
+            },
+        ];
+
+        let err = resolve_bro_selector("reviewer", &teams).unwrap_err();
+        assert!(err.contains("Ambiguous bro name: reviewer"));
+        assert!(err.contains("red"));
+        assert!(err.contains("blue"));
+
+        let scoped = resolve_bro_selector("blue::reviewer", &teams)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scoped.team.name, "blue");
+        assert_eq!(scoped.team.members[scoped.member_idx].name, "reviewer");
+    }
+
+    #[test]
+    fn test_resolve_bro_selector_unknown_scoped_member_errors() {
+        let teams = vec![Team {
+            name: "red".into(),
+            teamplate: "tp1".into(),
+            members: vec![TeamMember {
+                name: "reviewer".into(),
+                brofile: "reviewer".into(),
+                session_id: None,
+                task_history: vec![],
+            }],
+            project_dir: None,
+            created_at: 0,
+        }];
+
+        let err = resolve_bro_selector("red::critic", &teams).unwrap_err();
+        assert_eq!(err, "Unknown bro selector: red::critic");
+    }
+
+    #[test]
     fn test_find_bro_name_for_task() {
         let dir = temp_store();
         let team = Team {
@@ -403,6 +515,13 @@ mod tests {
         assert_eq!(
             find_bro_name_for_task("task-123", dir.path()),
             Some("alice".into())
+        );
+        assert_eq!(
+            find_bro_ref_for_task("task-123", dir.path()),
+            Some(BroRef {
+                team_name: "t1".into(),
+                member_name: "alice".into(),
+            })
         );
         assert_eq!(find_bro_name_for_task("task-999", dir.path()), None);
     }

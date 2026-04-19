@@ -621,27 +621,24 @@ pub fn spawn_task(
                             },
                         };
                         provider.parse_event(&evt, &mut sink);
-                        inner.last_assistant_message = sink.last_assistant_message;
-                        inner.usage = sink.usage;
-                        inner.cost_usd = sink.cost_usd;
-                        inner.num_turns = sink.num_turns;
-                        if let Some(sid) = sink.session_id {
+                        let emitted_session_id = sink.session_id.clone();
+                        let mut accepted = true;
+                        if let Some(sid) = emitted_session_id {
                             if inner.session_id == "pending" {
                                 inner.session_id = sid;
-                            } else if inner.session_id != sid && inner.status != TaskStatus::Failed
-                            {
+                            } else if inner.session_id != sid {
                                 // Provider emitted a session_id that doesn't
                                 // match the one we asked to resume. Mark failed
-                                // so the caller doesn't trust a forked session
-                                // as a successful continuation.
-                                let requested = inner.session_id.clone();
-                                inner.status = TaskStatus::Failed;
-                                inner.stderr.push_str(&format!(
-                                    "\nsession fork detected: requested resume of {requested}, provider emitted {sid}"
-                                ));
+                                // and discard parsed output so the caller does
+                                // not accidentally trust forked-session text.
+                                reject_forked_session(&mut inner, &sid);
+                                accepted = false;
                             }
                         }
-                        inner.last_assistant_message.as_ref().map(|msg| {
+                        if accepted {
+                            apply_sink_updates(&mut inner, sink);
+                        }
+                        accepted.then(|| inner.last_assistant_message.as_ref().map(|msg| {
                             const TAIL_CHARS: usize = 160;
                             let count = msg.chars().count();
                             if count > TAIL_CHARS {
@@ -651,7 +648,7 @@ pub fn spawn_task(
                             } else {
                                 msg.clone()
                             }
-                        })
+                        })).flatten()
                     };
 
                     if let Some(snippet) = snippet_to_emit {
@@ -691,20 +688,17 @@ pub fn spawn_task(
                     session_id: None,
                 };
                 provider.parse_bulk_output(buf.trim(), &mut sink);
-                inner.last_assistant_message = sink.last_assistant_message;
-                inner.usage = sink.usage;
-                inner.cost_usd = sink.cost_usd;
-                inner.num_turns = sink.num_turns;
-                if let Some(sid) = sink.session_id {
+                if let Some(sid) = sink.session_id.clone() {
                     if inner.session_id == "pending" {
                         inner.session_id = sid;
-                    } else if inner.session_id != sid && inner.status != TaskStatus::Failed {
-                        let requested = inner.session_id.clone();
-                        inner.status = TaskStatus::Failed;
-                        inner.stderr.push_str(&format!(
-                            "\nsession fork detected: requested resume of {requested}, provider emitted {sid}"
-                        ));
+                        apply_sink_updates(&mut inner, sink);
+                    } else if inner.session_id != sid {
+                        reject_forked_session(&mut inner, &sid);
+                    } else {
+                        apply_sink_updates(&mut inner, sink);
                     }
+                } else {
+                    apply_sink_updates(&mut inner, sink);
                 }
             }
             let _ = stdout_done_tx.send(());
@@ -882,6 +876,23 @@ pub fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn apply_sink_updates(inner: &mut TaskInner, sink: EventSink) {
+    inner.last_assistant_message = sink.last_assistant_message;
+    inner.usage = sink.usage;
+    inner.cost_usd = sink.cost_usd;
+    inner.num_turns = sink.num_turns;
+}
+
+fn reject_forked_session(inner: &mut TaskInner, emitted_session_id: &str) {
+    if inner.status != TaskStatus::Failed {
+        let requested = inner.session_id.clone();
+        inner.status = TaskStatus::Failed;
+        inner.stderr.push_str(&format!(
+            "\nsession fork detected: requested resume of {requested}, provider emitted {emitted_session_id}"
+        ));
+    }
 }
 
 pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
@@ -1193,6 +1204,88 @@ mod tests {
                 .unwrap()
                 .contains("something went wrong")
         );
+    }
+
+    #[test]
+    fn fork_rejection_marks_failed_without_overwriting_result_state() {
+        let mut inner = TaskInner {
+            id: "t3".into(),
+            provider: Provider::Gemini,
+            session_id: "requested-session".into(),
+            events: vec![],
+            last_assistant_message: Some("trusted prior result".into()),
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            }),
+            cost_usd: Some(0.01),
+            num_turns: Some(1),
+            stderr: String::new(),
+            status: TaskStatus::Running,
+            started_at: 1000,
+            completed_at: None,
+            exit_code: None,
+            cwd: None,
+        };
+
+        reject_forked_session(&mut inner, "forked-session");
+
+        assert_eq!(inner.status, TaskStatus::Failed);
+        assert_eq!(
+            inner.last_assistant_message.as_deref(),
+            Some("trusted prior result")
+        );
+        assert_eq!(
+            inner.stderr.trim(),
+            "session fork detected: requested resume of requested-session, provider emitted forked-session"
+        );
+        assert_eq!(
+            inner.usage.as_ref().map(|u| (u.input_tokens, u.output_tokens)),
+            Some((10, 5))
+        );
+        assert_eq!(inner.cost_usd, Some(0.01));
+        assert_eq!(inner.num_turns, Some(1));
+    }
+
+    #[test]
+    fn apply_sink_updates_replaces_task_observed_state() {
+        let mut inner = TaskInner {
+            id: "t4".into(),
+            provider: Provider::Gemini,
+            session_id: "s1".into(),
+            events: vec![],
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            stderr: String::new(),
+            status: TaskStatus::Running,
+            started_at: 1000,
+            completed_at: None,
+            exit_code: None,
+            cwd: None,
+        };
+
+        let sink = EventSink {
+            last_assistant_message: Some("fresh output".into()),
+            usage: Some(Usage {
+                input_tokens: 12,
+                output_tokens: 8,
+            }),
+            cost_usd: Some(0.02),
+            num_turns: Some(2),
+            session_id: Some("s1".into()),
+        };
+
+        apply_sink_updates(&mut inner, sink);
+
+        assert_eq!(inner.last_assistant_message.as_deref(), Some("fresh output"));
+        assert_eq!(
+            inner.usage.as_ref().map(|u| (u.input_tokens, u.output_tokens)),
+            Some((12, 8))
+        );
+        assert_eq!(inner.cost_usd, Some(0.02));
+        assert_eq!(inner.num_turns, Some(2));
     }
 }
 

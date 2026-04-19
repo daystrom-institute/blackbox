@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
+use clap::{Args, Parser, Subcommand};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -37,6 +38,7 @@ use parser::{
 #[derive(Deserialize, Debug, Clone)]
 struct RosterEntry {
     bro: String,
+    bro_selector: String,
     team: String,
     provider: String,
     session_id: Option<String>,
@@ -54,6 +56,54 @@ struct TailSelectors {
     providers: Vec<String>,
 }
 
+#[derive(Debug, Parser)]
+#[command(name = "bro", about = "Terminal client for blackbox orchestration", version)]
+struct BroCli {
+    #[command(subcommand)]
+    command: BroCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BroCommand {
+    /// Multi-lane transcript tail for agent orchestration
+    Tail(TailArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(
+    after_help = "Selectors are unioned. Each flag is repeatable.\n\nExamples:\n  bro tail alice bob\n  bro tail --team review-panel\n  bro tail --team A --team B\n  bro tail --team A --bro solo --bro qa\n  bro tail --session <uuid>\n  bro tail --provider codex"
+)]
+struct TailArgs {
+    /// Specific bros to include. Accepts bare names or `team::bro`.
+    #[arg(long = "bro", value_name = "NAME")]
+    bros: Vec<String>,
+    /// Teams to include in full.
+    #[arg(long = "team", value_name = "NAME")]
+    teams: Vec<String>,
+    /// Raw sessions to tail directly.
+    #[arg(long = "session", value_name = "ID")]
+    sessions: Vec<String>,
+    /// Provider filter applied after selector union.
+    #[arg(long = "provider", value_name = "NAME")]
+    providers: Vec<String>,
+    /// Positional shorthand for bro selectors.
+    #[arg(value_name = "BRO")]
+    positional_bros: Vec<String>,
+}
+
+impl From<TailArgs> for TailSelectors {
+    fn from(args: TailArgs) -> Self {
+        let mut bros = args.bros;
+        bros.extend(args.positional_bros);
+        Self {
+            bros,
+            teams: args.teams,
+            sessions: args.sessions,
+            providers: args.providers,
+        }
+    }
+}
+
 // ── SSE subscriber ─────────────────────────────────────────────────
 //
 // The daemon synthesises richer activity signal than the JSONL file
@@ -68,12 +118,14 @@ struct TailSelectors {
 enum LaneSignal {
     TaskStarted {
         bro: Option<String>,
+        bro_selector: Option<String>,
         session_id: Option<String>,
         jsonl_path: Option<String>,
         task_id: String,
     },
     TaskProgress {
         bro: Option<String>,
+        bro_selector: Option<String>,
         session_id: Option<String>,
         jsonl_path: Option<String>,
         task_id: String,
@@ -81,12 +133,14 @@ enum LaneSignal {
     },
     TaskCompleted {
         bro: Option<String>,
+        bro_selector: Option<String>,
         session_id: Option<String>,
         jsonl_path: Option<String>,
         task_id: String,
     },
     TaskFailed {
         bro: Option<String>,
+        bro_selector: Option<String>,
         session_id: Option<String>,
         jsonl_path: Option<String>,
         task_id: String,
@@ -94,6 +148,7 @@ enum LaneSignal {
     },
     TaskCancelled {
         bro: Option<String>,
+        bro_selector: Option<String>,
         session_id: Option<String>,
         jsonl_path: Option<String>,
         task_id: String,
@@ -182,6 +237,10 @@ async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
 fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
     let task_id = v.get("task_id")?.as_str()?.to_string();
     let bro = v.get("bro_name").and_then(|x| x.as_str()).map(String::from);
+    let bro_selector = v
+        .get("bro_selector")
+        .and_then(|x| x.as_str())
+        .map(String::from);
     let session_id = v
         .get("session_id")
         .and_then(|x| x.as_str())
@@ -194,6 +253,7 @@ fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
     match kind {
         "task_started" => Some(LaneSignal::TaskStarted {
             bro,
+            bro_selector,
             session_id,
             jsonl_path,
             task_id,
@@ -206,6 +266,7 @@ fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
                 .to_string();
             Some(LaneSignal::TaskProgress {
                 bro,
+                bro_selector,
                 session_id,
                 jsonl_path,
                 task_id,
@@ -214,6 +275,7 @@ fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
         }
         "task_completed" => Some(LaneSignal::TaskCompleted {
             bro,
+            bro_selector,
             session_id,
             jsonl_path,
             task_id,
@@ -226,6 +288,7 @@ fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
                 .to_string();
             Some(LaneSignal::TaskFailed {
                 bro,
+                bro_selector,
                 session_id,
                 jsonl_path,
                 task_id,
@@ -234,6 +297,7 @@ fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
         }
         "task_cancelled" => Some(LaneSignal::TaskCancelled {
             bro,
+            bro_selector,
             session_id,
             jsonl_path,
             task_id,
@@ -282,6 +346,7 @@ async fn fetch_roster(sel: TailSelectors) -> anyhow::Result<Vec<RosterEntry>> {
 
 struct Lane {
     bro: String,
+    bro_selector: String,
     team: String,
     provider: String,
     model: Option<String>,
@@ -329,6 +394,7 @@ impl Lane {
         };
         let mut lane = Lane {
             bro: e.bro,
+            bro_selector: e.bro_selector,
             team: e.team,
             provider: e.provider,
             model: e.model,
@@ -351,9 +417,19 @@ impl Lane {
     }
 
     /// Does this signal belong to this lane?
-    fn matches_signal(&self, bro: Option<&str>, session_id: Option<&str>) -> bool {
+    fn matches_signal(
+        &self,
+        bro: Option<&str>,
+        bro_selector: Option<&str>,
+        session_id: Option<&str>,
+    ) -> bool {
+        if let Some(selector) = bro_selector {
+            if selector == self.bro_selector {
+                return true;
+            }
+        }
         if let Some(b) = bro {
-            if b == self.bro {
+            if b == self.bro && self.team == "adhoc" {
                 return true;
             }
         }
@@ -397,26 +473,31 @@ impl Lane {
     fn attach_from_signal(&mut self, sig: &LaneSignal) {
         let (session_id, jsonl_path) = match sig {
             LaneSignal::TaskStarted {
+                bro_selector: _,
                 session_id,
                 jsonl_path,
                 ..
             }
             | LaneSignal::TaskProgress {
+                bro_selector: _,
                 session_id,
                 jsonl_path,
                 ..
             }
             | LaneSignal::TaskCompleted {
+                bro_selector: _,
                 session_id,
                 jsonl_path,
                 ..
             }
             | LaneSignal::TaskFailed {
+                bro_selector: _,
                 session_id,
                 jsonl_path,
                 ..
             }
             | LaneSignal::TaskCancelled {
+                bro_selector: _,
                 session_id,
                 jsonl_path,
                 ..
@@ -630,60 +711,13 @@ struct App {
     quit: bool,
 }
 
-// ── Arg parsing ─────────────────────────────────────────────────────
-
-fn parse_tail_args(args: &[String]) -> TailSelectors {
-    let mut sel = TailSelectors::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--team" if i + 1 < args.len() => {
-                sel.teams.push(args[i + 1].clone());
-                i += 2;
-            }
-            "--bro" if i + 1 < args.len() => {
-                sel.bros.push(args[i + 1].clone());
-                i += 2;
-            }
-            "--session" if i + 1 < args.len() => {
-                sel.sessions.push(args[i + 1].clone());
-                i += 2;
-            }
-            "--provider" if i + 1 < args.len() => {
-                sel.providers.push(args[i + 1].clone());
-                i += 2;
-            }
-            s if !s.starts_with("--") => {
-                sel.bros.push(s.to_string());
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    sel
-}
-
 // ── Entry point ─────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 || args[1] != "tail" {
-        eprintln!(
-            "Usage: bro tail [BROS...] [--team NAME]... [--bro NAME]... [--session ID]... [--provider NAME]..."
-        );
-        eprintln!();
-        eprintln!("Selectors are unioned. Each flag is repeatable.");
-        eprintln!();
-        eprintln!("Examples:");
-        eprintln!("  bro tail alice bob                           Two specific bros (positional)");
-        eprintln!("  bro tail --team review-panel                 All members of a team");
-        eprintln!("  bro tail --team A --team B                   All members of two teams");
-        eprintln!("  bro tail --team A --bro solo --bro qa        Team A plus two named bros");
-        eprintln!("  bro tail --session <uuid>                    Adhoc lane on a raw session ID");
-        eprintln!("  bro tail --provider codex                    Filter: only codex bros");
-        std::process::exit(1);
-    }
-    let sel = parse_tail_args(&args[2..]);
+    let cli = BroCli::parse();
+    let sel = match cli.command {
+        BroCommand::Tail(args) => TailSelectors::from(args),
+    };
 
     // Tokio runtime stays alive for the TUI's lifetime: the SSE subscriber
     // task runs on it continuously.
@@ -724,6 +758,91 @@ fn main() -> anyhow::Result<()> {
     // Runtime is dropped here, killing the SSE task.
     drop(rt);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lane(team: &str, bro: &str, bro_selector: &str, session_id: Option<&str>) -> Lane {
+        Lane {
+            bro: bro.into(),
+            bro_selector: bro_selector.into(),
+            team: team.into(),
+            provider: "gemini".into(),
+            model: None,
+            session_id: session_id.map(str::to_string),
+            jsonl_path: None,
+            events: Vec::new(),
+            file_offset: 0,
+            file_mtime: None,
+            seen_ids: HashSet::new(),
+            scroll_from_bottom: 0,
+            cached_total_lines: 0,
+            status: LaneStatus::Waiting,
+            active_tasks: HashSet::new(),
+            last_progress_at: None,
+            last_progress_snippet: None,
+            last_failure: None,
+        }
+    }
+
+    #[test]
+    fn lane_matches_scoped_signal_before_bare_name() {
+        let lane = lane("red", "reviewer", "red::reviewer", Some("sid-red"));
+        assert!(lane.matches_signal(
+            Some("reviewer"),
+            Some("red::reviewer"),
+            Some("sid-red")
+        ));
+        assert!(!lane.matches_signal(
+            Some("reviewer"),
+            Some("blue::reviewer"),
+            Some("sid-blue")
+        ));
+    }
+
+    #[test]
+    fn adhoc_lane_can_match_by_session_without_team_scoping() {
+        let lane = lane("adhoc", "sid-red", "sid-red", Some("sid-red"));
+        assert!(lane.matches_signal(Some("sid-red"), None, Some("sid-red")));
+        assert!(!lane.matches_signal(Some("sid-blue"), None, Some("sid-blue")));
+    }
+
+    #[test]
+    fn clap_parses_tail_repeatable_and_positional_selectors() {
+        let cli = BroCli::parse_from([
+            "bro",
+            "tail",
+            "alpha",
+            "beta",
+            "--team",
+            "red",
+            "--team",
+            "blue",
+            "--bro",
+            "solo",
+            "--session",
+            "sid-123",
+            "--provider",
+            "gemini",
+        ]);
+
+        let BroCommand::Tail(args) = cli.command;
+        let sel = TailSelectors::from(args);
+        assert_eq!(sel.bros, vec!["solo", "alpha", "beta"]);
+        assert_eq!(sel.teams, vec!["red", "blue"]);
+        assert_eq!(sel.sessions, vec!["sid-123"]);
+        assert_eq!(sel.providers, vec!["gemini"]);
+    }
+
+    #[test]
+    fn clap_preserves_scoped_bro_selectors() {
+        let cli = BroCli::parse_from(["bro", "tail", "--bro", "red::reviewer"]);
+        let BroCommand::Tail(args) = cli.command;
+        let sel = TailSelectors::from(args);
+        assert_eq!(sel.bros, vec!["red::reviewer"]);
+    }
 }
 
 // ── TUI main loop ───────────────────────────────────────────────────
@@ -780,25 +899,44 @@ fn run_tui(mut app: App, signals: mpsc::Receiver<LaneSignal>) -> anyhow::Result<
 }
 
 fn dispatch_signal(app: &mut App, sig: LaneSignal) {
-    let (bro, session_id) = match &sig {
+    let (bro, bro_selector, session_id) = match &sig {
         LaneSignal::TaskStarted {
-            bro, session_id, ..
+            bro,
+            bro_selector,
+            session_id,
+            ..
         }
         | LaneSignal::TaskProgress {
-            bro, session_id, ..
+            bro,
+            bro_selector,
+            session_id,
+            ..
         }
         | LaneSignal::TaskCompleted {
-            bro, session_id, ..
+            bro,
+            bro_selector,
+            session_id,
+            ..
         }
         | LaneSignal::TaskFailed {
-            bro, session_id, ..
+            bro,
+            bro_selector,
+            session_id,
+            ..
         }
         | LaneSignal::TaskCancelled {
-            bro, session_id, ..
-        } => (bro.as_deref(), session_id.as_deref()),
+            bro,
+            bro_selector,
+            session_id,
+            ..
+        } => (
+            bro.as_deref(),
+            bro_selector.as_deref(),
+            session_id.as_deref(),
+        ),
     };
     for lane in &mut app.lanes {
-        if lane.matches_signal(bro, session_id) {
+        if lane.matches_signal(bro, bro_selector, session_id) {
             lane.apply_signal(&sig);
         }
     }
