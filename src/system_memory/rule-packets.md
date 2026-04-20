@@ -186,6 +186,93 @@ Don't compile a packet that half-works and then paper over the holes with prose 
 
 Events are newest-first, filter by `op`, `packet_id`, `outcome`, `since`, `limit` (default 50, max 500).
 
+## Predicate reference (example JSON per op)
+
+Paste-ready snippets, grouped by category. `"op"` is the serde tag.
+
+**Equality / integer comparison**
+```json
+{"op": "Eq", "field": "tests_pass", "value": false}
+{"op": "Ge", "field": "new_warnings", "value": 1}
+{"op": "Gt", "field": "affected_services", "value": 2}
+{"op": "Le", "field": "retries", "value": 5}
+{"op": "Lt", "field": "priority", "value": 3}
+```
+
+**Float comparison**
+```json
+{"op": "GeF", "field": "coverage_pct", "value": 0.8}
+{"op": "LtF", "field": "perf_delta_ratio", "value": 1.05}
+```
+
+**Applicability (tri-state)**
+```json
+{"op": "KeyExists", "field": "migration_note"}
+{"op": "IsNull",    "field": "migration_note"}
+{"op": "IsNonNull", "field": "migration_note"}
+{"op": "IsMissing", "field": "migration_note"}
+```
+
+**Cross-field comparison**
+```json
+{"op": "FieldEq", "lhs_field": "owner", "rhs_field": "author"}
+{"op": "FieldGt", "lhs_field": "requested", "rhs_field": "approved"}
+{"op": "FieldGe", "lhs_field": "rank",      "rhs_field": "min_rank"}
+```
+
+**Named idioms**
+```json
+{"op": "RankGeFieldThreshold", "rank_field": "role_rank", "threshold_field": "resource_threshold"}
+{"op": "InRange",  "field": "perf_delta_ms", "min": 1,  "max": 5}
+{"op": "InRangeF", "field": "p99_ratio",     "min": 1.0,"max": 2.0}
+```
+
+**String predicates**
+```json
+{"op": "StringContains", "field": "message", "needle": "OOM"}
+{"op": "StringContains", "field": "message", "needle": "out of memory", "case_insensitive": true}
+```
+Multi-needle alternation (`/OOM|out of memory/i`) composes via `Any`:
+```json
+{"op": "Any", "args": [
+  {"op": "StringContains", "field": "message", "needle": "OOM",           "case_insensitive": true},
+  {"op": "StringContains", "field": "message", "needle": "out of memory", "case_insensitive": true}
+]}
+```
+
+**Logical composition**
+```json
+{"op": "All", "args": [<pred>, <pred>, ...]}
+{"op": "Any", "args": [<pred>, <pred>, ...]}
+{"op": "Not", "arg":  <pred>}
+{"op": "True"}
+{"op": "False"}
+```
+
+**Quantified collection predicates**
+```json
+{"op": "ForAll", "path": "tools[*]", "pred": {"op": "IsNonNull", "field": "description"}}
+{"op": "Exists", "path": "findings[*]", "pred": {"op": "Eq", "field": "severity", "value": "critical"}}
+{"op": "CountCmp", "path": "errors[*]", "compare": "gt", "value": 0}
+```
+
+For primitive array elements (strings/ints/bools), the predicate sees `{"$": element}`:
+```json
+{"op": "ForAll", "path": "tags[*]", "pred": {"op": "IsNonNull", "field": "$"}}
+```
+
+**Packet composition**
+```json
+{"op": "Apply", "packet_id": "packet-a1b2c3d4", "expect": ["breaking"]}
+```
+With field remapping:
+```json
+{"op": "Apply",
+ "packet_id": "packet-a1b2c3d4",
+ "expect": ["privileged"],
+ "entity_map": {"role": "actor_role", "resource": "target"}}
+```
+
 ## Phase-next gaps
 
 - `bbox_merge` via behavioral equivalence — merge two packets by clustering rules that fire identically on a witness set
