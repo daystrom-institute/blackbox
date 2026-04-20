@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rmcp::schemars;
@@ -221,7 +222,9 @@ pub struct AuditParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EventsParams {
-    /// Filter by operation: `compile`, `apply`, `audit`, `gap`.
+    /// Filter by operation: `compile`, `apply`, `audit`, `gap`,
+    /// `repair_candidate` (emitted by the self-heal scanner when
+    /// `PACKET_SELF_HEAL_ENABLED=true`).
     #[serde(default)]
     pub op: Option<String>,
     /// Filter by packet id (canonical `packet-<8hex>` or bare hex).
@@ -2441,6 +2444,312 @@ fn normalize_id(id: &str) -> String {
     }
 }
 
+// ── Self-heal scanner ─────────────────────────────────────────────
+//
+// A periodic read-only walk over the packet event log that flags
+// candidates for repair: packets whose applies miss too often (no-match
+// rate above threshold) or whose audits show fidelity drift. Emits
+// `op="repair_candidate"` events; does NOT auto-dispatch. An orchestrator
+// or the human operator decides what to do with the signal.
+//
+// Off by default. Enable via `PACKET_SELF_HEAL_ENABLED=true`.
+//
+// This is intentionally scanner-only. A future revision may add an
+// opt-in dispatcher that spawns an AST-repair agent when a candidate
+// fires; that's its own feature and lives behind a separate flag.
+
+const ENV_SELF_HEAL_ENABLED: &str = "PACKET_SELF_HEAL_ENABLED";
+const ENV_SELF_HEAL_INTERVAL_SECS: &str = "PACKET_SELF_HEAL_INTERVAL_SECS";
+const ENV_SELF_HEAL_WINDOW_HOURS: &str = "PACKET_SELF_HEAL_WINDOW_HOURS";
+const ENV_SELF_HEAL_NO_MATCH_THRESHOLD: &str = "PACKET_SELF_HEAL_NO_MATCH_THRESHOLD";
+const ENV_SELF_HEAL_FIDELITY_THRESHOLD: &str = "PACKET_SELF_HEAL_FIDELITY_THRESHOLD";
+const ENV_SELF_HEAL_MIN_APPLIES: &str = "PACKET_SELF_HEAL_MIN_APPLIES";
+const ENV_SELF_HEAL_COOLDOWN_HOURS: &str = "PACKET_SELF_HEAL_COOLDOWN_HOURS";
+
+/// Default interval between scanner ticks when the env var is unset.
+/// Hourly is cheap for a log-walk and matches the scale at which
+/// packet behaviour drifts meaningfully.
+const DEFAULT_INTERVAL_SECS: u64 = 3600;
+const DEFAULT_WINDOW_HOURS: u64 = 24;
+const DEFAULT_NO_MATCH_THRESHOLD: f32 = 0.2;
+const DEFAULT_FIDELITY_THRESHOLD: f32 = 0.9;
+const DEFAULT_MIN_APPLIES: usize = 5;
+const DEFAULT_COOLDOWN_HOURS: u64 = 24;
+
+#[derive(Debug, Clone)]
+pub struct ScannerConfig {
+    pub enabled: bool,
+    pub interval: Duration,
+    /// Trailing window over which apply / audit events are aggregated.
+    pub window: Duration,
+    /// Fraction of applies that must be no_match to flag (e.g. 0.2 = 20%).
+    pub no_match_threshold: f32,
+    /// Fidelity floor — the most recent audit below this flags the packet.
+    pub fidelity_threshold: f32,
+    /// Minimum apply count in the window before no_match_rate is trusted.
+    /// Prevents flagging packets that have only been tried once or twice.
+    pub min_apply_samples: usize,
+    /// Suppression window after a candidate event fires for a packet, so
+    /// the same packet isn't spammed every tick until the operator acts.
+    pub repair_cooldown: Duration,
+}
+
+impl Default for ScannerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
+            window: Duration::from_secs(DEFAULT_WINDOW_HOURS * 3600),
+            no_match_threshold: DEFAULT_NO_MATCH_THRESHOLD,
+            fidelity_threshold: DEFAULT_FIDELITY_THRESHOLD,
+            min_apply_samples: DEFAULT_MIN_APPLIES,
+            repair_cooldown: Duration::from_secs(DEFAULT_COOLDOWN_HOURS * 3600),
+        }
+    }
+}
+
+impl ScannerConfig {
+    pub fn from_env() -> Self {
+        fn flag(name: &str) -> Option<bool> {
+            std::env::var(name).ok().map(|v| {
+                let v = v.to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+        }
+        fn u64_env(name: &str) -> Option<u64> {
+            std::env::var(name).ok().and_then(|v| v.parse().ok())
+        }
+        fn f32_env(name: &str) -> Option<f32> {
+            std::env::var(name).ok().and_then(|v| v.parse().ok())
+        }
+        fn usize_env(name: &str) -> Option<usize> {
+            std::env::var(name).ok().and_then(|v| v.parse().ok())
+        }
+
+        let mut cfg = ScannerConfig::default();
+        if let Some(on) = flag(ENV_SELF_HEAL_ENABLED) {
+            cfg.enabled = on;
+        }
+        if let Some(s) = u64_env(ENV_SELF_HEAL_INTERVAL_SECS) {
+            cfg.interval = Duration::from_secs(s.max(10));
+        }
+        if let Some(h) = u64_env(ENV_SELF_HEAL_WINDOW_HOURS) {
+            cfg.window = Duration::from_secs(h.max(1) * 3600);
+        }
+        if let Some(t) = f32_env(ENV_SELF_HEAL_NO_MATCH_THRESHOLD) {
+            cfg.no_match_threshold = t.clamp(0.0, 1.0);
+        }
+        if let Some(t) = f32_env(ENV_SELF_HEAL_FIDELITY_THRESHOLD) {
+            cfg.fidelity_threshold = t.clamp(0.0, 1.0);
+        }
+        if let Some(n) = usize_env(ENV_SELF_HEAL_MIN_APPLIES) {
+            cfg.min_apply_samples = n;
+        }
+        if let Some(h) = u64_env(ENV_SELF_HEAL_COOLDOWN_HOURS) {
+            cfg.repair_cooldown = Duration::from_secs(h * 3600);
+        }
+        cfg
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepairCandidate {
+    pub packet_id: String,
+    pub domain: Option<String>,
+    /// Machine-readable reason tags: `"high_no_match_rate"`, `"low_fidelity"`.
+    pub reasons: Vec<String>,
+    pub apply_count: usize,
+    pub no_match_count: usize,
+    pub no_match_rate: Option<f32>,
+    pub fidelity: Option<f32>,
+    pub last_audit_timestamp: Option<String>,
+}
+
+/// Subtract `dur` from `now` in ISO-8601 lexicographic space. We use
+/// string comparison on ISO-8601 timestamps (already done in
+/// `list_events`), so the cutoff is a string too. Returns the cutoff
+/// timestamp. On clock parse failure, returns `None` — the caller should
+/// fall back to "keep everything".
+fn window_cutoff(now_iso: &str, dur: Duration) -> Option<String> {
+    let now = chrono::DateTime::parse_from_rfc3339(now_iso).ok()?;
+    let cutoff = now.checked_sub_signed(chrono::Duration::from_std(dur).ok()?)?;
+    Some(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// Pure function. Given a newest-first slice of events and a config,
+/// return the packets that qualify for repair this tick. Events older
+/// than the window are ignored. Packets with a recent
+/// `repair_candidate` event inside the cooldown are skipped.
+pub fn find_repair_candidates(
+    events: &[PacketEvent],
+    config: &ScannerConfig,
+    now_iso: &str,
+) -> Vec<RepairCandidate> {
+    let cutoff = window_cutoff(now_iso, config.window);
+    let cooldown_cutoff = window_cutoff(now_iso, config.repair_cooldown);
+
+    // Aggregate per packet_id.
+    struct Agg {
+        domain: Option<String>,
+        applies: usize,
+        no_matches: usize,
+        latest_fidelity: Option<f32>,
+        latest_audit_ts: Option<String>,
+        latest_candidate_ts: Option<String>,
+    }
+    let mut agg: BTreeMap<String, Agg> = BTreeMap::new();
+    for ev in events {
+        let Some(pid) = ev.packet_id.as_ref() else {
+            continue;
+        };
+        let in_window = match &cutoff {
+            Some(c) => ev.timestamp.as_str() >= c.as_str(),
+            None => true,
+        };
+
+        let slot = agg.entry(pid.clone()).or_insert_with(|| Agg {
+            domain: ev.domain.clone(),
+            applies: 0,
+            no_matches: 0,
+            latest_fidelity: None,
+            latest_audit_ts: None,
+            latest_candidate_ts: None,
+        });
+        if slot.domain.is_none() {
+            slot.domain = ev.domain.clone();
+        }
+
+        // Cooldown tracking always looks at the latest candidate
+        // regardless of window, so a stale-but-recent candidate still
+        // suppresses re-flag.
+        if ev.op == "repair_candidate" {
+            if slot
+                .latest_candidate_ts
+                .as_deref()
+                .is_none_or(|t| t < ev.timestamp.as_str())
+            {
+                slot.latest_candidate_ts = Some(ev.timestamp.clone());
+            }
+            continue;
+        }
+
+        if !in_window {
+            continue;
+        }
+
+        match ev.op.as_str() {
+            "apply" => {
+                slot.applies += 1;
+                if ev.outcome == "no_match" {
+                    slot.no_matches += 1;
+                }
+            }
+            "audit" => {
+                // Latest audit wins (events are newest-first, so first
+                // audit we see for this packet is the freshest).
+                if slot.latest_audit_ts.is_none() {
+                    if let Some(f) = ev.details.get("fidelity").and_then(|v| v.as_f64()) {
+                        slot.latest_fidelity = Some(f as f32);
+                        slot.latest_audit_ts = Some(ev.timestamp.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for (pid, a) in agg {
+        // Skip packets still inside cooldown.
+        if let (Some(ts), Some(cd)) = (&a.latest_candidate_ts, &cooldown_cutoff) {
+            if ts.as_str() >= cd.as_str() {
+                continue;
+            }
+        }
+
+        let no_match_rate = if a.applies >= config.min_apply_samples {
+            Some(a.no_matches as f32 / a.applies as f32)
+        } else {
+            None
+        };
+
+        let mut reasons: Vec<String> = Vec::new();
+        if let Some(rate) = no_match_rate {
+            if rate >= config.no_match_threshold {
+                reasons.push("high_no_match_rate".to_string());
+            }
+        }
+        if let Some(f) = a.latest_fidelity {
+            if f < config.fidelity_threshold {
+                reasons.push("low_fidelity".to_string());
+            }
+        }
+        if reasons.is_empty() {
+            continue;
+        }
+
+        out.push(RepairCandidate {
+            packet_id: pid,
+            domain: a.domain,
+            reasons,
+            apply_count: a.applies,
+            no_match_count: a.no_matches,
+            no_match_rate,
+            fidelity: a.latest_fidelity,
+            last_audit_timestamp: a.latest_audit_ts,
+        });
+    }
+    out
+}
+
+impl Packets {
+    /// One scanner pass. Reads the recent event log, flags candidates,
+    /// writes one `op="repair_candidate"` event per candidate. Returns
+    /// the list of candidates flagged this tick.
+    ///
+    /// Called on a timer by the main-process background task when
+    /// `PACKET_SELF_HEAL_ENABLED=true`. Also exposed for direct
+    /// invocation from tests / operators.
+    pub fn scanner_step(&self, config: &ScannerConfig) -> Result<Vec<RepairCandidate>> {
+        // Pull a generous slice of the event log. The default 50 is too
+        // small for aggregation; 10_000 keeps I/O bounded while giving
+        // enough history to compute rates over a 24h window even on
+        // busy installations.
+        let events = self.list_events(None, None, None, None, 10_000)?;
+        let now = crate::util::now_iso();
+        let candidates = find_repair_candidates(&events, config, &now);
+
+        for cand in &candidates {
+            let mut details = serde_json::Map::new();
+            details.insert("reasons".into(), serde_json::json!(cand.reasons));
+            details.insert("apply_count".into(), serde_json::json!(cand.apply_count));
+            details.insert("no_match_count".into(), serde_json::json!(cand.no_match_count));
+            if let Some(r) = cand.no_match_rate {
+                details.insert("no_match_rate".into(), serde_json::json!(r));
+            }
+            if let Some(f) = cand.fidelity {
+                details.insert("fidelity".into(), serde_json::json!(f));
+            }
+            if let Some(ts) = &cand.last_audit_timestamp {
+                details.insert("last_audit_timestamp".into(), serde_json::json!(ts));
+            }
+            details.insert(
+                "window_hours".into(),
+                serde_json::json!(config.window.as_secs() / 3600),
+            );
+
+            let mut ev = PacketEvent::now("repair_candidate", "flagged")
+                .with_packet_id(cand.packet_id.clone());
+            if let Some(d) = &cand.domain {
+                ev = ev.with_domain(d.clone());
+            }
+            ev = ev.with_details(serde_json::Value::Object(details));
+            self.append_event(&ev);
+        }
+        Ok(candidates)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3037,6 +3346,165 @@ mod tests {
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].id, "packet-22222222");
         assert_eq!(deduped[1].id, "packet-33333333");
+    }
+
+    #[test]
+    fn self_heal_scanner_flags_and_dedups() {
+        // Synthetic event stream covering the three cases the scanner
+        // cares about:
+        //   A. high no_match rate, enough samples → flag
+        //   B. low fidelity from latest audit → flag
+        //   C. noisy but low-sample (below min_apply_samples) → don't flag
+        //   D. recent repair_candidate within cooldown → suppress
+        //
+        // The scanner consumes events newest-first (matching list_events).
+        // We construct timestamps explicitly so the test is independent of
+        // wall clock.
+
+        fn ev(op: &str, outcome: &str, pid: &str, ts: &str, details: serde_json::Value) -> PacketEvent {
+            let mut e = PacketEvent::now(op, outcome);
+            e.timestamp = ts.to_string();
+            e.packet_id = Some(pid.to_string());
+            e.domain = Some(format!("dom-{pid}"));
+            e.details = details;
+            e
+        }
+
+        let now = "2026-04-20T12:00:00Z";
+        let in_window = "2026-04-20T06:00:00Z"; // 6h ago
+        let out_of_window = "2026-04-18T00:00:00Z"; // >24h
+
+        let mut events: Vec<PacketEvent> = Vec::new();
+
+        // A: 8 applies in window, 4 no_match → 0.5 no_match rate
+        for i in 0..4 {
+            events.push(ev(
+                "apply",
+                "no_match",
+                "packet-aaaaaaaa",
+                &format!("2026-04-20T0{}:30:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+        for i in 0..4 {
+            events.push(ev(
+                "apply",
+                "ok",
+                "packet-aaaaaaaa",
+                &format!("2026-04-20T0{}:45:00Z", i + 1),
+                serde_json::json!({"mode": "first"}),
+            ));
+        }
+
+        // B: 6 applies all ok, but audit fidelity 0.7
+        for i in 0..6 {
+            events.push(ev(
+                "apply",
+                "ok",
+                "packet-bbbbbbbb",
+                &format!("2026-04-20T0{}:00:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+        events.push(ev(
+            "audit",
+            "low_fidelity",
+            "packet-bbbbbbbb",
+            in_window,
+            serde_json::json!({"fidelity": 0.7, "total": 10, "correct": 7}),
+        ));
+
+        // C: only 2 applies, both no_match — below min_apply_samples (5),
+        // should NOT flag despite 100% no_match rate
+        for i in 0..2 {
+            events.push(ev(
+                "apply",
+                "no_match",
+                "packet-cccccccc",
+                &format!("2026-04-20T0{}:00:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+
+        // D: same shape as A, but a repair_candidate event 2h ago
+        // should suppress re-flag (cooldown default 24h).
+        for i in 0..4 {
+            events.push(ev(
+                "apply",
+                "no_match",
+                "packet-dddddddd",
+                &format!("2026-04-20T0{}:00:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+        for i in 0..4 {
+            events.push(ev(
+                "apply",
+                "ok",
+                "packet-dddddddd",
+                &format!("2026-04-20T0{}:30:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+        events.push(ev(
+            "repair_candidate",
+            "flagged",
+            "packet-dddddddd",
+            "2026-04-20T10:00:00Z", // 2h ago, inside cooldown
+            serde_json::json!({"reasons": ["high_no_match_rate"]}),
+        ));
+
+        // An out-of-window apply that should be ignored entirely.
+        events.push(ev(
+            "apply",
+            "no_match",
+            "packet-aaaaaaaa",
+            out_of_window,
+            serde_json::json!({}),
+        ));
+
+        // Sort newest-first (mirrors list_events shape).
+        events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+        let config = ScannerConfig::default();
+        let candidates = find_repair_candidates(&events, &config, now);
+
+        // A and B fire; C suppressed by min_apply_samples; D suppressed by cooldown.
+        assert_eq!(
+            candidates.len(),
+            2,
+            "expected A and B, got: {:?}",
+            candidates.iter().map(|c| &c.packet_id).collect::<Vec<_>>()
+        );
+
+        let a = candidates
+            .iter()
+            .find(|c| c.packet_id == "packet-aaaaaaaa")
+            .expect("packet-aaaaaaaa flagged");
+        assert!(a.reasons.contains(&"high_no_match_rate".to_string()));
+        assert_eq!(a.apply_count, 8);
+        assert_eq!(a.no_match_count, 4);
+        assert_eq!(a.no_match_rate, Some(0.5));
+
+        let b = candidates
+            .iter()
+            .find(|c| c.packet_id == "packet-bbbbbbbb")
+            .expect("packet-bbbbbbbb flagged");
+        assert!(b.reasons.contains(&"low_fidelity".to_string()));
+        assert_eq!(b.fidelity, Some(0.7));
+
+        // Confirm scanner_step persists events to the log.
+        let (_dir, store) = tmp_packets();
+        for e in &events {
+            store.append_event(e);
+        }
+        let written = store.scanner_step(&config).unwrap();
+        assert_eq!(written.len(), 2);
+        let log = store
+            .list_events(Some("repair_candidate"), None, None, None, 50)
+            .unwrap();
+        // Two we just wrote PLUS the synthetic one from the input stream.
+        assert_eq!(log.len(), 3);
     }
 
     #[test]

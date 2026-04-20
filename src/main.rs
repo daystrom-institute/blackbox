@@ -41,7 +41,7 @@ use notes::Notes;
 use orchestration::providers::{ExecOpts, Provider};
 use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
-use packets::Packets;
+use packets::{Packets, ScannerConfig};
 use threads::Threads;
 
 // ---------------------------------------------------------------------------
@@ -484,7 +484,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_packet_events",
-        description = "Query the packet operation log — every compile / apply / audit / gap event the daemon has recorded. Use to investigate packet behavior over time: low-fidelity audits, high no_match rates, compile failures, authoring gaps. Filter by op, packet_id, outcome, or since. Returns newest-first up to `limit` (default 50, max 500)."
+        description = "Query the packet operation log — every compile / apply / audit / gap event the daemon has recorded, plus `repair_candidate` events emitted by the self-heal scanner when enabled. Use to investigate packet behavior over time: low-fidelity audits, high no_match rates, compile failures, authoring gaps, and packets the scanner has flagged for repair. Filter by op (compile / apply / audit / gap / repair_candidate), packet_id, outcome, or since. Returns newest-first up to `limit` (default 50, max 500)."
     )]
     fn bbox_packet_events(&self, Parameters(p): Parameters<EventsParams>) -> CallToolResult {
         Self::run("bbox_packet_events", || {
@@ -2848,6 +2848,54 @@ async fn main() -> anyhow::Result<()> {
         tail_tx: tail_tx.clone(),
         store_dir: store_dir.clone(),
     });
+
+    // Packet self-heal scanner — off by default. Walks recent
+    // packet events on an interval, flags candidates (high no_match
+    // rate, low audit fidelity) by writing `op="repair_candidate"`
+    // events. Does NOT dispatch repair agents — that's a separate
+    // feature gated behind its own flag (not yet implemented).
+    let scanner_config = ScannerConfig::from_env();
+    if scanner_config.enabled {
+        tracing::info!(
+            interval_secs = scanner_config.interval.as_secs(),
+            window_hours = scanner_config.window.as_secs() / 3600,
+            no_match_threshold = scanner_config.no_match_threshold,
+            fidelity_threshold = scanner_config.fidelity_threshold,
+            "packet self-heal scanner: enabled"
+        );
+        let shared_for_scanner = shared.clone();
+        tokio::spawn(async move {
+            let cfg = scanner_config;
+            let mut ticker = tokio::time::interval(cfg.interval);
+            // Discard the immediate t=0 tick; run the first pass after
+            // one interval so short-interval dev setups don't stampede
+            // at startup.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let result = {
+                    let guard = shared_for_scanner.packets.read();
+                    guard.scanner_step(&cfg)
+                };
+                match result {
+                    Ok(cands) if !cands.is_empty() => {
+                        tracing::info!(
+                            flagged = cands.len(),
+                            "packet self-heal scanner: flagged repair candidates"
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::debug!("packet self-heal scanner: no candidates this tick");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "packet self-heal scanner: tick failed");
+                    }
+                }
+            }
+        });
+    } else {
+        tracing::debug!("packet self-heal scanner: disabled");
+    }
 
     // MCP service
     let port: u16 = std::env::var("BBOX_PORT")

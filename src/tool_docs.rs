@@ -303,7 +303,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_packet_events",
         category: ToolCategory::Packets,
-        summary: "Query the packet operation log — every compile / apply / audit / gap event the daemon has recorded. Use to investigate packet behavior over time: low-fidelity audits, high no_match rates, compile failures, authoring gaps. Filter by op, packet_id, outcome, or since. Returns newest-first up to `limit` (default 50, max 500).",
+        summary: "Query the packet operation log — every compile / apply / audit / gap event the daemon has recorded, plus `repair_candidate` events emitted by the self-heal scanner when enabled. Use to investigate packet behavior over time: low-fidelity audits, high no_match rates, compile failures, authoring gaps, and packets the scanner has flagged for repair. Filter by op (compile / apply / audit / gap / repair_candidate), packet_id, outcome, or since. Returns newest-first up to `limit` (default 50, max 500).",
         when_to_use: "Diagnostic surface for the packet subsystem. Use when a packet is behaving unexpectedly, when you want to see which domains have the highest compile error rate, or when aggregating authoring gaps to prioritize new AST primitives.",
         example: Some(r#"bbox_packet_events(op="gap", limit=20)"#),
     },
