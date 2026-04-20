@@ -1,4 +1,5 @@
 use parking_lot::{Mutex, MutexGuard};
+use rmcp::schemars;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -30,11 +31,76 @@ fn default_one() -> u32 {
 pub struct Teamplate {
     pub name: String,
     pub members: Vec<TeamplateMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisor: Option<TeamAdvisorConfig>,
 }
 
 // ---------------------------------------------------------------------------
 // Team (live instance)
 // ---------------------------------------------------------------------------
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    strum::EnumString,
+    strum::AsRefStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum AdvisorMode {
+    Blocking,
+    Background,
+}
+
+impl Default for AdvisorMode {
+    fn default() -> Self {
+        Self::Blocking
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamAdvisorConfig {
+    pub brofile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    pub charter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub halt_conditions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_conditions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<f64>,
+    #[serde(default)]
+    pub mode: AdvisorMode,
+}
+
+impl TeamAdvisorConfig {
+    pub fn display_name(&self) -> String {
+        self.alias
+            .clone()
+            .unwrap_or_else(|| self.brofile.clone())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamAdvisor {
+    pub name: String,
+    pub config: TeamAdvisorConfig,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub task_history: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamMember {
@@ -51,6 +117,8 @@ pub struct Team {
     pub name: String,
     pub teamplate: String,
     pub members: Vec<TeamMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisor: Option<TeamAdvisor>,
     pub project_dir: Option<String>,
     pub created_at: u64,
 }
@@ -179,6 +247,12 @@ pub fn instantiate_team(
         name: team_name.to_string(),
         teamplate: tp.name.clone(),
         members,
+        advisor: tp.advisor.clone().map(|config| TeamAdvisor {
+            name: config.display_name(),
+            config,
+            session_id: None,
+            task_history: vec![],
+        }),
         project_dir: project_dir.map(String::from),
         created_at: super::now_ms(),
     };
@@ -360,6 +434,7 @@ mod tests {
                     count: 1,
                 },
             ],
+            advisor: None,
         };
         save_teamplate(&tp, "global", dir.path(), None);
         let loaded = resolve_teamplate("review-panel", dir.path(), None);
@@ -386,6 +461,7 @@ mod tests {
                     count: 1,
                 },
             ],
+            advisor: None,
         };
 
         let team = instantiate_team(&tp, "test-team", Some("/tmp/proj"), dir.path());
@@ -420,6 +496,7 @@ mod tests {
                     task_history: vec![],
                 },
             ],
+            advisor: None,
             project_dir: None,
             created_at: 0,
         }];
@@ -447,6 +524,7 @@ mod tests {
                     session_id: Some("sid-red".into()),
                     task_history: vec![],
                 }],
+                advisor: None,
                 project_dir: None,
                 created_at: 0,
             },
@@ -459,6 +537,7 @@ mod tests {
                     session_id: Some("sid-blue".into()),
                     task_history: vec![],
                 }],
+                advisor: None,
                 project_dir: None,
                 created_at: 0,
             },
@@ -487,6 +566,7 @@ mod tests {
                 session_id: None,
                 task_history: vec![],
             }],
+            advisor: None,
             project_dir: None,
             created_at: 0,
         }];
@@ -507,6 +587,7 @@ mod tests {
                 session_id: None,
                 task_history: vec!["task-123".into()],
             }],
+            advisor: None,
             project_dir: None,
             created_at: 0,
         };
@@ -538,6 +619,7 @@ mod tests {
                 session_id: Some("pending".into()),
                 task_history: vec!["task-abc".into()],
             }],
+            advisor: None,
             project_dir: None,
             created_at: 0,
         };
@@ -562,6 +644,7 @@ mod tests {
                 alias: None,
                 count: 1,
             }],
+            advisor: None,
         };
         let _team = instantiate_team(&tp, "to-dissolve", None, dir.path());
         assert!(load_team("to-dissolve", dir.path()).is_some());

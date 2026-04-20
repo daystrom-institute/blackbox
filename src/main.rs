@@ -133,7 +133,7 @@ use knowledge::{
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
-    PacketListParams, packet_matches_query, packet_summary,
+    PacketListParams, apply_with as apply_packet_with, packet_matches_query, packet_summary,
 };
 use threads::{ThreadListParams, ThreadParams};
 
@@ -723,6 +723,8 @@ struct TeamParams {
     scope: Option<String>,
     #[serde(default)]
     cancel_running: Option<bool>,
+    #[serde(default)]
+    advisor: Option<AdvisorSpecParams>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -732,6 +734,74 @@ struct TeamMemberSlot {
     alias: Option<String>,
     #[serde(default)]
     count: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AdvisorSpecParams {
+    /// Special brofile designated as the advisor for this team.
+    brofile: String,
+    /// Optional advisor alias; defaults to the brofile name.
+    #[serde(default)]
+    alias: Option<String>,
+    /// One-sentence or short-paragraph charter for the advisor.
+    charter: String,
+    /// Optional extra context that should stay hot across advisor rounds.
+    #[serde(default)]
+    context: Option<String>,
+    /// Halt / escalate conditions the advisor should watch for.
+    #[serde(default)]
+    halt_conditions: Option<Vec<String>>,
+    /// Exit conditions the advisor should watch for.
+    #[serde(default)]
+    exit_conditions: Option<Vec<String>>,
+    /// Optional compiled packet ID the advisor can use mechanically.
+    #[serde(default)]
+    packet_id: Option<String>,
+    /// Wait behavior for internal advisor rounds.
+    #[serde(default)]
+    mode: Option<orchestration::team::AdvisorMode>,
+    /// Optional timeout for internal advisor init/resume waits.
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdvisorMemberCheckpoint {
+    bro: Option<String>,
+    task_id: String,
+    status: String,
+    timed_out: bool,
+    keep_going: Option<String>,
+    result_snippet: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct AdvisorNoteSummary {
+    dispute_count: usize,
+    assumption_count: usize,
+    surprise_count: usize,
+    followup_count: usize,
+    blocked_count: usize,
+    learned_count: usize,
+    done_count: usize,
+    recent_unresolved: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdvisorCheckpoint {
+    wait_kind: String,
+    team_name: String,
+    teamplate: String,
+    monitored_task_ids: Vec<String>,
+    packet_id: Option<String>,
+    total_count: usize,
+    completed_count: usize,
+    failed_count: usize,
+    cancelled_count: usize,
+    timed_out_count: usize,
+    running_count: usize,
+    members: Vec<AdvisorMemberCheckpoint>,
+    notes: AdvisorNoteSummary,
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,11 +1260,25 @@ impl BlackboxServer {
         if let Some(h) = progress_handle {
             h.abort();
         }
-        if completed {
-            Self::ok_json(&orch::task_result_json(&task))
+        let result = if completed {
+            orch::task_result_json(&task)
         } else {
-            Self::ok_json(&orch::timeout_snapshot_json(&task))
+            orch::timeout_snapshot_json(&task)
+        };
+        let mut out = result;
+        if let Some(team_ref) =
+            orchestration::team::find_bro_ref_for_task(&p.task_id, &self.state.store_dir)
+        {
+            match self
+                .maybe_resume_team_advisor(&team_ref.team_name, "wait", &[out.clone()])
+                .await
+            {
+                Ok(Some(value)) => out["advisor"] = value,
+                Ok(None) => {}
+                Err(err) => out["advisor"] = json!({"error": err}),
+            }
         }
+        Self::ok_json(&out)
     }
 
     #[tool(
@@ -1257,7 +1341,19 @@ impl BlackboxServer {
             h.abort();
         }
         let all_done = results.iter().all(|r| r.get("timed_out").is_none());
-        Self::ok_json(&json!({ "all_completed": all_done, "results": results }))
+        let advisor = match p.team.as_deref() {
+            Some(team_name) => self
+                .maybe_resume_team_advisor(team_name, "when_all", &results)
+                .await,
+            None => Ok(None),
+        };
+        let mut out = json!({ "all_completed": all_done, "results": results });
+        match advisor {
+            Ok(Some(value)) => out["advisor"] = value,
+            Ok(None) => {}
+            Err(err) => out["advisor"] = json!({"error": err}),
+        }
+        Self::ok_json(&out)
     }
 
     #[tool(
@@ -1872,7 +1968,7 @@ impl BlackboxServer {
         name = "bro_team",
         description = "Manage teamplates and instantiated teams."
     )]
-    fn bro_team(&self, Parameters(p): Parameters<TeamParams>) -> CallToolResult {
+    async fn bro_team(&self, Parameters(p): Parameters<TeamParams>) -> CallToolResult {
         use orchestration::team;
         let store_dir = &self.state.store_dir;
         let scope = p.scope.as_deref().unwrap_or("global");
@@ -1902,6 +1998,14 @@ impl BlackboxServer {
                         return Self::err_text(&format!("Brofile not found: {}", m.brofile));
                     }
                 }
+                let advisor = match self.resolve_team_advisor_config(
+                    p.advisor.as_ref(),
+                    store_dir,
+                    p.project_dir.as_deref(),
+                ) {
+                    Ok(cfg) => cfg,
+                    Err(e) => return Self::err_text(&e),
+                };
                 let tp = team::Teamplate {
                     name: name.clone(),
                     members: members
@@ -1912,6 +2016,7 @@ impl BlackboxServer {
                             count: m.count.unwrap_or(1),
                         })
                         .collect(),
+                    advisor,
                 };
                 team::save_teamplate(&tp, scope, store_dir, p.project_dir.as_deref());
                 Self::ok_json(&json!({"saved": name, "scope": scope}))
@@ -1956,16 +2061,50 @@ impl BlackboxServer {
                         return Self::err_text(&format!("Brofile not found: {}", m.brofile));
                     }
                 }
+                let advisor_override = match self.resolve_team_advisor_config(
+                    p.advisor.as_ref(),
+                    store_dir,
+                    p.project_dir.as_deref(),
+                ) {
+                    Ok(cfg) => cfg,
+                    Err(e) => return Self::err_text(&e),
+                };
+                if let Some(ref cfg) = advisor_override {
+                    if orchestration::brofile::resolve_brofile(
+                        &cfg.brofile,
+                        store_dir,
+                        p.project_dir.as_deref(),
+                    )
+                    .is_none()
+                    {
+                        return Self::err_text(&format!("Brofile not found: {}", cfg.brofile));
+                    }
+                }
                 let team_name = p
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("{template}-{}", orch::now_ms()));
-                let t =
+                let mut tp = tp;
+                if advisor_override.is_some() {
+                    tp.advisor = advisor_override;
+                }
+                let mut t =
                     team::instantiate_team(&tp, &team_name, p.project_dir.as_deref(), store_dir);
+                if let Err(e) = self.initialize_team_advisor(&mut t).await {
+                    return Self::err_text(&e);
+                }
                 Self::ok_json(&json!({
                     "created": t.name,
                     "teamplate": tp.name,
                     "members": t.members.iter().map(|m| json!({"name": m.name, "brofile": m.brofile})).collect::<Vec<_>>(),
+                    "advisor": t.advisor.as_ref().map(|a| json!({
+                        "name": a.name,
+                        "brofile": a.config.brofile,
+                        "sessionId": a.session_id,
+                        "taskCount": a.task_history.len(),
+                        "packetId": a.config.packet_id,
+                        "mode": a.config.mode.as_ref(),
+                    })),
                 }))
             }
             "list" => {
@@ -1979,6 +2118,13 @@ impl BlackboxServer {
                             "memberCount": t.members.len(),
                             "createdAt": t.created_at,
                             "projectDir": t.project_dir,
+                            "advisor": t.advisor.as_ref().map(|a| json!({
+                                "name": a.name,
+                                "brofile": a.config.brofile,
+                                "sessionId": a.session_id,
+                                "packetId": a.config.packet_id,
+                                "mode": a.config.mode.as_ref(),
+                            })),
                         })
                     })
                     .collect();
@@ -2043,7 +2189,20 @@ impl BlackboxServer {
                     })
                     .collect();
                 Self::ok_json(
-                    &json!({"team": name, "teamplate": loaded_team.teamplate, "members": roster}),
+                    &json!({
+                        "team": name,
+                        "teamplate": loaded_team.teamplate,
+                        "advisor": loaded_team.advisor.as_ref().map(|a| json!({
+                            "name": a.name,
+                            "brofile": a.config.brofile,
+                            "sessionId": a.session_id,
+                            "taskCount": a.task_history.len(),
+                            "packetId": a.config.packet_id,
+                            "mode": a.config.mode.as_ref(),
+                            "charter": a.config.charter,
+                        })),
+                        "members": roster
+                    }),
                 )
             }
             _ => Self::err_text(&format!("Unknown team action: {}", p.action)),
@@ -2056,6 +2215,435 @@ impl BlackboxServer {
 // ---------------------------------------------------------------------------
 
 impl BlackboxServer {
+    fn resolve_team_advisor_config(
+        &self,
+        advisor: Option<&AdvisorSpecParams>,
+        store_dir: &Path,
+        project_dir: Option<&str>,
+    ) -> Result<Option<orchestration::team::TeamAdvisorConfig>, String> {
+        let Some(advisor) = advisor else {
+            return Ok(None);
+        };
+        if advisor.charter.trim().is_empty() {
+            return Err("advisor.charter is required and cannot be empty".into());
+        }
+        let brofile = orchestration::brofile::resolve_brofile(&advisor.brofile, store_dir, project_dir)
+            .ok_or_else(|| format!("Brofile not found: {}", advisor.brofile))?;
+        if !brofile.provider.supports_resume() {
+            return Err(format!(
+                "Advisor brofile {} uses provider {} which does not support resume",
+                advisor.brofile, brofile.provider
+            ));
+        }
+        Ok(Some(orchestration::team::TeamAdvisorConfig {
+            brofile: advisor.brofile.clone(),
+            alias: advisor.alias.clone(),
+            charter: advisor.charter.clone(),
+            context: advisor.context.clone(),
+            halt_conditions: advisor.halt_conditions.clone().unwrap_or_default(),
+            exit_conditions: advisor.exit_conditions.clone().unwrap_or_default(),
+            packet_id: advisor.packet_id.clone(),
+            timeout_seconds: advisor.timeout_seconds,
+            mode: advisor.mode.unwrap_or_default(),
+        }))
+    }
+
+    fn build_team_advisor_init_prompt(
+        &self,
+        team: &orchestration::team::Team,
+        advisor: &orchestration::team::TeamAdvisor,
+    ) -> String {
+        let member_list = team
+            .members
+            .iter()
+            .map(|m| format!("- {} ({})", m.name, m.brofile))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let halt_list = if advisor.config.halt_conditions.is_empty() {
+            "- none declared".to_string()
+        } else {
+            advisor
+                .config
+                .halt_conditions
+                .iter()
+                .map(|c| format!("- {c}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let exit_list = if advisor.config.exit_conditions.is_empty() {
+            "- none declared".to_string()
+        } else {
+            advisor
+                .config
+                .exit_conditions
+                .iter()
+                .map(|c| format!("- {c}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let context = advisor.config.context.as_deref().unwrap_or("(none)");
+        let packet_id = advisor.config.packet_id.as_deref().unwrap_or("(none)");
+        format!(
+            "You are the advisor for team \"{team_name}\".\n\n\
+Role:\n\
+- monitor big-picture progression only\n\
+- stay out of code-level execution unless explicitly asked\n\
+- use the charter, halt conditions, exit conditions, and packet result to steer\n\
+- when the checkpoint indicates drift/blockage/exit, say so plainly\n\n\
+Team members:\n{member_list}\n\n\
+Charter:\n{charter}\n\n\
+Context:\n{context}\n\n\
+Halt conditions:\n{halt_list}\n\n\
+Exit conditions:\n{exit_list}\n\n\
+Compiled packet for mechanical evaluation:\n- {packet_id}\n\n\
+From now on, you will receive structured checkpoint updates after wait boundaries.\n\
+Respond tersely with:\n\
+Status: CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET | REPLACE_BRO\n\
+Rationale: <1-3 sentences>\n\
+Next step: <one concrete steering suggestion>\n",
+            team_name = team.name,
+            member_list = member_list,
+            charter = advisor.config.charter,
+            context = context,
+            halt_list = halt_list,
+            exit_list = exit_list,
+            packet_id = packet_id,
+        )
+    }
+
+    async fn dispatch_team_advisor_prompt(
+        &self,
+        team: &mut orchestration::team::Team,
+        prompt: String,
+    ) -> Result<Value, String> {
+        let advisor = match team.advisor.as_mut() {
+            Some(a) => a,
+            None => return Ok(json!({"configured": false})),
+        };
+        let store_dir = self.state.store_dir.clone();
+        let brofile = orchestration::brofile::resolve_brofile(
+            &advisor.config.brofile,
+            &store_dir,
+            team.project_dir.as_deref(),
+        )
+        .ok_or_else(|| format!("Brofile not found: {}", advisor.config.brofile))?;
+        let env_overrides = brofile
+            .account
+            .as_ref()
+            .and_then(|a| orchestration::brofile::load_account(a, &store_dir))
+            .and_then(|a| a.env);
+        let exec_opts = if brofile.model.is_some() || brofile.effort.is_some() {
+            Some(ExecOpts {
+                model: brofile.model.clone(),
+                effort: brofile.effort.clone(),
+            })
+        } else {
+            None
+        };
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let timeout = advisor.config.timeout_seconds;
+        let provider = brofile.provider;
+        let cwd = team.project_dir.clone();
+        let task = if let Some(session_id) = advisor.session_id.clone().filter(|s| s != "pending") {
+            let ambient_ctx = orch::AmbientContext {
+                task_id: Some(task_id.clone()),
+                session_id: Some(session_id.clone()),
+                project_dir: cwd.clone(),
+                bro_name: Some(advisor.name.clone()),
+                thread_id: None,
+                work_item_id: None,
+                completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+                allow_recursion: false,
+                provider: Some(provider),
+            };
+            let wrapped_prompt = orch::apply_ambient(&prompt, &ambient_ctx);
+            let mut args = provider.build_resume_args(&session_id, &wrapped_prompt, exec_opts.as_ref());
+            let dispatch_filters = resolve_dispatch_filters(
+                provider,
+                cwd.as_deref(),
+                false,
+                &task_id,
+                brofile.filters.as_ref(),
+            );
+            args.extend(dispatch_filters.args);
+            let task = orch::spawn_task(
+                task_id.clone(),
+                provider,
+                args,
+                session_id,
+                cwd.clone(),
+                env_overrides,
+                store_dir.clone(),
+                self.state.task_store.clone(),
+                self.state.tail_tx.clone(),
+            );
+            cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+            task
+        } else {
+            let session_id = if provider == Provider::Claude {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                "pending".into()
+            };
+            let ambient_ctx = orch::AmbientContext {
+                task_id: Some(task_id.clone()),
+                session_id: Some(session_id.clone()),
+                project_dir: cwd.clone(),
+                bro_name: Some(advisor.name.clone()),
+                thread_id: None,
+                work_item_id: None,
+                completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+                allow_recursion: false,
+                provider: Some(provider),
+            };
+            let wrapped_prompt = orch::apply_brofile_lens(
+                &orch::apply_ambient(&prompt, &ambient_ctx),
+                brofile.lens.as_deref(),
+            );
+            let mut args =
+                provider.build_exec_args(&wrapped_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
+            let dispatch_filters = resolve_dispatch_filters(
+                provider,
+                cwd.as_deref(),
+                false,
+                &task_id,
+                brofile.filters.as_ref(),
+            );
+            args.extend(dispatch_filters.args);
+            let task = orch::spawn_task(
+                task_id.clone(),
+                provider,
+                args,
+                session_id,
+                cwd.clone(),
+                env_overrides,
+                store_dir.clone(),
+                self.state.task_store.clone(),
+                self.state.tail_tx.clone(),
+            );
+            cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+            task
+        };
+
+        advisor.task_history.push(task_id);
+        let completed = orch::wait_for_task_with_timeout(&task, timeout).await;
+        let session_id = task.inner.lock().session_id.clone();
+        if session_id != "pending" {
+            advisor.session_id = Some(session_id);
+        }
+        orchestration::team::save_team(team, &self.state.store_dir);
+
+        Ok(if completed {
+            orch::task_result_json(&task)
+        } else {
+            orch::timeout_snapshot_json(&task)
+        })
+    }
+
+    async fn initialize_team_advisor(
+        &self,
+        team: &mut orchestration::team::Team,
+    ) -> Result<(), String> {
+        let Some(advisor) = team.advisor.as_ref() else {
+            return Ok(());
+        };
+        if advisor.session_id.as_deref().filter(|s| *s != "pending").is_some() {
+            return Ok(());
+        }
+        let prompt = self.build_team_advisor_init_prompt(team, advisor);
+        let _ = self.dispatch_team_advisor_prompt(team, prompt).await?;
+        Ok(())
+    }
+
+    fn summarize_notes_for_tasks(&self, task_ids: &[String]) -> AdvisorNoteSummary {
+        use notes::{NoteKind, NoteResolution};
+
+        let mut summary = AdvisorNoteSummary::default();
+        let task_set: std::collections::HashSet<&str> = task_ids.iter().map(String::as_str).collect();
+        let mut recent_unresolved = Vec::new();
+
+        for note in self.state.notes.read().all().iter().rev() {
+            let Some(task_id) = note.task_id.as_deref() else {
+                continue;
+            };
+            if !task_set.contains(task_id) {
+                continue;
+            }
+            match note.kind {
+                NoteKind::Dispute => summary.dispute_count += 1,
+                NoteKind::Assumption => summary.assumption_count += 1,
+                NoteKind::Surprise => summary.surprise_count += 1,
+                NoteKind::Followup => summary.followup_count += 1,
+                NoteKind::Blocked => summary.blocked_count += 1,
+                NoteKind::Learned => summary.learned_count += 1,
+                NoteKind::Done => summary.done_count += 1,
+            }
+            if note.resolution == NoteResolution::Unresolved && recent_unresolved.len() < 5 {
+                recent_unresolved.push(format!("{}: {}", note.kind.as_ref(), note.body));
+            }
+        }
+        summary.recent_unresolved = recent_unresolved;
+        summary
+    }
+
+    fn build_advisor_checkpoint(
+        &self,
+        team: &orchestration::team::Team,
+        wait_kind: &str,
+        results: &[Value],
+    ) -> AdvisorCheckpoint {
+        let monitored_task_ids: Vec<String> = results
+            .iter()
+            .filter_map(|r| r.get("taskId").and_then(Value::as_str).map(ToString::to_string))
+            .collect();
+        let notes = self.summarize_notes_for_tasks(&monitored_task_ids);
+        let mut members = Vec::new();
+        let mut completed_count = 0usize;
+        let mut failed_count = 0usize;
+        let mut cancelled_count = 0usize;
+        let mut timed_out_count = 0usize;
+        let mut running_count = 0usize;
+
+        for result in results {
+            let status = result
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let timed_out = result.get("timed_out").is_some();
+            if timed_out {
+                timed_out_count += 1;
+                running_count += 1;
+            } else {
+                match status.as_str() {
+                    "completed" | "Completed" => completed_count += 1,
+                    "failed" | "Failed" => failed_count += 1,
+                    "cancelled" | "Cancelled" => cancelled_count += 1,
+                    _ => running_count += 1,
+                }
+            }
+            let result_snippet = result
+                .get("result")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().replace('\n', " "))
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    if s.len() > 160 {
+                        format!("{}…", &s[..160])
+                    } else {
+                        s
+                    }
+                })
+                .or_else(|| {
+                    result
+                        .get("lastAssistantSnippet")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                });
+            members.push(AdvisorMemberCheckpoint {
+                bro: result.get("bro").and_then(Value::as_str).map(ToString::to_string),
+                task_id: result
+                    .get("taskId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                status,
+                timed_out,
+                keep_going: result
+                    .get("keep_going")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                result_snippet,
+            });
+        }
+
+        AdvisorCheckpoint {
+            wait_kind: wait_kind.to_string(),
+            team_name: team.name.clone(),
+            teamplate: team.teamplate.clone(),
+            packet_id: team
+                .advisor
+                .as_ref()
+                .and_then(|a| a.config.packet_id.clone()),
+            monitored_task_ids,
+            total_count: results.len(),
+            completed_count,
+            failed_count,
+            cancelled_count,
+            timed_out_count,
+            running_count,
+            members,
+            notes,
+        }
+    }
+
+    fn apply_advisor_packet(
+        &self,
+        packet_id: &str,
+        checkpoint: &AdvisorCheckpoint,
+    ) -> Result<Value, String> {
+        let packet_store = self.state.packets.read();
+        let packet = packet_store
+            .load(packet_id)
+            .map_err(|e| format!("{e:#}"))?;
+        let entity = serde_json::to_value(checkpoint).map_err(|e| e.to_string())?;
+        let prediction = apply_packet_with(&packet, &entity, &*packet_store);
+        Ok(match prediction {
+            Some(prediction) => json!({
+                "packetId": packet.id,
+                "match": true,
+                "ruleId": prediction.rule_id,
+                "classification": prediction.classification,
+                "consequent": prediction.consequent,
+                "confidence": prediction.confidence,
+            }),
+            None => json!({
+                "packetId": packet.id,
+                "match": false,
+            }),
+        })
+    }
+
+    async fn maybe_resume_team_advisor(
+        &self,
+        team_name: &str,
+        wait_kind: &str,
+        results: &[Value],
+    ) -> Result<Option<Value>, String> {
+        let mut team = match orchestration::team::load_team(team_name, &self.state.store_dir) {
+            Some(team) => team,
+            None => return Ok(None),
+        };
+        let Some(advisor) = team.advisor.as_ref() else {
+            return Ok(None);
+        };
+        let checkpoint = self.build_advisor_checkpoint(&team, wait_kind, results);
+        let packet_eval = match advisor.config.packet_id.as_deref() {
+            Some(packet_id) => Some(self.apply_advisor_packet(packet_id, &checkpoint)?),
+            None => None,
+        };
+        let checkpoint_json = serde_json::to_string_pretty(&checkpoint).map_err(|e| e.to_string())?;
+        let packet_section = packet_eval
+            .as_ref()
+            .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
+            .unwrap_or_else(|| "{\n  \"configured\": false\n}".to_string());
+        let prompt = format!(
+            "Team wait checkpoint.\n\n\
+Checkpoint entity:\n{checkpoint_json}\n\n\
+Mechanical packet evaluation:\n{packet_section}\n\n\
+Interpret the checkpoint against the charter and respond with:\n\
+Status: CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET | REPLACE_BRO\n\
+Rationale: <1-3 sentences>\n\
+Next step: <one concrete steering suggestion>\n"
+        );
+        let advisor_result = self.dispatch_team_advisor_prompt(&mut team, prompt).await?;
+        Ok(Some(json!({
+            "checkpoint": checkpoint,
+            "packet": packet_eval,
+            "result": advisor_result,
+        })))
+    }
+
     #[allow(clippy::type_complexity)]
     fn resolve_exec_target(
         &self,
@@ -2998,6 +3586,7 @@ mod tests {
                         session_id: Some(session_id.into()),
                         task_history: vec![],
                     }],
+                    advisor: None,
                     project_dir: None,
                     created_at: 0,
                 },
@@ -3030,6 +3619,7 @@ mod tests {
                         session_id: Some(session_id.into()),
                         task_history: vec![],
                     }],
+                    advisor: None,
                     project_dir: Some(format!("/tmp/{team_name}")),
                     created_at: 0,
                 },
