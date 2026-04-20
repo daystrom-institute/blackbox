@@ -475,6 +475,29 @@ pub enum Predicate {
         min: f64,
         max: f64,
     },
+    /// **Count-matching predicate.** True iff the count of sub-predicates
+    /// that evaluate to true satisfies `count compare value`. Sibling to
+    /// `All` (count == len) and `Any` (count >= 1) but with explicit
+    /// threshold semantics. Enables "exactly K of N" and "at least K of
+    /// N" shapes that All/Any can't express without enumeration.
+    ///
+    /// Phase-6 addition motivated by E14 composition-depth findings:
+    /// three providers independently hit the "count how many composed
+    /// sub-packets classified as red" limit when encoding tallying
+    /// decisions over `Apply` nodes. The workaround — enumerating all
+    /// C(N,K) pairwise combinations — is O(2^N) in the rule count and
+    /// fails at N≥4. `CountMatches` collapses it to two rules and
+    /// generalizes beyond Apply tallies to any multi-field threshold
+    /// shape.
+    ///
+    /// Composes cleanly with `Apply` for sub-packet tallies:
+    /// `CountMatches{args:[Apply{A,red}, Apply{B,red}, Apply{C,red}],
+    ///               compare: ge, value: 2}` → true iff ≥2 concerns red.
+    CountMatches {
+        args: Vec<Predicate>,
+        compare: CmpOp,
+        value: usize,
+    },
 }
 
 // ── Classification (user-defined per-packet lattice) ─────────────
@@ -693,6 +716,12 @@ fn validate_predicate(pred: &Predicate, inside_forall: bool) -> Result<()> {
             }
             Ok(())
         }
+        Predicate::CountMatches { args, .. } => {
+            for arg in args {
+                validate_predicate(arg, inside_forall)?;
+            }
+            Ok(())
+        }
         Predicate::Not { arg } => validate_predicate(arg, inside_forall),
         Predicate::Apply {
             packet_id,
@@ -725,6 +754,11 @@ fn collect_apply_refs(pred: &Predicate, out: &mut Vec<String>) {
                 collect_apply_refs(a, out);
             }
         }
+        Predicate::CountMatches { args, .. } => {
+            for a in args {
+                collect_apply_refs(a, out);
+            }
+        }
         Predicate::Not { arg } => collect_apply_refs(arg, out),
         Predicate::ForAll { pred: inner, .. } | Predicate::Exists { pred: inner, .. } => {
             collect_apply_refs(inner, out);
@@ -748,6 +782,11 @@ fn collect_apply_by_id<'a>(pred: &'a Predicate, target: &str, out: &mut Vec<&'a 
     match pred {
         Predicate::Apply { packet_id, .. } if packet_id == target => out.push(pred),
         Predicate::All { args } | Predicate::Any { args } => {
+            for a in args {
+                collect_apply_by_id(a, target, out);
+            }
+        }
+        Predicate::CountMatches { args, .. } => {
             for a in args {
                 collect_apply_by_id(a, target, out);
             }
@@ -1280,6 +1319,17 @@ fn eval_predicate(
         Predicate::InRangeF { field, min, max } => entity_f64(entity, field)
             .map(|v| v >= *min && v <= *max)
             .unwrap_or(false),
+        Predicate::CountMatches {
+            args,
+            compare,
+            value,
+        } => {
+            let count = args
+                .iter()
+                .filter(|p| eval_predicate(p, entity, resolver, depth))
+                .count();
+            compare.apply(count, *value)
+        }
         Predicate::Apply {
             packet_id,
             expect,
@@ -4300,6 +4350,269 @@ mod tests {
                 .unwrap()
                 .rule_id,
             "ignore_default"
+        );
+    }
+
+    // ── CountMatches predicate tests ───────────────────────────────
+
+    #[test]
+    fn count_matches_counts_true_subpredicates() {
+        // 3 predicates, 2 of which match → count=2
+        let p = Predicate::CountMatches {
+            args: vec![
+                Predicate::Eq {
+                    field: "a".into(),
+                    value: Value::Bool(true),
+                },
+                Predicate::Eq {
+                    field: "b".into(),
+                    value: Value::Bool(true),
+                },
+                Predicate::Eq {
+                    field: "c".into(),
+                    value: Value::Bool(true),
+                },
+            ],
+            compare: CmpOp::Ge,
+            value: 2,
+        };
+        let two_true = serde_json::json!({"a": true, "b": true, "c": false})
+            .as_object()
+            .unwrap()
+            .clone();
+        let one_true = serde_json::json!({"a": true, "b": false, "c": false})
+            .as_object()
+            .unwrap()
+            .clone();
+        let all_true = serde_json::json!({"a": true, "b": true, "c": true})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(eval_predicate(&p, &two_true, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &one_true, &NoopResolver, 0));
+        assert!(eval_predicate(&p, &all_true, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn count_matches_exactly_k_shape() {
+        // "exactly 1 of N" uses CmpOp::Eq
+        let p = Predicate::CountMatches {
+            args: vec![
+                Predicate::Eq {
+                    field: "a".into(),
+                    value: Value::Bool(true),
+                },
+                Predicate::Eq {
+                    field: "b".into(),
+                    value: Value::Bool(true),
+                },
+                Predicate::Eq {
+                    field: "c".into(),
+                    value: Value::Bool(true),
+                },
+            ],
+            compare: CmpOp::Eq,
+            value: 1,
+        };
+        for (a, b, c, want) in [
+            (false, false, false, false), // 0 true
+            (true, false, false, true),   // 1 true
+            (true, true, false, false),   // 2 true
+            (true, true, true, false),    // 3 true
+        ] {
+            let e = serde_json::json!({"a": a, "b": b, "c": c})
+                .as_object()
+                .unwrap()
+                .clone();
+            assert_eq!(
+                eval_predicate(&p, &e, &NoopResolver, 0),
+                want,
+                "a={a},b={b},c={c}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_matches_empty_args_is_zero_count() {
+        let p = Predicate::CountMatches {
+            args: vec![],
+            compare: CmpOp::Eq,
+            value: 0,
+        };
+        let e = noop_entity();
+        assert!(eval_predicate(&p, &e, &NoopResolver, 0));
+
+        let p_ge_1 = Predicate::CountMatches {
+            args: vec![],
+            compare: CmpOp::Ge,
+            value: 1,
+        };
+        assert!(!eval_predicate(&p_ge_1, &e, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn count_matches_composes_with_apply_for_subpacket_tally() {
+        // End-to-end: compose three sub-packet Apply nodes under
+        // CountMatches to express "≥ 2 of these 3 sub-packets say red".
+        // This is the E14 use case — collapses pairwise enumeration to
+        // a single rule.
+        let (_d, packets) = tmp_packets();
+        let red_lattice = vec!["red".into(), "green".into()];
+
+        let make_red_sub = |packets: &Packets, domain: &str, field: &str| -> String {
+            let out = packets
+                .compile(&CompileParams {
+                    domain: domain.into(),
+                    scope: Some("global".into()),
+                    project: None,
+                    classification_lattice: Some(red_lattice.clone()),
+                    prefix_inference: None,
+                    rank_table: None,
+                    threshold_table: None,
+                    rank_lookup_key: None,
+                    threshold_lookup_key: None,
+                    source_ids: None,
+                    rules: json!([
+                        {
+                            "id": "red_on_true",
+                            "classification": "red",
+                            "antecedent": {"op": "Eq", "field": field, "value": true},
+                            "consequent": "RED"
+                        },
+                        {
+                            "id": "green_default",
+                            "classification": "green",
+                            "emit": "fallback",
+                            "antecedent": {"op": "True"},
+                            "consequent": "GREEN"
+                        }
+                    ]),
+                })
+                .unwrap();
+            out.split_whitespace().nth(1).unwrap().to_string()
+        };
+        let a = make_red_sub(&packets, "a-sub", "a_red");
+        let b = make_red_sub(&packets, "b-sub", "b_red");
+        let c = make_red_sub(&packets, "c-sub", "c_red");
+
+        // Master uses CountMatches over three Apply nodes.
+        let out = packets
+            .compile(&CompileParams {
+                domain: "tally".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: Some(vec!["block".into(), "review".into(), "ok".into()]),
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([
+                    {
+                        "id": "block_2plus_red",
+                        "classification": "block",
+                        "antecedent": {
+                            "op": "CountMatches",
+                            "args": [
+                                {"op": "Apply", "packet_id": a, "expect": ["red"]},
+                                {"op": "Apply", "packet_id": b, "expect": ["red"]},
+                                {"op": "Apply", "packet_id": c, "expect": ["red"]}
+                            ],
+                            "compare": "ge",
+                            "value": 2
+                        },
+                        "consequent": "BLOCK"
+                    },
+                    {
+                        "id": "review_1_red",
+                        "classification": "review",
+                        "antecedent": {
+                            "op": "CountMatches",
+                            "args": [
+                                {"op": "Apply", "packet_id": a, "expect": ["red"]},
+                                {"op": "Apply", "packet_id": b, "expect": ["red"]},
+                                {"op": "Apply", "packet_id": c, "expect": ["red"]}
+                            ],
+                            "compare": "eq",
+                            "value": 1
+                        },
+                        "consequent": "REVIEW"
+                    },
+                    {
+                        "id": "ok_default",
+                        "classification": "ok",
+                        "emit": "fallback",
+                        "antecedent": {"op": "True"},
+                        "consequent": "OK"
+                    }
+                ]),
+            })
+            .unwrap();
+        let master_id = out.split_whitespace().nth(1).unwrap().to_string();
+        let master = packets.load(&master_id).unwrap();
+
+        // All green
+        let all_green = json!({"a_red": false, "b_red": false, "c_red": false});
+        assert_eq!(
+            apply_with(&master, &all_green, &packets).unwrap().rule_id,
+            "ok_default"
+        );
+        // One red
+        let one_red = json!({"a_red": true, "b_red": false, "c_red": false});
+        assert_eq!(
+            apply_with(&master, &one_red, &packets).unwrap().rule_id,
+            "review_1_red"
+        );
+        // Two red
+        let two_red = json!({"a_red": true, "b_red": true, "c_red": false});
+        assert_eq!(
+            apply_with(&master, &two_red, &packets).unwrap().rule_id,
+            "block_2plus_red"
+        );
+        // Three red
+        let three_red = json!({"a_red": true, "b_red": true, "c_red": true});
+        assert_eq!(
+            apply_with(&master, &three_red, &packets).unwrap().rule_id,
+            "block_2plus_red"
+        );
+    }
+
+    #[test]
+    fn count_matches_compile_validates_nested_apply_refs() {
+        // CountMatches containing Apply with a missing packet_id should
+        // fail compile (same invariant as top-level Apply).
+        let (_d, packets) = tmp_packets();
+        let err = packets
+            .compile(&CompileParams {
+                domain: "test".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: None,
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([{
+                    "id": "fail_nested_ref",
+                    "antecedent": {
+                        "op": "CountMatches",
+                        "args": [
+                            {"op": "Apply", "packet_id": "packet-missing1", "expect": ["red"]}
+                        ],
+                        "compare": "ge",
+                        "value": 1
+                    },
+                    "consequent": "X"
+                }]),
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("packet-missing1"),
+            "expected missing-packet error via nested CountMatches, got: {msg}"
         );
     }
 

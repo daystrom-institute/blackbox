@@ -67,6 +67,7 @@ Packets are for *structured domains that admit generators*. If priors already pr
 **Logical composition:**
 - `All{args: [...]}` / `Any{args: [...]}` / `Not{arg: ...}`
 - `True` / `False` — constants
+- `CountMatches{args: [...], compare, value}` — counts how many sub-predicates evaluate to true, compares against `value` (compare: `lt/le/eq/ge/gt`). Sibling to All (count == len) and Any (count >= 1) but with explicit threshold semantics. Natural for "exactly K of N" and "at least K of N" shapes — especially tallying sub-packet verdicts via `Apply`. Use this instead of enumerating all C(N,K) pairwise combinations; collapses a tally to one rule and generalizes to any N.
 
 **Quantified collection predicates (phase 4):**
 - `ForAll{path, pred}` — every element at `path` satisfies `pred`. Empty/missing collection is vacuously true.
@@ -248,6 +249,23 @@ Multi-needle alternation (`/OOM|out of memory/i`) composes via `Any`:
 {"op": "True"}
 {"op": "False"}
 ```
+
+**Count-matching (tally shape)** — how many of N sub-predicates are true, compared to a threshold:
+```json
+{"op": "CountMatches", "args": [<pred>, <pred>, <pred>], "compare": "ge", "value": 2}
+```
+Classic use — "≥ 2 of these 3 concern packets classify red" via `Apply` composition:
+```json
+{"op": "CountMatches",
+ "args": [
+   {"op": "Apply", "packet_id": "packet-safety",   "expect": ["red"]},
+   {"op": "Apply", "packet_id": "packet-coverage", "expect": ["red"]},
+   {"op": "Apply", "packet_id": "packet-scope",    "expect": ["red"]}
+ ],
+ "compare": "ge",
+ "value": 2}
+```
+"Exactly 1 of N" uses `"compare": "eq", "value": 1` — natural for "one concern red → REVIEW" decisions. Use CountMatches instead of enumerating C(N,K) pairwise `All` combinations; it scales and generalizes.
 
 **Quantified collection predicates**
 ```json
