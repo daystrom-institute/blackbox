@@ -566,6 +566,19 @@ pub fn review_prefix_inference() -> BTreeMap<String, String> {
 /// Codex flagged this as the hidden-policy-most-likely-to-surprise in
 /// phase-3 review (thread-cc7ff97d).
 fn infer_classification(id: &str, prefix_map: &BTreeMap<String, String>) -> Option<String> {
+    infer_classification_detailed(id, prefix_map).map(|(c, _)| c)
+}
+
+/// Variant of `infer_classification` that also returns the matching
+/// prefix. Used by error messages so that a classification-lattice
+/// mismatch can name the inferred prefix path explicitly, which was
+/// the hidden-feature-most-likely-to-surprise per E14 (Gemini tripped
+/// on a `review_` prefix auto-classifying as `manual` without seeing
+/// the inference step in the error).
+fn infer_classification_detailed<'a>(
+    id: &str,
+    prefix_map: &'a BTreeMap<String, String>,
+) -> Option<(String, &'a str)> {
     let mut best: Option<(&str, &str)> = None;
     for (prefix, class) in prefix_map {
         if id.starts_with(prefix.as_str()) {
@@ -578,7 +591,7 @@ fn infer_classification(id: &str, prefix_map: &BTreeMap<String, String>) -> Opti
             }
         }
     }
-    best.map(|(_, c)| c.to_string())
+    best.map(|(p, c)| (c.to_string(), p))
 }
 
 // ── Emit (rule firing semantics in apply_all) ────────────────────
@@ -839,22 +852,38 @@ impl RuleInput {
 
         // 1. Explicit classification wins; 2. infer from id prefix;
         // 3. fall back to the lowest-priority classification in the lattice.
-        let classification = self
-            .classification
-            .or_else(|| infer_classification(&self.id, prefix_map))
-            .or_else(|| lattice.last().cloned())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
+        // Track the source so error messages can name the inference path
+        // — the `prefix_inference` map is a real footgun when the caller
+        // doesn't know about it (E14/Gemini tripped on review_ → manual).
+        let (classification, inferred_prefix): (String, Option<String>) =
+            if let Some(c) = self.classification.clone() {
+                (c, None)
+            } else if let Some((c, p)) = infer_classification_detailed(&self.id, prefix_map) {
+                (c, Some(p.to_string()))
+            } else if let Some(c) = lattice.last().cloned() {
+                (c, None)
+            } else {
+                anyhow::bail!(
                     "rule '{}' has no classification and packet lattice is empty",
                     self.id
                 )
-            })?;
+            };
         if !lattice.iter().any(|c| c == &classification) {
+            let source_hint = match &inferred_prefix {
+                Some(prefix) => format!(
+                    " (classification '{classification}' was INFERRED from id prefix \
+                     '{prefix}' via the packet's prefix_inference map; set an explicit \
+                     `classification` field on the rule to override, or revise the \
+                     prefix_inference map / rule id)"
+                ),
+                None => String::new(),
+            };
             anyhow::bail!(
-                "rule '{}' classification '{}' is not in packet lattice {:?}",
+                "rule '{}' classification '{}' is not in packet lattice {:?}{}",
                 self.id,
                 classification,
-                lattice
+                lattice,
+                source_hint
             );
         }
         Ok(Rule {
@@ -4351,6 +4380,83 @@ mod tests {
                 .rule_id,
             "ignore_default"
         );
+    }
+
+    // ── Prefix-inference error clarity test (E14 gotcha) ───────────
+
+    #[test]
+    fn classification_mismatch_error_names_inferred_prefix() {
+        // Reproduces the E14/Gemini gotcha: rule id has prefix `review_`
+        // which auto-classifies as `manual` via default prefix_inference,
+        // but the packet lattice doesn't include `manual`. Error should
+        // explicitly name the inference path so the author knows where
+        // `manual` came from.
+        let (_d, packets) = tmp_packets();
+        let err = packets
+            .compile(&CompileParams {
+                domain: "prefix-trap".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: Some(vec![
+                    "BLOCK".into(),
+                    "REVIEW".into(),
+                    "AUTO_APPROVE".into(),
+                ]),
+                prefix_inference: None, // uses default review_prefix_inference
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([{
+                    "id": "review_one_red",
+                    // No explicit classification → inferred from `review_` prefix → "manual"
+                    "antecedent": {"op": "True"},
+                    "consequent": "REVIEW"
+                }]),
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        // Old error: "rule 'review_one_red' classification 'manual' is not in packet lattice [...]"
+        // New error: adds "INFERRED from id prefix 'review_' via the packet's prefix_inference map"
+        assert!(
+            msg.contains("INFERRED from id prefix 'review_'"),
+            "expected error to name inferred prefix path, got: {msg}"
+        );
+        assert!(
+            msg.contains("prefix_inference map"),
+            "expected error to mention the inference map, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn classification_mismatch_error_no_inference_hint_when_explicit() {
+        // When classification is explicit, error should NOT add the
+        // inference hint (it would be misleading).
+        let (_d, packets) = tmp_packets();
+        let err = packets
+            .compile(&CompileParams {
+                domain: "explicit-mismatch".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: Some(vec!["red".into(), "green".into()]),
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([{
+                    "id": "bad_rule",
+                    "classification": "purple", // explicit, not in lattice
+                    "antecedent": {"op": "True"},
+                    "consequent": "X"
+                }]),
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("'purple'"));
+        assert!(!msg.contains("INFERRED"), "explicit classification should not trigger inference hint, got: {msg}");
     }
 
     // ── CountMatches predicate tests ───────────────────────────────
