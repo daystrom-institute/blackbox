@@ -76,6 +76,13 @@
           dev-vibe = flake-utils.lib.mkApp { drv = bbx-dev-vibe; };
         };
 
+        checks = {
+          inherit blackbox;
+          default = blackbox;
+        };
+
+        formatter = pkgs.nixpkgs-fmt;
+
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.bash
@@ -83,6 +90,7 @@
             pkgs.git
             pkgs.jq
             pkgs.nix
+            pkgs.nixpkgs-fmt
             pkgs.pkg-config
             pkgs.rustc
           ];
@@ -102,6 +110,7 @@
             pkgs.git
             pkgs.jq
             pkgs.nix
+            pkgs.nixpkgs-fmt
             pkgs.pkg-config
             pkgs.rustc
             bbx-dev-home

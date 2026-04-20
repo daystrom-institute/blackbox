@@ -58,18 +58,19 @@ This sample unit listens on `127.0.0.1:7265/mcp` and self-registers as `blackbox
 The root flake now separates product outputs from contributor tooling:
 
 ```bash
-nix build path:.#blackbox
-nix run path:.#blackboxd
-nix run path:.#bro
-nix develop path:.
+nix build .#blackbox
+nix run .#blackboxd
+nix run .#bro
+nix develop .
+nix flake check
+nix fmt
 ```
 
 - `packages.blackbox` / `packages.default`: build the crate for consumers
 - `apps.blackboxd` / `apps.bro`: run the shipped binaries without a local Rust toolchain
+- `checks.default`: validates the packaged build path that consumers use
+- `formatter`: `nix fmt` formats the flake with `nixpkgs-fmt`
 - `devShells.default`: contributor shell with Rust/Nix tooling
-
-Use `path:.` while the flake files are still untracked. Once `flake.nix` / `flake.lock`
-are committed, plain `.` works too.
 
 ### 2c. Run a fully isolated dev-agent world with Nix
 
@@ -79,7 +80,7 @@ still auto-read `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, or
 dev harness instead:
 
 ```bash
-nix develop path:.#dev-agent
+nix develop .#dev-agent
 cp .dev-agent-links.example .dev-agent-links   # optional; keep untracked
 $EDITOR .dev-agent-links                       # link only auth/session material
 bbx-dev-home init
@@ -90,7 +91,7 @@ Open a second shell in the same repo and launch provider CLIs through the
 wrappers:
 
 ```bash
-nix develop path:.#dev-agent
+nix develop .#dev-agent
 bbx-dev-claude
 bbx-dev-codex
 bbx-dev-gemini
