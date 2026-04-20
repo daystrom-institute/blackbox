@@ -16,6 +16,22 @@ Start with `bbox_search`.
 
 Use when you know the subject but not the session. Add `project`, `role`, or `account` filters early when you already know the likely slice.
 
+By default `bbox_search` uses `mode="smart"`:
+
+- adjacent terms broaden recall
+- quoted phrases stay exact
+- `-term` excludes
+
+Switch to `mode="fulltext"` only when you want raw Tantivy/Lucene-style boolean syntax and conjunction semantics.
+
+Examples:
+
+- `bbox_search(query="blackbox-dev adversarial", project="transcript-search")`
+- `bbox_search(query="redis AND locking", project="transcript-search", mode="fulltext")`
+- `bbox_search(query="blackbox-dev -service", project="transcript-search")`
+
+If your question is about stored knowledge rather than transcripts, `bbox_knowledge` uses the same natural query language by default. Reach for `mode="substring"` there only when you want literal whole-query matching.
+
 ### Find provenance for a rule
 
 Use `bbox_cite`.

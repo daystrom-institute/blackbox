@@ -12,6 +12,7 @@ mod threads;
 mod tool_docs;
 mod util;
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -132,6 +133,7 @@ use knowledge::{
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
+    PacketListParams, packet_matches_query, packet_summary,
 };
 use threads::{ThreadListParams, ThreadParams};
 
@@ -139,7 +141,7 @@ use threads::{ThreadListParams, ThreadParams};
 impl BlackboxServer {
     #[tool(
         name = "bbox_search",
-        description = "Full-text search across all indexed transcripts."
+        description = "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax."
     )]
     fn bbox_search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
         Self::run("bbox_search", || {
@@ -247,19 +249,65 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_knowledge",
-        description = "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above. Also surfaces matching system memories (code-embedded runbooks) marked `[system]` when the query hits one."
+        description = "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (code-embedded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. For structured packet discovery + filtering, use bbox_packet_list."
     )]
     fn bbox_knowledge(&self, Parameters(p): Parameters<KnowledgeListParams>) -> CallToolResult {
         Self::run("bbox_knowledge", || {
-            let runtime = self.state.kb.write().list(&p)?;
+            let mut combined = self.state.kb.write().list(&p)?;
+
+            // Surface matching packets. Uses the same match semantics as
+            // bbox_packet_list so the two tools agree on what "matches" means.
+            let all_packets = self.state.packets.read().list_all()?;
+            let matching_packets: Vec<_> = if let Some(q) =
+                p.query.as_deref().filter(|q| !q.is_empty())
+            {
+                all_packets
+                    .into_iter()
+                    .filter(|pkt| packet_matches_query(pkt, q))
+                    .collect()
+            } else if p.category.as_deref() == Some("packet") {
+                all_packets
+            } else {
+                Vec::new()
+            };
+
+            if !matching_packets.is_empty() {
+                if !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str("\n── Rule-packets ───────────────────────────────\n");
+                let limit = p.limit.unwrap_or(50).min(500) as usize;
+                for pkt in matching_packets.iter().take(limit) {
+                    let histogram: Vec<String> = pkt
+                        .rules
+                        .iter()
+                        .fold(BTreeMap::<String, usize>::new(), |mut acc, r| {
+                            *acc.entry(r.classification.clone()).or_insert(0) += 1;
+                            acc
+                        })
+                        .into_iter()
+                        .map(|(k, v)| format!("{k}:{v}"))
+                        .collect();
+                    combined.push_str(&format!(
+                        "[{}] Packet | domain: {} | scope: {} | {} rules [{}] | created {}\n",
+                        pkt.id,
+                        pkt.domain,
+                        pkt.scope,
+                        pkt.rules.len(),
+                        histogram.join(", "),
+                        pkt.created_at,
+                    ));
+                }
+                combined.push_str(
+                    "  (use bbox_packet_list for filter/query/preview; bbox_apply to evaluate)\n",
+                );
+            }
+
             // Also surface matching code-embedded memories. See
             // src/system_memory/ — these are static runbooks baked into the
             // binary via include_str!, queryable but never rendered.
             let memories = system_memory::search(p.query.as_deref());
-            if memories.is_empty() {
-                Ok(runtime)
-            } else {
-                let mut combined = runtime;
+            if !memories.is_empty() {
                 if !combined.ends_with('\n') {
                     combined.push('\n');
                 }
@@ -268,8 +316,8 @@ impl BlackboxServer {
                     combined.push_str(&system_memory::format_for_listing(m));
                     combined.push('\n');
                 }
-                Ok(combined)
             }
+            Ok(combined)
         })
     }
 
@@ -398,6 +446,40 @@ impl BlackboxServer {
     )]
     fn bbox_audit(&self, Parameters(p): Parameters<AuditParams>) -> CallToolResult {
         Self::run("bbox_audit", || self.state.packets.read().audit_tool(&p))
+    }
+
+    #[tool(
+        name = "bbox_packet_list",
+        description = "Discover compiled rule-packets before authoring a new one. Filter by `domain` (exact), `scope` (global/project), or `query` (case-insensitive substring across id, domain, rule ids, classification values). Pass `latest_per_domain=true` to collapse multiple revisions of the same domain. Each summary includes a classification histogram and the first few rule ids so you can judge relevance without calling bbox_apply. If a packet already covers your domain, compose it via `Apply{packet_id, expect}` or reuse via `bbox_apply`. See sm-rule-packets via bbox_knowledge."
+    )]
+    fn bbox_packet_list(&self, Parameters(p): Parameters<PacketListParams>) -> CallToolResult {
+        Self::run("bbox_packet_list", || {
+            let mut packets = self.state.packets.read().list_all()?;
+            if let Some(domain) = &p.domain {
+                packets.retain(|pkt| pkt.domain == *domain);
+            }
+            if let Some(scope) = &p.scope {
+                packets.retain(|pkt| &pkt.scope == scope);
+            }
+            if let Some(q) = p.query.as_deref().filter(|q| !q.is_empty()) {
+                packets.retain(|pkt| packet_matches_query(pkt, q));
+            }
+            if p.latest_per_domain.unwrap_or(false) {
+                // list_all returns newest-first; keep the first occurrence of each domain.
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                packets.retain(|pkt| seen.insert(pkt.domain.clone()));
+            }
+            let limit = p.limit.unwrap_or(50).min(500);
+            packets.truncate(limit);
+
+            let summaries: Vec<_> = packets.iter().map(packet_summary).collect();
+
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "count": summaries.len(),
+                "limit": limit,
+                "packets": summaries,
+            }))?)
+        })
     }
 
     #[tool(

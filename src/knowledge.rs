@@ -90,10 +90,15 @@ pub struct KnowledgeListParams {
     pub status: Option<String>,
     #[serde(default)]
     pub approval: Option<String>,
+    /// Free-text query. By default adjacent terms broaden recall, quoted
+    /// phrases stay exact, explicit `AND` / `OR` work, and `-term` excludes.
     #[serde(default)]
     pub query: Option<String>,
+    /// Search mode: smart (default) or substring. Smart uses the natural
+    /// query parser; substring uses literal whole-query matching.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Max rows to return.
     #[serde(default)]
     pub limit: Option<u64>,
 }

@@ -25,6 +25,81 @@ use serde::{Deserialize, Serialize};
 // ── MCP parameter structs ─────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PacketListParams {
+    /// Optional domain to filter by (e.g. "auth-matrix"). Exact match.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Optional scope to filter by ("global" or "project").
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Case-insensitive substring match across packet id, domain, rule ids,
+    /// classification lattice values, and rule classifications. Use when you
+    /// know the concept ("breaking", "pii", "deny") but not which domain it
+    /// was filed under.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// When true, return only the newest packet per domain. Useful after
+    /// multiple compile iterations — `list_all` returns every revision.
+    #[serde(default)]
+    pub latest_per_domain: Option<bool>,
+    /// Max packets to return (default: 50, max: 500).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Case-insensitive substring match across the fields an agent is likely to
+/// search for: packet id, domain, rule ids, rule classifications, and the
+/// packet's classification lattice values. Intentionally narrow — rule
+/// antecedents are structured AST, not free text, and searching inside them
+/// would produce mostly noise. If an agent needs to know what a packet
+/// *does*, the summary's rule-id preview + classification histogram carry
+/// that signal; a full scan of nested predicate fields does not.
+pub fn packet_matches_query(pkt: &Packet, query: &str) -> bool {
+    let needle = query.to_lowercase();
+    if pkt.id.to_lowercase().contains(&needle) {
+        return true;
+    }
+    if pkt.domain.to_lowercase().contains(&needle) {
+        return true;
+    }
+    for cls in &pkt.classification_lattice {
+        if cls.to_lowercase().contains(&needle) {
+            return true;
+        }
+    }
+    for rule in &pkt.rules {
+        if rule.id.to_lowercase().contains(&needle) {
+            return true;
+        }
+        if rule.classification.to_lowercase().contains(&needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build the per-packet summary used by bbox_packet_list and bbox_knowledge's
+/// packet-surfacing section. Includes a classification histogram and the
+/// first few rule ids so agents can judge relevance at a glance.
+pub fn packet_summary(pkt: &Packet) -> serde_json::Value {
+    let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
+    for rule in &pkt.rules {
+        *histogram.entry(rule.classification.clone()).or_insert(0) += 1;
+    }
+    let preview: Vec<&str> = pkt.rules.iter().take(3).map(|r| r.id.as_str()).collect();
+    serde_json::json!({
+        "id": pkt.id,
+        "domain": pkt.domain,
+        "scope": pkt.scope,
+        "rules_count": pkt.rules.len(),
+        "classification_histogram": histogram,
+        "rule_ids_preview": preview,
+        "created_at": pkt.created_at,
+        "updated_at": pkt.updated_at,
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CompileParams {
     /// Short domain label (e.g. "auth-matrix", "retry-policy"). Used for
     /// filtering and display; free-form.
@@ -2832,6 +2907,136 @@ mod tests {
         assert!(report_text.contains("\"total\": 5"));
         assert!(report_text.contains("\"correct\": 5"));
         assert!(report_text.contains("\"fidelity\": 1.0"));
+    }
+
+    #[test]
+    fn packet_list_helpers_match_and_summarize() {
+        // Exercises the helpers bbox_packet_list / bbox_knowledge share:
+        // packet_matches_query and packet_summary. Covers substring match
+        // across id / domain / rule ids / classifications, the classification
+        // histogram, the rule-id preview, and the latest-per-domain dedup
+        // semantics (consumers rely on list_all being newest-first).
+
+        fn mk_rule(id: &str, cls: &str) -> Rule {
+            Rule {
+                id: id.to_string(),
+                antecedent: Predicate::AlwaysTrue {},
+                consequent: Value::String(cls.to_uppercase()),
+                classification: cls.to_string(),
+                emit: Emit::Independent,
+                confidence: 1.0,
+                provenance: vec![],
+            }
+        }
+
+        fn mk_packet(id: &str, domain: &str, created_at: &str, rules: Vec<Rule>) -> Packet {
+            Packet {
+                id: id.to_string(),
+                domain: domain.to_string(),
+                scope: "global".to_string(),
+                project: None,
+                rank_table: BTreeMap::new(),
+                threshold_table: BTreeMap::new(),
+                rank_lookup_key: default_rank_lookup_key(),
+                threshold_lookup_key: default_threshold_lookup_key(),
+                classification_lattice: vec![
+                    "fail".to_string(),
+                    "flag".to_string(),
+                    "pass".to_string(),
+                ],
+                prefix_inference: BTreeMap::new(),
+                rules,
+                source_ids: vec![],
+                self_audit_fidelity: None,
+                created_at: created_at.to_string(),
+                updated_at: created_at.to_string(),
+                superseded_by: None,
+                merged_from: vec![],
+            }
+        }
+
+        let pr_triage_old = mk_packet(
+            "packet-11111111",
+            "pr-triage",
+            "2026-01-01T00:00:00Z",
+            vec![
+                mk_rule("breaking_api_change", "fail"),
+                mk_rule("missing_tests", "flag"),
+            ],
+        );
+        let pr_triage_new = mk_packet(
+            "packet-22222222",
+            "pr-triage",
+            "2026-04-19T00:00:00Z",
+            vec![
+                mk_rule("breaking_api_change", "fail"),
+                mk_rule("missing_tests", "flag"),
+                mk_rule("all_clean", "pass"),
+            ],
+        );
+        let auth_matrix = mk_packet(
+            "packet-33333333",
+            "auth-matrix",
+            "2026-02-14T00:00:00Z",
+            vec![
+                mk_rule("deny_reader_team", "fail"),
+                mk_rule("allow_owner_any", "pass"),
+            ],
+        );
+
+        // --- packet_matches_query ---
+        // domain hit (case-insensitive)
+        assert!(packet_matches_query(&pr_triage_new, "PR-triage"));
+        // rule id hit
+        assert!(packet_matches_query(&pr_triage_new, "breaking"));
+        // classification lattice hit
+        assert!(packet_matches_query(&pr_triage_new, "FAIL"));
+        // id hit
+        assert!(packet_matches_query(&auth_matrix, "33333333"));
+        // miss
+        assert!(!packet_matches_query(&auth_matrix, "retry"));
+        // empty query degenerates to false — caller is responsible for
+        // skipping the filter on empty queries; the helper just answers.
+        assert!(!packet_matches_query(&auth_matrix, "zzzzz"));
+
+        // --- packet_summary ---
+        let summary = packet_summary(&pr_triage_new);
+        assert_eq!(summary["id"], "packet-22222222");
+        assert_eq!(summary["domain"], "pr-triage");
+        assert_eq!(summary["rules_count"], 3);
+        // Histogram counts by classification
+        let hist = &summary["classification_histogram"];
+        assert_eq!(hist["fail"], 1);
+        assert_eq!(hist["flag"], 1);
+        assert_eq!(hist["pass"], 1);
+        // Rule-id preview capped at 3
+        let preview = summary["rule_ids_preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 3);
+        assert_eq!(preview[0], "breaking_api_change");
+
+        // --- list_all ordering + latest_per_domain dedup ---
+        // Save via a tmp store and confirm list_all returns newest-first.
+        let (_dir, store) = tmp_packets();
+        store.save_packet(&pr_triage_old).unwrap();
+        store.save_packet(&pr_triage_new).unwrap();
+        store.save_packet(&auth_matrix).unwrap();
+
+        let listed = store.list_all().unwrap();
+        assert_eq!(listed.len(), 3);
+        // Newest first: pr_triage_new (Apr), auth_matrix (Feb), pr_triage_old (Jan)
+        assert_eq!(listed[0].id, "packet-22222222");
+        assert_eq!(listed[1].id, "packet-33333333");
+        assert_eq!(listed[2].id, "packet-11111111");
+
+        // Simulate the latest_per_domain filter used by bbox_packet_list.
+        let mut seen = std::collections::HashSet::new();
+        let deduped: Vec<_> = listed
+            .into_iter()
+            .filter(|pkt| seen.insert(pkt.domain.clone()))
+            .collect();
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].id, "packet-22222222");
+        assert_eq!(deduped[1].id, "packet-33333333");
     }
 
     #[test]

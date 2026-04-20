@@ -83,8 +83,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_search",
         category: ToolCategory::Transcripts,
-        summary: "Full-text search across all indexed transcripts.",
-        when_to_use: "Use when you know the topic but not the exact session. Filter by account, project, or role as early as possible. Pass `exclude_self=true` to suppress the caller's own current session. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
+        summary: "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax.",
+        when_to_use: "Use when you know the topic but not the exact session. Default `smart` mode treats adjacent terms as broad recall, preserves quoted phrases, and understands `-term`; switch to `mode=fulltext` when you want raw boolean query syntax with conjunction semantics. Filter by account, project, or role as early as possible. Pass `exclude_self=true` to suppress the caller's own current session. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders and query-shaping guidance.",
         example: Some(r#"bbox_search(query="redis locking", project="my-app", role="user")"#),
     },
     ToolDoc {
@@ -174,8 +174,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
-        summary: "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above. Also surfaces matching system memories (code-embedded runbooks) marked `[system]` when the query hits one.",
-        when_to_use: "Start here on substantive tasks. Use one distinctive keyword by default; add `project=<cwd>` when looking for a prior decision to supersede. System memories can also be fetched by canonical `sm-*` ID.",
+        summary: "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (code-embedded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. For structured packet discovery + filtering, use bbox_packet_list.",
+        when_to_use: "Start here on substantive tasks. Use one distinctive keyword by default; when you need broader lookup, adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for a prior decision to supersede. System memories can also be fetched by canonical `sm-*` ID. Rule-packets appear in a separate section when the query hits their id / domain / rule ids / classifications — reach for bbox_packet_list when you want structured filters (scope, latest_per_domain) or richer per-packet previews.",
         example: Some(r#"bbox_knowledge(query="retry")"#),
     },
     ToolDoc {
@@ -292,6 +292,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Run a packet against a {entity, expected}[] dataset; report fidelity + mismatching rule ids. The self-verify step: a packet with fidelity < 1.0 is lying about its training data. ALWAYS call this after bbox_compile against the observations you derived the rules from — catches over-generalization, rule-ordering bugs, and field-name typos.",
         when_to_use: "ALWAYS run this after `bbox_compile` against the observations you derived the rules from. Catches (a) rules that mis-generalized beyond the anomalies, (b) ordering bugs where a general rule shadows an anomaly, (c) typos in field names. Use `mode=\"all\"` when the packet is for multi-finding review and expected outputs are rule-id sets.",
         example: Some(r#"bbox_audit(packet_id="packet-a1b2c3d4", dataset=[{"entity":{"tests_pass":false,...}, "expected":"REJECT"}, ...])"#),
+    },
+    ToolDoc {
+        name: "bbox_packet_list",
+        category: ToolCategory::Packets,
+        summary: "Discover compiled rule-packets before authoring a new one. Filter by `domain` (exact), `scope` (global/project), or `query` (case-insensitive substring across id, domain, rule ids, classification values). Pass `latest_per_domain=true` to collapse multiple revisions of the same domain. Each summary includes a classification histogram and the first few rule ids so you can judge relevance without calling bbox_apply. If a packet already covers your domain, compose it via `Apply{packet_id, expect}` or reuse via `bbox_apply`. See sm-rule-packets via bbox_knowledge.",
+        when_to_use: "Run BEFORE `bbox_compile` on any new domain. Query by concept (\"breaking\", \"pii\", \"deny\") when you don't know the exact domain label. If a match exists: reuse via `bbox_apply` or compose via `Apply{packet_id, expect}` inside your new packet — don't re-derive. Pair with `bbox_packet_events(packet_id=...)` to check the packet's track record (fidelity, no_match rate) before depending on it.",
+        example: Some(r#"bbox_packet_list(query="breaking", latest_per_domain=true, limit=10)"#),
     },
     ToolDoc {
         name: "bbox_packet_events",
@@ -422,6 +429,15 @@ pub const WORKFLOW_NOTES: &str = "\
 If a tool stanza says `See: sm-...`, fetch that runbook on demand with \
 `bbox_knowledge(query=\"sm-...\")`. Keep primitive semantics hot; pull deep \
 workflow guidance only when you need it.
+
+## Query semantics
+
+- `bbox_search` defaults to `mode=smart`: adjacent terms broaden recall, quoted \
+phrases stay exact, and `-term` excludes. Use `mode=fulltext` when you want raw \
+Tantivy/Lucene boolean syntax and conjunction semantics.
+- `bbox_knowledge` uses the same natural query language by default. Use \
+`mode=substring` only when you want literal whole-query matching instead of \
+broader recall.
 
 ## Roles and the core loop
 

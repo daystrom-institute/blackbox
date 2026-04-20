@@ -10,6 +10,22 @@ The tool you want is **`bbox_compile`**. Not prose. Not Python scripts. Not `bbo
 
 **Why this tool exists.** Prose rubrics aren't machine-reusable; pseudocode drifts; per-item hand-judgment doesn't scale. Packets compress 10–50× against the raw observations and generalize to entities you never saw. The evaluator is a pure function of `(packet, entity) → prediction` — deterministic, no LLM in the receive path.
 
+## Discover before you author
+
+**Before `bbox_compile`, check whether a packet for your concept already exists.** Packets are durable across sessions; the previous agent who solved a neighboring problem already did the work.
+
+- `bbox_packet_list(query="<concept>", latest_per_domain=true)` — substring search across id, domain, rule ids, and classification values. Each result carries a classification histogram (`{"fail": 2, "pass": 1}`) and a rule-id preview so you can judge relevance without `bbox_apply`.
+- `bbox_packet_list(domain="<exact-label>")` — exact domain match when you already know the label.
+- `bbox_knowledge(query="<concept>")` — same hits surface under a "Rule-packets" section alongside knowledge entries. Use when you're doing a general recall pass; reach for `bbox_packet_list` when you want structured filters.
+- `bbox_packet_events(packet_id="<id>")` — check the packet's track record (fidelity, no_match rate) before depending on it. A packet with fidelity 0.6 is not your reusable mechanism.
+
+If a prior packet already covers your concept:
+- **Reuse wholesale** — call `bbox_apply(packet_id, entity)` directly.
+- **Compose** — reference it from your new packet via `Apply{packet_id, expect: [...]}`. See *Packet composition (phase 5)* below. Composing is how a standard library emerges: one authoritative `is_breaking` packet, every review packet that needs the concept references it.
+- **Supersede** — if the prior packet is stale but the domain is the same, compile the replacement and `bbox_decide(supersedes=<prior>)` to make the chain auditable.
+
+**Discovery is cheap, re-derivation is wasteful.** The `bbox_packet_list` call costs nothing; re-compiling a concept another agent already solved costs a round-trip, drift risk, and any future caller's composition cost.
+
 **Pick your domain runbook for worked examples:**
 
 - `sm-review-packets` — code review / PR triage (lattice: fail/flag/manual/pass/info)
