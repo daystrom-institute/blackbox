@@ -678,7 +678,9 @@ struct PruneParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct BrofileParams {
-    /// Operation: create, list, get, delete, set_account, list_accounts
+    /// Operation: create, list, get, delete, set_account, list_accounts,
+    /// set_provider_default, get_provider_default, list_provider_defaults,
+    /// clear_provider_default
     action: String,
     #[serde(default)]
     name: Option<String>,
@@ -1928,6 +1930,66 @@ impl BlackboxServer {
                 let config = brofile::load_config(store_dir);
                 Self::ok_json(&serde_json::to_value(&config.accounts).unwrap_or_default())
             }
+            "set_provider_default" => {
+                let provider = match p
+                    .provider
+                    .as_deref()
+                    .and_then(|s| s.parse::<Provider>().ok())
+                {
+                    Some(p) => p,
+                    None => return Self::err_text("valid provider is required"),
+                };
+                let account = match &p.account {
+                    Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+                    _ => return Self::err_text("account is required"),
+                };
+                let mut config = brofile::load_config(store_dir);
+                config.provider_defaults.insert(
+                    provider,
+                    brofile::ProviderDefault {
+                        account: account.clone(),
+                    },
+                );
+                brofile::save_config(&config, store_dir);
+                Self::ok_json(
+                    &json!({"provider": provider.as_str(), "account": account, "updated": true}),
+                )
+            }
+            "get_provider_default" => {
+                let provider = match p
+                    .provider
+                    .as_deref()
+                    .and_then(|s| s.parse::<Provider>().ok())
+                {
+                    Some(p) => p,
+                    None => return Self::err_text("valid provider is required"),
+                };
+                let account = brofile::provider_default_account(provider, store_dir);
+                Self::ok_json(&json!({"provider": provider.as_str(), "account": account}))
+            }
+            "list_provider_defaults" => {
+                let config = brofile::load_config(store_dir);
+                let defaults: std::collections::HashMap<String, String> = config
+                    .provider_defaults
+                    .into_iter()
+                    .map(|(provider, entry)| (provider.to_string(), entry.account))
+                    .collect();
+                Self::ok_json(&serde_json::to_value(defaults).unwrap_or_default())
+            }
+            "clear_provider_default" => {
+                let provider = match p
+                    .provider
+                    .as_deref()
+                    .and_then(|s| s.parse::<Provider>().ok())
+                {
+                    Some(p) => p,
+                    None => return Self::err_text("valid provider is required"),
+                };
+                let mut config = brofile::load_config(store_dir);
+                let removed = config.provider_defaults.remove(&provider).is_some();
+                brofile::save_config(&config, store_dir);
+                Self::ok_json(&json!({"provider": provider.as_str(), "removed": removed}))
+            }
             _ => Self::err_text(&format!("Unknown brofile action: {}", p.action)),
         }
     }
@@ -2154,7 +2216,13 @@ impl BlackboxServer {
                             store_dir,
                             loaded_team.project_dir.as_deref(),
                         )
-                        .and_then(|bf| bf.account);
+                        .and_then(|bf| {
+                            orchestration::brofile::effective_account(
+                                bf.provider,
+                                bf.account.as_deref(),
+                                store_dir,
+                            )
+                        });
                         let latest_tid = m.task_history.last();
                         let latest = latest_tid.and_then(|id| task_store.get(id)).map(|t| {
                         let inner = t.inner.lock();
@@ -3072,7 +3140,9 @@ fn build_member_entry(
         provider: provider
             .map(|p| p.to_string())
             .unwrap_or_else(|| "unknown".into()),
-        account: brofile.as_ref().and_then(|b| b.account.clone()),
+        account: brofile.as_ref().and_then(|b| {
+            orchestration::brofile::effective_account(b.provider, b.account.as_deref(), store_dir)
+        }),
         session_id,
         jsonl_path,
         brofile: member.brofile.clone(),

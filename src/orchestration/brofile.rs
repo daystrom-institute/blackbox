@@ -43,10 +43,17 @@ pub struct Account {
     pub env: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderDefault {
+    pub account: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BroConfig {
     #[serde(default)]
     pub accounts: HashMap<String, Account>,
+    #[serde(default)]
+    pub provider_defaults: HashMap<Provider, ProviderDefault>,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +172,26 @@ pub fn save_config(config: &BroConfig, store_dir: &Path) {
 pub fn load_account(name: &str, store_dir: &Path) -> Option<Account> {
     let config = load_config(store_dir);
     config.accounts.get(name).cloned()
+}
+
+pub fn provider_default_account(provider: Provider, store_dir: &Path) -> Option<String> {
+    let config = load_config(store_dir);
+    config
+        .provider_defaults
+        .get(&provider)
+        .map(|entry| entry.account.clone())
+}
+
+pub fn effective_account(
+    provider: Provider,
+    explicit_account: Option<&str>,
+    store_dir: &Path,
+) -> Option<String> {
+    explicit_account
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| provider_default_account(provider, store_dir))
 }
 
 fn load_settings_env(config_dir: &Path) -> HashMap<String, String> {
@@ -329,6 +356,7 @@ pub fn resolve_provider_env(
     model: Option<&str>,
     store_dir: &Path,
 ) -> Option<HashMap<String, String>> {
+    let account_name = effective_account(provider, account_name, store_dir);
     let mut env = dirs::home_dir()
         .as_deref()
         .map(|home| match provider {
@@ -337,7 +365,7 @@ pub fn resolve_provider_env(
         })
         .unwrap_or_default();
 
-    if let Some(account_name) = account_name {
+    if let Some(account_name) = account_name.as_deref() {
         if provider != Provider::Opencode {
             if let Some(account_env) = dirs::home_dir()
                 .as_deref()
@@ -348,7 +376,7 @@ pub fn resolve_provider_env(
         }
     }
 
-    if let Some(account_name) = account_name {
+    if let Some(account_name) = account_name.as_deref() {
         if let Some(overrides) = load_account(account_name, store_dir).and_then(|a| a.env) {
             env.extend(overrides);
         }
@@ -589,6 +617,47 @@ mod tests {
 
         let resolved =
             resolve_provider_env(Provider::Claude, Some("account2"), None, store.path()).unwrap();
+        assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
+        assert!(resolved
+            .get("CLAUDE_CONFIG_DIR")
+            .is_some_and(|path| path.ends_with("/.claude-account2")));
+    }
+
+    #[test]
+    fn test_effective_account_falls_back_to_provider_default() {
+        let store = temp_store();
+        let mut config = load_config(store.path());
+        config.provider_defaults.insert(
+            Provider::Claude,
+            ProviderDefault {
+                account: "account2".into(),
+            },
+        );
+        save_config(&config, store.path());
+
+        let effective = effective_account(Provider::Claude, None, store.path());
+        assert_eq!(effective.as_deref(), Some("account2"));
+    }
+
+    #[test]
+    fn test_resolve_provider_env_uses_provider_default_account() {
+        let store = temp_store();
+        let mut config = load_config(store.path());
+        config.accounts.insert(
+            "account2".into(),
+            Account {
+                env: Some(HashMap::from([("EXTRA_FLAG".into(), "1".into())])),
+            },
+        );
+        config.provider_defaults.insert(
+            Provider::Claude,
+            ProviderDefault {
+                account: "account2".into(),
+            },
+        );
+        save_config(&config, store.path());
+
+        let resolved = resolve_provider_env(Provider::Claude, None, None, store.path()).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
         assert!(resolved
             .get("CLAUDE_CONFIG_DIR")
