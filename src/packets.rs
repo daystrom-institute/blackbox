@@ -2723,7 +2723,10 @@ impl Packets {
             let mut details = serde_json::Map::new();
             details.insert("reasons".into(), serde_json::json!(cand.reasons));
             details.insert("apply_count".into(), serde_json::json!(cand.apply_count));
-            details.insert("no_match_count".into(), serde_json::json!(cand.no_match_count));
+            details.insert(
+                "no_match_count".into(),
+                serde_json::json!(cand.no_match_count),
+            );
             if let Some(r) = cand.no_match_rate {
                 details.insert("no_match_rate".into(), serde_json::json!(r));
             }
@@ -3361,7 +3364,13 @@ mod tests {
         // We construct timestamps explicitly so the test is independent of
         // wall clock.
 
-        fn ev(op: &str, outcome: &str, pid: &str, ts: &str, details: serde_json::Value) -> PacketEvent {
+        fn ev(
+            op: &str,
+            outcome: &str,
+            pid: &str,
+            ts: &str,
+            details: serde_json::Value,
+        ) -> PacketEvent {
             let mut e = PacketEvent::now(op, outcome);
             e.timestamp = ts.to_string();
             e.packet_id = Some(pid.to_string());
@@ -5129,7 +5138,10 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("'purple'"));
-        assert!(!msg.contains("INFERRED"), "explicit classification should not trigger inference hint, got: {msg}");
+        assert!(
+            !msg.contains("INFERRED"),
+            "explicit classification should not trigger inference hint, got: {msg}"
+        );
     }
 
     // ── CountMatches predicate tests ───────────────────────────────
