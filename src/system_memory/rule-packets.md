@@ -70,6 +70,12 @@ Packets are for *structured domains that admit generators*. If priors already pr
 
 **Packet composition (phase 5):**
 - `Apply{packet_id, expect, entity_map?}` — true iff applying the referenced packet produces a first-match verdict whose classification is in `expect`. Lets a theory depend on another theory — a review packet can compose a `is_breaking` packet; an auth packet can compose a `privileged_role` packet. Use when a concept is worth extracting and reusing across packets.
+
+    **When to extract a sub-packet** (the naming-as-compression heuristic):
+    - The same cluster of conditions appears in 2+ rules within a packet — pull it out, `Apply` it by name.
+    - The concept has a crisp name your collaborator would recognize without the predicate body — "is_breaking", "is_privileged_role", "is_after_business_hours". If the concept DOESN'T have a natural name, it's probably not ready to extract.
+    - The concept is reused across packets in the same domain — an auth matrix's `is_privileged` applies to many resource types; a review rubric's `is_breaking` applies to many PR-triage packets.
+    - Rule of thumb: extraction reduces cognitive load when it replaces a restatement. It adds load when it fragments a single, crisp rule across two artifacts. One-off conditions stay inline.
     - `expect` is validated at compile time against the sub-packet's lattice — typos fail fast instead of silently never matching.
     - `entity_map` optionally rebinds outer field names into the sub-packet's schema: `{"role": "actor_role"}` populates the sub's `role` from the outer entity's `actor_role`. Unmapped fields pass through unchanged.
     - Compile-time check: referenced `packet_id` must already exist in the store. Compile the sub-packet first.
@@ -118,6 +124,15 @@ Each rule has an `emit` field: `independent` (default) or `fallback`.
 {"id": "pass_all_clean", "classification": "pass", "emit": "fallback",
  "antecedent": {"op": "True"}, "consequent": "PASS"}
 ```
+
+### Emit × Mode interaction (the one non-obvious bit)
+
+The `emit` field means different things under each mode, and this trips authors up:
+
+- In `mode="first"`, `emit` is **ignored**. First-match-wins. Your fallback rule still has to live at the end of the rule list — ordering is what makes it fire last.
+- In `mode="all"`, `emit="independent"` rules fire whenever they match. `emit="fallback"` rules only fire when NO independent rule fired — that's what makes a `pass_all_clean` catchall vanish when real findings surface.
+
+Rule of thumb: if you're writing `mode="first"`, just put fallback-style rules last and don't bother setting `emit`. If you're writing `mode="all"`, mark catchalls as `emit="fallback"` explicitly or they'll fire alongside your real findings.
 
 ## Mode choice
 
