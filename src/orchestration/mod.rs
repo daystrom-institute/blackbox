@@ -317,11 +317,14 @@ Task-shape check: if this task involves repeatedly classifying, \
 ranking, triaging, scoring, or judging entities against stated \
 criteria — try `bbox_compile` first (see `sm-rule-packets` via \
 `bbox_knowledge`). Packets force explicit rule ordering and buy a \
-free audit via `bbox_audit`. If the AST can't express part of what \
-you need (string-matching beyond StringContains, rate/time windows, \
-regex), compile what you can and log the gap via `bbox_packet_gap` \
-— don't silently fall back to prose; the gap log is what drives \
-which primitives get added next.";
+free audit via `bbox_audit`. Log a gap via `bbox_packet_gap` when \
+the AST can't express what you need — whether mechanically (no \
+operator fires) or conceptually (a composition works but is \
+semantically blunt — e.g., keyword StringContains where you'd \
+have wanted regex or synonym matching, Any{} over a long needle \
+list where you wanted a generalizer). Fidelity 1.0 on training \
+alone doesn't rule out the gap; if the mechanism won't generalize \
+to unseen vocabulary, that's the signal the log wants.";
 
 /// Default per-dispatch contract requiring a structured completion
 /// signal before the agent returns. Observed empirically: without
