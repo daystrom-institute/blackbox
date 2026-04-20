@@ -1359,7 +1359,7 @@ pub fn discover_gemini_session_in(
     }
 
     scored.sort_by(|a, b| b.1.cmp(&a.1));
-    scored
+    let task_match = scored
         .iter()
         .find(|(_, _, dir, recent, task)| *dir && *recent && *task)
         .or_else(|| scored.iter().find(|(_, _, dir, _, task)| *dir && *task))
@@ -1369,10 +1369,31 @@ pub fn discover_gemini_session_in(
                 .find(|(_, _, _, recent, task)| *recent && *task)
         })
         .or_else(|| scored.iter().find(|(_, _, _, _, task)| *task))
-        .or_else(|| scored.iter().find(|(_, _, dir, recent, _)| *dir && *recent))
-        .or_else(|| scored.iter().find(|(_, _, dir, _, _)| *dir))
-        .or_else(|| scored.iter().find(|(_, _, _, recent, _)| *recent))
-        .map(|(sid, _, _, _, _)| sid.clone())
+        .map(|(sid, _, _, _, _)| sid.clone());
+
+    if task_id.is_some() {
+        return task_match;
+    }
+
+    task_match
+        .or_else(|| {
+            scored
+                .iter()
+                .find(|(_, _, dir, recent, _)| *dir && *recent)
+                .map(|(sid, _, _, _, _)| sid.clone())
+        })
+        .or_else(|| {
+            scored
+                .iter()
+                .find(|(_, _, dir, _, _)| *dir)
+                .map(|(sid, _, _, _, _)| sid.clone())
+        })
+        .or_else(|| {
+            scored
+                .iter()
+                .find(|(_, _, _, recent, _)| *recent)
+                .map(|(sid, _, _, _, _)| sid.clone())
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2808,6 +2829,29 @@ mod tests {
         let sid = discover_gemini_session_in(tmp.path(), now_ms, "/repo/x", Some("task-older"))
             .expect("should resolve older task by marker");
         assert_eq!(sid, "aaaaaaaa-1111-2222-3333-444444444444");
+    }
+
+    #[test]
+    fn discover_gemini_session_with_task_marker_refuses_unmatched_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_gemini_fixture(
+            tmp.path(),
+            "proj",
+            "/repo/x",
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            "2026-04-18T10-00",
+            Some("some-other-task"),
+        );
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            discover_gemini_session_in(tmp.path(), now_ms, "/repo/x", Some("missing-task"))
+                .is_none(),
+            "task-scoped discovery must wait for an exact marker match"
+        );
     }
 
     fn seed_claude_fixture(
