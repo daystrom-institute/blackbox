@@ -79,7 +79,18 @@ pub struct CompileParams {
 /// case). Typed enum instead of a `String` field per the project's
 /// stringly-typed-avoidance convention — bros called this out in the
 /// phase-2 review and they were right.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, strum::EnumString, strum::AsRefStr)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    strum::EnumString,
+    strum::AsRefStr,
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum ApplyMode {
@@ -275,17 +286,44 @@ impl CmpOp {
 #[serde(tag = "op")]
 pub enum Predicate {
     /// `entity[field] == value`
-    Eq { field: String, value: Value },
+    Eq {
+        field: String,
+        value: Value,
+    },
     /// `entity[field] >= value` (integer)
-    Ge { field: String, value: i64 },
-    Gt { field: String, value: i64 },
-    Le { field: String, value: i64 },
-    Lt { field: String, value: i64 },
+    Ge {
+        field: String,
+        value: i64,
+    },
+    Gt {
+        field: String,
+        value: i64,
+    },
+    Le {
+        field: String,
+        value: i64,
+    },
+    Lt {
+        field: String,
+        value: i64,
+    },
     /// `entity[field] >= value` (float)
-    GeF { field: String, value: f64 },
-    GtF { field: String, value: f64 },
-    LeF { field: String, value: f64 },
-    LtF { field: String, value: f64 },
+    GeF {
+        field: String,
+        value: f64,
+    },
+    GtF {
+        field: String,
+        value: f64,
+    },
+    LeF {
+        field: String,
+        value: f64,
+    },
+    LtF {
+        field: String,
+        value: f64,
+    },
     /// Tri-state applicability. Preserves the distinction between
     /// `{}` (key missing) and `{x: null}` (key present, value null).
     ///
@@ -293,10 +331,18 @@ pub enum Predicate {
     /// - `IsNull`    — key exists AND value is the JSON `null` literal
     /// - `IsNonNull` — key exists AND value is NOT null
     /// - `IsMissing` — key does not exist in the entity at all
-    KeyExists { field: String },
-    IsNull { field: String },
-    IsNonNull { field: String },
-    IsMissing { field: String },
+    KeyExists {
+        field: String,
+    },
+    IsNull {
+        field: String,
+    },
+    IsNonNull {
+        field: String,
+    },
+    IsMissing {
+        field: String,
+    },
     /// Cross-field comparison (integer). `entity[lhs_field] OP entity[rhs_field]`.
     /// Returns false when either side is missing or non-integer.
     FieldEq {
@@ -326,9 +372,15 @@ pub enum Predicate {
         rank_field: String,
         threshold_field: String,
     },
-    All { args: Vec<Predicate> },
-    Any { args: Vec<Predicate> },
-    Not { arg: Box<Predicate> },
+    All {
+        args: Vec<Predicate>,
+    },
+    Any {
+        args: Vec<Predicate>,
+    },
+    Not {
+        arg: Box<Predicate>,
+    },
     /// **Quantified universal.** Path resolves to an array in the
     /// entity; inner predicate must hold for EVERY element. Missing or
     /// empty collection → `true` (vacuous truth). Non-array path →
@@ -513,7 +565,9 @@ fn infer_classification(id: &str, prefix_map: &BTreeMap<String, String>) -> Opti
 /// alongside real findings — `Fallback` rules are evaluated only when
 /// no `Independent` rule fired, which is the correct semantics for a
 /// catchall that should disappear when real findings exist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr,
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Emit {
@@ -586,7 +640,11 @@ fn validate_path(path: &str, context: &str) -> Result<()> {
         )
     })?;
     if inner.is_empty() {
-        anyhow::bail!("{}: path '{}' has empty field name before '[*]'", context, path);
+        anyhow::bail!(
+            "{}: path '{}' has empty field name before '[*]'",
+            context,
+            path
+        );
     }
     if inner.contains('.') {
         anyhow::bail!(
@@ -678,10 +736,7 @@ fn collect_apply_refs(pred: &Predicate, out: &mut Vec<String>) {
 /// Walk every rule's antecedent and collect all `Apply` nodes that
 /// reference the given packet_id. Returned references share the caller's
 /// borrow so callers can inspect `expect` without cloning.
-fn rule_antecedents_referencing<'a>(
-    rules: &'a [Rule],
-    packet_id: &str,
-) -> Vec<&'a Predicate> {
+fn rule_antecedents_referencing<'a>(rules: &'a [Rule], packet_id: &str) -> Vec<&'a Predicate> {
     let mut out = Vec::new();
     for rule in rules {
         collect_apply_by_id(&rule.antecedent, packet_id, &mut out);
@@ -689,11 +744,7 @@ fn rule_antecedents_referencing<'a>(
     out
 }
 
-fn collect_apply_by_id<'a>(
-    pred: &'a Predicate,
-    target: &str,
-    out: &mut Vec<&'a Predicate>,
-) {
+fn collect_apply_by_id<'a>(pred: &'a Predicate, target: &str, out: &mut Vec<&'a Predicate>) {
     match pred {
         Predicate::Apply { packet_id, .. } if packet_id == target => out.push(pred),
         Predicate::All { args } | Predicate::Any { args } => {
@@ -713,10 +764,7 @@ fn collect_apply_by_id<'a>(
 /// that exist in the sub-packet's lattice. A typo here silently makes
 /// the composition un-matchable; surfacing at compile time saves a
 /// debugging round.
-fn check_apply_expect_against_lattice(
-    applies: &[&Predicate],
-    sub: &Packet,
-) -> Result<()> {
+fn check_apply_expect_against_lattice(applies: &[&Predicate], sub: &Packet) -> Result<()> {
     for pred in applies {
         if let Predicate::Apply {
             packet_id, expect, ..
@@ -738,7 +786,11 @@ fn check_apply_expect_against_lattice(
 }
 
 impl RuleInput {
-    fn materialize(self, lattice: &[String], prefix_map: &BTreeMap<String, String>) -> Result<Rule> {
+    fn materialize(
+        self,
+        lattice: &[String],
+        prefix_map: &BTreeMap<String, String>,
+    ) -> Result<Rule> {
         // Validate the predicate tree at compile time: reject malformed
         // quantified paths and nested-ForAll. This is the phase-4 bros'
         // convergent critique — silent failure on authoring errors was
@@ -930,9 +982,10 @@ pub struct AllModeMismatch {
 /// Augment `entity` with fields derived from `packet.rank_table` /
 /// `packet.threshold_table` lookups. Pure function over the entity
 /// map; does not mutate the packet.
-fn resolve_entity(packet: &Packet, entity: &serde_json::Map<String, serde_json::Value>)
-    -> serde_json::Map<String, serde_json::Value>
-{
+fn resolve_entity(
+    packet: &Packet,
+    entity: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut resolved = entity.clone();
 
     // rank lookup: entity[rank_lookup_key] is a name → packet.rank_table[name] → int
@@ -1065,9 +1118,7 @@ fn apply_entity_map(
 /// Objects pass through unchanged. Primitives become `{"$": value}` so
 /// predicates inside `ForAll`/`Exists` can address them via the
 /// special `"$"` field.
-fn as_sub_entity(
-    item: &serde_json::Value,
-) -> serde_json::Map<String, serde_json::Value> {
+fn as_sub_entity(item: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
     match item {
         serde_json::Value::Object(obj) => obj.clone(),
         other => {
@@ -1099,69 +1150,77 @@ fn eval_predicate(
         Predicate::AlwaysTrue {} => true,
         Predicate::AlwaysFalse {} => false,
         Predicate::Eq { field, value } => entity_get(entity, field).as_ref() == Some(value),
-        Predicate::Ge { field, value } => {
-            entity_int(entity, field).map(|v| v >= *value).unwrap_or(false)
-        }
-        Predicate::Gt { field, value } => {
-            entity_int(entity, field).map(|v| v > *value).unwrap_or(false)
-        }
-        Predicate::Le { field, value } => {
-            entity_int(entity, field).map(|v| v <= *value).unwrap_or(false)
-        }
-        Predicate::Lt { field, value } => {
-            entity_int(entity, field).map(|v| v < *value).unwrap_or(false)
-        }
-        Predicate::GeF { field, value } => {
-            entity_f64(entity, field).map(|v| v >= *value).unwrap_or(false)
-        }
-        Predicate::GtF { field, value } => {
-            entity_f64(entity, field).map(|v| v > *value).unwrap_or(false)
-        }
-        Predicate::LeF { field, value } => {
-            entity_f64(entity, field).map(|v| v <= *value).unwrap_or(false)
-        }
-        Predicate::LtF { field, value } => {
-            entity_f64(entity, field).map(|v| v < *value).unwrap_or(false)
-        }
+        Predicate::Ge { field, value } => entity_int(entity, field)
+            .map(|v| v >= *value)
+            .unwrap_or(false),
+        Predicate::Gt { field, value } => entity_int(entity, field)
+            .map(|v| v > *value)
+            .unwrap_or(false),
+        Predicate::Le { field, value } => entity_int(entity, field)
+            .map(|v| v <= *value)
+            .unwrap_or(false),
+        Predicate::Lt { field, value } => entity_int(entity, field)
+            .map(|v| v < *value)
+            .unwrap_or(false),
+        Predicate::GeF { field, value } => entity_f64(entity, field)
+            .map(|v| v >= *value)
+            .unwrap_or(false),
+        Predicate::GtF { field, value } => entity_f64(entity, field)
+            .map(|v| v > *value)
+            .unwrap_or(false),
+        Predicate::LeF { field, value } => entity_f64(entity, field)
+            .map(|v| v <= *value)
+            .unwrap_or(false),
+        Predicate::LtF { field, value } => entity_f64(entity, field)
+            .map(|v| v < *value)
+            .unwrap_or(false),
         Predicate::KeyExists { field } => entity_key_exists(entity, field),
         Predicate::IsNull { field } => entity_is_null(entity, field),
         Predicate::IsNonNull { field } => entity_has(entity, field),
         Predicate::IsMissing { field } => !entity_key_exists(entity, field),
-        Predicate::FieldEq { lhs_field, rhs_field } => {
-            match (entity_get(entity, lhs_field), entity_get(entity, rhs_field)) {
-                (Some(l), Some(r)) => l == r,
-                _ => false,
-            }
-        }
-        Predicate::FieldGt { lhs_field, rhs_field } => {
-            match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
-                (Some(l), Some(r)) => l > r,
-                _ => false,
-            }
-        }
-        Predicate::FieldGe { lhs_field, rhs_field } => {
-            match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
-                (Some(l), Some(r)) => l >= r,
-                _ => false,
-            }
-        }
-        Predicate::FieldLt { lhs_field, rhs_field } => {
-            match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
-                (Some(l), Some(r)) => l < r,
-                _ => false,
-            }
-        }
-        Predicate::FieldLe { lhs_field, rhs_field } => {
-            match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
-                (Some(l), Some(r)) => l <= r,
-                _ => false,
-            }
-        }
+        Predicate::FieldEq {
+            lhs_field,
+            rhs_field,
+        } => match (entity_get(entity, lhs_field), entity_get(entity, rhs_field)) {
+            (Some(l), Some(r)) => l == r,
+            _ => false,
+        },
+        Predicate::FieldGt {
+            lhs_field,
+            rhs_field,
+        } => match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
+            (Some(l), Some(r)) => l > r,
+            _ => false,
+        },
+        Predicate::FieldGe {
+            lhs_field,
+            rhs_field,
+        } => match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
+            (Some(l), Some(r)) => l >= r,
+            _ => false,
+        },
+        Predicate::FieldLt {
+            lhs_field,
+            rhs_field,
+        } => match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
+            (Some(l), Some(r)) => l < r,
+            _ => false,
+        },
+        Predicate::FieldLe {
+            lhs_field,
+            rhs_field,
+        } => match (entity_int(entity, lhs_field), entity_int(entity, rhs_field)) {
+            (Some(l), Some(r)) => l <= r,
+            _ => false,
+        },
         Predicate::RankGeFieldThreshold {
             rank_field,
             threshold_field,
         } => {
-            match (entity_int(entity, rank_field), entity_int(entity, threshold_field)) {
+            match (
+                entity_int(entity, rank_field),
+                entity_int(entity, threshold_field),
+            ) {
                 (Some(r), Some(t)) => r >= t,
                 _ => false,
             }
@@ -1195,7 +1254,9 @@ fn eval_predicate(
             compare,
             value,
         } => {
-            let n = resolve_collection(entity, path).map(|a| a.len()).unwrap_or(0);
+            let n = resolve_collection(entity, path)
+                .map(|a| a.len())
+                .unwrap_or(0);
             compare.apply(n, *value)
         }
         Predicate::StringContains {
@@ -1384,10 +1445,7 @@ pub fn apply_all_with(
 /// `{entity, expected_verdict?, expected_rule_ids?}`. Compares aggregate
 /// verdict + fired-rule-id set independently; mismatches tag which
 /// check failed so fixes are targeted.
-pub fn verify_all(
-    packet: &Packet,
-    dataset: &serde_json::Value,
-) -> Result<AllModeFidelityReport> {
+pub fn verify_all(packet: &Packet, dataset: &serde_json::Value) -> Result<AllModeFidelityReport> {
     verify_all_with(packet, dataset, &NoopResolver)
 }
 
@@ -1406,7 +1464,10 @@ pub fn verify_all_with(
     let mut mismatches = Vec::new();
 
     for row in rows {
-        let entity = row.get("entity").cloned().unwrap_or(serde_json::Value::Null);
+        let entity = row
+            .get("entity")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let expected_verdict: Option<String> = row
             .get("expected_verdict")
             .and_then(|v| v.as_str().map(|s| s.to_string()));
@@ -1458,7 +1519,11 @@ pub fn verify_all_with(
             mismatches.push(AllModeMismatch {
                 entity: entity.clone(),
                 check: check.to_string(),
-                expected_verdict: if !verdict_ok { expected_verdict.clone() } else { None },
+                expected_verdict: if !verdict_ok {
+                    expected_verdict.clone()
+                } else {
+                    None
+                },
                 actual_verdict: if !verdict_ok { actual_verdict } else { None },
                 expected_rule_ids: if !ids_ok { expected_ids_sorted } else { None },
                 actual_rule_ids: if !ids_ok { Some(actual_rule_ids) } else { None },
@@ -1502,7 +1567,10 @@ pub fn verify_with(
     let mut uncovered = Vec::new();
 
     for row in rows {
-        let entity = row.get("entity").cloned().unwrap_or(serde_json::Value::Null);
+        let entity = row
+            .get("entity")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let expected_json = row
             .get("expected")
             .cloned()
@@ -1570,7 +1638,10 @@ fn events_log_path(state_dir: &Path) -> PathBuf {
 /// payload. No rotation in v1 — revisit if the log grows unbounded.
 fn append_line(path: &Path, line: &str) -> Result<()> {
     use std::io::Write;
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(line.as_bytes())?;
     f.write_all(b"\n")?;
     Ok(())
@@ -1701,8 +1772,8 @@ impl Packets {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let mut events: Vec<PacketEvent> = Vec::new();
         for line in raw.lines().rev() {
             if events.len() >= limit {
@@ -1762,7 +1833,10 @@ impl Packets {
             serde_json::Value::String(description.to_string()),
         );
         if let Some(v) = attempted_sketch {
-            details.insert("attempted_sketch".into(), serde_json::Value::String(v.into()));
+            details.insert(
+                "attempted_sketch".into(),
+                serde_json::Value::String(v.into()),
+            );
         }
         if let Some(v) = fallback_used {
             details.insert("fallback_used".into(), serde_json::Value::String(v.into()));
@@ -1773,8 +1847,8 @@ impl Packets {
                 serde_json::Value::String(v.into()),
             );
         }
-        let mut ev = PacketEvent::now("gap", "logged")
-            .with_details(serde_json::Value::Object(details));
+        let mut ev =
+            PacketEvent::now("gap", "logged").with_details(serde_json::Value::Object(details));
         if let Some(d) = domain {
             ev = ev.with_domain(d);
         }
@@ -1784,8 +1858,7 @@ impl Packets {
 
     fn save_packet(&self, packet: &Packet) -> Result<()> {
         let dir = scope_dir(&self.state_dir, &packet.scope);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = packet_path(&self.state_dir, &packet.scope, &packet.id);
         let tmp = path.with_extension("json.tmp");
         let raw = serde_json::to_string_pretty(packet)?;
@@ -1810,9 +1883,7 @@ impl Packets {
                 return Ok(packet);
             }
         }
-        anyhow::bail!(
-            "Packet not found: {id} (expected `packet-<8hex>`, e.g. `packet-a1b2c3d4`)"
-        )
+        anyhow::bail!("Packet not found: {id} (expected `packet-<8hex>`, e.g. `packet-a1b2c3d4`)")
     }
 
     pub fn list_all(&self) -> Result<Vec<Packet>> {
@@ -1949,15 +2020,19 @@ impl Packets {
                 )
             })?;
             // Check expect values are in the sub-packet's lattice.
-            check_apply_expect_against_lattice(&rule_antecedents_referencing(&rules, packet_id), &sub)?;
+            check_apply_expect_against_lattice(
+                &rule_antecedents_referencing(&rules, packet_id),
+                &sub,
+            )?;
         }
 
         let rank_table: BTreeMap<String, i64> = match &p.rank_table {
             Some(v) => {
                 let mut vv = v.clone();
                 unwrap_jsonish(&mut vv);
-                serde_json::from_value(vv)
-                    .context("'rank_table' must be an object mapping string keys to integer values")?
+                serde_json::from_value(vv).context(
+                    "'rank_table' must be an object mapping string keys to integer values",
+                )?
             }
             None => BTreeMap::new(),
         };
@@ -1965,8 +2040,9 @@ impl Packets {
             Some(v) => {
                 let mut vv = v.clone();
                 unwrap_jsonish(&mut vv);
-                serde_json::from_value(vv)
-                    .context("'threshold_table' must be an object mapping string keys to integer values")?
+                serde_json::from_value(vv).context(
+                    "'threshold_table' must be an object mapping string keys to integer values",
+                )?
             }
             None => BTreeMap::new(),
         };
@@ -2071,7 +2147,11 @@ impl Packets {
             },
             ApplyMode::All => {
                 let result = apply_all_with(&packet, &entity, self);
-                let outcome = if result.verdict.is_some() { "ok" } else { "no_match" };
+                let outcome = if result.verdict.is_some() {
+                    "ok"
+                } else {
+                    "no_match"
+                };
                 self.append_event(
                     &PacketEvent::now("apply", outcome)
                         .with_packet_id(packet.id.clone())
@@ -2114,7 +2194,11 @@ impl Packets {
         match mode {
             ApplyMode::First => {
                 let report = verify_with(&packet, &dataset, self)?;
-                let outcome = if report.fidelity >= 1.0 { "ok" } else { "low_fidelity" };
+                let outcome = if report.fidelity >= 1.0 {
+                    "ok"
+                } else {
+                    "low_fidelity"
+                };
                 self.append_event(
                     &PacketEvent::now("audit", outcome)
                         .with_packet_id(packet.id.clone())
@@ -2140,7 +2224,11 @@ impl Packets {
             }
             ApplyMode::All => {
                 let report = verify_all_with(&packet, &dataset, self)?;
-                let outcome = if report.fidelity >= 1.0 { "ok" } else { "low_fidelity" };
+                let outcome = if report.fidelity >= 1.0 {
+                    "ok"
+                } else {
+                    "low_fidelity"
+                };
                 self.append_event(
                     &PacketEvent::now("audit", outcome)
                         .with_packet_id(packet.id.clone())
@@ -2508,7 +2596,8 @@ mod tests {
 
         assert_eq!(total, 125, "125 cells total");
         assert_eq!(
-            correct, 125,
+            correct,
+            125,
             "Expected 125/125, got {correct}/125. Mismatches:\n{}",
             mismatches.join("\n")
         );
@@ -2779,8 +2868,13 @@ mod tests {
             "fail_undocumented",
             Predicate::All {
                 args: vec![
-                    Predicate::IsNonNull { field: "mcp_tools_added".into() },
-                    Predicate::Gt { field: "mcp_tools_added".into(), value: 0 },
+                    Predicate::IsNonNull {
+                        field: "mcp_tools_added".into(),
+                    },
+                    Predicate::Gt {
+                        field: "mcp_tools_added".into(),
+                        value: 0,
+                    },
                     Predicate::FieldLt {
                         lhs_field: "tool_docs_stanzas_added".into(),
                         rhs_field: "mcp_tools_added".into(),
@@ -2821,39 +2915,112 @@ mod tests {
     #[test]
     fn field_comparisons_work_across_all_ops() {
         let cases: &[(Predicate, &str, serde_json::Value, bool)] = &[
-            (Predicate::FieldEq { lhs_field: "a".into(), rhs_field: "b".into() },
-                "eq-hit", json!({"a": 5, "b": 5}), true),
-            (Predicate::FieldEq { lhs_field: "a".into(), rhs_field: "b".into() },
-                "eq-miss", json!({"a": 5, "b": 6}), false),
-            (Predicate::FieldGt { lhs_field: "a".into(), rhs_field: "b".into() },
-                "gt-hit", json!({"a": 10, "b": 5}), true),
-            (Predicate::FieldGt { lhs_field: "a".into(), rhs_field: "b".into() },
-                "gt-eq", json!({"a": 5, "b": 5}), false),
-            (Predicate::FieldGe { lhs_field: "a".into(), rhs_field: "b".into() },
-                "ge-eq", json!({"a": 5, "b": 5}), true),
-            (Predicate::FieldLt { lhs_field: "a".into(), rhs_field: "b".into() },
-                "lt-hit", json!({"a": 1, "b": 5}), true),
-            (Predicate::FieldLe { lhs_field: "a".into(), rhs_field: "b".into() },
-                "le-eq", json!({"a": 5, "b": 5}), true),
+            (
+                Predicate::FieldEq {
+                    lhs_field: "a".into(),
+                    rhs_field: "b".into(),
+                },
+                "eq-hit",
+                json!({"a": 5, "b": 5}),
+                true,
+            ),
+            (
+                Predicate::FieldEq {
+                    lhs_field: "a".into(),
+                    rhs_field: "b".into(),
+                },
+                "eq-miss",
+                json!({"a": 5, "b": 6}),
+                false,
+            ),
+            (
+                Predicate::FieldGt {
+                    lhs_field: "a".into(),
+                    rhs_field: "b".into(),
+                },
+                "gt-hit",
+                json!({"a": 10, "b": 5}),
+                true,
+            ),
+            (
+                Predicate::FieldGt {
+                    lhs_field: "a".into(),
+                    rhs_field: "b".into(),
+                },
+                "gt-eq",
+                json!({"a": 5, "b": 5}),
+                false,
+            ),
+            (
+                Predicate::FieldGe {
+                    lhs_field: "a".into(),
+                    rhs_field: "b".into(),
+                },
+                "ge-eq",
+                json!({"a": 5, "b": 5}),
+                true,
+            ),
+            (
+                Predicate::FieldLt {
+                    lhs_field: "a".into(),
+                    rhs_field: "b".into(),
+                },
+                "lt-hit",
+                json!({"a": 1, "b": 5}),
+                true,
+            ),
+            (
+                Predicate::FieldLe {
+                    lhs_field: "a".into(),
+                    rhs_field: "b".into(),
+                },
+                "le-eq",
+                json!({"a": 5, "b": 5}),
+                true,
+            ),
             // Missing field → false (no panic)
-            (Predicate::FieldGt { lhs_field: "a".into(), rhs_field: "b".into() },
-                "missing-a", json!({"b": 5}), false),
+            (
+                Predicate::FieldGt {
+                    lhs_field: "a".into(),
+                    rhs_field: "b".into(),
+                },
+                "missing-a",
+                json!({"b": 5}),
+                false,
+            ),
         ];
 
         for (pred, label, entity, expect_hit) in cases {
             let p = bare_packet(vec![rule(label, pred.clone(), "HIT", "info")]);
             let fired = apply(&p, entity).is_some();
-            assert_eq!(fired, *expect_hit, "case `{label}` failed; pred={pred:?}, entity={entity}");
+            assert_eq!(
+                fired, *expect_hit,
+                "case `{label}` failed; pred={pred:?}, entity={entity}"
+            );
         }
     }
 
     #[test]
     fn float_comparisons_work() {
         let p = bare_packet(vec![
-            rule("fail_low_coverage", Predicate::LtF { field: "coverage_pct".into(), value: 80.0 },
-                 "FAIL: coverage below 80%", "fail"),
-            rule("pass_high_coverage", Predicate::GeF { field: "coverage_pct".into(), value: 95.0 },
-                 "PASS: coverage above 95%", "pass"),
+            rule(
+                "fail_low_coverage",
+                Predicate::LtF {
+                    field: "coverage_pct".into(),
+                    value: 80.0,
+                },
+                "FAIL: coverage below 80%",
+                "fail",
+            ),
+            rule(
+                "pass_high_coverage",
+                Predicate::GeF {
+                    field: "coverage_pct".into(),
+                    value: 95.0,
+                },
+                "PASS: coverage above 95%",
+                "pass",
+            ),
         ]);
 
         let low = apply(&p, &json!({"coverage_pct": 73.5})).unwrap();
@@ -2869,11 +3036,26 @@ mod tests {
     #[test]
     fn classification_infers_from_id_prefix() {
         let map = review_prefix_inference();
-        assert_eq!(infer_classification("fail_warnings", &map).as_deref(), Some("fail"));
-        assert_eq!(infer_classification("flag_readonly_fs", &map).as_deref(), Some("flag"));
-        assert_eq!(infer_classification("manual_review_security", &map).as_deref(), Some("manual"));
-        assert_eq!(infer_classification("review_contract", &map).as_deref(), Some("manual"));
-        assert_eq!(infer_classification("pass_all_clean", &map).as_deref(), Some("pass"));
+        assert_eq!(
+            infer_classification("fail_warnings", &map).as_deref(),
+            Some("fail")
+        );
+        assert_eq!(
+            infer_classification("flag_readonly_fs", &map).as_deref(),
+            Some("flag")
+        );
+        assert_eq!(
+            infer_classification("manual_review_security", &map).as_deref(),
+            Some("manual")
+        );
+        assert_eq!(
+            infer_classification("review_contract", &map).as_deref(),
+            Some("manual")
+        );
+        assert_eq!(
+            infer_classification("pass_all_clean", &map).as_deref(),
+            Some("pass")
+        );
         assert_eq!(infer_classification("miscellaneous", &map).as_deref(), None);
     }
 
@@ -2904,7 +3086,11 @@ mod tests {
 
         let all = store.list_all().unwrap();
         let packet = &all[0];
-        let classes: Vec<&str> = packet.rules.iter().map(|r| r.classification.as_str()).collect();
+        let classes: Vec<&str> = packet
+            .rules
+            .iter()
+            .map(|r| r.classification.as_str())
+            .collect();
         assert_eq!(
             classes,
             vec![
@@ -2979,9 +3165,15 @@ mod tests {
         };
         let p = bare_packet(vec![rule("flag_x", pred, "HIT", "flag")]);
         // Missing collection → vacuous true → rule fires even though inner is False.
-        assert!(apply(&p, &json!({})).is_some(), "missing collection: ForAll is true vacuously");
+        assert!(
+            apply(&p, &json!({})).is_some(),
+            "missing collection: ForAll is true vacuously"
+        );
         // Empty collection → also vacuous true.
-        assert!(apply(&p, &json!({"items": []})).is_some(), "empty collection: vacuous true");
+        assert!(
+            apply(&p, &json!({"items": []})).is_some(),
+            "empty collection: vacuous true"
+        );
     }
 
     #[test]
@@ -2989,7 +3181,9 @@ mod tests {
         // Rule: every tool must have a non-null description.
         let pred = Predicate::ForAll {
             path: "tools[*]".into(),
-            pred: Box::new(Predicate::IsNonNull { field: "description".into() }),
+            pred: Box::new(Predicate::IsNonNull {
+                field: "description".into(),
+            }),
         };
         let p = bare_packet(vec![rule("ok_all_documented", pred, "ALL_OK", "flag")]);
 
@@ -3003,16 +3197,26 @@ mod tests {
             {"name": "a", "description": "does A"},
             {"name": "b"},  // missing description
         ]});
-        assert!(apply(&p, &bad).is_none(), "one undocumented → rule does not fire");
+        assert!(
+            apply(&p, &bad).is_none(),
+            "one undocumented → rule does not fire"
+        );
     }
 
     #[test]
     fn exists_false_on_empty_true_on_witness() {
         let pred = Predicate::Exists {
             path: "tools[*]".into(),
-            pred: Box::new(Predicate::IsNonNull { field: "critical".into() }),
+            pred: Box::new(Predicate::IsNonNull {
+                field: "critical".into(),
+            }),
         };
-        let p = bare_packet(vec![rule("flag_has_critical", pred, "HAS_CRITICAL", "flag")]);
+        let p = bare_packet(vec![rule(
+            "flag_has_critical",
+            pred,
+            "HAS_CRITICAL",
+            "flag",
+        )]);
 
         // Empty → Exists is false → rule doesn't fire.
         assert!(apply(&p, &json!({"tools": []})).is_none());
@@ -3032,10 +3236,16 @@ mod tests {
         };
         let p = bare_packet(vec![rule("flag_tags_present", pred, "OK", "flag")]);
 
-        assert!(apply(&p, &json!({"tags": ["a", "b", "c"]})).is_some(), "all non-null strings");
+        assert!(
+            apply(&p, &json!({"tags": ["a", "b", "c"]})).is_some(),
+            "all non-null strings"
+        );
         // Primitive null in array → IsNonNull("$") is false → ForAll fails.
         let with_null = json!({"tags": ["a", null, "c"]});
-        assert!(apply(&p, &with_null).is_none(), "any null element breaks ForAll");
+        assert!(
+            apply(&p, &with_null).is_none(),
+            "any null element breaks ForAll"
+        );
     }
 
     #[test]
@@ -3052,8 +3262,10 @@ mod tests {
             pred: Box::new(Predicate::AlwaysTrue {}),
         };
         let p = bare_packet(vec![rule("flag_x", pred, "X", "flag")]);
-        assert!(apply(&p, &json!({"count": 42})).is_some(),
-            "non-array at runtime → vacuous true (not an authoring error)");
+        assert!(
+            apply(&p, &json!({"count": 42})).is_some(),
+            "non-array at runtime → vacuous true (not an authoring error)"
+        );
     }
 
     #[test]
@@ -3142,7 +3354,10 @@ mod tests {
             project: None,
         };
         let err = format!("{:#}", store.compile(&params).unwrap_err());
-        assert!(err.contains("dotted path"), "dotted-path rejection missing: got {err}");
+        assert!(
+            err.contains("dotted path"),
+            "dotted-path rejection missing: got {err}"
+        );
     }
 
     #[test]
@@ -3166,7 +3381,10 @@ mod tests {
             project: None,
         };
         let err = format!("{:#}", store.compile(&params).unwrap_err());
-        assert!(err.contains("[*]"), "missing [*] rejection unclear: got {err}");
+        assert!(
+            err.contains("[*]"),
+            "missing [*] rejection unclear: got {err}"
+        );
     }
 
     #[test]
@@ -3234,7 +3452,9 @@ mod tests {
             scope: Some("global".into()),
             project: None,
         };
-        store.compile(&params).expect("Exists over ForAll should compile");
+        store
+            .compile(&params)
+            .expect("Exists over ForAll should compile");
     }
 
     #[test]
@@ -3283,12 +3503,24 @@ mod tests {
         store.compile(&params).unwrap();
 
         let packet = &store.list_all().unwrap()[0];
-        let classes: Vec<&str> = packet.rules.iter().map(|r| r.classification.as_str()).collect();
-        assert_eq!(classes, vec!["deny", "allow"], "auth prefixes inferred correctly");
+        let classes: Vec<&str> = packet
+            .rules
+            .iter()
+            .map(|r| r.classification.as_str())
+            .collect();
+        assert_eq!(
+            classes,
+            vec!["deny", "allow"],
+            "auth prefixes inferred correctly"
+        );
 
         // Apply in mode=all with a sensitive resource — deny wins.
         let result = apply_all(packet, &json!({"sensitive": true, "role": "admin"}));
-        assert_eq!(result.verdict, Some("deny".to_string()), "DENY precedes ALLOW in auth lattice");
+        assert_eq!(
+            result.verdict,
+            Some("deny".to_string()),
+            "DENY precedes ALLOW in auth lattice"
+        );
     }
 
     #[test]
@@ -3299,15 +3531,30 @@ mod tests {
         let p = bare_packet(vec![
             rule("fail_a", Predicate::AlwaysTrue {}, "FAIL: always", "fail"),
             rule("flag_b", Predicate::AlwaysTrue {}, "FLAG: always", "flag"),
-            rule("flag_c", Predicate::Eq { field: "x".into(), value: Value::Int(1) },
-                 "FLAG: on x=1", "flag"),
+            rule(
+                "flag_c",
+                Predicate::Eq {
+                    field: "x".into(),
+                    value: Value::Int(1),
+                },
+                "FLAG: on x=1",
+                "flag",
+            ),
             rule("pass_d", Predicate::AlwaysFalse {}, "PASS: never", "pass"),
         ]);
 
         let result = apply_all(&p, &json!({"x": 1}));
         let fired: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
-        assert_eq!(fired, vec!["fail_a", "flag_b", "flag_c"], "every matching rule should appear");
-        assert_eq!(result.verdict, Some("fail".to_string()), "verdict = highest severity that fired");
+        assert_eq!(
+            fired,
+            vec!["fail_a", "flag_b", "flag_c"],
+            "every matching rule should appear"
+        );
+        assert_eq!(
+            result.verdict,
+            Some("fail".to_string()),
+            "verdict = highest severity that fired"
+        );
 
         // Entity where only the false rule fires → no findings, no verdict
         let empty = apply_all(&p, &json!({"x": 99}));
@@ -3323,19 +3570,28 @@ mod tests {
             rule("manual_y", Predicate::AlwaysTrue {}, "MANUAL", "manual"),
             rule("flag_z", Predicate::AlwaysTrue {}, "FLAG", "flag"),
         ]);
-        assert_eq!(apply_all(&fail_p, &json!({})).verdict, Some("flag".to_string()));
+        assert_eq!(
+            apply_all(&fail_p, &json!({})).verdict,
+            Some("flag".to_string())
+        );
 
         let with_fail = bare_packet(vec![
             rule("pass_x", Predicate::AlwaysTrue {}, "PASS", "pass"),
             rule("fail_y", Predicate::AlwaysTrue {}, "FAIL", "fail"),
             rule("info_z", Predicate::AlwaysTrue {}, "INFO", "info"),
         ]);
-        assert_eq!(apply_all(&with_fail, &json!({})).verdict, Some("fail".to_string()));
+        assert_eq!(
+            apply_all(&with_fail, &json!({})).verdict,
+            Some("fail".to_string())
+        );
 
         // Nothing fires
-        let nothing = bare_packet(vec![
-            rule("fail_never", Predicate::AlwaysFalse {}, "NOPE", "fail"),
-        ]);
+        let nothing = bare_packet(vec![rule(
+            "fail_never",
+            Predicate::AlwaysFalse {},
+            "NOPE",
+            "fail",
+        )]);
         assert_eq!(apply_all(&nothing, &json!({})).verdict, None);
     }
 
@@ -3384,7 +3640,10 @@ mod tests {
         // fail at JSON deserialization rather than reaching apply_tool.
         let bad = json!({"packet_id": "packet-deadbeef", "entity": {}, "mode": "nonsense"});
         let res: std::result::Result<ApplyParams, _> = serde_json::from_value(bad);
-        assert!(res.is_err(), "invalid mode string should fail deserialization");
+        assert!(
+            res.is_err(),
+            "invalid mode string should fail deserialization"
+        );
     }
 
     #[test]
@@ -3401,14 +3660,34 @@ mod tests {
 
     #[test]
     fn tri_state_applicability_discriminates_null_vs_missing() {
-        let missing = json!({});                      // no key
+        let missing = json!({}); // no key
         let nulled = json!({"x": serde_json::Value::Null}); // key present, value null
-        let real = json!({"x": 42});                  // key present, real value
+        let real = json!({"x": 42}); // key present, real value
 
-        let key_exists = bare_packet(vec![rule("flag_ke", Predicate::KeyExists { field: "x".into() }, "KE", "flag")]);
-        let is_null = bare_packet(vec![rule("flag_null", Predicate::IsNull { field: "x".into() }, "NULL", "flag")]);
-        let is_non_null = bare_packet(vec![rule("flag_nn", Predicate::IsNonNull { field: "x".into() }, "NN", "flag")]);
-        let is_missing = bare_packet(vec![rule("flag_miss", Predicate::IsMissing { field: "x".into() }, "M", "flag")]);
+        let key_exists = bare_packet(vec![rule(
+            "flag_ke",
+            Predicate::KeyExists { field: "x".into() },
+            "KE",
+            "flag",
+        )]);
+        let is_null = bare_packet(vec![rule(
+            "flag_null",
+            Predicate::IsNull { field: "x".into() },
+            "NULL",
+            "flag",
+        )]);
+        let is_non_null = bare_packet(vec![rule(
+            "flag_nn",
+            Predicate::IsNonNull { field: "x".into() },
+            "NN",
+            "flag",
+        )]);
+        let is_missing = bare_packet(vec![rule(
+            "flag_miss",
+            Predicate::IsMissing { field: "x".into() },
+            "M",
+            "flag",
+        )]);
 
         // KeyExists: fires when key exists regardless of value
         assert!(apply(&key_exists, &missing).is_none());
@@ -3458,8 +3737,14 @@ mod tests {
         };
         store.compile(&params).unwrap();
         let packet = &store.list_all().unwrap()[0];
-        assert_eq!(packet.rules[0].classification, "info", "explicit info must survive prefix inference");
-        assert_eq!(packet.rules[1].classification, "fail", "no classification declared → infer from prefix");
+        assert_eq!(
+            packet.rules[0].classification, "info",
+            "explicit info must survive prefix inference"
+        );
+        assert_eq!(
+            packet.rules[1].classification, "fail",
+            "no classification declared → infer from prefix"
+        );
     }
 
     #[test]
@@ -3468,20 +3753,36 @@ mod tests {
         // This is how pass_all_clean ought to behave: disappear when real
         // findings exist, present when nothing else has anything to say.
         let p = bare_packet(vec![
-            rule("flag_x", Predicate::Eq { field: "trigger".into(), value: Value::Bool(true) }, "FLAG", "flag"),
+            rule(
+                "flag_x",
+                Predicate::Eq {
+                    field: "trigger".into(),
+                    value: Value::Bool(true),
+                },
+                "FLAG",
+                "flag",
+            ),
             fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", "pass"),
         ]);
 
         // Trigger fires — fallback is suppressed
         let result = apply_all(&p, &json!({"trigger": true}));
         let fired: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
-        assert_eq!(fired, vec!["flag_x"], "fallback must be suppressed when Independent fires");
+        assert_eq!(
+            fired,
+            vec!["flag_x"],
+            "fallback must be suppressed when Independent fires"
+        );
         assert_eq!(result.verdict, Some("flag".to_string()));
 
         // No trigger — fallback fires
         let result = apply_all(&p, &json!({"trigger": false}));
         let fired: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
-        assert_eq!(fired, vec!["pass_catchall"], "fallback fires when no Independent matched");
+        assert_eq!(
+            fired,
+            vec!["pass_catchall"],
+            "fallback fires when no Independent matched"
+        );
         assert_eq!(result.verdict, Some("pass".to_string()));
     }
 
@@ -3490,7 +3791,15 @@ mod tests {
         // In apply (mode="first"), emit is irrelevant — first-match-wins
         // applies regardless. Fallback rules can still fire.
         let p = bare_packet(vec![
-            rule("flag_x", Predicate::Eq { field: "a".into(), value: Value::Int(1) }, "FLAG_X", "flag"),
+            rule(
+                "flag_x",
+                Predicate::Eq {
+                    field: "a".into(),
+                    value: Value::Int(1),
+                },
+                "FLAG_X",
+                "flag",
+            ),
             fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", "pass"),
         ]);
 
@@ -3506,7 +3815,10 @@ mod tests {
 
     #[test]
     fn apply_mode_enum_serde_lowercase() {
-        assert_eq!(serde_json::to_value(&ApplyMode::First).unwrap(), json!("first"));
+        assert_eq!(
+            serde_json::to_value(&ApplyMode::First).unwrap(),
+            json!("first")
+        );
         assert_eq!(serde_json::to_value(&ApplyMode::All).unwrap(), json!("all"));
         let m: ApplyMode = serde_json::from_value(json!("all")).unwrap();
         assert_eq!(m, ApplyMode::All);
@@ -3521,7 +3833,9 @@ mod tests {
             "consequent": "X",
         });
         let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
-        let r = ri.materialize(&review_lattice(), &review_prefix_inference()).unwrap();
+        let r = ri
+            .materialize(&review_lattice(), &review_prefix_inference())
+            .unwrap();
         assert_eq!(r.emit, Emit::Independent);
     }
 
@@ -3530,7 +3844,15 @@ mod tests {
     fn multi_find_packet() -> Packet {
         bare_packet(vec![
             rule("fail_always", Predicate::AlwaysTrue {}, "FAIL", "fail"),
-            rule("flag_on_x", Predicate::Eq { field: "x".into(), value: Value::Int(1) }, "FLAG_X", "flag"),
+            rule(
+                "flag_on_x",
+                Predicate::Eq {
+                    field: "x".into(),
+                    value: Value::Int(1),
+                },
+                "FLAG_X",
+                "flag",
+            ),
             fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", "pass"),
         ])
     }
@@ -3563,7 +3885,10 @@ mod tests {
         assert_eq!(report.correct, 0);
         assert_eq!(report.mismatches.len(), 1);
         assert_eq!(report.mismatches[0].check, "verdict");
-        assert_eq!(report.mismatches[0].expected_verdict.as_deref(), Some("flag"));
+        assert_eq!(
+            report.mismatches[0].expected_verdict.as_deref(),
+            Some("flag")
+        );
         assert_eq!(report.mismatches[0].actual_verdict.as_deref(), Some("fail"));
     }
 
@@ -3601,7 +3926,10 @@ mod tests {
             "expected_rule_ids": ["flag_on_x", "fail_always"]  // reversed
         }]);
         let report = verify_all(&p, &dataset).unwrap();
-        assert_eq!(report.correct, 1, "rule_ids comparison is a set, not a list");
+        assert_eq!(
+            report.correct, 1,
+            "rule_ids comparison is a set, not a list"
+        );
     }
 
     #[test]
@@ -3647,7 +3975,9 @@ mod tests {
             "emit": "fallback",
         });
         let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
-        let r = ri.materialize(&review_lattice(), &review_prefix_inference()).unwrap();
+        let r = ri
+            .materialize(&review_lattice(), &review_prefix_inference())
+            .unwrap();
         assert_eq!(r.emit, Emit::Fallback);
     }
 
@@ -3839,13 +4169,7 @@ mod tests {
             min: 1,
             max: 5,
         };
-        for (v, want) in [
-            (0, false),
-            (1, true),
-            (3, true),
-            (5, true),
-            (6, false),
-        ] {
+        for (v, want) in [(0, false), (1, true), (3, true), (5, true), (6, false)] {
             let e = serde_json::json!({"perf_delta_ms": v})
                 .as_object()
                 .unwrap()
@@ -4254,7 +4578,9 @@ mod tests {
             })
             .unwrap();
 
-        let events = packets.list_events(Some("compile"), None, None, None, 50).unwrap();
+        let events = packets
+            .list_events(Some("compile"), None, None, None, 50)
+            .unwrap();
         // Two compile events: sub + outer
         assert_eq!(events.len(), 2);
         // Newest-first: outer is index 0
@@ -4262,7 +4588,12 @@ mod tests {
         assert_eq!(outer.op, "compile");
         assert_eq!(outer.outcome, "ok");
         assert_eq!(outer.domain.as_deref(), Some("pr-triage-with-events"));
-        let refs = outer.details.get("referenced_packets").unwrap().as_array().unwrap();
+        let refs = outer
+            .details
+            .get("referenced_packets")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].as_str().unwrap(), sub_id);
     }
@@ -4294,13 +4625,18 @@ mod tests {
             })
             .unwrap_err();
 
-        let events = packets.list_events(Some("compile"), None, Some("error"), None, 50).unwrap();
+        let events = packets
+            .list_events(Some("compile"), None, Some("error"), None, 50)
+            .unwrap();
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.outcome, "error");
         assert_eq!(ev.domain.as_deref(), Some("broken-compile"));
         let err = ev.details.get("error").unwrap().as_str().unwrap();
-        assert!(err.contains("packet-nonexistent"), "error detail missing id: {err}");
+        assert!(
+            err.contains("packet-nonexistent"),
+            "error detail missing id: {err}"
+        );
     }
 
     #[test]
@@ -4335,7 +4671,9 @@ mod tests {
             })
             .unwrap();
 
-        let events = packets.list_events(Some("apply"), Some(&id), None, None, 50).unwrap();
+        let events = packets
+            .list_events(Some("apply"), Some(&id), None, None, 50)
+            .unwrap();
         // Two apply events, one per call.
         assert_eq!(events.len(), 2);
         // At least one ok (the breaking entity fired a rule).
@@ -4360,7 +4698,9 @@ mod tests {
             })
             .unwrap();
 
-        let events = packets.list_events(Some("audit"), Some(&id), None, None, 50).unwrap();
+        let events = packets
+            .list_events(Some("audit"), Some(&id), None, None, 50)
+            .unwrap();
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.outcome, "ok");
@@ -4381,7 +4721,9 @@ mod tests {
             )
             .unwrap();
 
-        let events = packets.list_events(Some("gap"), None, None, None, 10).unwrap();
+        let events = packets
+            .list_events(Some("gap"), None, None, None, 10)
+            .unwrap();
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.op, "gap");
@@ -4390,7 +4732,11 @@ mod tests {
         let desc = ev.details.get("description").unwrap().as_str().unwrap();
         assert!(desc.contains("10 per minute"));
         assert_eq!(
-            ev.details.get("ast_feature_requested").unwrap().as_str().unwrap(),
+            ev.details
+                .get("ast_feature_requested")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "RateCmp or Within{temporal}"
         );
     }
@@ -4434,7 +4780,9 @@ mod tests {
             .contains("gap B"));
 
         // Filter by op=gap — should be two.
-        let gaps = packets.list_events(Some("gap"), None, None, None, 100).unwrap();
+        let gaps = packets
+            .list_events(Some("gap"), None, None, None, 100)
+            .unwrap();
         assert_eq!(gaps.len(), 2);
 
         // Limit honored.

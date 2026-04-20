@@ -192,9 +192,7 @@ fn stale_threads<'a>(
     let mut rows: Vec<(&Thread, u64)> = threads
         .all()
         .iter()
-        .filter(|t| {
-            matches!(t.status, ThreadStatus::Open | ThreadStatus::Active)
-        })
+        .filter(|t| matches!(t.status, ThreadStatus::Open | ThreadStatus::Active))
         .filter(|t| match project_filter {
             Some(pf) => t.project.to_lowercase().contains(pf),
             None => true,

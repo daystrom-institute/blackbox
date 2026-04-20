@@ -5,6 +5,7 @@ mod notes;
 mod orchestration;
 mod packets;
 mod parser;
+mod query;
 mod render;
 mod system_memory;
 mod threads;
@@ -25,11 +26,11 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, IntoContents, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -466,9 +467,13 @@ struct ExecParams {
     allow_recursion: Option<bool>,
     /// Per-dispatch allow patterns merged on top of global+project+brofile.
     /// Use to tighten or open the tool surface for this one invocation.
+    /// Accepts canonical MCP patterns (`mcp__blackbox__bro_*`) and the
+    /// surfaced dotted form (`mcp__blackbox__.bro_*`).
     #[serde(default)]
     allow_tools: Option<Vec<String>>,
     /// Per-dispatch disallow patterns merged on top of global+project+brofile.
+    /// Accepts canonical MCP patterns (`mcp__blackbox__bro_*`) and the
+    /// surfaced dotted form (`mcp__blackbox__.bro_*`).
     #[serde(default)]
     disallow_tools: Option<Vec<String>>,
 }
@@ -496,6 +501,8 @@ struct ResumeParams {
     /// Per-dispatch allow/disallow overlays for this resume only.
     #[serde(default)]
     allow_tools: Option<Vec<String>>,
+    /// Accepts canonical MCP patterns (`mcp__blackbox__bro_*`) and the
+    /// surfaced dotted form (`mcp__blackbox__.bro_*`).
     #[serde(default)]
     disallow_tools: Option<Vec<String>>,
 }
@@ -730,8 +737,14 @@ fn extra_filters_from_params(
         return None;
     }
     Some(orchestration::mcp::McpFilters {
-        allow: allow.to_vec(),
-        disallow: disallow.to_vec(),
+        allow: allow
+            .iter()
+            .map(|p| orchestration::mcp::normalize_filter_pattern(p))
+            .collect(),
+        disallow: disallow
+            .iter()
+            .map(|p| orchestration::mcp::normalize_filter_pattern(p))
+            .collect(),
     })
 }
 
@@ -2801,12 +2814,8 @@ mod tests {
     use super::*;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
-        let index = TranscriptIndex::open_or_create(
-            &tmp.path().join("index"),
-            Vec::new(),
-            None,
-        )
-        .unwrap();
+        let index =
+            TranscriptIndex::open_or_create(&tmp.path().join("index"), Vec::new(), None).unwrap();
         let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
         let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
         let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
@@ -2906,4 +2915,3 @@ mod tests {
         assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
     }
 }
-mod query;

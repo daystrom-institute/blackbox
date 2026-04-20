@@ -19,7 +19,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -28,9 +28,9 @@ use serde::Deserialize;
 #[path = "parser.rs"]
 mod parser;
 use parser::{
-    EventDetail, MessageRole, SystemSignalKind, TranscriptEvent, parse_codex_line_rich,
-    parse_copilot_line_rich, parse_gemini_file_rich, parse_transcript_line_rich,
-    parse_vibe_line_rich,
+    parse_codex_line_rich, parse_copilot_line_rich, parse_gemini_file_rich,
+    parse_transcript_line_rich, parse_vibe_line_rich, EventDetail, MessageRole, SystemSignalKind,
+    TranscriptEvent,
 };
 
 // ── Roster fetch ────────────────────────────────────────────────────
@@ -57,7 +57,11 @@ struct TailSelectors {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "bro", about = "Terminal client for blackbox orchestration", version)]
+#[command(
+    name = "bro",
+    about = "Terminal client for blackbox orchestration",
+    version
+)]
 struct BroCli {
     #[command(subcommand)]
     command: BroCommand,
@@ -790,16 +794,8 @@ mod tests {
     #[test]
     fn lane_matches_scoped_signal_before_bare_name() {
         let lane = lane("red", "reviewer", "red::reviewer", Some("sid-red"));
-        assert!(lane.matches_signal(
-            Some("reviewer"),
-            Some("red::reviewer"),
-            Some("sid-red")
-        ));
-        assert!(!lane.matches_signal(
-            Some("reviewer"),
-            Some("blue::reviewer"),
-            Some("sid-blue")
-        ));
+        assert!(lane.matches_signal(Some("reviewer"), Some("red::reviewer"), Some("sid-red")));
+        assert!(!lane.matches_signal(Some("reviewer"), Some("blue::reviewer"), Some("sid-blue")));
     }
 
     #[test]

@@ -916,11 +916,7 @@ mod tests {
                 kind: None,
             })
             .unwrap();
-        let thread_id = created
-            .split_whitespace()
-            .nth(2)
-            .unwrap()
-            .to_string();
+        let thread_id = created.split_whitespace().nth(2).unwrap().to_string();
         threads
             .thread(&ThreadParams {
                 action: "continue".into(),
@@ -980,11 +976,7 @@ mod tests {
                 kind: None,
             })
             .unwrap();
-        let thread_id = created
-            .split_whitespace()
-            .nth(2)
-            .unwrap()
-            .to_string();
+        let thread_id = created.split_whitespace().nth(2).unwrap().to_string();
         set_last_activity(&store_path, &thread_id, "2026-01-01T00:00:00Z");
         let threads = Threads::open(&store_path).unwrap();
 

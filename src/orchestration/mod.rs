@@ -713,17 +713,21 @@ pub fn spawn_task(
                         if accepted {
                             apply_sink_updates(&mut inner, sink);
                         }
-                        accepted.then(|| inner.last_assistant_message.as_ref().map(|msg| {
-                            const TAIL_CHARS: usize = 160;
-                            let count = msg.chars().count();
-                            if count > TAIL_CHARS {
-                                let skip = count - TAIL_CHARS;
-                                let tail: String = msg.chars().skip(skip).collect();
-                                format!("…{tail}")
-                            } else {
-                                msg.clone()
-                            }
-                        })).flatten()
+                        accepted
+                            .then(|| {
+                                inner.last_assistant_message.as_ref().map(|msg| {
+                                    const TAIL_CHARS: usize = 160;
+                                    let count = msg.chars().count();
+                                    if count > TAIL_CHARS {
+                                        let skip = count - TAIL_CHARS;
+                                        let tail: String = msg.chars().skip(skip).collect();
+                                        format!("…{tail}")
+                                    } else {
+                                        msg.clone()
+                                    }
+                                })
+                            })
+                            .flatten()
                     };
 
                     if let Some(snippet) = snippet_to_emit {
@@ -1328,12 +1332,10 @@ mod tests {
 
         let json = task_result_json(&task);
         assert_eq!(json["exitCode"], 1);
-        assert!(
-            json["stderr"]
-                .as_str()
-                .unwrap()
-                .contains("something went wrong")
-        );
+        assert!(json["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("something went wrong"));
     }
 
     #[test]
@@ -1370,7 +1372,10 @@ mod tests {
             "session fork detected: requested resume of requested-session, provider emitted forked-session"
         );
         assert_eq!(
-            inner.usage.as_ref().map(|u| (u.input_tokens, u.output_tokens)),
+            inner
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens)),
             Some((10, 5))
         );
         assert_eq!(inner.cost_usd, Some(0.01));
@@ -1409,9 +1414,15 @@ mod tests {
 
         apply_sink_updates(&mut inner, sink);
 
-        assert_eq!(inner.last_assistant_message.as_deref(), Some("fresh output"));
         assert_eq!(
-            inner.usage.as_ref().map(|u| (u.input_tokens, u.output_tokens)),
+            inner.last_assistant_message.as_deref(),
+            Some("fresh output")
+        );
+        assert_eq!(
+            inner
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens)),
             Some((12, 8))
         );
         assert_eq!(inner.cost_usd, Some(0.02));
