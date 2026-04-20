@@ -17,13 +17,18 @@ use super::helpers::*;
 use super::reindex::*;
 use super::{FileMeta, TranscriptIndex};
 use crate::parser;
+use crate::query::smart_query_to_tantivy;
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
-    /// Search query. Terms ANDed by default. Use quotes for phrases, OR for disjunction.
+    /// Search query. In smart mode, adjacent terms broaden recall (`OR`);
+    /// use `mode=fulltext` for raw Tantivy/Lucene-style boolean syntax.
     pub query: String,
+    /// Search mode: smart (default) or fulltext
+    #[serde(default)]
+    pub mode: Option<String>,
     /// Filter to account: 'claude', 'account2', 'account3', 'codex'
     #[serde(default)]
     pub account: Option<String>,
@@ -46,6 +51,25 @@ pub struct SearchParams {
     /// its own current turn and would otherwise see itself in results.
     #[serde(default)]
     pub exclude_self: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptSearchMode {
+    Smart,
+    Fulltext,
+}
+
+impl TranscriptSearchMode {
+    fn parse_optional(s: Option<&str>) -> Result<Self> {
+        match s {
+            None => Ok(Self::Smart),
+            Some("smart" | "natural") => Ok(Self::Smart),
+            Some("fulltext" | "lucene" | "literal") => Ok(Self::Fulltext),
+            Some(raw) => anyhow::bail!(
+                "invalid mode: {raw:?} (expected \"smart\"/\"natural\" or \"fulltext\"/\"lucene\"/\"literal\")"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -142,7 +166,14 @@ impl TranscriptIndex {
     // ── Search ──────────────────────────────────────────────────────
 
     pub fn search(&self, p: &SearchParams) -> Result<String> {
-        let query_str = p.query.as_str();
+        let raw_query = p.query.as_str();
+        let mode = TranscriptSearchMode::parse_optional(p.mode.as_deref())?;
+        let query_str = match mode {
+            TranscriptSearchMode::Smart => {
+                smart_query_to_tantivy(raw_query).unwrap_or_else(|| raw_query.to_string())
+            }
+            TranscriptSearchMode::Fulltext => raw_query.to_string(),
+        };
         let limit = p.limit.unwrap_or(20).min(100) as usize;
         let include_subagents = p.include_subagents.unwrap_or(true);
 
@@ -155,8 +186,10 @@ impl TranscriptIndex {
         // Parse the user's text query against content + project fields
         let mut qp =
             QueryParser::for_index(&self.index, vec![self.fields.content, self.fields.project]);
-        qp.set_conjunction_by_default();
-        let text_query = qp.parse_query(query_str)?;
+        if matches!(mode, TranscriptSearchMode::Fulltext) {
+            qp.set_conjunction_by_default();
+        }
+        let text_query = qp.parse_query(&query_str)?;
 
         // Build filter clauses
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
@@ -209,7 +242,7 @@ impl TranscriptIndex {
         // `exclude_self=true` from interactive callers that genuinely
         // need to suppress self-reference.
         if p.exclude_self.unwrap_or(false) {
-            if let Some(caller_sid) = detect_caller_session(&self.config, query_str) {
+            if let Some(caller_sid) = detect_caller_session(&self.config, raw_query) {
                 clauses.push((
                     Occur::MustNot,
                     Box::new(TermQuery::new(
@@ -245,12 +278,16 @@ impl TranscriptIndex {
             let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
 
             results.push(format!(
-                "Score: {score:.2} | {account} | {role}\n\
+                "Score: {score:.2} | mode={} | {account} | {role}\n\
                  Session: {session_id}\n\
                  Project: {project}\n\
                  Time: {ts}\n\
                  File: {file_path}\n\
-                 Excerpt: {excerpt}"
+                 Excerpt: {excerpt}",
+                match mode {
+                    TranscriptSearchMode::Smart => "smart",
+                    TranscriptSearchMode::Fulltext => "fulltext",
+                }
             ));
         }
 

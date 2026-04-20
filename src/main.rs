@@ -2906,3 +2906,4 @@ mod tests {
         assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
     }
 }
+mod query;

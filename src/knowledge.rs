@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,8 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
+
+use crate::query::{parse_query, QueryAtom, QueryNode};
 
 // ── MCP parameter structs ─────────────────────────────────────────
 //
@@ -74,7 +76,7 @@ pub struct RememberParams {
     pub expires_at: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct KnowledgeListParams {
     #[serde(default)]
     pub category: Option<String>,
@@ -90,6 +92,8 @@ pub struct KnowledgeListParams {
     pub approval: Option<String>,
     #[serde(default)]
     pub query: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
     #[serde(default)]
     pub limit: Option<u64>,
 }
@@ -337,6 +341,160 @@ fn default_weight() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnowledgeQueryMode {
+    Smart,
+    Substring,
+}
+
+impl KnowledgeQueryMode {
+    fn parse_optional(s: Option<&str>) -> Result<Self> {
+        match s {
+            None => Ok(Self::Smart),
+            Some("smart" | "fulltext") => Ok(Self::Smart),
+            Some("substring" | "literal") => Ok(Self::Substring),
+            Some(raw) => anyhow::bail!(
+                "invalid mode: {raw:?} (expected \"smart\"/\"fulltext\" or \"substring\"/\"literal\")"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SearchCorpus {
+    id: String,
+    title: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MatchEvidence {
+    id: BTreeSet<String>,
+    title: BTreeSet<String>,
+    content: BTreeSet<String>,
+}
+
+impl MatchEvidence {
+    fn add_id(&mut self, text: &str) {
+        self.id.insert(text.to_string());
+    }
+
+    fn add_title(&mut self, text: &str) {
+        self.title.insert(text.to_string());
+    }
+
+    fn add_content(&mut self, text: &str) {
+        self.content.insert(text.to_string());
+    }
+
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.id.is_empty() {
+            parts.push(format!(
+                "id:{}",
+                self.id.iter().cloned().collect::<Vec<_>>().join(",")
+            ));
+        }
+        if !self.title.is_empty() {
+            parts.push(format!(
+                "title:{}",
+                self.title.iter().cloned().collect::<Vec<_>>().join(",")
+            ));
+        }
+        if !self.content.is_empty() {
+            parts.push(format!(
+                "content:{}",
+                self.content.iter().cloned().collect::<Vec<_>>().join(",")
+            ));
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(" | ")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct QueryMatch {
+    score: f64,
+    evidence: MatchEvidence,
+}
+
+fn matches_atom(atom: &QueryAtom, corpus: &SearchCorpus) -> Option<QueryMatch> {
+    let mut evidence = MatchEvidence::default();
+    let mut score = 0.0;
+
+    if corpus.id.contains(&atom.text) {
+        evidence.add_id(&atom.text);
+        score += if atom.phrase { 80.0 } else { 65.0 };
+    }
+    if corpus.title.contains(&atom.text) {
+        evidence.add_title(&atom.text);
+        score += if atom.phrase { 45.0 } else { 28.0 };
+    }
+    if corpus.content.contains(&atom.text) {
+        evidence.add_content(&atom.text);
+        score += if atom.phrase { 20.0 } else { 8.0 };
+    }
+
+    if score > 0.0 {
+        Some(QueryMatch { score, evidence })
+    } else {
+        None
+    }
+}
+
+fn query_matches(node: &QueryNode, corpus: &SearchCorpus) -> bool {
+    match node {
+        QueryNode::Atom(atom) => matches_atom(atom, corpus).is_some(),
+        QueryNode::And(lhs, rhs) => query_matches(lhs, corpus) && query_matches(rhs, corpus),
+        QueryNode::Or(lhs, rhs) => query_matches(lhs, corpus) || query_matches(rhs, corpus),
+        QueryNode::Not(inner) => !query_matches(inner, corpus),
+    }
+}
+
+fn collect_positive_matches(node: &QueryNode, corpus: &SearchCorpus, out: &mut QueryMatch) {
+    match node {
+        QueryNode::Atom(atom) => {
+            if let Some(m) = matches_atom(atom, corpus) {
+                out.score += m.score;
+                out.evidence.id.extend(m.evidence.id);
+                out.evidence.title.extend(m.evidence.title);
+                out.evidence.content.extend(m.evidence.content);
+            }
+        }
+        QueryNode::And(lhs, rhs) | QueryNode::Or(lhs, rhs) => {
+            collect_positive_matches(lhs, corpus, out);
+            collect_positive_matches(rhs, corpus, out);
+        }
+        QueryNode::Not(_) => {}
+    }
+}
+
+fn substring_match(query: &str, corpus: &SearchCorpus) -> Option<QueryMatch> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+
+    let mut out = QueryMatch::default();
+    if corpus.id.contains(&needle) {
+        out.evidence.add_id(&needle);
+        out.score += 80.0;
+    }
+    if corpus.title.contains(&needle) {
+        out.evidence.add_title(&needle);
+        out.score += 45.0;
+    }
+    if corpus.content.contains(&needle) {
+        out.evidence.add_content(&needle);
+        out.score += 20.0;
+    }
+
+    (out.score > 0.0).then_some(out)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -733,13 +891,19 @@ impl Knowledge {
         let status_filter = p.status.as_deref().unwrap_or("active");
         let approval_filter = p.approval.as_deref();
         let query = p.query.as_deref();
+        let query_mode = KnowledgeQueryMode::parse_optional(p.mode.as_deref())?;
+        let parsed_query = match (query_mode, query) {
+            (_, None) => None,
+            (KnowledgeQueryMode::Substring, Some(_)) => None,
+            (KnowledgeQueryMode::Smart, Some(raw)) => parse_query(raw),
+        };
         let limit = p.limit.unwrap_or(50) as usize;
 
-        let mut results: Vec<&KnowledgeEntry> = self
+        let mut results: Vec<(&KnowledgeEntry, QueryMatch)> = self
             .store
             .entries
             .iter()
-            .filter(|e| {
+            .filter_map(|e| {
                 // Status filter
                 let status_ok = match status_filter {
                     "active" => e.status == Status::Active && !Self::is_expired(e),
@@ -751,20 +915,20 @@ impl Knowledge {
                     _ => e.status == Status::Active,
                 };
                 if !status_ok {
-                    return false;
+                    return None;
                 }
 
                 if let Some(cat) = category_filter {
                     if let Ok(c) = Category::from_str(cat) {
                         if e.category != c {
-                            return false;
+                            return None;
                         }
                     }
                 }
                 if let Some(s) = scope_filter {
                     if let Ok(target) = s.parse::<Scope>() {
                         if e.scope != target {
-                            return false;
+                            return None;
                         }
                     }
                 }
@@ -772,15 +936,15 @@ impl Knowledge {
                     match &e.project {
                         Some(ep) => {
                             if !ep.contains(p) {
-                                return false;
+                                return None;
                             }
                         }
-                        None => return false,
+                        None => return None,
                     }
                 }
                 if let Some(prov) = provider_filter {
                     if !e.providers.is_empty() && !e.providers.iter().any(|p| p == prov) {
-                        return false;
+                        return None;
                     }
                 }
                 if let Some(ap) = approval_filter {
@@ -791,33 +955,55 @@ impl Knowledge {
                         _ => true,
                     };
                     if !matches {
-                        return false;
+                        return None;
                     }
                 }
-                if let Some(q) = query {
-                    let q_lower = q.to_lowercase();
-                    if !e.content.to_lowercase().contains(&q_lower)
-                        && !e.title.to_lowercase().contains(&q_lower)
-                    {
-                        return false;
-                    }
-                }
-                true
+
+                let corpus = SearchCorpus {
+                    id: e.id.to_lowercase(),
+                    title: e.title.to_lowercase(),
+                    content: e.content.to_lowercase(),
+                };
+                let query_match = match query {
+                    None => QueryMatch::default(),
+                    Some(raw) if raw.trim().is_empty() => QueryMatch::default(),
+                    Some(raw) => match query_mode {
+                        KnowledgeQueryMode::Substring => substring_match(raw, &corpus)?,
+                        KnowledgeQueryMode::Smart => {
+                            let ast = parsed_query.as_ref()?;
+                            if !query_matches(ast, &corpus) {
+                                return None;
+                            }
+                            let mut out = QueryMatch::default();
+                            collect_positive_matches(ast, &corpus, &mut out);
+                            out
+                        }
+                    },
+                };
+
+                Some((e, query_match))
             })
             .collect();
 
-        results.sort_by(|a, b| a.weight.cmp(&b.weight));
+        results.sort_by(|(a_entry, a_match), (b_entry, b_match)| {
+            b_match
+                .score
+                .partial_cmp(&a_match.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a_entry.weight.cmp(&b_entry.weight))
+                .then_with(|| a_entry.title.cmp(&b_entry.title))
+        });
         results.truncate(limit);
 
         if results.is_empty() {
             return Ok("No entries found.".to_string());
         }
 
-        let returned_ids: Vec<String> = results.iter().map(|e| e.id.clone()).collect();
+        let returned_ids: Vec<String> = results.iter().map(|(e, _)| e.id.clone()).collect();
 
         let lines: Vec<String> = results
             .iter()
-            .map(|e| {
+            .map(|(e, query_match)| {
                 let prov = if e.providers.is_empty() {
                     "all".to_string()
                 } else {
@@ -830,8 +1016,17 @@ impl Knowledge {
                 };
                 let render_mark = if !e.render { " [indexed-only]" } else { "" };
                 let decay_mark = if !e.decay { " [invariant]" } else { "" };
+                let query_line = if query.is_some() && query_match.score > 0.0 {
+                    format!(
+                        "\n  score={:.1} | matched_by={}",
+                        query_match.score,
+                        query_match.evidence.summary()
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
-                    "[{}] {:?}/{} | {} | {}{}{}{}\n  {}",
+                    "[{}] {:?}/{} | {} | {}{}{}{}{}\n  {}",
                     e.id,
                     e.category,
                     e.scope,
@@ -840,6 +1035,7 @@ impl Knowledge {
                     approval_mark,
                     render_mark,
                     decay_mark,
+                    query_line,
                     if e.content.len() > 120 {
                         let mut end = 120;
                         while end > 0 && !e.content.is_char_boundary(end) {
@@ -1858,6 +2054,135 @@ body
             .unwrap_or_else(|p| p.into_inner())
     }
 
+    fn push_entry(kb: &mut Knowledge, id: &str, title: &str, content: &str) {
+        kb.store.entries.push(KnowledgeEntry {
+            id: id.into(),
+            title: title.into(),
+            content: content.into(),
+            variants: HashMap::new(),
+            category: Category::Memory,
+            scope: Scope::Project,
+            project: Some("/tmp/proj".into()),
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        });
+    }
+
+    #[test]
+    fn parse_query_defaults_adjacent_terms_to_or() {
+        let ast = parse_query("disallow glob").expect("query should parse");
+        let corpus = SearchCorpus {
+            id: "entry".into(),
+            title: "glob patterns".into(),
+            content: "nothing else".into(),
+        };
+        assert!(query_matches(&ast, &corpus));
+    }
+
+    #[test]
+    fn parse_query_honors_and_phrase_and_exclusion() {
+        let ast = parse_query("\"glob pattern\" AND disallow -legacy").expect("query should parse");
+
+        let matching = SearchCorpus {
+            id: "entry".into(),
+            title: "disallow glob pattern".into(),
+            content: "modern only".into(),
+        };
+        assert!(query_matches(&ast, &matching));
+
+        let excluded = SearchCorpus {
+            id: "entry".into(),
+            title: "disallow glob pattern".into(),
+            content: "legacy escape hatch".into(),
+        };
+        assert!(!query_matches(&ast, &excluded));
+    }
+
+    #[test]
+    fn list_smart_mode_matches_tokens_and_reports_evidence() {
+        let (_tmp, mut kb) = mk_kb();
+        push_entry(
+            &mut kb,
+            "abcd1234",
+            "Glob filtering",
+            "Adds explicit disallow rules for broad matching.",
+        );
+        push_entry(
+            &mut kb,
+            "efgh5678",
+            "Literal phrases",
+            "Exact phrase behavior only.",
+        );
+
+        let out = kb
+            .list(&KnowledgeListParams {
+                project: Some("/tmp/proj".into()),
+                query: Some("disallow glob".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .expect("list should succeed");
+
+        assert!(out.contains("1 entries:"));
+        assert!(out.contains("Glob filtering"));
+        assert!(out.contains("matched_by="));
+        assert!(out.contains("title:glob"));
+        assert!(out.contains("content:disallow"));
+    }
+
+    #[test]
+    fn list_supports_explicit_and_and_substring_mode() {
+        let (_tmp, mut kb) = mk_kb();
+        push_entry(
+            &mut kb,
+            "abcd1234",
+            "Glob filtering",
+            "Adds explicit disallow rules for broad matching.",
+        );
+        push_entry(
+            &mut kb,
+            "efgh5678",
+            "Legacy note",
+            "disallow appears here but wildcard matching does not.",
+        );
+
+        let smart = kb
+            .list(&KnowledgeListParams {
+                project: Some("/tmp/proj".into()),
+                query: Some("disallow AND glob".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .expect("smart query should succeed");
+        assert!(smart.contains("Glob filtering"));
+        assert!(!smart.contains("Legacy note"));
+
+        let literal = kb
+            .list(&KnowledgeListParams {
+                project: Some("/tmp/proj".into()),
+                query: Some("disallow glob".into()),
+                mode: Some("substring".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .expect("substring query should succeed");
+        assert_eq!(literal, "No entries found.");
+    }
+
     #[test]
     fn absorb_global_extracts_only_managed_region() {
         let _env_guard = global_env_lock();
@@ -2040,12 +2365,11 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD");
 
         assert!(report.contains("Absorbed 0"), "report: {report}");
-        assert!(
-            kb.store
-                .entries
-                .iter()
-                .all(|e| e.approval != Approval::Imported)
-        );
+        assert!(kb
+            .store
+            .entries
+            .iter()
+            .all(|e| e.approval != Approval::Imported));
     }
 
     #[test]

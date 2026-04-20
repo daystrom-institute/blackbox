@@ -23,6 +23,8 @@
 //! query via bbox_knowledge." Agent reads tool description, spots pointer,
 //! pulls the runbook with one query when they actually need it.
 
+use crate::query::{QueryAtom, QueryNode, parse_query};
+
 #[derive(Debug, Clone, Copy)]
 pub struct SystemMemory {
     /// Canonical ID: `sm-<slug>`. Stable across daemon restarts because it's
@@ -244,41 +246,87 @@ pub fn get(id: &str) -> Option<&'static SystemMemory> {
         .find(|m| m.id == id || m.id.strip_prefix("sm-") == Some(id))
 }
 
-/// Tokenized case-insensitive search. The query is split on whitespace; a memory
-/// matches if ANY token appears as a substring of its id, title, any tag, or body.
-/// Single-token queries behave like ordinary substring search.
-/// Multi-token queries (e.g. "PR triage rubric") recall anything matching at least
-/// one token — natural-language phrasing surfaces runbooks with relevant tags even
-/// when the full phrase isn't a substring anywhere. `None` or empty query returns
-/// all memories. Returns in catalog order.
+#[derive(Debug, Clone)]
+struct MemoryCorpus {
+    id: String,
+    title: String,
+    tags: Vec<String>,
+    content: String,
+}
+
+fn memory_atom_score(atom: &QueryAtom, corpus: &MemoryCorpus) -> f64 {
+    let mut score = 0.0;
+    if corpus.id.contains(&atom.text) {
+        score += if atom.phrase { 80.0 } else { 65.0 };
+    }
+    if corpus.title.contains(&atom.text) {
+        score += if atom.phrase { 40.0 } else { 24.0 };
+    }
+    if corpus.tags.iter().any(|tag| tag.contains(&atom.text)) {
+        score += if atom.phrase { 32.0 } else { 20.0 };
+    }
+    if corpus.content.contains(&atom.text) {
+        score += if atom.phrase { 12.0 } else { 6.0 };
+    }
+    score
+}
+
+fn memory_matches(node: &QueryNode, corpus: &MemoryCorpus) -> bool {
+    match node {
+        QueryNode::Atom(atom) => memory_atom_score(atom, corpus) > 0.0,
+        QueryNode::And(lhs, rhs) => memory_matches(lhs, corpus) && memory_matches(rhs, corpus),
+        QueryNode::Or(lhs, rhs) => memory_matches(lhs, corpus) || memory_matches(rhs, corpus),
+        QueryNode::Not(inner) => !memory_matches(inner, corpus),
+    }
+}
+
+fn memory_collect_score(node: &QueryNode, corpus: &MemoryCorpus) -> f64 {
+    match node {
+        QueryNode::Atom(atom) => memory_atom_score(atom, corpus),
+        QueryNode::And(lhs, rhs) | QueryNode::Or(lhs, rhs) => {
+            memory_collect_score(lhs, corpus) + memory_collect_score(rhs, corpus)
+        }
+        QueryNode::Not(_) => 0.0,
+    }
+}
+
+/// Smart case-insensitive search. Adjacent terms broaden recall via `OR`;
+/// quoted phrases, explicit `AND`/`OR`, and unary exclusion (`-term`) are
+/// supported. `None` or empty query returns all memories. Results are scored
+/// by where the query matched (id/title/tags/content) and returned best-first.
 pub fn search(query: Option<&str>) -> Vec<&'static SystemMemory> {
-    let tokens: Vec<String> = query
-        .map(|q| {
-            q.to_lowercase()
-                .split_whitespace()
-                .map(|t| t.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    SYSTEM_MEMORIES
+    let Some(raw_query) = query.map(str::trim) else {
+        return SYSTEM_MEMORIES.iter().collect();
+    };
+    if raw_query.is_empty() {
+        return SYSTEM_MEMORIES.iter().collect();
+    }
+    let Some(ast) = parse_query(raw_query) else {
+        return SYSTEM_MEMORIES.iter().collect();
+    };
+
+    let mut scored: Vec<(&'static SystemMemory, f64, usize)> = SYSTEM_MEMORIES
         .iter()
-        .filter(|m| {
-            if tokens.is_empty() {
-                return true;
+        .enumerate()
+        .filter_map(|(idx, m)| {
+            let corpus = MemoryCorpus {
+                id: m.id.to_lowercase(),
+                title: m.title.to_lowercase(),
+                tags: m.tags.iter().map(|t| t.to_lowercase()).collect(),
+                content: m.content.to_lowercase(),
+            };
+            if !memory_matches(&ast, &corpus) {
+                return None;
             }
-            let id = m.id.to_lowercase();
-            let title = m.title.to_lowercase();
-            let content = m.content.to_lowercase();
-            let tags_lc: Vec<String> =
-                m.tags.iter().map(|t| t.to_lowercase()).collect();
-            tokens.iter().any(|tok| {
-                id.contains(tok)
-                    || title.contains(tok)
-                    || content.contains(tok)
-                    || tags_lc.iter().any(|t| t.contains(tok))
-            })
+            Some((m, memory_collect_score(&ast, &corpus), idx))
         })
-        .collect()
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    scored.into_iter().map(|(m, _, _)| m).collect()
 }
 
 /// Render one memory for an agent response: `[system] sm-…` header + title +
@@ -357,6 +405,20 @@ mod tests {
     fn search_case_insensitive() {
         let hits = search(Some("PACKET"));
         assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
+    }
+
+    #[test]
+    fn search_defaults_adjacent_terms_to_or() {
+        let hits = search(Some("adversarial rubric"));
+        assert!(hits.iter().any(|m| m.id == "sm-review-packets"));
+        assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
+    }
+
+    #[test]
+    fn search_honors_and_and_exclusion() {
+        let hits = search(Some("packets AND review -access-table"));
+        assert!(hits.iter().any(|m| m.id == "sm-review-packets"));
+        assert!(!hits.iter().any(|m| m.id == "sm-auth-packets"));
     }
 
     #[test]
