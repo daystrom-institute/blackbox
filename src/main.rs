@@ -800,6 +800,13 @@ struct AdvisorCheckpoint {
     cancelled_count: usize,
     timed_out_count: usize,
     running_count: usize,
+    dispute_count: usize,
+    assumption_count: usize,
+    surprise_count: usize,
+    followup_count: usize,
+    blocked_count: usize,
+    learned_count: usize,
+    done_count: usize,
     members: Vec<AdvisorMemberCheckpoint>,
     notes: AdvisorNoteSummary,
 }
@@ -2572,6 +2579,13 @@ Next step: <one concrete steering suggestion>\n",
             cancelled_count,
             timed_out_count,
             running_count,
+            dispute_count: notes.dispute_count,
+            assumption_count: notes.assumption_count,
+            surprise_count: notes.surprise_count,
+            followup_count: notes.followup_count,
+            blocked_count: notes.blocked_count,
+            learned_count: notes.learned_count,
+            done_count: notes.done_count,
             members,
             notes,
         }
@@ -3633,5 +3647,74 @@ mod tests {
         assert_eq!(provider, Provider::Gemini);
         assert_eq!(session_id, "sid-blue");
         assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
+    }
+
+    #[test]
+    fn build_advisor_checkpoint_flattens_note_counts_for_packets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        {
+            let mut notes = server.state.notes.write();
+            notes
+                .create(&NoteParams {
+                    kind: "blocked".into(),
+                    body: "worker is blocked".into(),
+                    task_id: Some("task-1".into()),
+                    session_id: None,
+                    project: None,
+                    thread_id: None,
+                    provider: None,
+                    bro: Some("worker".into()),
+                })
+                .unwrap();
+            notes
+                .create(&NoteParams {
+                    kind: "dispute".into(),
+                    body: "worker disputes premise".into(),
+                    task_id: Some("task-1".into()),
+                    session_id: None,
+                    project: None,
+                    thread_id: None,
+                    provider: None,
+                    bro: Some("worker".into()),
+                })
+                .unwrap();
+        }
+        let team = orchestration::team::Team {
+            name: "demo".into(),
+            teamplate: "tp".into(),
+            members: vec![],
+            advisor: Some(orchestration::team::TeamAdvisor {
+                name: "advisor".into(),
+                config: orchestration::team::TeamAdvisorConfig {
+                    brofile: "advisor".into(),
+                    alias: Some("advisor".into()),
+                    charter: "demo".into(),
+                    context: None,
+                    halt_conditions: vec![],
+                    exit_conditions: vec![],
+                    packet_id: Some("packet-demo".into()),
+                    timeout_seconds: None,
+                    mode: orchestration::team::AdvisorMode::Blocking,
+                },
+                session_id: None,
+                task_history: vec![],
+            }),
+            project_dir: None,
+            created_at: 0,
+        };
+        let checkpoint = server.build_advisor_checkpoint(
+            &team,
+            "when_all",
+            &[json!({
+                "taskId": "task-1",
+                "status": "running",
+                "timed_out": true
+            })],
+        );
+        assert_eq!(checkpoint.blocked_count, 1);
+        assert_eq!(checkpoint.dispute_count, 1);
+        assert_eq!(checkpoint.notes.blocked_count, 1);
+        assert_eq!(checkpoint.notes.dispute_count, 1);
     }
 }
