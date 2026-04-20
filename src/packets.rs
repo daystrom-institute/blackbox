@@ -325,6 +325,28 @@ pub enum Predicate {
     AlwaysTrue {},
     #[serde(rename = "False")]
     AlwaysFalse {},
+    /// **Packet composition.** True iff applying the referenced packet
+    /// to this entity produces a first-match verdict whose classification
+    /// is in `expect`. Lets theories depend on other theories — a
+    /// review packet can compose a `breaking_change` packet; an auth
+    /// packet can compose a `privileged_role` packet.
+    ///
+    /// `entity_map` optionally rebinds caller fields before passing:
+    /// `{"role": "actor_role"}` populates the sub-packet's `role`
+    /// from the outer entity's `actor_role`. Unmapped fields pass
+    /// through unchanged.
+    ///
+    /// Cycles are bounded by the depth limit
+    /// [`MAX_COMPOSITION_DEPTH`]; exceeding it returns false with a
+    /// warning log. Missing packets also return false with a warning.
+    /// Validate at compile time via the optional resolver in
+    /// [`Packets::compile`].
+    Apply {
+        packet_id: String,
+        expect: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        entity_map: BTreeMap<String, String>,
+    },
 }
 
 // ── Classification (user-defined per-packet lattice) ─────────────
@@ -538,8 +560,105 @@ fn validate_predicate(pred: &Predicate, inside_forall: bool) -> Result<()> {
             Ok(())
         }
         Predicate::Not { arg } => validate_predicate(arg, inside_forall),
+        Predicate::Apply {
+            packet_id,
+            expect,
+            entity_map: _,
+        } => {
+            if packet_id.trim().is_empty() {
+                anyhow::bail!("Apply requires non-empty 'packet_id'");
+            }
+            if expect.is_empty() {
+                anyhow::bail!(
+                    "Apply requires non-empty 'expect' — list at least one \
+                     classification you want the sub-packet to produce"
+                );
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
+}
+
+/// Walk a predicate tree and collect every packet_id referenced via
+/// `Apply`. Used by [`Packets::compile`] to verify sub-packets exist
+/// at compile time rather than silently failing at eval time.
+fn collect_apply_refs(pred: &Predicate, out: &mut Vec<String>) {
+    match pred {
+        Predicate::Apply { packet_id, .. } => out.push(packet_id.clone()),
+        Predicate::All { args } | Predicate::Any { args } => {
+            for a in args {
+                collect_apply_refs(a, out);
+            }
+        }
+        Predicate::Not { arg } => collect_apply_refs(arg, out),
+        Predicate::ForAll { pred: inner, .. } | Predicate::Exists { pred: inner, .. } => {
+            collect_apply_refs(inner, out);
+        }
+        _ => {}
+    }
+}
+
+/// Walk every rule's antecedent and collect all `Apply` nodes that
+/// reference the given packet_id. Returned references share the caller's
+/// borrow so callers can inspect `expect` without cloning.
+fn rule_antecedents_referencing<'a>(
+    rules: &'a [Rule],
+    packet_id: &str,
+) -> Vec<&'a Predicate> {
+    let mut out = Vec::new();
+    for rule in rules {
+        collect_apply_by_id(&rule.antecedent, packet_id, &mut out);
+    }
+    out
+}
+
+fn collect_apply_by_id<'a>(
+    pred: &'a Predicate,
+    target: &str,
+    out: &mut Vec<&'a Predicate>,
+) {
+    match pred {
+        Predicate::Apply { packet_id, .. } if packet_id == target => out.push(pred),
+        Predicate::All { args } | Predicate::Any { args } => {
+            for a in args {
+                collect_apply_by_id(a, target, out);
+            }
+        }
+        Predicate::Not { arg } => collect_apply_by_id(arg, target, out),
+        Predicate::ForAll { pred: inner, .. } | Predicate::Exists { pred: inner, .. } => {
+            collect_apply_by_id(inner, target, out);
+        }
+        _ => {}
+    }
+}
+
+/// Verify that every `Apply` node's `expect` only names classifications
+/// that exist in the sub-packet's lattice. A typo here silently makes
+/// the composition un-matchable; surfacing at compile time saves a
+/// debugging round.
+fn check_apply_expect_against_lattice(
+    applies: &[&Predicate],
+    sub: &Packet,
+) -> Result<()> {
+    for pred in applies {
+        if let Predicate::Apply {
+            packet_id, expect, ..
+        } = pred
+        {
+            for e in expect {
+                if !sub.classification_lattice.iter().any(|c| c == e) {
+                    anyhow::bail!(
+                        "Apply({packet_id}).expect contains '{e}', which is not in the \
+                         referenced packet's lattice {:?}. Typo, or the sub-packet's \
+                         lattice was changed?",
+                        sub.classification_lattice
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl RuleInput {
@@ -818,6 +937,54 @@ fn resolve_collection<'a>(
     entity.get(field)?.as_array().map(|v| v.as_slice())
 }
 
+/// Depth limit for `Apply` (packet composition). Prevents unbounded
+/// recursion if a packet graph contains a cycle or a very deep chain.
+/// Bumps here should be paired with a concrete use case — most real
+/// compositions are two or three levels deep.
+pub const MAX_COMPOSITION_DEPTH: usize = 8;
+
+/// Packet lookup for composition. The daemon's [`Packets`] store is the
+/// canonical implementation; tests can use [`NoopResolver`] when the
+/// predicate under test doesn't exercise `Apply`.
+pub trait PacketResolver {
+    fn resolve(&self, packet_id: &str) -> Option<Packet>;
+}
+
+/// Resolver that never finds a packet. Handy as a default when the
+/// caller hasn't wired composition.
+pub struct NoopResolver;
+
+impl PacketResolver for NoopResolver {
+    fn resolve(&self, _: &str) -> Option<Packet> {
+        None
+    }
+}
+
+impl PacketResolver for Packets {
+    fn resolve(&self, packet_id: &str) -> Option<Packet> {
+        self.load(packet_id).ok()
+    }
+}
+
+/// Rebind caller fields into sub-packet field names before composition.
+/// Outer entity fields specified in `entity_map` values populate sub
+/// entity fields named by the keys. Unmapped fields pass through.
+fn apply_entity_map(
+    entity: &serde_json::Map<String, serde_json::Value>,
+    entity_map: &BTreeMap<String, String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    if entity_map.is_empty() {
+        return entity.clone();
+    }
+    let mut out = entity.clone();
+    for (sub_key, outer_key) in entity_map {
+        if let Some(v) = entity.get(outer_key) {
+            out.insert(sub_key.clone(), v.clone());
+        }
+    }
+    out
+}
+
 /// Wrap a JSON value as a sub-entity map suitable for `eval_predicate`.
 /// Objects pass through unchanged. Primitives become `{"$": value}` so
 /// predicates inside `ForAll`/`Exists` can address them via the
@@ -835,15 +1002,22 @@ fn as_sub_entity(
     }
 }
 
-/// Evaluate a predicate against a resolved entity. Pure function — no
-/// I/O, no LLM, no side effects. Cross-field and applicability
-/// predicates return `false` on missing / malformed inputs rather than
-/// panicking or erroring; compose with `KeyExists` / `IsMissing` /
-/// `IsNonNull` / `IsNull` inside `All` when applicability guards are
-/// wanted.
+/// Evaluate a predicate against a resolved entity. Pure with respect
+/// to `entity` — no I/O on the entity side. Cross-field and
+/// applicability predicates return `false` on missing / malformed
+/// inputs rather than panicking or erroring; compose with `KeyExists`
+/// / `IsMissing` / `IsNonNull` / `IsNull` inside `All` when
+/// applicability guards are wanted.
+///
+/// `resolver` is used only by `Apply` for packet composition; other
+/// arms ignore it. `depth` tracks composition depth to bound
+/// recursion at [`MAX_COMPOSITION_DEPTH`]; top-level callers start at
+/// 0.
 fn eval_predicate(
     p: &Predicate,
     entity: &serde_json::Map<String, serde_json::Value>,
+    resolver: &dyn PacketResolver,
+    depth: usize,
 ) -> bool {
     match p {
         Predicate::AlwaysTrue {} => true,
@@ -916,16 +1090,20 @@ fn eval_predicate(
                 _ => false,
             }
         }
-        Predicate::All { args } => args.iter().all(|arg| eval_predicate(arg, entity)),
-        Predicate::Any { args } => args.iter().any(|arg| eval_predicate(arg, entity)),
-        Predicate::Not { arg } => !eval_predicate(arg, entity),
+        Predicate::All { args } => args
+            .iter()
+            .all(|arg| eval_predicate(arg, entity, resolver, depth)),
+        Predicate::Any { args } => args
+            .iter()
+            .any(|arg| eval_predicate(arg, entity, resolver, depth)),
+        Predicate::Not { arg } => !eval_predicate(arg, entity, resolver, depth),
         Predicate::ForAll { path, pred } => match resolve_collection(entity, path) {
             // Vacuous truth: empty or missing collection → true. Matches
             // the standard ∀x∈∅: P(x) convention.
             None => true,
             Some(items) => items.iter().all(|item| {
                 let sub = as_sub_entity(item);
-                eval_predicate(pred, &sub)
+                eval_predicate(pred, &sub, resolver, depth)
             }),
         },
         Predicate::Exists { path, pred } => match resolve_collection(entity, path) {
@@ -933,7 +1111,7 @@ fn eval_predicate(
             None => false,
             Some(items) => items.iter().any(|item| {
                 let sub = as_sub_entity(item);
-                eval_predicate(pred, &sub)
+                eval_predicate(pred, &sub, resolver, depth)
             }),
         },
         Predicate::CountCmp {
@@ -944,17 +1122,67 @@ fn eval_predicate(
             let n = resolve_collection(entity, path).map(|a| a.len()).unwrap_or(0);
             compare.apply(n, *value)
         }
+        Predicate::Apply {
+            packet_id,
+            expect,
+            entity_map,
+        } => {
+            if depth >= MAX_COMPOSITION_DEPTH {
+                tracing::warn!(
+                    packet_id = %packet_id,
+                    depth,
+                    "Apply: composition depth limit exceeded, returning false"
+                );
+                return false;
+            }
+            let sub = match resolver.resolve(packet_id) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        packet_id = %packet_id,
+                        "Apply: referenced packet not found, returning false"
+                    );
+                    return false;
+                }
+            };
+            let mapped = apply_entity_map(entity, entity_map);
+            let sub_resolved = resolve_entity(&sub, &mapped);
+            for rule in &sub.rules {
+                if eval_predicate(&rule.antecedent, &sub_resolved, resolver, depth + 1) {
+                    return expect.contains(&rule.classification);
+                }
+            }
+            // No sub-rule fired; outer predicate can't match unless the
+            // caller explicitly expected "no match" — but that's not a
+            // classification value, so this is always false.
+            false
+        }
     }
 }
 
-/// Apply a packet to an entity. Returns the first matching rule's
-/// prediction, or None when no rule matches.
+/// Apply a packet to an entity without packet composition. Returns
+/// the first matching rule's prediction, or None when no rule matches.
+/// `Apply` predicates in the tree silently return false because there
+/// is no resolver — use [`apply_with`] for composition-aware
+/// evaluation.
 pub fn apply(packet: &Packet, entity: &serde_json::Value) -> Option<Prediction> {
+    apply_with(packet, entity, &NoopResolver)
+}
+
+/// Apply a packet with composition support. The resolver looks up
+/// referenced packets for [`Predicate::Apply`] nodes. Pass the daemon's
+/// [`Packets`] store here for production; tests without composition
+/// can use [`NoopResolver`].
+pub fn apply_with(
+    packet: &Packet,
+    entity: &serde_json::Value,
+    resolver: &dyn PacketResolver,
+) -> Option<Prediction> {
     let entity_obj = entity.as_object()?;
     let resolved = resolve_entity(packet, entity_obj);
 
     for rule in &packet.rules {
-        if eval_predicate(&rule.antecedent, &resolved) {
+        if eval_predicate(&rule.antecedent, &resolved, resolver, 0) {
             return Some(Prediction {
                 rule_id: rule.id.clone(),
                 consequent: rule.consequent.clone(),
@@ -979,6 +1207,16 @@ pub fn apply(packet: &Packet, entity: &serde_json::Value) -> Option<Prediction> 
 /// severity enum. A catchall PASS rule authored as `emit: "fallback"`
 /// now vanishes automatically when any real finding exists.
 pub fn apply_all(packet: &Packet, entity: &serde_json::Value) -> ApplyAllResult {
+    apply_all_with(packet, entity, &NoopResolver)
+}
+
+/// Composition-aware variant of [`apply_all`]. Pass the daemon's
+/// [`Packets`] store to let `Apply` predicates resolve other packets.
+pub fn apply_all_with(
+    packet: &Packet,
+    entity: &serde_json::Value,
+    resolver: &dyn PacketResolver,
+) -> ApplyAllResult {
     let entity_obj = match entity.as_object() {
         Some(o) => o,
         None => {
@@ -995,7 +1233,7 @@ pub fn apply_all(packet: &Packet, entity: &serde_json::Value) -> ApplyAllResult 
         .rules
         .iter()
         .filter(|rule| rule.emit == Emit::Independent)
-        .filter(|rule| eval_predicate(&rule.antecedent, &resolved))
+        .filter(|rule| eval_predicate(&rule.antecedent, &resolved, resolver, 0))
         .map(|rule| Prediction {
             rule_id: rule.id.clone(),
             consequent: rule.consequent.clone(),
@@ -1013,7 +1251,7 @@ pub fn apply_all(packet: &Packet, entity: &serde_json::Value) -> ApplyAllResult 
             .rules
             .iter()
             .filter(|rule| rule.emit == Emit::Fallback)
-            .filter(|rule| eval_predicate(&rule.antecedent, &resolved))
+            .filter(|rule| eval_predicate(&rule.antecedent, &resolved, resolver, 0))
             .map(|rule| Prediction {
                 rule_id: rule.id.clone(),
                 consequent: rule.consequent.clone(),
@@ -1053,6 +1291,15 @@ pub fn verify_all(
     packet: &Packet,
     dataset: &serde_json::Value,
 ) -> Result<AllModeFidelityReport> {
+    verify_all_with(packet, dataset, &NoopResolver)
+}
+
+/// Composition-aware variant of [`verify_all`].
+pub fn verify_all_with(
+    packet: &Packet,
+    dataset: &serde_json::Value,
+    resolver: &dyn PacketResolver,
+) -> Result<AllModeFidelityReport> {
     let rows = dataset.as_array().context(
         "dataset must be a JSON array of {entity, expected_verdict?, expected_rule_ids?} objects",
     )?;
@@ -1082,7 +1329,7 @@ pub fn verify_all(
         }
 
         total += 1;
-        let result = apply_all(packet, &entity);
+        let result = apply_all_with(packet, &entity, resolver);
         let actual_verdict = result.verdict.clone();
         let mut actual_rule_ids: Vec<String> =
             result.findings.iter().map(|p| p.rule_id.clone()).collect();
@@ -1139,6 +1386,15 @@ pub fn verify_all(
 /// Apply packet to every entry in `dataset`. Dataset is a JSON array of
 /// `{entity, expected}` pairs. Returns a fidelity report.
 pub fn verify(packet: &Packet, dataset: &serde_json::Value) -> Result<FidelityReport> {
+    verify_with(packet, dataset, &NoopResolver)
+}
+
+/// Composition-aware variant of [`verify`].
+pub fn verify_with(
+    packet: &Packet,
+    dataset: &serde_json::Value,
+    resolver: &dyn PacketResolver,
+) -> Result<FidelityReport> {
     let rows = dataset
         .as_array()
         .context("dataset must be a JSON array of {entity, expected} objects")?;
@@ -1160,7 +1416,7 @@ pub fn verify(packet: &Packet, dataset: &serde_json::Value) -> Result<FidelityRe
         };
 
         total += 1;
-        match apply(packet, &entity) {
+        match apply_with(packet, &entity, resolver) {
             Some(prediction) if prediction.consequent == expected => {
                 correct += 1;
             }
@@ -1330,6 +1586,28 @@ impl Packets {
             .map(|ri| ri.materialize(&lattice, &prefix_inference))
             .collect::<Result<Vec<_>>>()?;
 
+        // Phase-5 composition: verify every `Apply{packet_id}` reference
+        // resolves to an existing packet. Catches typos and stale IDs at
+        // compile time rather than silent false-returns at eval time.
+        // Also check the referenced packet's classification lattice
+        // contains every element of `expect` — otherwise the Apply can
+        // never match.
+        let mut refs = Vec::new();
+        for rule in &rules {
+            collect_apply_refs(&rule.antecedent, &mut refs);
+        }
+        for packet_id in &refs {
+            let normalized = normalize_id(packet_id);
+            let sub = self.load(&normalized).with_context(|| {
+                format!(
+                    "Apply references packet '{packet_id}' which is not in the store. \
+                     Compile the referenced packet first, or check the ID."
+                )
+            })?;
+            // Check expect values are in the sub-packet's lattice.
+            check_apply_expect_against_lattice(&rule_antecedents_referencing(&rules, packet_id), &sub)?;
+        }
+
         let rank_table: BTreeMap<String, i64> = match &p.rank_table {
             Some(v) => serde_json::from_value(v.clone())
                 .context("'rank_table' must be an object mapping string keys to integer values")?,
@@ -1391,7 +1669,7 @@ impl Packets {
         let packet = self.load(&p.packet_id)?;
         let mode = p.mode.unwrap_or_default();
         match mode {
-            ApplyMode::First => match apply(&packet, &p.entity) {
+            ApplyMode::First => match apply_with(&packet, &p.entity, self) {
                 Some(prediction) => Ok(serde_json::to_string_pretty(&serde_json::json!({
                     "packet_id": packet.id,
                     "mode": mode,
@@ -1410,7 +1688,7 @@ impl Packets {
                 }))?),
             },
             ApplyMode::All => {
-                let result = apply_all(&packet, &p.entity);
+                let result = apply_all_with(&packet, &p.entity, self);
                 Ok(serde_json::to_string_pretty(&serde_json::json!({
                     "packet_id": result.packet_id,
                     "mode": mode,
@@ -1429,7 +1707,7 @@ impl Packets {
         let mode = p.mode.unwrap_or_default();
         match mode {
             ApplyMode::First => {
-                let report = verify(&packet, &p.dataset)?;
+                let report = verify_with(&packet, &p.dataset, self)?;
                 Ok(serde_json::to_string_pretty(&serde_json::json!({
                     "packet_id": packet.id,
                     "mode": mode,
@@ -1441,7 +1719,7 @@ impl Packets {
                 }))?)
             }
             ApplyMode::All => {
-                let report = verify_all(&packet, &p.dataset)?;
+                let report = verify_all_with(&packet, &p.dataset, self)?;
                 Ok(serde_json::to_string_pretty(&serde_json::json!({
                     "packet_id": packet.id,
                     "mode": mode,
@@ -2914,5 +3192,327 @@ mod tests {
         let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
         let r = ri.materialize(&review_lattice(), &review_prefix_inference()).unwrap();
         assert_eq!(r.emit, Emit::Fallback);
+    }
+
+    // ── Composition (Apply predicate) tests ────────────────────────
+
+    /// Compile a minimal "is_breaking" sub-packet: breaks if api_surface
+    /// changed AND no migration note. Lattice: [breaking, safe].
+    fn compile_breaking_packet(packets: &Packets) -> String {
+        let out = packets
+            .compile(&CompileParams {
+                domain: "pr-breakingness".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: Some(vec!["breaking".into(), "safe".into()]),
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([
+                    {
+                        "id": "breaking_api_no_migration",
+                        "classification": "breaking",
+                        "antecedent": {"op": "All", "args": [
+                            {"op": "Eq", "field": "api_surface_changed", "value": true},
+                            {"op": "Eq", "field": "migration_note_present", "value": false}
+                        ]},
+                        "consequent": "BREAKING"
+                    },
+                    {
+                        "id": "safe_default",
+                        "classification": "safe",
+                        "emit": "fallback",
+                        "antecedent": {"op": "True"},
+                        "consequent": "SAFE"
+                    }
+                ]),
+            })
+            .unwrap();
+        // compile returns "Packet packet-xxxxxxxx compiled (...)"
+        out.split_whitespace().nth(1).unwrap().to_string()
+    }
+
+    #[test]
+    fn apply_node_composes_sub_packet_verdict() {
+        let (_d, packets) = tmp_packets();
+        let sub_id = compile_breaking_packet(&packets);
+
+        // Outer packet: REJECT if sub says breaking; else PASS.
+        let outer = packets
+            .compile(&CompileParams {
+                domain: "pr-triage".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: None, // use review lattice
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([
+                    {
+                        "id": "fail_breaking",
+                        "antecedent": {
+                            "op": "Apply",
+                            "packet_id": sub_id.clone(),
+                            "expect": ["breaking"],
+                        },
+                        "consequent": "REJECT"
+                    },
+                    {
+                        "id": "pass_default",
+                        "emit": "fallback",
+                        "antecedent": {"op": "True"},
+                        "consequent": "ACCEPT"
+                    }
+                ]),
+            })
+            .unwrap();
+        let outer_id = outer.split_whitespace().nth(1).unwrap();
+        let outer_pkt = packets.load(outer_id).unwrap();
+
+        // Breaking entity → outer fires fail_breaking via Apply.
+        let breaking = json!({
+            "api_surface_changed": true,
+            "migration_note_present": false,
+        });
+        let pred = apply_with(&outer_pkt, &breaking, &packets).unwrap();
+        assert_eq!(pred.rule_id, "fail_breaking");
+        assert_eq!(pred.consequent, Value::String("REJECT".into()));
+
+        // Safe entity → outer falls through to pass_default.
+        let safe = json!({
+            "api_surface_changed": true,
+            "migration_note_present": true,
+        });
+        let pred = apply_with(&outer_pkt, &safe, &packets).unwrap();
+        assert_eq!(pred.rule_id, "pass_default");
+    }
+
+    #[test]
+    fn apply_node_returns_false_when_resolver_cannot_find_packet() {
+        let (_d, packets) = tmp_packets();
+        let pred = Predicate::Apply {
+            packet_id: "packet-deadbeef".into(),
+            expect: vec!["breaking".into()],
+            entity_map: BTreeMap::new(),
+        };
+        let entity = serde_json::Map::new();
+        // With a real resolver that doesn't have the packet, eval returns false.
+        assert!(!eval_predicate(&pred, &entity, &packets, 0));
+        // With NoopResolver, also false.
+        assert!(!eval_predicate(&pred, &entity, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn compile_rejects_apply_with_missing_sub_packet() {
+        let (_d, packets) = tmp_packets();
+        let err = packets
+            .compile(&CompileParams {
+                domain: "test".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: None,
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([{
+                    "id": "fail_missing",
+                    "antecedent": {
+                        "op": "Apply",
+                        "packet_id": "packet-nonexistent",
+                        "expect": ["breaking"]
+                    },
+                    "consequent": "REJECT"
+                }]),
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("packet-nonexistent") && msg.contains("not in the store"),
+            "expected missing-packet error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_apply_with_expect_outside_sub_lattice() {
+        let (_d, packets) = tmp_packets();
+        let sub_id = compile_breaking_packet(&packets);
+        let err = packets
+            .compile(&CompileParams {
+                domain: "test".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: None,
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([{
+                    "id": "fail_typo",
+                    "antecedent": {
+                        "op": "Apply",
+                        "packet_id": sub_id,
+                        "expect": ["brekaing"]  // typo
+                    },
+                    "consequent": "REJECT"
+                }]),
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("brekaing") && msg.contains("lattice"),
+            "expected lattice-mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_node_entity_map_rebinds_fields() {
+        let (_d, packets) = tmp_packets();
+        let sub_id = compile_breaking_packet(&packets);
+
+        // Outer's entity schema uses DIFFERENT field names.
+        // Map outer's `did_break` → sub's `api_surface_changed`, etc.
+        let outer = packets
+            .compile(&CompileParams {
+                domain: "pr-triage-remap".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: None,
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([
+                    {
+                        "id": "fail_via_mapped",
+                        "antecedent": {
+                            "op": "Apply",
+                            "packet_id": sub_id,
+                            "expect": ["breaking"],
+                            "entity_map": {
+                                "api_surface_changed": "did_break",
+                                "migration_note_present": "has_migration_doc"
+                            }
+                        },
+                        "consequent": "REJECT"
+                    },
+                    {
+                        "id": "pass_default",
+                        "emit": "fallback",
+                        "antecedent": {"op": "True"},
+                        "consequent": "ACCEPT"
+                    }
+                ]),
+            })
+            .unwrap();
+        let outer_id = outer.split_whitespace().nth(1).unwrap();
+        let outer_pkt = packets.load(outer_id).unwrap();
+
+        // Entity with outer schema → mapping rebinds to sub schema.
+        let breaking = json!({
+            "did_break": true,
+            "has_migration_doc": false,
+        });
+        let pred = apply_with(&outer_pkt, &breaking, &packets).unwrap();
+        assert_eq!(pred.rule_id, "fail_via_mapped");
+    }
+
+    #[test]
+    fn apply_node_respects_depth_limit() {
+        let (_d, packets) = tmp_packets();
+
+        // Build a chain: p0 references p1 references p2 ... up to limit.
+        // Each packet has one rule: classification "match" fires iff the
+        // NEXT packet in the chain says "match".
+        //
+        // We can construct this by (a) compiling a base packet that
+        // always says "match", then (b) wrapping N times. With N >
+        // MAX_COMPOSITION_DEPTH, the outermost call should return false
+        // because depth exceeded.
+        let base_id = {
+            let out = packets
+                .compile(&CompileParams {
+                    domain: "chain-base".into(),
+                    scope: Some("global".into()),
+                    project: None,
+                    classification_lattice: Some(vec!["match".into(), "nomatch".into()]),
+                    prefix_inference: None,
+                    rank_table: None,
+                    threshold_table: None,
+                    rank_lookup_key: None,
+                    threshold_lookup_key: None,
+                    source_ids: None,
+                    rules: json!([{
+                        "id": "always_match",
+                        "classification": "match",
+                        "antecedent": {"op": "True"},
+                        "consequent": "M"
+                    }]),
+                })
+                .unwrap();
+            out.split_whitespace().nth(1).unwrap().to_string()
+        };
+
+        let mut current = base_id.clone();
+        // Build a chain longer than the depth limit.
+        for i in 0..(MAX_COMPOSITION_DEPTH + 2) {
+            let out = packets
+                .compile(&CompileParams {
+                    domain: format!("chain-{i}"),
+                    scope: Some("global".into()),
+                    project: None,
+                    classification_lattice: Some(vec!["match".into(), "nomatch".into()]),
+                    prefix_inference: None,
+                    rank_table: None,
+                    threshold_table: None,
+                    rank_lookup_key: None,
+                    threshold_lookup_key: None,
+                    source_ids: None,
+                    rules: json!([
+                        {
+                            "id": "match_via_next",
+                            "classification": "match",
+                            "antecedent": {
+                                "op": "Apply",
+                                "packet_id": current.clone(),
+                                "expect": ["match"]
+                            },
+                            "consequent": "M"
+                        },
+                        {
+                            "id": "nomatch_default",
+                            "classification": "nomatch",
+                            "emit": "fallback",
+                            "antecedent": {"op": "True"},
+                            "consequent": "N"
+                        }
+                    ]),
+                })
+                .unwrap();
+            current = out.split_whitespace().nth(1).unwrap().to_string();
+        }
+
+        // The outermost packet's eval should trip the depth limit
+        // before reaching the base. That means `match_via_next` returns
+        // false, the fallback `nomatch_default` fires, and the outer
+        // verdict is "nomatch" — NOT "match".
+        let outer = packets.load(&current).unwrap();
+        let pred = apply_with(&outer, &json!({}), &packets).unwrap();
+        assert_eq!(
+            pred.classification, "nomatch",
+            "depth limit should prevent the outer chain from resolving to 'match'"
+        );
     }
 }

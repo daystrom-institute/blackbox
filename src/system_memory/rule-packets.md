@@ -68,6 +68,14 @@ Packets are for *structured domains that admit generators*. If priors already pr
 - `Exists{path, pred}` — some element satisfies. Empty/missing is false (no witness).
 - `CountCmp{path, compare, value}` — length of collection at `path` compared with `value`. `compare` is one of `lt/le/eq/ge/gt`. Missing path → count 0.
 
+**Packet composition (phase 5):**
+- `Apply{packet_id, expect, entity_map?}` — true iff applying the referenced packet produces a first-match verdict whose classification is in `expect`. Lets a theory depend on another theory — a review packet can compose a `is_breaking` packet; an auth packet can compose a `privileged_role` packet. Use when a concept is worth extracting and reusing across packets.
+    - `expect` is validated at compile time against the sub-packet's lattice — typos fail fast instead of silently never matching.
+    - `entity_map` optionally rebinds outer field names into the sub-packet's schema: `{"role": "actor_role"}` populates the sub's `role` from the outer entity's `actor_role`. Unmapped fields pass through unchanged.
+    - Compile-time check: referenced `packet_id` must already exist in the store. Compile the sub-packet first.
+    - Runtime: depth-limited at 8 composition levels. Exceeding that returns false with a warning log (not a panic).
+    - Cycles are detected by depth limit, not visited-set. A direct self-reference compiles because the new packet's ID isn't known until save — authoring discipline catches those.
+
 Path syntax in v1: single field with `[*]` suffix, e.g. `"tools[*]"`. Dotted paths like `"config.rules[*]"` are phase-next; flatten the entity if you need them.
 
 Inside the inner predicate, the sub-entity IS the array element. Object elements are addressable directly by their fields (`IsNonNull{field: "description"}`). Primitive elements (strings, ints, bools) get wrapped as `{"$": value}` — address via the special field `"$"`.
