@@ -1276,6 +1276,7 @@ impl BlackboxServer {
         if let Some(team_ref) =
             orchestration::team::find_bro_ref_for_task(&p.task_id, &self.state.store_dir)
         {
+            out["bro"] = Value::String(team_ref.member_name.clone());
             match self
                 .maybe_resume_team_advisor(&team_ref.team_name, "wait", &[out.clone()])
                 .await
