@@ -48,7 +48,7 @@ impl ToolCategory {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
             }
             Self::Knowledge => {
-                "Durable memory with three verbs: `bbox_learn` for rendered rules/conventions, `bbox_remember` for indexed-only notes you can grep later, `bbox_decide` for commitments with required rationale. Render pipeline emits provider-specific markdown files (CLAUDE.md / AGENTS.md / GEMINI.md). Prefer `remember` when unsure — it can be promoted to `learn` later."
+                "Memory has four lanes: `bbox_learn` for standing rendered rules, `bbox_remember` for cold indexed recall, `bbox_decide` for durable commitments with rationale, and `bbox_pin` for persisted but scope-limited ambient context on an active session/bro/thread/work-item. Render pipeline emits provider-specific markdown files (CLAUDE.md / AGENTS.md / GEMINI.md) only for the standing lanes."
             }
             Self::Threads => {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
@@ -148,7 +148,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
         summary: "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically.",
-        when_to_use: "Use for standing user rules that must outlive the current edit. Not for one-off task constraints, and not for facts you discovered yourself. Query `bbox_knowledge` first to avoid duplicate entries. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
+        when_to_use: "Use for standing user rules that must outlive the current edit. Not for one-off task constraints, not for facts you discovered yourself, and not for active-arc guidance like migration sequencing, executor charters, or 'for this initiative' instructions. Those belong in `bbox_pin` if they need to stay hot, or `bbox_remember` if they only need cold recall. Query `bbox_knowledge` first to avoid duplicate entries. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
         ),
@@ -157,7 +157,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_remember",
         category: ToolCategory::Knowledge,
         summary: "Persist a fact for later recall; indexed but NOT rendered.",
-        when_to_use: "Observations, decisions, context worth grepping for later but not worth every session loading. Safer default than `learn` when unsure.",
+        when_to_use: "Observations, decisions, and context worth grepping for later but not worth every session loading. Use when you want persistence without prompt residency. Safer default than `learn` when unsure; use `bbox_pin` instead when the context must stay hot for one active execution lane.",
         example: Some(
             r#"bbox_remember(content="port 7263 conflicts with helper-daemon on host bravo", title="port clash")"#,
         ),
@@ -169,6 +169,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use for real commitments or reversals that need rationale and audit trail. Query `bbox_knowledge` first to find the prior decision you may be superseding; `supersedes` takes the bare 8-hex entry ID. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_decide(content="use RocksDB for cache", rationale="SQLite locking conflicted with concurrent writers", supersedes="8a3f12cd")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_pin",
+        category: ToolCategory::Knowledge,
+        summary: "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope.",
+        when_to_use: "Use for active-arc guidance that should stay hot for one execution lane without becoming standing repo policy: migration phase notes, bounded executor charters, current-initiative sequencing, or temporary reviewer context. Prefer `bbox_pin` over `bbox_learn` when the guidance is supposed to disappear with the session/arc rather than bind future unrelated agents. See `sm-scoped-pins` via `bbox_knowledge` for the deeper split.",
+        example: Some(
+            r#"bbox_pin(action="set", scope="bro", target="executor", project="/repo/x", title="Active arc", content="For the current migration, validate every phase cut against the canonical scoping doc before proposing code changes.")"#,
         ),
     },
     ToolDoc {
@@ -189,7 +198,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_render",
         category: ToolCategory::Knowledge,
         summary: "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md.",
-        when_to_use: "Use to publish approved knowledge into managed files. `global` patches host-wide memory files; `project` writes project-local files + PROJECT.md. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches host-wide memory files; `project` writes project-local files + PROJECT.md. Do not use render as a way to keep active-work guidance hot across turns — that is what `bbox_pin` is for. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: Some(r#"bbox_render(scope="project", project="/repo/x")"#),
     },
     ToolDoc {
@@ -457,7 +466,8 @@ from transcript history.
 - List before create.
 - `bro_exec` starts fresh; `bro_resume` continues.
 - `bbox_learn` is for user-stated standing rules; `bbox_note(kind=learned)` is \
-for agent-discovered facts.
+for agent-discovered facts; `bbox_pin` is for active-arc context that should \
+stay hot for one execution lane without becoming standing policy.
 ";
 
 fn system_memory_hint(doc: &ToolDoc) -> Option<String> {
@@ -520,7 +530,7 @@ pub fn render_markdown() -> String {
     out.push_str("## CORE RULE: capture durable user directives\n\n");
     out.push_str("**When the user states a rule, convention, or preference meant to bind future sessions, your response MUST include a `bbox_learn` (or `bbox_remember` / `bbox_decide`) call BEFORE you wrap up the task.** Mechanical enforcement — a `.gitignore` entry, a linter config, deleted code, a removed dependency — does not replace this. It enforces the rule for the current edit; it does NOT transmit the *intent* to a future session that won't see this turn. Skipping the call means the rule silently rots and a future agent re-derives the wrong answer.\n\n");
     out.push_str("Triggers (positive and negative bind equally): \"from now on\", \"always X\", \"never X\", \"we (don't) use Y\", \"prefer Y\", \"X is banned / retired / out of scope\", \"stop using X\", \"no more X\", \"house rule\", \"standing order\", \"keep X out of\", \"X must not\".\n\n");
-    out.push_str("Scope test before emitting: would the statement still matter after this edit is reverted or forgotten? If yes, store it. If no (\"for this fix, skip tests\", \"just for today\"), don't — that's an ephemeral task constraint, not a standing rule.\n\n");
+    out.push_str("Scope test before emitting: would the statement still matter after this edit is reverted or forgotten? If yes, store it. If no (\"for this fix, skip tests\", \"just for today\"), don't — that's an ephemeral task constraint, not a standing rule. If it needs to stay hot only for one active session, bro, thread, or work item, use `bbox_pin` instead of promoting it into rendered memory.\n\n");
     out.push_str("After implementing any user directive in code/config, explicitly ask yourself: did the user just state a standing rule? If yes, emit the storage call before replying.\n\n");
 
     out.push_str("**Scope selection.** Default to `project` for repo-local conventions. Choose `global` only when the user's phrasing explicitly reaches beyond this repo — \"across every project\", \"on every machine\", \"in every X I write\", \"I always X as a personal rule\", \"house rule on this machine\". Technology-scoped but project-agnostic statements (\"in all Rust code I write\", \"always prefer fd over find\") are `global`. Strong wording alone is not enough — \"we always use tokio here\" stays `project`. Presence of a current project does not imply `project` scope when the user states a cross-project personal rule. If both readings are plausible, choose `project`.\n\n");

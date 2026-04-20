@@ -5,6 +5,7 @@ mod notes;
 mod orchestration;
 mod packets;
 mod parser;
+mod pins;
 mod query;
 mod render;
 mod system_memory;
@@ -42,6 +43,7 @@ use orchestration::providers::{ExecOpts, Provider};
 use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
 use packets::{Packets, ScannerConfig};
+use pins::{AmbientPinQuery, PinParams, Pins};
 use threads::Threads;
 
 // ---------------------------------------------------------------------------
@@ -53,6 +55,7 @@ struct SharedState {
     kb: RwLock<Knowledge>,
     threads: RwLock<Threads>,
     notes: RwLock<Notes>,
+    pins: RwLock<Pins>,
     packets: RwLock<Packets>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
@@ -75,6 +78,23 @@ impl BlackboxServer {
             state,
             tool_router: Self::bbox_tools() + Self::bro_tools(),
         }
+    }
+
+    fn ambient_pin_block(
+        &self,
+        project_dir: Option<&str>,
+        bro_name: Option<&str>,
+        session_id: Option<&str>,
+        thread_id: Option<&str>,
+        work_item_id: Option<&str>,
+    ) -> Option<String> {
+        self.state.pins.read().render_for_ambient(&AmbientPinQuery {
+            project: project_dir,
+            bro: bro_name,
+            session_id,
+            thread_id,
+            work_item_id,
+        })
     }
 
     fn ok_text(text: &str) -> CallToolResult {
@@ -406,6 +426,14 @@ impl BlackboxServer {
     )]
     fn bbox_note_resolve(&self, Parameters(p): Parameters<NoteResolveParams>) -> CallToolResult {
         Self::run("bbox_note_resolve", || self.state.notes.write().resolve(&p))
+    }
+
+    #[tool(
+        name = "bbox_pin",
+        description = "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope."
+    )]
+    fn bbox_pin(&self, Parameters(p): Parameters<PinParams>) -> CallToolResult {
+        Self::run("bbox_pin", || self.state.pins.write().pin(&p))
     }
 
     #[tool(
@@ -1076,6 +1104,13 @@ impl BlackboxServer {
             bro_name: p.bro.clone(),
             thread_id: None,
             work_item_id: None,
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                p.bro.as_deref(),
+                Some(session_id.as_str()),
+                None,
+                None,
+            ),
             completion_contract: if allow_recursion {
                 None
             } else {
@@ -1188,6 +1223,13 @@ impl BlackboxServer {
             bro_name: p.bro.clone(),
             thread_id: None,
             work_item_id: None,
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                p.bro.as_deref(),
+                Some(session_id.as_str()),
+                None,
+                None,
+            ),
             completion_contract: if allow_recursion {
                 None
             } else {
@@ -1510,6 +1552,13 @@ impl BlackboxServer {
                     bro_name: Some(member.name.clone()),
                     thread_id: None,
                     work_item_id: None,
+                    pin_block: self.ambient_pin_block(
+                        cwd.as_deref(),
+                        Some(member.name.as_str()),
+                        Some(session_id),
+                        None,
+                        None,
+                    ),
                     completion_contract: if allow_recursion {
                         None
                     } else {
@@ -2413,6 +2462,13 @@ Next step: <one concrete steering suggestion>\n",
                     bro_name: Some(advisor.name.clone()),
                     thread_id: None,
                     work_item_id: None,
+                    pin_block: self.ambient_pin_block(
+                        cwd.as_deref(),
+                        Some(advisor.name.as_str()),
+                        Some(session_id),
+                        None,
+                        None,
+                    ),
                     completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
                     allow_recursion: false,
                     provider: Some(provider),
@@ -2455,6 +2511,13 @@ Next step: <one concrete steering suggestion>\n",
                     bro_name: Some(advisor.name.clone()),
                     thread_id: None,
                     work_item_id: None,
+                    pin_block: self.ambient_pin_block(
+                        cwd.as_deref(),
+                        Some(advisor.name.as_str()),
+                        Some(session_id.as_str()),
+                        None,
+                        None,
+                    ),
                     completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
                     allow_recursion: false,
                     provider: Some(provider),
@@ -3550,6 +3613,10 @@ async fn main() -> anyhow::Result<()> {
     let notes_store = Notes::open(&notes_path)?;
     tracing::info!("Notes store: {}", notes_path.display());
 
+    let pins_path = util::blackbox_pins_path(&home);
+    let pins_store = Pins::open(&pins_path)?;
+    tracing::info!("Pins store: {}", pins_path.display());
+
     let packets_dir = util::blackbox_packets_dir(&home);
     let packets_store = Packets::open(&packets_dir)?;
     tracing::info!("Packets store: {}", packets_dir.join("packets").display());
@@ -3584,6 +3651,7 @@ async fn main() -> anyhow::Result<()> {
         kb: RwLock::new(kb),
         threads: RwLock::new(th),
         notes: RwLock::new(notes_store),
+        pins: RwLock::new(pins_store),
         packets: RwLock::new(packets_store),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx: tail_tx.clone(),
@@ -3690,6 +3758,7 @@ mod tests {
         let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
         let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
         let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
+        let pins = Pins::open(&tmp.path().join("pins.json")).unwrap();
         let packets = Packets::open(tmp.path()).unwrap();
         let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
         let state = Arc::new(SharedState {
@@ -3697,6 +3766,7 @@ mod tests {
             kb: RwLock::new(kb),
             threads: RwLock::new(threads),
             notes: RwLock::new(notes),
+            pins: RwLock::new(pins),
             packets: RwLock::new(packets),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,

@@ -384,6 +384,9 @@ pub struct AmbientContext {
     pub bro_name: Option<String>,
     pub thread_id: Option<String>,
     pub work_item_id: Option<String>,
+    /// Scoped active-arc guidance injected from bbox_pin. Persisted on disk,
+    /// hot only for matching ambient scopes, never rendered into repo memory.
+    pub pin_block: Option<String>,
     /// Per-dispatch expectation, e.g. "call bbox_note(kind='done', body='…') before returning".
     pub completion_contract: Option<String>,
     pub allow_recursion: bool,
@@ -454,6 +457,12 @@ pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
     if !fields.is_empty() {
         prefix.push_str("[scope] ");
         prefix.push_str(&fields.join(" · "));
+        prefix.push_str("\n\n");
+    }
+
+    if let Some(pin_block) = &ctx.pin_block {
+        prefix.push_str("[scoped pins]\n");
+        prefix.push_str(pin_block.trim_end());
         prefix.push_str("\n\n");
     }
 
@@ -1270,6 +1279,19 @@ mod tests {
         let out = apply_ambient("work", &ctx);
         assert!(out.contains("[completion contract]"));
         assert!(out.contains("bbox_note"));
+    }
+
+    #[test]
+    fn ambient_emits_scoped_pin_block_when_present() {
+        let ctx = AmbientContext {
+            pin_block: Some(
+                "- [bro:executor] Active arc: validate cuts against canonical doc".into(),
+            ),
+            ..Default::default()
+        };
+        let out = apply_ambient("work", &ctx);
+        assert!(out.contains("[scoped pins]"));
+        assert!(out.contains("Active arc"));
     }
 
     #[test]

@@ -60,6 +60,11 @@ pub fn blackbox_notes_path(home: &Path) -> PathBuf {
         .unwrap_or_else(|| blackbox_state_dir(home).join("blackbox-notes.json"))
 }
 
+pub fn blackbox_pins_path(home: &Path) -> PathBuf {
+    env_path("BLACKBOX_PINS_PATH")
+        .unwrap_or_else(|| blackbox_state_dir(home).join("blackbox-pins.json"))
+}
+
 /// Rule-packets live as one-file-per-packet under a directory rather than
 /// a single merged JSON. Each packet can be substantial (rank tables,
 /// rule trees, provenance arrays) and the per-scope layout makes
@@ -151,6 +156,7 @@ mod tests {
         std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH");
         std::env::remove_var("BLACKBOX_THREADS_PATH");
         std::env::remove_var("BLACKBOX_NOTES_PATH");
+        std::env::remove_var("BLACKBOX_PINS_PATH");
         std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH");
         std::env::remove_var("BRO_HOME");
 
@@ -159,6 +165,7 @@ mod tests {
         assert!(blackbox_knowledge_path(home).ends_with("blackbox-knowledge.json"));
         assert!(blackbox_threads_path(home).ends_with("blackbox-threads.json"));
         assert!(blackbox_notes_path(home).ends_with("blackbox-notes.json"));
+        assert!(blackbox_pins_path(home).ends_with("blackbox-pins.json"));
         assert!(blackbox_index_path(home).ends_with("blackbox/index"));
         assert!(bro_home_dir(home).ends_with("blackbox/bro"));
     }
@@ -182,6 +189,7 @@ mod tests {
         std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH");
         std::env::remove_var("BLACKBOX_THREADS_PATH");
         std::env::remove_var("BLACKBOX_NOTES_PATH");
+        std::env::remove_var("BLACKBOX_PINS_PATH");
         std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH");
         std::env::remove_var("BRO_HOME");
         std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));

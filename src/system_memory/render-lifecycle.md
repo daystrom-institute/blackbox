@@ -8,6 +8,7 @@ This is the compact model:
 - `bbox_absorb` imports external edits back into the knowledge store as unverified entries.
 - `bbox_review` accepts or rejects those unverified entries.
 - `bbox_lint` checks the store for contradictions, duplication, and stale structure.
+- `bbox_pin` is not part of this lifecycle. Pins stay out of rendered memory entirely.
 
 ## Normal forward path
 
@@ -39,6 +40,7 @@ Use when the guidance belongs only to the current repo and its project-local mem
 ## What each verb is not
 
 - `bbox_render` is not a review step. It publishes what is already approved/renderable.
+- `bbox_render` is not a hot-context mechanism. If the goal is "keep this active-arc guidance visible across turns for one execution lane," use `bbox_pin`, not render.
 - `bbox_absorb` is not publication. It imports external edits into the store, usually as unverified state.
 - `bbox_review` is not rendering. It changes whether absorbed entries are accepted.
 - `bbox_lint` is not a sync step. It is hygiene/diagnostics.

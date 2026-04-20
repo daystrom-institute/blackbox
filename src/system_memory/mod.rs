@@ -9,6 +9,8 @@
 //! - `bbox_learn` / `bbox_decide` render into provider markdown files → every
 //!   agent, every turn. Best for things every agent must always know.
 //! - `bbox_remember` → runtime fact store, queryable but not rendered.
+//! - `bbox_pin` → scoped ambient context for one active execution lane;
+//!   persisted but not rendered.
 //! - `WORKFLOW_NOTES` in `tool_docs.rs` → rendered; reserved for short always-
 //!   in-context guidance.
 //! - **System memories (here)** → code-embedded, not rendered, discoverable
@@ -85,6 +87,23 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
             "runbook",
         ],
         content: include_str!("persistence-taxonomy.md"),
+    },
+    SystemMemory {
+        id: "sm-scoped-pins",
+        title: "Scoped pins — hot context for one active execution lane",
+        tags: &[
+            "pin",
+            "pins",
+            "scoped",
+            "ambient",
+            "session",
+            "bro",
+            "thread",
+            "work_item",
+            "active-arc",
+            "runbook",
+        ],
+        content: include_str!("scoped-pins.md"),
     },
     SystemMemory {
         id: "sm-bro-dispatch-patterns",
