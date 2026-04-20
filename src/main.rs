@@ -129,7 +129,9 @@ use knowledge::{
     RememberParams, RenderParams, ReviewParams,
 };
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
-use packets::{ApplyParams as PacketApplyParams, AuditParams, CompileParams};
+use packets::{
+    ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
+};
 use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
@@ -395,6 +397,49 @@ impl BlackboxServer {
     )]
     fn bbox_audit(&self, Parameters(p): Parameters<AuditParams>) -> CallToolResult {
         Self::run("bbox_audit", || self.state.packets.read().audit_tool(&p))
+    }
+
+    #[tool(
+        name = "bbox_packet_events",
+        description = "Query the packet operation log — every compile / apply / audit / gap event the daemon has recorded. Use to investigate packet behavior over time: low-fidelity audits, high no_match rates, compile failures, authoring gaps. Filter by op, packet_id, outcome, or since. Returns newest-first up to `limit` (default 50, max 500)."
+    )]
+    fn bbox_packet_events(&self, Parameters(p): Parameters<EventsParams>) -> CallToolResult {
+        Self::run("bbox_packet_events", || {
+            let limit = p.limit.unwrap_or(50).min(500);
+            let events = self.state.packets.read().list_events(
+                p.op.as_deref(),
+                p.packet_id.as_deref(),
+                p.outcome.as_deref(),
+                p.since.as_deref(),
+                limit,
+            )?;
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "count": events.len(),
+                "limit": limit,
+                "events": events,
+            }))?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_packet_gap",
+        description = "Log a packet-authoring gap: 'I wanted to compile a rule but the AST couldn't express it'. Use when you fall back to prose, ad-hoc code, or a different tool because a primitive you needed isn't available. The `description` names what you wanted; `ast_feature_requested` names the primitive you wished existed (e.g. `RateCmp`, `StringMatches`, `Within{temporal}`). These gaps are the highest-signal input for prioritizing new AST primitives — every gap logged is a vote for what the packet system can't yet say. Query via bbox_packet_events(op='gap')."
+    )]
+    fn bbox_packet_gap(&self, Parameters(p): Parameters<GapParams>) -> CallToolResult {
+        Self::run("bbox_packet_gap", || {
+            let ev = self.state.packets.read().log_gap(
+                &p.description,
+                p.domain.as_deref(),
+                p.attempted_sketch.as_deref(),
+                p.fallback_used.as_deref(),
+                p.ast_feature_requested.as_deref(),
+            )?;
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "logged": true,
+                "timestamp": ev.timestamp,
+                "note": "Thank you — this gap is now queryable via bbox_packet_events(op='gap')",
+            }))?)
+        })
     }
 }
 

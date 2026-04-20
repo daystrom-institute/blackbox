@@ -133,6 +133,51 @@ pub struct AuditParams {
     pub mode: Option<ApplyMode>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EventsParams {
+    /// Filter by operation: `compile`, `apply`, `audit`, `gap`.
+    #[serde(default)]
+    pub op: Option<String>,
+    /// Filter by packet id (canonical `packet-<8hex>` or bare hex).
+    #[serde(default)]
+    pub packet_id: Option<String>,
+    /// Filter by outcome: `ok`, `error`, `no_match`, `low_fidelity`,
+    /// `logged`.
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// ISO 8601 lower bound; events with earlier timestamps are excluded.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Hard cap on returned rows (default 50, max 500).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GapParams {
+    /// One-sentence description of what the author wanted to express
+    /// and why the AST couldn't handle it. E.g. "wanted to flag
+    /// requests exceeding 10 per minute per user; no rate/time
+    /// predicate".
+    pub description: String,
+    /// Optional domain tag (e.g. `pr-review`, `auth`, `retry`) to
+    /// cluster gaps by use case.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Optional sketch of the rule you would have written if the AST
+    /// supported it, in free form.
+    #[serde(default)]
+    pub attempted_sketch: Option<String>,
+    /// Optional note on what you fell back to (prose rubric, ad-hoc
+    /// code, different tool, giving up).
+    #[serde(default)]
+    pub fallback_used: Option<String>,
+    /// Optional name of the primitive you wished existed
+    /// (e.g. `RateCmp`, `StringMatches`, `Within{temporal}`).
+    #[serde(default)]
+    pub ast_feature_requested: Option<String>,
+}
+
 // ── Value (consequent + entity field type) ───────────────────────
 
 /// Field values. Serialized untagged so packets read cleanly:
@@ -1463,6 +1508,82 @@ fn packet_path(state_dir: &Path, scope: &str, id: &str) -> PathBuf {
     scope_dir(state_dir, scope).join(format!("{id}.json"))
 }
 
+fn events_log_path(state_dir: &Path) -> PathBuf {
+    packets_dir(state_dir).join("events.jsonl")
+}
+
+/// Atomic-ish append: opens the file in append mode and writes one
+/// line terminated by `\n`. Small concurrent writes on Linux are
+/// atomic below PIPE_BUF (~4KiB), which covers every plausible event
+/// payload. No rotation in v1 — revisit if the log grows unbounded.
+fn append_line(path: &Path, line: &str) -> Result<()> {
+    use std::io::Write;
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(line.as_bytes())?;
+    f.write_all(b"\n")?;
+    Ok(())
+}
+
+// ── Event log ─────────────────────────────────────────────────────
+
+/// One entry in the packet event log. Written as a JSON line on every
+/// `compile`, `apply`, `audit`, or `gap` operation. The log is the
+/// discovery-layer's observability surface: compile errors and
+/// `bbox_packet_gap` entries tell us which primitives are missing in
+/// practice; low-fidelity audits tell us which packets drifted; no-
+/// match applies tell us where catchall rules are missing.
+///
+/// Deliberately small and un-versioned in v1 — rotate or migrate when
+/// a real use case surfaces. Query via `bbox_packet_events`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PacketEvent {
+    /// ISO 8601 timestamp.
+    pub timestamp: String,
+    /// `compile` | `apply` | `audit` | `gap`.
+    pub op: String,
+    /// `ok` | `error` | `no_match` | `low_fidelity` | `logged` (for gaps).
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Op-specific structured payload. Schema: compile → {rules_count,
+    /// lattice_size, referenced_packets?}. apply → {mode, matched,
+    /// rule_id?, verdict?}. audit → {mode, total, correct, fidelity,
+    /// mismatch_count}. gap → {description, attempted_sketch?,
+    /// fallback_used?, ast_feature_requested?}.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub details: serde_json::Value,
+}
+
+impl PacketEvent {
+    fn now(op: &str, outcome: &str) -> Self {
+        Self {
+            timestamp: crate::util::now_iso(),
+            op: op.to_string(),
+            outcome: outcome.to_string(),
+            packet_id: None,
+            domain: None,
+            details: serde_json::Value::Null,
+        }
+    }
+
+    fn with_packet_id(mut self, id: impl Into<String>) -> Self {
+        self.packet_id = Some(id.into());
+        self
+    }
+
+    fn with_domain(mut self, d: impl Into<String>) -> Self {
+        self.domain = Some(d.into());
+        self
+    }
+
+    fn with_details(mut self, d: serde_json::Value) -> Self {
+        self.details = d;
+        self
+    }
+}
+
 /// Store handle. One `Packets` per daemon; constructs/lists from the
 /// state directory directly (one file per packet, unlike notes which
 /// share a single JSON).
@@ -1490,6 +1611,123 @@ impl Packets {
 
     fn now_iso() -> String {
         crate::util::now_iso()
+    }
+
+    /// Append one event to the log. Best-effort: errors are logged
+    /// via tracing but never propagate, so event-log I/O can never
+    /// break a compile/apply/audit operation.
+    fn append_event(&self, event: &PacketEvent) {
+        let path = events_log_path(&self.state_dir);
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                tracing::warn!(error = %e, "packet event log: create_dir_all failed");
+                return;
+            }
+        }
+        let line = match serde_json::to_string(event) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "packet event log: serialize failed");
+                return;
+            }
+        };
+        if let Err(e) = append_line(&path, &line) {
+            tracing::warn!(error = %e, "packet event log: append failed");
+        }
+    }
+
+    /// Read events from the log, newest first, with optional filters.
+    pub fn list_events(
+        &self,
+        op: Option<&str>,
+        packet_id: Option<&str>,
+        outcome: Option<&str>,
+        since: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PacketEvent>> {
+        let path = events_log_path(&self.state_dir);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let mut events: Vec<PacketEvent> = Vec::new();
+        for line in raw.lines().rev() {
+            if events.len() >= limit {
+                break;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            let ev: PacketEvent = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(_) => continue, // skip malformed lines silently
+            };
+            if let Some(o) = op {
+                if ev.op != o {
+                    continue;
+                }
+            }
+            if let Some(id) = packet_id {
+                let want = normalize_id(id);
+                match &ev.packet_id {
+                    Some(p) if p == &want => {}
+                    _ => continue,
+                }
+            }
+            if let Some(oc) = outcome {
+                if ev.outcome != oc {
+                    continue;
+                }
+            }
+            if let Some(s) = since {
+                if ev.timestamp.as_str() < s {
+                    continue;
+                }
+            }
+            events.push(ev);
+        }
+        Ok(events)
+    }
+
+    /// Record a packet-authoring gap — "I wanted to compile but the
+    /// AST couldn't express this." High-signal input for prioritizing
+    /// new predicate primitives.
+    pub fn log_gap(
+        &self,
+        description: &str,
+        domain: Option<&str>,
+        attempted_sketch: Option<&str>,
+        fallback_used: Option<&str>,
+        ast_feature_requested: Option<&str>,
+    ) -> Result<PacketEvent> {
+        if description.trim().is_empty() {
+            anyhow::bail!("'description' is required and cannot be empty");
+        }
+        let mut details = serde_json::Map::new();
+        details.insert(
+            "description".into(),
+            serde_json::Value::String(description.to_string()),
+        );
+        if let Some(v) = attempted_sketch {
+            details.insert("attempted_sketch".into(), serde_json::Value::String(v.into()));
+        }
+        if let Some(v) = fallback_used {
+            details.insert("fallback_used".into(), serde_json::Value::String(v.into()));
+        }
+        if let Some(v) = ast_feature_requested {
+            details.insert(
+                "ast_feature_requested".into(),
+                serde_json::Value::String(v.into()),
+            );
+        }
+        let mut ev = PacketEvent::now("gap", "logged")
+            .with_details(serde_json::Value::Object(details));
+        if let Some(d) = domain {
+            ev = ev.with_domain(d);
+        }
+        self.append_event(&ev);
+        Ok(ev)
     }
 
     fn save_packet(&self, packet: &Packet) -> Result<()> {
@@ -1552,6 +1790,55 @@ impl Packets {
     // ── bbox_compile (create) ──────────────────────────────────────
 
     pub fn compile(&self, p: &CompileParams) -> Result<String> {
+        let result = self.compile_inner(p);
+        // Log the outcome regardless of success/failure. Event-log
+        // I/O errors are swallowed inside append_event so they can't
+        // mask the real result.
+        match &result {
+            Ok(packet) => {
+                let mut refs = Vec::new();
+                for rule in &packet.rules {
+                    collect_apply_refs(&rule.antecedent, &mut refs);
+                }
+                refs.sort();
+                refs.dedup();
+                let details = serde_json::json!({
+                    "rules_count": packet.rules.len(),
+                    "lattice_size": packet.classification_lattice.len(),
+                    "lattice": packet.classification_lattice,
+                    "referenced_packets": refs,
+                    "scope": packet.scope,
+                });
+                self.append_event(
+                    &PacketEvent::now("compile", "ok")
+                        .with_packet_id(packet.id.clone())
+                        .with_domain(p.domain.clone())
+                        .with_details(details),
+                );
+            }
+            Err(e) => {
+                let details = serde_json::json!({
+                    "error": format!("{e:#}"),
+                });
+                let mut ev = PacketEvent::now("compile", "error").with_details(details);
+                if !p.domain.trim().is_empty() {
+                    ev = ev.with_domain(p.domain.clone());
+                }
+                self.append_event(&ev);
+            }
+        }
+        result.map(|packet| {
+            format!(
+                "Packet {} compiled (domain={}, scope={}, rules={})",
+                packet.id,
+                packet.domain,
+                packet.scope,
+                packet.rules.len()
+            )
+        })
+    }
+
+    fn compile_inner(&self, p: &CompileParams) -> Result<Packet> {
         if p.domain.trim().is_empty() {
             anyhow::bail!("'domain' is required and cannot be empty");
         }
@@ -1655,40 +1942,77 @@ impl Packets {
 
         self.save_packet(&packet)?;
 
-        Ok(format!(
-            "Packet {id} compiled (domain={}, scope={}, rules={})",
-            packet.domain,
-            packet.scope,
-            packet.rules.len()
-        ))
+        Ok(packet)
     }
 
     // ── bbox_apply ─────────────────────────────────────────────────
 
     pub fn apply_tool(&self, p: &ApplyParams) -> Result<String> {
-        let packet = self.load(&p.packet_id)?;
+        let packet = match self.load(&p.packet_id) {
+            Ok(pk) => pk,
+            Err(e) => {
+                self.append_event(
+                    &PacketEvent::now("apply", "error")
+                        .with_packet_id(normalize_id(&p.packet_id))
+                        .with_details(serde_json::json!({"error": format!("{e:#}")})),
+                );
+                return Err(e);
+            }
+        };
         let mode = p.mode.unwrap_or_default();
         match mode {
             ApplyMode::First => match apply_with(&packet, &p.entity, self) {
-                Some(prediction) => Ok(serde_json::to_string_pretty(&serde_json::json!({
-                    "packet_id": packet.id,
-                    "mode": mode,
-                    "match": true,
-                    "rule_id": prediction.rule_id,
-                    "classification": prediction.classification,
-                    "consequent": prediction.consequent,
-                    "confidence": prediction.confidence,
-                }))?),
-                None => Ok(serde_json::to_string_pretty(&serde_json::json!({
-                    "packet_id": packet.id,
-                    "mode": mode,
-                    "match": false,
-                    "consequent": serde_json::Value::Null,
-                    "note": "no rule's antecedent matched the entity",
-                }))?),
+                Some(prediction) => {
+                    self.append_event(
+                        &PacketEvent::now("apply", "ok")
+                            .with_packet_id(packet.id.clone())
+                            .with_domain(packet.domain.clone())
+                            .with_details(serde_json::json!({
+                                "mode": "first",
+                                "matched": true,
+                                "rule_id": prediction.rule_id,
+                                "classification": prediction.classification,
+                            })),
+                    );
+                    Ok(serde_json::to_string_pretty(&serde_json::json!({
+                        "packet_id": packet.id,
+                        "mode": mode,
+                        "match": true,
+                        "rule_id": prediction.rule_id,
+                        "classification": prediction.classification,
+                        "consequent": prediction.consequent,
+                        "confidence": prediction.confidence,
+                    }))?)
+                }
+                None => {
+                    self.append_event(
+                        &PacketEvent::now("apply", "no_match")
+                            .with_packet_id(packet.id.clone())
+                            .with_domain(packet.domain.clone())
+                            .with_details(serde_json::json!({"mode": "first"})),
+                    );
+                    Ok(serde_json::to_string_pretty(&serde_json::json!({
+                        "packet_id": packet.id,
+                        "mode": mode,
+                        "match": false,
+                        "consequent": serde_json::Value::Null,
+                        "note": "no rule's antecedent matched the entity",
+                    }))?)
+                }
             },
             ApplyMode::All => {
                 let result = apply_all_with(&packet, &p.entity, self);
+                let outcome = if result.verdict.is_some() { "ok" } else { "no_match" };
+                self.append_event(
+                    &PacketEvent::now("apply", outcome)
+                        .with_packet_id(packet.id.clone())
+                        .with_domain(packet.domain.clone())
+                        .with_details(serde_json::json!({
+                            "mode": "all",
+                            "verdict": result.verdict,
+                            "finding_count": result.findings.len(),
+                        })),
+                );
                 Ok(serde_json::to_string_pretty(&serde_json::json!({
                     "packet_id": result.packet_id,
                     "mode": mode,
@@ -1703,11 +2027,35 @@ impl Packets {
     // ── bbox_audit ─────────────────────────────────────────────────
 
     pub fn audit_tool(&self, p: &AuditParams) -> Result<String> {
-        let packet = self.load(&p.packet_id)?;
+        let packet = match self.load(&p.packet_id) {
+            Ok(pk) => pk,
+            Err(e) => {
+                self.append_event(
+                    &PacketEvent::now("audit", "error")
+                        .with_packet_id(normalize_id(&p.packet_id))
+                        .with_details(serde_json::json!({"error": format!("{e:#}")})),
+                );
+                return Err(e);
+            }
+        };
         let mode = p.mode.unwrap_or_default();
         match mode {
             ApplyMode::First => {
                 let report = verify_with(&packet, &p.dataset, self)?;
+                let outcome = if report.fidelity >= 1.0 { "ok" } else { "low_fidelity" };
+                self.append_event(
+                    &PacketEvent::now("audit", outcome)
+                        .with_packet_id(packet.id.clone())
+                        .with_domain(packet.domain.clone())
+                        .with_details(serde_json::json!({
+                            "mode": "first",
+                            "total": report.total,
+                            "correct": report.correct,
+                            "fidelity": report.fidelity,
+                            "mismatch_count": report.mismatches.len(),
+                            "uncovered_count": report.uncovered.len(),
+                        })),
+                );
                 Ok(serde_json::to_string_pretty(&serde_json::json!({
                     "packet_id": packet.id,
                     "mode": mode,
@@ -1720,6 +2068,19 @@ impl Packets {
             }
             ApplyMode::All => {
                 let report = verify_all_with(&packet, &p.dataset, self)?;
+                let outcome = if report.fidelity >= 1.0 { "ok" } else { "low_fidelity" };
+                self.append_event(
+                    &PacketEvent::now("audit", outcome)
+                        .with_packet_id(packet.id.clone())
+                        .with_domain(packet.domain.clone())
+                        .with_details(serde_json::json!({
+                            "mode": "all",
+                            "total": report.total,
+                            "correct": report.correct,
+                            "fidelity": report.fidelity,
+                            "mismatch_count": report.mismatches.len(),
+                        })),
+                );
                 Ok(serde_json::to_string_pretty(&serde_json::json!({
                     "packet_id": packet.id,
                     "mode": mode,
@@ -3427,6 +3788,234 @@ mod tests {
         });
         let pred = apply_with(&outer_pkt, &breaking, &packets).unwrap();
         assert_eq!(pred.rule_id, "fail_via_mapped");
+    }
+
+    // ── Event logging tests ────────────────────────────────────────
+
+    #[test]
+    fn compile_ok_records_event_with_rules_count_and_refs() {
+        let (_d, packets) = tmp_packets();
+        let sub_id = compile_breaking_packet(&packets);
+        // Outer packet composes the sub-packet — events should capture
+        // the reference.
+        let _ = packets
+            .compile(&CompileParams {
+                domain: "pr-triage-with-events".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: None,
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([
+                    {
+                        "id": "fail_if_breaking",
+                        "antecedent": {
+                            "op": "Apply",
+                            "packet_id": sub_id.clone(),
+                            "expect": ["breaking"]
+                        },
+                        "consequent": "REJECT"
+                    },
+                    {
+                        "id": "pass_default",
+                        "emit": "fallback",
+                        "antecedent": {"op": "True"},
+                        "consequent": "ACCEPT"
+                    }
+                ]),
+            })
+            .unwrap();
+
+        let events = packets.list_events(Some("compile"), None, None, None, 50).unwrap();
+        // Two compile events: sub + outer
+        assert_eq!(events.len(), 2);
+        // Newest-first: outer is index 0
+        let outer = &events[0];
+        assert_eq!(outer.op, "compile");
+        assert_eq!(outer.outcome, "ok");
+        assert_eq!(outer.domain.as_deref(), Some("pr-triage-with-events"));
+        let refs = outer.details.get("referenced_packets").unwrap().as_array().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].as_str().unwrap(), sub_id);
+    }
+
+    #[test]
+    fn compile_error_records_event_with_error_message() {
+        let (_d, packets) = tmp_packets();
+        let _ = packets
+            .compile(&CompileParams {
+                domain: "broken-compile".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: None,
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([{
+                    "id": "fail_bad_ref",
+                    "antecedent": {
+                        "op": "Apply",
+                        "packet_id": "packet-nonexistent",
+                        "expect": ["breaking"]
+                    },
+                    "consequent": "REJECT"
+                }]),
+            })
+            .unwrap_err();
+
+        let events = packets.list_events(Some("compile"), None, Some("error"), None, 50).unwrap();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.outcome, "error");
+        assert_eq!(ev.domain.as_deref(), Some("broken-compile"));
+        let err = ev.details.get("error").unwrap().as_str().unwrap();
+        assert!(err.contains("packet-nonexistent"), "error detail missing id: {err}");
+    }
+
+    #[test]
+    fn apply_tool_records_ok_and_no_match_events() {
+        let (_d, packets) = tmp_packets();
+        let id = compile_breaking_packet(&packets);
+
+        // Breaking entity — should match.
+        let _ = packets
+            .apply_tool(&ApplyParams {
+                packet_id: id.clone(),
+                entity: json!({
+                    "api_surface_changed": true,
+                    "migration_note_present": false,
+                }),
+                mode: Some(ApplyMode::First),
+            })
+            .unwrap();
+
+        // Safe entity — breaking_api rule won't fire; safe_default
+        // (fallback) doesn't fire in mode=first either way because
+        // first-match and fallback interact differently; either way
+        // we record an event.
+        let _ = packets
+            .apply_tool(&ApplyParams {
+                packet_id: id.clone(),
+                entity: json!({
+                    "api_surface_changed": true,
+                    "migration_note_present": true,
+                }),
+                mode: Some(ApplyMode::First),
+            })
+            .unwrap();
+
+        let events = packets.list_events(Some("apply"), Some(&id), None, None, 50).unwrap();
+        // Two apply events, one per call.
+        assert_eq!(events.len(), 2);
+        // At least one ok (the breaking entity fired a rule).
+        assert!(events.iter().any(|e| e.outcome == "ok"));
+    }
+
+    #[test]
+    fn audit_tool_records_fidelity_and_mismatch_count() {
+        let (_d, packets) = tmp_packets();
+        let id = compile_breaking_packet(&packets);
+
+        let _ = packets
+            .audit_tool(&AuditParams {
+                packet_id: id.clone(),
+                dataset: json!([
+                    {
+                        "entity": {"api_surface_changed": true, "migration_note_present": false},
+                        "expected": "BREAKING"
+                    }
+                ]),
+                mode: Some(ApplyMode::First),
+            })
+            .unwrap();
+
+        let events = packets.list_events(Some("audit"), Some(&id), None, None, 50).unwrap();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.outcome, "ok");
+        let fidelity = ev.details.get("fidelity").unwrap().as_f64().unwrap();
+        assert!((fidelity - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn log_gap_records_event_with_details() {
+        let (_d, packets) = tmp_packets();
+        let _ = packets
+            .log_gap(
+                "wanted to flag requests exceeding 10 per minute per user",
+                Some("rate-limit"),
+                Some("CountInWindow{path: 'requests[*]', window_seconds: 60, gt: 10}"),
+                Some("prose rubric in reviewer instructions"),
+                Some("RateCmp or Within{temporal}"),
+            )
+            .unwrap();
+
+        let events = packets.list_events(Some("gap"), None, None, None, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.op, "gap");
+        assert_eq!(ev.outcome, "logged");
+        assert_eq!(ev.domain.as_deref(), Some("rate-limit"));
+        let desc = ev.details.get("description").unwrap().as_str().unwrap();
+        assert!(desc.contains("10 per minute"));
+        assert_eq!(
+            ev.details.get("ast_feature_requested").unwrap().as_str().unwrap(),
+            "RateCmp or Within{temporal}"
+        );
+    }
+
+    #[test]
+    fn log_gap_rejects_empty_description() {
+        let (_d, packets) = tmp_packets();
+        let err = packets.log_gap("", None, None, None, None).unwrap_err();
+        assert!(format!("{err:#}").contains("description"));
+    }
+
+    #[test]
+    fn list_events_filters_and_newest_first() {
+        let (_d, packets) = tmp_packets();
+        // Fire a mix of operations.
+        let id = compile_breaking_packet(&packets);
+        let _ = packets.log_gap("gap A", None, None, None, None).unwrap();
+        let _ = packets
+            .apply_tool(&ApplyParams {
+                packet_id: id.clone(),
+                entity: json!({"api_surface_changed": false}),
+                mode: Some(ApplyMode::First),
+            })
+            .unwrap();
+        let _ = packets.log_gap("gap B", None, None, None, None).unwrap();
+
+        // All events, default ordering (newest-first).
+        let all = packets.list_events(None, None, None, None, 100).unwrap();
+        assert!(!all.is_empty());
+        // Newest first — last logged gap ("gap B") should be first.
+        let first_gap = all
+            .iter()
+            .find(|e| e.op == "gap")
+            .expect("at least one gap event");
+        assert!(first_gap
+            .details
+            .get("description")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("gap B"));
+
+        // Filter by op=gap — should be two.
+        let gaps = packets.list_events(Some("gap"), None, None, None, 100).unwrap();
+        assert_eq!(gaps.len(), 2);
+
+        // Limit honored.
+        let limited = packets.list_events(None, None, None, None, 1).unwrap();
+        assert_eq!(limited.len(), 1);
     }
 
     #[test]

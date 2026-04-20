@@ -137,6 +137,35 @@ After compiling, always `bbox_audit` against source observations. A packet with 
 
 Packets are for *structured domains that admit generators*.
 
+## When the AST can't express your rule
+
+Packets are bounded by the predicate AST. If you want to compile a rule but can't find a predicate that fits ("I need rate-over-time", "I need regex match", "I need recursive set-membership"), **log a gap instead of fighting it**:
+
+```
+bbox_packet_gap(
+    description="wanted to flag requests exceeding 10/min/user; no rate/time predicate",
+    domain="rate-limit",
+    attempted_sketch="CountInWindow{path:'requests[*]', window_seconds:60, gt:10}",
+    fallback_used="prose rubric in reviewer instructions",
+    ast_feature_requested="RateCmp"
+)
+```
+
+Every gap logged is a vote for what the AST can't yet say. Query the aggregate via `bbox_packet_events(op="gap")`. When the same gap shows up three times from different agents, it's time to add the primitive.
+
+Don't compile a packet that half-works and then paper over the holes with prose in the consequent — that reintroduces drift. Either the predicate captures the decision or the gap goes in the log.
+
+## Operation events
+
+`bbox_compile`, `bbox_apply`, and `bbox_audit` each emit a structured event to a rolling log. Query via `bbox_packet_events`:
+
+- `op="compile"` with `outcome="error"` — authoring failures; filter by `domain` to find patterns.
+- `op="apply"` with `outcome="no_match"` — catchall gap in the packet; revise rules.
+- `op="audit"` with `outcome="low_fidelity"` — packet drifted from its training data; recompile with updated rules.
+- `op="gap"` — everything logged via `bbox_packet_gap`.
+
+Events are newest-first, filter by `op`, `packet_id`, `outcome`, `since`, `limit` (default 50, max 500).
+
 ## Phase-next gaps
 
 - `bbox_merge` via behavioral equivalence — merge two packets by clustering rules that fire identically on a witness set
