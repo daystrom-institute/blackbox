@@ -1,0 +1,9 @@
+# TAB-separated: <relative path under dev HOME> <absolute host path>
+# Keep this file untracked. Link only the auth/session material the CLI
+# absolutely needs; let configs, memory files, MCP config, and blackbox
+# state stay isolated inside ./.dev-agent/home.
+#
+# examples:
+# .claude/.credentials.json	/home/invidious/.claude/.credentials.json
+# .codex/auth.json	/home/invidious/.codex/auth.json
+# .gemini/oauth.json	/home/invidious/.gemini/oauth.json
