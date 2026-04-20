@@ -21,7 +21,7 @@ cargo test               # unit tests (159 tests, ~0.1s)
 cargo clippy             # lint
 ```
 
-`blackboxd` serves MCP over HTTP (`axum`) on `127.0.0.1:${BBOX_PORT:-7264}/mcp`. Stderr carries tracing logs; stdout is unused.
+`blackboxd` serves MCP over HTTP (`axum`) on `127.0.0.1:${BBOX_PORT:-7264}/mcp`. Stderr carries tracing logs; stdout is unused. The same built daemon artifact is installed under two names for service isolation: `~/.local/bin/blackboxd` for prod and `~/.local/bin/blackboxd-dev` for the dev unit.
 
 ## Architecture
 
@@ -36,7 +36,7 @@ Source layout (`src/`):
 - **notes.rs** — Side-channel note store (`bbox_note`). Structured records executors emit during work — kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Scan-friendly trail so the orchestrator can query instead of re-parsing prose. Filterable by kind/project/session/thread/resolution.
 - **inbox.rs** — Attention layer (`bbox_inbox`). Cross-store aggregator that surfaces unresolved notes (disputes/blocked/surprises), deferred followups, stale threads, unverified knowledge, and failed bro tasks in one ranked view.
 - **tool_docs.rs** — Single source of truth for the agent-facing tool reference. Per-tool stanzas (`name`, `summary`, `when_to_use`, `example`) grouped by category plus cross-tool `WORKFLOW_NOTES`. Rendered into a fixed-ID global knowledge entry (`bb-tool-reference`) by `sync_into_knowledge`, which runs automatically on every daemon startup. A compile-time unit test asserts every `#[tool]`-registered name has a matching stanza — adding a tool without docs fails the build.
-- **orchestration/** — Multi-provider agent dispatch (Claude, Codex, Copilot, Vibe, Gemini). Provider catalogs (models, effort tiers), exec/resume arg builders, brofile/team management, task lifecycle, tail event stream. Two orthogonal prompt layers: **ambient** (`apply_ambient`, per-turn) prepends a scope block with pre-bound `session`/`project`/`bro`/`thread`/`work_item` IDs + optional `completion_contract`; **brofile lens** (`apply_brofile_lens`, persona/system-prompt layer) composes on top. Only the ambient layer is gated by `allow_recursion`.
+- **orchestration/** — Multi-provider agent dispatch (Claude, OpenCode, Codex, Copilot, Vibe, Gemini). Provider catalogs (models, effort tiers), exec/resume arg builders, brofile/team management, task lifecycle, tail event stream. Two orthogonal prompt layers: **ambient** (`apply_ambient`, per-turn) prepends a scope block with pre-bound `session`/`project`/`bro`/`thread`/`work_item` IDs + optional `completion_contract`; **brofile lens** (`apply_brofile_lens`, persona/system-prompt layer) composes on top. Only the ambient layer is gated by `allow_recursion`.
   - `orchestration/mcp.rs` — MCP registry + filter layer. `McpServerConfig` (Http/Sse/Stdio), `McpFilters` (allow/disallow glob patterns), `McpStore` (JSON-backed). Global at `~/.bro/mcp.json`, project overlay at `<project>/.bro/mcp.json`. `self_register_blackbox(url)` runs on daemon startup and upserts a `blackbox` HTTP entry in every installed provider's MCP config (Claude / Copilot / Codex / Gemini via their native `mcp add/list/remove` CLIs). `bro_mcp` tool exposes list/get/add/remove/allow/disallow/clear_filters/sync — global-scope writes fan out to every provider CLI, project-scope writes stay local until `sync`.
   - **Mechanical recursion guard, universal.** Every dispatch-capable provider applies the default `mcp__blackbox__bro_*` disallow filter mechanically at argv construction. Translation per provider: Claude `--disallowedTools`, Copilot `--deny-tool=`, Codex `-c mcp_servers.blackbox.disabled_tools=[...]` (with glob expansion via `tool_docs::orchestration_tool_names`), Gemini `--policy <tempfile>` (per-dispatch TOML written to `~/.bro/gemini-policies/dispatch-<id>.toml`, cleaned up when the task terminates, orphan sweep on daemon startup). Vibe has no MCP and no bro_* surface to recurse through. The text recursion guard is retired — `allow_recursion=true` on exec/resume is the only bypass.
 - **render.rs** — Markdown emitter shared by knowledge render and other tooling.
@@ -46,6 +46,7 @@ Source layout (`src/`):
 Maintained in `src/orchestration/providers.rs`:
 
 - **Claude**: Opus 4.7 (default, 1M context built-in), Opus 4.6 [1m]/200K, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (xhigh default, Opus-4.7-only; max unsupported on Haiku).
+- **OpenCode**: native `provider/model` routing with Z.AI Coding Plan GLM models exposed directly. Defaults to `zai-coding-plan/glm-5.1`, helper model `zai-coding-plan/glm-4.5-air`, and variant tiers `minimal`/`low`/`medium`/`high`/`max`.
 - **Codex**: gpt-5.4 family. Effort tiers `minimal`/`low`/`medium`/`high`/`xhigh`.
 - **Copilot**: tracks Anthropic + OpenAI models. Effort tiers `low`/`medium`/`high`/`xhigh`.
 - **Vibe**, **Gemini**: model lists only, no effort tier.
@@ -65,7 +66,7 @@ Maintained in `src/orchestration/providers.rs`:
 - `TRANSCRIPT_SEARCH_INDEX_PATH` — override tantivy index location
 - `BLACKBOX_REINDEX_INTERVAL_SECS` — background reindex interval (default: 120)
 - `BBOX_PORT` / `BRO_PORT` — HTTP listener port for `/mcp`, `/tail`, `/roster` (default: 7264; 7263 is retired and avoided)
-- `CLAUDE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` — override provider binary paths
+- `CLAUDE_BIN` / `OPENCODE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` — override provider binary paths
 - `RUST_LOG` — tracing filter (default: `transcript_search=info`)
 
 ## Deployment
@@ -78,17 +79,27 @@ unit and the daemon default both pin port 7264 — 7263 is retired (old
 `bro.service`) and intentionally avoided. Client config examples below use
 7264 accordingly.
 
-Install template at `deploy/blackbox.service`:
+Install templates at `deploy/blackbox.service` and `deploy/blackbox-dev.service`:
 
 ```bash
+install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
+install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
 cp deploy/blackbox.service ~/.config/systemd/user/
+cp deploy/blackbox-dev.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now blackbox.service
+systemctl --user enable --now blackbox-dev.service
 ```
 
-Upgrades: build, `install -m 755 target/release/blackboxd ~/.claude-shared/bin/`,
-then `systemctl --user restart blackbox`. The `install` is atomic (unlink +
-write) so the running process keeps the old inode until systemd restarts it.
+Prod and dev intentionally run different installed daemon paths even when both
+come from the same release build: `blackbox.service` uses
+`~/.local/bin/blackboxd`, while `blackbox-dev.service` uses
+`~/.local/bin/blackboxd-dev`. That keeps dev binary swaps and restarts from
+mutating the prod service executable in place.
+
+Upgrades: build, install both daemon names plus `bro`, then restart whichever
+service you actually changed. The `install` is atomic (unlink + write) so the
+running process keeps the old inode until systemd restarts it.
 
 Client config (all point to the same daemon):
 - Claude Code: `mcpServers.blackbox = { type: "http", url: "http://127.0.0.1:7264/mcp" }` in each `~/.claude*/.claude.json`

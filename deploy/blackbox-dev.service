@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/blackboxd
+ExecStart=%h/.local/bin/blackboxd-dev
 Restart=on-failure
 RestartSec=3
 Environment=BBOX_PORT=7265

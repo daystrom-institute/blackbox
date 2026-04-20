@@ -132,8 +132,9 @@ use knowledge::{
 };
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
+    apply_with as apply_packet_with, packet_matches_query, packet_summary,
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
-    PacketListParams, apply_with as apply_packet_with, packet_matches_query, packet_summary,
+    PacketListParams,
 };
 use threads::{ThreadListParams, ThreadParams};
 
@@ -258,18 +259,17 @@ impl BlackboxServer {
             // Surface matching packets. Uses the same match semantics as
             // bbox_packet_list so the two tools agree on what "matches" means.
             let all_packets = self.state.packets.read().list_all()?;
-            let matching_packets: Vec<_> = if let Some(q) =
-                p.query.as_deref().filter(|q| !q.is_empty())
-            {
-                all_packets
-                    .into_iter()
-                    .filter(|pkt| packet_matches_query(pkt, q))
-                    .collect()
-            } else if p.category.as_deref() == Some("packet") {
-                all_packets
-            } else {
-                Vec::new()
-            };
+            let matching_packets: Vec<_> =
+                if let Some(q) = p.query.as_deref().filter(|q| !q.is_empty()) {
+                    all_packets
+                        .into_iter()
+                        .filter(|pkt| packet_matches_query(pkt, q))
+                        .collect()
+                } else if p.category.as_deref() == Some("packet") {
+                    all_packets
+                } else {
+                    Vec::new()
+                };
 
             if !matching_packets.is_empty() {
                 if !combined.ends_with('\n') {
@@ -1062,7 +1062,7 @@ impl BlackboxServer {
         // bbox_note emissions regardless of when the provider itself
         // emits a session ID.
         let task_id = uuid::Uuid::new_v4().to_string();
-        let session_id = if provider == Provider::Claude {
+        let session_id = if matches!(provider, Provider::Claude) {
             uuid::Uuid::new_v4().to_string()
         } else {
             "pending".to_string()
@@ -1350,9 +1350,10 @@ impl BlackboxServer {
         }
         let all_done = results.iter().all(|r| r.get("timed_out").is_none());
         let advisor = match p.team.as_deref() {
-            Some(team_name) => self
-                .maybe_resume_team_advisor(team_name, "when_all", &results)
-                .await,
+            Some(team_name) => {
+                self.maybe_resume_team_advisor(team_name, "when_all", &results)
+                    .await
+            }
             None => Ok(None),
         };
         let mut out = json!({ "all_completed": all_done, "results": results });
@@ -1477,12 +1478,12 @@ impl BlackboxServer {
                 }
             };
 
-            let mut env_overrides = None;
-            if let Some(ref acct_name) = brofile.account {
-                if let Some(acct) = orchestration::brofile::load_account(acct_name, &store_dir) {
-                    env_overrides = acct.env;
-                }
-            }
+            let env_overrides = orchestration::brofile::resolve_provider_env(
+                brofile.provider,
+                brofile.account.as_deref(),
+                brofile.model.as_deref(),
+                &store_dir,
+            );
             let exec_opts = if brofile.model.is_some() || brofile.effort.is_some() {
                 Some(ExecOpts {
                     model: brofile.model.clone(),
@@ -1567,45 +1568,15 @@ impl BlackboxServer {
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     t
                 } else {
-                    let task_id = uuid::Uuid::new_v4().to_string();
-                    let session_id = if brofile.provider == Provider::Claude {
-                        uuid::Uuid::new_v4().to_string()
-                    } else {
-                        "pending".into()
-                    };
-                    let exec_prompt = build_exec_prompt(&task_id, &session_id);
-                    let mut args = brofile.provider.build_exec_args(
-                        &exec_prompt,
-                        &session_id,
-                        cwd.as_deref(),
-                        exec_opts.as_ref(),
-                    );
-                    let df = resolve_dispatch_filters(
-                        brofile.provider,
-                        cwd.as_deref(),
-                        allow_recursion,
-                        &task_id,
-                        extra.as_ref(),
-                    );
-                    args.extend(df.args);
-                    let t = orch::spawn_task(
-                        task_id,
-                        brofile.provider,
-                        args,
-                        session_id,
-                        cwd.clone(),
-                        env_overrides,
-                        store_dir.clone(),
-                        self.state.task_store.clone(),
-                        self.state.tail_tx.clone(),
-                    );
-                    cleanup_policy_file_when_done(t.clone(), df.policy_file);
-                    updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
-                    t
+                    launched.push(json!({
+                        "bro": member.name,
+                        "error": "Session discovery still pending from the previous launch; refusing to fork a second session",
+                    }));
+                    continue;
                 }
             } else {
                 let task_id = uuid::Uuid::new_v4().to_string();
-                let session_id = if brofile.provider == Provider::Claude {
+                let session_id = if matches!(brofile.provider, Provider::Claude) {
                     uuid::Uuid::new_v4().to_string()
                 } else {
                     "pending".into()
@@ -2178,6 +2149,12 @@ impl BlackboxServer {
                     .members
                     .iter()
                     .map(|m| {
+                        let account = orchestration::brofile::resolve_brofile(
+                            &m.brofile,
+                            store_dir,
+                            loaded_team.project_dir.as_deref(),
+                        )
+                        .and_then(|bf| bf.account);
                         let latest_tid = m.task_history.last();
                         let latest = latest_tid.and_then(|id| task_store.get(id)).map(|t| {
                         let inner = t.inner.lock();
@@ -2190,28 +2167,27 @@ impl BlackboxServer {
                         json!({
                             "name": m.name,
                             "brofile": m.brofile,
+                            "account": account,
                             "sessionId": m.session_id,
                             "taskCount": m.task_history.len(),
                             "latestTask": latest,
                         })
                     })
                     .collect();
-                Self::ok_json(
-                    &json!({
-                        "team": name,
-                        "teamplate": loaded_team.teamplate,
-                        "advisor": loaded_team.advisor.as_ref().map(|a| json!({
-                            "name": a.name,
-                            "brofile": a.config.brofile,
-                            "sessionId": a.session_id,
-                            "taskCount": a.task_history.len(),
-                            "packetId": a.config.packet_id,
-                            "mode": a.config.mode.as_ref(),
-                            "charter": a.config.charter,
-                        })),
-                        "members": roster
-                    }),
-                )
+                Self::ok_json(&json!({
+                    "team": name,
+                    "teamplate": loaded_team.teamplate,
+                    "advisor": loaded_team.advisor.as_ref().map(|a| json!({
+                        "name": a.name,
+                        "brofile": a.config.brofile,
+                        "sessionId": a.session_id,
+                        "taskCount": a.task_history.len(),
+                        "packetId": a.config.packet_id,
+                        "mode": a.config.mode.as_ref(),
+                        "charter": a.config.charter,
+                    })),
+                    "members": roster
+                }))
             }
             _ => Self::err_text(&format!("Unknown team action: {}", p.action)),
         }
@@ -2235,8 +2211,9 @@ impl BlackboxServer {
         if advisor.charter.trim().is_empty() {
             return Err("advisor.charter is required and cannot be empty".into());
         }
-        let brofile = orchestration::brofile::resolve_brofile(&advisor.brofile, store_dir, project_dir)
-            .ok_or_else(|| format!("Brofile not found: {}", advisor.brofile))?;
+        let brofile =
+            orchestration::brofile::resolve_brofile(&advisor.brofile, store_dir, project_dir)
+                .ok_or_else(|| format!("Brofile not found: {}", advisor.brofile))?;
         if !brofile.provider.supports_resume() {
             return Err(format!(
                 "Advisor brofile {} uses provider {} which does not support resume",
@@ -2335,11 +2312,13 @@ Next step: <one concrete steering suggestion>\n",
             team.project_dir.as_deref(),
         )
         .ok_or_else(|| format!("Brofile not found: {}", advisor.config.brofile))?;
-        let env_overrides = brofile
-            .account
-            .as_ref()
-            .and_then(|a| orchestration::brofile::load_account(a, &store_dir))
-            .and_then(|a| a.env);
+        let provider = brofile.provider;
+        let env_overrides = orchestration::brofile::resolve_provider_env(
+            provider,
+            brofile.account.as_deref(),
+            brofile.model.as_deref(),
+            &store_dir,
+        );
         let exec_opts = if brofile.model.is_some() || brofile.effort.is_some() {
             Some(ExecOpts {
                 model: brofile.model.clone(),
@@ -2350,100 +2329,111 @@ Next step: <one concrete steering suggestion>\n",
         };
         let task_id = uuid::Uuid::new_v4().to_string();
         let timeout = advisor.config.timeout_seconds;
-        let provider = brofile.provider;
         let cwd = team.project_dir.clone();
-        let task = if let Some(session_id) = advisor.session_id.clone().filter(|s| s != "pending") {
-            let ambient_ctx = orch::AmbientContext {
-                task_id: Some(task_id.clone()),
-                session_id: Some(session_id.clone()),
-                project_dir: cwd.clone(),
-                bro_name: Some(advisor.name.clone()),
-                thread_id: None,
-                work_item_id: None,
-                completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
-                allow_recursion: false,
-                provider: Some(provider),
-            };
-            let wrapped_prompt = orch::apply_ambient(&prompt, &ambient_ctx);
-            let mut args = provider.build_resume_args(&session_id, &wrapped_prompt, exec_opts.as_ref());
-            let dispatch_filters = resolve_dispatch_filters(
-                provider,
-                cwd.as_deref(),
-                false,
-                &task_id,
-                brofile.filters.as_ref(),
-            );
-            args.extend(dispatch_filters.args);
-            let task = orch::spawn_task(
-                task_id.clone(),
-                provider,
-                args,
-                session_id,
-                cwd.clone(),
-                env_overrides,
-                store_dir.clone(),
-                self.state.task_store.clone(),
-                self.state.tail_tx.clone(),
-            );
-            cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
-            task
-        } else {
-            let session_id = if provider == Provider::Claude {
-                uuid::Uuid::new_v4().to_string()
-            } else {
-                "pending".into()
-            };
-            let ambient_ctx = orch::AmbientContext {
-                task_id: Some(task_id.clone()),
-                session_id: Some(session_id.clone()),
-                project_dir: cwd.clone(),
-                bro_name: Some(advisor.name.clone()),
-                thread_id: None,
-                work_item_id: None,
-                completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
-                allow_recursion: false,
-                provider: Some(provider),
-            };
-            let wrapped_prompt = orch::apply_brofile_lens(
-                &orch::apply_ambient(&prompt, &ambient_ctx),
-                brofile.lens.as_deref(),
-            );
-            let mut args =
-                provider.build_exec_args(&wrapped_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-            let dispatch_filters = resolve_dispatch_filters(
-                provider,
-                cwd.as_deref(),
-                false,
-                &task_id,
-                brofile.filters.as_ref(),
-            );
-            args.extend(dispatch_filters.args);
-            let task = orch::spawn_task(
-                task_id.clone(),
-                provider,
-                args,
-                session_id,
-                cwd.clone(),
-                env_overrides,
-                store_dir.clone(),
-                self.state.task_store.clone(),
-                self.state.tail_tx.clone(),
-            );
-            cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
-            task
+        let task = match advisor.session_id.as_deref() {
+            Some("pending") => {
+                return Err(format!(
+                    "Advisor {} is still waiting for session discovery; refusing to launch a second session",
+                    advisor.name
+                ));
+            }
+            Some(session_id) => {
+                let ambient_ctx = orch::AmbientContext {
+                    task_id: Some(task_id.clone()),
+                    session_id: Some(session_id.to_string()),
+                    project_dir: cwd.clone(),
+                    bro_name: Some(advisor.name.clone()),
+                    thread_id: None,
+                    work_item_id: None,
+                    completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+                    allow_recursion: false,
+                    provider: Some(provider),
+                };
+                let wrapped_prompt = orch::apply_ambient(&prompt, &ambient_ctx);
+                let mut args =
+                    provider.build_resume_args(session_id, &wrapped_prompt, exec_opts.as_ref());
+                let dispatch_filters = resolve_dispatch_filters(
+                    provider,
+                    cwd.as_deref(),
+                    false,
+                    &task_id,
+                    brofile.filters.as_ref(),
+                );
+                args.extend(dispatch_filters.args);
+                let task = orch::spawn_task(
+                    task_id.clone(),
+                    provider,
+                    args,
+                    session_id.to_string(),
+                    cwd.clone(),
+                    env_overrides,
+                    store_dir.clone(),
+                    self.state.task_store.clone(),
+                    self.state.tail_tx.clone(),
+                );
+                cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+                task
+            }
+            None => {
+                let session_id = if matches!(provider, Provider::Claude) {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    "pending".into()
+                };
+                let ambient_ctx = orch::AmbientContext {
+                    task_id: Some(task_id.clone()),
+                    session_id: Some(session_id.clone()),
+                    project_dir: cwd.clone(),
+                    bro_name: Some(advisor.name.clone()),
+                    thread_id: None,
+                    work_item_id: None,
+                    completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+                    allow_recursion: false,
+                    provider: Some(provider),
+                };
+                let wrapped_prompt = orch::apply_brofile_lens(
+                    &orch::apply_ambient(&prompt, &ambient_ctx),
+                    brofile.lens.as_deref(),
+                );
+                let mut args = provider.build_exec_args(
+                    &wrapped_prompt,
+                    &session_id,
+                    cwd.as_deref(),
+                    exec_opts.as_ref(),
+                );
+                let dispatch_filters = resolve_dispatch_filters(
+                    provider,
+                    cwd.as_deref(),
+                    false,
+                    &task_id,
+                    brofile.filters.as_ref(),
+                );
+                args.extend(dispatch_filters.args);
+                let task = orch::spawn_task(
+                    task_id.clone(),
+                    provider,
+                    args,
+                    session_id,
+                    cwd.clone(),
+                    env_overrides,
+                    store_dir.clone(),
+                    self.state.task_store.clone(),
+                    self.state.tail_tx.clone(),
+                );
+                cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+                task
+            }
         };
 
         advisor.task_history.push(task_id);
+        advisor.session_id = Some(task.inner.lock().session_id.clone());
         orchestration::team::save_team(team, &self.state.store_dir);
         Ok((task, timeout))
     }
 
-    fn persist_advisor_session_to_team(
-        &self,
-        team_name: &str,
-        task: &Arc<orch::Task>,
-    ) {
-        let Some(mut team) = orchestration::team::load_team(team_name, &self.state.store_dir) else {
+    fn persist_advisor_session_to_team(&self, team_name: &str, task: &Arc<orch::Task>) {
+        let Some(mut team) = orchestration::team::load_team(team_name, &self.state.store_dir)
+        else {
             return;
         };
         let Some(advisor) = team.advisor.as_mut() else {
@@ -2478,13 +2468,20 @@ Next step: <one concrete steering suggestion>\n",
         let Some(advisor) = team.advisor.as_ref() else {
             return Ok(());
         };
-        if advisor.session_id.as_deref().filter(|s| *s != "pending").is_some() {
+        if advisor
+            .session_id
+            .as_deref()
+            .filter(|s| *s != "pending")
+            .is_some()
+        {
             return Ok(());
         }
         let prompt = self.build_team_advisor_init_prompt(team, advisor);
         let team_name = team.name.clone();
         let (task, timeout) = self.dispatch_team_advisor_prompt(team, prompt).await?;
-        let _ = self.await_team_advisor_task(&team_name, task, timeout).await?;
+        let _ = self
+            .await_team_advisor_task(&team_name, task, timeout)
+            .await?;
         Ok(())
     }
 
@@ -2492,7 +2489,8 @@ Next step: <one concrete steering suggestion>\n",
         use notes::{NoteKind, NoteResolution};
 
         let mut summary = AdvisorNoteSummary::default();
-        let task_set: std::collections::HashSet<&str> = task_ids.iter().map(String::as_str).collect();
+        let task_set: std::collections::HashSet<&str> =
+            task_ids.iter().map(String::as_str).collect();
         let mut recent_unresolved = Vec::new();
 
         for note in self.state.notes.read().all().iter().rev() {
@@ -2527,7 +2525,11 @@ Next step: <one concrete steering suggestion>\n",
     ) -> AdvisorCheckpoint {
         let monitored_task_ids: Vec<String> = results
             .iter()
-            .filter_map(|r| r.get("taskId").and_then(Value::as_str).map(ToString::to_string))
+            .filter_map(|r| {
+                r.get("taskId")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
             .collect();
         let notes = self.summarize_notes_for_tasks(&monitored_task_ids);
         let mut members = Vec::new();
@@ -2574,7 +2576,10 @@ Next step: <one concrete steering suggestion>\n",
                         .map(ToString::to_string)
                 });
             members.push(AdvisorMemberCheckpoint {
-                bro: result.get("bro").and_then(Value::as_str).map(ToString::to_string),
+                bro: result
+                    .get("bro")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
                 task_id: result
                     .get("taskId")
                     .and_then(Value::as_str)
@@ -2623,9 +2628,7 @@ Next step: <one concrete steering suggestion>\n",
         checkpoint: &AdvisorCheckpoint,
     ) -> Result<Value, String> {
         let packet_store = self.state.packets.read();
-        let packet = packet_store
-            .load(packet_id)
-            .map_err(|e| format!("{e:#}"))?;
+        let packet = packet_store.load(packet_id).map_err(|e| format!("{e:#}"))?;
         let entity = serde_json::to_value(checkpoint).map_err(|e| e.to_string())?;
         let prediction = apply_packet_with(&packet, &entity, &*packet_store);
         Ok(match prediction {
@@ -2662,7 +2665,8 @@ Next step: <one concrete steering suggestion>\n",
             Some(packet_id) => Some(self.apply_advisor_packet(packet_id, &checkpoint)?),
             None => None,
         };
-        let checkpoint_json = serde_json::to_string_pretty(&checkpoint).map_err(|e| e.to_string())?;
+        let checkpoint_json =
+            serde_json::to_string_pretty(&checkpoint).map_err(|e| e.to_string())?;
         let packet_section = packet_eval
             .as_ref()
             .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
@@ -2746,11 +2750,12 @@ Next step: <one concrete steering suggestion>\n"
                         bro_match.team.project_dir.as_deref(),
                     )
                     .ok_or(format!("Brofile not found: {}", member.brofile))?;
-                    let env = bf
-                        .account
-                        .as_ref()
-                        .and_then(|a| orchestration::brofile::load_account(a, store_dir))
-                        .and_then(|a| a.env);
+                    let env = orchestration::brofile::resolve_provider_env(
+                        bf.provider,
+                        bf.account.as_deref(),
+                        bf.model.as_deref(),
+                        store_dir,
+                    );
                     let opts = if bf.model.is_some() || bf.effort.is_some() {
                         Some(ExecOpts {
                             model: bf.model.clone(),
@@ -2770,11 +2775,12 @@ Next step: <one concrete steering suggestion>\n"
             }
             let bf = orchestration::brofile::resolve_brofile(name, store_dir, project_dir)
                 .ok_or(format!("Unknown bro or brofile: {name}"))?;
-            let env = bf
-                .account
-                .as_ref()
-                .and_then(|a| orchestration::brofile::load_account(a, store_dir))
-                .and_then(|a| a.env);
+            let env = orchestration::brofile::resolve_provider_env(
+                bf.provider,
+                bf.account.as_deref(),
+                bf.model.as_deref(),
+                store_dir,
+            );
             let opts = if bf.model.is_some() || bf.effort.is_some() {
                 Some(ExecOpts {
                     model: bf.model.clone(),
@@ -2797,11 +2803,12 @@ Next step: <one concrete steering suggestion>\n"
             let provider = p
                 .parse::<Provider>()
                 .map_err(|_| format!("Unknown provider: {p}"))?;
+            let env = orchestration::brofile::resolve_provider_env(provider, None, None, store_dir);
             return Ok((
                 provider,
                 None,
                 None,
-                None,
+                env,
                 project_dir.map(String::from),
                 None,
             ));
@@ -2859,11 +2866,12 @@ Next step: <one concrete steering suggestion>\n"
                 bro_match.team.project_dir.as_deref(),
             )
             .ok_or(format!("Brofile not found: {}", member.brofile))?;
-            let env = bf
-                .account
-                .as_ref()
-                .and_then(|a| orchestration::brofile::load_account(a, store_dir))
-                .and_then(|a| a.env);
+            let env = orchestration::brofile::resolve_provider_env(
+                bf.provider,
+                bf.account.as_deref(),
+                bf.model.as_deref(),
+                store_dir,
+            );
             let opts = if bf.model.is_some() || bf.effort.is_some() {
                 Some(ExecOpts {
                     model: bf.model.clone(),
@@ -2890,12 +2898,13 @@ Next step: <one concrete steering suggestion>\n"
             let provider = p
                 .parse::<Provider>()
                 .map_err(|_| format!("Unknown provider: {p}"))?;
+            let env = orchestration::brofile::resolve_provider_env(provider, None, None, store_dir);
             return Ok((
                 provider,
                 sid.to_string(),
                 None,
                 None,
-                None,
+                env,
                 project_dir.map(String::from),
                 None,
             ));
@@ -2951,11 +2960,10 @@ Next step: <one concrete steering suggestion>\n"
             }
             let member = &mut team.members[target_member_idx];
             member.task_history.push(tid.clone());
-            // Track the latest launch. Skip "pending" — late propagation
-            // will fill it in once the provider discovers its session.
-            if task_sid != "pending" {
-                member.session_id = Some(task_sid.clone());
-            }
+            // Track the latest launch immediately, including "pending",
+            // so later team rounds fail closed instead of starting a
+            // second session before provider-side discovery completes.
+            member.session_id = Some(task_sid.clone());
             orchestration::team::save_team(&team, &self.state.store_dir);
             break;
         }
@@ -3003,6 +3011,7 @@ struct BroRosterEntry {
     bro_selector: String,
     team: String,
     provider: String,
+    account: Option<String>,
     session_id: Option<String>,
     jsonl_path: Option<String>,
     brofile: String,
@@ -3063,6 +3072,7 @@ fn build_member_entry(
         provider: provider
             .map(|p| p.to_string())
             .unwrap_or_else(|| "unknown".into()),
+        account: brofile.as_ref().and_then(|b| b.account.clone()),
         session_id,
         jsonl_path,
         brofile: member.brofile.clone(),
@@ -3146,6 +3156,7 @@ async fn roster_handler(
             provider: provider
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "unknown".into()),
+            account: None,
             session_id: Some(sid.clone()),
             jsonl_path: path.map(|p| p.to_string_lossy().into_owned()),
             brofile: String::new(),

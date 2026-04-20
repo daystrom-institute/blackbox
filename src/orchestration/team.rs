@@ -86,9 +86,7 @@ pub struct TeamAdvisorConfig {
 
 impl TeamAdvisorConfig {
     pub fn display_name(&self) -> String {
-        self.alias
-            .clone()
-            .unwrap_or_else(|| self.brofile.clone())
+        self.alias.clone().unwrap_or_else(|| self.brofile.clone())
     }
 }
 
@@ -356,6 +354,12 @@ pub fn propagate_session_id(task_id: &str, session_id: &str, store_dir: &Path) {
             // late-completing older task must not clobber a newer session.
             if member.task_history.last().map(String::as_str) == Some(task_id) {
                 member.session_id = Some(session_id.to_string());
+                dirty = true;
+            }
+        }
+        if let Some(advisor) = team.advisor.as_mut() {
+            if advisor.task_history.last().map(String::as_str) == Some(task_id) {
+                advisor.session_id = Some(session_id.to_string());
                 dirty = true;
             }
         }
@@ -631,6 +635,46 @@ mod tests {
         assert_eq!(
             loaded.members[0].session_id.as_deref(),
             Some("real-session-id")
+        );
+    }
+
+    #[test]
+    fn test_propagate_session_id_updates_advisor() {
+        let dir = temp_store();
+        let team = Team {
+            name: "t1".into(),
+            teamplate: "tp1".into(),
+            members: vec![],
+            advisor: Some(TeamAdvisor {
+                name: "lead".into(),
+                config: TeamAdvisorConfig {
+                    brofile: "advisor".into(),
+                    alias: None,
+                    charter: "watch things".into(),
+                    context: None,
+                    halt_conditions: vec![],
+                    exit_conditions: vec![],
+                    packet_id: None,
+                    timeout_seconds: None,
+                    mode: AdvisorMode::Blocking,
+                },
+                session_id: Some("pending".into()),
+                task_history: vec!["task-adv".into()],
+            }),
+            project_dir: None,
+            created_at: 0,
+        };
+        save_team(&team, dir.path());
+
+        propagate_session_id("task-adv", "advisor-session-id", dir.path());
+
+        let loaded = load_team("t1", dir.path()).unwrap();
+        assert_eq!(
+            loaded
+                .advisor
+                .as_ref()
+                .and_then(|advisor| advisor.session_id.as_deref()),
+            Some("advisor-session-id")
         );
     }
 

@@ -7,22 +7,14 @@ use serde_json::Value;
 // Provider enum
 // ---------------------------------------------------------------------------
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    strum::EnumString,
-    strum::IntoStaticStr,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumString)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Provider {
     Claude,
+    #[serde(alias = "glm")]
+    #[strum(serialize = "opencode", serialize = "glm")]
+    Opencode,
     Codex,
     Copilot,
     Vibe,
@@ -32,6 +24,7 @@ pub enum Provider {
 impl Provider {
     pub const ALL: &[Provider] = &[
         Provider::Claude,
+        Provider::Opencode,
         Provider::Codex,
         Provider::Copilot,
         Provider::Vibe,
@@ -39,12 +32,22 @@ impl Provider {
     ];
 
     pub fn as_str(&self) -> &'static str {
-        self.into()
+        match self {
+            Provider::Claude => "claude",
+            Provider::Opencode => "opencode",
+            Provider::Codex => "codex",
+            Provider::Copilot => "copilot",
+            Provider::Vibe => "vibe",
+            Provider::Gemini => "gemini",
+        }
     }
 
     pub fn bin(&self) -> String {
         match self {
             Provider::Claude => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
+            Provider::Opencode => {
+                std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into())
+            }
             Provider::Codex => std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into()),
             Provider::Copilot => std::env::var("COPILOT_BIN").unwrap_or_else(|_| "gh".into()),
             Provider::Vibe => std::env::var("VIBE_BIN").unwrap_or_else(|_| "vibe".into()),
@@ -56,6 +59,7 @@ impl Provider {
         matches!(
             self,
             Provider::Claude
+                | Provider::Opencode
                 | Provider::Codex
                 | Provider::Copilot
                 | Provider::Vibe
@@ -64,12 +68,16 @@ impl Provider {
     }
 
     pub fn is_streaming_json(&self) -> bool {
-        matches!(self, Provider::Claude | Provider::Codex | Provider::Copilot)
+        matches!(
+            self,
+            Provider::Claude | Provider::Opencode | Provider::Codex | Provider::Copilot
+        )
     }
 
     pub fn models(&self) -> &'static [ModelInfo] {
         match self {
             Provider::Claude => CLAUDE_MODELS,
+            Provider::Opencode => OPENCODE_MODELS,
             Provider::Codex => CODEX_MODELS,
             Provider::Copilot => COPILOT_MODELS,
             Provider::Vibe => VIBE_MODELS,
@@ -80,6 +88,7 @@ impl Provider {
     pub fn efforts(&self) -> &'static [EffortInfo] {
         match self {
             Provider::Claude => CLAUDE_EFFORTS,
+            Provider::Opencode => OPENCODE_VARIANTS,
             Provider::Codex => CODEX_EFFORTS,
             Provider::Copilot => COPILOT_EFFORTS,
             _ => &[],
@@ -201,6 +210,25 @@ impl Provider {
                 }
                 args
             }
+            Provider::Opencode => {
+                let mut args = vec![
+                    "run".into(),
+                    "--format".into(),
+                    "json".into(),
+                    "--dangerously-skip-permissions".into(),
+                ];
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
+                if let Some(e) = effort {
+                    args.extend(["--variant".into(), e.into()]);
+                }
+                if let Some(c) = cwd {
+                    args.extend(["--dir".into(), c.into()]);
+                }
+                args.push(prompt.into());
+                args
+            }
             Provider::Codex => {
                 let mut args = vec![
                     "exec".into(),
@@ -271,6 +299,7 @@ impl Provider {
     pub fn resolve_session_cwd(&self, session_id: &str) -> Option<std::path::PathBuf> {
         match self {
             Provider::Claude => resolve_claude_session_cwd(session_id),
+            Provider::Opencode => None,
             Provider::Codex => resolve_codex_session_cwd(session_id),
             Provider::Gemini => resolve_gemini_session_cwd(session_id),
             Provider::Copilot | Provider::Vibe => None,
@@ -309,6 +338,24 @@ impl Provider {
                     let name = transient_blackbox_name();
                     args.extend(["--mcp-config".into(), claude_mcp_config_json(&name, &url)]);
                 }
+                args
+            }
+            Provider::Opencode => {
+                let mut args = vec![
+                    "run".into(),
+                    "--format".into(),
+                    "json".into(),
+                    "--session".into(),
+                    session_id.into(),
+                    "--dangerously-skip-permissions".into(),
+                ];
+                if let Some(m) = model {
+                    args.extend(["--model".into(), m.into()]);
+                }
+                if let Some(e) = effort {
+                    args.extend(["--variant".into(), e.into()]);
+                }
+                args.push(prompt.into());
                 args
             }
             Provider::Codex => {
@@ -466,6 +513,7 @@ impl Provider {
                 args.extend([name.into(), url.into()]);
                 Some(args)
             }
+            Provider::Opencode => None,
             Provider::Copilot => {
                 if scope != "user" {
                     return None;
@@ -552,6 +600,7 @@ impl Provider {
                     name.into(),
                 ])
             }
+            Provider::Opencode => None,
             Provider::Copilot => {
                 if scope != "user" {
                     return None;
@@ -591,6 +640,7 @@ impl Provider {
     pub fn build_mcp_list_args(&self) -> Option<Vec<String>> {
         match self {
             Provider::Claude => Some(vec!["mcp".into(), "list".into()]),
+            Provider::Opencode => None,
             Provider::Copilot => Some(vec![
                 "copilot".into(),
                 "--".into(),
@@ -660,6 +710,7 @@ impl Provider {
                     args.push(expanded_allow.join(" "));
                 }
             }
+            Provider::Opencode => {}
             Provider::Copilot => {
                 // Copilot's --deny-tool / --allow-tool expect
                 // `ServerName(tool_name)` format, not the MCP-prefixed
@@ -917,6 +968,7 @@ impl Provider {
     pub fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
         match self {
             Provider::Claude => parse_claude_event(evt, sink),
+            Provider::Opencode => parse_opencode_event(evt, sink),
             Provider::Codex => parse_codex_event(evt, sink),
             Provider::Copilot => parse_copilot_event(evt, sink),
             Provider::Vibe => parse_vibe_event(evt, sink),
@@ -930,6 +982,13 @@ impl Provider {
             self.parse_event(&parsed, sink);
         } else {
             sink.last_assistant_message = Some(raw.trim().to_string());
+        }
+    }
+
+    pub fn build_export_args(&self, session_id: &str) -> Option<Vec<String>> {
+        match self {
+            Provider::Opencode => Some(vec!["export".into(), session_id.into()]),
+            _ => None,
         }
     }
 }
@@ -985,6 +1044,62 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         sink.cost_usd = evt["total_cost_usd"].as_f64();
         sink.num_turns = evt["num_turns"].as_u64();
     }
+}
+
+fn parse_opencode_event(evt: &Value, sink: &mut EventSink) {
+    if let Some(session_id) = evt["sessionID"].as_str() {
+        sink.session_id = Some(session_id.to_string());
+    }
+}
+
+pub fn parse_opencode_export(raw: &str, sink: &mut EventSink) {
+    let Some(json_start) = raw.find('{') else {
+        return;
+    };
+    let Ok(export) = serde_json::from_str::<Value>(&raw[json_start..]) else {
+        return;
+    };
+
+    if sink.session_id.is_none() {
+        sink.session_id = export["info"]["id"].as_str().map(str::to_string);
+    }
+
+    let Some(messages) = export["messages"].as_array() else {
+        return;
+    };
+
+    let assistant_messages: Vec<&Value> = messages
+        .iter()
+        .filter(|msg| msg["info"]["role"].as_str() == Some("assistant"))
+        .collect();
+
+    sink.num_turns = Some(assistant_messages.len() as u64);
+
+    let Some(last_assistant) = assistant_messages.last() else {
+        return;
+    };
+
+    let text_parts: Vec<&str> = last_assistant["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|part| part["type"].as_str() == Some("text"))
+        .filter_map(|part| part["text"].as_str())
+        .collect();
+    if !text_parts.is_empty() {
+        sink.last_assistant_message = Some(text_parts.join("\n"));
+    }
+
+    let input_tokens = last_assistant["info"]["tokens"]["input"].as_u64();
+    let output_tokens = last_assistant["info"]["tokens"]["output"].as_u64();
+    if let (Some(input_tokens), Some(output_tokens)) = (input_tokens, output_tokens) {
+        sink.usage = Some(Usage {
+            input_tokens,
+            output_tokens,
+        });
+    }
+
+    sink.cost_usd = last_assistant["info"]["cost"].as_f64();
 }
 
 fn parse_codex_event(evt: &Value, sink: &mut EventSink) {
@@ -1160,20 +1275,26 @@ pub fn discover_vibe_session(start_ms: u64, project_dir: &str) -> Option<String>
         .map(|(sid, _, _, _)| sid.clone())
 }
 
-pub fn discover_gemini_session(start_ms: u64, project_dir: &str) -> Option<String> {
+pub fn discover_gemini_session(
+    start_ms: u64,
+    project_dir: &str,
+    task_id: Option<&str>,
+) -> Option<String> {
     let tmp_root = dirs::home_dir()?.join(".gemini").join("tmp");
-    discover_gemini_session_in(&tmp_root, start_ms, project_dir)
+    discover_gemini_session_in(&tmp_root, start_ms, project_dir, task_id)
 }
 
 pub fn discover_gemini_session_in(
     tmp_root: &Path,
     start_ms: u64,
     project_dir: &str,
+    task_id: Option<&str>,
 ) -> Option<String> {
     let resolved_project =
         std::fs::canonicalize(project_dir).unwrap_or_else(|_| Path::new(project_dir).to_path_buf());
 
-    let mut scored: Vec<(String, u64, bool, bool)> = Vec::new();
+    let task_marker = task_id.map(|id| format!("task: {id}"));
+    let mut scored: Vec<(String, u64, bool, bool, bool)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(tmp_root) else {
         return None;
     };
@@ -1222,6 +1343,10 @@ pub fn discover_gemini_session_in(
             let Ok(raw) = std::fs::read_to_string(&path) else {
                 continue;
             };
+            let matches_task = task_marker
+                .as_ref()
+                .map(|marker| raw.contains(marker))
+                .unwrap_or(false);
             let Ok(data) = serde_json::from_str::<Value>(&raw) else {
                 continue;
             };
@@ -1229,17 +1354,25 @@ pub fn discover_gemini_session_in(
                 continue;
             };
             let session_id = session_id.to_string();
-            scored.push((session_id, mtime_ms, matches_dir, recent));
+            scored.push((session_id, mtime_ms, matches_dir, recent, matches_task));
         }
     }
 
     scored.sort_by(|a, b| b.1.cmp(&a.1));
     scored
         .iter()
-        .find(|(_, _, dir, recent)| *dir && *recent)
-        .or_else(|| scored.iter().find(|(_, _, dir, _)| *dir))
-        .or_else(|| scored.iter().find(|(_, _, _, recent)| *recent))
-        .map(|(sid, _, _, _)| sid.clone())
+        .find(|(_, _, dir, recent, task)| *dir && *recent && *task)
+        .or_else(|| scored.iter().find(|(_, _, dir, _, task)| *dir && *task))
+        .or_else(|| {
+            scored
+                .iter()
+                .find(|(_, _, _, recent, task)| *recent && *task)
+        })
+        .or_else(|| scored.iter().find(|(_, _, _, _, task)| *task))
+        .or_else(|| scored.iter().find(|(_, _, dir, recent, _)| *dir && *recent))
+        .or_else(|| scored.iter().find(|(_, _, dir, _, _)| *dir))
+        .or_else(|| scored.iter().find(|(_, _, _, recent, _)| *recent))
+        .map(|(sid, _, _, _, _)| sid.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1498,6 +1631,34 @@ static CLAUDE_EFFORTS: &[EffortInfo] = &[
     },
 ];
 
+static OPENCODE_VARIANTS: &[EffortInfo] = &[
+    EffortInfo {
+        id: "minimal",
+        description: "Fastest variant",
+        default: false,
+    },
+    EffortInfo {
+        id: "low",
+        description: "Light reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "medium",
+        description: "Balanced speed and depth",
+        default: true,
+    },
+    EffortInfo {
+        id: "high",
+        description: "Deeper reasoning",
+        default: false,
+    },
+    EffortInfo {
+        id: "max",
+        description: "Maximum reasoning depth",
+        default: false,
+    },
+];
+
 static CLAUDE_MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "claude-opus-4-7",
@@ -1522,6 +1683,74 @@ static CLAUDE_MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "claude-haiku-4-5-20251001",
         description: "Fastest, lowest cost",
+        default: false,
+    },
+];
+
+static OPENCODE_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "zai-coding-plan/glm-5.1",
+        description: "Z.AI Coding Plan flagship GLM model via OpenCode",
+        default: true,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-5",
+        description: "General-purpose frontier GLM model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-5-turbo",
+        description: "Fast high-end GLM model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-4.7",
+        description: "Strong balanced GLM model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-4.7-flashx",
+        description: "Cheap accelerated GLM-4.7 variant via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-4.6",
+        description: "Previous balanced GLM model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-4.5",
+        description: "Balanced GLM-4.5 model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-4.5-air",
+        description: "Low-cost helper model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-4.5v",
+        description: "Vision-capable GLM-4.5 model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-4.6v",
+        description: "Vision-capable GLM-4.6 model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-4.7-flash",
+        description: "Free GLM-4.7 flash model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-4.5-flash",
+        description: "Free GLM flash model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "zai-coding-plan/glm-5v-turbo",
+        description: "Vision-capable GLM model via OpenCode",
         default: false,
     },
 ];
@@ -2422,6 +2651,7 @@ mod tests {
         project_root: &str,
         session_id: &str,
         iso: &str,
+        task_id: Option<&str>,
     ) {
         let proj_dir = tmp_root.join(project_name);
         let chats = proj_dir.join("chats");
@@ -2429,9 +2659,14 @@ mod tests {
         std::fs::write(proj_dir.join(".project_root"), project_root).unwrap();
         let first8 = &session_id[..8];
         let path = chats.join(format!("session-{iso}-{first8}.json"));
+        let message_text = task_id
+            .map(|task| format!("[scope] task: {task}"))
+            .unwrap_or_default();
         std::fs::write(
             &path,
-            format!("{{\n  \"sessionId\": \"{session_id}\",\n  \"messages\": []\n}}"),
+            format!(
+                "{{\n  \"sessionId\": \"{session_id}\",\n  \"messages\": [{{\"text\": {message_text:?}}}]\n}}"
+            ),
         )
         .unwrap();
     }
@@ -2445,6 +2680,7 @@ mod tests {
             "/home/user/repos/daystrom-mk2",
             "13683fa2-df9a-44f3-a068-4520b4dbb55b",
             "2026-04-18T19-18",
+            None,
         );
         let cwd = resolve_gemini_session_cwd_in(tmp.path(), "13683fa2-df9a-44f3-a068-4520b4dbb55b")
             .expect("should resolve");
@@ -2463,6 +2699,7 @@ mod tests {
             "/repo/a",
             "aaaaaaaa-1111-2222-3333-444444444444",
             "2026-04-18T10-00",
+            None,
         );
         // Different UUID — silent fork territory on the real Gemini CLI;
         // here we want None so the caller refuses.
@@ -2484,6 +2721,7 @@ mod tests {
             "/repo/a",
             "13683fa2-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "2026-04-18T19-00",
+            None,
         );
         seed_gemini_fixture(
             tmp.path(),
@@ -2491,6 +2729,7 @@ mod tests {
             "/repo/b",
             "13683fa2-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
             "2026-04-18T20-00",
+            None,
         );
         let cwd = resolve_gemini_session_cwd_in(tmp.path(), "13683fa2-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
             .expect("should resolve");
@@ -2512,6 +2751,7 @@ mod tests {
             "/repo/a",
             "aaaaaaaa-1111-2222-3333-444444444444",
             "2026-04-18T10-00",
+            None,
         );
         seed_gemini_fixture(
             tmp.path(),
@@ -2519,14 +2759,15 @@ mod tests {
             "/repo/b",
             "bbbbbbbb-1111-2222-3333-444444444444",
             "2026-04-18T10-01",
+            None,
         );
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let sid =
-            discover_gemini_session_in(tmp.path(), now_ms, "/repo/b").expect("should resolve");
+        let sid = discover_gemini_session_in(tmp.path(), now_ms, "/repo/b", None)
+            .expect("should resolve");
         assert_eq!(sid, "bbbbbbbb-1111-2222-3333-444444444444");
     }
 
@@ -2537,7 +2778,36 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        assert!(discover_gemini_session_in(tmp.path(), now_ms, "/repo/missing").is_none());
+        assert!(discover_gemini_session_in(tmp.path(), now_ms, "/repo/missing", None).is_none());
+    }
+
+    #[test]
+    fn discover_gemini_session_prefers_matching_task_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_gemini_fixture(
+            tmp.path(),
+            "proj",
+            "/repo/x",
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            "2026-04-18T10-00",
+            Some("task-older"),
+        );
+        seed_gemini_fixture(
+            tmp.path(),
+            "proj",
+            "/repo/x",
+            "bbbbbbbb-1111-2222-3333-444444444444",
+            "2026-04-18T10-01",
+            Some("task-newer"),
+        );
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let sid = discover_gemini_session_in(tmp.path(), now_ms, "/repo/x", Some("task-older"))
+            .expect("should resolve older task by marker");
+        assert_eq!(sid, "aaaaaaaa-1111-2222-3333-444444444444");
     }
 
     fn seed_claude_fixture(

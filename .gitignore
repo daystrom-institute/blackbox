@@ -1,1 +1,5 @@
 /target/
+/.dev-agent/
+/.dev-agent-links
+/.direnv/
+/result

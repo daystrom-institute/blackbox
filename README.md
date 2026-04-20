@@ -18,8 +18,9 @@ Five steps. After step 5 every agent CLI on your host is talking to the same dae
 git clone https://github.com/invidious9000/transcript-search.git
 cd transcript-search
 cargo build --release
-install -m 755 target/release/blackboxd ~/.local/bin/
-install -m 755 target/release/bro       ~/.local/bin/
+install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
+install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
+install -m 755 target/release/bro       ~/.local/bin/bro
 ```
 
 ### 2. Run `blackboxd` as a systemd user service
@@ -30,7 +31,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now blackbox.service
 ```
 
-One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI on the host, so they all share the same tantivy index, knowledge store, and orchestration state. Upgrades: rebuild, `install` (atomic), `systemctl --user restart blackbox`.
+One daemon serves every Claude / OpenCode / Codex / Gemini / Copilot / Vibe CLI on the host, so they all share the same tantivy index, knowledge store, and orchestration state. Prod and dev should use separate installed daemon paths even when they come from the same built artifact, so restarting the dev unit never mutates the prod service binary in place. Upgrades: rebuild, `install` (atomic), `systemctl --user restart blackbox`.
 
 Logs live in journald:
 ```bash
@@ -50,7 +51,60 @@ systemctl --user daemon-reload
 systemctl --user enable --now blackbox-dev.service
 ```
 
-This sample unit listens on `127.0.0.1:7265/mcp` and self-registers as `blackbox-dev`, while keeping knowledge/threads/notes/index/render backups under dev-specific XDG paths. It is safe for iteration because it does not mutate the prod daemon's port, MCP entry, task store, or canonical bbox JSON files.
+This sample unit listens on `127.0.0.1:7265/mcp` and self-registers as `blackbox-dev`, while keeping knowledge/threads/notes/index/render backups under dev-specific XDG paths. It also runs a separate installed binary path, `~/.local/bin/blackboxd-dev`, so dev restarts and binary swaps do not touch the prod service executable.
+
+### 2b. Run a fully isolated dev-agent world with Nix
+
+The dev systemd unit isolates the daemon, but not the agent harnesses that may
+still auto-read `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, or
+`~/.gemini/GEMINI.md`. For contained end-to-end testing, use the flake-backed
+dev harness instead:
+
+```bash
+nix develop
+cp .dev-agent-links.example .dev-agent-links   # optional; keep untracked
+$EDITOR .dev-agent-links                       # link only auth/session material
+bbx-dev-home init
+bbx-dev-blackboxd
+```
+
+Open a second shell in the same repo and launch provider CLIs through the
+wrappers:
+
+```bash
+nix develop
+bbx-dev-claude
+bbx-dev-codex
+bbx-dev-gemini
+```
+
+What the harness does:
+
+- creates an isolated home tree at `./.dev-agent/home`
+- keeps config, MCP wiring, render targets, blackbox state, transcript index,
+  and bro state inside that tree
+- points rendered global memory at the fake home's real pickup paths:
+  - `./.dev-agent/home/.claude-shared/CLAUDE.md`
+  - `./.dev-agent/home/.codex/AGENTS.md`
+  - `./.dev-agent/home/.gemini/GEMINI.md`
+- leaves auth/session passthrough explicit via `./.dev-agent-links`
+
+`./.dev-agent-links` is TAB-separated: `<relative-path-under-dev-home><TAB><absolute-host-path>`.
+That lets you borrow only the auth material the real CLI requires while keeping
+the mutable config and memory files isolated. Example:
+
+```text
+.claude/.credentials.json	/home/you/.claude/.credentials.json
+.codex/auth.json	/home/you/.codex/auth.json
+```
+
+This split is intentional: auth may need to map back to host paths, but config,
+MCP, render targets, and blackbox state should not.
+
+If a provider co-locates auth with config in a single file, do not symlink your
+real config wholesale unless you accept losing isolation for that provider.
+Prefer copying just the auth-bearing material into the dev home or using a
+provider-specific env var when the CLI supports one.
 
 ### 3. Connect your CLIs
 
@@ -264,7 +318,7 @@ See [Knowledge lifecycle](#knowledge-lifecycle) for the narrative — quick refe
 
 ### Multi-provider orchestration (`bro_*`)
 
-Dispatch agent tasks to Claude, Codex, Copilot, Vibe, or Gemini and coordinate them as teams.
+Dispatch agent tasks to Claude, OpenCode, Codex, Copilot, Vibe, or Gemini and coordinate them as teams.
 
 | Tool | Description |
 |---|---|
@@ -316,6 +370,7 @@ Content is capped at 12KB per document. Responses are capped at 80KB to avoid bl
 Maintained in `src/orchestration/providers.rs`:
 
 - **Claude** — Opus 4.7 (default, 1M context built-in), Opus 4.6, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`; `xhigh` is Opus-4.7-only, `max` unsupported on Haiku). Runs with `--include-partial-messages` so progress notifiers see true delta streaming.
+- **OpenCode** — native `provider/model` execution. Current catalog exposes Z.AI Coding Plan GLM models directly, defaults to `zai-coding-plan/glm-5.1`, and uses OpenCode variants `minimal`/`low`/`medium`/`high`/`max`.
 - **Codex** — gpt-5.4 family. Efforts `minimal`/`low`/`medium`/`high`/`xhigh`.
 - **Copilot** — Anthropic + OpenAI models. Efforts `low`/`medium`/`high`/`xhigh`.
 - **Vibe**, **Gemini** — model lists only.
@@ -341,7 +396,7 @@ Auto-detection works out of the box for most setups. Override via environment va
 | `BBOX_PORT` / `BRO_PORT` | `7264` | HTTP port for MCP + `/tail` + `/roster` endpoints |
 | `BLACKBOX_GLOBAL_CLAUDE_MD` / `BLACKBOX_GLOBAL_CODEX_MD` / `BLACKBOX_GLOBAL_GEMINI_MD` | provider defaults | Override global render targets; useful for dev instances that must not touch prod memory files |
 | `BLACKBOX_BACKUP_DIR` | `~/.local/state/blackbox/backups` | Managed-region backup root for `bbox_render(scope=global)` |
-| `CLAUDE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` / `VIBE_BIN` | from `$PATH` | Override provider binary paths |
+| `CLAUDE_BIN` / `OPENCODE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` / `VIBE_BIN` | from `$PATH` | Override provider binary paths |
 | `RUST_LOG` | `blackbox=info` | Tracing filter |
 
 ### Auto-detection

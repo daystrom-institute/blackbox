@@ -638,7 +638,11 @@ pub fn spawn_task(
                         }
                     }
 
-                    if let Some(sid) = providers::discover_gemini_session(started_at, &cwd_clone) {
+                    if let Some(sid) = providers::discover_gemini_session(
+                        started_at,
+                        &cwd_clone,
+                        Some(&task_id_watch),
+                    ) {
                         let discovered = {
                             let mut inner = task_ref_watch.inner.lock();
                             if inner.session_id == "pending" {
@@ -673,6 +677,8 @@ pub fn spawn_task(
     let is_streaming = provider.is_streaming_json();
     let tail_tx_clone = tail_tx.clone();
     let task_id_clone = id.clone();
+    let env_overrides_export = env_overrides.clone();
+    let cwd_export = cwd.clone();
 
     let (stdout_done_tx, stdout_done_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -827,6 +833,26 @@ pub fn spawn_task(
             }
         }
 
+        if provider == Provider::Opencode {
+            let session_id = {
+                let inner = task_ref_wait.inner.lock();
+                (inner.session_id != "pending").then(|| inner.session_id.clone())
+            };
+            if let Some(session_id) = session_id {
+                if let Some(sink) = export_opencode_session(
+                    provider,
+                    &session_id,
+                    cwd_export.as_deref(),
+                    env_overrides_export.as_ref(),
+                )
+                .await
+                {
+                    let mut inner = task_ref_wait.inner.lock();
+                    apply_sink_updates(&mut inner, sink);
+                }
+            }
+        }
+
         {
             let mut inner = task_ref_wait.inner.lock();
             inner.exit_code = code;
@@ -879,6 +905,64 @@ pub fn spawn_task(
     });
 
     task
+}
+
+async fn export_opencode_session(
+    provider: Provider,
+    session_id: &str,
+    cwd: Option<&str>,
+    env_overrides: Option<&std::collections::HashMap<String, String>>,
+) -> Option<EventSink> {
+    let args = provider.build_export_args(session_id)?;
+
+    let extra_path = std::env::var("BRO_EXTRA_PATH").unwrap_or_else(|_| {
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".local/bin")
+            .to_string_lossy()
+            .to_string()
+    });
+    let path_env = format!(
+        "{}:{}",
+        extra_path,
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let raw_bin = provider.bin();
+    let bin = providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .env("PATH", &path_env)
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("FORCE_COLOR", "0");
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    if let Some(overrides) = env_overrides {
+        for (k, v) in overrides {
+            cmd.env(k, v);
+        }
+    }
+
+    let output = cmd.output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut sink = EventSink {
+        last_assistant_message: None,
+        usage: None,
+        cost_usd: None,
+        num_turns: None,
+        session_id: Some(session_id.to_string()),
+    };
+    let raw = String::from_utf8_lossy(&output.stdout);
+    providers::parse_opencode_export(&raw, &mut sink);
+    Some(sink)
 }
 
 /// Wait for a task to complete. Returns immediately if already terminal.

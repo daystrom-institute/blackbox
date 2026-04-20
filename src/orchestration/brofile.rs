@@ -4,6 +4,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::mcp::McpFilters;
 use super::providers::Provider;
@@ -166,6 +167,196 @@ pub fn load_account(name: &str, store_dir: &Path) -> Option<Account> {
     config.accounts.get(name).cloned()
 }
 
+fn load_settings_env(config_dir: &Path) -> HashMap<String, String> {
+    let settings_path = config_dir.join("settings.json");
+    let data = match fs::read_to_string(&settings_path) {
+        Ok(data) => data,
+        Err(_) => return HashMap::new(),
+    };
+
+    let value: Value = match serde_json::from_str(&data) {
+        Ok(value) => value,
+        Err(_) => return HashMap::new(),
+    };
+
+    value
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter()
+                .filter_map(|(key, value)| match value {
+                    Value::String(s) => Some((key.clone(), s.clone())),
+                    Value::Number(n) => Some((key.clone(), n.to_string())),
+                    Value::Bool(b) => Some((key.clone(), b.to_string())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_json_file(path: &Path, value: &Value) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(data) = serde_json::to_string_pretty(value) {
+        let _ = fs::write(path, data);
+    }
+}
+
+fn default_opencode_config_path(store_dir: &Path) -> PathBuf {
+    store_dir.join("generated").join("opencode.json")
+}
+
+fn opencode_model_defaults(model: Option<&str>) -> (&str, &str) {
+    match model.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(model) => (model, "zai-coding-plan/glm-4.5-air"),
+        None => ("zai-coding-plan/glm-5.1", "zai-coding-plan/glm-4.5-air"),
+    }
+}
+
+fn build_opencode_config(model: Option<&str>) -> Value {
+    let (model, small_model) = opencode_model_defaults(model);
+    let provider_id = model.split('/').next().unwrap_or_default();
+    let mut config = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "model": model,
+        "small_model": small_model,
+        "tools": {
+            "blackbox_bro_*": false
+        }
+    });
+
+    if provider_id == "zai-coding-plan" {
+        config["provider"] = serde_json::json!({
+            "zai-coding-plan": {
+                "options": {
+                    "apiKey": "{env:ANTHROPIC_AUTH_TOKEN}"
+                }
+            }
+        });
+    }
+
+    if let Some(url) = super::providers::transient_blackbox_url() {
+        config["mcp"] = serde_json::json!({
+            super::providers::transient_blackbox_name(): {
+                "type": "remote",
+                "url": url,
+                "enabled": true
+            }
+        });
+    }
+
+    config
+}
+
+fn default_opencode_env(
+    store_dir: &Path,
+    home_dir: &Path,
+    model: Option<&str>,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    let settings_env = load_settings_env(&home_dir.join(".claude-zai"));
+    if let Some(token) = settings_env.get("ANTHROPIC_AUTH_TOKEN") {
+        env.insert("ANTHROPIC_AUTH_TOKEN".into(), token.clone());
+    }
+
+    let config_path = default_opencode_config_path(store_dir);
+    write_json_file(&config_path, &build_opencode_config(model));
+    env.insert(
+        "OPENCODE_CONFIG".into(),
+        config_path.to_string_lossy().into_owned(),
+    );
+    env
+}
+
+fn normalized_account_suffix(name: &str) -> Option<String> {
+    let lowered = name.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return None;
+    }
+
+    match lowered.as_str() {
+        "default" | "primary" | "main" | "account1" | "yolo1" => return Some(String::new()),
+        "account2" | "yolo2" => return Some("-account2".into()),
+        "account3" | "yolo3" => return Some("-account3".into()),
+        _ => {}
+    }
+
+    if let Some(rest) = lowered.strip_prefix("account") {
+        return match rest {
+            "" => None,
+            "1" => Some(String::new()),
+            _ => Some(format!("-account{rest}")),
+        };
+    }
+
+    if let Some(rest) = lowered.strip_prefix("yolo") {
+        return match rest {
+            "" => None,
+            "1" => Some(String::new()),
+            _ => Some(format!("-account{rest}")),
+        };
+    }
+
+    None
+}
+
+fn synthesized_account_env_for_home(
+    provider: Provider,
+    account_name: &str,
+    home_dir: &Path,
+) -> Option<HashMap<String, String>> {
+    let suffix = normalized_account_suffix(account_name)?;
+
+    let (env_key, rel_path) = match provider {
+        Provider::Claude => ("CLAUDE_CONFIG_DIR", format!(".claude{suffix}")),
+        Provider::Codex => ("CODEX_HOME", format!(".codex{suffix}")),
+        // `gh` respects GH_CONFIG_DIR; keep the same account suffix pattern.
+        Provider::Copilot => ("GH_CONFIG_DIR", format!(".config/gh{suffix}")),
+        Provider::Opencode | Provider::Gemini | Provider::Vibe => return None,
+    };
+
+    Some(HashMap::from([(
+        env_key.to_string(),
+        home_dir.join(rel_path).to_string_lossy().into_owned(),
+    )]))
+}
+
+pub fn resolve_provider_env(
+    provider: Provider,
+    account_name: Option<&str>,
+    model: Option<&str>,
+    store_dir: &Path,
+) -> Option<HashMap<String, String>> {
+    let mut env = dirs::home_dir()
+        .as_deref()
+        .map(|home| match provider {
+            Provider::Opencode => default_opencode_env(store_dir, home, model),
+            _ => HashMap::new(),
+        })
+        .unwrap_or_default();
+
+    if let Some(account_name) = account_name {
+        if provider != Provider::Opencode {
+            if let Some(account_env) = dirs::home_dir()
+                .as_deref()
+                .and_then(|home| synthesized_account_env_for_home(provider, account_name, home))
+            {
+                env.extend(account_env);
+            }
+        }
+    }
+
+    if let Some(account_name) = account_name {
+        if let Some(overrides) = load_account(account_name, store_dir).and_then(|a| a.env) {
+            env.extend(overrides);
+        }
+    }
+
+    (!env.is_empty()).then_some(env)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -177,6 +368,17 @@ mod tests {
 
     fn temp_store() -> TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    fn with_fake_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+        let result = f();
+        match prior {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        result
     }
 
     #[test]
@@ -343,5 +545,105 @@ mod tests {
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
         assert_eq!(loaded.model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(loaded.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn test_synthesized_account_env_for_claude_aliases() {
+        let env = synthesized_account_env_for_home(
+            Provider::Claude,
+            "yolo2",
+            Path::new("/tmp/fake-home"),
+        )
+        .unwrap();
+        assert_eq!(
+            env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/tmp/fake-home/.claude-account2")
+        );
+    }
+
+    #[test]
+    fn test_synthesized_account_env_for_codex_account_name() {
+        let env = synthesized_account_env_for_home(
+            Provider::Codex,
+            "account3",
+            Path::new("/tmp/fake-home"),
+        )
+        .unwrap();
+        assert_eq!(
+            env.get("CODEX_HOME").map(String::as_str),
+            Some("/tmp/fake-home/.codex-account3")
+        );
+    }
+
+    #[test]
+    fn test_resolve_provider_env_merges_config_overrides() {
+        let store = temp_store();
+        let mut config = load_config(store.path());
+        config.accounts.insert(
+            "account2".into(),
+            Account {
+                env: Some(HashMap::from([("EXTRA_FLAG".into(), "1".into())])),
+            },
+        );
+        save_config(&config, store.path());
+
+        let resolved =
+            resolve_provider_env(Provider::Claude, Some("account2"), None, store.path()).unwrap();
+        assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
+        assert!(resolved
+            .get("CLAUDE_CONFIG_DIR")
+            .is_some_and(|path| path.ends_with("/.claude-account2")));
+    }
+
+    #[test]
+    fn test_resolve_provider_env_defaults_opencode_zai_config() {
+        let store = temp_store();
+        let home = temp_store();
+        let config_dir = home.path().join(".claude-zai");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"token-from-settings"}} "#,
+        )
+        .unwrap();
+
+        let resolved = with_fake_home(home.path(), || {
+            resolve_provider_env(Provider::Opencode, None, None, store.path()).unwrap()
+        });
+        assert_eq!(
+            resolved.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+            Some("token-from-settings")
+        );
+        let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
+        let config = fs::read_to_string(config_path).unwrap();
+        assert!(config.contains("\"model\": \"zai-coding-plan/glm-5.1\""));
+        assert!(config.contains("\"small_model\": \"zai-coding-plan/glm-4.5-air\""));
+        assert!(config.contains("\"blackbox_bro_*\": false"));
+    }
+
+    #[test]
+    fn test_resolve_provider_env_opencode_model_override_updates_config() {
+        let store = temp_store();
+        let home = temp_store();
+        let config_dir = home.path().join(".claude-zai");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"token-from-settings"}} "#,
+        )
+        .unwrap();
+
+        let resolved = with_fake_home(home.path(), || {
+            resolve_provider_env(
+                Provider::Opencode,
+                Some("yoloz"),
+                Some("zai-coding-plan/glm-4.7"),
+                store.path(),
+            )
+            .unwrap()
+        });
+        let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
+        let config = fs::read_to_string(config_path).unwrap();
+        assert!(config.contains("\"model\": \"zai-coding-plan/glm-4.7\""));
     }
 }
