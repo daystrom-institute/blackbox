@@ -392,6 +392,37 @@ pub enum Predicate {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         entity_map: BTreeMap<String, String>,
     },
+    /// **Substring match.** True iff `entity[field]` is a string that
+    /// contains `needle`. Non-string values and missing fields return
+    /// false. Combine via `Any{[Contains, Contains, ...]}` for the
+    /// multi-needle idiom (the regex-alternation shape). This is the
+    /// phase-6 answer to the two StringContains gap-log votes from
+    /// the E10 sweep (S5 and S11).
+    StringContains {
+        field: String,
+        needle: String,
+        /// When true, both sides are lowercased before comparison.
+        #[serde(default)]
+        case_insensitive: bool,
+    },
+    /// **Integer banded range.** True iff `min <= entity[field] <= max`.
+    /// Inclusive both ends. For exclusive bounds compose `All[Gt/Lt]`
+    /// or use `InRangeF` with off-by-epsilon values. Missing or
+    /// non-integer fields return false. Phase-6 sugar motivated by
+    /// the E10 reflection where authoring `All[Gt 0, Le 5]` twice in
+    /// one packet felt noisy.
+    InRange {
+        field: String,
+        min: i64,
+        max: i64,
+    },
+    /// **Float banded range.** True iff `min <= entity[field] <= max`.
+    /// Inclusive both ends. Missing or non-numeric fields return false.
+    InRangeF {
+        field: String,
+        min: f64,
+        max: f64,
+    },
 }
 
 // ── Classification (user-defined per-packet lattice) ─────────────
@@ -1167,6 +1198,27 @@ fn eval_predicate(
             let n = resolve_collection(entity, path).map(|a| a.len()).unwrap_or(0);
             compare.apply(n, *value)
         }
+        Predicate::StringContains {
+            field,
+            needle,
+            case_insensitive,
+        } => {
+            let haystack = match entity.get(field) {
+                Some(serde_json::Value::String(s)) => s.as_str(),
+                _ => return false,
+            };
+            if *case_insensitive {
+                haystack.to_lowercase().contains(&needle.to_lowercase())
+            } else {
+                haystack.contains(needle.as_str())
+            }
+        }
+        Predicate::InRange { field, min, max } => entity_int(entity, field)
+            .map(|v| v >= *min && v <= *max)
+            .unwrap_or(false),
+        Predicate::InRangeF { field, min, max } => entity_f64(entity, field)
+            .map(|v| v >= *min && v <= *max)
+            .unwrap_or(false),
         Predicate::Apply {
             packet_id,
             expect,
@@ -3553,6 +3605,243 @@ mod tests {
         let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
         let r = ri.materialize(&review_lattice(), &review_prefix_inference()).unwrap();
         assert_eq!(r.emit, Emit::Fallback);
+    }
+
+    // ── Phase 6: StringContains / InRange tests ────────────────────
+
+    fn noop_entity() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
+
+    #[test]
+    fn string_contains_matches_case_sensitive() {
+        let p = Predicate::StringContains {
+            field: "message".into(),
+            needle: "OOM".into(),
+            case_insensitive: false,
+        };
+        let yes = serde_json::json!({"message": "worker OOMKilled"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mixed = serde_json::json!({"message": "worker oom event"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let no_field = noop_entity();
+        let non_string = serde_json::json!({"message": 42})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(eval_predicate(&p, &yes, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &mixed, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &no_field, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &non_string, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn string_contains_matches_case_insensitive() {
+        let p = Predicate::StringContains {
+            field: "message".into(),
+            needle: "out of memory".into(),
+            case_insensitive: true,
+        };
+        let yes1 = serde_json::json!({"message": "Out Of Memory allocating"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let yes2 = serde_json::json!({"message": "OUT OF MEMORY"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let no = serde_json::json!({"message": "disk full"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(eval_predicate(&p, &yes1, &NoopResolver, 0));
+        assert!(eval_predicate(&p, &yes2, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &no, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn string_contains_composes_via_any_for_multi_needle() {
+        // The regex-alternation idiom: Any[Contains{a}, Contains{b}].
+        let p = Predicate::Any {
+            args: vec![
+                Predicate::StringContains {
+                    field: "message".into(),
+                    needle: "OOM".into(),
+                    case_insensitive: true,
+                },
+                Predicate::StringContains {
+                    field: "message".into(),
+                    needle: "out of memory".into(),
+                    case_insensitive: true,
+                },
+            ],
+        };
+        let oom = serde_json::json!({"message": "ooMkilled"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let prose = serde_json::json!({"message": "Process Ran Out Of Memory"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let neither = serde_json::json!({"message": "disk full"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(eval_predicate(&p, &oom, &NoopResolver, 0));
+        assert!(eval_predicate(&p, &prose, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &neither, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn in_range_inclusive_both_ends() {
+        let p = Predicate::InRange {
+            field: "perf_delta_ms".into(),
+            min: 1,
+            max: 5,
+        };
+        for (v, want) in [
+            (0, false),
+            (1, true),
+            (3, true),
+            (5, true),
+            (6, false),
+        ] {
+            let e = serde_json::json!({"perf_delta_ms": v})
+                .as_object()
+                .unwrap()
+                .clone();
+            assert_eq!(
+                eval_predicate(&p, &e, &NoopResolver, 0),
+                want,
+                "v={v} expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_range_missing_or_non_int_is_false() {
+        let p = Predicate::InRange {
+            field: "x".into(),
+            min: 0,
+            max: 10,
+        };
+        let missing = noop_entity();
+        let str_field = serde_json::json!({"x": "five"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!eval_predicate(&p, &missing, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &str_field, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn in_range_f_inclusive_and_rejects_non_numeric() {
+        let p = Predicate::InRangeF {
+            field: "coverage".into(),
+            min: 0.8,
+            max: 0.95,
+        };
+        for (v, want) in [
+            (0.79, false),
+            (0.80, true),
+            (0.90, true),
+            (0.95, true),
+            (0.96, false),
+        ] {
+            let e = serde_json::json!({"coverage": v})
+                .as_object()
+                .unwrap()
+                .clone();
+            assert_eq!(
+                eval_predicate(&p, &e, &NoopResolver, 0),
+                want,
+                "v={v} expected {want}"
+            );
+        }
+        let str_field = serde_json::json!({"coverage": "high"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!eval_predicate(&p, &str_field, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn compile_accepts_new_predicates_end_to_end() {
+        let (_d, packets) = tmp_packets();
+        let out = packets
+            .compile(&CompileParams {
+                domain: "log-triage".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: Some(vec![
+                    "critical".into(),
+                    "observe".into(),
+                    "ignore".into(),
+                ]),
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: json!([
+                    {
+                        "id": "critical_oom",
+                        "classification": "critical",
+                        "antecedent": {
+                            "op": "Any",
+                            "args": [
+                                {"op": "StringContains", "field": "message", "needle": "OOM", "case_insensitive": true},
+                                {"op": "StringContains", "field": "message", "needle": "out of memory", "case_insensitive": true}
+                            ]
+                        },
+                        "consequent": "CRIT"
+                    },
+                    {
+                        "id": "observe_elevated_latency",
+                        "classification": "observe",
+                        "antecedent": {
+                            "op": "InRangeF", "field": "p99_ms", "min": 500.0, "max": 2000.0
+                        },
+                        "consequent": "OBS"
+                    },
+                    {
+                        "id": "ignore_default",
+                        "classification": "ignore",
+                        "emit": "fallback",
+                        "antecedent": {"op": "True"},
+                        "consequent": "IGN"
+                    }
+                ]),
+            })
+            .unwrap();
+        let id = out.split_whitespace().nth(1).unwrap().to_string();
+        let pkt = packets.load(&id).unwrap();
+
+        // Apply + multi-finding via bbox_audit dataset.
+        assert_eq!(
+            apply(&pkt, &json!({"message": "worker OOMKilled at 0x1234"}))
+                .unwrap()
+                .rule_id,
+            "critical_oom"
+        );
+        assert_eq!(
+            apply(&pkt, &json!({"message": "disk full", "p99_ms": 800.0}))
+                .unwrap()
+                .rule_id,
+            "observe_elevated_latency"
+        );
+        assert_eq!(
+            apply(&pkt, &json!({"message": "ok", "p99_ms": 50.0}))
+                .unwrap()
+                .rule_id,
+            "ignore_default"
+        );
     }
 
     // ── Composition (Apply predicate) tests ────────────────────────

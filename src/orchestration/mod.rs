@@ -283,6 +283,26 @@ compile it into a packet first via `bbox_compile` and dispatch the \
 `bbox_apply`, and a 4th agent can reproduce the results deterministically \
 without re-reading prose. See `sm-rule-packets` via `bbox_knowledge`.";
 
+/// Ambient task-shape nudge for every dispatch. Addresses a failure
+/// mode observed in E10/S11 where an agent bypassed packets entirely
+/// on a log-triage task ("the primitive was simply absent from my
+/// mental toolkit") because `bbox_compile` wasn't deferred-loaded and
+/// the task's shape read as regex-ish. Naming the packet tools in
+/// the ambient prefix pre-loads their schemas into the agent's option
+/// space and reframes "the AST can't do regex" as a gap-log rather
+/// than a bypass. Fires for every dispatch, orthogonal to
+/// ORCHESTRATOR_HINT.
+pub const TASK_SHAPE_HINT: &str = "\
+Task-shape check: if this task involves repeatedly classifying, \
+ranking, triaging, scoring, or judging entities against stated \
+criteria — try `bbox_compile` first (see `sm-rule-packets` via \
+`bbox_knowledge`). Packets force explicit rule ordering and buy a \
+free audit via `bbox_audit`. If the AST can't express part of what \
+you need (string-matching beyond StringContains, rate/time windows, \
+regex), compile what you can and log the gap via `bbox_packet_gap` \
+— don't silently fall back to prose; the gap log is what drives \
+which primitives get added next.";
+
 /// Default per-dispatch contract requiring a structured completion
 /// signal before the agent returns. Observed empirically: without
 /// this, agents competently complete tasks via prose but never emit
@@ -419,6 +439,14 @@ pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
     // it rides with every turn.
     prefix.push_str("[recall before acting]\n");
     prefix.push_str(RECALL_DIRECTIVE);
+    prefix.push_str("\n\n");
+
+    // Packet-primitive awareness nudge for every dispatch. Addresses
+    // the S11-shape silent-bypass where the agent doesn't have
+    // `bbox_compile` in their mental toolkit when a structured-task
+    // prompt arrives. Puts it there before plan formation.
+    prefix.push_str("[task shape]\n");
+    prefix.push_str(TASK_SHAPE_HINT);
     prefix.push_str("\n\n");
 
     // When the caller explicitly enabled recursion, this agent is a
@@ -1140,6 +1168,33 @@ mod tests {
         assert!(out.contains("[recall before acting]"));
         assert!(out.contains("bbox_knowledge"));
         assert!(out.contains("FIRST tool call"));
+    }
+
+    #[test]
+    fn ambient_task_shape_hint_fires_for_every_dispatch() {
+        // Solo task: [task shape] should appear with bbox_compile +
+        // bbox_packet_gap named. Addresses the S11 silent-bypass mode.
+        let solo = AmbientContext {
+            allow_recursion: false,
+            ..Default::default()
+        };
+        let out_solo = apply_ambient("work", &solo);
+        assert!(out_solo.contains("[task shape]"));
+        assert!(out_solo.contains("bbox_compile"));
+        assert!(out_solo.contains("bbox_packet_gap"));
+
+        // Orchestrator task: both hints fire, composed.
+        let orch = AmbientContext {
+            allow_recursion: true,
+            ..Default::default()
+        };
+        let out_orch = apply_ambient("coord", &orch);
+        assert!(out_orch.contains("[task shape]"));
+        assert!(out_orch.contains("[orchestrator]"));
+        // Orchestrator hint follows task-shape hint in order.
+        let shape_idx = out_orch.find("[task shape]").unwrap();
+        let orch_idx = out_orch.find("[orchestrator]").unwrap();
+        assert!(shape_idx < orch_idx);
     }
 
     #[test]

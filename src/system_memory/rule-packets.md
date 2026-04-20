@@ -58,6 +58,11 @@ Packets are for *structured domains that admit generators*. If priors already pr
 
 **Named idioms:**
 - `RankGeFieldThreshold{rank_field, threshold_field}` — auth-style pattern, kept as a named alias
+- `InRange{field, min, max}` — inclusive integer banded range. Use instead of `All[Ge, Le]` when you want "min to max, both inclusive" in one node. For exclusive bounds compose the smaller primitives or use `InRangeF` with epsilon offsets.
+- `InRangeF{field, min, max}` — float variant. Inclusive both ends; non-numeric fields return false.
+
+**String predicates:**
+- `StringContains{field, needle, case_insensitive?}` — substring match. Non-string / missing fields return false. For multi-needle ("alternation") use `Any{[StringContains{a}, StringContains{b}, ...]}` — there's no regex primitive in v1 on purpose; composition is the path.
 
 **Logical composition:**
 - `All{args: [...]}` / `Any{args: [...]}` / `Not{arg: ...}`

@@ -147,7 +147,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
-        summary: "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files.",
+        summary: "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically.",
         when_to_use: "Use for standing user rules that must outlive the current edit. Not for one-off task constraints, and not for facts you discovered yourself. Query `bbox_knowledge` first to avoid duplicate entries. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
@@ -275,23 +275,37 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_compile",
         category: ToolCategory::Packets,
-        summary: "Compile a rubric / judge / decision-function into a shareable packet. Inputs are ordered rules (first-match-wins) over a predicate AST; output is a `packet_id` any agent can apply deterministically. Reach here when you're about to write a priority-ordered rubric, a ranking mechanism, an access-control table, a retry taxonomy, or any \"classify future X the same way\" procedure. See `sm-rule-packets` via `bbox_knowledge`.",
+        summary: "Compile a rubric / judge / decision-function into a shareable packet. Reach here when you're writing a priority-ordered rubric, ranking proposals against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones. Symptom: you're about to paste the same rubric text into multiple sub-agent prompts — compile once and dispatch the packet_id instead. Rules are first-match-wins over a predicate AST; validate with bbox_audit before trusting. Packets compose via `Apply{packet_id, expect}` — extract `is_breaking` / `privileged_role` / etc. once, reuse across packets. Full workflow: sm-rule-packets via bbox_knowledge.",
         when_to_use: "Symptoms that mean \"compile a packet\": (1) you're coordinating multiple sub-agents and pasting the same rubric text into each prompt — compile once, dispatch `packet_id` instead, guarantees bit-identical standards; (2) you're ranking a batch of proposals/PRs/incidents against shared criteria; (3) you've got 10+ labeled examples and need a mechanism that generalizes to the 100+ unlabeled ones; (4) you're about to write Python/prose to implement a decision tree. First-match-wins so put anomalies before general rules. Always follow with `bbox_audit` to verify fidelity.",
         example: Some(r#"bbox_compile(domain="pr-triage", classification_lattice=["fail","flag","manual","pass","info"], rules=[{"id":"fail_tests","classification":"fail","antecedent":{"op":"Eq","field":"tests_pass","value":false},"consequent":"REJECT"},{"id":"flag_api_change","classification":"flag","antecedent":{"op":"Eq","field":"api_surface_changed","value":true},"consequent":"FLAG"},{"id":"pass_default","classification":"pass","emit":"fallback","antecedent":{"op":"True"},"consequent":"ACCEPT"}])"#),
     },
     ToolDoc {
         name: "bbox_apply",
         category: ToolCategory::Packets,
-        summary: "Evaluate a packet against one entity — deterministic, no LLM. `mode=\"first\"` returns the first matching rule (classification: ALLOW/DENY/RETRY/...); `mode=\"all\"` returns every matching rule plus an aggregate verdict (review / multi-finding shape).",
+        summary: "Evaluate a packet against one entity — deterministic, no LLM. The receive-side of the packet workflow: a sub-agent that received packet_id from its orchestrator calls this to classify without reinterpreting the rubric. mode=\"first\" returns the first matching rule; mode=\"all\" returns every matching rule plus an aggregate verdict (for review / multi-finding shape). Cheap at arbitrary scale.",
         when_to_use: "The receive-side of the packet workflow. Use from a sub-agent that received `packet_id` from its orchestrator — no need to re-read or re-interpret the rubric, just evaluate. Also use yourself after compiling to spot-check on specific entities. If no rule matches, returns `{match: false}` rather than guessing — so missing catchalls surface immediately.",
         example: Some(r#"bbox_apply(packet_id="packet-a1b2c3d4", entity={"tests_pass":true,"api_surface_changed":true,"migration_note_present":false}, mode="all")"#),
     },
     ToolDoc {
         name: "bbox_audit",
         category: ToolCategory::Packets,
-        summary: "Run a packet against a `{entity, expected}[]` dataset and report fidelity + any mismatching rule ids. The self-verify step — a packet with fidelity < 1.0 is lying to you about its training examples.",
+        summary: "Run a packet against a {entity, expected}[] dataset; report fidelity + mismatching rule ids. The self-verify step: a packet with fidelity < 1.0 is lying about its training data. ALWAYS call this after bbox_compile against the observations you derived the rules from — catches over-generalization, rule-ordering bugs, and field-name typos.",
         when_to_use: "ALWAYS run this after `bbox_compile` against the observations you derived the rules from. Catches (a) rules that mis-generalized beyond the anomalies, (b) ordering bugs where a general rule shadows an anomaly, (c) typos in field names. Use `mode=\"all\"` when the packet is for multi-finding review and expected outputs are rule-id sets.",
         example: Some(r#"bbox_audit(packet_id="packet-a1b2c3d4", dataset=[{"entity":{"tests_pass":false,...}, "expected":"REJECT"}, ...])"#),
+    },
+    ToolDoc {
+        name: "bbox_packet_events",
+        category: ToolCategory::Packets,
+        summary: "Query the packet operation log — every compile / apply / audit / gap event the daemon has recorded. Use to investigate packet behavior over time: low-fidelity audits, high no_match rates, compile failures, authoring gaps. Filter by op, packet_id, outcome, or since. Returns newest-first up to `limit` (default 50, max 500).",
+        when_to_use: "Diagnostic surface for the packet subsystem. Use when a packet is behaving unexpectedly, when you want to see which domains have the highest compile error rate, or when aggregating authoring gaps to prioritize new AST primitives.",
+        example: Some(r#"bbox_packet_events(op="gap", limit=20)"#),
+    },
+    ToolDoc {
+        name: "bbox_packet_gap",
+        category: ToolCategory::Packets,
+        summary: "Log a packet-authoring gap: 'I wanted to compile a rule but the AST couldn't express it'. Use when you fall back to prose, ad-hoc code, or a different tool because a primitive you needed isn't available. The `description` names what you wanted; `ast_feature_requested` names the primitive you wished existed (e.g. `RateCmp`, `StringMatches`, `Within{temporal}`). These gaps are the highest-signal input for prioritizing new AST primitives — every gap logged is a vote for what the packet system can't yet say. Query via bbox_packet_events(op='gap').",
+        when_to_use: "Reach here when you've tried to compile a packet but the AST can't express part of what you need. Don't silently fall back to prose — logging the gap turns the blocker into a vote for a new primitive. Equally valid for partial-compile cases: compile the mechanizable part, log a gap for the rest.",
+        example: Some(r#"bbox_packet_gap(description="wanted regex matching on log messages; no StringContains-like primitive", ast_feature_requested="StringMatches")"#),
     },
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {
@@ -683,8 +697,8 @@ mod tests {
     }
 
     /// Extract `key = "value"` from an attribute body. Whitespace-tolerant.
-    /// Returns the unescaped `value` (no escape processing needed in our
-    /// current corpus).
+    /// Returns the value with `\"` and `\\` unescaped so it matches how
+    /// Rust's compile-time string literals round-trip into runtime str.
     fn extract_string_arg(body: &str, key: &str) -> Option<String> {
         let needle = format!("{key}");
         let mut start = 0;
@@ -711,8 +725,29 @@ mod tests {
             let Some(after) = after.strip_prefix('"') else {
                 continue;
             };
-            let end = after.find('"')?;
-            return Some(after[..end].to_string());
+            // Walk the string literal, honoring `\\` and `\"` escapes so
+            // descriptions that quote `mode="first"` or `"we always X"`
+            // round-trip correctly.
+            let mut out = String::new();
+            let mut chars = after.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => match chars.next()? {
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        other => {
+                            out.push('\\');
+                            out.push(other);
+                        }
+                    },
+                    '"' => return Some(out),
+                    _ => out.push(c),
+                }
+            }
+            return None;
         }
         None
     }
