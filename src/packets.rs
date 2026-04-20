@@ -1913,7 +1913,12 @@ impl Packets {
         // materialize validates each rule's classification is in the
         // lattice, inferring from id prefix when the caller omitted it.
         // Explicit classification beats inferred.
-        let inputs: Vec<RuleInput> = serde_json::from_value(p.rules.clone())
+        //
+        // Unwrap stringified-JSON here so Codex-style first-attempts
+        // (stringified arrays) succeed without a retry cycle.
+        let mut rules_v = p.rules.clone();
+        unwrap_jsonish(&mut rules_v);
+        let inputs: Vec<RuleInput> = serde_json::from_value(rules_v)
             .context("'rules' must be a JSON array of {id, antecedent, consequent, classification?, emit?, confidence?, provenance?} objects")?;
 
         if inputs.is_empty() {
@@ -1948,13 +1953,21 @@ impl Packets {
         }
 
         let rank_table: BTreeMap<String, i64> = match &p.rank_table {
-            Some(v) => serde_json::from_value(v.clone())
-                .context("'rank_table' must be an object mapping string keys to integer values")?,
+            Some(v) => {
+                let mut vv = v.clone();
+                unwrap_jsonish(&mut vv);
+                serde_json::from_value(vv)
+                    .context("'rank_table' must be an object mapping string keys to integer values")?
+            }
             None => BTreeMap::new(),
         };
         let threshold_table: BTreeMap<String, i64> = match &p.threshold_table {
-            Some(v) => serde_json::from_value(v.clone())
-                .context("'threshold_table' must be an object mapping string keys to integer values")?,
+            Some(v) => {
+                let mut vv = v.clone();
+                unwrap_jsonish(&mut vv);
+                serde_json::from_value(vv)
+                    .context("'threshold_table' must be an object mapping string keys to integer values")?
+            }
             None => BTreeMap::new(),
         };
 
@@ -2011,9 +2024,13 @@ impl Packets {
                 return Err(e);
             }
         };
+        // Absorb stringified-JSON first-attempts from agents whose
+        // clients serialize structured params as strings (see E12).
+        let mut entity = p.entity.clone();
+        unwrap_jsonish(&mut entity);
         let mode = p.mode.unwrap_or_default();
         match mode {
-            ApplyMode::First => match apply_with(&packet, &p.entity, self) {
+            ApplyMode::First => match apply_with(&packet, &entity, self) {
                 Some(prediction) => {
                     self.append_event(
                         &PacketEvent::now("apply", "ok")
@@ -2053,7 +2070,7 @@ impl Packets {
                 }
             },
             ApplyMode::All => {
-                let result = apply_all_with(&packet, &p.entity, self);
+                let result = apply_all_with(&packet, &entity, self);
                 let outcome = if result.verdict.is_some() { "ok" } else { "no_match" };
                 self.append_event(
                     &PacketEvent::now("apply", outcome)
@@ -2090,10 +2107,13 @@ impl Packets {
                 return Err(e);
             }
         };
+        // Absorb stringified-JSON first-attempts — see apply_tool.
+        let mut dataset = p.dataset.clone();
+        unwrap_jsonish(&mut dataset);
         let mode = p.mode.unwrap_or_default();
         match mode {
             ApplyMode::First => {
-                let report = verify_with(&packet, &p.dataset, self)?;
+                let report = verify_with(&packet, &dataset, self)?;
                 let outcome = if report.fidelity >= 1.0 { "ok" } else { "low_fidelity" };
                 self.append_event(
                     &PacketEvent::now("audit", outcome)
@@ -2119,7 +2139,7 @@ impl Packets {
                 }))?)
             }
             ApplyMode::All => {
-                let report = verify_all_with(&packet, &p.dataset, self)?;
+                let report = verify_all_with(&packet, &dataset, self)?;
                 let outcome = if report.fidelity >= 1.0 { "ok" } else { "low_fidelity" };
                 self.append_event(
                     &PacketEvent::now("audit", outcome)
@@ -2141,6 +2161,30 @@ impl Packets {
                     "fidelity": report.fidelity,
                     "mismatches": report.mismatches,
                 }))?)
+            }
+        }
+    }
+}
+
+/// Absorb a provider-serialization quirk observed in E12: some MCP
+/// clients (notably Codex on first-attempt) pass structured params
+/// as stringified JSON rather than structured arrays/objects. This
+/// helper inspects a value — if it's a `String` that starts with
+/// `{` or `[` and parses as JSON, it replaces the string with the
+/// parsed value in place. No-op on already-structured values.
+///
+/// Applied at the tool boundary so the wire shape from the agent
+/// doesn't need to be pixel-perfect to succeed. Trade: an agent who
+/// genuinely wants a JSON-literal string as input (very unusual in
+/// this surface) sees it coerced to structure. That's the right
+/// trade for an AI-facing API where the first-attempt cost of retry
+/// is much higher than the near-zero cost of permissive parsing.
+fn unwrap_jsonish(v: &mut serde_json::Value) {
+    if let serde_json::Value::String(s) = v {
+        let trimmed = s.trim_start();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                *v = parsed;
             }
         }
     }
@@ -3605,6 +3649,97 @@ mod tests {
         let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
         let r = ri.materialize(&review_lattice(), &review_prefix_inference()).unwrap();
         assert_eq!(r.emit, Emit::Fallback);
+    }
+
+    // ── E12-refinement: permissive JSON on tool params ─────────────
+
+    #[test]
+    fn unwrap_jsonish_parses_stringified_array() {
+        let mut v = serde_json::Value::String(r#"[{"a": 1}, {"a": 2}]"#.into());
+        unwrap_jsonish(&mut v);
+        assert!(v.is_array());
+        assert_eq!(v.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unwrap_jsonish_parses_stringified_object() {
+        let mut v = serde_json::Value::String(r#"{"role": "admin"}"#.into());
+        unwrap_jsonish(&mut v);
+        assert!(v.is_object());
+        assert_eq!(v.get("role").unwrap().as_str().unwrap(), "admin");
+    }
+
+    #[test]
+    fn unwrap_jsonish_noop_on_structured_value() {
+        let mut v = serde_json::json!({"already": "structured"});
+        let before = v.clone();
+        unwrap_jsonish(&mut v);
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn unwrap_jsonish_noop_on_plain_string() {
+        // A genuinely string param (not a JSON literal) should not be
+        // coerced. The `{`/`[` prefix check prevents false positives.
+        let mut v = serde_json::Value::String("hello world".into());
+        let before = v.clone();
+        unwrap_jsonish(&mut v);
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn unwrap_jsonish_leaves_invalid_json_string_untouched() {
+        // String that starts with `{` but isn't valid JSON — leave it.
+        let mut v = serde_json::Value::String("{ not json }".into());
+        let before = v.clone();
+        unwrap_jsonish(&mut v);
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn compile_accepts_stringified_rules_array() {
+        // Simulates the Codex first-attempt shape: rules passed as a
+        // JSON-encoded string instead of a structured array. Compile
+        // should succeed without a retry.
+        let (_d, packets) = tmp_packets();
+        let rules_as_string = serde_json::Value::String(
+            r#"[{"id":"r1","antecedent":{"op":"True"},"consequent":"X","classification":"pass","emit":"fallback"}]"#
+                .into(),
+        );
+        let out = packets
+            .compile(&CompileParams {
+                domain: "coerce-test".into(),
+                scope: Some("global".into()),
+                project: None,
+                classification_lattice: None,
+                prefix_inference: None,
+                rank_table: None,
+                threshold_table: None,
+                rank_lookup_key: None,
+                threshold_lookup_key: None,
+                source_ids: None,
+                rules: rules_as_string,
+            })
+            .unwrap();
+        assert!(out.contains("compiled"));
+    }
+
+    #[test]
+    fn apply_tool_accepts_stringified_entity() {
+        let (_d, packets) = tmp_packets();
+        let id = compile_breaking_packet(&packets);
+        // Entity passed as string
+        let report = packets
+            .apply_tool(&ApplyParams {
+                packet_id: id,
+                entity: serde_json::Value::String(
+                    r#"{"api_surface_changed": true, "migration_note_present": false}"#.into(),
+                ),
+                mode: Some(ApplyMode::First),
+            })
+            .unwrap();
+        assert!(report.contains("\"match\": true"));
+        assert!(report.contains("breaking_api_no_migration"));
     }
 
     // ── Phase 6: StringContains / InRange tests ────────────────────
