@@ -112,11 +112,27 @@ Each rule carries a `classification: String` that must appear in the packet's `c
 {"classification_lattice": ["blocker", "concern", "suggestion", "advantage", "neutral"]}
 ```
 
-## Prefix inference
+## Prefix inference (authoring footgun — read this before naming rules)
 
-Each packet can declare a `prefix_inference: {id_prefix → classification}` map. When a rule omits `classification`, the compiler walks the prefix map to find a matching id prefix. **Explicit `classification` in a rule always wins over inference.**
+Each packet can declare a `prefix_inference: {id_prefix → classification}` map. When a rule omits `classification`, the compiler walks the prefix map and assigns whichever classification has the **longest matching prefix** of the rule's id. **Explicit `classification` in a rule always wins over inference.**
 
-Default review-domain prefix map: `{fail_ → fail, flag_ → flag, manual_/review_ → manual, pass_ → pass}`.
+### Why this bites authors
+
+When you omit `classification_lattice` (accepting the default review lattice), you ALSO inherit the default `prefix_inference` map:
+
+```json
+{"fail_": "fail", "flag_": "flag", "manual_": "manual", "review_": "manual", "pass_": "pass"}
+```
+
+A rule id like `review_one_red` auto-classifies as `manual`. If your packet uses a *different* lattice — e.g. `["BLOCK", "REVIEW", "AUTO_APPROVE"]` — but you didn't override `prefix_inference`, the rule will fail compile with a classification-mismatch error because `manual` isn't in your lattice. The compiler now names the inference path in that error (as of commit 62d4c65), but you can skip the whole failure by:
+
+- Setting an explicit `classification` field on every rule (most surgical), OR
+- Passing `prefix_inference: {}` in the compile params to disable inference, OR
+- Providing a `prefix_inference` map aligned to your lattice (e.g. `{"block_": "BLOCK", "review_": "REVIEW", "auto_": "AUTO_APPROVE"}`)
+
+### The default review-domain prefix map
+
+`{fail_ → fail, flag_ → flag, manual_/review_ → manual, pass_ → pass}` — applies when `prefix_inference` is omitted AND `classification_lattice` is omitted (i.e. you took both defaults). If you override the lattice, override the prefix map too, or set classification explicitly.
 
 ## Firing semantics: Independent vs Fallback
 
