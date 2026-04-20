@@ -139,7 +139,11 @@ pub fn resolve_bin(bin: &str) -> Option<String> {
         return None;
     }
     let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if path.is_empty() { None } else { Some(path) }
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +740,10 @@ fn codex_group_patterns_by_server(patterns: &[String]) -> Vec<(String, Vec<Strin
     let bb_prefix = crate::tool_docs::blackbox_mcp_prefix();
     let mut by_server: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
-    for p in patterns {
+    for p in patterns
+        .iter()
+        .map(|p| super::mcp::normalize_filter_pattern(p))
+    {
         let Some(rest) = p.strip_prefix("mcp__") else {
             tracing::debug!(target: "blackbox::filter",
                 "codex skipping non-MCP pattern (filter scope is mcp_servers.*): {p}");
@@ -797,7 +804,10 @@ fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
     let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
     let prefix = crate::tool_docs::blackbox_mcp_prefix();
     let mut out = Vec::new();
-    for p in patterns {
+    for p in patterns
+        .iter()
+        .map(|p| super::mcp::normalize_filter_pattern(p))
+    {
         if let Some(stripped) = p.strip_prefix(&prefix) {
             for bare in super::mcp::expand_pattern(stripped, &universe) {
                 let full = format!("{prefix}{bare}");
@@ -805,7 +815,7 @@ fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
                     out.push(full);
                 }
             }
-        } else if !out.contains(p) {
+        } else if !out.contains(&p) {
             out.push(p.clone());
         }
     }
@@ -2046,11 +2056,9 @@ mod tests {
         assert!(g.iter().any(|a| a == "-s"));
         assert!(g.contains(&u.to_string()));
 
-        assert!(
-            Provider::Vibe
-                .build_mcp_add_http_args("x", "y", &[])
-                .is_none()
-        );
+        assert!(Provider::Vibe
+            .build_mcp_add_http_args("x", "y", &[])
+            .is_none());
     }
 
     #[test]
@@ -2085,7 +2093,7 @@ mod tests {
     #[test]
     fn test_claude_filter_disallow_args_expands_blackbox_globs() {
         let filters = McpFilters {
-            disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(rm -rf *)".into()],
+            disallow: vec!["mcp__blackbox__.bro_*".into(), "Bash(rm -rf *)".into()],
             allow: vec![],
         };
         let args = Provider::Claude.build_filter_args(&filters);
@@ -2097,17 +2105,15 @@ mod tests {
         assert!(args[1].contains("Bash(rm -rf *)"));
         // The raw glob should NOT appear — it'd be treated as a literal
         // tool name by Claude and match nothing.
-        assert!(
-            !args[1]
-                .split_whitespace()
-                .any(|t| t == "mcp__blackbox__bro_*")
-        );
+        assert!(!args[1]
+            .split_whitespace()
+            .any(|t| t == "mcp__blackbox__bro_*"));
     }
 
     #[test]
     fn test_copilot_filter_repeats_flag_expanded() {
         let filters = McpFilters {
-            disallow: vec!["mcp__blackbox__bro_*".into(), "shell(git push)".into()],
+            disallow: vec!["mcp__blackbox__.bro_*".into(), "shell(git push)".into()],
             allow: vec!["shell".into()],
         };
         let args = Provider::Copilot.build_filter_args(&filters);
@@ -2140,7 +2146,7 @@ mod tests {
     #[test]
     fn test_codex_expands_blackbox_glob_to_disabled_tools() {
         let filters = McpFilters {
-            disallow: vec!["mcp__blackbox__bro_*".into()],
+            disallow: vec!["mcp__blackbox__.bro_*".into()],
             allow: vec![],
         };
         let args = Provider::Codex.build_filter_args(&filters);
@@ -2169,7 +2175,7 @@ mod tests {
     #[test]
     fn test_codex_routes_non_blackbox_mcp_pattern_to_correct_server() {
         let filters = McpFilters {
-            disallow: vec!["mcp__github__create_issue".into()],
+            disallow: vec!["mcp__github__.create_issue".into()],
             allow: vec![],
         };
         let args = Provider::Codex.build_filter_args(&filters);
@@ -2187,7 +2193,7 @@ mod tests {
         // Glob against a non-blackbox server can't be expanded (no tool
         // universe), so it's skipped with a warning. End result: empty.
         let filters = McpFilters {
-            disallow: vec!["mcp__github__create_*".into()],
+            disallow: vec!["mcp__github__.create_*".into()],
             allow: vec![],
         };
         let args = Provider::Codex.build_filter_args(&filters);
@@ -2230,7 +2236,7 @@ mod tests {
     #[test]
     fn test_gemini_filter_args_deferred_to_policy_file() {
         let filters = McpFilters {
-            disallow: vec!["mcp__blackbox__bro_*".into()],
+            disallow: vec!["mcp__blackbox__.bro_*".into()],
             allow: vec![],
         };
         // Gemini gets its policy via --policy <file>, produced by the
@@ -2312,57 +2318,39 @@ mod tests {
     #[test]
     fn test_scoped_arg_builders_honor_scope_capability() {
         // Claude + Gemini support both user and project.
-        assert!(
-            Provider::Claude
-                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-                .is_some()
-        );
-        assert!(
-            Provider::Claude
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_some()
-        );
-        assert!(
-            Provider::Gemini
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_some()
-        );
+        assert!(Provider::Claude
+            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+            .is_some());
+        assert!(Provider::Claude
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_some());
+        assert!(Provider::Gemini
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_some());
 
         // Codex has no project scope (single config file).
-        assert!(
-            Provider::Codex
-                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-                .is_some()
-        );
-        assert!(
-            Provider::Codex
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_none()
-        );
-        assert!(
-            Provider::Codex
-                .build_mcp_remove_args_scoped("x", "project")
-                .is_none()
-        );
+        assert!(Provider::Codex
+            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+            .is_some());
+        assert!(Provider::Codex
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_none());
+        assert!(Provider::Codex
+            .build_mcp_remove_args_scoped("x", "project")
+            .is_none());
 
         // Copilot only user (no documented project flag).
-        assert!(
-            Provider::Copilot
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_none()
-        );
+        assert!(Provider::Copilot
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_none());
 
         // Vibe never.
-        assert!(
-            Provider::Vibe
-                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-                .is_none()
-        );
-        assert!(
-            Provider::Vibe
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_none()
-        );
+        assert!(Provider::Vibe
+            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+            .is_none());
+        assert!(Provider::Vibe
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_none());
 
         // Claude project scope emits -s project.
         let claude_proj = Provider::Claude

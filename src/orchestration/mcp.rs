@@ -109,13 +109,15 @@ impl McpFilters {
     /// entries are appended; duplicates are deduped.
     pub fn merge_from(&mut self, other: &McpFilters) {
         for p in &other.disallow {
-            if !self.disallow.iter().any(|q| q == p) {
-                self.disallow.push(p.clone());
+            let normalized = normalize_filter_pattern(p);
+            if !self.disallow.iter().any(|q| q == &normalized) {
+                self.disallow.push(normalized);
             }
         }
         for p in &other.allow {
-            if !self.allow.iter().any(|q| q == p) {
-                self.allow.push(p.clone());
+            let normalized = normalize_filter_pattern(p);
+            if !self.allow.iter().any(|q| q == &normalized) {
+                self.allow.push(normalized);
             }
         }
     }
@@ -232,6 +234,62 @@ pub fn expand_pattern(pattern: &str, universe: &[&str]) -> Vec<String> {
         .filter(|t| glob_match(pattern, t))
         .map(|t| t.to_string())
         .collect()
+}
+
+/// Canonicalize a user/tool-facing filter pattern into the daemon's
+/// internal MCP form. Accepts:
+///   - canonical: `mcp__server__tool`
+///   - surfaced dotted form: `mcp__server__.tool`
+///   - Copilot-style MCP form: `server(tool)` (only when the inner
+///     token looks like a tool name, not a shell command)
+///
+/// Native non-MCP patterns like `Bash(git push *)` pass through
+/// unchanged.
+pub fn normalize_filter_pattern(pattern: &str) -> String {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("mcp__") {
+        if let Some((server, tool)) = rest.split_once("__.") {
+            if !server.is_empty() && !tool.is_empty() {
+                return format!("mcp__{server}__{tool}");
+            }
+        }
+        if let Some((server, tool)) = rest.split_once("__") {
+            if !server.is_empty() && !tool.is_empty() {
+                return format!("mcp__{server}__{tool}");
+            }
+        }
+    }
+
+    if let Some((server, tool)) = parse_copilot_mcp_pattern(trimmed) {
+        return format!("mcp__{server}__{tool}");
+    }
+
+    trimmed.to_string()
+}
+
+fn parse_copilot_mcp_pattern(pattern: &str) -> Option<(&str, &str)> {
+    let (server, rest) = pattern.split_once('(')?;
+    let tool = rest.strip_suffix(')')?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    if !server
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    if !tool
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '*' | '?' | '.' | ':'))
+    {
+        return None;
+    }
+    Some((server, tool))
 }
 
 /// Simple recursive glob matcher: `*` = any sequence (incl. empty),
@@ -541,7 +599,7 @@ pub fn render_gemini_policy_toml(filters: &McpFilters) -> String {
     let mcp_name = crate::util::blackbox_mcp_name();
 
     let mut disabled: Vec<String> = Vec::new();
-    for p in &filters.disallow {
+    for p in filters.disallow.iter().map(|p| normalize_filter_pattern(p)) {
         let Some(stripped) = p.strip_prefix(&prefix) else {
             continue;
         };
@@ -868,6 +926,7 @@ fn action_remove(p: &McpToolParams) -> Result<String> {
 
 fn action_filter(p: &McpToolParams, disallow: bool) -> Result<String> {
     let pattern = p.pattern.as_deref().context("'pattern' is required")?;
+    let normalized = normalize_filter_pattern(pattern);
     let path = resolve_scope_path(p)?;
     let mut store = McpStore::load(&path)?;
 
@@ -876,17 +935,17 @@ fn action_filter(p: &McpToolParams, disallow: bool) -> Result<String> {
     } else {
         &mut store.filters.allow
     };
-    if list.iter().any(|p| p == pattern) {
+    if list.iter().any(|p| p == &normalized) {
         return Ok(format!(
-            "{} pattern {pattern} already present",
+            "{} pattern {normalized} already present",
             if disallow { "disallow" } else { "allow" }
         ));
     }
-    list.push(pattern.to_string());
+    list.push(normalized.clone());
     store.save(&path)?;
 
     Ok(format!(
-        "Added {} pattern {pattern} to {}",
+        "Added {} pattern {normalized} to {}",
         if disallow { "disallow" } else { "allow" },
         path.display()
     ))
@@ -1093,7 +1152,7 @@ mod tests {
             allow: vec![],
         };
         let b = McpFilters {
-            disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(rm -rf *)".into()],
+            disallow: vec!["mcp__blackbox__.bro_*".into(), "Bash(rm -rf *)".into()],
             allow: vec!["Read".into()],
         };
         a.merge_from(&b);
@@ -1131,11 +1190,10 @@ mod tests {
             Some(McpServerConfig::Http { url, .. }) if url == "http://new/mcp"
         ));
         assert_eq!(eff.filters.disallow.len(), 2);
-        assert!(
-            eff.filters
-                .disallow
-                .contains(&"Bash(git push *)".to_string())
-        );
+        assert!(eff
+            .filters
+            .disallow
+            .contains(&"Bash(git push *)".to_string()));
         assert!(eff.filters.disallow.contains(&"Edit(*)".to_string()));
     }
 
@@ -1168,6 +1226,42 @@ mod tests {
         assert_eq!(
             out,
             vec!["mcp__blackbox__bro_exec", "mcp__blackbox__bro_resume"]
+        );
+    }
+
+    #[test]
+    fn normalize_filter_pattern_accepts_surfaced_dotted_form() {
+        assert_eq!(
+            normalize_filter_pattern("mcp__blackbox__.bro_*"),
+            "mcp__blackbox__bro_*"
+        );
+        assert_eq!(
+            normalize_filter_pattern("mcp__github__.create_issue"),
+            "mcp__github__create_issue"
+        );
+    }
+
+    #[test]
+    fn normalize_filter_pattern_accepts_copilot_mcp_form() {
+        assert_eq!(
+            normalize_filter_pattern("blackbox(bro_exec)"),
+            "mcp__blackbox__bro_exec"
+        );
+        assert_eq!(
+            normalize_filter_pattern("github(create_*)"),
+            "mcp__github__create_*"
+        );
+    }
+
+    #[test]
+    fn normalize_filter_pattern_leaves_native_non_mcp_patterns_alone() {
+        assert_eq!(
+            normalize_filter_pattern("Bash(git push *)"),
+            "Bash(git push *)"
+        );
+        assert_eq!(
+            normalize_filter_pattern("shell(git push)"),
+            "shell(git push)"
         );
     }
 
@@ -1207,7 +1301,7 @@ mod tests {
     #[test]
     fn gemini_policy_toml_renders_deny_rule() {
         let filters = McpFilters {
-            disallow: vec!["mcp__blackbox__bro_*".to_string()],
+            disallow: vec!["mcp__blackbox__.bro_*".to_string()],
             allow: vec![],
         };
         let toml = render_gemini_policy_toml(&filters);
