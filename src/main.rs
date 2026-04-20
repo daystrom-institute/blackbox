@@ -2322,10 +2322,10 @@ Next step: <one concrete steering suggestion>\n",
         &self,
         team: &mut orchestration::team::Team,
         prompt: String,
-    ) -> Result<Value, String> {
+    ) -> Result<(Arc<orch::Task>, Option<f64>), String> {
         let advisor = match team.advisor.as_mut() {
             Some(a) => a,
-            None => return Ok(json!({"configured": false})),
+            None => return Err("team has no advisor configured".into()),
         };
         let store_dir = self.state.store_dir.clone();
         let brofile = orchestration::brofile::resolve_brofile(
@@ -2433,13 +2433,36 @@ Next step: <one concrete steering suggestion>\n",
         };
 
         advisor.task_history.push(task_id);
-        let completed = orch::wait_for_task_with_timeout(&task, timeout).await;
+        orchestration::team::save_team(team, &self.state.store_dir);
+        Ok((task, timeout))
+    }
+
+    fn persist_advisor_session_to_team(
+        &self,
+        team_name: &str,
+        task: &Arc<orch::Task>,
+    ) {
+        let Some(mut team) = orchestration::team::load_team(team_name, &self.state.store_dir) else {
+            return;
+        };
+        let Some(advisor) = team.advisor.as_mut() else {
+            return;
+        };
         let session_id = task.inner.lock().session_id.clone();
         if session_id != "pending" {
             advisor.session_id = Some(session_id);
+            orchestration::team::save_team(&team, &self.state.store_dir);
         }
-        orchestration::team::save_team(team, &self.state.store_dir);
+    }
 
+    async fn await_team_advisor_task(
+        &self,
+        team_name: &str,
+        task: Arc<orch::Task>,
+        timeout: Option<f64>,
+    ) -> Result<Value, String> {
+        let completed = orch::wait_for_task_with_timeout(&task, timeout).await;
+        self.persist_advisor_session_to_team(team_name, &task);
         Ok(if completed {
             orch::task_result_json(&task)
         } else {
@@ -2458,7 +2481,9 @@ Next step: <one concrete steering suggestion>\n",
             return Ok(());
         }
         let prompt = self.build_team_advisor_init_prompt(team, advisor);
-        let _ = self.dispatch_team_advisor_prompt(team, prompt).await?;
+        let team_name = team.name.clone();
+        let (task, timeout) = self.dispatch_team_advisor_prompt(team, prompt).await?;
+        let _ = self.await_team_advisor_task(&team_name, task, timeout).await?;
         Ok(())
     }
 
@@ -2650,11 +2675,43 @@ Status: CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET | REPLACE_BRO\n\
 Rationale: <1-3 sentences>\n\
 Next step: <one concrete steering suggestion>\n"
         );
-        let advisor_result = self.dispatch_team_advisor_prompt(&mut team, prompt).await?;
+        let advisor_mode = advisor.config.mode;
+        let team_name_owned = team.name.clone();
+        let (task, timeout) = self.dispatch_team_advisor_prompt(&mut team, prompt).await?;
+        let advisor_result = match advisor_mode {
+            orchestration::team::AdvisorMode::Blocking => {
+                let result = self
+                    .await_team_advisor_task(&team_name_owned, task.clone(), timeout)
+                    .await?;
+                json!({
+                    "mode": "blocking",
+                    "taskId": task.id(),
+                    "result": result,
+                })
+            }
+            orchestration::team::AdvisorMode::Background => {
+                let server = self.clone();
+                let team_name = team_name_owned.clone();
+                let task_clone = task.clone();
+                tokio::spawn(async move {
+                    let _ = server
+                        .await_team_advisor_task(&team_name, task_clone, timeout)
+                        .await;
+                });
+                let inner = task.inner.lock();
+                json!({
+                    "mode": "background",
+                    "scheduled": true,
+                    "taskId": inner.id,
+                    "sessionId": inner.session_id,
+                    "status": "running",
+                })
+            }
+        };
         Ok(Some(json!({
             "checkpoint": checkpoint,
             "packet": packet_eval,
-            "result": advisor_result,
+            "advisor": advisor_result,
         })))
     }
 
