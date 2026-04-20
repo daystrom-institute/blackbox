@@ -292,6 +292,26 @@ without re-reading prose. See `sm-rule-packets` via `bbox_knowledge`.";
 /// space and reframes "the AST can't do regex" as a gap-log rather
 /// than a bypass. Fires for every dispatch, orthogonal to
 /// ORCHESTRATOR_HINT.
+///
+/// **Calibration bound (E12 cross-provider data):** the current
+/// wording is at the "works across claude+codex+gemini" joint.
+/// Self-reported force varies by provider — Claude reads it as
+/// "nudge, not decider" ("I'd have compiled regardless"), Codex as
+/// "could have tipped fuzzier tasks", Gemini as "MANDATORY choice,
+/// not nudge". Escalating the language (e.g. imperative verbs,
+/// longer justification, explicit step-by-step) risks:
+///   (a) over-constraint on Claude — it becomes noise it ignores,
+///       or worse, makes the hint feel adversarial in tasks where
+///       packets are clearly wrong (prose/research/synthesis);
+///   (b) compliance theater on Gemini — Gemini already treats this
+///       as mandatory at current wording; turning the dial up could
+///       make it compile packets for tasks where the AST doesn't
+///       fit, defeating the gap-tool signal.
+///
+/// If you change this string, re-run E12 (cross-provider S11 sweep)
+/// to confirm all three providers still read it as intended.
+/// Don't add imperative verbs ("MUST compile", "ALWAYS use") without
+/// that verification.
 pub const TASK_SHAPE_HINT: &str = "\
 Task-shape check: if this task involves repeatedly classifying, \
 ranking, triaging, scoring, or judging entities against stated \
