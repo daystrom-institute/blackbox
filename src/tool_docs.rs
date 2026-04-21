@@ -437,6 +437,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     },
     // ── Workflows ────────────────────────────────────────────────────
     ToolDoc {
+        name: "bro_orchestrate_author",
+        category: ToolCategory::Workflows,
+        summary: "Compile a prose charter into a validated workflow spec. Dispatches an authoring LLM with the sm-workflow-orchestration runbook + a minimal reference example, parses its JSON response, cross-validates via the engine's compile step, retries once on compile failure with the error appended, and returns the validated spec — ready to pass to `bro_orchestrate_run`. Closes the authoring loop: operators describe the arc in prose, get a mermaid-shaped spec back, dispatch without hand-writing the graph.",
+        when_to_use: "Use when you want a workflow but don't want to hand-write the JSON — describe the arc shape in prose (charter), pass an authoring brofile (e.g. `probe-haiku` or a Sonnet/Opus profile for richer outputs), optionally hint at a known pattern (`crucible`, `blind-convergence`, `optimistic-review`, `linear`), and the compiler returns a validated spec. Gate/policy packet IDs come back as `packet-TODO` placeholders you fill in after compilation. Pair with `bro_orchestrate_run` for a prose-to-execution loop.",
+        example: Some(
+            r#"bro_orchestrate_author(charter="Review a proposal against 3 design criteria in parallel, aggregate findings, and route 'pass' or 'revise' to a final node", brofile="probe-haiku", hint="crucible")"#,
+        ),
+    },
+    ToolDoc {
         name: "bro_orchestrate_run",
         category: ToolCategory::Workflows,
         summary: "Dispatch a mermaid-shaped workflow. Takes a full workflow spec (actors, nodes, embedded stateDiagram-v2 graph) and blocks until the arc terminates. Returns the event log, per-node outputs, and the `arc_thread_id` for post-hoc audit via `bbox_notes(thread_id=...)` or `bro orchestrate status`. Pass `dry_run=true` to validate + summarize without dispatching any bros. Replaces long skill-prose protocols like overmind/crucible — the daemon owns the state machine, dispatched bros are stateless function-call turns. See `sm-workflow-orchestration` via `bbox_knowledge` and `examples/workflows/` for the shape catalog.",
@@ -573,6 +582,7 @@ pub fn render_markdown() -> String {
         ToolCategory::Inbox,
         ToolCategory::Packets,
         ToolCategory::Orchestration,
+        ToolCategory::Workflows,
     ];
 
     for cat in categories {

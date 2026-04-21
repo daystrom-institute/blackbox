@@ -2520,6 +2520,121 @@ impl BlackboxServer {
     }
 
     #[tool(
+        name = "bro_orchestrate_author",
+        description = "Compile a prose charter into a validated workflow spec. Dispatches an authoring LLM with the sm-workflow-orchestration runbook + a minimal reference example, parses its JSON response, cross-validates via the engine's compile step, retries once on compile failure with the error appended, and returns the validated spec — ready to pass to `bro_orchestrate_run`. Closes the authoring loop: operators describe the arc in prose, get a mermaid-shaped spec back, dispatch without hand-writing the graph."
+    )]
+    async fn bro_orchestrate_author(
+        &self,
+        Parameters(p): Parameters<OrchestrateAuthorParams>,
+    ) -> CallToolResult {
+        // Load the runbook + a reference example.
+        let runbook = match system_memory::get("sm-workflow-orchestration") {
+            Some(sm) => sm.content,
+            None => {
+                return Self::err_text(
+                    "sm-workflow-orchestration runbook not found — internal error",
+                );
+            }
+        };
+        let reference_example = include_str!("../examples/workflows/e2e-gated.json");
+        let hint_line = p
+            .hint
+            .as_deref()
+            .map(|h| format!("\nShape hint: match the `{h}` pattern from the runbook if it fits the charter.\n"))
+            .unwrap_or_default();
+
+        let base_prompt = format!(
+            "You are a workflow spec compiler. Convert a prose charter into a validated workflow JSON spec for the blackbox `bro_orchestrate_run` engine.\n\n\
+=== REFERENCE RUNBOOK ===\n{runbook}\n\n\
+=== REFERENCE EXAMPLE (e2e-gated.json) ===\n{reference_example}\n\n\
+=== CHARTER ===\n{charter}\n{hint_line}\n\
+=== OUTPUT INSTRUCTIONS ===\n\
+Output ONLY the JSON workflow spec — no preamble, no prose explanation, no trailing commentary. Start with `{{` and end with `}}`. You may wrap in ```json fences; the parser handles both.\n\n\
+Constraints:\n\
+- Use actor kinds only from {{executor, ensemble, advisor, user}}.\n\
+- Cross-reference every `actor` field in nodes to a declared actor name.\n\
+- Every activity node in the graph must have a matching entry in `nodes`.\n\
+- Every `nodes` entry (except ones with `subworkflow`) needs an `actor`.\n\
+- The `graph` value must be a single string starting with `stateDiagram-v2\\n`, using only the mermaid subset the runbook documents.\n\
+- If you reference a gate or policy packet ID, use a placeholder like `packet-TODO` — the operator will fill it in after compilation.\n\
+- Do NOT invent new actor kinds or graph primitives.\n",
+            charter = p.charter,
+        );
+
+        let first_task = match self
+            .workflow_dispatch_executor(&p.brofile, &base_prompt, p.project_dir.as_deref(), None)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => return Self::err_text(&format!("authoring dispatch failed: {e}")),
+        };
+        let completed = orch::wait_for_task_with_timeout(&first_task, Some(600.0)).await;
+        if !completed {
+            return Self::err_text("authoring dispatch timed out");
+        }
+        let first_output = orch::task_result_json(&first_task)
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let first_session_id = first_task.inner.lock().session_id.clone();
+
+        // Try to compile. If it fails, retry once with the error.
+        match extract_and_compile_workflow(&first_output) {
+            Ok(spec) => Self::ok_json(&serde_json::json!({
+                "workflow": spec,
+                "attempts": 1,
+                "author_session_id": first_session_id,
+            })),
+            Err(first_err) => {
+                let retry_prompt = format!(
+                    "Your previous spec failed validation with this error:\n\n{first_err}\n\nRevise and output the corrected JSON spec. Same output rules — no preamble, no trailing prose."
+                );
+                // Resume the same session so the LLM sees its prior output.
+                let retry_task = match self
+                    .workflow_dispatch_executor(
+                        &p.brofile,
+                        &retry_prompt,
+                        p.project_dir.as_deref(),
+                        Some(&first_session_id),
+                    )
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return Self::err_text(&format!(
+                            "authoring retry dispatch failed: {e}; first error: {first_err}"
+                        ));
+                    }
+                };
+                let retry_completed =
+                    orch::wait_for_task_with_timeout(&retry_task, Some(600.0)).await;
+                if !retry_completed {
+                    return Self::err_text(&format!(
+                        "authoring retry timed out; first error: {first_err}"
+                    ));
+                }
+                let retry_output = orch::task_result_json(&retry_task)
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                match extract_and_compile_workflow(&retry_output) {
+                    Ok(spec) => Self::ok_json(&serde_json::json!({
+                        "workflow": spec,
+                        "attempts": 2,
+                        "author_session_id": first_session_id,
+                        "first_error": first_err,
+                    })),
+                    Err(second_err) => Self::err_text(&format!(
+                        "authoring failed after 2 attempts. First error: {first_err} | Second error: {second_err}"
+                    )),
+                }
+            }
+        }
+    }
+
+    #[tool(
         name = "bro_orchestrate_run",
         description = "Dispatch a mermaid-shaped workflow. Takes a full workflow spec (actors, nodes, embedded stateDiagram-v2 graph) and blocks until the arc terminates. Returns the event log, per-node outputs, and the `arc_thread_id` for post-hoc audit via `bbox_notes(thread_id=...)` or `bro orchestrate status`. Pass `dry_run=true` to validate + summarize without dispatching any bros. Replaces long skill-prose protocols like overmind/crucible — the daemon owns the state machine, dispatched bros are stateless function-call turns. See `sm-workflow-orchestration` via `bbox_knowledge` and `examples/workflows/` for the shape catalog."
     )]
@@ -2563,6 +2678,107 @@ struct OrchestrateRunParams {
     /// When true: parse + cross-validate + summarize; do NOT dispatch.
     #[serde(default)]
     pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct OrchestrateAuthorParams {
+    /// Prose charter — what the arc should accomplish. Describe the
+    /// actors, the phases, any gate/retry/halt conditions the author
+    /// should encode. The compiler turns this into a validated
+    /// workflow spec.
+    pub charter: String,
+    /// Brofile to dispatch as the authoring LLM. Should be a capable
+    /// instruction-following model; Claude Haiku is usually sufficient.
+    pub brofile: String,
+    /// Optional shape hint — e.g. "crucible", "blind-convergence",
+    /// "linear", "optimistic-review". If given, the authoring prompt
+    /// suggests matching the named pattern.
+    #[serde(default)]
+    pub hint: Option<String>,
+    /// Working directory for the authoring dispatch.
+    #[serde(default)]
+    pub project_dir: Option<String>,
+}
+
+/// Extract a JSON workflow spec from an LLM's response text and
+/// validate it via `workflow::compile`. Tolerates: raw JSON, ```json
+/// fenced blocks, and prose preamble/trailing commentary. Returns the
+/// original JSON Value (pre-compile) on success so callers can re-
+/// emit the exact spec the author produced.
+fn extract_and_compile_workflow(text: &str) -> Result<Value, String> {
+    let candidates = extract_json_candidates(text);
+    if candidates.is_empty() {
+        return Err("no JSON object found in the author's output".into());
+    }
+    let mut last_err = String::new();
+    for cand in candidates {
+        let parsed: Value = match serde_json::from_str(&cand) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = format!("JSON parse failed: {e}");
+                continue;
+            }
+        };
+        let spec: workflow::Workflow = match serde_json::from_value(parsed.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = format!("workflow schema mismatch: {e}");
+                continue;
+            }
+        };
+        match workflow::compile(spec) {
+            Ok(_) => return Ok(parsed),
+            Err(e) => {
+                last_err = format!("workflow cross-validation failed: {e}");
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn extract_json_candidates(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // Strategy 1: fenced ```json ... ``` blocks. Most LLMs wrap.
+    let mut remaining = text;
+    while let Some(fence_start) = remaining.find("```json") {
+        let after = &remaining[fence_start + "```json".len()..];
+        let body_start = after.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body = &after[body_start..];
+        if let Some(fence_end) = body.find("```") {
+            out.push(body[..fence_end].trim().to_string());
+            remaining = &body[fence_end + 3..];
+        } else {
+            break;
+        }
+    }
+    // Strategy 2: bare ``` blocks (no language tag).
+    let mut remaining = text;
+    while let Some(fence_start) = remaining.find("```") {
+        let after = &remaining[fence_start + 3..];
+        let body_start = after.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body = &after[body_start..];
+        if let Some(fence_end) = body.find("```") {
+            let candidate = body[..fence_end].trim();
+            if candidate.starts_with('{') {
+                out.push(candidate.to_string());
+            }
+            remaining = &body[fence_end + 3..];
+        } else {
+            break;
+        }
+    }
+    // Strategy 3: first `{` to last `}` of the whole text.
+    if let Some(first) = text.find('{') {
+        if let Some(last) = text.rfind('}') {
+            if last > first {
+                out.push(text[first..=last].to_string());
+            }
+        }
+    }
+    // Dedup while preserving order.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    out.retain(|c| seen.insert(c.clone()));
+    out
 }
 
 // ---------------------------------------------------------------------------
