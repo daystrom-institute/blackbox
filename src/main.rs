@@ -14,7 +14,7 @@ mod tool_docs;
 mod util;
 mod workflow;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -61,6 +61,27 @@ struct SharedState {
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
     store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
+    /// In-flight workflow arcs keyed by `arc_thread_id`. Updated at
+    /// every node boundary by the engine so /orchestrate/peek can
+    /// report the live state without reading notes. Entries persist
+    /// after the arc terminates so a peek shortly after close still
+    /// works (they stay until the daemon restarts).
+    running_arcs: RwLock<HashMap<String, ArcSnapshot>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArcSnapshot {
+    arc_thread_id: String,
+    workflow_name: String,
+    workflow_version: u32,
+    status: String,
+    current_node: Option<String>,
+    completed_nodes: Vec<String>,
+    in_flight_nodes: Vec<String>,
+    last_verdict: Option<String>,
+    visit_counts: std::collections::HashMap<String, u32>,
+    started_at: String,
+    updated_at: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -3830,6 +3851,36 @@ async fn orchestrate_list_handler(
     axum::Json(entries).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct OrchestratePeekQuery {
+    /// Optional thread_id filter — when set, return only that arc's
+    /// snapshot. When absent, return all running_arcs entries.
+    #[serde(default)]
+    thread_id: Option<String>,
+}
+
+async fn orchestrate_peek_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    Query(q): Query<OrchestratePeekQuery>,
+) -> impl axum::response::IntoResponse {
+    let map = state.running_arcs.read();
+    match q.thread_id {
+        Some(tid) => {
+            match map.get(&tid) {
+                Some(s) => axum::Json(serde_json::to_value(s).unwrap_or_default()),
+                None => axum::Json(serde_json::json!({
+                    "error": format!("no arc snapshot for thread_id={tid}")
+                })),
+            }
+        }
+        None => {
+            let mut all: Vec<&ArcSnapshot> = map.values().collect();
+            all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            axum::Json(serde_json::to_value(&all).unwrap_or_default())
+        }
+    }
+}
+
 async fn orchestrate_status_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     Query(q): Query<OrchestrateStatusQuery>,
@@ -4379,6 +4430,7 @@ async fn main() -> anyhow::Result<()> {
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx: tail_tx.clone(),
         store_dir: store_dir.clone(),
+        running_arcs: RwLock::new(HashMap::new()),
     });
 
     // Packet self-heal scanner — off by default. Walks recent
@@ -4465,6 +4517,10 @@ async fn main() -> anyhow::Result<()> {
             "/orchestrate/list",
             axum::routing::get(orchestrate_list_handler),
         )
+        .route(
+            "/orchestrate/peek",
+            axum::routing::get(orchestrate_peek_handler),
+        )
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 
@@ -4507,6 +4563,7 @@ mod tests {
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,
             store_dir: tmp.path().join("bro"),
+            running_arcs: RwLock::new(HashMap::new()),
         });
         BlackboxServer::new(state)
     }

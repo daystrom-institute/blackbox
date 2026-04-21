@@ -92,6 +92,18 @@ enum OrchestrateCommand {
     Status(OrchestrateStatusArgs),
     /// List recent workflow arcs with their final status + latest anchor
     List(OrchestrateListArgs),
+    /// Peek at in-flight arcs' live state (current node, visit counts, in_flight)
+    Peek(OrchestratePeekArgs),
+}
+
+#[derive(Debug, Args)]
+struct OrchestratePeekArgs {
+    /// Arc thread ID to peek at. Omit to list all live arc snapshots.
+    #[arg(value_name = "THREAD_ID")]
+    thread_id: Option<String>,
+    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    #[arg(long)]
+    url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -788,7 +800,90 @@ async fn run_orchestrate(args: OrchestrateArgs) -> anyhow::Result<()> {
         OrchestrateCommand::Run(run_args) => orchestrate_run(run_args).await,
         OrchestrateCommand::Status(status_args) => orchestrate_status(status_args).await,
         OrchestrateCommand::List(list_args) => orchestrate_list(list_args).await,
+        OrchestrateCommand::Peek(peek_args) => orchestrate_peek(peek_args).await,
     }
+}
+
+async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
+    let base_url = args.url.unwrap_or_else(|| {
+        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
+        format!("http://127.0.0.1:{port}")
+    });
+    let mut url = format!("{}/orchestrate/peek", base_url.trim_end_matches('/'));
+    if let Some(tid) = &args.thread_id {
+        url.push_str(&format!("?thread_id={}", urlencoding_lite(tid)));
+    }
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?;
+    let text = resp.text().await?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    if let Some(err) = parsed["error"].as_str() {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+    let snapshots: Vec<serde_json::Value> = if parsed.is_array() {
+        parsed.as_array().cloned().unwrap_or_default()
+    } else {
+        vec![parsed]
+    };
+    if snapshots.is_empty() {
+        println!("no live arc snapshots");
+        return Ok(());
+    }
+    for s in snapshots {
+        println!(
+            "arc: {} ({}) v{}",
+            s["arc_thread_id"].as_str().unwrap_or("?"),
+            s["workflow_name"].as_str().unwrap_or("?"),
+            s["workflow_version"].as_u64().unwrap_or(0)
+        );
+        println!("  status:    {}", s["status"].as_str().unwrap_or("?"));
+        println!(
+            "  current:   {}",
+            s["current_node"].as_str().unwrap_or("(none)")
+        );
+        println!(
+            "  completed: {}",
+            s["completed_nodes"]
+                .as_array()
+                .map(|a| a
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .unwrap_or_default()
+        );
+        let in_flight = s["in_flight_nodes"]
+            .as_array()
+            .map(|a| a
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", "))
+            .unwrap_or_default();
+        if !in_flight.is_empty() {
+            println!("  in_flight: {in_flight}");
+        }
+        if let Some(v) = s["last_verdict"].as_str() {
+            println!("  verdict:   {v}");
+        }
+        if let Some(vc) = s["visit_counts"].as_object() {
+            let mut pairs: Vec<String> =
+                vc.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            pairs.sort();
+            println!("  visits:    {}", pairs.join(", "));
+        }
+        println!(
+            "  started:   {}",
+            s["started_at"].as_str().unwrap_or("?")
+        );
+        println!(
+            "  updated:   {}",
+            s["updated_at"].as_str().unwrap_or("?")
+        );
+        println!();
+    }
+    Ok(())
 }
 
 async fn orchestrate_list(args: OrchestrateListArgs) -> anyhow::Result<()> {

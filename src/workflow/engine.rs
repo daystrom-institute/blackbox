@@ -100,7 +100,9 @@ pub async fn run_workflow_streaming(
         Err(e) => {
             runner.log_event("error", json!({"message": e.to_string()}));
             runner.arc_note("blocked", &format!("workflow errored: {e}"));
-            format!("error: {e}")
+            let status_str = format!("error: {e}");
+            runner.update_arc_snapshot(&status_str, "(error)", None);
+            status_str
         }
     };
     let arc_thread_id = runner.arc_thread_id.clone();
@@ -163,7 +165,9 @@ pub async fn run_workflow_at_depth(
         Err(e) => {
             runner.log_event("error", json!({"message": e.to_string()}));
             runner.arc_note("blocked", &format!("workflow errored: {e}"));
-            format!("error: {e}")
+            let status_str = format!("error: {e}");
+            runner.update_arc_snapshot(&status_str, "(error)", None);
+            status_str
         }
     };
     let arc_thread_id = runner.arc_thread_id.clone();
@@ -308,6 +312,45 @@ impl<'a> WorkflowRunner<'a> {
         }
     }
 
+    /// Register/update this arc's live snapshot in the daemon's
+    /// running_arcs registry for observability via /orchestrate/peek.
+    /// Called at every node boundary + at start/finish with the
+    /// appropriate status. Silent on missing arc_thread_id (the
+    /// snapshot key).
+    fn update_arc_snapshot(&self, status: &str, just_ran: &str, next: Option<&str>) {
+        let Some(thread_id) = self.arc_thread_id.as_deref() else {
+            return;
+        };
+        let now = crate::util::now_iso();
+        let mut completed: Vec<String> =
+            self.node_outputs.keys().cloned().collect();
+        completed.sort();
+        let mut in_flight: Vec<String> = self.in_flight.keys().cloned().collect();
+        in_flight.sort();
+        let visit_counts: std::collections::HashMap<String, u32> = self
+            .visit_counts
+            .iter()
+            .filter(|(k, _)| !k.starts_with("__"))
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let mut map = self.server.state.running_arcs.write();
+        let existing_started = map.get(thread_id).map(|s| s.started_at.clone());
+        let snapshot = crate::ArcSnapshot {
+            arc_thread_id: thread_id.to_string(),
+            workflow_name: self.compiled.spec.name.clone(),
+            workflow_version: self.compiled.spec.version,
+            status: status.to_string(),
+            current_node: next.map(|s| s.to_string()).or(Some(just_ran.to_string())),
+            completed_nodes: completed,
+            in_flight_nodes: in_flight,
+            last_verdict: self.last_verdict.clone(),
+            visit_counts,
+            started_at: existing_started.unwrap_or_else(|| now.clone()),
+            updated_at: now,
+        };
+        map.insert(thread_id.to_string(), snapshot);
+    }
+
     /// Write a structured note on the arc thread. Kind MUST be one of
     /// the 7 canonical note kinds: dispute, assumption, surprise,
     /// followup, blocked, learned, done. No-op if no arc thread is
@@ -340,6 +383,7 @@ impl<'a> WorkflowRunner<'a> {
                 "entry_node": entry,
             }),
         );
+        self.update_arc_snapshot("running", "(start)", Some(&entry));
         let mut current = entry;
         let mut steps = 0usize;
         while current != "[*]" {
@@ -353,6 +397,8 @@ impl<'a> WorkflowRunner<'a> {
             // boundary so an observer can reconstruct arc state
             // without reading every per-node event.
             self.write_compaction_anchor(steps, &current, &next);
+            // Update the in-flight arc snapshot for /orchestrate/peek.
+            self.update_arc_snapshot("running", &current, Some(&next));
             // Arc-level policy packet: advisor-as-packet, evaluates
             // arc state mechanically. Halt/escalate/warn verdicts act
             // on the arc without needing an LLM advisor round.
@@ -360,6 +406,7 @@ impl<'a> WorkflowRunner<'a> {
             current = next;
         }
         self.log_event("complete", json!({"steps": steps}));
+        self.update_arc_snapshot("completed", "(end)", None);
         Ok(())
     }
 
