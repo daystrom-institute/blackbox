@@ -71,18 +71,22 @@ pub async fn run_workflow(
     project_dir: Option<String>,
     max_steps: Option<usize>,
 ) -> WorkflowRunResult {
-    run_workflow_at_depth(server, compiled, project_dir, max_steps, 0).await
+    run_workflow_at_depth(server, compiled, project_dir, max_steps, 0, HashMap::new()).await
 }
 
-/// Internal entry point that tracks nested-composition depth. Use
-/// [`run_workflow`] at top level; `run_subworkflow_node` calls this
-/// directly with `composition_depth + 1`.
+/// Internal entry point that tracks nested-composition depth and
+/// seeds initial node_outputs. Use [`run_workflow`] at top level;
+/// `run_subworkflow_node` calls this directly with the parent's
+/// `node_outputs` as seed so sub-workflow templates can reference
+/// parent nodes via `${ParentNode.output}` identically to sibling
+/// references.
 pub async fn run_workflow_at_depth(
     server: &BlackboxServer,
     compiled: &CompiledWorkflow,
     project_dir: Option<String>,
     max_steps: Option<usize>,
     composition_depth: u32,
+    seed_outputs: HashMap<String, String>,
 ) -> WorkflowRunResult {
     if composition_depth > MAX_COMPOSITION_DEPTH {
         return WorkflowRunResult {
@@ -102,6 +106,7 @@ pub async fn run_workflow_at_depth(
         max_steps.unwrap_or(50),
         composition_depth,
     );
+    runner.node_outputs = seed_outputs;
     runner.open_arc_thread();
     let status = match runner.run().await {
         Ok(()) => "completed".to_string(),
@@ -447,7 +452,10 @@ impl<'a> WorkflowRunner<'a> {
             let verdict = self.last_verdict.as_deref().ok_or_else(|| {
                 anyhow!(
                     "choice node '{current}' reached with no prior gate verdict — \
-                     the predecessor activity node must have a `gate` spec"
+                     either the predecessor activity node has no `gate` packet \
+                     spec, or the gate fired but no rule matched the output \
+                     (packet returned None). Check the predecessor's gate \
+                     config and ensure the packet has a catchall fallback rule."
                 )
             })?;
             let matched = outgoing.iter().find(|e| e.label.as_deref() == Some(verdict));
@@ -490,13 +498,7 @@ impl<'a> WorkflowRunner<'a> {
                 Ok(())
             }
             MermaidNodeKind::Fork => self.run_fork_node(node_id).await,
-            MermaidNodeKind::Join => {
-                // Join semantics would wait for all incoming async
-                // branches before passing control to the single
-                // outgoing edge. Not implemented yet — workflows can
-                // express equivalent shapes via late_inject for now.
-                bail!("v0 engine does not yet execute <<join>> control nodes (hit '{node_id}')");
-            }
+            MermaidNodeKind::Join => self.run_join_node(node_id).await,
             MermaidNodeKind::Activity => self.run_activity_node(node_id).await,
         }
     }
@@ -864,37 +866,41 @@ impl<'a> WorkflowRunner<'a> {
             Some(li) => li.clone(),
             None => return Ok(()),
         };
-        let source = &late_inject.from;
+        let source = late_inject.from;
+        let joined = self.join_in_flight_source(&source).await?;
+        if joined {
+            self.log_event(
+                "late_inject_join",
+                json!({"node": node_id, "source": source}),
+            );
+            self.arc_note(
+                "surprise",
+                &format!("node '{node_id}' late-joined async source '{source}'"),
+            );
+        } else {
+            self.log_event(
+                "late_inject_skip",
+                json!({
+                    "node": node_id,
+                    "source": source,
+                    "reason": "no in-flight handle",
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    /// Wait on a single in-flight source node's task(s), capture its
+    /// output into `node_outputs[source]`, update session maps if the
+    /// actor was durable. Returns `Ok(true)` when a handle was joined,
+    /// `Ok(false)` when the source had no in-flight handle (already
+    /// joined, or never dispatched). Shared path between `late_inject`
+    /// and explicit `<<join>>` control nodes.
+    async fn join_in_flight_source(&mut self, source: &str) -> Result<bool> {
         let entry = match self.in_flight.remove(source) {
             Some(e) => e,
-            None => {
-                // Source either wasn't dispatched by a prior fork, or
-                // was already joined earlier. Not fatal — the template
-                // will render whatever is in node_outputs[source] (or
-                // leave the placeholder if empty).
-                self.log_event(
-                    "late_inject_skip",
-                    json!({
-                        "node": node_id,
-                        "source": source,
-                        "reason": "no in-flight handle",
-                    }),
-                );
-                return Ok(());
-            }
+            None => return Ok(false),
         };
-
-        self.log_event(
-            "late_inject_join",
-            json!({"node": node_id, "source": source}),
-        );
-        self.arc_note(
-            "surprise",
-            &format!(
-                "node '{node_id}' late-joined async source '{source}'"
-            ),
-        );
-
         match entry {
             InFlight::Single {
                 actor_name,
@@ -905,7 +911,7 @@ impl<'a> WorkflowRunner<'a> {
                 let completed = orch::wait_for_task_with_timeout(&task, Some(900.0)).await;
                 if !completed {
                     bail!(
-                        "late_inject source '{source}' (task {task_id}) exceeded timeout for node '{node_id}'"
+                        "in-flight source '{source}' (task {task_id}) exceeded timeout"
                     );
                 }
                 let result_json = orch::task_result_json(&task);
@@ -918,7 +924,7 @@ impl<'a> WorkflowRunner<'a> {
                 if durable {
                     self.actor_sessions.insert(actor_name, session_id.clone());
                 }
-                self.node_outputs.insert(source.clone(), output);
+                self.node_outputs.insert(source.to_string(), output);
             }
             InFlight::Ensemble {
                 actor_name,
@@ -945,7 +951,7 @@ impl<'a> WorkflowRunner<'a> {
                 let mut timed_out = false;
                 while let Some(res) = joinset.join_next().await {
                     let (member, completed, output, session_id) =
-                        res.map_err(|e| anyhow!("late_inject ensemble join: {e}"))?;
+                        res.map_err(|e| anyhow!("ensemble join: {e}"))?;
                     if !completed {
                         timed_out = true;
                     }
@@ -954,7 +960,7 @@ impl<'a> WorkflowRunner<'a> {
                 }
                 if timed_out {
                     bail!(
-                        "late_inject source '{source}' (ensemble) had member timeouts for node '{node_id}'"
+                        "in-flight source '{source}' (ensemble) had member timeouts"
                     );
                 }
                 outs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -966,8 +972,52 @@ impl<'a> WorkflowRunner<'a> {
                 if durable {
                     self.ensemble_sessions.insert(actor_name, sessions);
                 }
-                self.node_outputs.insert(source.clone(), merged);
+                self.node_outputs.insert(source.to_string(), merged);
             }
+        }
+        Ok(true)
+    }
+
+    /// `<<join>>` control node — synchronous fan-in. Waits for every
+    /// incoming edge's source that's currently in-flight, captures
+    /// their outputs into `node_outputs`, then advances via the single
+    /// outgoing edge. Sources already joined (e.g., via `late_inject`)
+    /// are skipped silently.
+    async fn run_join_node(&mut self, node_id: &str) -> Result<()> {
+        let incoming_sources: Vec<String> = self
+            .compiled
+            .graph
+            .edges
+            .iter()
+            .filter(|e| e.to == node_id && e.from != "[*]")
+            .map(|e| e.from.clone())
+            .collect();
+        let mut joined_count = 0usize;
+        let mut skipped_count = 0usize;
+        for source in &incoming_sources {
+            let joined = self.join_in_flight_source(source).await?;
+            if joined {
+                joined_count += 1;
+            } else {
+                skipped_count += 1;
+            }
+        }
+        self.log_event(
+            "join",
+            json!({
+                "node": node_id,
+                "incoming": incoming_sources,
+                "joined": joined_count,
+                "already_completed": skipped_count,
+            }),
+        );
+        if joined_count > 0 {
+            self.arc_note(
+                "surprise",
+                &format!(
+                    "join '{node_id}' fanned in {joined_count} async source(s) (+{skipped_count} already completed)"
+                ),
+            );
         }
         Ok(())
     }
@@ -1146,6 +1196,11 @@ impl<'a> WorkflowRunner<'a> {
             anyhow!("subworkflow on node '{node_id}' failed to compile: {e}")
         })?;
         let project_dir = self.project_dir.clone();
+        // Seed the sub-runner with the parent's node_outputs so sub
+        // prompts can reference `${ParentNode.output}` the same way
+        // siblings do. Caveat: sub-node names that collide with parent
+        // names overwrite parent entries in the sub's local copy.
+        let seed_outputs = self.node_outputs.clone();
         // Box the recursive future to avoid infinitely-sized types.
         // Depth is threaded so the child runner knows where it is in
         // the composition tree.
@@ -1155,6 +1210,7 @@ impl<'a> WorkflowRunner<'a> {
             project_dir,
             Some(25),
             child_depth,
+            seed_outputs,
         ))
         .await;
 
@@ -1168,9 +1224,16 @@ impl<'a> WorkflowRunner<'a> {
 
         // Merge sub-node outputs into a single labeled string — same
         // shape as ensemble output so downstream templates can consume
-        // it consistently.
-        let mut sub_outputs: Vec<(String, String)> =
-            sub_result.node_outputs.into_iter().collect();
+        // it consistently. Filter OUT seeded parent outputs (keys not
+        // in the sub's own node set) so the merge reflects only what
+        // the sub produced, not what it received as input context.
+        let sub_node_names: std::collections::HashSet<String> =
+            compiled.spec.nodes.keys().cloned().collect();
+        let mut sub_outputs: Vec<(String, String)> = sub_result
+            .node_outputs
+            .into_iter()
+            .filter(|(k, _)| sub_node_names.contains(k))
+            .collect();
         sub_outputs.sort_by(|a, b| a.0.cmp(&b.0));
         let merged = sub_outputs
             .iter()

@@ -3506,6 +3506,92 @@ struct OrchestrateStatusResponse {
     latest_anchor: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct OrchestrateListEntry {
+    thread_id: String,
+    name: Option<String>,
+    topic: String,
+    status: String,
+    created_at: String,
+    last_activity: String,
+    project: Option<String>,
+    latest_anchor: Option<String>,
+    final_status: Option<String>,
+    note_count: usize,
+}
+
+async fn orchestrate_list_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    // Snapshot threads + notes via the raw stores so we don't hold
+    // any parking_lot guard across an await (there aren't any awaits
+    // in this handler, but the pattern is still cleaner).
+    let entries: Vec<OrchestrateListEntry> = {
+        let threads = state.threads.read();
+        let notes = state.notes.read();
+        let mut out: Vec<OrchestrateListEntry> = threads
+            .all()
+            .iter()
+            .filter(|t| {
+                matches!(t.kind, Some(crate::threads::ThreadKind::WorkItem))
+                    && t.name.as_deref().is_some_and(|n| n.starts_with("wf-"))
+            })
+            .map(|t| {
+                let tid = &t.id;
+                let mut latest_anchor: Option<(String, String)> = None;
+                let mut final_status: Option<String> = None;
+                let mut note_count = 0usize;
+                for n in notes.all() {
+                    if n.thread_id.as_deref() != Some(tid.as_str()) {
+                        continue;
+                    }
+                    note_count += 1;
+                    let body = n.body.as_str();
+                    if body.starts_with("ANCHOR ") {
+                        let is_newer = latest_anchor
+                            .as_ref()
+                            .map(|(ts, _)| n.created_at.as_str() > ts.as_str())
+                            .unwrap_or(true);
+                        if is_newer {
+                            latest_anchor =
+                                Some((n.created_at.clone(), body.to_string()));
+                        }
+                    }
+                    if body.starts_with("workflow ") && body.contains("completed in") {
+                        final_status = Some("completed".into());
+                    } else if body.starts_with("workflow errored") {
+                        final_status = Some("errored".into());
+                    } else if body.starts_with("paused at user node") {
+                        final_status = Some("paused".into());
+                    } else if body.starts_with("policy halt") {
+                        final_status = Some("policy_halt".into());
+                    }
+                }
+                OrchestrateListEntry {
+                    thread_id: t.id.clone(),
+                    name: t.name.clone(),
+                    topic: t.topic.clone(),
+                    status: t.status.as_ref().to_string(),
+                    created_at: t.created_at.clone(),
+                    last_activity: t.last_activity.clone(),
+                    project: if t.project.is_empty() {
+                        None
+                    } else {
+                        Some(t.project.clone())
+                    },
+                    latest_anchor: latest_anchor.map(|(_, b)| b),
+                    final_status,
+                    note_count,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        out
+    };
+    axum::Json(entries).into_response()
+}
+
 async fn orchestrate_status_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     Query(q): Query<OrchestrateStatusQuery>,
@@ -4080,6 +4166,10 @@ async fn main() -> anyhow::Result<()> {
             "/orchestrate/status",
             axum::routing::get(orchestrate_status_handler),
         )
+        .route(
+            "/orchestrate/list",
+            axum::routing::get(orchestrate_list_handler),
+        )
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 
@@ -4310,6 +4400,7 @@ mod tests {
             None,
             Some(1),
             engine::MAX_COMPOSITION_DEPTH,
+            std::collections::HashMap::new(),
         )
         .await;
         assert!(
@@ -4325,6 +4416,7 @@ mod tests {
             None,
             Some(1),
             engine::MAX_COMPOSITION_DEPTH + 1,
+            std::collections::HashMap::new(),
         )
         .await;
         assert!(

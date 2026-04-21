@@ -1,0 +1,39 @@
+{
+  "name": "fork-join",
+  "version": 1,
+  "actors": {
+    "primary": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    },
+    "left": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    },
+    "right": {
+      "kind": "executor",
+      "brofile": "probe-haiku-b"
+    }
+  },
+  "nodes": {
+    "Setup": {
+      "actor": "primary",
+      "prompt": "Output exactly this topic, verbatim, no other text:\n\n'Should deprecated CLI flags be removed in a major release, or kept for one more minor release?'"
+    },
+    "LeftBranch": {
+      "actor": "left",
+      "prompt": "Argue for removing deprecated flags in the next major release. One sentence, no preamble.\n\nTopic: ${Setup.output}",
+      "mode": "fire_and_forget"
+    },
+    "RightBranch": {
+      "actor": "right",
+      "prompt": "Argue for keeping deprecated flags for one more minor release. One sentence, no preamble.\n\nTopic: ${Setup.output}",
+      "mode": "fire_and_forget"
+    },
+    "Summarize": {
+      "actor": "primary",
+      "prompt": "Two arguments were presented on this topic:\n\nTopic: ${Setup.output}\n\nLeftBranch argued: ${LeftBranch.output}\n\nRightBranch argued: ${RightBranch.output}\n\nIn exactly two sentences: (1) paraphrase each side's argument neutrally, (2) identify which side has the stronger case and why. No preamble."
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> Setup\n    state fork_debate <<fork>>\n    Setup --> fork_debate\n    fork_debate --> LeftBranch\n    fork_debate --> RightBranch\n    state join_debate <<join>>\n    LeftBranch --> join_debate\n    RightBranch --> join_debate\n    join_debate --> Summarize\n    Summarize --> [*]"
+}

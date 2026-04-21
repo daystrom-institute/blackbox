@@ -1,0 +1,54 @@
+{
+  "name": "combo-showcase",
+  "version": 1,
+  "policy_packet": "packet-6eab1744",
+  "actors": {
+    "author": {
+      "kind": "executor",
+      "brofile": "probe-haiku",
+      "durable": true
+    },
+    "panel": {
+      "kind": "ensemble",
+      "team": "ensemble-duo"
+    }
+  },
+  "nodes": {
+    "Draft": {
+      "actor": "author",
+      "prompt": "Write a one-sentence product tagline for a fictional tool called 'Constellation' — a distributed tracing platform for async workloads. Under 15 words. No preamble, output only the tagline.",
+      "retry": { "max_generations": 3 }
+    },
+    "Panel": {
+      "actor": "panel",
+      "prompt": "You are one of two reviewers evaluating a product tagline. Tagline:\n\n${Draft.output}\n\nIn your reply, the FIRST line must be exactly one of:\nVERDICT: APPROVE\nVERDICT: REVISE\n\nThen one sentence of reasoning. No preamble.\n\nApprove only if the tagline is concrete, non-generic, and mentions a distinguishing property. Revise if it's vague, cliche, or indistinct from other telemetry tools.",
+      "gate": "packet-078c52f5"
+    },
+    "Summary": {
+      "actor": "author",
+      "subworkflow": {
+        "name": "combo-summary-sub",
+        "version": 1,
+        "actors": {
+          "summarizer": {
+            "kind": "executor",
+            "brofile": "probe-haiku",
+            "durable": true
+          }
+        },
+        "nodes": {
+          "Restate": {
+            "actor": "summarizer",
+            "prompt": "Paraphrase this approved tagline in one sentence, preserving the key distinguishing property:\n\n${Draft.output}"
+          },
+          "Rationale": {
+            "actor": "summarizer",
+            "prompt": "In one sentence, explain why the panel approved: ${Panel.output}"
+          }
+        },
+        "graph": "stateDiagram-v2\n    [*] --> Restate\n    Restate --> Rationale\n    Rationale --> [*]"
+      }
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> Draft\n    Draft --> Panel\n    Panel --> PanelRoute\n    state PanelRoute <<choice>>\n    PanelRoute --> Draft: needs_revision\n    PanelRoute --> Summary: unanimous_approve\n    Summary --> [*]"
+}

@@ -90,6 +90,18 @@ enum OrchestrateCommand {
     Run(OrchestrateRunArgs),
     /// Read an arc thread's note trail + latest compaction anchor
     Status(OrchestrateStatusArgs),
+    /// List recent workflow arcs with their final status + latest anchor
+    List(OrchestrateListArgs),
+}
+
+#[derive(Debug, Args)]
+struct OrchestrateListArgs {
+    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    #[arg(long)]
+    url: Option<String>,
+    /// Max entries to print (default: 20, most recent first).
+    #[arg(long, default_value = "20")]
+    limit: usize,
 }
 
 #[derive(Debug, Args)]
@@ -771,7 +783,57 @@ async fn run_orchestrate(args: OrchestrateArgs) -> anyhow::Result<()> {
     match args.command {
         OrchestrateCommand::Run(run_args) => orchestrate_run(run_args).await,
         OrchestrateCommand::Status(status_args) => orchestrate_status(status_args).await,
+        OrchestrateCommand::List(list_args) => orchestrate_list(list_args).await,
     }
+}
+
+async fn orchestrate_list(args: OrchestrateListArgs) -> anyhow::Result<()> {
+    let base_url = args.url.unwrap_or_else(|| {
+        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
+        format!("http://127.0.0.1:{port}")
+    });
+    let url = format!("{}/orchestrate/list", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        eprintln!("daemon returned {status}\n{text}");
+        std::process::exit(1);
+    }
+    let entries: serde_json::Value = serde_json::from_str(&text)?;
+    let Some(arr) = entries.as_array() else {
+        println!("no arcs");
+        return Ok(());
+    };
+    if arr.is_empty() {
+        println!("no workflow arcs found");
+        return Ok(());
+    }
+    println!(
+        "{:<18} {:<22} {:<10} {:<22} {}",
+        "thread_id", "name", "status", "last_activity", "anchor"
+    );
+    for e in arr.iter().take(args.limit) {
+        let tid = e["thread_id"].as_str().unwrap_or("?");
+        let name = e["name"].as_str().unwrap_or("?");
+        let status = e["final_status"]
+            .as_str()
+            .unwrap_or_else(|| e["status"].as_str().unwrap_or("?"));
+        let last = e["last_activity"].as_str().unwrap_or("");
+        let anchor_full = e["latest_anchor"].as_str().unwrap_or("");
+        let anchor: String = anchor_full.chars().take(60).collect();
+        println!(
+            "{tid:<18} {name:<22} {status:<10} {last:<22} {anchor}"
+        );
+    }
+    if arr.len() > args.limit {
+        println!(
+            "\n... {} more (use --limit to see more)",
+            arr.len() - args.limit
+        );
+    }
+    Ok(())
 }
 
 async fn orchestrate_status(args: OrchestrateStatusArgs) -> anyhow::Result<()> {

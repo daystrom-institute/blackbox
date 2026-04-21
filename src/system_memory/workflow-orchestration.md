@@ -154,7 +154,9 @@ The arc is reconstructable from the thread alone. Observers (you, other sessions
 
 ## Common traps
 
-- **Gate verdict lattice must match edge labels.** If packet lattice is `["approved", "revise"]`, choice-node edges must be labeled `approved` and `revise`. Engine rejects unmatched verdicts at runtime with a clear error.
+- **Gate verdict lattice must match edge labels.** If packet lattice is `["approved", "revise"]`, choice-node edges must be labeled `approved` and `revise`. Engine rejects unmatched verdicts at runtime with a clear error listing available edge labels.
+- **Gate packet with no catchall rule can produce a null verdict.** If every rule antecedent fires false on the output, `apply_workflow_gate` returns None. A downstream choice node then halts with "no prior gate verdict." Fix: add a fallback rule (`emit: "fallback"` with `True` antecedent) so the gate always emits SOMETHING. Equivalent of a `default:` branch.
+- **Unmatched verdict and unmatched edge are DIFFERENT failure modes.** Both halt the arc cleanly — no silent hang — but produce distinct errors. "no prior gate verdict" means the packet didn't fire (no matching rule). "no edge for verdict 'X'" means the gate fired but no choice-edge has that label. First one is a packet-authoring problem; second is a workflow-graph-authoring problem.
 - **Fork node ordering is semantic.** First outgoing edge is the sync continuation (main walk). All others are fire-and-forget. Re-ordering changes meaning.
 - **Fan-out outside choice/fork is a spec error.** Activity nodes must have exactly one outgoing edge.
 - **Retry ceiling is per-visit-count.** Back-edges through choice nodes count as retries. `retry.max_generations: 3` means a node can be visited at most 3 times.
