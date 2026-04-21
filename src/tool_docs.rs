@@ -27,6 +27,7 @@ pub enum ToolCategory {
     Inbox,
     Packets,
     Orchestration,
+    Workflows,
 }
 
 impl ToolCategory {
@@ -39,6 +40,7 @@ impl ToolCategory {
             Self::Inbox => "Attention / inbox",
             Self::Packets => "Rule-packets",
             Self::Orchestration => "Bro orchestration",
+            Self::Workflows => "Workflow orchestration",
         }
     }
 
@@ -64,6 +66,9 @@ impl ToolCategory {
             }
             Self::Orchestration => {
                 "Dispatch agents across providers (Claude, OpenCode, Codex, Copilot, Vibe, Gemini). Prefer named `bro` targeting (resolves provider + account + lens + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race)."
+            }
+            Self::Workflows => {
+                "Define multi-phase agent protocols as mermaid-shaped JSON specs and dispatch them as a unit. The daemon owns the state machine; actors (executor / ensemble / advisor / user) are dispatched INTO the loop as stateless turns. Gate packets route choice nodes by verdict; retry ceilings cap back-edges; fork + `late_inject` express async steering; sub-workflows compose arcs like rule-packets compose via `Apply`; workflow-level `policy_packet` mechanizes arc-health decisions without an LLM advisor. Every run opens a `bbox_thread(kind=work_item)` with structured notes + rolling compaction anchors. Replaces long skill-prose protocols (overmind, crucible). See `sm-workflow-orchestration` via `bbox_knowledge` for the full runbook and `examples/workflows/` for the catalog."
             }
         }
     }
@@ -430,6 +435,16 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#,
         ),
     },
+    // ── Workflows ────────────────────────────────────────────────────
+    ToolDoc {
+        name: "bro_orchestrate_run",
+        category: ToolCategory::Workflows,
+        summary: "Dispatch a mermaid-shaped workflow. Takes a full workflow spec (actors, nodes, embedded stateDiagram-v2 graph) and blocks until the arc terminates. Returns the event log, per-node outputs, and the `arc_thread_id` for post-hoc audit via `bbox_notes(thread_id=...)` or `bro orchestrate status`. Pass `dry_run=true` to validate + summarize without dispatching any bros. Replaces long skill-prose protocols like overmind/crucible — the daemon owns the state machine, dispatched bros are stateless function-call turns. See `sm-workflow-orchestration` via `bbox_knowledge` and `examples/workflows/` for the shape catalog.",
+        when_to_use: "Use when your task has multiple phases with verdict-based branching, retry-on-fail semantics, async steering (fork + late_inject), or reusable sub-arcs — and especially when you'd otherwise be writing dozens of lines of 'advisor MUST NOT … / protocol REQUIRES …' prose to keep a top-level LLM from drifting as it coordinates. Author the spec (or copy one from `examples/workflows/`), cross-validate via `dry_run=true`, then dispatch. Follow with `bbox_notes(thread_id=<arc_thread_id>)` or `bro orchestrate status <id>` for the audit trail. Full runbook at `sm-workflow-orchestration` via `bbox_knowledge`.",
+        example: Some(
+            r#"bro_orchestrate_run(workflow={...full spec...}, project_dir="/repo/x", dry_run=true)"#,
+        ),
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\
@@ -470,6 +485,12 @@ from transcript history.
 `bbox_remember` (cold grep-able facts), `bbox_pin` (arc-bound hot context). \
 The one-year test picks between rendered and pin — would it still be correct \
 a year from now with current arcs done?
+- Workflow vs. manual dispatch: when you're about to author (or \
+re-author) a multi-phase protocol with gates, retries, or ensemble \
+review — reach for `bro_orchestrate_run` with a mermaid-shaped spec \
+instead of pasting a discipline-protocol into an LLM and hoping it \
+won't drift. The daemon owns the state machine; the LLM is a turn. \
+See `sm-workflow-orchestration` via `bbox_knowledge`.
 - `bbox_learn` is for user-stated rules; `bbox_note(kind=learned)` is for \
 agent-discovered facts.
 ";

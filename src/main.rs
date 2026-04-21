@@ -2518,6 +2518,51 @@ impl BlackboxServer {
             _ => Self::err_text(&format!("Unknown team action: {}", p.action)),
         }
     }
+
+    #[tool(
+        name = "bro_orchestrate_run",
+        description = "Dispatch a mermaid-shaped workflow. Takes a full workflow spec (actors, nodes, embedded stateDiagram-v2 graph) and blocks until the arc terminates. Returns the event log, per-node outputs, and the `arc_thread_id` for post-hoc audit via `bbox_notes(thread_id=...)` or `bro orchestrate status`. Pass `dry_run=true` to validate + summarize without dispatching any bros. Replaces long skill-prose protocols like overmind/crucible — the daemon owns the state machine, dispatched bros are stateless function-call turns. See `sm-workflow-orchestration` via `bbox_knowledge` and `examples/workflows/` for the shape catalog."
+    )]
+    async fn bro_orchestrate_run(
+        &self,
+        Parameters(p): Parameters<OrchestrateRunParams>,
+    ) -> CallToolResult {
+        let spec: workflow::Workflow = match serde_json::from_value(p.workflow) {
+            Ok(s) => s,
+            Err(e) => {
+                return Self::err_text(&format!("workflow parse failed: {e}"));
+            }
+        };
+        let compiled = match workflow::compile(spec) {
+            Ok(c) => c,
+            Err(e) => return Self::err_text(&format!("workflow compile failed: {e}")),
+        };
+        if p.dry_run.unwrap_or(false) {
+            let result = workflow::engine::dry_run(&compiled);
+            return Self::ok_json(&serde_json::to_value(&result).unwrap_or_default());
+        }
+        let result =
+            workflow::run_workflow(self, &compiled, p.project_dir, p.max_steps).await;
+        Self::ok_json(&serde_json::to_value(&result).unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct OrchestrateRunParams {
+    /// Full workflow spec (Workflow struct serialized as JSON). Must
+    /// contain `name`, `version`, `actors`, `nodes`, and `graph` (an
+    /// embedded stateDiagram-v2 string). Optional `policy_packet` for
+    /// arc-level advisor-as-packet evaluation.
+    pub workflow: Value,
+    /// Working directory passed to every dispatched bro.
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    /// Cap on activity-node steps (default: 50).
+    #[serde(default)]
+    pub max_steps: Option<usize>,
+    /// When true: parse + cross-validate + summarize; do NOT dispatch.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4231,6 +4276,64 @@ mod tests {
         assert_eq!(checkpoint.dispute_count, 1);
         assert_eq!(checkpoint.notes.blocked_count, 1);
         assert_eq!(checkpoint.notes.dispute_count, 1);
+    }
+
+    #[tokio::test]
+    async fn run_workflow_at_depth_rejects_past_ceiling() {
+        // A direct smoke test for the fix driven by the self-audit
+        // live validation: the subworkflow depth counter used to live
+        // in a per-runner HashMap, so nested runners silently reset
+        // it. Now it's threaded through run_workflow_at_depth so the
+        // ceiling is enforced globally across the composition chain.
+        use crate::workflow::{compile, engine, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        // Minimal valid workflow — doesn't actually matter since the
+        // depth check short-circuits before any dispatch.
+        let json = r#"{
+            "name": "depth-test",
+            "version": 1,
+            "actors": {"a": {"kind": "executor", "brofile": "b"}},
+            "nodes": {"N": {"actor": "a"}},
+            "graph": "stateDiagram-v2\n    [*] --> N\n    N --> [*]"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+
+        // At exactly MAX_COMPOSITION_DEPTH: should proceed (no error
+        // from depth check). We don't actually dispatch because there's
+        // no brofile "b" on this test server — but we confirm the
+        // depth check isn't the thing that errors it out.
+        let at_ceiling = engine::run_workflow_at_depth(
+            &server,
+            &compiled,
+            None,
+            Some(1),
+            engine::MAX_COMPOSITION_DEPTH,
+        )
+        .await;
+        assert!(
+            !at_ceiling.status.starts_with("error: subworkflow composition depth"),
+            "at-ceiling depth should not be rejected by the depth guard; got: {}",
+            at_ceiling.status
+        );
+
+        // Past ceiling: short-circuit with a depth-error status.
+        let past_ceiling = engine::run_workflow_at_depth(
+            &server,
+            &compiled,
+            None,
+            Some(1),
+            engine::MAX_COMPOSITION_DEPTH + 1,
+        )
+        .await;
+        assert!(
+            past_ceiling.status.starts_with("error: subworkflow composition depth"),
+            "past-ceiling should error on depth; got: {}",
+            past_ceiling.status
+        );
+        assert!(past_ceiling.events.is_empty());
+        assert!(past_ceiling.arc_thread_id.is_none());
     }
 
     #[test]

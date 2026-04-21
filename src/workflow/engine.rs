@@ -58,13 +58,50 @@ pub struct WorkflowRunResult {
     pub arc_thread_id: Option<String>,
 }
 
+/// Absolute ceiling on nested sub-workflow composition. The depth is
+/// threaded through `run_workflow` calls so child runners inherit it —
+/// a local per-runner counter would let an arbitrarily-deep nest
+/// silently skip the cap (caught by a Haiku self-audit round, fixed
+/// here). Top-level callers pass 0.
+pub const MAX_COMPOSITION_DEPTH: u32 = 5;
+
 pub async fn run_workflow(
     server: &BlackboxServer,
     compiled: &CompiledWorkflow,
     project_dir: Option<String>,
     max_steps: Option<usize>,
 ) -> WorkflowRunResult {
-    let mut runner = WorkflowRunner::new(server, compiled, project_dir, max_steps.unwrap_or(50));
+    run_workflow_at_depth(server, compiled, project_dir, max_steps, 0).await
+}
+
+/// Internal entry point that tracks nested-composition depth. Use
+/// [`run_workflow`] at top level; `run_subworkflow_node` calls this
+/// directly with `composition_depth + 1`.
+pub async fn run_workflow_at_depth(
+    server: &BlackboxServer,
+    compiled: &CompiledWorkflow,
+    project_dir: Option<String>,
+    max_steps: Option<usize>,
+    composition_depth: u32,
+) -> WorkflowRunResult {
+    if composition_depth > MAX_COMPOSITION_DEPTH {
+        return WorkflowRunResult {
+            status: format!(
+                "error: subworkflow composition depth {composition_depth} exceeds ceiling {MAX_COMPOSITION_DEPTH}"
+            ),
+            events: Vec::new(),
+            node_outputs: HashMap::new(),
+            plan: None,
+            arc_thread_id: None,
+        };
+    }
+    let mut runner = WorkflowRunner::new(
+        server,
+        compiled,
+        project_dir,
+        max_steps.unwrap_or(50),
+        composition_depth,
+    );
     runner.open_arc_thread();
     let status = match runner.run().await {
         Ok(()) => "completed".to_string(),
@@ -127,6 +164,10 @@ struct WorkflowRunner<'a> {
     events: Vec<Value>,
     max_steps: usize,
     arc_thread_id: Option<String>,
+    /// Nesting depth for sub-workflow composition. Threaded through
+    /// recursive `run_workflow_at_depth` calls so a chain of nested
+    /// sub-workflows can't silently bypass the ceiling.
+    composition_depth: u32,
 }
 
 impl<'a> WorkflowRunner<'a> {
@@ -135,6 +176,7 @@ impl<'a> WorkflowRunner<'a> {
         compiled: &'a CompiledWorkflow,
         project_dir: Option<String>,
         max_steps: usize,
+        composition_depth: u32,
     ) -> Self {
         Self {
             server,
@@ -149,6 +191,7 @@ impl<'a> WorkflowRunner<'a> {
             events: Vec::new(),
             max_steps,
             arc_thread_id: None,
+            composition_depth,
         }
     }
 
@@ -1058,7 +1101,6 @@ impl<'a> WorkflowRunner<'a> {
     /// project_dir — so it opens its own arc thread, applies its own
     /// gates, etc. Depth-limited to prevent runaway recursion.
     async fn run_subworkflow_node(&mut self, node_id: &str) -> Result<()> {
-        const MAX_DEPTH: u32 = 5;
         let spec = self
             .compiled
             .spec
@@ -1071,15 +1113,14 @@ impl<'a> WorkflowRunner<'a> {
             .ok_or_else(|| anyhow!("subworkflow missing from node '{node_id}'"))?;
         let sub_spec = (**sub_spec).clone();
 
-        // Soft depth ceiling via a per-runner counter. We don't have a
-        // runner-chain so store it in visit_counts under a sentinel key.
-        let depth_key = "__subworkflow_depth__";
-        let depth = self.visit_counts.entry(depth_key.into()).or_insert(0);
-        *depth += 1;
-        let current_depth = *depth;
-        if current_depth > MAX_DEPTH {
+        // Depth is threaded through `run_workflow_at_depth`. Check at
+        // dispatch time so the error surfaces here (with node context)
+        // rather than inside the child runner's error return.
+        let child_depth = self.composition_depth + 1;
+        if child_depth > MAX_COMPOSITION_DEPTH {
             bail!(
-                "subworkflow recursion exceeded depth {MAX_DEPTH} at node '{node_id}'"
+                "subworkflow recursion would exceed ceiling {MAX_COMPOSITION_DEPTH} at node '{node_id}' (current depth {}, child would be {child_depth})",
+                self.composition_depth
             );
         }
 
@@ -1089,13 +1130,14 @@ impl<'a> WorkflowRunner<'a> {
                 "node": node_id,
                 "sub_name": sub_spec.name.clone(),
                 "sub_version": sub_spec.version,
-                "depth": current_depth,
+                "parent_depth": self.composition_depth,
+                "child_depth": child_depth,
             }),
         );
         self.arc_note(
             "learned",
             &format!(
-                "node '{node_id}' entering sub-workflow '{}' (depth {current_depth})",
+                "node '{node_id}' entering sub-workflow '{}' (depth {child_depth}/{MAX_COMPOSITION_DEPTH})",
                 sub_spec.name
             ),
         );
@@ -1105,18 +1147,16 @@ impl<'a> WorkflowRunner<'a> {
         })?;
         let project_dir = self.project_dir.clone();
         // Box the recursive future to avoid infinitely-sized types.
-        let sub_result = Box::pin(run_workflow(
+        // Depth is threaded so the child runner knows where it is in
+        // the composition tree.
+        let sub_result = Box::pin(run_workflow_at_depth(
             self.server,
             &compiled,
             project_dir,
             Some(25),
+            child_depth,
         ))
         .await;
-
-        // Unwind the depth counter.
-        if let Some(c) = self.visit_counts.get_mut(depth_key) {
-            *c = c.saturating_sub(1);
-        }
 
         if !sub_result.status.starts_with("completed") {
             bail!(
