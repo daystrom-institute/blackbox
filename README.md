@@ -302,15 +302,20 @@ Five providers at parity: Claude (`.jsonl`), Codex (`.jsonl`), Gemini (`.json` s
 Protocol-level orchestration: define a workflow as a mermaid state-diagram plus actor/node metadata, then dispatch it. The daemon owns the loop; the CLI is a courier. Intended as the replacement for long skill-prose protocols (overmind, crucible) that required the top-most LLM to cosplay a state machine across hundreds of turns.
 
 ```bash
-bro orchestrate run <workflow.json> [--project-dir <path>] [--max-steps N] [--dry-run]
+bro orchestrate run <workflow.json> [--project-dir <path>] [--max-steps N] [--dry-run] [--stream]
 bro orchestrate status <thread-id>
+bro orchestrate list [--limit N]
+bro orchestrate peek [<thread-id>]
 ```
 
-`run` reads the file, POSTs it to the daemon's `/orchestrate` endpoint, blocks until the workflow terminates, then prints the event log and per-node outputs. Long workflows are fine — the HTTP client times out at 1 hour. `--dry-run` validates the spec without dispatching anything and prints the plan.
+- **`run`** — reads the file, POSTs to `/orchestrate` (or `/orchestrate/stream` with `--stream`), blocks until termination or streams events live. `--dry-run` validates the spec + prints the plan without dispatching.
+- **`status <thread-id>`** — fetches the notes posted to the arc's thread over its lifetime + the most recent compaction anchor. Post-hoc audit trail.
+- **`list`** — recent workflow arcs with final status + latest anchor. Catalog view.
+- **`peek [<thread-id>]`** — live in-flight state: current node, completed/in-flight/visit counts. Without an id, dumps every live arc snapshot.
 
-`status` fetches the notes posted to the arc's thread over its lifetime + the most recent compaction anchor — inspectable audit trail for any arc that was ever run.
+MCP tools: `bro_orchestrate_run` dispatches a workflow. `bro_orchestrate_author` compiles a prose charter into a validated workflow spec via an authoring LLM, closing the authoring loop (operators describe arcs in prose, get a spec back, dispatch).
 
-Every `run` opens a `bbox_thread(kind=work_item)` automatically; the returned `arc_thread_id` makes the arc discoverable via `bbox_inbox`, `bbox_notes`, `bbox_thread_list`. Sub-workflows open their own threads; you get a tree of arcs without any additional bookkeeping.
+Every `run` opens a `bbox_thread(kind=work_item)` automatically; the returned `arc_thread_id` makes the arc discoverable via `bbox_inbox`, `bbox_notes`, `bbox_thread_list`. Sub-workflows open their own threads; you get a tree of arcs without any additional bookkeeping. The rolling `ANCHOR` compaction notes at each boundary let observers reconstruct state without reading every event.
 
 **Why the daemon owns the loop.** An LLM maintaining workflow state across turns drifts: forgets phases, re-litigates settled decisions, invents new steps to paper over mistakes, dies on context compaction. A CLI-driven loop doesn't — it has no context to forget. LLMs become stateless function calls dispatched *into* the loop rather than the loop's substrate.
 
@@ -397,7 +402,7 @@ A workflow can declare a top-level `policy_packet: <id>`. The engine builds an a
 
 This is the mechanization of the advisor loop: instead of dispatching an LLM at every boundary to read the checkpoint and say `CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET`, compile those rules into a packet once and let them evaluate deterministically. Useful for runaway-visit detectors, time / step ceilings, arc-shape invariants, and any other rule where the LLM's judgment adds latency without adding accuracy.
 
-### What's currently implemented (v0.3)
+### What's currently implemented (v0.4)
 
 - Actor kinds: `executor` (exec+resume), `ensemble` (broadcast+join), `advisor` (executor lens), `user` (pause+note)
 - Graph shapes: sequential edges, `<<choice>>` verdict routing, `<<fork>>` sync-continuation + fire-and-forget branches, back-edges (retry loops)
@@ -411,16 +416,20 @@ This is the mechanization of the advisor loop: instead of dispatching an LLM at 
 - Compaction anchors: rolling `ANCHOR [step N, …]` notes at each boundary summarize arc state for observers that don't want to read every event
 - `--dry-run` validates + summarizes without dispatching
 - `bro orchestrate status <thread-id>` dumps the arc's note trail + latest anchor
+- `bro orchestrate list` catalogs recent arcs; `bro orchestrate peek` shows live state for in-flight arcs
+- `bro orchestrate run --stream` emits SSE events live during the run instead of blocking
 - Workflow-level `policy_packet` — advisor-as-packet, deterministic arc-health rules applied at every boundary
+- Gate-packet modes: `first` (single verdict) or `all` (multi-finding aggregate, lattice-highest classification)
+- `<<join>>` control nodes for synchronous fan-in after fork
+- Parent outputs seeded into sub-workflow runners so sub templates can reference `${ParentNode.output}` identically to siblings
+- `bro_orchestrate_author` MCP tool — prose-charter → validated spec via authoring LLM; auto-retries on compile failure
 
 ### Phase-next
 
-- `<<join>>` control nodes (synchronous fan-in after fork)
-- Review-mode gates (`mode=all` multi-finding aggregation) instead of first-match-wins
-- `bro orchestrate resume <thread-id>` — genuine re-entry at the last recorded step for arcs that paused or errored
-- YAML workflow loader (JSON-only today)
-- Live event streaming (SSE) during `run` instead of block-until-complete
-- Workflow templates on the daemon (referenceable by id instead of inlined per spec)
+- `bro orchestrate resume <thread-id>` — genuine re-entry at the last recorded step for arcs that paused or errored. Needs persistent full-output snapshots to survive daemon restarts.
+- YAML workflow loader (JSON-only today; one-line add once `serde_yaml` is introduced).
+- Workflow templates on the daemon (referenceable by name instead of inlined per spec) — mirrors rule-packet composition via `Apply`. Same shape, one layer up.
+- Auto-prune of `running_arcs` registry + persistence across daemon restarts so `peek` works after a restart.
 
 See [`examples/workflows/`](examples/workflows/README.md) for runnable examples and a deeper walkthrough.
 
