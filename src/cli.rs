@@ -133,6 +133,10 @@ struct OrchestrateRunArgs {
     /// Prints the plan and exits.
     #[arg(long)]
     dry_run: bool,
+    /// Stream events as they happen via SSE instead of blocking until
+    /// completion. Useful for long arcs where you want live progress.
+    #[arg(long)]
+    stream: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -907,7 +911,6 @@ async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
         let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
         format!("http://127.0.0.1:{port}")
     });
-    let url = format!("{}/orchestrate", base_url.trim_end_matches('/'));
     let mut body = serde_json::json!({ "workflow": workflow });
     if let Some(pd) = args.project_dir {
         body["project_dir"] = serde_json::Value::String(pd);
@@ -918,6 +921,12 @@ async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
     if args.dry_run {
         body["dry_run"] = serde_json::Value::Bool(true);
     }
+
+    if args.stream && !args.dry_run {
+        return orchestrate_run_stream(&base_url, &body).await;
+    }
+
+    let url = format!("{}/orchestrate", base_url.trim_end_matches('/'));
     eprintln!("POST {url}");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3600))
@@ -961,6 +970,96 @@ async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn orchestrate_run_stream(
+    base_url: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    let url = format!("{}/orchestrate/stream", base_url.trim_end_matches('/'));
+    eprintln!("POST {url} (streaming)");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()?;
+    let resp = client.post(&url).json(body).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        eprintln!("daemon returned {status}\n{text}");
+        std::process::exit(1);
+    }
+    // Parse SSE: each frame is `data: <json>\n\n`. Buffer chunks and
+    // split on the SSE record separator.
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = find_sse_separator(&buf) {
+            let frame_bytes = buf.drain(..pos + 2).collect::<Vec<_>>();
+            let frame_str = String::from_utf8_lossy(&frame_bytes);
+            for line in frame_str.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    print_stream_event(data);
+                } else if let Some(data) = line.strip_prefix("data:") {
+                    print_stream_event(data.trim_start());
+                }
+            }
+        }
+    }
+    // Any trailing buffer (no terminator) — ignore; complete frames only.
+    Ok(())
+}
+
+fn find_sse_separator(buf: &[u8]) -> Option<usize> {
+    // SSE record terminator is `\n\n`. Some servers use `\r\n\r\n`;
+    // handle both.
+    for i in 0..buf.len().saturating_sub(1) {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+    }
+    for i in 0..buf.len().saturating_sub(3) {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 2);
+        }
+    }
+    None
+}
+
+fn print_stream_event(data: &str) {
+    // Attempt structured parse for pretty output; fall back to raw.
+    match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(ev) => {
+            let kind = ev["kind"].as_str().unwrap_or("?");
+            let ts = ev["timestamp"].as_str().unwrap_or("");
+            if kind == "result" {
+                println!("\n=== terminal ===");
+                let result = &ev["data"];
+                let status = result["status"].as_str().unwrap_or("?");
+                println!("status: {status}");
+                if let Some(arc) = result["arc_thread_id"].as_str() {
+                    println!("arc_thread_id: {arc}");
+                }
+                if let Some(outputs) = result["node_outputs"].as_object() {
+                    for (node, out) in outputs {
+                        let preview: String = out
+                            .as_str()
+                            .unwrap_or("")
+                            .chars()
+                            .take(500)
+                            .collect();
+                        println!("\n─── {node} ───\n{preview}");
+                    }
+                }
+            } else {
+                let data_s = ev["data"].to_string();
+                println!("[{ts}] {kind}: {data_s}");
+            }
+        }
+        Err(_) => println!("{data}"),
+    }
 }
 
 fn main() -> anyhow::Result<()> {

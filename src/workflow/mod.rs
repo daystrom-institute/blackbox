@@ -13,11 +13,11 @@ pub mod engine;
 pub mod mermaid;
 pub mod schema;
 
-pub use engine::{run_workflow, WorkflowRunResult};
+pub use engine::{run_workflow, run_workflow_streaming, WorkflowRunResult};
 pub use mermaid::{parse_mermaid, MermaidGraph, MermaidNodeKind};
 #[cfg(test)]
 pub use mermaid::{MermaidEdge, MermaidNode};
-pub use schema::{load_workflow, ActorKind, ActorSpec, NodeMode, Workflow};
+pub use schema::{load_workflow, ActorKind, ActorSpec, GateMode, NodeMode, Workflow};
 #[cfg(test)]
 pub use schema::{InjectPolicy, LateInject, NodeSpec, RetryPolicy};
 

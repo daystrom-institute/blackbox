@@ -1,0 +1,23 @@
+{
+  "name": "review-mode-demo",
+  "version": 1,
+  "actors": {
+    "author": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    }
+  },
+  "nodes": {
+    "DraftReply": {
+      "actor": "author",
+      "prompt": "Write a 3-sentence technical reply that contains deliberate hedging language ('maybe', 'probably', 'might be') and also includes the word TODO somewhere. No preamble.",
+      "gate": "packet-794dabb9",
+      "gate_mode": "all"
+    },
+    "SelfAssess": {
+      "actor": "author",
+      "prompt": "The review found issues in your reply. In one sentence, acknowledge the findings without defensiveness."
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> DraftReply\n    DraftReply --> SelfAssess\n    SelfAssess --> [*]"
+}

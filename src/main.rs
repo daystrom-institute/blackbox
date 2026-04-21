@@ -247,10 +247,10 @@ impl BlackboxServer {
         Ok(prediction.map(|p| p.classification))
     }
 
-    /// Evaluate a workflow gate packet against a node's output. Returns
-    /// the matching rule's classification (the verdict) when a rule fires,
-    /// `None` when no rule matches (packet has no catchall). Entity shape
-    /// is `{output: <output>, node: <node_id>}` — packet predicates can
+    /// Evaluate a workflow gate packet against a node's output in
+    /// mode=first semantics. Returns the matching rule's classification
+    /// as the verdict, or `None` when no rule fires. Entity shape is
+    /// `{output: <output>, node: <node_id>}` — packet predicates can
     /// reference either field.
     pub fn apply_workflow_gate(
         &self,
@@ -268,6 +268,28 @@ impl BlackboxServer {
         });
         let prediction = apply_packet_with(&packet, &entity, &*packet_store);
         Ok(prediction.map(|p| p.classification))
+    }
+
+    /// Evaluate a workflow gate packet in mode=all — every rule whose
+    /// antecedent holds emits a finding, the aggregate verdict is the
+    /// highest-priority classification in the packet's lattice among
+    /// the findings. Returns the verdict + the findings list so the
+    /// engine can surface the multi-finding shape in arc notes.
+    pub fn apply_workflow_gate_all(
+        &self,
+        packet_id: &str,
+        output: &str,
+        node_id: &str,
+    ) -> Result<packets::ApplyAllResult, String> {
+        let packet_store = self.state.packets.read();
+        let packet = packet_store
+            .load(packet_id)
+            .map_err(|e| format!("loading gate packet {packet_id}: {e:#}"))?;
+        let entity = serde_json::json!({
+            "output": output,
+            "node": node_id,
+        });
+        Ok(packets::apply_all_with(&packet, &entity, &*packet_store))
     }
 
     /// Soft-nag classifier for `bbox_learn`: apply the latest
@@ -3846,6 +3868,59 @@ async fn orchestrate_status_handler(
     .into_response()
 }
 
+async fn orchestrate_stream_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<OrchestrateRequest>,
+) -> axum::response::Sse<
+    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::Event;
+    use axum::response::Sse;
+    let compiled = workflow::compile(req.workflow);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+
+    // Kick off the run on a background task; events stream via tx.
+    tokio::spawn(async move {
+        let state_clone = state.clone();
+        let server = BlackboxServer::new(state_clone);
+        match compiled {
+            Err(e) => {
+                let _ = tx.send(json!({
+                    "kind": "compile_error",
+                    "data": {"message": e.to_string()},
+                    "timestamp": crate::util::now_iso(),
+                }));
+            }
+            Ok(compiled) => {
+                let result = workflow::run_workflow_streaming(
+                    &server,
+                    &compiled,
+                    req.project_dir,
+                    req.max_steps,
+                    tx.clone(),
+                )
+                .await;
+                // Terminal frame: the full result. Clients should
+                // detect `kind: "result"` as end-of-run.
+                let _ = tx.send(json!({
+                    "kind": "result",
+                    "data": result,
+                    "timestamp": crate::util::now_iso(),
+                }));
+            }
+        }
+        // tx dropped here closes the stream.
+    });
+
+    let stream = async_stream::stream! {
+        while let Some(ev) = rx.recv().await {
+            let s = ev.to_string();
+            yield Ok::<_, std::convert::Infallible>(Event::default().data(s));
+        }
+    };
+    Sse::new(stream)
+}
+
 async fn orchestrate_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<OrchestrateRequest>,
@@ -4378,6 +4453,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/tail", axum::routing::get(tail_handler))
         .route("/roster", axum::routing::get(roster_handler))
         .route("/orchestrate", axum::routing::post(orchestrate_handler))
+        .route(
+            "/orchestrate/stream",
+            axum::routing::post(orchestrate_stream_handler),
+        )
         .route(
             "/orchestrate/status",
             axum::routing::get(orchestrate_status_handler),

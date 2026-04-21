@@ -86,6 +86,13 @@ pub struct NodeSpec {
     /// successful return.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// Gate evaluation mode. `first` (default) returns the first rule
+    /// whose antecedent holds. `all` evaluates every rule, aggregates
+    /// findings, and returns the lattice-highest-priority classification
+    /// as verdict — natural for multi-finding review gates where one
+    /// rule firing shouldn't shadow the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_mode: Option<GateMode>,
     /// Sync (caller waits) vs. fire-and-forget (caller advances
     /// immediately). Defaults to sync.
     #[serde(default)]
@@ -107,6 +114,14 @@ pub struct NodeSpec {
     /// brings its own actors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subworkflow: Option<Box<Workflow>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GateMode {
+    #[default]
+    First,
+    All,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

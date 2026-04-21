@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
-use super::{ActorKind, ActorSpec, CompiledWorkflow, MermaidNodeKind, NodeMode};
+use super::{ActorKind, ActorSpec, CompiledWorkflow, GateMode, MermaidNodeKind, NodeMode};
 use crate::orchestration as orch;
 use crate::BlackboxServer;
 
@@ -72,6 +72,56 @@ pub async fn run_workflow(
     max_steps: Option<usize>,
 ) -> WorkflowRunResult {
     run_workflow_at_depth(server, compiled, project_dir, max_steps, 0, HashMap::new()).await
+}
+
+/// Streaming variant: runs the workflow while forwarding every
+/// `log_event` to the provided sender. The final `WorkflowRunResult`
+/// is still returned synchronously so the HTTP handler can emit it
+/// as the terminal SSE frame. Sender is dropped on exit, which
+/// signals end-of-stream to consumers via `recv() -> None`.
+pub async fn run_workflow_streaming(
+    server: &BlackboxServer,
+    compiled: &CompiledWorkflow,
+    project_dir: Option<String>,
+    max_steps: Option<usize>,
+    event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
+) -> WorkflowRunResult {
+    let mut runner = WorkflowRunner::new(
+        server,
+        compiled,
+        project_dir,
+        max_steps.unwrap_or(50),
+        0,
+    );
+    runner.event_sink = Some(event_sink);
+    runner.open_arc_thread();
+    let status = match runner.run().await {
+        Ok(()) => "completed".to_string(),
+        Err(e) => {
+            runner.log_event("error", json!({"message": e.to_string()}));
+            runner.arc_note("blocked", &format!("workflow errored: {e}"));
+            format!("error: {e}")
+        }
+    };
+    let arc_thread_id = runner.arc_thread_id.clone();
+    if matches!(status.as_str(), "completed") {
+        runner.arc_note(
+            "done",
+            &format!(
+                "workflow {} (v{}) completed in {} event(s)",
+                runner.compiled.spec.name,
+                runner.compiled.spec.version,
+                runner.events.len()
+            ),
+        );
+    }
+    WorkflowRunResult {
+        status,
+        events: runner.events,
+        node_outputs: runner.node_outputs,
+        plan: None,
+        arc_thread_id,
+    }
 }
 
 /// Internal entry point that tracks nested-composition depth and
@@ -173,6 +223,11 @@ struct WorkflowRunner<'a> {
     /// recursive `run_workflow_at_depth` calls so a chain of nested
     /// sub-workflows can't silently bypass the ceiling.
     composition_depth: u32,
+    /// Optional live event channel — every `log_event` also sends
+    /// through this sender. Used by the SSE streaming endpoint so
+    /// clients see events as they happen rather than waiting for the
+    /// terminal WorkflowRunResult. None for plain blocking runs.
+    event_sink: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
 }
 
 impl<'a> WorkflowRunner<'a> {
@@ -197,6 +252,7 @@ impl<'a> WorkflowRunner<'a> {
             max_steps,
             arc_thread_id: None,
             composition_depth,
+            event_sink: None,
         }
     }
 
@@ -590,47 +646,105 @@ impl<'a> WorkflowRunner<'a> {
             }
         }
 
-        // Apply the gate packet (if any). The packet's classification
-        // becomes `last_verdict` for the next choice node. Missing or
-        // unresolved packet → verdict stays None (choice will fail
-        // later if one is needed).
+        // Apply the gate packet (if any). Dispatch by gate_mode:
+        // - first (default): one rule's classification becomes verdict
+        // - all: every matching rule produces a finding, verdict is
+        //   the lattice-highest-priority classification across them
         if let Some(packet_id) = spec.gate.as_deref() {
             let output = self
                 .node_outputs
                 .get(node_id)
                 .cloned()
                 .unwrap_or_default();
-            match self.server.apply_workflow_gate(packet_id, &output, node_id) {
-                Ok(verdict) => {
-                    self.last_verdict = verdict.clone();
-                    self.log_event(
-                        "gate_applied",
-                        json!({
-                            "node": node_id,
-                            "packet_id": packet_id,
-                            "verdict": verdict.clone(),
-                        }),
-                    );
-                    let verdict_s = verdict.as_deref().unwrap_or("(no match)");
-                    self.arc_note(
-                        "learned",
-                        &format!(
-                            "gate '{packet_id}' on '{node_id}' → {verdict_s}"
-                        ),
-                    );
+            let mode = spec.gate_mode.clone().unwrap_or_default();
+            match mode {
+                GateMode::First => {
+                    match self.server.apply_workflow_gate(packet_id, &output, node_id) {
+                        Ok(verdict) => {
+                            self.last_verdict = verdict.clone();
+                            self.log_event(
+                                "gate_applied",
+                                json!({
+                                    "node": node_id,
+                                    "packet_id": packet_id,
+                                    "mode": "first",
+                                    "verdict": verdict.clone(),
+                                }),
+                            );
+                            let verdict_s = verdict.as_deref().unwrap_or("(no match)");
+                            self.arc_note(
+                                "learned",
+                                &format!(
+                                    "gate '{packet_id}' on '{node_id}' (first) → {verdict_s}"
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            self.log_event(
+                                "gate_error",
+                                json!({
+                                    "node": node_id,
+                                    "packet_id": packet_id,
+                                    "mode": "first",
+                                    "error": e,
+                                }),
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.log_event(
-                        "gate_error",
-                        json!({
-                            "node": node_id,
-                            "packet_id": packet_id,
-                            "error": e,
-                        }),
-                    );
-                    // Don't halt — gate errors are soft. last_verdict
-                    // stays whatever it was; downstream choice will
-                    // error if a verdict was required.
+                GateMode::All => {
+                    match self
+                        .server
+                        .apply_workflow_gate_all(packet_id, &output, node_id)
+                    {
+                        Ok(result) => {
+                            self.last_verdict = result.verdict.clone();
+                            let finding_previews: Vec<String> = result
+                                .findings
+                                .iter()
+                                .map(|f| {
+                                    let consequent_str = format!("{:?}", f.consequent);
+                                    let preview: String =
+                                        consequent_str.chars().take(80).collect();
+                                    format!("{}[{}]: {preview}", f.classification, f.rule_id)
+                                })
+                                .collect();
+                            self.log_event(
+                                "gate_applied",
+                                json!({
+                                    "node": node_id,
+                                    "packet_id": packet_id,
+                                    "mode": "all",
+                                    "verdict": result.verdict.clone(),
+                                    "finding_count": result.findings.len(),
+                                    "findings": finding_previews.clone(),
+                                }),
+                            );
+                            let verdict_s = result
+                                .verdict
+                                .as_deref()
+                                .unwrap_or("(no match)");
+                            self.arc_note(
+                                "learned",
+                                &format!(
+                                    "gate '{packet_id}' on '{node_id}' (all) → verdict={verdict_s}, {} finding(s): [{}]",
+                                    result.findings.len(),
+                                    finding_previews.join("; ")
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            self.log_event(
+                                "gate_error",
+                                json!({
+                                    "node": node_id,
+                                    "packet_id": packet_id,
+                                    "mode": "all",
+                                    "error": e,
+                                }),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1295,11 +1409,15 @@ impl<'a> WorkflowRunner<'a> {
     }
 
     fn log_event(&mut self, kind: &str, data: Value) {
-        self.events.push(json!({
+        let ev = json!({
             "kind": kind,
             "data": data,
             "timestamp": crate::util::now_iso(),
-        }));
+        });
+        if let Some(tx) = &self.event_sink {
+            let _ = tx.send(ev.clone());
+        }
+        self.events.push(ev);
     }
 }
 
