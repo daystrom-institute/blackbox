@@ -757,7 +757,14 @@ impl Knowledge {
 
         self.store.entries.push(entry);
         self.save()?;
-        Ok(format!("Created entry {id}"))
+        // Signal render-lifecycle state: entries are stored + indexed but NOT
+        // automatically rendered into provider markdown (CLAUDE.md / AGENTS.md /
+        // GEMINI.md). Making this explicit at the call site prevents the
+        // "I learned it but it's not visible to providers yet" gap — the caller
+        // can chain bbox_render or accept deferred rendering consciously.
+        Ok(format!(
+            "Created entry {id} [render_pending=true (call bbox_render to publish to CLAUDE.md/AGENTS.md/GEMINI.md)]"
+        ))
     }
 
     /// Import a knowledge entry from external content. Used by absorb().
