@@ -630,9 +630,21 @@ impl Knowledge {
             Approval::UserConfirmed
         };
 
-        // Update existing entry if id given and found
+        // Update existing entry if id given and found. Snapshot the pre-mutation
+        // state so we can render a one-line diff of changed fields in the return
+        // value — silent-corruption protection for `id` typos that target the
+        // wrong entry. Unchanged fields are omitted from the summary.
         if let Some(id) = p.id.as_deref() {
             if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
+                let old_title = entry.title.clone();
+                let old_content_len = entry.content.len();
+                let old_category = format!("{:?}", entry.category);
+                let old_priority = format!("{:?}", entry.priority);
+                let old_weight = entry.weight;
+                let old_providers = entry.providers.clone();
+                let old_scope = format!("{:?}", entry.scope);
+                let old_project = entry.project.clone();
+
                 entry.content = p.content.clone();
                 entry.title = title;
                 entry.category = category;
@@ -651,8 +663,64 @@ impl Knowledge {
                 if let Some(proj) = p.project.clone() {
                     entry.project = Some(proj);
                 }
+
+                let mut changes: Vec<String> = Vec::new();
+                if old_title != entry.title {
+                    changes.push(format!(
+                        "title: {:?} → {:?}",
+                        truncate_mid(&old_title, 40),
+                        truncate_mid(&entry.title, 40)
+                    ));
+                }
+                let new_content_len = entry.content.len();
+                if old_content_len != new_content_len || p.content != entry.content {
+                    // For content, show the char-count delta. Exact edit-distance
+                    // would require a diff crate; char-count catches the common
+                    // case (wrong-id typo overwriting a long entry with a short one).
+                    changes.push(format!(
+                        "content: {}→{} chars ({:+})",
+                        old_content_len,
+                        new_content_len,
+                        new_content_len as i64 - old_content_len as i64
+                    ));
+                }
+                let new_category = format!("{:?}", entry.category);
+                if old_category != new_category {
+                    changes.push(format!("category: {old_category} → {new_category}"));
+                }
+                let new_priority = format!("{:?}", entry.priority);
+                if old_priority != new_priority {
+                    changes.push(format!("priority: {old_priority} → {new_priority}"));
+                }
+                if old_weight != entry.weight {
+                    changes.push(format!("weight: {} → {}", old_weight, entry.weight));
+                }
+                if old_providers != entry.providers {
+                    changes.push(format!(
+                        "providers: [{}] → [{}]",
+                        old_providers.join(","),
+                        entry.providers.join(",")
+                    ));
+                }
+                let new_scope = format!("{:?}", entry.scope);
+                if old_scope != new_scope {
+                    changes.push(format!("scope: {old_scope} → {new_scope}"));
+                }
+                if old_project != entry.project {
+                    changes.push(format!(
+                        "project: {:?} → {:?}",
+                        old_project.as_deref().unwrap_or("(none)"),
+                        entry.project.as_deref().unwrap_or("(none)")
+                    ));
+                }
+
                 self.save()?;
-                return Ok(format!("Updated entry {id}"));
+                let summary = if changes.is_empty() {
+                    "no-op (all fields unchanged)".to_string()
+                } else {
+                    changes.join(" | ")
+                };
+                return Ok(format!("Updated entry {id} [{summary}]"));
             }
         }
 
@@ -1685,6 +1753,19 @@ fn derive_title(content: &str) -> String {
     }
 }
 
+fn truncate_mid(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max / 2).collect();
+        let tail_chars: Vec<char> = s.chars().collect();
+        let tail: String = tail_chars[tail_chars.len() - (max - max / 2 - 1)..]
+            .iter()
+            .collect();
+        format!("{head}…{tail}")
+    }
+}
+
 fn entry_visible_to(entry: &KnowledgeEntry, provider: &str) -> bool {
     if entry.providers.is_empty() {
         return true; // visible to all
@@ -2485,5 +2566,58 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             )
             .unwrap_err();
         assert!(e.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn learn_update_returns_diff_summary() {
+        let (_t, mut kb) = mk_kb();
+        push_entry(&mut kb, "diffid01", "orig title", "original body text");
+        let out = kb
+            .learn(
+                &LearnParams {
+                    content: "brand new much longer replacement body text with extras".into(),
+                    category: "convention".into(),
+                    title: Some("new title".into()),
+                    scope: Some("project".into()),
+                    project: Some("/tmp/proj".into()),
+                    providers: None,
+                    priority: None,
+                    weight: None,
+                    expires_at: None,
+                    id: Some("diffid01".into()),
+                },
+                false,
+            )
+            .unwrap();
+        assert!(out.starts_with("Updated entry diffid01 ["), "got: {out}");
+        assert!(out.contains("title:"), "title diff missing: {out}");
+        assert!(out.contains("content: 18→55 chars (+37)"), "content diff shape wrong: {out}");
+        assert!(out.contains("category:"), "category diff missing: {out}");
+        // providers did not change → should not appear
+        assert!(!out.contains("providers:"), "unchanged providers leaked: {out}");
+    }
+
+    #[test]
+    fn learn_update_noop_when_nothing_changed() {
+        let (_t, mut kb) = mk_kb();
+        push_entry(&mut kb, "noopid01", "same title", "same body");
+        let out = kb
+            .learn(
+                &LearnParams {
+                    content: "same body".into(),
+                    category: "memory".into(),
+                    title: Some("same title".into()),
+                    scope: Some("project".into()),
+                    project: Some("/tmp/proj".into()),
+                    providers: None,
+                    priority: Some("standard".into()),
+                    weight: Some(100),
+                    expires_at: None,
+                    id: Some("noopid01".into()),
+                },
+                false,
+            )
+            .unwrap();
+        assert!(out.contains("no-op"), "expected no-op summary, got: {out}");
     }
 }
