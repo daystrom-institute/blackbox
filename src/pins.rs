@@ -435,4 +435,141 @@ mod tests {
         assert!(lines[2].contains("session-level"));
         assert!(lines[3].contains("bro-level"));
     }
+
+    #[test]
+    fn project_scoped_pin_does_not_leak_across_projects() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let mut pins = Pins::open(&path).unwrap();
+
+        pins.pin(&PinParams {
+            action: "set".into(),
+            id: None,
+            content: Some("project-X arc guidance".into()),
+            title: Some("arc guidance".into()),
+            scope: Some("bro".into()),
+            target: Some("executor".into()),
+            project: Some("/repo/x".into()),
+            expires_at: None,
+        })
+        .unwrap();
+
+        let leaked = pins.render_for_ambient(&AmbientPinQuery {
+            project: Some("/repo/y"),
+            bro: Some("executor"),
+            session_id: None,
+            thread_id: None,
+            work_item_id: None,
+        });
+        assert!(
+            leaked.is_none(),
+            "project-scoped pin leaked into dispatch for a different project: {leaked:?}"
+        );
+
+        let no_project_query = pins.render_for_ambient(&AmbientPinQuery {
+            project: None,
+            bro: Some("executor"),
+            session_id: None,
+            thread_id: None,
+            work_item_id: None,
+        });
+        assert!(
+            no_project_query.is_none(),
+            "project-scoped pin leaked into dispatch with no project context: {no_project_query:?}"
+        );
+
+        let matching = pins
+            .render_for_ambient(&AmbientPinQuery {
+                project: Some("/repo/x"),
+                bro: Some("executor"),
+                session_id: None,
+                thread_id: None,
+                work_item_id: None,
+            })
+            .expect("matching-project dispatch should inject the pin");
+        assert!(matching.contains("project-X arc guidance"));
+    }
+
+    #[test]
+    fn pin_without_project_matches_any_project_dispatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let mut pins = Pins::open(&path).unwrap();
+
+        pins.pin(&PinParams {
+            action: "set".into(),
+            id: None,
+            content: Some("cross-project arc note".into()),
+            title: Some("cross-project".into()),
+            scope: Some("bro".into()),
+            target: Some("executor".into()),
+            project: None,
+            expires_at: None,
+        })
+        .unwrap();
+
+        for project in [Some("/repo/a"), Some("/repo/b"), None] {
+            let rendered = pins
+                .render_for_ambient(&AmbientPinQuery {
+                    project,
+                    bro: Some("executor"),
+                    session_id: None,
+                    thread_id: None,
+                    work_item_id: None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("project-agnostic pin should match project={project:?}")
+                });
+            assert!(rendered.contains("cross-project arc note"));
+        }
+    }
+
+    #[test]
+    fn ambient_flood_respects_byte_budget_and_shows_truncation_footer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let mut pins = Pins::open(&path).unwrap();
+
+        let long_content = "x".repeat(400);
+        for i in 0..20 {
+            pins.pin(&PinParams {
+                action: "set".into(),
+                id: None,
+                content: Some(format!("{long_content} #{i}")),
+                title: Some(format!("flood-{i}")),
+                scope: Some("bro".into()),
+                target: Some("executor".into()),
+                project: Some("/repo/x".into()),
+                expires_at: None,
+            })
+            .unwrap();
+        }
+
+        let rendered = pins
+            .render_for_ambient(&AmbientPinQuery {
+                project: Some("/repo/x"),
+                bro: Some("executor"),
+                session_id: None,
+                thread_id: None,
+                work_item_id: None,
+            })
+            .expect("flooded pin scope should still render something");
+
+        // Byte budget from MAX_CHARS (2000) plus the truncation footer line.
+        // Allow a small overshoot — the budget check admits one line that
+        // pushes over the threshold only when no line has been included yet.
+        assert!(
+            rendered.len() < 2600,
+            "ambient pin block grew past the byte budget under flood: {} chars",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains("[truncated]"),
+            "flooded pin render missing truncation footer: {rendered}"
+        );
+        assert!(
+            rendered.contains("additional pin(s) not shown"),
+            "truncation footer missing pin-count suffix: {rendered}"
+        );
+    }
 }

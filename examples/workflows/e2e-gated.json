@@ -1,0 +1,27 @@
+{
+  "name": "e2e-gated",
+  "version": 1,
+  "actors": {
+    "haiku": {
+      "kind": "executor",
+      "brofile": "probe-haiku",
+      "durable": true
+    }
+  },
+  "nodes": {
+    "Decide": {
+      "actor": "haiku",
+      "prompt": "Flip a mental coin. Output exactly one word — either YES or NO — in all caps. No other text.",
+      "gate": "packet-05f4ba16"
+    },
+    "Say_Yes": {
+      "actor": "haiku",
+      "prompt": "The coin came up YES. Say one short celebratory sentence. No preamble."
+    },
+    "Say_No": {
+      "actor": "haiku",
+      "prompt": "The coin came up NO. Say one short resigned sentence. No preamble."
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> Decide\n    state Decide_Route <<choice>>\n    Decide --> Decide_Route\n    Decide_Route --> Say_Yes: yes\n    Decide_Route --> Say_No: no\n    Say_Yes --> [*]\n    Say_No --> [*]"
+}

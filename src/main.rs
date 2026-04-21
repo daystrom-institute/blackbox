@@ -12,6 +12,7 @@ mod system_memory;
 mod threads;
 mod tool_docs;
 mod util;
+mod workflow;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -95,6 +96,207 @@ impl BlackboxServer {
             thread_id,
             work_item_id,
         })
+    }
+
+    /// Dispatch an executor node's turn (new session or resume of an
+    /// existing one). Returns the spawned `Task` so the caller can wait
+    /// on it. Duplicates the core of `bro_exec` / `bro_resume` minus the
+    /// MCP-result formatting — used by the workflow engine.
+    pub async fn workflow_dispatch_executor(
+        &self,
+        brofile: &str,
+        prompt: &str,
+        project_dir: Option<&str>,
+        existing_session_id: Option<&str>,
+    ) -> Result<Arc<orch::Task>, String> {
+        let store_dir = self.state.store_dir.clone();
+        let is_resume = existing_session_id.is_some();
+
+        // Always use exec-target resolution. The workflow engine owns
+        // the project_dir; resume just swaps the provider args call.
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
+            self.resolve_exec_target(Some(brofile), None, project_dir)?;
+
+        if is_resume && !provider.supports_resume() {
+            return Err(format!("provider {provider} does not support resume"));
+        }
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let session_id = match existing_session_id {
+            Some(s) => s.to_string(),
+            None if matches!(provider, Provider::Claude) => uuid::Uuid::new_v4().to_string(),
+            None => "pending".to_string(),
+        };
+
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
+            session_id: Some(session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: Some(brofile.to_string()),
+            thread_id: None,
+            work_item_id: None,
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                Some(brofile),
+                Some(session_id.as_str()),
+                None,
+                None,
+            ),
+            completion_contract: None,
+            allow_recursion: false,
+            provider: Some(provider),
+        };
+        let final_prompt = orch::apply_brofile_lens(
+            &orch::apply_ambient(prompt, &ambient_ctx),
+            lens.as_deref(),
+        );
+        let mut args = if is_resume {
+            provider.build_resume_args(&session_id, &final_prompt, exec_opts.as_ref())
+        } else {
+            provider.build_exec_args(
+                &final_prompt,
+                &session_id,
+                cwd.as_deref(),
+                exec_opts.as_ref(),
+            )
+        };
+
+        let dispatch_filters = resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            false,
+            &task_id,
+            brofile_filters.as_ref(),
+        );
+        args.extend(dispatch_filters.args);
+
+        let task = orch::spawn_task(
+            task_id,
+            provider,
+            args,
+            session_id,
+            cwd,
+            env_overrides,
+            store_dir,
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+        );
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        self.record_task_to_bro(brofile, &task);
+        Ok(task)
+    }
+
+    /// Dispatch every member of an ensemble team with the same prompt,
+    /// returning one task per member. Each dispatch goes through
+    /// `workflow_dispatch_executor`, so durable-session reuse + ambient
+    /// context + dispatch filters work uniformly. Unresolved brofiles
+    /// are skipped (logged in the returned error string), not fatal.
+    pub async fn workflow_dispatch_ensemble(
+        &self,
+        team_name: &str,
+        prompt: &str,
+        project_dir: Option<&str>,
+        existing_session_ids: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<(String, Arc<orch::Task>)>, String> {
+        // Scope the team lock narrowly — we only need it to read the
+        // team's current roster. Holding a parking_lot guard across
+        // `.await` makes the resulting future `!Send`, which axum
+        // handler bounds reject. Snapshot + drop.
+        let (members, project_dir_from_team): (Vec<_>, _) = {
+            let _lock = orchestration::team::lock_teams();
+            let team = orchestration::team::load_team(team_name, &self.state.store_dir)
+                .ok_or_else(|| format!("Unknown team: {team_name}"))?;
+            let project_dir_from_team = team.project_dir.clone();
+            let members = team
+                .members
+                .iter()
+                .map(|m| (m.name.clone(), m.brofile.clone()))
+                .collect();
+            (members, project_dir_from_team)
+        };
+        let cwd = project_dir.map(String::from).or(project_dir_from_team);
+        let mut launched = Vec::new();
+        for (member_name, brofile) in &members {
+            let existing = existing_session_ids.get(member_name).cloned();
+            let task = self
+                .workflow_dispatch_executor(
+                    brofile,
+                    prompt,
+                    cwd.as_deref(),
+                    existing.as_deref(),
+                )
+                .await
+                .map_err(|e| format!("member {member_name}: {e}"))?;
+            launched.push((member_name.clone(), task));
+        }
+        Ok(launched)
+    }
+
+    /// Apply a workflow-level policy packet to an arc-state entity.
+    /// Returns the matching rule's classification (verdict) or `None`.
+    pub fn apply_workflow_policy(
+        &self,
+        packet_id: &str,
+        entity: &serde_json::Value,
+    ) -> Result<Option<String>, String> {
+        let packet_store = self.state.packets.read();
+        let packet = packet_store
+            .load(packet_id)
+            .map_err(|e| format!("loading policy packet {packet_id}: {e:#}"))?;
+        let prediction = apply_packet_with(&packet, entity, &*packet_store);
+        Ok(prediction.map(|p| p.classification))
+    }
+
+    /// Evaluate a workflow gate packet against a node's output. Returns
+    /// the matching rule's classification (the verdict) when a rule fires,
+    /// `None` when no rule matches (packet has no catchall). Entity shape
+    /// is `{output: <output>, node: <node_id>}` — packet predicates can
+    /// reference either field.
+    pub fn apply_workflow_gate(
+        &self,
+        packet_id: &str,
+        output: &str,
+        node_id: &str,
+    ) -> Result<Option<String>, String> {
+        let packet_store = self.state.packets.read();
+        let packet = packet_store
+            .load(packet_id)
+            .map_err(|e| format!("loading gate packet {packet_id}: {e:#}"))?;
+        let entity = serde_json::json!({
+            "output": output,
+            "node": node_id,
+        });
+        let prediction = apply_packet_with(&packet, &entity, &*packet_store);
+        Ok(prediction.map(|p| p.classification))
+    }
+
+    /// Soft-nag classifier for `bbox_learn`: apply the latest
+    /// `content-classification/arc-bound` packet (if one is compiled) to the
+    /// entry's content and return a suggestion string when it classifies
+    /// arc-bound. System-generated entries (ids prefixed `bb-`, e.g. the
+    /// regenerated tool reference) are exempt — their content legitimately
+    /// discusses arc-bound patterns in documentation examples. Silent on any
+    /// error; this is steering, not enforcement.
+    fn arc_bound_warning(&self, id: Option<&str>, content: &str) -> Option<String> {
+        if id.is_some_and(|s| s.starts_with("bb-")) {
+            return None;
+        }
+        let packet_store = self.state.packets.read();
+        let packets = packet_store.list_all().ok()?;
+        let packet = packets
+            .into_iter()
+            .find(|pk| pk.domain == "content-classification/arc-bound")?;
+        let entity = serde_json::json!({ "content": content });
+        let prediction = apply_packet_with(&packet, &entity, &*packet_store)?;
+        if prediction.classification == "arc_bound" {
+            Some(format!(
+                "\n\nNote: this content was classified arc-bound by packet {pkt} (rule: {rule}). Active-arc guidance that will not still be correct a year from now usually belongs in `bbox_pin` (scope=work_item/thread/bro/session) rather than `bbox_learn`, where it renders into every unrelated future session's CLAUDE.md. The entry was saved; review and consider pinning instead.",
+                pkt = packet.id,
+                rule = prediction.rule_id
+            ))
+        } else {
+            None
+        }
     }
 
     fn ok_text(text: &str) -> CallToolResult {
@@ -247,7 +449,14 @@ impl BlackboxServer {
         description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically."
     )]
     fn bbox_learn(&self, Parameters(p): Parameters<LearnParams>) -> CallToolResult {
-        Self::run("bbox_learn", || self.state.kb.write().learn(&p, false))
+        Self::run("bbox_learn", || {
+            let warning = self.arc_bound_warning(p.id.as_deref(), &p.content);
+            let result = self.state.kb.write().learn(&p, false)?;
+            Ok(match warning {
+                Some(w) => format!("{result}{w}"),
+                None => result,
+            })
+        })
     }
 
     #[tool(
@@ -3221,6 +3430,98 @@ fn roster_entry_key(entry: &BroRosterEntry) -> String {
     }
 }
 
+/// Request body for POST `/orchestrate`. `workflow` is the parsed
+/// workflow spec; `project_dir` is the working directory to pass to all
+/// dispatched bros; `max_steps` caps the loop (defaults to 50 server-side).
+#[derive(Debug, Deserialize)]
+struct OrchestrateRequest {
+    workflow: workflow::Workflow,
+    #[serde(default)]
+    project_dir: Option<String>,
+    #[serde(default)]
+    max_steps: Option<usize>,
+    /// When true, parse + cross-validate the workflow and return a
+    /// textual plan — do not dispatch any bros. Intended as a pre-flight
+    /// check before the real run.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestrateStatusQuery {
+    thread_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OrchestrateStatusResponse {
+    thread_id: String,
+    notes: Vec<Value>,
+    /// Most recent `ANCHOR [...]` body — the rolling compaction summary
+    /// emitted at each step boundary.
+    latest_anchor: Option<String>,
+}
+
+async fn orchestrate_status_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    Query(q): Query<OrchestrateStatusQuery>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    // Snapshot notes linked to this thread via the raw store.
+    let entries: Vec<Value> = {
+        let store = state.notes.read();
+        store
+            .all()
+            .iter()
+            .filter(|n| n.thread_id.as_deref() == Some(q.thread_id.as_str()))
+            .map(|n| serde_json::to_value(n).unwrap_or_default())
+            .collect()
+    };
+    let latest_anchor = entries
+        .iter()
+        .filter(|e| {
+            e.get("body")
+                .and_then(Value::as_str)
+                .map(|b| b.starts_with("ANCHOR "))
+                .unwrap_or(false)
+        })
+        .max_by_key(|e| {
+            e.get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+        .and_then(|e| e.get("body").and_then(Value::as_str).map(String::from));
+    axum::Json(OrchestrateStatusResponse {
+        thread_id: q.thread_id,
+        notes: entries,
+        latest_anchor,
+    })
+    .into_response()
+}
+
+async fn orchestrate_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<OrchestrateRequest>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let compiled = match workflow::compile(req.workflow) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("compile failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    if req.dry_run {
+        return axum::Json(workflow::engine::dry_run(&compiled)).into_response();
+    }
+    let server = BlackboxServer::new(state);
+    let result = workflow::run_workflow(&server, &compiled, req.project_dir, req.max_steps).await;
+    axum::Json(result).into_response()
+}
+
 async fn roster_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     Query(query): Query<RosterQuery>,
@@ -3729,6 +4030,11 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/tail", axum::routing::get(tail_handler))
         .route("/roster", axum::routing::get(roster_handler))
+        .route("/orchestrate", axum::routing::post(orchestrate_handler))
+        .route(
+            "/orchestrate/status",
+            axum::routing::get(orchestrate_status_handler),
+        )
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 
@@ -3925,5 +4231,296 @@ mod tests {
         assert_eq!(checkpoint.dispute_count, 1);
         assert_eq!(checkpoint.notes.blocked_count, 1);
         assert_eq!(checkpoint.notes.dispute_count, 1);
+    }
+
+    #[test]
+    fn build_team_advisor_init_prompt_includes_charter_halt_exit_and_status_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let team = orchestration::team::Team {
+            name: "migration-team".into(),
+            teamplate: "tp".into(),
+            members: vec![
+                orchestration::team::TeamMember {
+                    name: "executor".into(),
+                    brofile: "codex-exec".into(),
+                    session_id: None,
+                    task_history: vec![],
+                },
+                orchestration::team::TeamMember {
+                    name: "reviewer".into(),
+                    brofile: "claude-review".into(),
+                    session_id: None,
+                    task_history: vec![],
+                },
+            ],
+            advisor: None,
+            project_dir: None,
+            created_at: 0,
+        };
+        let advisor = orchestration::team::TeamAdvisor {
+            name: "lead-advisor".into(),
+            config: orchestration::team::TeamAdvisorConfig {
+                brofile: "advisor-brofile".into(),
+                alias: Some("lead-advisor".into()),
+                charter: "keep the migration honest; reject fake phase boundaries".into(),
+                context: Some("phase 2 of 3".into()),
+                halt_conditions: vec![
+                    "executor invents a phase boundary that masks coupling".into(),
+                    "reviewer rubber-stamps a phase without adversarial read".into(),
+                ],
+                exit_conditions: vec!["all three phases land and are reviewed".into()],
+                packet_id: Some("packet-abcdef12".into()),
+                timeout_seconds: None,
+                mode: orchestration::team::AdvisorMode::Blocking,
+            },
+            session_id: None,
+            task_history: vec![],
+        };
+
+        let prompt = server.build_team_advisor_init_prompt(&team, &advisor);
+
+        // Status schema — load-bearing for orchestrator parsing of advisor output.
+        assert!(
+            prompt.contains("Status: CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET | REPLACE_BRO"),
+            "advisor init prompt missing canonical status schema: {prompt}"
+        );
+        assert!(prompt.contains("Rationale:"), "missing Rationale line");
+        assert!(prompt.contains("Next step:"), "missing Next step line");
+
+        // Charter, context, packet_id round-tripped verbatim.
+        assert!(prompt.contains("keep the migration honest"));
+        assert!(prompt.contains("phase 2 of 3"));
+        assert!(prompt.contains("packet-abcdef12"));
+
+        // Every halt and exit condition must survive as its own bullet.
+        assert!(prompt.contains("- executor invents a phase boundary that masks coupling"));
+        assert!(prompt.contains("- reviewer rubber-stamps a phase without adversarial read"));
+        assert!(prompt.contains("- all three phases land and are reviewed"));
+
+        // Team roster surfaces so the advisor knows who it is steering.
+        assert!(prompt.contains("executor (codex-exec)"));
+        assert!(prompt.contains("reviewer (claude-review)"));
+        assert!(prompt.contains("migration-team"));
+    }
+
+    #[test]
+    fn advisor_checkpoint_serializes_with_packet_entity_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let team = orchestration::team::Team {
+            name: "demo".into(),
+            teamplate: "tp".into(),
+            members: vec![],
+            advisor: None,
+            project_dir: None,
+            created_at: 0,
+        };
+        let checkpoint = server.build_advisor_checkpoint(
+            &team,
+            "wait",
+            &[
+                json!({
+                    "taskId": "task-a",
+                    "status": "completed",
+                    "bro": "exec",
+                    "result": "ok"
+                }),
+                json!({
+                    "taskId": "task-b",
+                    "status": "running",
+                    "bro": "reviewer",
+                    "timed_out": true
+                }),
+            ],
+        );
+        let serialized = serde_json::to_value(&checkpoint).unwrap();
+
+        // Fields the packet evaluator uses as predicate operands. If any of
+        // these drift, every advisor packet in the wild breaks silently.
+        for key in [
+            "wait_kind",
+            "team_name",
+            "total_count",
+            "completed_count",
+            "failed_count",
+            "running_count",
+            "timed_out_count",
+            "blocked_count",
+            "dispute_count",
+            "done_count",
+            "members",
+            "notes",
+        ] {
+            assert!(
+                serialized.get(key).is_some(),
+                "advisor checkpoint missing packet-facing field '{key}': {serialized}"
+            );
+        }
+
+        assert_eq!(serialized["total_count"], 2);
+        assert_eq!(serialized["completed_count"], 1);
+        assert_eq!(serialized["running_count"], 1);
+        assert_eq!(serialized["timed_out_count"], 1);
+    }
+
+    #[test]
+    fn apply_advisor_packet_returns_rule_hit_for_checkpoint_entity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let packet_id = {
+            let store = server.state.packets.read();
+            let result = store
+                .compile(&CompileParams {
+                    domain: "advisor/demo-escalate".into(),
+                    classification_lattice: Some(vec![
+                        "escalate".into(),
+                        "continue".into(),
+                    ]),
+                    prefix_inference: Some(
+                        [
+                            ("escalate_".into(), "escalate".into()),
+                            ("continue_".into(), "continue".into()),
+                        ]
+                        .into(),
+                    ),
+                    rules: json!([
+                        {
+                            "id": "escalate_any_blocked",
+                            "antecedent": {"op": "Gt", "field": "blocked_count", "value": 0},
+                            "consequent": "ESCALATE"
+                        },
+                        {
+                            "id": "continue_default",
+                            "classification": "continue",
+                            "emit": "fallback",
+                            "antecedent": {"op": "True"},
+                            "consequent": "CONTINUE"
+                        }
+                    ]),
+                    scope: Some("global".into()),
+                    project: None,
+                    source_ids: None,
+                    rank_table: None,
+                    rank_lookup_key: None,
+                    threshold_table: None,
+                    threshold_lookup_key: None,
+                })
+                .unwrap();
+            // compile() returns "Packet packet-<id> compiled (...)" — extract id.
+            result
+                .split_whitespace()
+                .find(|tok| tok.starts_with("packet-"))
+                .unwrap()
+                .to_string()
+        };
+
+        let team = orchestration::team::Team {
+            name: "t".into(),
+            teamplate: "tp".into(),
+            members: vec![],
+            advisor: None,
+            project_dir: None,
+            created_at: 0,
+        };
+        {
+            let mut notes = server.state.notes.write();
+            notes
+                .create(&NoteParams {
+                    kind: "blocked".into(),
+                    body: "exec is stuck".into(),
+                    task_id: Some("task-x".into()),
+                    session_id: None,
+                    project: None,
+                    thread_id: None,
+                    provider: None,
+                    bro: Some("exec".into()),
+                })
+                .unwrap();
+        }
+        let checkpoint = server.build_advisor_checkpoint(
+            &team,
+            "wait",
+            &[json!({"taskId": "task-x", "status": "running"})],
+        );
+
+        let verdict = server.apply_advisor_packet(&packet_id, &checkpoint).unwrap();
+        assert_eq!(verdict["match"], true);
+        assert_eq!(verdict["ruleId"], "escalate_any_blocked");
+        assert_eq!(verdict["classification"], "escalate");
+    }
+
+    #[test]
+    fn arc_bound_warning_fires_on_residue_and_skips_system_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        {
+            let store = server.state.packets.read();
+            store
+                .compile(&CompileParams {
+                    domain: "content-classification/arc-bound".into(),
+                    classification_lattice: Some(vec!["arc_bound".into(), "standing".into()]),
+                    prefix_inference: Some(
+                        [
+                            ("arc_".into(), "arc_bound".into()),
+                            ("standing_".into(), "standing".into()),
+                        ]
+                        .into(),
+                    ),
+                    rules: json!([
+                        {
+                            "id": "arc_named_migration",
+                            "antecedent": {
+                                "op": "StringContains",
+                                "field": "content",
+                                "needle": "3-tier migration",
+                                "case_insensitive": true
+                            },
+                            "consequent": "ARC_BOUND"
+                        },
+                        {
+                            "id": "standing_catchall",
+                            "classification": "standing",
+                            "emit": "fallback",
+                            "antecedent": {"op": "True"},
+                            "consequent": "STANDING"
+                        }
+                    ]),
+                    scope: Some("global".into()),
+                    project: None,
+                    source_ids: None,
+                    rank_table: None,
+                    rank_lookup_key: None,
+                    threshold_table: None,
+                    threshold_lookup_key: None,
+                })
+                .unwrap();
+        }
+
+        let nag_arc =
+            server.arc_bound_warning(None, "For the 3-tier migration, avoid touching X");
+        assert!(
+            nag_arc
+                .as_deref()
+                .is_some_and(|s| s.contains("arc-bound") && s.contains("bbox_pin")),
+            "arc-bound content should produce a pin-steering nag: {nag_arc:?}"
+        );
+
+        let nag_standing = server.arc_bound_warning(None, "Prefer rustls over openssl");
+        assert!(
+            nag_standing.is_none(),
+            "standing content should not trigger a nag: {nag_standing:?}"
+        );
+
+        let nag_system = server.arc_bound_warning(
+            Some("bb-tool-reference"),
+            "For the 3-tier migration, avoid touching X",
+        );
+        assert!(
+            nag_system.is_none(),
+            "system-generated entries must be exempt from the nag: {nag_system:?}"
+        );
     }
 }

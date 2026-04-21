@@ -51,7 +51,7 @@ rmcp = { version = "1.4", features = ["server", "macros", "transport-streamable-
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # HTTP server (for /tail endpoint outside MCP)
-axum = "0.8"
+axum = { version = "0.8", features = ["macros"] }
 
 # IDs
 uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,46 @@
+{
+  "name": "composition-demo",
+  "version": 1,
+  "actors": {
+    "main": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    }
+  },
+  "nodes": {
+    "Preamble": {
+      "actor": "main",
+      "prompt": "Say in one sentence: 'Invoking a nested workflow for a two-turn exchange.' No preamble."
+    },
+    "SubGreet": {
+      "actor": "main",
+      "subworkflow": {
+        "name": "greet-and-riff-sub",
+        "version": 1,
+        "actors": {
+          "sub_haiku": {
+            "kind": "executor",
+            "brofile": "probe-haiku",
+            "durable": true
+          }
+        },
+        "nodes": {
+          "SubA": {
+            "actor": "sub_haiku",
+            "prompt": "Output exactly: 'Hello from the sub-workflow.' No preamble, no other text."
+          },
+          "SubB": {
+            "actor": "sub_haiku",
+            "prompt": "Now, in the same conversation, riff on what you just said in exactly one sentence. No preamble."
+          }
+        },
+        "graph": "stateDiagram-v2\n    [*] --> SubA\n    SubA --> SubB\n    SubB --> [*]"
+      }
+    },
+    "Closing": {
+      "actor": "main",
+      "prompt": "The nested sub-workflow produced these outputs:\n\n${SubGreet.output}\n\nIn one sentence, summarize what the sub-workflow said. No preamble."
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> Preamble\n    Preamble --> SubGreet\n    SubGreet --> Closing\n    Closing --> [*]"
+}

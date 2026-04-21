@@ -4,6 +4,22 @@ Reference configurations that demonstrate how to wire blackbox (`bbox_*` / `bro_
 into the CLIs it orchestrates. Copy / adapt into your own project or agent directories — the
 daemon doesn't read these files, they're just starting points.
 
+## Workflows
+
+JSON specs consumed by `bro orchestrate run`. Each one carries structured metadata plus an embedded `stateDiagram-v2` describing control flow; the daemon cross-validates both halves before any dispatch.
+
+| File | Purpose |
+|---|---|
+| [`workflows/e2e-smoke.json`](workflows/e2e-smoke.json) | Minimal two-turn durable-actor probe. Proves the pipeline end-to-end — same bro session across both nodes, prompt substitution between turns. |
+| [`workflows/e2e-gated.json`](workflows/e2e-gated.json) | Gate packet + `<<choice>>` node routing to one of two branches based on the gate's verdict. Unpicked branches never dispatch. |
+| [`workflows/e2e-async-review.json`](workflows/e2e-async-review.json) | `<<fork>>` + `fire_and_forget` + `late_inject` — optimistic async-steering where a background reviewer's output joins a downstream node at its entry. |
+| [`workflows/e2e-composition.json`](workflows/e2e-composition.json) | Sub-workflow as a node. Parent arc embeds a full workflow inline; the sub-arc opens its own `bbox_thread` and its output flows back into the parent. |
+| [`workflows/e2e-policy.json`](workflows/e2e-policy.json) | Workflow-level policy packet — rule-packet applied to the arc's own state at every boundary. Halts, escalates, or warns based on the packet's verdict. "Advisor as packet" without any LLM in the decision loop. |
+| [`workflows/optimistic.json`](workflows/optimistic.json) | Ensemble version of the async-review pattern — needs an ensemble team on the daemon. |
+| [`workflows/blind.json`](workflows/blind.json) | Blind converge-then-execute pattern — needs an ensemble team on the daemon. |
+
+See [`workflows/README.md`](workflows/README.md) for the authoring guide, the mermaid subset the parser accepts, and the common traps.
+
 ## Agents
 
 Drop-in subagent definitions for Claude Code. Install by copying into

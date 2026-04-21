@@ -1,0 +1,34 @@
+{
+  "name": "e2e-async-review",
+  "version": 1,
+  "actors": {
+    "haiku": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    },
+    "reviewer": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    }
+  },
+  "nodes": {
+    "P1": {
+      "actor": "haiku",
+      "prompt": "Output exactly one sentence confirming phase 1 is done. No preamble."
+    },
+    "Background_Review": {
+      "actor": "reviewer",
+      "prompt": "Write a short haiku (3 lines, 5-7-5) about patience. Output only the haiku, no preamble or commentary.",
+      "mode": "fire_and_forget"
+    },
+    "P2": {
+      "actor": "haiku",
+      "prompt": "Phase 2 is starting. Meanwhile a reviewer wrote:\n\n${Background_Review.output}\n\nIn exactly two sentences: (1) confirm phase 2 is done, (2) quote the middle line of the reviewer's haiku verbatim. No preamble.",
+      "late_inject": {
+        "from": "Background_Review",
+        "policy": "resume_on_return"
+      }
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> P1\n    state fork_phase1 <<fork>>\n    P1 --> fork_phase1\n    fork_phase1 --> P2\n    fork_phase1 --> Background_Review\n    Background_Review --> P2: late-inject\n    P2 --> [*]"
+}

@@ -148,7 +148,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
         summary: "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically.",
-        when_to_use: "Use for standing user rules that must outlive the current edit. Not for one-off task constraints, not for facts you discovered yourself, and not for active-arc guidance like migration sequencing, executor charters, or 'for this initiative' instructions. Those belong in `bbox_pin` if they need to stay hot, or `bbox_remember` if they only need cold recall. Query `bbox_knowledge` first to avoid duplicate entries. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
+        when_to_use: "Use for standing user rules that must outlive the current edit AND would still be correct a year from now with all current arcs complete. Anti-trigger: content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing — that's arc-bound; route to `bbox_pin`. Not for one-off task constraints, not for facts you discovered yourself (that's `bbox_note(kind=\"learned\")`). Query `bbox_knowledge` first to avoid duplicate entries. See `sm-persistence-taxonomy` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
         ),
@@ -175,7 +175,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_pin",
         category: ToolCategory::Knowledge,
         summary: "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope.",
-        when_to_use: "Use for active-arc guidance that should stay hot for one execution lane without becoming standing repo policy: migration phase notes, bounded executor charters, current-initiative sequencing, or temporary reviewer context. Prefer `bbox_pin` over `bbox_learn` when the guidance is supposed to disappear with the session/arc rather than bind future unrelated agents. See `sm-scoped-pins` via `bbox_knowledge` for the deeper split.",
+        when_to_use: "Use for active-arc guidance that should stay hot for one execution lane without becoming standing repo policy: migration phase notes, bounded executor charters, current-initiative sequencing, or temporary reviewer context. Prefer `bbox_pin` over `bbox_learn` when the guidance is supposed to disappear with the session/arc rather than bind future unrelated agents. Self-inspection: `bbox_pin(action=\"list\")` with scope/target/project filters returns your active anchors — pins are not surfaced via `bbox_knowledge`, so `list` is the only read path. See `sm-scoped-pins` via `bbox_knowledge` for the deeper split.",
         example: Some(
             r#"bbox_pin(action="set", scope="bro", target="executor", project="/repo/x", title="Active arc", content="For the current migration, validate every phase cut against the canonical scoping doc before proposing code changes.")"#,
         ),
@@ -465,9 +465,13 @@ from transcript history.
 
 - List before create.
 - `bro_exec` starts fresh; `bro_resume` continues.
-- `bbox_learn` is for user-stated standing rules; `bbox_note(kind=learned)` is \
-for agent-discovered facts; `bbox_pin` is for active-arc context that should \
-stay hot for one execution lane without becoming standing policy.
+- Memory lanes: `bbox_thread` (investigation state), \
+`bbox_learn`/`bbox_decide` (standing rules / commitments), \
+`bbox_remember` (cold grep-able facts), `bbox_pin` (arc-bound hot context). \
+The one-year test picks between rendered and pin — would it still be correct \
+a year from now with current arcs done?
+- `bbox_learn` is for user-stated rules; `bbox_note(kind=learned)` is for \
+agent-discovered facts.
 ";
 
 fn system_memory_hint(doc: &ToolDoc) -> Option<String> {
@@ -530,7 +534,12 @@ pub fn render_markdown() -> String {
     out.push_str("## CORE RULE: capture durable user directives\n\n");
     out.push_str("**When the user states a rule, convention, or preference meant to bind future sessions, your response MUST include a `bbox_learn` (or `bbox_remember` / `bbox_decide`) call BEFORE you wrap up the task.** Mechanical enforcement — a `.gitignore` entry, a linter config, deleted code, a removed dependency — does not replace this. It enforces the rule for the current edit; it does NOT transmit the *intent* to a future session that won't see this turn. Skipping the call means the rule silently rots and a future agent re-derives the wrong answer.\n\n");
     out.push_str("Triggers (positive and negative bind equally): \"from now on\", \"always X\", \"never X\", \"we (don't) use Y\", \"prefer Y\", \"X is banned / retired / out of scope\", \"stop using X\", \"no more X\", \"house rule\", \"standing order\", \"keep X out of\", \"X must not\".\n\n");
-    out.push_str("Scope test before emitting: would the statement still matter after this edit is reverted or forgotten? If yes, store it. If no (\"for this fix, skip tests\", \"just for today\"), don't — that's an ephemeral task constraint, not a standing rule. If it needs to stay hot only for one active session, bro, thread, or work item, use `bbox_pin` instead of promoting it into rendered memory.\n\n");
+    out.push_str("Lane selection — once you've decided the content should persist, walk the ladder and stop at the first yes:\n\n");
+    out.push_str("1. Is this investigation state tied to one debug/QC walk? → `bbox_thread`\n");
+    out.push_str("2. Would the statement still be correct a year from now with all current arcs complete? → `bbox_learn` or `bbox_decide`\n");
+    out.push_str("3. Is it a cold searchable fact worth grepping for later but not worth every session loading? → `bbox_remember`\n");
+    out.push_str("4. Otherwise — arc-bound guidance that must stay hot for one execution lane — → `bbox_pin`\n\n");
+    out.push_str("The one-year test at step 2 is the load-bearing filter. Content naming a specific migration, phase, active arc, current initiative, or \"finish X before Y\" sequencing fails it and belongs in `bbox_pin`, not `bbox_learn`. Ephemeral task constraints (\"for this fix, skip tests\", \"just for today\") don't get persisted at all.\n\n");
     out.push_str("After implementing any user directive in code/config, explicitly ask yourself: did the user just state a standing rule? If yes, emit the storage call before replying.\n\n");
 
     out.push_str("**Scope selection.** Default to `project` for repo-local conventions. Choose `global` only when the user's phrasing explicitly reaches beyond this repo — \"across every project\", \"on every machine\", \"in every X I write\", \"I always X as a personal rule\", \"house rule on this machine\". Technology-scoped but project-agnostic statements (\"in all Rust code I write\", \"always prefer fd over find\") are `global`. Strong wording alone is not enough — \"we always use tokio here\" stays `project`. Presence of a current project does not imply `project` scope when the user states a cross-project personal rule. If both readings are plausible, choose `project`.\n\n");

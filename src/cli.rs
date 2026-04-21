@@ -71,6 +71,56 @@ struct BroCli {
 enum BroCommand {
     /// Multi-lane transcript tail for agent orchestration
     Tail(TailArgs),
+    /// Workflow orchestration — drive a mermaid-shaped flow through the daemon
+    Orchestrate(OrchestrateArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Subcommands:\n  run <workflow.json>    dispatch a workflow and print event log"
+)]
+struct OrchestrateArgs {
+    #[command(subcommand)]
+    command: OrchestrateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum OrchestrateCommand {
+    /// Load a workflow spec, POST it to the daemon, print the event log
+    Run(OrchestrateRunArgs),
+    /// Read an arc thread's note trail + latest compaction anchor
+    Status(OrchestrateStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct OrchestrateStatusArgs {
+    /// Arc thread ID (e.g. `thread-9e03d596`). Returned by the earlier
+    /// `run` invocation as `arc_thread_id`.
+    #[arg(value_name = "THREAD_ID")]
+    thread_id: String,
+    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct OrchestrateRunArgs {
+    /// Path to the workflow JSON file.
+    #[arg(value_name = "WORKFLOW_JSON")]
+    path: std::path::PathBuf,
+    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    #[arg(long)]
+    url: Option<String>,
+    /// Working directory passed to every dispatched bro.
+    #[arg(long)]
+    project_dir: Option<String>,
+    /// Cap on activity-node steps. Defaults to 50 server-side.
+    #[arg(long)]
+    max_steps: Option<usize>,
+    /// Validate + summarize the workflow without dispatching any bros.
+    /// Prints the plan and exits.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -717,15 +767,153 @@ struct App {
 
 // ── Entry point ─────────────────────────────────────────────────────
 
+async fn run_orchestrate(args: OrchestrateArgs) -> anyhow::Result<()> {
+    match args.command {
+        OrchestrateCommand::Run(run_args) => orchestrate_run(run_args).await,
+        OrchestrateCommand::Status(status_args) => orchestrate_status(status_args).await,
+    }
+}
+
+async fn orchestrate_status(args: OrchestrateStatusArgs) -> anyhow::Result<()> {
+    let base_url = args.url.unwrap_or_else(|| {
+        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
+        format!("http://127.0.0.1:{port}")
+    });
+    let url = format!(
+        "{}/orchestrate/status?thread_id={}",
+        base_url.trim_end_matches('/'),
+        urlencoding_lite(&args.thread_id)
+    );
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        eprintln!("daemon returned {status}");
+        eprintln!("{text}");
+        std::process::exit(1);
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    println!("arc thread: {}", parsed["thread_id"].as_str().unwrap_or("?"));
+    if let Some(anchor) = parsed["latest_anchor"].as_str() {
+        println!();
+        println!("latest anchor:");
+        println!("  {anchor}");
+    }
+    println!();
+    println!("notes:");
+    if let Some(notes) = parsed["notes"].as_array() {
+        for n in notes {
+            let kind = n["kind"].as_str().unwrap_or("?");
+            let body = n["body"].as_str().unwrap_or("");
+            let ts = n["created_at"].as_str().unwrap_or("");
+            let id = n["id"].as_str().unwrap_or("?");
+            let resolution = n["resolution"].as_str().unwrap_or("?");
+            println!("  [{ts}] {id} {kind}/{resolution}");
+            for line in body.lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Minimal RFC 3986 component-encoder for the one query param we send
+/// (`thread_id` — already in canonical `thread-<8hex>` form but defensive
+/// encoding costs nothing).
+fn urlencoding_lite(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                vec![c]
+            } else {
+                format!("%{:02X}", c as u32)
+                    .chars()
+                    .collect::<Vec<_>>()
+            }
+        })
+        .collect()
+}
+
+async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let workflow_raw = std::fs::read_to_string(&args.path)
+        .with_context(|| format!("reading {}", args.path.display()))?;
+    let workflow: serde_json::Value = serde_json::from_str(&workflow_raw)
+        .with_context(|| format!("parsing {} as JSON", args.path.display()))?;
+    let base_url = args.url.unwrap_or_else(|| {
+        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
+        format!("http://127.0.0.1:{port}")
+    });
+    let url = format!("{}/orchestrate", base_url.trim_end_matches('/'));
+    let mut body = serde_json::json!({ "workflow": workflow });
+    if let Some(pd) = args.project_dir {
+        body["project_dir"] = serde_json::Value::String(pd);
+    }
+    if let Some(ms) = args.max_steps {
+        body["max_steps"] = serde_json::Value::from(ms);
+    }
+    if args.dry_run {
+        body["dry_run"] = serde_json::Value::Bool(true);
+    }
+    eprintln!("POST {url}");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()?;
+    let resp = client.post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        eprintln!("daemon returned {status}");
+        eprintln!("{text}");
+        std::process::exit(1);
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| "daemon returned non-JSON response")?;
+    println!("status: {}", parsed["status"].as_str().unwrap_or("?"));
+    println!();
+    if let Some(plan) = parsed["plan"].as_str() {
+        println!("{plan}");
+        return Ok(());
+    }
+    if let Some(events) = parsed["events"].as_array() {
+        for ev in events {
+            let kind = ev["kind"].as_str().unwrap_or("?");
+            let ts = ev["timestamp"].as_str().unwrap_or("");
+            let data = ev["data"].to_string();
+            println!("[{ts}] {kind}: {data}");
+        }
+    }
+    println!();
+    if let Some(outputs) = parsed["node_outputs"].as_object() {
+        for (node, output) in outputs {
+            let preview: String = output
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(500)
+                .collect();
+            println!("─── {node} ───");
+            println!("{preview}");
+            println!();
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = BroCli::parse();
+    let rt = tokio::runtime::Runtime::new()?;
+
     let sel = match cli.command {
         BroCommand::Tail(args) => TailSelectors::from(args),
+        BroCommand::Orchestrate(args) => {
+            let result = rt.block_on(run_orchestrate(args));
+            drop(rt);
+            return result;
+        }
     };
 
-    // Tokio runtime stays alive for the TUI's lifetime: the SSE subscriber
-    // task runs on it continuously.
-    let rt = tokio::runtime::Runtime::new()?;
     let roster = match rt.block_on(fetch_roster(sel.clone())) {
         Ok(r) => r,
         Err(e) => {
@@ -824,7 +1012,9 @@ mod tests {
             "gemini",
         ]);
 
-        let BroCommand::Tail(args) = cli.command;
+        let BroCommand::Tail(args) = cli.command else {
+            panic!("expected Tail command");
+        };
         let sel = TailSelectors::from(args);
         assert_eq!(sel.bros, vec!["solo", "alpha", "beta"]);
         assert_eq!(sel.teams, vec!["red", "blue"]);
@@ -835,7 +1025,9 @@ mod tests {
     #[test]
     fn clap_preserves_scoped_bro_selectors() {
         let cli = BroCli::parse_from(["bro", "tail", "--bro", "red::reviewer"]);
-        let BroCommand::Tail(args) = cli.command;
+        let BroCommand::Tail(args) = cli.command else {
+            panic!("expected Tail command");
+        };
         let sel = TailSelectors::from(args);
         assert_eq!(sel.bros, vec!["red::reviewer"]);
     }

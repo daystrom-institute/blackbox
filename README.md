@@ -297,6 +297,135 @@ Five providers at parity: Claude (`.jsonl`), Codex (`.jsonl`), Gemini (`.json` s
 
 ---
 
+## `bro orchestrate` — workflow engine
+
+Protocol-level orchestration: define a workflow as a mermaid state-diagram plus actor/node metadata, then dispatch it. The daemon owns the loop; the CLI is a courier. Intended as the replacement for long skill-prose protocols (overmind, crucible) that required the top-most LLM to cosplay a state machine across hundreds of turns.
+
+```bash
+bro orchestrate run <workflow.json> [--project-dir <path>] [--max-steps N] [--dry-run]
+bro orchestrate status <thread-id>
+```
+
+`run` reads the file, POSTs it to the daemon's `/orchestrate` endpoint, blocks until the workflow terminates, then prints the event log and per-node outputs. Long workflows are fine — the HTTP client times out at 1 hour. `--dry-run` validates the spec without dispatching anything and prints the plan.
+
+`status` fetches the notes posted to the arc's thread over its lifetime + the most recent compaction anchor — inspectable audit trail for any arc that was ever run.
+
+Every `run` opens a `bbox_thread(kind=work_item)` automatically; the returned `arc_thread_id` makes the arc discoverable via `bbox_inbox`, `bbox_notes`, `bbox_thread_list`. Sub-workflows open their own threads; you get a tree of arcs without any additional bookkeeping.
+
+**Why the daemon owns the loop.** An LLM maintaining workflow state across turns drifts: forgets phases, re-litigates settled decisions, invents new steps to paper over mistakes, dies on context compaction. A CLI-driven loop doesn't — it has no context to forget. LLMs become stateless function calls dispatched *into* the loop rather than the loop's substrate.
+
+### Workflow shape
+
+A workflow file has two halves: structured metadata and an embedded mermaid `stateDiagram-v2`. The daemon parses and cross-validates both before any dispatch.
+
+```json
+{
+  "name": "e2e-smoke",
+  "version": 1,
+  "actors": {
+    "haiku": { "kind": "executor", "brofile": "probe-haiku", "durable": true }
+  },
+  "nodes": {
+    "Greet": { "actor": "haiku", "prompt": "Say hello briefly." },
+    "Riff":  { "actor": "haiku", "prompt": "Riff on: ${Greet.output}" }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> Greet\n    Greet --> Riff\n    Riff --> [*]"
+}
+```
+
+**Actors** declare WHO runs each turn. Four kinds:
+- `executor` — single bro, dispatched via `bro_exec` / `bro_resume`. `durable: true` reuses the same session across every node that invokes this actor.
+- `ensemble` — team broadcast via `bro_broadcast`. Each member runs the same prompt concurrently; the node's output is the labeled concatenation of all member outputs.
+- `advisor` — like executor but conventionally narrower tool surface / persona lens.
+- `user` — human escalation point. Hitting a user node halts the arc with a `blocked` note carrying the prompt; resume is an operator action (currently re-dispatch the workflow with whatever state change resolves the pause; arc-state resume is phase-next).
+
+**Nodes** declare the unit of work. Fields:
+- `actor` (required unless `subworkflow` is set) — references `actors`
+- `prompt` — template with `${NodeName.output}` substitution from earlier nodes (including async sources joined via `late_inject`)
+- `gate` — optional packet ID; applied after the node completes. The packet's classification becomes the verdict for the next choice node.
+- `retry.max_generations` — visit-count ceiling. Each re-entry (including back-edges through choice nodes) bumps the count; exceeding halts the arc. Retry prompts get a `[retry — attempt N, prior gate verdict: X]` prepended automatically.
+- `mode` — `sync` (default) or `fire_and_forget`. Fire-and-forget dispatches and advances without waiting; a downstream node declaring `late_inject` joins it later.
+- `late_inject.from` — name of a source node whose output is folded into this node's prompt at its entry (waits with timeout if still running). Enables the optimistic-review pattern where async steering lands on the next turn boundary.
+- `subworkflow` — full inline workflow spec. When present, the node runs the sub-workflow to completion instead of dispatching an actor; the sub-workflow's node outputs are concatenated (with member labels) and stored as this node's output. Sub-arcs open their own `bbox_thread` so the call tree is fully auditable.
+
+**Graph** is the embedded mermaid. The parser accepts a narrow subset of `stateDiagram-v2`:
+- `[*]` start / end markers
+- `A --> B` sequential edges
+- `A --> B: label` labeled edges (consumed by choice nodes to select by verdict, and by fork nodes to denote async branches)
+- `state X <<choice>>` — routing node; selects the outgoing edge whose label matches the last gate verdict
+- `state X <<fork>>` — dispatches every outgoing edge's target; the first outgoing edge is the sync continuation, the rest are fire-and-forget branches whose handles are held for `late_inject` joins
+- `state X <<join>>` — declared, not yet executed (use `late_inject` for equivalent shapes today)
+- `%%` comments
+
+The graph is cross-validated against the metadata: every activity node in the graph must have a matching `nodes[...]` entry, every `nodes[...]` entry must be reachable in the graph, every `actor` reference must resolve (unless the node is a subworkflow), every `late_inject.from` must reference a real node, every fork must have at least 2 outgoing edges, and embedded sub-workflows compile recursively so errors surface at parent-compile time. Every gate packet reference is resolved at dispatch time.
+
+### Gate-driven branching
+
+A workflow branches by compiling a rule-packet whose classifications match edge labels on a choice node:
+
+```json
+"Decide": {
+  "actor": "haiku",
+  "prompt": "Output exactly YES or NO.",
+  "gate": "packet-05f4ba16"
+},
+"Say_Yes": { "actor": "haiku", "prompt": "Celebrate briefly." },
+"Say_No":  { "actor": "haiku", "prompt": "Sigh briefly." }
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Decide
+    state Decide_Route <<choice>>
+    Decide --> Decide_Route
+    Decide_Route --> Say_Yes: yes
+    Decide_Route --> Say_No: no
+    Say_Yes --> [*]
+    Say_No --> [*]
+```
+
+After `Decide` completes, its output is handed to `packet-05f4ba16` (a packet with lattice `["yes", "no"]`). The packet's classification becomes the verdict; the choice node `Decide_Route` picks whichever outgoing edge label matches. Back-edges in the graph become natural retry loops, gated on the circuit breaker in `retry.max_generations`.
+
+### Workflow-level policy packets — advisor as packet
+
+A workflow can declare a top-level `policy_packet: <id>`. The engine builds an arc-state entity at each node boundary (`step`, `just_ran`, `next`, `completed`, `completed_count`, `in_flight`, `in_flight_count`, `last_verdict`, `visit_counts`) and applies the packet. The classification is an arc-level verdict:
+
+- `halt` — stop the arc immediately (error exit with the reason on the arc thread)
+- `escalate` — write a `blocked` note to the arc thread, continue
+- `warn` — write a `surprise` note, continue
+- anything else (including the default `continue`) — no-op
+
+This is the mechanization of the advisor loop: instead of dispatching an LLM at every boundary to read the checkpoint and say `CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET`, compile those rules into a packet once and let them evaluate deterministically. Useful for runaway-visit detectors, time / step ceilings, arc-shape invariants, and any other rule where the LLM's judgment adds latency without adding accuracy.
+
+### What's currently implemented (v0.3)
+
+- Actor kinds: `executor` (exec+resume), `ensemble` (broadcast+join), `advisor` (executor lens), `user` (pause+note)
+- Graph shapes: sequential edges, `<<choice>>` verdict routing, `<<fork>>` sync-continuation + fire-and-forget branches, back-edges (retry loops)
+- Gate packets via `bbox_apply` on the packet store; classifications become edge-label matchers
+- Retry ceilings via per-node visit counts + `retry.max_generations`
+- `${NodeName.output}` prompt substitution, including late-bound source outputs
+- `late_inject.from` joins an async source's output into a downstream node's brief at its entry
+- `subworkflow` — fully compositional; nested arcs get their own `bbox_thread`
+- `fire_and_forget` node mode dispatches without blocking
+- Arc-thread persistence: every `run` opens a `bbox_thread(kind=work_item)`; structured notes (`done`, `learned`, `surprise`, `blocked`) trail every major event
+- Compaction anchors: rolling `ANCHOR [step N, …]` notes at each boundary summarize arc state for observers that don't want to read every event
+- `--dry-run` validates + summarizes without dispatching
+- `bro orchestrate status <thread-id>` dumps the arc's note trail + latest anchor
+- Workflow-level `policy_packet` — advisor-as-packet, deterministic arc-health rules applied at every boundary
+
+### Phase-next
+
+- `<<join>>` control nodes (synchronous fan-in after fork)
+- Review-mode gates (`mode=all` multi-finding aggregation) instead of first-match-wins
+- `bro orchestrate resume <thread-id>` — genuine re-entry at the last recorded step for arcs that paused or errored
+- YAML workflow loader (JSON-only today)
+- Live event streaming (SSE) during `run` instead of block-until-complete
+- Workflow templates on the daemon (referenceable by id instead of inlined per spec)
+
+See [`examples/workflows/`](examples/workflows/README.md) for runnable examples and a deeper walkthrough.
+
+---
+
 ## MCP tools reference
 
 ### Transcript search (`bbox_*`)

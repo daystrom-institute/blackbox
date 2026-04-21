@@ -1,0 +1,27 @@
+{
+  "name": "e2e-policy",
+  "version": 1,
+  "policy_packet": "packet-f12544ac",
+  "actors": {
+    "haiku": {
+      "kind": "executor",
+      "brofile": "probe-haiku",
+      "durable": true
+    }
+  },
+  "nodes": {
+    "A": {
+      "actor": "haiku",
+      "prompt": "Output exactly one word: 'Alpha'. No other text."
+    },
+    "B": {
+      "actor": "haiku",
+      "prompt": "Output exactly one word: 'Beta'. No other text."
+    },
+    "C": {
+      "actor": "haiku",
+      "prompt": "Output exactly one word: 'Gamma'. No other text."
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> A\n    A --> B\n    B --> C\n    C --> [*]"
+}
