@@ -59,6 +59,44 @@ stateDiagram-v2
 
 This is the pattern that used to require an LLM cosplaying a state machine to coordinate. Now it's deterministic: fork → async dispatch → sync continuation → join-at-next-turn-boundary.
 
+### `e2e-ensemble-vote.json` — concurrent ensemble dispatch + aggregation
+
+Ensemble actor validation. A moderator poses a question; an `ensemble` actor backed by a team runs both members concurrently via `bro_broadcast`; member outputs are collected (sorted by member name, labeled `── <member> ──`), merged as the node's output, and flow into a downstream synthesizer via `${PanelVote.output}` substitution. Proves `workflow_dispatch_ensemble` + concurrent `JoinSet` wait + stable output ordering + cross-actor template flow all work end-to-end.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PoseQuestion
+    PoseQuestion --> PanelVote
+    PanelVote --> Synthesize
+    Synthesize --> [*]
+```
+
+Requires a team with at least two brofiles. Default in the spec is `ensemble-duo`. Create one on the daemon via:
+
+```
+bro_brofile(action="create", name="probe-haiku-b", provider="claude",
+            model="claude-haiku-4-5-20251001", scope="global")
+bro_team(action="save_template", name="ensemble-duo",
+         members=[{"brofile":"probe-haiku","alias":"haiku-a"},
+                  {"brofile":"probe-haiku-b","alias":"haiku-b"}])
+bro_team(action="create", name="ensemble-duo", template="ensemble-duo")
+```
+
+### `e2e-self-audit.json` — durable-session multi-phase critique
+
+Four-phase self-critique arc: Summarize → IdentifyConcerns (gated, retry ≤ 3) → choice router → SanityCheck. Durable auditor carries context across all turns. The gate packet (`workflow/critique-concreteness`) classifies the critique's structural format — three `CONCERN N` headers with `Issue:` / `Scenario:` / `Fix:` fields — to decide whether the router advances to SanityCheck or back-edges to revise. Good exercise of gate + choice + durable session + back-edge in one arc. Used in the live validation that drove the depth-threading bug fix.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Summarize
+    Summarize --> IdentifyConcerns
+    IdentifyConcerns --> ConcernRouter
+    state ConcernRouter <<choice>>
+    ConcernRouter --> IdentifyConcerns: revise
+    ConcernRouter --> SanityCheck: concrete
+    SanityCheck --> [*]
+```
+
 ### `e2e-composition.json` — sub-workflow as a node
 
 A parent workflow embeds a full sub-workflow via a node's `subworkflow` field. The sub-workflow compiles and validates at parent-compile time; at dispatch time it runs as a unit (opening its own arc thread) and its per-node outputs are concatenated (labeled `sub:<node>`) into the parent node's output, available to downstream template substitutions.

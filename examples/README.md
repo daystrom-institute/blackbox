@@ -15,6 +15,8 @@ JSON specs consumed by `bro orchestrate run`. Each one carries structured metada
 | [`workflows/e2e-async-review.json`](workflows/e2e-async-review.json) | `<<fork>>` + `fire_and_forget` + `late_inject` — optimistic async-steering where a background reviewer's output joins a downstream node at its entry. |
 | [`workflows/e2e-composition.json`](workflows/e2e-composition.json) | Sub-workflow as a node. Parent arc embeds a full workflow inline; the sub-arc opens its own `bbox_thread` and its output flows back into the parent. |
 | [`workflows/e2e-policy.json`](workflows/e2e-policy.json) | Workflow-level policy packet — rule-packet applied to the arc's own state at every boundary. Halts, escalates, or warns based on the packet's verdict. "Advisor as packet" without any LLM in the decision loop. |
+| [`workflows/e2e-ensemble-vote.json`](workflows/e2e-ensemble-vote.json) | Ensemble actor — concurrent team dispatch via `bro_broadcast`, member outputs aggregated into a labeled block, downstream synthesizer consumes the merged panel response. |
+| [`workflows/e2e-self-audit.json`](workflows/e2e-self-audit.json) | Durable-session multi-phase critique arc with gate + choice + back-edge. The live-validation workflow that surfaced the subworkflow depth-threading bug. |
 | [`workflows/optimistic.json`](workflows/optimistic.json) | Ensemble version of the async-review pattern — needs an ensemble team on the daemon. |
 | [`workflows/blind.json`](workflows/blind.json) | Blind converge-then-execute pattern — needs an ensemble team on the daemon. |
 
