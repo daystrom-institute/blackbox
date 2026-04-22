@@ -407,7 +407,11 @@ impl Notes {
         out.push_str(&format!("{} note(s)\n\n", results.len()));
         for n in &results {
             let body_preview = if n.body.len() > 200 {
-                format!("{}…", &n.body[..200])
+                let mut end = 200;
+                while !n.body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &n.body[..end])
             } else {
                 n.body.clone()
             };
@@ -677,6 +681,44 @@ mod tests {
             msg.contains("note-<8hex>"),
             "error should hint at format: {msg}"
         );
+    }
+
+    #[test]
+    fn list_preview_handles_multibyte_boundary() {
+        let (_tmp, mut notes) = mk_store();
+        // Em-dash is 3 bytes; place one so byte 200 lands mid-char.
+        let mut body = "x".repeat(198);
+        body.push('—');
+        body.push_str(&"y".repeat(50));
+        notes
+            .create(&NoteParams {
+                kind: "done".into(),
+                body,
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+
+        let out = notes
+            .list(&NoteListParams {
+                kind: None,
+                project: None,
+                session_id: None,
+                task_id: None,
+                thread_id: None,
+                bro: None,
+                resolution: None,
+                query: None,
+                since: None,
+                limit: None,
+                include_addressed: None,
+            })
+            .unwrap();
+        assert!(out.contains('…'));
     }
 
     #[test]
