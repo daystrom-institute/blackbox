@@ -308,6 +308,7 @@ mod tests {
             &LearnParams {
                 content: "always use bbox_note".into(),
                 category: "convention".into(),
+                format: None,
                 title: Some("note habit".into()),
                 scope: None,
                 project: None,
@@ -315,6 +316,7 @@ mod tests {
                 priority: None,
                 weight: None,
                 expires_at: None,
+                cluster: None,
                 id: None,
             },
             true,

@@ -22,7 +22,12 @@ pub struct LearnParams {
     /// The instruction, fact, or preference
     pub content: String,
     /// Entry category
+    #[schemars(with = "Category")]
     pub category: String,
+    /// Response format: text (default) or json
+    #[serde(default)]
+    #[schemars(with = "Option<ResponseFormat>")]
+    pub format: Option<String>,
     /// Short title (auto-generated if omitted)
     #[serde(default)]
     pub title: Option<String>,
@@ -44,6 +49,9 @@ pub struct LearnParams {
     /// ISO 8601 expiry time
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// Optional subsection heading within the category render block
+    #[serde(default)]
+    pub cluster: Option<String>,
     /// Update existing entry by ID
     #[serde(default)]
     pub id: Option<String>,
@@ -55,6 +63,7 @@ pub struct RememberParams {
     pub content: String,
     /// Category (default: memory)
     #[serde(default)]
+    #[schemars(with = "Option<Category>")]
     pub category: Option<String>,
     /// Short title
     #[serde(default)]
@@ -202,6 +211,7 @@ pub struct DecideParams {
     PartialEq,
     Serialize,
     Deserialize,
+    schemars::JsonSchema,
     strum::EnumString,
     strum::AsRefStr,
     strum::Display,
@@ -227,7 +237,15 @@ impl Scope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Category {
@@ -259,13 +277,63 @@ impl Category {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, strum::EnumString)]
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    schemars::JsonSchema,
+    strum::EnumString,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Priority {
     Critical,
     Standard,
     Supplementary,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ResponseFormat {
+    Text,
+    Json,
+}
+
+impl ResponseFormat {
+    pub fn parse_optional(s: Option<&str>) -> Result<Self> {
+        match s {
+            None => Ok(Self::Text),
+            Some(raw) => raw.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid format: {raw:?} (expected \"text\" or \"json\")"
+                )
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LearnWriteResult {
+    pub id: String,
+    pub action: String,
+    pub rendered: bool,
+    pub render_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub message: String,
 }
 
 impl Priority {
@@ -305,6 +373,8 @@ pub struct KnowledgeEntry {
     pub id: String,
     pub title: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
     #[serde(default)]
     pub variants: HashMap<String, String>, // provider → alternative content
     pub category: Category,
@@ -614,7 +684,7 @@ impl Knowledge {
 
     // ── CRUD ───────────────────────────────────────────────────────
 
-    pub fn learn(&mut self, p: &LearnParams, from_agent: bool) -> Result<String> {
+    pub fn learn_result(&mut self, p: &LearnParams, from_agent: bool) -> Result<LearnWriteResult> {
         let category = Category::from_str(&p.category)
             .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
@@ -622,6 +692,12 @@ impl Knowledge {
         let providers = p.providers.clone().unwrap_or_default();
         let priority = Priority::parse_optional(p.priority.as_deref())?;
         let weight = p.weight.unwrap_or(100);
+        let cluster = p
+            .cluster
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         let now = Self::now_iso();
         let approval = if from_agent {
@@ -637,7 +713,9 @@ impl Knowledge {
         if let Some(id) = p.id.as_deref() {
             if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
                 let old_title = entry.title.clone();
+                let old_content = entry.content.clone();
                 let old_content_len = entry.content.len();
+                let old_cluster = entry.cluster.clone();
                 let old_category = format!("{:?}", entry.category);
                 let old_priority = format!("{:?}", entry.priority);
                 let old_weight = entry.weight;
@@ -646,6 +724,7 @@ impl Knowledge {
                 let old_project = entry.project.clone();
 
                 entry.content = p.content.clone();
+                entry.cluster = cluster.clone();
                 entry.title = title;
                 entry.category = category;
                 entry.priority = priority;
@@ -673,15 +752,26 @@ impl Knowledge {
                     ));
                 }
                 let new_content_len = entry.content.len();
-                if old_content_len != new_content_len || p.content != entry.content {
-                    // For content, show the char-count delta. Exact edit-distance
-                    // would require a diff crate; char-count catches the common
-                    // case (wrong-id typo overwriting a long entry with a short one).
+                if old_content != entry.content {
+                    if old_content_len == new_content_len {
+                        changes.push(format!(
+                            "content: {} chars (body changed, same length)",
+                            new_content_len
+                        ));
+                    } else {
+                        changes.push(format!(
+                            "content: {}→{} chars ({:+})",
+                            old_content_len,
+                            new_content_len,
+                            new_content_len as i64 - old_content_len as i64
+                        ));
+                    }
+                }
+                if old_cluster != entry.cluster {
                     changes.push(format!(
-                        "content: {}→{} chars ({:+})",
-                        old_content_len,
-                        new_content_len,
-                        new_content_len as i64 - old_content_len as i64
+                        "cluster: {:?} → {:?}",
+                        old_cluster.as_deref().unwrap_or("(none)"),
+                        entry.cluster.as_deref().unwrap_or("(none)")
                     ));
                 }
                 let new_category = format!("{:?}", entry.category);
@@ -720,7 +810,15 @@ impl Knowledge {
                 } else {
                     changes.join(" | ")
                 };
-                return Ok(format!("Updated entry {id} [{summary}]"));
+                let message = format!("Updated entry {id} [{summary}]");
+                return Ok(LearnWriteResult {
+                    id: id.to_string(),
+                    action: "updated".to_string(),
+                    rendered: false,
+                    render_pending: true,
+                    summary: Some(summary),
+                    message,
+                });
             }
         }
 
@@ -729,6 +827,7 @@ impl Knowledge {
             id: id.clone(),
             title,
             content: p.content.clone(),
+            cluster,
             variants: HashMap::new(),
             category,
             scope,
@@ -762,9 +861,21 @@ impl Knowledge {
         // GEMINI.md). Making this explicit at the call site prevents the
         // "I learned it but it's not visible to providers yet" gap — the caller
         // can chain bbox_render or accept deferred rendering consciously.
-        Ok(format!(
+        let message = format!(
             "Created entry {id} [render_pending=true (call bbox_render to publish to CLAUDE.md/AGENTS.md/GEMINI.md)]"
-        ))
+        );
+        Ok(LearnWriteResult {
+            id,
+            action: "created".to_string(),
+            rendered: false,
+            render_pending: true,
+            summary: None,
+            message,
+        })
+    }
+
+    pub fn learn(&mut self, p: &LearnParams, from_agent: bool) -> Result<String> {
+        self.learn_result(p, from_agent).map(|result| result.message)
     }
 
     /// Import a knowledge entry from external content. Used by absorb().
@@ -784,6 +895,7 @@ impl Knowledge {
             id: id.clone(),
             title,
             content,
+            cluster: None,
             variants: HashMap::new(),
             category,
             scope,
@@ -830,6 +942,7 @@ impl Knowledge {
             id: id.clone(),
             title,
             content: p.content.clone(),
+            cluster: None,
             variants: HashMap::new(),
             category,
             scope,
@@ -898,6 +1011,7 @@ impl Knowledge {
             id: id.clone(),
             title,
             content: p.content.clone(),
+            cluster: None,
             variants: HashMap::new(),
             category: Category::Decision,
             scope,
@@ -1105,8 +1219,9 @@ impl Knowledge {
                 } else {
                     String::new()
                 };
+                let excerpt = knowledge_excerpt(&e.content, KNOWLEDGE_EXCERPT_BYTES);
                 format!(
-                    "[{}] {:?}/{} | {} | {}{}{}{}{}\n  {}",
+                    "[{}] {:?}/{} | {} | {}{}{}{}{}\n  content_bytes={}\n  {}",
                     e.id,
                     e.category,
                     e.scope,
@@ -1116,15 +1231,8 @@ impl Knowledge {
                     render_mark,
                     decay_mark,
                     query_line,
-                    if e.content.len() > 120 {
-                        let mut end = 120;
-                        while end > 0 && !e.content.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        format!("{}...", &e.content[..end])
-                    } else {
-                        e.content.clone()
-                    }
+                    e.content.len(),
+                    excerpt
                 )
             })
             .collect();
@@ -1354,9 +1462,14 @@ impl Knowledge {
             let heading = cat.heading();
             if let Some(entries) = by_category.get(heading) {
                 let mut sorted = entries.clone();
-                sorted.sort_by_key(|e| e.weight);
+                sorted.sort_by(|a, b| {
+                    a.weight
+                        .cmp(&b.weight)
+                        .then_with(|| a.title.cmp(&b.title))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
                 md.push_str(&format!("## {}\n\n", heading));
-                render_entries(&sorted, provider, md);
+                render_entries_grouped(&sorted, provider, md);
                 md.push('\n');
             }
         }
@@ -1749,6 +1862,8 @@ impl Knowledge {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
+const KNOWLEDGE_EXCERPT_BYTES: usize = 120;
+
 /// Derive a short display title from entry content: first ~60 chars,
 /// truncated at a UTF-8 boundary, with an ellipsis when we had to cut.
 fn derive_title(content: &str) -> String {
@@ -1771,6 +1886,21 @@ fn truncate_mid(s: &str, max: usize) -> String {
             .collect();
         format!("{head}…{tail}")
     }
+}
+
+fn knowledge_excerpt(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+
+    let mut end = max_bytes.min(content.len());
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let excerpt = &content[..end];
+    let remaining_chars = content[end..].chars().count();
+    format!("{excerpt}... [{remaining_chars} more chars]")
 }
 
 fn entry_visible_to(entry: &KnowledgeEntry, provider: &str) -> bool {
@@ -1817,6 +1947,31 @@ fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String)
         out.push_str(content);
         out.push_str("\n\n");
         out.push_str(&format!("<!-- /bb:entry={} -->\n", entry.id));
+    }
+}
+
+fn render_entries_grouped(entries: &[&KnowledgeEntry], provider: &str, out: &mut String) {
+    let mut unclustered = Vec::new();
+    let mut clustered: std::collections::BTreeMap<&str, Vec<&KnowledgeEntry>> =
+        std::collections::BTreeMap::new();
+
+    for entry in entries {
+        match entry.cluster.as_deref() {
+            Some(cluster) if !cluster.trim().is_empty() => {
+                clustered.entry(cluster).or_default().push(*entry);
+            }
+            _ => unclustered.push(*entry),
+        }
+    }
+
+    if !unclustered.is_empty() {
+        render_entries(&unclustered, provider, out);
+    }
+
+    for (cluster, grouped) in clustered {
+        out.push_str(&format!("### {}\n\n", cluster));
+        render_entries(&grouped, provider, out);
+        out.push('\n');
     }
 }
 
@@ -2152,6 +2307,7 @@ body
             id: id.into(),
             title: title.into(),
             content: content.into(),
+            cluster: None,
             variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Project,
@@ -2277,6 +2433,43 @@ body
     }
 
     #[test]
+    fn list_reports_content_bytes_for_complete_entry() {
+        let (_tmp, mut kb) = mk_kb();
+        let content = "short knowledge body";
+        push_entry(&mut kb, "abcd1234", "Short", content);
+
+        let out = kb
+            .list(&KnowledgeListParams {
+                project: Some("/tmp/proj".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .expect("list should succeed");
+
+        assert!(out.contains(&format!("content_bytes={}", content.len())));
+        assert!(out.contains(&format!("\n  {content}")));
+        assert!(!out.contains("more chars]"));
+    }
+
+    #[test]
+    fn list_marks_truncated_entry_with_remaining_chars() {
+        let (_tmp, mut kb) = mk_kb();
+        let content = "x".repeat(KNOWLEDGE_EXCERPT_BYTES + 17);
+        push_entry(&mut kb, "abcd1234", "Long", &content);
+
+        let out = kb
+            .list(&KnowledgeListParams {
+                project: Some("/tmp/proj".into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .expect("list should succeed");
+
+        assert!(out.contains(&format!("content_bytes={}", content.len())));
+        assert!(out.contains("... [17 more chars]"));
+    }
+
+    #[test]
     fn absorb_global_extracts_only_managed_region() {
         let _env_guard = global_env_lock();
         let (_t, mut kb) = mk_kb();
@@ -2321,6 +2514,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             id: id.into(),
             title: title.into(),
             content: content.into(),
+            cluster: None,
             variants: HashMap::new(),
             category: Category::Memory,
             scope: Scope::Global,
@@ -2584,6 +2778,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 &LearnParams {
                     content: "brand new much longer replacement body text with extras".into(),
                     category: "convention".into(),
+                    format: None,
                     title: Some("new title".into()),
                     scope: Some("project".into()),
                     project: Some("/tmp/proj".into()),
@@ -2591,6 +2786,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     priority: None,
                     weight: None,
                     expires_at: None,
+                    cluster: Some("lifecycle rules".into()),
                     id: Some("diffid01".into()),
                 },
                 false,
@@ -2599,9 +2795,40 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert!(out.starts_with("Updated entry diffid01 ["), "got: {out}");
         assert!(out.contains("title:"), "title diff missing: {out}");
         assert!(out.contains("content: 18→55 chars (+37)"), "content diff shape wrong: {out}");
+        assert!(out.contains("cluster:"), "cluster diff missing: {out}");
         assert!(out.contains("category:"), "category diff missing: {out}");
         // providers did not change → should not appear
         assert!(!out.contains("providers:"), "unchanged providers leaked: {out}");
+    }
+
+    #[test]
+    fn learn_update_same_length_body_reports_rewrite_signal() {
+        let (_t, mut kb) = mk_kb();
+        push_entry(&mut kb, "diffid02", "same title", "abcdefghij");
+        let out = kb
+            .learn(
+                &LearnParams {
+                    content: "klmnopqrst".into(),
+                    category: "memory".into(),
+                    format: None,
+                    title: Some("same title".into()),
+                    scope: Some("global".into()),
+                    project: None,
+                    providers: None,
+                    priority: None,
+                    weight: None,
+                    expires_at: None,
+                    cluster: None,
+                    id: Some("diffid02".into()),
+                },
+                false,
+            )
+            .unwrap();
+        assert!(out.starts_with("Updated entry diffid02 ["), "got: {out}");
+        assert!(
+            out.contains("content: 10 chars (body changed, same length)"),
+            "same-length rewrite signal missing: {out}"
+        );
     }
 
     #[test]
@@ -2613,6 +2840,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 &LearnParams {
                     content: "same body".into(),
                     category: "memory".into(),
+                    format: None,
                     title: Some("same title".into()),
                     scope: Some("project".into()),
                     project: Some("/tmp/proj".into()),
@@ -2620,11 +2848,178 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                     priority: Some("standard".into()),
                     weight: Some(100),
                     expires_at: None,
+                    cluster: None,
                     id: Some("noopid01".into()),
                 },
                 false,
             )
             .unwrap();
         assert!(out.contains("no-op"), "expected no-op summary, got: {out}");
+    }
+
+    #[test]
+    fn render_memory_groups_clustered_entries_under_h3_heading() {
+        let (_t, mut kb) = mk_kb();
+        let project = "/tmp/proj";
+        kb.store.entries.push(KnowledgeEntry {
+            id: "flat0001".into(),
+            title: "Flat rule".into(),
+            content: "flat body".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: Some(project.into()),
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 10,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        });
+        for (id, title, body, weight) in [
+            ("clust001", "Foreground push", "keep lt push in foreground", 20),
+            ("clust002", "Require change", "gate on actual changes", 30),
+        ] {
+            kb.store.entries.push(KnowledgeEntry {
+                id: id.into(),
+                title: title.into(),
+                content: body.into(),
+                cluster: Some("Lifecycle Rules".into()),
+                variants: HashMap::new(),
+                category: Category::Convention,
+                scope: Scope::Project,
+                project: Some(project.into()),
+                providers: vec![],
+                priority: Priority::Standard,
+                weight,
+                render: true,
+                decay: true,
+                review_at: None,
+                status: Status::Active,
+                approval: Approval::UserConfirmed,
+                supersedes: None,
+                rationale: None,
+                expires_at: None,
+                source: "test".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                recall_count: 0,
+                last_recalled: None,
+            });
+        }
+
+        let out = kb
+            .render_project_body("claude", project)
+            .expect("render should succeed");
+
+        assert!(out.contains("## Conventions\n\n"));
+        assert!(out.contains("### Lifecycle Rules\n\n"));
+        let flat_idx = out.find("**Flat rule**").expect("flat rule should render");
+        let cluster_idx = out
+            .find("### Lifecycle Rules")
+            .expect("cluster heading should render");
+        let first_clustered = out
+            .find("**Foreground push**")
+            .expect("clustered rule should render");
+        assert!(flat_idx < cluster_idx, "unclustered entries should stay flat first: {out}");
+        assert!(cluster_idx < first_clustered, "cluster heading should precede grouped entries: {out}");
+    }
+
+    #[test]
+    fn learn_params_schema_exposes_category_enum_values() {
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(LearnParams))
+            .expect("schema should serialize to json");
+        let props = schema
+            .as_object()
+            .and_then(|obj| obj.get("properties"))
+            .and_then(|props| props.as_object())
+            .expect("LearnParams schema should expose properties");
+        let category = props
+            .get("category")
+            .and_then(|value| value.as_object())
+            .expect("LearnParams.category should be an object schema");
+        let variants = category
+            .get("enum")
+            .and_then(|value| value.as_array())
+            .or_else(|| {
+                let ref_name = category
+                    .get("$ref")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| value.rsplit('/').next())?;
+                schema
+                    .as_object()
+                    .and_then(|obj| obj.get("$defs").or_else(|| obj.get("definitions")))
+                    .and_then(|defs| defs.as_object())
+                    .and_then(|defs| defs.get(ref_name))
+                    .and_then(|def| def.as_object())
+                    .and_then(|def| def.get("enum"))
+                    .and_then(|value| value.as_array())
+            })
+            .expect("LearnParams.category should expose enum values");
+        let actual: Vec<&str> = variants
+            .iter()
+            .map(|value| value.as_str().expect("enum values should be strings"))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                "profile",
+                "convention",
+                "steering",
+                "build",
+                "tool",
+                "memory",
+                "workflow",
+                "decision",
+            ]
+        );
+    }
+
+    #[test]
+    fn learn_result_exposes_stable_machine_fields() {
+        let (_t, mut kb) = mk_kb();
+        let out = kb
+            .learn_result(
+                &LearnParams {
+                    content: "use rustls, not openssl".into(),
+                    category: "convention".into(),
+                    format: Some("json".into()),
+                    title: None,
+                    scope: Some("project".into()),
+                    project: Some("/tmp/proj".into()),
+                    providers: None,
+                    priority: None,
+                    weight: None,
+                    expires_at: None,
+                    cluster: Some("Lifecycle Rules".into()),
+                    id: None,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(out.action, "created");
+        assert_eq!(out.rendered, false);
+        assert_eq!(out.render_pending, true);
+        assert_eq!(out.summary, None);
+        assert_eq!(out.id.len(), 8);
+        assert!(out.message.starts_with("Created entry "));
+        let stored = kb
+            .store
+            .entries
+            .iter()
+            .find(|entry| entry.id == out.id)
+            .expect("entry should persist");
+        assert_eq!(stored.cluster.as_deref(), Some("Lifecycle Rules"));
     }
 }

@@ -17,6 +17,8 @@ cargo test               # unit tests (159 tests, ~0.1s)
 cargo clippy             # lint
 ```
 
+`blackbox` is a bin-only crate right now (`[[bin]] blackboxd`, `[[bin]] bro`) with no `[lib]` target, so `cargo test --release --lib` fails with `no library targets found in package 'blackbox'`. For the unit tests in `#[cfg(test)]` blocks under `src/main.rs`, use `cargo test --release --bin blackboxd` (or `cargo test --bin blackboxd`) instead.
+
 `blackboxd` serves MCP over HTTP (`axum`) on `127.0.0.1:${BBOX_PORT:-7264}/mcp`. Stderr carries tracing logs; stdout is unused. The same built daemon artifact is installed under two names for service isolation: `~/.local/bin/blackboxd` for prod and `~/.local/bin/blackboxd-dev` for the dev unit.
 
 ## Architecture

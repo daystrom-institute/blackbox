@@ -393,7 +393,7 @@ use index::{
 };
 use knowledge::{
     AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeListParams, LearnParams,
-    RememberParams, RenderParams, ReviewParams,
+    RememberParams, RenderParams, ResponseFormat, ReviewParams,
 };
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
@@ -492,14 +492,53 @@ impl BlackboxServer {
         description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically."
     )]
     fn bbox_learn(&self, Parameters(p): Parameters<LearnParams>) -> CallToolResult {
-        Self::run("bbox_learn", || {
+        let format = match ResponseFormat::parse_optional(p.format.as_deref()) {
+            Ok(format) => format,
+            Err(e) => return Self::err_text(&format!("Error: {e:#}")),
+        };
+        let start = std::time::Instant::now();
+        match (|| {
             let warning = self.arc_bound_warning(p.id.as_deref(), &p.content);
-            let result = self.state.kb.write().learn(&p, false)?;
-            Ok(match warning {
-                Some(w) => format!("{result}{w}"),
-                None => result,
-            })
-        })
+            let result = self.state.kb.write().learn_result(&p, false)?;
+            Ok::<_, anyhow::Error>((result, warning))
+        })() {
+            Ok((result, warning)) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                match format {
+                    ResponseFormat::Text => {
+                        let text = match warning {
+                            Some(w) => format!("{}{}", result.message, w),
+                            None => result.message,
+                        };
+                        tracing::info!(target: "blackbox::tool", tool = "bbox_learn", elapsed_ms = ms, bytes = text.len(), "ok");
+                        Self::ok_text(&text)
+                    }
+                    ResponseFormat::Json => {
+                        let mut payload = serde_json::json!({
+                            "id": result.id,
+                            "action": result.action,
+                            "rendered": result.rendered,
+                            "render_pending": result.render_pending,
+                            "message": result.message,
+                        });
+                        if let Some(summary) = result.summary {
+                            payload["summary"] = serde_json::json!(summary);
+                        }
+                        if let Some(w) = warning {
+                            payload["warnings"] = serde_json::json!([w.trim().to_string()]);
+                        }
+                        let bytes = serde_json::to_string(&payload).map(|s| s.len()).unwrap_or_default();
+                        tracing::info!(target: "blackbox::tool", tool = "bbox_learn", elapsed_ms = ms, bytes, "ok");
+                        Self::ok_json(&payload)
+                    }
+                }
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_learn", elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 
     #[tool(

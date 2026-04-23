@@ -21,6 +21,8 @@ cargo test               # unit tests (159 tests, ~0.1s)
 cargo clippy             # lint
 ```
 
+`blackbox` is a bin-only crate right now (`[[bin]] blackboxd`, `[[bin]] bro`) with no `[lib]` target, so `cargo test --release --lib` fails with `no library targets found in package 'blackbox'`. For the unit tests in `#[cfg(test)]` blocks under `src/main.rs`, use `cargo test --release --bin blackboxd` (or `cargo test --bin blackboxd`) instead.
+
 `blackboxd` serves MCP over HTTP (`axum`) on `127.0.0.1:${BBOX_PORT:-7264}/mcp`. Stderr carries tracing logs; stdout is unused. The same built daemon artifact is installed under two names for service isolation: `~/.local/bin/blackboxd` for prod and `~/.local/bin/blackboxd-dev` for the dev unit.
 
 ## Architecture
@@ -125,6 +127,61 @@ Client config (all point to the same daemon):
 ## Design Docs
 
 - `design/knowledge-store.md` — knowledge store v2: layer architecture, absorption, entry schema, rendering pipeline, migration path.
+## Conventions
+
+<!-- bb:entry=a3a8c3c1 -->
+**Pharo self-heal pattern: provenance + routed exception repair**
+
+Self-healing loop for Pharo live images with agent-authored code:
+
+1. **Provenance on every install.** Every LTCompileMethodOp>>apply records {class, selector, patch_id, bro_id, session_id, provider, recorded_at} into LTProvenance registry. Keyed on 'Class>>#selector'. The LTPatch>>apply wraps op iteration with a class-side `current` so each op can resolve its owning patch (which carries `provenance: 'bro#N'` or 'dlg-K/turn-M/provider').
+
+2. **Hook: OupsDebuggerSystem>>#handleDebugRequest:.** This is the universal funnel for all unhandled exceptions in Pharo 12. Wrap by (a) stashing original as `originalHandleDebugRequest:`, (b) installing a new `handleDebugRequest:` that fires your healer then calls `self originalHandleDebugRequest: aDebugRequest`. Retains normal debugger; adds the parallel fix dispatch.
+
+3. **Dual-route healing.** On exception, extract diagnostic {exc_class, message, class, selector, method_source}. Look up provenance for that method:
+   - If recorded AND session_id present → `bro_resume` the ORIGINATING bro with "your patch ... just raised this exception, here's current source, diagnose and fix" — the agent who wrote it now sees its downstream failure with their original context + intent intact. Much richer signal than a cold-start bro.
+   - Else → anonymous bro with full cold diagnostic.
+   Both paths return an LTPatch. Same judge-packet gate for both: structural checks (has CompileMethod op, matches class+selector of failing method, non-empty source, has ^ return, has 'self').
+
+4. **Guards that matter:**
+   - Per-(class,selector) retry budget: max 3 heals per rolling hour via LTProvenance countAttempt:/budgetOk:. Stops loop-bombs.
+   - Re-entry: `busy` flag on the healer prevents concurrent heal dispatches.
+   - Package allowlist: `LargeTalk-*` + LT-prefixed classes only. Never touch Kernel/Morphic/System code via auto-heal.
+   - autoApply toggle defaults false — proposals queue in `lastProposals` for manual review. Auto-apply is the full autonomy mode for when the judge-packet is trusted.
+
+5. **Patch-target gate:** before applying a heal proposal, verify the patch's CompileMethod op targets the SAME class+selector that threw. Agents sometimes hallucinate different selectors; this rejects them cleanly.
+
+Insight that unlocks the design (credit: user): "when an exception occurs, it needs to route one of two ways — to an anonymous bro that has no context, OR back to the bro that originated the change." The second path is the pedagogical one. The agent gets feedback on its own mistake with full intent preserved. Every method carries its authoring context so downstream failures can route backward along that chain.
+
+See r-provenance-healer.st in largetalk-spike for the full installation file.
+
+Tags: pharo, self-heal, provenance, exception-routing, originator-resume, bro_resume, LTExceptionHealer, LTProvenance, OupsDebuggerSystem, largetalk-spike
+
+<!-- /bb:entry=a3a8c3c1 -->
+<!-- bb:entry=b12f4560 -->
+**LargeTalk inside-dispatch: use ./lt CLI, not MCP, in -p resume mode**
+
+When spawning `claude --resume <id> -p "prompt"` from inside the Pharo image (e.g., LTClaudeSession>>resume:), MCP tools appear as disconnected in the resumed session — this is a known Claude Code limitation. `--dangerously-skip-permissions` doesn't fix it. `--mcp-config <file>` doesn't fix it. Tools like mcp__largetalk__image_eval are unreachable.
+
+**Correct path:** expose a Bash CLI wrapper to the live image — `/home/invidious/repos/largetalk-spike/lt` — and teach inside-claude to use it via `Bash(./lt ...)`. The wrapper just POSTs to the MCP HTTP endpoint directly (urllib); works the same as MCP tool calls but over Bash.
+
+Example inside-claude prompt preamble (now baked into LTClaudeSession>>resume:):
+```
+INSIDE-PREAMBLE: You are in -p mode resumed into a Pharo image. MCP shows "disconnected" — use Bash + ./lt instead:
+  cd /home/invidious/repos/largetalk-spike && ./lt eval "42 * 42"
+  cd /home/invidious/repos/largetalk-spike && ./lt compile Class "method ^ body"
+  cd /home/invidious/repos/largetalk-spike && ./lt whoami
+ZnServer is single-threaded; avoid parallel ./lt calls; back off on >10s hangs.
+```
+
+**Verified behavior:** inside-claude correctly diagnosed the server saturation issue (reported "6 queued connections on :7270, ./lt calls timeout at 10s") — so the Bash path WORKS when the server is healthy. The saturation was self-inflicted by a chat-window bus-subscription firing on every event; fix: subscribe only to claude-home-reply/error, not claude-home-send.
+
+**Architecture note:** This means the inside/outside handoff is NOT via MCP-in-resumed-session. It's via Bash+HTTP. The session transcript (jsonl) stays the canonical shared record between inside and outside. Each side writes turns to it; the chat window seeds from it on open and refreshes on reply events.
+
+Tags: largetalk-spike, inside-dispatch, claude-resume, mcp-p-mode-limitation, lt-cli-wrapper, session-handoff, 2026-04-20
+
+<!-- /bb:entry=b12f4560 -->
+
 ## Workflow
 
 <!-- bb:entry=aac35492 -->

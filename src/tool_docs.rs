@@ -641,6 +641,7 @@ pub fn sync_into_knowledge(kb: &mut crate::knowledge::Knowledge) -> Result<SyncR
         id: TOOL_DOC_ENTRY_ID.to_string(),
         title: "Blackbox tool reference".to_string(),
         content,
+        cluster: None,
         variants: Default::default(),
         category: Category::Tool,
         scope: Scope::Global,
