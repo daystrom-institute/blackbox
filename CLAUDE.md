@@ -56,7 +56,7 @@ Maintained in `src/orchestration/providers.rs`:
 
 - **Claude**: Opus 4.7 (default, 1M context built-in), Opus 4.6 [1m]/200K, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (xhigh default, Opus-4.7-only; max unsupported on Haiku).
 - **OpenCode**: native `provider/model` routing with Z.AI Coding Plan GLM models exposed directly. Defaults to `zai-coding-plan/glm-5.1`, helper model `zai-coding-plan/glm-4.5-air`, and variant tiers `minimal`/`low`/`medium`/`high`/`max`.
-- **Codex**: gpt-5.4 family. Effort tiers `minimal`/`low`/`medium`/`high`/`xhigh`.
+- **Codex**: gpt-5.5 family (default `gpt-5.5`; `-mini`/`-codex` variants are API-direct only and not available on ChatGPT-account auth). gpt-5.4 family retained as secondary. Effort tiers `minimal`/`low`/`medium`/`high`/`xhigh`.
 - **Copilot**: tracks Anthropic + OpenAI models. Effort tiers `low`/`medium`/`high`/`xhigh`.
 - **Vibe**, **Gemini**: model lists only, no effort tier.
 

@@ -1778,13 +1778,23 @@ static OPENCODE_MODELS: &[ModelInfo] = &[
 
 static CODEX_MODELS: &[ModelInfo] = &[
     ModelInfo {
-        id: "gpt-5.4",
-        description: "Latest frontier agentic coding model",
+        id: "gpt-5.5",
+        description: "Latest frontier agentic coding model (subsumes codex flavor)",
         default: true,
     },
     ModelInfo {
+        id: "gpt-5.5-mini",
+        description: "Smaller 5.5-family model (API-direct only; not available on ChatGPT account)",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.4",
+        description: "Prior-generation frontier agentic coding model (subsumes codex flavor)",
+        default: false,
+    },
+    ModelInfo {
         id: "gpt-5.4-mini",
-        description: "Smaller frontier agentic coding model",
+        description: "Smaller 5.4-family model",
         default: false,
     },
     ModelInfo {
@@ -1842,7 +1852,7 @@ static CODEX_EFFORTS: &[EffortInfo] = &[
     },
     EffortInfo {
         id: "xhigh",
-        description: "Maximum depth (gpt-5.1-codex-max / gpt-5.2-codex only)",
+        description: "Maximum depth (gpt-5.4 / gpt-5.5 / gpt-5.1-codex-max / gpt-5.2-codex)",
         default: false,
     },
 ];
