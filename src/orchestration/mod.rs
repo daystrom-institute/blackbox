@@ -1,4 +1,5 @@
 pub mod brofile;
+pub mod forgejo;
 pub mod mcp;
 pub mod providers;
 pub mod tail;

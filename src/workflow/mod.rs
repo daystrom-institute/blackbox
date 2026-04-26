@@ -9,9 +9,13 @@
 //! The execution loop (`bro orchestrate run`) is separate; this module is
 //! parsing + validation only.
 
+pub mod context;
 pub mod engine;
+pub mod extractor;
 pub mod mermaid;
+pub mod ops;
 pub mod schema;
+pub mod wait;
 
 pub use engine::{run_workflow, run_workflow_streaming, WorkflowRunResult};
 pub use mermaid::{parse_mermaid, MermaidGraph, MermaidNodeKind};
