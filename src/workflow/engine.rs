@@ -16,10 +16,15 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use tokio::sync::Notify;
 
+use super::context::{ArcContext, ArcMeta, SignalRef};
+use super::ops::{execute_op, HookOp, OnFailure, OpEffect};
+use super::wait::{canonicalize_correlation, PendingWait, WaitSpec};
 use super::{ActorKind, ActorSpec, CompiledWorkflow, GateMode, MermaidNodeKind, NodeMode};
 use crate::orchestration as orch;
 use crate::BlackboxServer;
@@ -45,6 +50,13 @@ pub struct WorkflowRunResult {
     pub status: String,
     pub events: Vec<Value>,
     pub node_outputs: HashMap<String, String>,
+    /// Final ArcContext vars at terminal state. Populated by hook
+    /// SetVar / IncVar / Forgejo ops, plus subworkflow imports.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub vars: Map<String, Value>,
+    /// Final arc id (for resume / signal targeting on suspended arcs).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arc_id: String,
     /// Populated only on `--dry-run`: the textual summary from
     /// [`crate::workflow::CompiledWorkflow::summarize`] for eyeballing
     /// the plan before any dispatch fires.
@@ -71,7 +83,38 @@ pub async fn run_workflow(
     project_dir: Option<String>,
     max_steps: Option<usize>,
 ) -> WorkflowRunResult {
-    run_workflow_at_depth(server, compiled, project_dir, max_steps, 0, HashMap::new()).await
+    run_workflow_with_initial_vars(
+        server,
+        compiled,
+        project_dir,
+        max_steps,
+        Map::new(),
+    )
+    .await
+}
+
+/// Variant of [`run_workflow`] that seeds initial vars into the
+/// arc's context — used by webhook router (`{route: start_arc, …}`)
+/// and by the meta-loop's `bbox_orchestrate_run(initial_vars=…)` MCP
+/// path.
+pub async fn run_workflow_with_initial_vars(
+    server: &BlackboxServer,
+    compiled: &CompiledWorkflow,
+    project_dir: Option<String>,
+    max_steps: Option<usize>,
+    initial_vars: Map<String, Value>,
+) -> WorkflowRunResult {
+    run_workflow_at_depth(
+        server,
+        compiled,
+        project_dir,
+        max_steps,
+        0,
+        HashMap::new(),
+        initial_vars,
+        None,
+    )
+    .await
 }
 
 /// Streaming variant: runs the workflow while forwarding every
@@ -86,8 +129,47 @@ pub async fn run_workflow_streaming(
     max_steps: Option<usize>,
     event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
 ) -> WorkflowRunResult {
-    let mut runner = WorkflowRunner::new(server, compiled, project_dir, max_steps.unwrap_or(50), 0);
+    run_workflow_streaming_with_vars(
+        server,
+        compiled,
+        project_dir,
+        max_steps,
+        Map::new(),
+        event_sink,
+    )
+    .await
+}
+
+pub async fn run_workflow_streaming_with_vars(
+    server: &BlackboxServer,
+    compiled: &CompiledWorkflow,
+    project_dir: Option<String>,
+    max_steps: Option<usize>,
+    initial_vars: Map<String, Value>,
+    event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
+) -> WorkflowRunResult {
+    let mut runner = WorkflowRunner::new(
+        server,
+        compiled,
+        project_dir,
+        max_steps.unwrap_or(50),
+        0,
+    );
     runner.event_sink = Some(event_sink);
+    if let Err(e) = runner.ctx.seed_vars(initial_vars, compiled.spec.vars_schema.as_ref()) {
+        return WorkflowRunResult {
+            status: format!("error: initial_vars seed failed: {e}"),
+            events: vec![json!({
+                "kind": "error",
+                "data": {"message": format!("initial_vars: {e}")},
+            })],
+            node_outputs: HashMap::new(),
+            vars: Map::new(),
+            arc_id: runner.ctx.meta.arc_id.clone(),
+            plan: None,
+            arc_thread_id: None,
+        };
+    }
     runner.open_arc_thread();
     let status = match runner.run().await {
         Ok(()) => "completed".to_string(),
@@ -111,10 +193,23 @@ pub async fn run_workflow_streaming(
             ),
         );
     }
+    let final_outcome = runner.ctx.meta.arc_outcome.clone().unwrap_or_else(|| {
+        if status == "completed" {
+            "success".into()
+        } else if status.starts_with("cancelled") {
+            "cancelled".into()
+        } else {
+            "failed".into()
+        }
+    });
+    runner.ctx.meta.arc_outcome = Some(final_outcome);
+    runner.run_arc_exit_hooks().await;
     WorkflowRunResult {
         status,
         events: runner.events,
         node_outputs: runner.node_outputs,
+        vars: runner.ctx.vars,
+        arc_id: runner.ctx.meta.arc_id,
         plan: None,
         arc_thread_id,
     }
@@ -133,6 +228,8 @@ pub async fn run_workflow_at_depth(
     max_steps: Option<usize>,
     composition_depth: u32,
     seed_outputs: HashMap<String, String>,
+    initial_vars: Map<String, Value>,
+    parent_arc_id: Option<String>,
 ) -> WorkflowRunResult {
     if composition_depth > MAX_COMPOSITION_DEPTH {
         return WorkflowRunResult {
@@ -141,6 +238,8 @@ pub async fn run_workflow_at_depth(
             ),
             events: Vec::new(),
             node_outputs: HashMap::new(),
+            vars: Map::new(),
+            arc_id: String::new(),
             plan: None,
             arc_thread_id: None,
         };
@@ -152,7 +251,29 @@ pub async fn run_workflow_at_depth(
         max_steps.unwrap_or(50),
         composition_depth,
     );
-    runner.node_outputs = seed_outputs;
+    runner.node_outputs = seed_outputs.clone();
+    // Mirror seeded outputs into the typed channel as JSON strings.
+    for (k, v) in &seed_outputs {
+        runner.ctx.set_output(k, Value::String(v.clone()));
+    }
+    runner.ctx.meta.parent_arc_id = parent_arc_id;
+    if let Err(e) = runner
+        .ctx
+        .seed_vars(initial_vars, compiled.spec.vars_schema.as_ref())
+    {
+        return WorkflowRunResult {
+            status: format!("error: initial_vars seed failed: {e}"),
+            events: vec![json!({
+                "kind": "error",
+                "data": {"message": format!("initial_vars: {e}")},
+            })],
+            node_outputs: HashMap::new(),
+            vars: Map::new(),
+            arc_id: runner.ctx.meta.arc_id.clone(),
+            plan: None,
+            arc_thread_id: None,
+        };
+    }
     runner.open_arc_thread();
     let status = match runner.run().await {
         Ok(()) => "completed".to_string(),
@@ -176,10 +297,23 @@ pub async fn run_workflow_at_depth(
             ),
         );
     }
+    let final_outcome = runner.ctx.meta.arc_outcome.clone().unwrap_or_else(|| {
+        if status == "completed" {
+            "success".into()
+        } else if status.starts_with("cancelled") {
+            "cancelled".into()
+        } else {
+            "failed".into()
+        }
+    });
+    runner.ctx.meta.arc_outcome = Some(final_outcome);
+    runner.run_arc_exit_hooks().await;
     WorkflowRunResult {
         status,
         events: runner.events,
         node_outputs: runner.node_outputs,
+        vars: runner.ctx.vars,
+        arc_id: runner.ctx.meta.arc_id,
         plan: None,
         arc_thread_id,
     }
@@ -193,6 +327,8 @@ pub fn dry_run(compiled: &CompiledWorkflow) -> WorkflowRunResult {
         status: "dry_run".into(),
         events: Vec::new(),
         node_outputs: HashMap::new(),
+        vars: Map::new(),
+        arc_id: String::new(),
         plan: Some(compiled.summarize()),
         arc_thread_id: None,
     }
@@ -202,7 +338,12 @@ struct WorkflowRunner<'a> {
     server: &'a BlackboxServer,
     compiled: &'a CompiledWorkflow,
     project_dir: Option<String>,
+    /// Legacy string-shaped output channel. Mirrored from `ctx.outputs`
+    /// at every set so existing callers (CLI, server endpoints,
+    /// existing tests) keep working. New code should read `ctx`.
     node_outputs: HashMap<String, String>,
+    /// Primary engine state: vars, typed outputs, meta, signals.
+    ctx: ArcContext,
     actor_sessions: HashMap<String, String>,
     /// Per-ensemble member session continuity: key is
     /// `<actor_name>::<member_name>`. Populated when the ensemble
@@ -236,11 +377,24 @@ impl<'a> WorkflowRunner<'a> {
         max_steps: usize,
         composition_depth: u32,
     ) -> Self {
+        let arc_id = format!("arc-{}", uuid::Uuid::new_v4().simple());
+        let ctx = ArcContext::new(ArcMeta {
+            arc_id: arc_id.clone(),
+            workflow_name: compiled.spec.name.clone(),
+            workflow_version: compiled.spec.version,
+            started_at: crate::util::now_iso(),
+            project_dir: project_dir.clone(),
+            worktree: None,
+            arc_outcome: None,
+            parent_arc_id: None,
+            composition_depth,
+        });
         Self {
             server,
             compiled,
             project_dir,
             node_outputs: HashMap::new(),
+            ctx,
             actor_sessions: HashMap::new(),
             ensemble_sessions: HashMap::new(),
             in_flight: HashMap::new(),
@@ -251,6 +405,157 @@ impl<'a> WorkflowRunner<'a> {
             arc_thread_id: None,
             composition_depth,
             event_sink: None,
+        }
+    }
+
+    /// Mirror a string output into both legacy and typed channels.
+    fn record_output(&mut self, node_id: &str, text: String) {
+        self.ctx.set_output(node_id, Value::String(text.clone()));
+        self.node_outputs.insert(node_id.to_string(), text);
+    }
+
+    /// Apply a single OpEffect to the runner state. Used by hook
+    /// execution to centralize logging + schema validation.
+    fn apply_op_effect(&mut self, effect: OpEffect) -> Result<()> {
+        match effect {
+            OpEffect::None => {}
+            OpEffect::SetVar { key, value } => {
+                self.ctx
+                    .set_var(&key, value, self.compiled.spec.vars_schema.as_ref())?;
+            }
+            OpEffect::SetWorktree(path) => {
+                self.ctx.meta.worktree = path;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a list of HookOps against the current ArcContext.
+    /// Per-op `when` packet evaluates against the flattened entity;
+    /// failure handled per `on_failure`.
+    async fn run_hooks(&mut self, hooks: &[HookOp], lifecycle: &str) -> Result<()> {
+        for (idx, hook) in hooks.iter().enumerate() {
+            // Gate evaluation
+            if let Some(packet_id) = &hook.when {
+                let entity = self.ctx.flatten();
+                let allow = match self.server.apply_workflow_policy(packet_id, &entity) {
+                    Ok(Some(verdict)) => is_allow_verdict(&verdict),
+                    Ok(None) => false,
+                    Err(e) => {
+                        self.log_event(
+                            "hook_gate_error",
+                            json!({
+                                "lifecycle": lifecycle,
+                                "index": idx,
+                                "packet_id": packet_id,
+                                "error": e,
+                            }),
+                        );
+                        false
+                    }
+                };
+                if !allow {
+                    self.log_event(
+                        "hook_gated_out",
+                        json!({
+                            "lifecycle": lifecycle,
+                            "index": idx,
+                            "op": format!("{:?}", hook.op),
+                            "packet_id": packet_id,
+                        }),
+                    );
+                    continue;
+                }
+            }
+            let op_kind = format!("{:?}", hook.op);
+            match execute_op(hook, &self.ctx, self.compiled.spec.vars_schema.as_ref()).await {
+                Ok(effect) => {
+                    if let Err(e) = self.apply_op_effect(effect) {
+                        match hook.on_failure {
+                            OnFailure::Halt => {
+                                bail!("hook {lifecycle}#{idx} {op_kind} effect-apply: {e}");
+                            }
+                            OnFailure::Warn => {
+                                self.arc_note(
+                                    "surprise",
+                                    &format!("hook {lifecycle}#{idx} {op_kind} effect: {e}"),
+                                );
+                            }
+                            OnFailure::Ignore => {}
+                        }
+                        continue;
+                    }
+                    self.log_event(
+                        "hook_ok",
+                        json!({
+                            "lifecycle": lifecycle,
+                            "index": idx,
+                            "op": op_kind,
+                        }),
+                    );
+                }
+                Err(e) => match hook.on_failure {
+                    OnFailure::Halt => {
+                        bail!("hook {lifecycle}#{idx} {op_kind}: {e}");
+                    }
+                    OnFailure::Warn => {
+                        self.log_event(
+                            "hook_failed",
+                            json!({
+                                "lifecycle": lifecycle,
+                                "index": idx,
+                                "op": op_kind,
+                                "error": e.to_string(),
+                                "policy": "warn",
+                            }),
+                        );
+                        self.arc_note(
+                            "surprise",
+                            &format!("hook {lifecycle}#{idx} {op_kind} warned: {e}"),
+                        );
+                    }
+                    OnFailure::Ignore => {
+                        self.log_event(
+                            "hook_failed",
+                            json!({
+                                "lifecycle": lifecycle,
+                                "index": idx,
+                                "op": op_kind,
+                                "error": e.to_string(),
+                                "policy": "ignore",
+                            }),
+                        );
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// Workflow-level `on_arc_cancel` + `on_arc_exit` invocation. Run
+    /// at terminal state. on_arc_cancel runs ONLY when the outcome is
+    /// `cancelled`; on_arc_exit runs in every terminal state. Errors
+    /// from terminal hooks are logged but never propagate (the arc is
+    /// already done).
+    async fn run_arc_exit_hooks(&mut self) {
+        let outcome = self.ctx.meta.arc_outcome.clone().unwrap_or_default();
+        if outcome == "cancelled" && !self.compiled.spec.on_arc_cancel.is_empty() {
+            let cancel_hooks = self.compiled.spec.on_arc_cancel.clone();
+            if let Err(e) = self.run_hooks(&cancel_hooks, "arc_cancel").await {
+                self.log_event(
+                    "arc_cancel_hook_error",
+                    json!({"error": e.to_string()}),
+                );
+            }
+        }
+        if !self.compiled.spec.on_arc_exit.is_empty() {
+            let exit_hooks = self.compiled.spec.on_arc_exit.clone();
+            if let Err(e) = self.run_hooks(&exit_hooks, "arc_exit").await {
+                self.log_event(
+                    "arc_exit_hook_error",
+                    json!({"error": e.to_string()}),
+                );
+            }
         }
     }
 
@@ -597,13 +902,35 @@ impl<'a> WorkflowRunner<'a> {
             .spec
             .nodes
             .get(node_id)
-            .ok_or_else(|| anyhow!("no metadata for activity node '{node_id}'"))?;
+            .ok_or_else(|| anyhow!("no metadata for activity node '{node_id}'"))?
+            .clone();
+
+        // on_enter hooks fire BEFORE every node body — including
+        // subworkflow descents, Wait registrations, and actor
+        // dispatches. They set up state (worktree, vars, branch
+        // names) and are the right place to run setup ops.
+        if !spec.on_enter.is_empty() {
+            self.run_hooks(&spec.on_enter, &format!("{node_id}/on_enter"))
+                .await?;
+        }
+
+        // Wait node — suspend the arc on a signal. Mutually exclusive
+        // with subworkflow + actor.
+        if let Some(wait_spec) = spec.wait.clone() {
+            self.run_wait_node(node_id, &wait_spec).await?;
+            self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
+            self.apply_node_gate(node_id, &spec).await;
+            return Ok(());
+        }
 
         // Sub-workflow composition: if the node embeds a workflow, run
         // it recursively instead of dispatching an actor. The parent
         // node's output becomes the concatenated sub-node outputs.
         if spec.subworkflow.is_some() {
-            return self.run_subworkflow_node(node_id).await;
+            self.run_subworkflow_node(node_id).await?;
+            self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
+            self.apply_node_gate(node_id, &spec).await;
+            return Ok(());
         }
 
         let actor_name = spec.actor.clone();
@@ -674,6 +1001,11 @@ impl<'a> WorkflowRunner<'a> {
                 self.run_user_node(node_id, &prompt)?;
             }
         }
+
+        // on_exit hooks — fire AFTER actor return but BEFORE gate so
+        // the gate sees normalized output (e.g. after a ParseJson
+        // hook stuffs structured data into vars).
+        self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
 
         // Apply the gate packet (if any). Dispatch by gate_mode:
         // - first (default): one rule's classification becomes verdict
@@ -1323,6 +1655,41 @@ impl<'a> WorkflowRunner<'a> {
         // siblings do. Caveat: sub-node names that collide with parent
         // names overwrite parent entries in the sub's local copy.
         let seed_outputs = self.node_outputs.clone();
+
+        // Compute initial_vars for the sub: explicit imports list +
+        // import_renames (extractor expressions on parent context).
+        // import_renames takes precedence; missing import keys are a
+        // soft warning (sub may be tolerant).
+        let mut initial_vars: Map<String, Value> = Map::new();
+        for k in &spec.imports {
+            if let Some(v) = self.ctx.vars.get(k) {
+                initial_vars.insert(k.clone(), v.clone());
+            } else {
+                self.log_event(
+                    "subworkflow_import_missing",
+                    json!({"node": node_id, "import": k}),
+                );
+            }
+        }
+        for (local_name, parent_path) in &spec.import_renames {
+            match self.ctx.resolve(parent_path) {
+                Some(v) => {
+                    initial_vars.insert(local_name.clone(), v);
+                }
+                None => {
+                    self.log_event(
+                        "subworkflow_rename_unresolved",
+                        json!({
+                            "node": node_id,
+                            "local": local_name,
+                            "parent_path": parent_path,
+                        }),
+                    );
+                }
+            }
+        }
+
+        let parent_arc_id = self.ctx.meta.arc_id.clone();
         // Box the recursive future to avoid infinitely-sized types.
         // Depth is threaded so the child runner knows where it is in
         // the composition tree.
@@ -1333,6 +1700,8 @@ impl<'a> WorkflowRunner<'a> {
             Some(25),
             child_depth,
             seed_outputs,
+            initial_vars,
+            Some(parent_arc_id),
         ))
         .await;
 
@@ -1362,8 +1731,35 @@ impl<'a> WorkflowRunner<'a> {
             .map(|(n, o)| format!("── sub:{n} ──\n{o}"))
             .collect::<Vec<_>>()
             .join("\n\n");
-        self.node_outputs
-            .insert(node_id.to_string(), merged.clone());
+        self.record_output(node_id, merged.clone());
+
+        // Promote declared exports from sub vars back into parent.
+        // Missing exports are a runtime error — declared contract.
+        for k in &spec.exports {
+            match sub_result.vars.get(k) {
+                Some(v) => {
+                    if let Err(e) = self.ctx.set_var(
+                        k,
+                        v.clone(),
+                        self.compiled.spec.vars_schema.as_ref(),
+                    ) {
+                        bail!("subworkflow '{}' export '{k}' parent-write rejected: {e}",
+                            compiled.spec.name);
+                    }
+                    self.log_event(
+                        "subworkflow_export",
+                        json!({"node": node_id, "key": k, "value": v.clone()}),
+                    );
+                }
+                None => {
+                    bail!(
+                        "subworkflow '{}' did not export declared key '{k}' (have: {:?})",
+                        compiled.spec.name,
+                        sub_result.vars.keys().collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
 
         self.log_event(
             "subworkflow_complete",
@@ -1372,6 +1768,7 @@ impl<'a> WorkflowRunner<'a> {
                 "sub_arc_thread_id": sub_result.arc_thread_id,
                 "sub_events": sub_result.events.len(),
                 "sub_node_count": sub_outputs.len(),
+                "exports_promoted": spec.exports.len(),
                 "merged_bytes": merged.len(),
             }),
         );
@@ -1409,12 +1806,255 @@ impl<'a> WorkflowRunner<'a> {
     }
 
     fn render_prompt(&self, template: &str) -> String {
-        let mut out = template.to_string();
-        for (node, output) in &self.node_outputs {
-            let key = format!("${{{node}.output}}");
-            out = out.replace(&key, output);
+        // Use the new ArcContext templater. It handles ${vars.x},
+        // ${outputs.NodeName.field}, ${meta.x}, ${last_signal.x}
+        // AND the legacy ${NodeName.output} form, so existing prompts
+        // keep working.
+        self.ctx.render_template(template)
+    }
+
+    async fn run_node_exit_hooks(
+        &mut self,
+        hooks: &[HookOp],
+        node_id: &str,
+    ) -> Result<()> {
+        if hooks.is_empty() {
+            return Ok(());
         }
-        out
+        self.run_hooks(hooks, &format!("{node_id}/on_exit")).await
+    }
+
+    /// Extracted gate evaluation. Reads the just-completed node's
+    /// output AND the full ArcContext flatten so rules can reference
+    /// `vars.x`, `last_signal.name`, etc. — not just the node output
+    /// string. The legacy first-mode and all-mode handlers still
+    /// receive the output string for backward compatibility; the
+    /// flattened entity is added under `node_output_json` and via
+    /// the gate-entity helpers in `apply_workflow_gate_*`.
+    async fn apply_node_gate(
+        &mut self,
+        node_id: &str,
+        spec: &super::schema::NodeSpec,
+    ) {
+        let Some(packet_id) = spec.gate.as_deref() else {
+            return;
+        };
+        // Build the canonical gate entity once, then both first- and
+        // all-mode dispatchers use it.
+        let entity = self.ctx.flatten_for_gate(node_id);
+        let mode = spec.gate_mode.clone().unwrap_or_default();
+        match mode {
+            GateMode::First => {
+                match self
+                    .server
+                    .apply_workflow_gate_entity(packet_id, &entity, node_id)
+                {
+                    Ok(verdict) => {
+                        self.last_verdict = verdict.clone();
+                        self.log_event(
+                            "gate_applied",
+                            json!({
+                                "node": node_id,
+                                "packet_id": packet_id,
+                                "mode": "first",
+                                "verdict": verdict.clone(),
+                            }),
+                        );
+                        let verdict_s = verdict.as_deref().unwrap_or("(no match)");
+                        self.arc_note(
+                            "learned",
+                            &format!("gate '{packet_id}' on '{node_id}' (first) → {verdict_s}"),
+                        );
+                    }
+                    Err(e) => {
+                        self.log_event(
+                            "gate_error",
+                            json!({
+                                "node": node_id,
+                                "packet_id": packet_id,
+                                "mode": "first",
+                                "error": e,
+                            }),
+                        );
+                    }
+                }
+            }
+            GateMode::All => {
+                match self
+                    .server
+                    .apply_workflow_gate_all_entity(packet_id, &entity, node_id)
+                {
+                    Ok(result) => {
+                        self.last_verdict = result.verdict.clone();
+                        let finding_previews: Vec<String> = result
+                            .findings
+                            .iter()
+                            .map(|f| {
+                                let consequent_str = format!("{:?}", f.consequent);
+                                let preview: String = consequent_str.chars().take(80).collect();
+                                format!("{}[{}]: {preview}", f.classification, f.rule_id)
+                            })
+                            .collect();
+                        self.log_event(
+                            "gate_applied",
+                            json!({
+                                "node": node_id,
+                                "packet_id": packet_id,
+                                "mode": "all",
+                                "verdict": result.verdict.clone(),
+                                "finding_count": result.findings.len(),
+                                "findings": finding_previews.clone(),
+                            }),
+                        );
+                        let verdict_s = result.verdict.as_deref().unwrap_or("(no match)");
+                        self.arc_note(
+                            "learned",
+                            &format!(
+                                "gate '{packet_id}' on '{node_id}' (all) → verdict={verdict_s}, {} finding(s): [{}]",
+                                result.findings.len(),
+                                finding_previews.join("; ")
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        self.log_event(
+                            "gate_error",
+                            json!({
+                                "node": node_id,
+                                "packet_id": packet_id,
+                                "mode": "all",
+                                "error": e,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait node — register pending waits in the server's WaitStore,
+    /// suspend on a Notify, resume when a matching signal arrives.
+    /// Updates `ctx.last_signal` + `signal_history` before returning.
+    async fn run_wait_node(&mut self, node_id: &str, spec: &WaitSpec) -> Result<()> {
+        // Clear any prior signal so a stale reference can't leak.
+        self.ctx.clear_last_signal();
+
+        let mut registered_ids: Vec<(String, String)> = Vec::new();
+        let resolved_slot: Arc<parking_lot::Mutex<Option<SignalRef>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let notify = Arc::new(Notify::new());
+        let arc_id = self.ctx.meta.arc_id.clone();
+
+        for (idx, wait_signal) in spec.any_of.iter().enumerate() {
+            // Resolve correlation tuple via Selector against the
+            // current ArcContext flatten.
+            let context_entity = self.ctx.flatten();
+            let mut correlation = Map::new();
+            for (k, sel) in &wait_signal.correlate {
+                let v = sel
+                    .evaluate(&context_entity)
+                    .map_err(|e| anyhow!("Wait correlation eval for '{k}': {e}"))?;
+                correlation.insert(k.clone(), v);
+            }
+            let wait_id = format!("{node_id}#{idx}");
+            self.log_event(
+                "wait_registered",
+                json!({
+                    "node": node_id,
+                    "wait_id": wait_id,
+                    "signal": wait_signal.signal,
+                    "correlation_canonical": canonicalize_correlation(&correlation),
+                }),
+            );
+            self.server.wait_store().register(PendingWait {
+                arc_id: arc_id.clone(),
+                wait_id: wait_id.clone(),
+                signal: wait_signal.signal.clone(),
+                correlation,
+                notify: notify.clone(),
+                resolved: resolved_slot.clone(),
+            });
+            registered_ids.push((arc_id.clone(), wait_id));
+        }
+
+        // Block on Notify with optional timeout. The store's
+        // match_and_take pops the first matching wait and inserts
+        // the SignalRef into resolved_slot before notifying.
+        let timeout = spec.timeout;
+        let waited = match timeout {
+            Some(d) => tokio::time::timeout(d, notify.notified()).await.is_ok(),
+            None => {
+                notify.notified().await;
+                true
+            }
+        };
+
+        // Cancel sibling waits — only the first to fire wins; the
+        // others must be removed from the store so a later signal
+        // doesn't accidentally resume a completed arc.
+        for (arc, wid) in &registered_ids {
+            self.server.wait_store().cancel(arc, wid);
+        }
+
+        if !waited {
+            // Timeout — synthesize a __timeout__ signal payload so the
+            // gate can branch on it (`In{name, [pr-merged, __timeout__]}`).
+            let sig = SignalRef {
+                name: "__timeout__".into(),
+                payload: json!({
+                    "expired": spec.any_of.iter().map(|s| s.signal.clone()).collect::<Vec<_>>(),
+                }),
+                correlation: Map::new(),
+                received_at: crate::util::now_iso(),
+            };
+            self.log_event(
+                "wait_timeout",
+                json!({
+                    "node": node_id,
+                    "expired_signals": sig.payload["expired"].clone(),
+                }),
+            );
+            self.ctx.record_signal(sig.clone());
+            self.record_output(
+                node_id,
+                serde_json::to_string(&sig).unwrap_or_default(),
+            );
+            self.arc_note(
+                "surprise",
+                &format!("Wait '{node_id}' timed out after {:?}", timeout),
+            );
+            return Ok(());
+        }
+
+        let sig = resolved_slot
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("Wait '{node_id}' notified but resolved slot empty"))?;
+        self.log_event(
+            "wait_resolved",
+            json!({
+                "node": node_id,
+                "signal": sig.name,
+                "correlation": sig.correlation,
+            }),
+        );
+        self.record_output(
+            node_id,
+            serde_json::to_string(&sig).unwrap_or_default(),
+        );
+        self.ctx.record_signal(sig.clone());
+        self.arc_note(
+            "done",
+            &format!("Wait '{node_id}' resolved by signal '{}'", sig.name),
+        );
+        Ok(())
+    }
+
+    fn duration_label(d: Option<Duration>) -> String {
+        match d {
+            Some(d) => format!("{}s", d.as_secs()),
+            None => "indefinite".into(),
+        }
     }
 
     fn log_event(&mut self, kind: &str, data: Value) {
@@ -1428,6 +2068,26 @@ impl<'a> WorkflowRunner<'a> {
         }
         self.events.push(ev);
     }
+}
+
+/// True when a hook-gating packet returned a verdict that means
+/// "fire the op." We accept the canonical positive classifications
+/// from the lattices most likely to be used for hook gating:
+/// `allow`, `pass`, `proceed`, `delete`, `keep`. Conservative — an
+/// unknown verdict (e.g. `flag`, `manual`) does NOT permit firing.
+fn is_allow_verdict(verdict: &str) -> bool {
+    matches!(
+        verdict,
+        "allow"
+            | "pass"
+            | "proceed"
+            | "fire"
+            | "ok"
+            | "delete"
+            | "keep"
+            | "yes"
+            | "true"
+    )
 }
 
 #[cfg(test)]

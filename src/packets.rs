@@ -553,6 +553,28 @@ pub enum Predicate {
         min: f64,
         max: f64,
     },
+    /// **Set membership.** True iff `entity[field]`'s scalar value is
+    /// in `values`. Strings, ints, bools — pick a homogeneous type.
+    /// Missing fields and non-scalar values return false. Common shape
+    /// for "branch in {`merged`, `closed`, `superseded`}" and
+    /// "last_signal.name in {`pr-merged`, `pr-feedback`}".
+    In {
+        field: String,
+        values: Vec<Value>,
+    },
+    /// **Regex match.** True iff `entity[field]` is a string that
+    /// matches `pattern`. Compiles the regex on every evaluation; the
+    /// regex crate caches at the type level so the cost is just the
+    /// hashmap lookup. Use anchors (`^`, `$`) explicitly — no implicit
+    /// anchoring (matches anywhere in the string by default, like
+    /// `regex::Regex::is_match`). Invalid regex evaluates to false
+    /// with a warn log.
+    StringMatches {
+        field: String,
+        pattern: String,
+        #[serde(default)]
+        case_insensitive: bool,
+    },
     /// **Count-matching predicate.** True iff the count of sub-predicates
     /// that evaluate to true satisfies `count compare value`. Sibling to
     /// `All` (count == len) and `Any` (count >= 1) but with explicit
@@ -760,9 +782,12 @@ fn validate_path(path: &str, context: &str) -> Result<()> {
             path
         );
     }
-    if inner.contains('.') {
+    // Dotted paths now permitted (e.g. `vars.labels[*]`,
+    // `outputs.Plan.findings[*]`) since the ArcContext flatten emits
+    // structured entities. Each segment must be non-empty.
+    if inner.split('.').any(|seg| seg.is_empty()) {
         anyhow::bail!(
-            "{}: dotted path '{}' not supported in v1 — flatten the entity or wait for phase-next",
+            "{}: dotted path '{}' has an empty segment",
             context,
             path
         );
@@ -1164,21 +1189,51 @@ fn resolve_entity(
 }
 
 fn entity_get(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> Option<Value> {
-    entity.get(field).and_then(Value::from_json)
+    entity_get_raw(entity, field).and_then(|v| Value::from_json(&v))
+}
+
+/// Raw JSON lookup with dotted-path support. Tries literal-key first
+/// (back-compat for legacy field names containing dots), then walks
+/// `head.tail.tail` against the entity, descending into nested objects
+/// and array indices. Used by every entity_* helper for consistent
+/// path semantics across the predicate evaluator.
+fn entity_get_raw(
+    entity: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<serde_json::Value> {
+    if let Some(v) = entity.get(field) {
+        return Some(v.clone());
+    }
+    if !field.contains('.') {
+        return None;
+    }
+    let parts: Vec<&str> = field.split('.').collect();
+    let mut cur = entity.get(parts[0])?.clone();
+    for seg in &parts[1..] {
+        cur = match &cur {
+            serde_json::Value::Object(m) => m.get(*seg)?.clone(),
+            serde_json::Value::Array(a) => {
+                let idx: usize = seg.parse().ok()?;
+                a.get(idx)?.clone()
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
 }
 
 fn entity_int(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> Option<i64> {
-    entity.get(field).and_then(|v| v.as_i64())
+    entity_get_raw(entity, field).and_then(|v| v.as_i64())
 }
 
 fn entity_f64(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> Option<f64> {
-    entity.get(field).and_then(|v| v.as_f64())
+    entity_get_raw(entity, field).and_then(|v| v.as_f64())
 }
 
 fn entity_has(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
     // Key exists AND value is non-null. Used by `IsNonNull`. Distinct
     // from `entity_key_exists` (which counts null as present).
-    match entity.get(field) {
+    match entity_get_raw(entity, field) {
         None => false,
         Some(serde_json::Value::Null) => false,
         Some(_) => true,
@@ -1186,30 +1241,41 @@ fn entity_has(entity: &serde_json::Map<String, serde_json::Value>, field: &str) 
 }
 
 fn entity_key_exists(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
-    entity.contains_key(field)
+    if entity.contains_key(field) {
+        return true;
+    }
+    entity_get_raw(entity, field).is_some()
 }
 
 fn entity_is_null(entity: &serde_json::Map<String, serde_json::Value>, field: &str) -> bool {
-    matches!(entity.get(field), Some(serde_json::Value::Null))
+    matches!(entity_get_raw(entity, field), Some(serde_json::Value::Null))
 }
 
-/// Resolve a path like `"tools[*]"` to the backing array in the entity.
-/// Returns `None` if the path doesn't end in `[*]`, the field is
-/// missing, or the value isn't an array.
+/// Resolve a path like `"tools[*]"` or `"vars.labels[*]"` to the
+/// backing array in the entity. Returns `None` if the path doesn't end
+/// in `[*]`, the field is missing, or the value isn't an array.
 ///
-/// Phase-4 path syntax (deliberately limited): a single field name
-/// followed by `[*]`. Dotted paths (`"config.rules[*]"`) are phase-
-/// next; if you need them, flatten the entity before applying.
-fn resolve_collection<'a>(
-    entity: &'a serde_json::Map<String, serde_json::Value>,
+/// Dotted-path support (added when the workflow engine started passing
+/// structured ArcContext entities — `vars.labels[*]`,
+/// `outputs.Plan.findings[*]`, etc.). The flat single-field form
+/// keeps working unchanged.
+///
+/// Returned as an owned Vec because the dotted-path walk has to clone
+/// to descend through nested objects; a borrow would need an arena.
+fn resolve_collection(
+    entity: &serde_json::Map<String, serde_json::Value>,
     path: &str,
-) -> Option<&'a [serde_json::Value]> {
+) -> Option<Vec<serde_json::Value>> {
     let field = path.strip_suffix("[*]")?;
-    if field.contains('.') {
-        // Dotted paths rejected in v1 — reserved for phase-next.
-        return None;
+    let value = if field.contains('.') {
+        entity_get_raw(entity, field)?
+    } else {
+        entity.get(field)?.clone()
+    };
+    match value {
+        serde_json::Value::Array(a) => Some(a),
+        _ => None,
     }
-    entity.get(field)?.as_array().map(|v| v.as_slice())
 }
 
 /// Depth limit for `Apply` (packet composition). Prevents unbounded
@@ -1436,6 +1502,38 @@ fn eval_predicate(
                 .filter(|p| eval_predicate(p, entity, resolver, depth))
                 .count();
             compare.apply(count, *value)
+        }
+        Predicate::In { field, values } => {
+            let v = match entity_get_raw(entity, field) {
+                Some(v) => v,
+                None => return false,
+            };
+            let typed = match Value::from_json(&v) {
+                Some(t) => t,
+                None => return false,
+            };
+            values.iter().any(|cand| cand == &typed)
+        }
+        Predicate::StringMatches {
+            field,
+            pattern,
+            case_insensitive,
+        } => {
+            let s = match entity_get_raw(entity, field) {
+                Some(serde_json::Value::String(s)) => s,
+                _ => return false,
+            };
+            let mut builder = regex::RegexBuilder::new(pattern);
+            builder.case_insensitive(*case_insensitive);
+            match builder.build() {
+                Ok(re) => re.is_match(&s),
+                Err(e) => {
+                    tracing::warn!(
+                        "StringMatches: invalid regex pattern {pattern:?}: {e}"
+                    );
+                    false
+                }
+            }
         }
         Predicate::Apply {
             packet_id,
@@ -4100,13 +4198,14 @@ mod tests {
     }
 
     #[test]
-    fn compile_rejects_dotted_paths() {
-        // Phase-4 bro critique: silent-failure on authoring errors is the
-        // wrong mode. Compile now rejects dotted paths explicitly rather
-        // than silently returning None at eval time.
+    fn compile_accepts_dotted_paths() {
+        // Workflow-engine integration accepts dotted paths in
+        // quantified-predicate path expressions because ArcContext
+        // entities are deeply structured (`vars.labels[*]`,
+        // `outputs.Plan.findings[*]`). Empty segments still rejected.
         let (_dir, store) = tmp_packets();
-        let params = CompileParams {
-            domain: "dotted-path-test".into(),
+        let ok_params = CompileParams {
+            domain: "dotted-path-accepted".into(),
             rules: json!([{
                 "id": "flag_x",
                 "antecedent": {"op": "ForAll", "path": "config.rules[*]", "pred": {"op": "True"}},
@@ -4122,10 +4221,31 @@ mod tests {
             scope: Some("global".into()),
             project: None,
         };
-        let err = format!("{:#}", store.compile(&params).unwrap_err());
+        store
+            .compile(&ok_params)
+            .expect("dotted-path antecedent must compile");
+
+        let bad_params = CompileParams {
+            domain: "dotted-path-empty-seg".into(),
+            rules: json!([{
+                "id": "flag_x",
+                "antecedent": {"op": "ForAll", "path": "config..rules[*]", "pred": {"op": "True"}},
+                "consequent": "X"
+            }]),
+            classification_lattice: None,
+            prefix_inference: None,
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        let err = format!("{:#}", store.compile(&bad_params).unwrap_err());
         assert!(
-            err.contains("dotted path"),
-            "dotted-path rejection missing: got {err}"
+            err.contains("empty segment"),
+            "empty-segment rejection missing: got {err}"
         );
     }
 
@@ -5987,5 +6107,130 @@ mod tests {
             pred.classification, "nomatch",
             "depth limit should prevent the outer chain from resolving to 'match'"
         );
+    }
+
+    // ── Workflow-engine-driven extensions: dotted paths + In + StringMatches ──
+
+    fn eval_simple(pred: &Predicate, entity: &serde_json::Value) -> bool {
+        let map = entity.as_object().expect("entity must be a JSON object");
+        eval_predicate(pred, map, &NoopResolver, 0)
+    }
+
+    #[test]
+    fn dotted_path_eq_resolves() {
+        let entity = json!({
+            "vars": {"issue": 42, "labels": ["bug", "urgent"]},
+            "outputs": {"Plan": {"branch": "fix/issue-42"}}
+        });
+        assert!(eval_simple(
+            &Predicate::Eq {
+                field: "vars.issue".into(),
+                value: Value::Int(42),
+            },
+            &entity
+        ));
+        assert!(eval_simple(
+            &Predicate::Eq {
+                field: "outputs.Plan.branch".into(),
+                value: Value::String("fix/issue-42".into()),
+            },
+            &entity
+        ));
+        assert!(!eval_simple(
+            &Predicate::Eq {
+                field: "vars.does_not_exist".into(),
+                value: Value::Int(0),
+            },
+            &entity
+        ));
+    }
+
+    #[test]
+    fn dotted_path_array_index() {
+        let entity = json!({"vars": {"labels": ["bug", "urgent"]}});
+        assert!(eval_simple(
+            &Predicate::Eq {
+                field: "vars.labels.0".into(),
+                value: Value::String("bug".into()),
+            },
+            &entity
+        ));
+        assert!(eval_simple(
+            &Predicate::Eq {
+                field: "vars.labels.1".into(),
+                value: Value::String("urgent".into()),
+            },
+            &entity
+        ));
+    }
+
+    #[test]
+    fn in_predicate_set_membership() {
+        let entity = json!({"last_signal": {"name": "pr-merged"}});
+        let pred = Predicate::In {
+            field: "last_signal.name".into(),
+            values: vec![
+                Value::String("pr-merged".into()),
+                Value::String("pr-feedback".into()),
+            ],
+        };
+        assert!(eval_simple(&pred, &entity));
+
+        let entity2 = json!({"last_signal": {"name": "pr-other"}});
+        assert!(!eval_simple(&pred, &entity2));
+
+        let entity3 = json!({});
+        assert!(!eval_simple(&pred, &entity3));
+    }
+
+    #[test]
+    fn string_matches_regex() {
+        let entity = json!({"event": "pull_request.synchronize"});
+        let pred = Predicate::StringMatches {
+            field: "event".into(),
+            pattern: r"^pull_request\..*$".into(),
+            case_insensitive: false,
+        };
+        assert!(eval_simple(&pred, &entity));
+
+        let entity2 = json!({"event": "issue.opened"});
+        assert!(!eval_simple(&pred, &entity2));
+    }
+
+    #[test]
+    fn string_matches_case_insensitive() {
+        let entity = json!({"branch": "Fix/Issue-42"});
+        let pred = Predicate::StringMatches {
+            field: "branch".into(),
+            pattern: r"^fix/issue-".into(),
+            case_insensitive: true,
+        };
+        assert!(eval_simple(&pred, &entity));
+    }
+
+    #[test]
+    fn string_matches_invalid_regex_returns_false() {
+        let entity = json!({"x": "anything"});
+        let pred = Predicate::StringMatches {
+            field: "x".into(),
+            pattern: r"(unclosed".into(),
+            case_insensitive: false,
+        };
+        assert!(!eval_simple(&pred, &entity));
+    }
+
+    #[test]
+    fn dotted_path_in_quantified_path() {
+        // Exists over `vars.labels[*]` — the core "labels contains
+        // `bug`" idiom.
+        let entity = json!({"vars": {"labels": ["bug", "urgent"]}});
+        let pred = Predicate::Exists {
+            path: "vars.labels[*]".into(),
+            pred: Box::new(Predicate::Eq {
+                field: "$".into(),
+                value: Value::String("bug".into()),
+            }),
+        };
+        assert!(eval_simple(&pred, &entity));
     }
 }

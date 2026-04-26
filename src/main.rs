@@ -67,6 +67,11 @@ struct SharedState {
     /// after the arc terminates so a peek shortly after close still
     /// works (they stay until the daemon restarts).
     running_arcs: RwLock<HashMap<String, ArcSnapshot>>,
+    /// Pending Wait-node registrations indexed by signal name +
+    /// correlation. Webhook router and direct `bbox_arc_signal` MCP
+    /// calls write into this; suspended arcs block on the per-wait
+    /// Notify until a matching signal arrives.
+    wait_store: Arc<crate::workflow::wait::WaitStore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +309,45 @@ impl BlackboxServer {
             "node": node_id,
         });
         Ok(packets::apply_all_with(&packet, &entity, &*packet_store))
+    }
+
+    /// Entity-shaped variant of `apply_workflow_gate` — the workflow
+    /// engine constructs the full ArcContext flatten (vars + outputs +
+    /// meta + last_signal + node_output + node_id) and passes it
+    /// directly so packet rules can reference `vars.x`,
+    /// `last_signal.name`, etc.
+    pub fn apply_workflow_gate_entity(
+        &self,
+        packet_id: &str,
+        entity: &serde_json::Value,
+        _node_id: &str,
+    ) -> Result<Option<String>, String> {
+        let packet_store = self.state.packets.read();
+        let packet = packet_store
+            .load(packet_id)
+            .map_err(|e| format!("loading gate packet {packet_id}: {e:#}"))?;
+        let prediction = apply_packet_with(&packet, entity, &*packet_store);
+        Ok(prediction.map(|p| p.classification))
+    }
+
+    /// Entity-shaped `apply_all` variant. Same shape as
+    /// `apply_workflow_gate_entity` but mode=all semantics.
+    pub fn apply_workflow_gate_all_entity(
+        &self,
+        packet_id: &str,
+        entity: &serde_json::Value,
+        _node_id: &str,
+    ) -> Result<packets::ApplyAllResult, String> {
+        let packet_store = self.state.packets.read();
+        let packet = packet_store
+            .load(packet_id)
+            .map_err(|e| format!("loading gate packet {packet_id}: {e:#}"))?;
+        Ok(packets::apply_all_with(&packet, entity, &*packet_store))
+    }
+
+    /// Server-owned WaitStore for suspendable arcs.
+    pub fn wait_store(&self) -> &Arc<crate::workflow::wait::WaitStore> {
+        &self.state.wait_store
     }
 
     /// Soft-nag classifier for `bbox_learn`: apply the latest
@@ -4461,6 +4505,7 @@ async fn main() -> anyhow::Result<()> {
         tail_tx: tail_tx.clone(),
         store_dir: store_dir.clone(),
         running_arcs: RwLock::new(HashMap::new()),
+        wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
     });
 
     // Packet self-heal scanner — off by default. Walks recent
@@ -4594,6 +4639,7 @@ mod tests {
             tail_tx,
             store_dir: tmp.path().join("bro"),
             running_arcs: RwLock::new(HashMap::new()),
+            wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
         });
         BlackboxServer::new(state)
     }
@@ -4783,6 +4829,8 @@ mod tests {
             Some(1),
             engine::MAX_COMPOSITION_DEPTH,
             std::collections::HashMap::new(),
+            serde_json::Map::new(),
+            None,
         )
         .await;
         assert!(
@@ -4801,6 +4849,8 @@ mod tests {
             Some(1),
             engine::MAX_COMPOSITION_DEPTH + 1,
             std::collections::HashMap::new(),
+            serde_json::Map::new(),
+            None,
         )
         .await;
         assert!(
