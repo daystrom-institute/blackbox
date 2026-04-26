@@ -299,7 +299,17 @@ Five providers at parity: Claude (`.jsonl`), Codex (`.jsonl`), Gemini (`.json` s
 
 ## `bro orchestrate` — workflow engine
 
-Protocol-level orchestration: define a workflow as a mermaid state-diagram plus actor/node metadata, then dispatch it. The daemon owns the loop; the CLI is a courier. Intended as the replacement for long skill-prose protocols (overmind, crucible) that required the top-most LLM to cosplay a state machine across hundreds of turns.
+Protocol-level orchestration: define a workflow as a mermaid
+state-diagram plus actor/node metadata, then dispatch it. The daemon
+owns the loop; the CLI is a courier. Replaces long skill-prose
+protocols (overmind, crucible) that required the top-most LLM to
+cosplay a state machine across hundreds of turns.
+
+The engine composes rule-packet decisions, hook side-effects,
+sub-arc composition, and external webhook signals into a deterministic
+state machine. Suspendable arcs (Wait nodes), capability-tagged
+actors, operator-blessed registries, and hook gating via packets are
+all first-class.
 
 ```bash
 bro orchestrate run <workflow.json> [--project-dir <path>] [--max-steps N] [--dry-run] [--stream]
@@ -308,130 +318,20 @@ bro orchestrate list [--limit N]
 bro orchestrate peek [<thread-id>]
 ```
 
-- **`run`** — reads the file, POSTs to `/orchestrate` (or `/orchestrate/stream` with `--stream`), blocks until termination or streams events live. `--dry-run` validates the spec + prints the plan without dispatching.
-- **`status <thread-id>`** — fetches the notes posted to the arc's thread over its lifetime + the most recent compaction anchor. Post-hoc audit trail.
-- **`list`** — recent workflow arcs with final status + latest anchor. Catalog view.
-- **`peek [<thread-id>]`** — live in-flight state: current node, completed/in-flight/visit counts. Without an id, dumps every live arc snapshot.
+MCP surface: `bro_orchestrate_run`, `bro_orchestrate_author`,
+`bro_workflow_install`, `bro_webhook_install`, `bro_arc_signal`,
+`bro_arc_status`. Webhook ingress at `POST /webhook/<name>` with
+HMAC-SHA256 signature verification (Forgejo / GitHub / None for
+closed networks).
 
-MCP tools: `bro_orchestrate_run` dispatches a workflow. `bro_orchestrate_author` compiles a prose charter into a validated workflow spec via an authoring LLM, closing the authoring loop (operators describe arcs in prose, get a spec back, dispatch).
-
-Every `run` opens a `bbox_thread(kind=work_item)` automatically; the returned `arc_thread_id` makes the arc discoverable via `bbox_inbox`, `bbox_notes`, `bbox_thread_list`. Sub-workflows open their own threads; you get a tree of arcs without any additional bookkeeping. The rolling `ANCHOR` compaction notes at each boundary let observers reconstruct state without reading every event.
-
-**Why the daemon owns the loop.** An LLM maintaining workflow state across turns drifts: forgets phases, re-litigates settled decisions, invents new steps to paper over mistakes, dies on context compaction. A CLI-driven loop doesn't — it has no context to forget. LLMs become stateless function calls dispatched *into* the loop rather than the loop's substrate.
-
-### Workflow shape
-
-A workflow file has two halves: structured metadata and an embedded mermaid `stateDiagram-v2`. The daemon parses and cross-validates both before any dispatch.
-
-```json
-{
-  "name": "e2e-smoke",
-  "version": 1,
-  "actors": {
-    "haiku": { "kind": "executor", "brofile": "probe-haiku", "durable": true }
-  },
-  "nodes": {
-    "Greet": { "actor": "haiku", "prompt": "Say hello briefly." },
-    "Riff":  { "actor": "haiku", "prompt": "Riff on: ${Greet.output}" }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> Greet\n    Greet --> Riff\n    Riff --> [*]"
-}
-```
-
-**Actors** declare WHO runs each turn. Four kinds:
-- `executor` — single bro, dispatched via `bro_exec` / `bro_resume`. `durable: true` reuses the same session across every node that invokes this actor.
-- `ensemble` — team broadcast via `bro_broadcast`. Each member runs the same prompt concurrently; the node's output is the labeled concatenation of all member outputs.
-- `advisor` — like executor but conventionally narrower tool surface / persona lens.
-- `user` — human escalation point. Hitting a user node halts the arc with a `blocked` note carrying the prompt; resume is an operator action (currently re-dispatch the workflow with whatever state change resolves the pause; arc-state resume is phase-next).
-
-**Nodes** declare the unit of work. Fields:
-- `actor` (required unless `subworkflow` is set) — references `actors`
-- `prompt` — template with `${NodeName.output}` substitution from earlier nodes (including async sources joined via `late_inject`)
-- `gate` — optional packet ID; applied after the node completes. The packet's classification becomes the verdict for the next choice node.
-- `retry.max_generations` — visit-count ceiling. Each re-entry (including back-edges through choice nodes) bumps the count; exceeding halts the arc. Retry prompts get a `[retry — attempt N, prior gate verdict: X]` prepended automatically.
-- `mode` — `sync` (default) or `fire_and_forget`. Fire-and-forget dispatches and advances without waiting; a downstream node declaring `late_inject` joins it later.
-- `late_inject.from` — name of a source node whose output is folded into this node's prompt at its entry (waits with timeout if still running). Enables the optimistic-review pattern where async steering lands on the next turn boundary.
-- `subworkflow` — full inline workflow spec. When present, the node runs the sub-workflow to completion instead of dispatching an actor; the sub-workflow's node outputs are concatenated (with member labels) and stored as this node's output. Sub-arcs open their own `bbox_thread` so the call tree is fully auditable.
-
-**Graph** is the embedded mermaid. The parser accepts a narrow subset of `stateDiagram-v2`:
-- `[*]` start / end markers
-- `A --> B` sequential edges
-- `A --> B: label` labeled edges (consumed by choice nodes to select by verdict, and by fork nodes to denote async branches)
-- `state X <<choice>>` — routing node; selects the outgoing edge whose label matches the last gate verdict
-- `state X <<fork>>` — dispatches every outgoing edge's target; the first outgoing edge is the sync continuation, the rest are fire-and-forget branches whose handles are held for `late_inject` joins
-- `state X <<join>>` — declared, not yet executed (use `late_inject` for equivalent shapes today)
-- `%%` comments
-
-The graph is cross-validated against the metadata: every activity node in the graph must have a matching `nodes[...]` entry, every `nodes[...]` entry must be reachable in the graph, every `actor` reference must resolve (unless the node is a subworkflow), every `late_inject.from` must reference a real node, every fork must have at least 2 outgoing edges, and embedded sub-workflows compile recursively so errors surface at parent-compile time. Every gate packet reference is resolved at dispatch time.
-
-### Gate-driven branching
-
-A workflow branches by compiling a rule-packet whose classifications match edge labels on a choice node:
-
-```json
-"Decide": {
-  "actor": "haiku",
-  "prompt": "Output exactly YES or NO.",
-  "gate": "packet-05f4ba16"
-},
-"Say_Yes": { "actor": "haiku", "prompt": "Celebrate briefly." },
-"Say_No":  { "actor": "haiku", "prompt": "Sigh briefly." }
-```
-
-```mermaid
-stateDiagram-v2
-    [*] --> Decide
-    state Decide_Route <<choice>>
-    Decide --> Decide_Route
-    Decide_Route --> Say_Yes: yes
-    Decide_Route --> Say_No: no
-    Say_Yes --> [*]
-    Say_No --> [*]
-```
-
-After `Decide` completes, its output is handed to `packet-05f4ba16` (a packet with lattice `["yes", "no"]`). The packet's classification becomes the verdict; the choice node `Decide_Route` picks whichever outgoing edge label matches. Back-edges in the graph become natural retry loops, gated on the circuit breaker in `retry.max_generations`.
-
-### Workflow-level policy packets — advisor as packet
-
-A workflow can declare a top-level `policy_packet: <id>`. The engine builds an arc-state entity at each node boundary (`step`, `just_ran`, `next`, `completed`, `completed_count`, `in_flight`, `in_flight_count`, `last_verdict`, `visit_counts`) and applies the packet. The classification is an arc-level verdict:
-
-- `halt` — stop the arc immediately (error exit with the reason on the arc thread)
-- `escalate` — write a `blocked` note to the arc thread, continue
-- `warn` — write a `surprise` note, continue
-- anything else (including the default `continue`) — no-op
-
-This is the mechanization of the advisor loop: instead of dispatching an LLM at every boundary to read the checkpoint and say `CONTINUE | ESCALATE | CHARTER_DRIFT | EXIT_MET`, compile those rules into a packet once and let them evaluate deterministically. Useful for runaway-visit detectors, time / step ceilings, arc-shape invariants, and any other rule where the LLM's judgment adds latency without adding accuracy.
-
-### What's currently implemented (v0.4)
-
-- Actor kinds: `executor` (exec+resume), `ensemble` (broadcast+join), `advisor` (executor lens), `user` (pause+note)
-- Graph shapes: sequential edges, `<<choice>>` verdict routing, `<<fork>>` sync-continuation + fire-and-forget branches, back-edges (retry loops)
-- Gate packets via `bbox_apply` on the packet store; classifications become edge-label matchers
-- Retry ceilings via per-node visit counts + `retry.max_generations`
-- `${NodeName.output}` prompt substitution, including late-bound source outputs
-- `late_inject.from` joins an async source's output into a downstream node's brief at its entry
-- `subworkflow` — fully compositional; nested arcs get their own `bbox_thread`
-- `fire_and_forget` node mode dispatches without blocking
-- Arc-thread persistence: every `run` opens a `bbox_thread(kind=work_item)`; structured notes (`done`, `learned`, `surprise`, `blocked`) trail every major event
-- Compaction anchors: rolling `ANCHOR [step N, …]` notes at each boundary summarize arc state for observers that don't want to read every event
-- `--dry-run` validates + summarizes without dispatching
-- `bro orchestrate status <thread-id>` dumps the arc's note trail + latest anchor
-- `bro orchestrate list` catalogs recent arcs; `bro orchestrate peek` shows live state for in-flight arcs
-- `bro orchestrate run --stream` emits SSE events live during the run instead of blocking
-- Workflow-level `policy_packet` — advisor-as-packet, deterministic arc-health rules applied at every boundary
-- Gate-packet modes: `first` (single verdict) or `all` (multi-finding aggregate, lattice-highest classification)
-- `<<join>>` control nodes for synchronous fan-in after fork
-- Parent outputs seeded into sub-workflow runners so sub templates can reference `${ParentNode.output}` identically to siblings
-- `bro_orchestrate_author` MCP tool — prose-charter → validated spec via authoring LLM; auto-retries on compile failure
-
-### Phase-next
-
-- `bro orchestrate resume <thread-id>` — genuine re-entry at the last recorded step for arcs that paused or errored. Needs persistent full-output snapshots to survive daemon restarts.
-- YAML workflow loader (JSON-only today; one-line add once `serde_yaml` is introduced).
-- Workflow templates on the daemon (referenceable by name instead of inlined per spec) — mirrors rule-packet composition via `Apply`. Same shape, one layer up.
-- Auto-prune of `running_arcs` registry + persistence across daemon restarts so `peek` works after a restart.
-
-See [`examples/workflows/`](examples/workflows/README.md) for runnable examples and a deeper walkthrough.
+> **See [`WORKFLOWS.md`](WORKFLOWS.md) for the canonical reference** —
+> ArcContext templating, hook ops, Wait/signal correlation,
+> subworkflow imports/exports, capability tags, webhook routing,
+> operator-blessed registries, audit surfaces, and authoring loops.
+>
+> **End-to-end example**: [`examples/keystone/`](examples/keystone/README.md)
+> wires Forgejo issues → implementer subworkflow → reviewer ensemble
+> → wait-loop until merged → cleanup hooks. Real LLM dispatch.
 
 ---
 
@@ -490,6 +390,19 @@ Dispatch agent tasks to Claude, OpenCode, Codex, Copilot, Vibe, or Gemini and co
 | `bro_brofile` | Manage brofile templates and named accounts. |
 | `bro_team` | Manage team templates and live teams. |
 
+### Workflow engine (`bro_*`)
+
+| Tool | Description |
+|---|---|
+| `bro_orchestrate_run`     | Dispatch a workflow spec; blocks until termination (or use `--stream`). |
+| `bro_orchestrate_author`  | Compile a prose charter into a validated spec via an authoring LLM. |
+| `bro_workflow_install` / `bro_workflow_list`  | Operator-blessed workflow registry (referenced by id from webhook routing + sub-arc lookup). |
+| `bro_webhook_install` / `bro_webhook_list`    | Operator-blessed webhook ingress (HMAC-SHA256, Extractor projection, routing-packet dispatch). |
+| `bro_arc_signal`          | Manually deliver a signal to a pending Wait (debug / rescue path). |
+| `bro_arc_status`          | Read-only snapshot of running arc + pending waits. |
+
+Full reference and authoring guide in [`WORKFLOWS.md`](WORKFLOWS.md).
+
 ### HTTP endpoints (non-MCP)
 
 | Path | Description |
@@ -497,6 +410,12 @@ Dispatch agent tasks to Claude, OpenCode, Codex, Copilot, Vibe, or Gemini and co
 | `GET /mcp` | MCP streamable-HTTP transport. All client CLIs connect here. |
 | `GET /tail` | SSE stream of orchestration lifecycle events. Filter via `?team=`/`?bro=`/`?provider=`. |
 | `GET /roster` | Resolves `?bros=a,b&team=X&provider=Y` selectors → `[{bro, team, provider, session_id, jsonl_path, model}]`. Used by `bro tail` to locate transcript files. |
+| `POST /webhook/<name>`        | External-event ingestion → routing packet → `start_arc`/`signal_arc`/`cancel_arc`/`ignore`/`dead_letter`. See [`WORKFLOWS.md`](WORKFLOWS.md#webhook-ingress). |
+| `POST /webhook/<name>/replay` | Run a payload through the extractor + routing packet without dispatching. Debug aid. |
+| `POST /orchestrate`           | Dispatch a full workflow spec (JSON body). |
+| `POST /orchestrate/by-id`     | Dispatch a registry-installed workflow by id with optional `initial_vars`. |
+| `GET /orchestrate/peek`       | Live in-flight arc snapshots. |
+| `POST /admin/{packet/compile,workflow/install,webhook/install,brofile/upsert,team/upsert}` | Plain-HTTP admin shortcuts for install scripts that can't speak rmcp's streamable-HTTP transport. |
 
 ---
 
@@ -634,6 +553,8 @@ Drop-in configs for wiring blackbox into agent CLIs live in [`examples/`](exampl
 
 - **Agents** — [`session-searcher`](examples/agents/session-searcher.md): read-only subagent that keeps transcript digging off your main context window.
 - **Skills / slash commands** — [`crucible`](examples/skills/crucible.md) (orchestrator + durable implementer + continuous red-team ensemble, coordinated through a `bbox_thread(kind="work_item")` and structured `bbox_note` signals), [`takeover`](examples/skills/takeover.md) (pick up a stalled or handed-off agent session without losing scope), and [`overmind`](examples/skills/overmind.md) (meta-orchestration — strategic Advisor above crucible, with a durable spine doc that survives orchestrator compaction; demonstrates the legitimate `allow_recursion=true` pattern).
+- **Workflow shape catalog** — [`examples/workflows/`](examples/workflows/) — runnable single-file specs covering linear, gated, ensemble, fork-join, blind-convergence, optimistic-review, self-audit patterns.
+- **Keystone end-to-end** — [`examples/keystone/`](examples/keystone/README.md) — Forgejo issue → arc → implementer subworkflow → wait → reviewer ensemble → wait-loop until merged → cleanup hooks. Real LLM dispatch. Adaptation guide in the example's README.
 
 ---
 
