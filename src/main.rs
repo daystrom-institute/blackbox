@@ -12,6 +12,7 @@ mod system_memory;
 mod threads;
 mod tool_docs;
 mod util;
+mod webhooks;
 mod workflow;
 
 use std::collections::{BTreeMap, HashMap};
@@ -72,6 +73,13 @@ struct SharedState {
     /// calls write into this; suspended arcs block on the per-wait
     /// Notify until a matching signal arrives.
     wait_store: Arc<crate::workflow::wait::WaitStore>,
+    /// Operator-installed webhook endpoints. Each carries its
+    /// signature scheme + extractor + routing-packet id.
+    webhooks: webhooks::SharedRegistry,
+    /// Operator-installed workflow specs by id. Allows
+    /// `start_arc{workflow: "name"}` routing verdicts to find their
+    /// target without the webhook payload carrying the full spec.
+    workflow_registry: Arc<RwLock<HashMap<String, workflow::Workflow>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2773,13 +2781,298 @@ Constraints:\n\
             Ok(c) => c,
             Err(e) => return Self::err_text(&format!("workflow compile failed: {e}")),
         };
+        // Capability validation — walk every actor's brofile/team →
+        // provider and verify the actor's `requires` capabilities are
+        // covered. Hard fail rather than silent route-around.
+        if let Err(e) = self.validate_workflow_capabilities(&compiled) {
+            return Self::err_text(&format!("workflow capability validation failed: {e}"));
+        }
         if p.dry_run.unwrap_or(false) {
             let result = workflow::engine::dry_run(&compiled);
             return Self::ok_json(&serde_json::to_value(&result).unwrap_or_default());
         }
-        let result = workflow::run_workflow(self, &compiled, p.project_dir, p.max_steps).await;
+        let initial_vars = p.initial_vars.unwrap_or_default();
+        let result = workflow::run_workflow_with_initial_vars(
+            self,
+            &compiled,
+            p.project_dir,
+            p.max_steps,
+            initial_vars,
+        )
+        .await;
         Self::ok_json(&serde_json::to_value(&result).unwrap_or_default())
     }
+
+    /// Walk each ActorSpec.requires → resolve actor's brofile (or
+    /// team's member brofiles) → resolve provider → check provider
+    /// capabilities cover the requirements. Hard fail with the first
+    /// mismatch. Empty `requires` (default) is always satisfied.
+    fn validate_workflow_capabilities(
+        &self,
+        compiled: &workflow::CompiledWorkflow,
+    ) -> Result<(), String> {
+        for (actor_name, actor) in &compiled.spec.actors {
+            if actor.requires.is_empty() {
+                continue;
+            }
+            let providers = self.resolve_actor_providers(actor)?;
+            if providers.is_empty() {
+                return Err(format!(
+                    "actor '{actor_name}' requires {:?} but resolves to no providers",
+                    actor.requires
+                ));
+            }
+            for provider in &providers {
+                let caps = provider.capabilities();
+                let missing: Vec<_> = actor
+                    .requires
+                    .iter()
+                    .filter(|r| !caps.contains(r))
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(format!(
+                        "actor '{actor_name}' requires {:?} but provider '{provider}' lacks {:?}",
+                        actor.requires, missing
+                    ));
+                }
+            }
+        }
+        // Recursively validate sub-workflows.
+        for (node_id, node) in &compiled.spec.nodes {
+            if let Some(sub) = &node.subworkflow {
+                let sub_compiled = workflow::compile((**sub).clone())
+                    .map_err(|e| format!("subworkflow on '{node_id}' compile: {e}"))?;
+                self.validate_workflow_capabilities(&sub_compiled)
+                    .map_err(|e| format!("subworkflow on '{node_id}': {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk an ActorSpec to the providers it dispatches to. For
+    /// executor/advisor: lookup brofile, return its provider. For
+    /// ensemble: lookup team, walk its member brofiles. Returns the
+    /// distinct provider set.
+    fn resolve_actor_providers(
+        &self,
+        actor: &workflow::schema::ActorSpec,
+    ) -> Result<Vec<orchestration::providers::Provider>, String> {
+        use std::collections::HashSet;
+        let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
+        match actor.kind {
+            workflow::schema::ActorKind::User => {
+                // User nodes have no provider — capability check trivially OK.
+            }
+            workflow::schema::ActorKind::Executor | workflow::schema::ActorKind::Advisor => {
+                let brofile_name = actor.brofile.as_deref().ok_or_else(|| {
+                    format!("actor (kind={:?}) missing brofile", actor.kind)
+                })?;
+                let bf = orchestration::brofile::resolve_brofile(
+                    brofile_name,
+                    &self.state.store_dir,
+                    None,
+                )
+                .ok_or_else(|| format!("brofile '{brofile_name}' not found"))?;
+                providers.insert(bf.provider);
+            }
+            workflow::schema::ActorKind::Ensemble => {
+                let team_name = actor
+                    .team
+                    .as_deref()
+                    .ok_or_else(|| "ensemble actor missing team".to_string())?;
+                let team = orchestration::team::load_team(team_name, &self.state.store_dir)
+                    .ok_or_else(|| format!("team '{team_name}' not found"))?;
+                for member in team.members.iter() {
+                    let bf = orchestration::brofile::resolve_brofile(
+                        &member.brofile,
+                        &self.state.store_dir,
+                        None,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "team '{team_name}' member '{}' brofile '{}' not found",
+                            member.name, member.brofile
+                        )
+                    })?;
+                    providers.insert(bf.provider);
+                }
+            }
+        }
+        Ok(providers.into_iter().collect())
+    }
+
+    #[tool(
+        name = "bro_arc_signal",
+        description = "Resolve a pending Wait by signal name + correlation tuple. Same dispatch path that the webhook router uses for `signal_arc` verdicts — surfaced as MCP so an operator can manually advance an arc that's blocked on an external event."
+    )]
+    async fn bro_arc_signal(
+        &self,
+        Parameters(p): Parameters<ArcSignalParams>,
+    ) -> CallToolResult {
+        let correlation = p.correlate.unwrap_or_default();
+        let result = signal_arc_dispatch(&self.state, &p.signal, correlation).await;
+        Self::ok_json(&result)
+    }
+
+    #[tool(
+        name = "bro_arc_status",
+        description = "Read-only structured query against active and recently-finished arcs. Returns the current ArcSnapshot (current_node, completed_nodes, in_flight_nodes, last_verdict, visit_counts, started_at) plus pending-wait registrations for the arc."
+    )]
+    async fn bro_arc_status(
+        &self,
+        Parameters(p): Parameters<ArcStatusParams>,
+    ) -> CallToolResult {
+        let snapshots: Vec<&ArcSnapshot> = if let Some(arc_id) = &p.arc_id {
+            self.state
+                .running_arcs
+                .read()
+                .values()
+                .filter(|s| s.arc_thread_id == *arc_id)
+                .cloned()
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|_| unreachable!()) // we cloned above; collect adapter
+                .collect()
+        } else {
+            // Default: all running.
+            let map = self.state.running_arcs.read();
+            return Self::ok_json(&serde_json::json!({
+                "snapshots": map.values().collect::<Vec<_>>(),
+                "pending_waits": self.state.wait_store.snapshot(),
+            }));
+        };
+        let _ = snapshots;
+        let map = self.state.running_arcs.read();
+        let wanted = p.arc_id.unwrap_or_default();
+        let snap = map.values().find(|s| s.arc_thread_id == wanted).cloned();
+        let waits = self
+            .state
+            .wait_store
+            .snapshot()
+            .into_iter()
+            .filter(|w| w.arc_id == wanted)
+            .collect::<Vec<_>>();
+        Self::ok_json(&serde_json::json!({
+            "snapshot": snap,
+            "pending_waits": waits,
+        }))
+    }
+
+    #[tool(
+        name = "bro_webhook_install",
+        description = "Install a webhook endpoint reachable at POST /webhook/<name>. Signature verification, extractor projection, and routing-packet dispatch are mechanical at the daemon. Routing packets must already be operator-installed in the global packet store."
+    )]
+    async fn bro_webhook_install(
+        &self,
+        Parameters(p): Parameters<WebhookInstallParams>,
+    ) -> CallToolResult {
+        let spec: webhooks::WebhookSpec = match serde_json::from_value(p.spec) {
+            Ok(s) => s,
+            Err(e) => return Self::err_text(&format!("webhook spec parse failed: {e}")),
+        };
+        // Persist for restart durability.
+        let dir = self.state.store_dir.join("webhooks");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{}.json", spec.name));
+        if let Err(e) = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&spec).unwrap_or_default(),
+        ) {
+            return Self::err_text(&format!("webhook persist failed: {e}"));
+        }
+        self.state.webhooks.install(spec.clone());
+        Self::ok_json(&serde_json::json!({
+            "status": "installed",
+            "name": spec.name,
+            "endpoint": format!("/webhook/{}", spec.name),
+        }))
+    }
+
+    #[tool(
+        name = "bro_webhook_list",
+        description = "List installed webhook endpoints with their signature scheme + routing packet."
+    )]
+    async fn bro_webhook_list(&self) -> CallToolResult {
+        let list = self.state.webhooks.list();
+        Self::ok_json(&serde_json::json!({"webhooks": list}))
+    }
+
+    #[tool(
+        name = "bro_workflow_install",
+        description = "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced."
+    )]
+    async fn bro_workflow_install(
+        &self,
+        Parameters(p): Parameters<WorkflowInstallParams>,
+    ) -> CallToolResult {
+        let spec: workflow::Workflow = match serde_json::from_value(p.spec) {
+            Ok(s) => s,
+            Err(e) => return Self::err_text(&format!("workflow spec parse failed: {e}")),
+        };
+        let compiled = match workflow::compile(spec.clone()) {
+            Ok(c) => c,
+            Err(e) => return Self::err_text(&format!("workflow compile failed: {e}")),
+        };
+        if let Err(e) = self.validate_workflow_capabilities(&compiled) {
+            return Self::err_text(&format!("capability validation failed: {e}"));
+        }
+        let id = p.id.unwrap_or_else(|| spec.name.clone());
+        let dir = self.state.store_dir.join("workflows");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{id}.json"));
+        if let Err(e) = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&spec).unwrap_or_default(),
+        ) {
+            return Self::err_text(&format!("workflow persist failed: {e}"));
+        }
+        self.state.workflow_registry.write().insert(id.clone(), spec);
+        Self::ok_json(&serde_json::json!({"status": "installed", "id": id}))
+    }
+
+    #[tool(
+        name = "bro_workflow_list",
+        description = "List installed workflow specs by id."
+    )]
+    async fn bro_workflow_list(&self) -> CallToolResult {
+        let map = self.state.workflow_registry.read();
+        let names: Vec<String> = map.keys().cloned().collect();
+        Self::ok_json(&serde_json::json!({"workflows": names}))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ArcSignalParams {
+    /// Signal name to deliver (e.g. `pr-merged`, `pr-feedback`).
+    pub signal: String,
+    /// Correlation tuple to match against pending waits. A wait
+    /// matches when every key/value here is present in the wait's
+    /// registered correlation. Empty correlation = broadcast.
+    #[serde(default)]
+    pub correlate: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ArcStatusParams {
+    /// Optional arc id (== arc_thread_id from a WorkflowRunResult).
+    /// When omitted, returns all running arcs + pending waits.
+    #[serde(default)]
+    pub arc_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct WebhookInstallParams {
+    /// Full WebhookSpec JSON (name, signature, extractor, routing_packet).
+    pub spec: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct WorkflowInstallParams {
+    /// Optional id for registry lookup. Defaults to `spec.name`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Full Workflow spec JSON.
+    pub spec: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2798,6 +3091,11 @@ struct OrchestrateRunParams {
     /// When true: parse + cross-validate + summarize; do NOT dispatch.
     #[serde(default)]
     pub dry_run: Option<bool>,
+    /// Optional initial vars seeded into the arc's ArcContext at
+    /// start. Schema-validated against `Workflow.vars_schema` before
+    /// the run begins.
+    #[serde(default)]
+    pub initial_vars: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -4069,6 +4367,296 @@ async fn orchestrate_handler(
     axum::Json(result).into_response()
 }
 
+/// HTTP webhook ingestion endpoint. URL: `POST /webhook/:name`.
+///
+/// Pipeline (in order):
+///   1. Look up WebhookSpec by name (404 if unknown)
+///   2. Verify signature scheme against headers + raw body
+///   3. Optional delivery-id dedup (Forgejo: X-Gitea-Delivery)
+///   4. Run extractor over payload → flat entity
+///   5. Apply routing packet → RoutingVerdict
+///   6. Dispatch verdict (start_arc | signal_arc | cancel_arc | ignore | dead_letter)
+async fn webhook_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let header_map = headers_to_lowercase_map(&headers);
+    let body_bytes: &[u8] = &body;
+    let outcome = process_webhook(&state, &name, &header_map, body_bytes).await;
+    match outcome {
+        Ok(verdict_json) => (
+            axum::http::StatusCode::OK,
+            axum::Json(verdict_json),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!("webhook /{name}: {e}");
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("webhook error: {e}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Replay an arbitrary payload through a webhook's extractor + routing
+/// packet WITHOUT dispatching the verdict. Returns the extracted entity
+/// + routing verdict so authors can debug without firing arcs.
+/// URL: `POST /webhook/:name/replay`. Skips signature verification.
+async fn webhook_replay_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let spec = match state.webhooks.get(&name) {
+        Some(s) => s,
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                format!("unknown webhook '{name}'"),
+            )
+                .into_response();
+        }
+    };
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("payload not JSON: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let entity = match spec.extractor.extract(&payload) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("extractor failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let server = BlackboxServer::new(state.clone());
+    let prediction = {
+        let store = state.packets.read();
+        match store.load(&spec.routing_packet) {
+            Ok(packet) => apply_packet_with(&packet, &entity, &*store),
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("routing packet load: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let _ = server; // suppress unused
+    let verdict_kind = prediction
+        .as_ref()
+        .map(|p| p.classification.clone())
+        .unwrap_or_else(|| "no_match".into());
+    let verdict = prediction.map(|p| p.consequent.to_json());
+    axum::Json(json!({
+        "entity": entity,
+        "verdict_classification": verdict_kind,
+        "verdict_consequent": verdict,
+    }))
+    .into_response()
+}
+
+fn headers_to_lowercase_map(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_lowercase(), s.to_string()))
+        })
+        .collect()
+}
+
+async fn process_webhook(
+    state: &Arc<SharedState>,
+    name: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> anyhow::Result<Value> {
+    let spec = state
+        .webhooks
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("unknown webhook '{name}'"))?;
+
+    // Signature verification.
+    webhooks::verify_signature(&spec.signature, headers, body)
+        .map_err(|e| anyhow::anyhow!("signature: {e}"))?;
+
+    // Delivery-id dedup (idempotency).
+    let delivery_id = spec
+        .delivery_id_header
+        .as_deref()
+        .and_then(|h| headers.get(&h.to_lowercase()))
+        .map(|s| s.as_str());
+    if !state.webhooks.check_delivery_id(name, delivery_id) {
+        tracing::info!("webhook '{name}': dropped duplicate delivery {:?}", delivery_id);
+        return Ok(json!({"status": "duplicate_dropped"}));
+    }
+
+    let payload: Value = serde_json::from_slice(body)
+        .map_err(|e| anyhow::anyhow!("payload not JSON: {e}"))?;
+
+    // Project payload via extractor.
+    let entity = spec
+        .extractor
+        .extract(&payload)
+        .map_err(|e| anyhow::anyhow!("extractor: {e}"))?;
+
+    // Apply routing packet.
+    let prediction = {
+        let store = state.packets.read();
+        let packet = store
+            .load(&spec.routing_packet)
+            .map_err(|e| anyhow::anyhow!("routing packet load: {e}"))?;
+        apply_packet_with(&packet, &entity, &*store)
+    };
+
+    let consequent_json = match prediction {
+        Some(p) => p.consequent.to_json(),
+        None => {
+            tracing::warn!(
+                "webhook '{name}': routing packet '{}' produced no_match — dead-lettering",
+                spec.routing_packet
+            );
+            return Ok(json!({
+                "status": "no_match",
+                "reason": "routing packet returned no_match (default → dead-letter)",
+                "extracted_entity": entity,
+            }));
+        }
+    };
+
+    let verdict = webhooks::RoutingVerdict::parse(&consequent_json)
+        .map_err(|e| anyhow::anyhow!("verdict parse: {e}"))?;
+
+    dispatch_verdict(state.clone(), &spec, verdict, entity).await
+}
+
+async fn dispatch_verdict(
+    state: Arc<SharedState>,
+    spec: &webhooks::WebhookSpec,
+    verdict: webhooks::RoutingVerdict,
+    entity: Value,
+) -> anyhow::Result<Value> {
+    use webhooks::RoutingVerdict;
+    match verdict {
+        RoutingVerdict::Ignore => Ok(json!({"status": "ignored"})),
+        RoutingVerdict::DeadLetter { reason } => {
+            tracing::warn!(
+                "webhook '{}': dead-lettered (reason={:?})",
+                spec.name,
+                reason
+            );
+            Ok(json!({
+                "status": "dead_letter",
+                "reason": reason,
+                "extracted_entity": entity,
+            }))
+        }
+        RoutingVerdict::SignalArc { signal, correlate } => {
+            // Look up matching wait + resolve.
+            let resolved = signal_arc_dispatch(&state, &signal, correlate).await;
+            Ok(resolved)
+        }
+        RoutingVerdict::CancelArc { correlate: _ } => {
+            // V1: cancellation is not implemented — log and respond.
+            // (Wait nodes can be cancelled via WaitStore.cancel; arc
+            // cancellation is a separate primitive that we'll add when
+            // a workflow needs it.)
+            tracing::warn!(
+                "webhook '{}': cancel_arc verdict received but cancellation not yet implemented",
+                spec.name
+            );
+            Ok(json!({"status": "cancel_arc_not_implemented"}))
+        }
+        RoutingVerdict::StartArc {
+            workflow: workflow_id,
+            initial_vars,
+        } => {
+            let registry = state.workflow_registry.clone();
+            let spec_clone = {
+                let map = registry.read();
+                map.get(&workflow_id).cloned()
+            };
+            let workflow_spec = spec_clone.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "start_arc verdict references unknown workflow id '{workflow_id}'"
+                )
+            })?;
+            let compiled = workflow::compile(workflow_spec)
+                .map_err(|e| anyhow::anyhow!("workflow compile: {e}"))?;
+            let server = BlackboxServer::new(state.clone());
+            // Spawn — webhook returns immediately; the arc runs in
+            // the background. The arc_id is included in the response
+            // so callers can correlate later.
+            let project_dir: Option<String> = None;
+            tokio::spawn(async move {
+                let _ = workflow::run_workflow_with_initial_vars(
+                    &server,
+                    &compiled,
+                    project_dir,
+                    Some(50),
+                    initial_vars,
+                )
+                .await;
+            });
+            Ok(json!({
+                "status": "arc_started",
+                "workflow": workflow_id,
+            }))
+        }
+    }
+}
+
+async fn signal_arc_dispatch(
+    state: &Arc<SharedState>,
+    signal: &str,
+    correlation: serde_json::Map<String, Value>,
+) -> Value {
+    let store = &state.wait_store;
+    let m = store.match_and_take(signal, &correlation);
+    let Some((resolved_slot, notify, arc_id, wait_id)) = m else {
+        tracing::info!(
+            "signal '{signal}' arrived with correlation {:?} — no matching wait (idle)",
+            correlation
+        );
+        return json!({
+            "status": "no_matching_wait",
+            "signal": signal,
+            "correlation": correlation,
+        });
+    };
+    let sig = crate::workflow::context::SignalRef {
+        name: signal.to_string(),
+        payload: Value::Object(correlation.clone()),
+        correlation,
+        received_at: util::now_iso(),
+    };
+    *resolved_slot.lock() = Some(sig);
+    notify.notify_one();
+    json!({
+        "status": "wait_resolved",
+        "arc_id": arc_id,
+        "wait_id": wait_id,
+        "signal": signal,
+    })
+}
+
 async fn roster_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     Query(query): Query<RosterQuery>,
@@ -4506,7 +5094,39 @@ async fn main() -> anyhow::Result<()> {
         store_dir: store_dir.clone(),
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
+        webhooks: Arc::new(webhooks::WebhookRegistry::new()),
+        workflow_registry: Arc::new(RwLock::new(HashMap::new())),
     });
+
+    // Restore webhook + workflow registries from disk so installs
+    // survive daemon restart.
+    let webhook_dir = shared.store_dir.join("webhooks");
+    for spec in webhooks::load_all(&webhook_dir) {
+        tracing::info!("restoring webhook '{}'", spec.name);
+        shared.webhooks.install(spec);
+    }
+    let workflow_dir = shared.store_dir.join("workflows");
+    if workflow_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&workflow_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.extension().is_some_and(|e| e == "json") {
+                    continue;
+                }
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Ok(spec) = serde_json::from_slice::<workflow::Workflow>(&bytes) {
+                        let id = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&spec.name)
+                            .to_string();
+                        tracing::info!("restoring workflow '{id}'");
+                        shared.workflow_registry.write().insert(id, spec);
+                    }
+                }
+            }
+        }
+    }
 
     // Packet self-heal scanner — off by default. Walks recent
     // packet events on an interval, flags candidates (high no_match
@@ -4596,6 +5216,8 @@ async fn main() -> anyhow::Result<()> {
             "/orchestrate/peek",
             axum::routing::get(orchestrate_peek_handler),
         )
+        .route("/webhook/{name}", axum::routing::post(webhook_handler))
+        .route("/webhook/{name}/replay", axum::routing::post(webhook_replay_handler))
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 
@@ -4640,6 +5262,8 @@ mod tests {
             store_dir: tmp.path().join("bro"),
             running_arcs: RwLock::new(HashMap::new()),
             wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
+            webhooks: Arc::new(webhooks::WebhookRegistry::new()),
+            workflow_registry: Arc::new(RwLock::new(HashMap::new())),
         });
         BlackboxServer::new(state)
     }

@@ -314,6 +314,19 @@ impl Value {
             _ => None,
         }
     }
+
+    /// Convert this typed Value back to a serde_json::Value. Round-trips
+    /// the four scalar shapes losslessly.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Value::Bool(b) => serde_json::Value::Bool(*b),
+            Value::Int(i) => serde_json::Value::Number((*i).into()),
+            Value::Float(f) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Value::String(s) => serde_json::Value::String(s.clone()),
+        }
+    }
 }
 
 // ── Comparison op (used by CountCmp) ─────────────────────────────

@@ -454,6 +454,54 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bro_orchestrate_run(workflow={...full spec...}, project_dir="/repo/x", dry_run=true)"#,
         ),
     },
+    ToolDoc {
+        name: "bro_arc_signal",
+        category: ToolCategory::Workflows,
+        summary: "Resolve a pending Wait by signal name + correlation tuple. Same dispatch path that the webhook router uses for `signal_arc` verdicts — surfaced as MCP so an operator can manually advance an arc that's blocked on an external event.",
+        when_to_use: "Use to manually push an arc that's parked on a Wait node when the upstream event hasn't (or won't) arrive — e.g. testing, debugging, or rescuing an arc that missed its webhook. Empty `correlate` broadcasts to all matching waits.",
+        example: Some(
+            r#"bro_arc_signal(signal="pr-merged", correlate={"pr": 42})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bro_arc_status",
+        category: ToolCategory::Workflows,
+        summary: "Read-only structured query against active and recently-finished arcs. Returns the current ArcSnapshot (current_node, completed_nodes, in_flight_nodes, last_verdict, visit_counts, started_at) plus pending-wait registrations for the arc.",
+        when_to_use: "Use to debug stuck arcs without parsing event logs — answers 'where is this arc and what's it waiting on?' in one shot. With no arc_id, lists every running arc plus all pending waits.",
+        example: Some(r#"bro_arc_status(arc_id="thread-abc12345")"#),
+    },
+    ToolDoc {
+        name: "bro_webhook_install",
+        category: ToolCategory::Workflows,
+        summary: "Install a webhook endpoint reachable at POST /webhook/<name>. Signature verification, extractor projection, and routing-packet dispatch are mechanical at the daemon. Routing packets must already be operator-installed in the global packet store.",
+        when_to_use: "Use to wire an external event source (Forgejo, GitHub, Stripe, generic JSON poster) into the workflow engine. Spec carries: name, signature scheme + secret env var, Extractor, routing packet id, optional delivery-id header for idempotency dedup. Persisted to disk for restart durability.",
+        example: Some(
+            r#"bro_webhook_install(spec={"name":"forgejo","signature":{"kind":"forgejo","secret_env":"FORGEJO_WEBHOOK_SECRET"},"extractor":{...},"routing_packet":"packet-abc"})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bro_webhook_list",
+        category: ToolCategory::Workflows,
+        summary: "List installed webhook endpoints with their signature scheme + routing packet.",
+        when_to_use: "Inventory check — what webhooks does this daemon serve? Useful before installing to avoid duplicate names.",
+        example: Some("bro_webhook_list()"),
+    },
+    ToolDoc {
+        name: "bro_workflow_install",
+        category: ToolCategory::Workflows,
+        summary: "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced.",
+        when_to_use: "Persist a workflow that webhooks or scheduled triggers will dispatch by name. Install alongside the routing packet that emits `start_arc` verdicts referencing this id.",
+        example: Some(
+            r#"bro_workflow_install(id="issue-to-pr", spec={...full Workflow JSON...})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bro_workflow_list",
+        category: ToolCategory::Workflows,
+        summary: "List installed workflow specs by id.",
+        when_to_use: "Inventory check — what workflows can routing verdicts target on this daemon?",
+        example: Some("bro_workflow_list()"),
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\

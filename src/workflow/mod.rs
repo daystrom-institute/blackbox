@@ -17,7 +17,10 @@ pub mod ops;
 pub mod schema;
 pub mod wait;
 
-pub use engine::{run_workflow, run_workflow_streaming, WorkflowRunResult};
+pub use engine::{
+    run_workflow, run_workflow_streaming, run_workflow_streaming_with_vars,
+    run_workflow_with_initial_vars, WorkflowRunResult,
+};
 pub use mermaid::{parse_mermaid, MermaidGraph, MermaidNodeKind};
 #[cfg(test)]
 pub use mermaid::{MermaidEdge, MermaidNode};
