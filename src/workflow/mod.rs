@@ -53,15 +53,11 @@ fn cross_validate(spec: &Workflow, graph: &MermaidGraph) -> Result<()> {
 
     let graph_only: Vec<&&str> = graph_activities.difference(&spec_nodes).collect();
     if !graph_only.is_empty() {
-        bail!(
-            "graph references activity nodes with no metadata: {graph_only:?}"
-        );
+        bail!("graph references activity nodes with no metadata: {graph_only:?}");
     }
     let spec_only: Vec<&&str> = spec_nodes.difference(&graph_activities).collect();
     if !spec_only.is_empty() {
-        bail!(
-            "metadata declares nodes not reachable in graph: {spec_only:?}"
-        );
+        bail!("metadata declares nodes not reachable in graph: {spec_only:?}");
     }
 
     // Every NodeSpec.actor must be a declared actor — UNLESS the node
@@ -79,9 +75,7 @@ fn cross_validate(spec: &Workflow, graph: &MermaidGraph) -> Result<()> {
             continue;
         }
         if node.actor.is_empty() {
-            bail!(
-                "node '{node_id}' has no actor and no subworkflow — at least one is required"
-            );
+            bail!("node '{node_id}' has no actor and no subworkflow — at least one is required");
         }
         if !spec.actors.contains_key(&node.actor) {
             bail!(
@@ -178,10 +172,7 @@ impl CompiledWorkflow {
                     out.push_str(&format!(" retry_max_gen={}", r.max_generations));
                 }
                 if let Some(li) = &spec.late_inject {
-                    out.push_str(&format!(
-                        " late_inject_from={}({:?})",
-                        li.from, li.policy
-                    ));
+                    out.push_str(&format!(" late_inject_from={}({:?})", li.from, li.policy));
                 }
                 if matches!(spec.mode, NodeMode::FireAndForget) {
                     out.push_str(" [fire-and-forget]");
@@ -287,10 +278,7 @@ mod tests {
             .iter()
             .any(|e| e.to == "Exec_Propose" && e.from != "[*]");
         assert!(has_back_edge, "blind workflow expected a revise back-edge");
-        eprintln!(
-            "\n=== BLIND WORKFLOW DRY-RUN ===\n{}",
-            compiled.summarize()
-        );
+        eprintln!("\n=== BLIND WORKFLOW DRY-RUN ===\n{}", compiled.summarize());
     }
 
     #[test]
@@ -461,10 +449,7 @@ mod tests {
         }"#;
         let spec = load_workflow(spec_json).unwrap();
         let err = compile(spec).unwrap_err().to_string();
-        assert!(
-            err.contains("fork") && err.contains("f1"),
-            "err: {err}"
-        );
+        assert!(err.contains("fork") && err.contains("f1"), "err: {err}");
     }
 
     #[test]
@@ -481,4 +466,3 @@ mod tests {
         assert!(err.contains("no start edge"), "err: {err}");
     }
 }
-

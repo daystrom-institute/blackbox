@@ -86,13 +86,7 @@ pub async fn run_workflow_streaming(
     max_steps: Option<usize>,
     event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
 ) -> WorkflowRunResult {
-    let mut runner = WorkflowRunner::new(
-        server,
-        compiled,
-        project_dir,
-        max_steps.unwrap_or(50),
-        0,
-    );
+    let mut runner = WorkflowRunner::new(server, compiled, project_dir, max_steps.unwrap_or(50), 0);
     runner.event_sink = Some(event_sink);
     runner.open_arc_thread();
     let status = match runner.run().await {
@@ -304,10 +298,7 @@ impl<'a> WorkflowRunner<'a> {
                 }
             }
             Err(e) => {
-                self.log_event(
-                    "arc_thread_open_failed",
-                    json!({"error": e.to_string()}),
-                );
+                self.log_event("arc_thread_open_failed", json!({"error": e.to_string()}));
             }
         }
     }
@@ -322,8 +313,7 @@ impl<'a> WorkflowRunner<'a> {
             return;
         };
         let now = crate::util::now_iso();
-        let mut completed: Vec<String> =
-            self.node_outputs.keys().cloned().collect();
+        let mut completed: Vec<String> = self.node_outputs.keys().cloned().collect();
         completed.sort();
         let mut in_flight: Vec<String> = self.in_flight.keys().cloned().collect();
         in_flight.sort();
@@ -432,10 +422,7 @@ impl<'a> WorkflowRunner<'a> {
         let verdict = match self.server.apply_workflow_policy(&packet_id, &entity) {
             Ok(v) => v,
             Err(e) => {
-                self.log_event(
-                    "policy_error",
-                    json!({"packet_id": packet_id, "error": e}),
-                );
+                self.log_event("policy_error", json!({"packet_id": packet_id, "error": e}));
                 return Ok(());
             }
         };
@@ -471,9 +458,7 @@ impl<'a> WorkflowRunner<'a> {
             "warn" => {
                 self.arc_note(
                     "surprise",
-                    &format!(
-                        "policy warn from {packet_id} at step {step} (just_ran={just_ran})"
-                    ),
+                    &format!("policy warn from {packet_id} at step {step} (just_ran={just_ran})"),
                 );
             }
             _ => {
@@ -561,14 +546,14 @@ impl<'a> WorkflowRunner<'a> {
                      config and ensure the packet has a catchall fallback rule."
                 )
             })?;
-            let matched = outgoing.iter().find(|e| e.label.as_deref() == Some(verdict));
+            let matched = outgoing
+                .iter()
+                .find(|e| e.label.as_deref() == Some(verdict));
             match matched {
                 Some(edge) => Ok(edge.to.clone()),
                 None => {
-                    let labels: Vec<&str> = outgoing
-                        .iter()
-                        .filter_map(|e| e.label.as_deref())
-                        .collect();
+                    let labels: Vec<&str> =
+                        outgoing.iter().filter_map(|e| e.label.as_deref()).collect();
                     bail!(
                         "choice '{current}' has no edge for verdict '{verdict}' (edge labels: {labels:?})"
                     );
@@ -622,12 +607,9 @@ impl<'a> WorkflowRunner<'a> {
         }
 
         let actor_name = spec.actor.clone();
-        let actor = self
-            .compiled
-            .spec
-            .actors
-            .get(&actor_name)
-            .ok_or_else(|| anyhow!("node '{node_id}' references undeclared actor '{actor_name}'"))?;
+        let actor = self.compiled.spec.actors.get(&actor_name).ok_or_else(|| {
+            anyhow!("node '{node_id}' references undeclared actor '{actor_name}'")
+        })?;
         // Fire-and-forget on the main walk: dispatch and store the
         // handle, then advance without waiting. Downstream late_inject
         // consumers will join.
@@ -698,11 +680,7 @@ impl<'a> WorkflowRunner<'a> {
         // - all: every matching rule produces a finding, verdict is
         //   the lattice-highest-priority classification across them
         if let Some(packet_id) = spec.gate.as_deref() {
-            let output = self
-                .node_outputs
-                .get(node_id)
-                .cloned()
-                .unwrap_or_default();
+            let output = self.node_outputs.get(node_id).cloned().unwrap_or_default();
             let mode = spec.gate_mode.clone().unwrap_or_default();
             match mode {
                 GateMode::First => {
@@ -721,9 +699,7 @@ impl<'a> WorkflowRunner<'a> {
                             let verdict_s = verdict.as_deref().unwrap_or("(no match)");
                             self.arc_note(
                                 "learned",
-                                &format!(
-                                    "gate '{packet_id}' on '{node_id}' (first) → {verdict_s}"
-                                ),
+                                &format!("gate '{packet_id}' on '{node_id}' (first) → {verdict_s}"),
                             );
                         }
                         Err(e) => {
@@ -751,8 +727,7 @@ impl<'a> WorkflowRunner<'a> {
                                 .iter()
                                 .map(|f| {
                                     let consequent_str = format!("{:?}", f.consequent);
-                                    let preview: String =
-                                        consequent_str.chars().take(80).collect();
+                                    let preview: String = consequent_str.chars().take(80).collect();
                                     format!("{}[{}]: {preview}", f.classification, f.rule_id)
                                 })
                                 .collect();
@@ -767,10 +742,7 @@ impl<'a> WorkflowRunner<'a> {
                                     "findings": finding_previews.clone(),
                                 }),
                             );
-                            let verdict_s = result
-                                .verdict
-                                .as_deref()
-                                .unwrap_or("(no match)");
+                            let verdict_s = result.verdict.as_deref().unwrap_or("(no match)");
                             self.arc_note(
                                 "learned",
                                 &format!(
@@ -856,7 +828,8 @@ impl<'a> WorkflowRunner<'a> {
             self.actor_sessions
                 .insert(actor_name.to_string(), session_id.clone());
         }
-        self.node_outputs.insert(node_id.to_string(), output.clone());
+        self.node_outputs
+            .insert(node_id.to_string(), output.clone());
 
         let output_preview: String = output.chars().take(160).collect();
         self.log_event(
@@ -869,10 +842,7 @@ impl<'a> WorkflowRunner<'a> {
                 "output_preview": output_preview.clone(),
             }),
         );
-        self.arc_note(
-            "done",
-            &format!("node '{node_id}' → {output_preview}"),
-        );
+        self.arc_note("done", &format!("node '{node_id}' → {output_preview}"));
         Ok(())
     }
 
@@ -912,16 +882,9 @@ impl<'a> WorkflowRunner<'a> {
             .get(target_id)
             .ok_or_else(|| anyhow!("fork: no metadata for async target '{target_id}'"))?;
         let actor_name = spec.actor.clone();
-        let actor = self
-            .compiled
-            .spec
-            .actors
-            .get(&actor_name)
-            .ok_or_else(|| {
-                anyhow!(
-                    "fork: async target '{target_id}' references undeclared actor '{actor_name}'"
-                )
-            })?;
+        let actor = self.compiled.spec.actors.get(&actor_name).ok_or_else(|| {
+            anyhow!("fork: async target '{target_id}' references undeclared actor '{actor_name}'")
+        })?;
         let prompt = self.render_prompt(spec.prompt.as_deref().unwrap_or(""));
         match &actor.kind {
             ActorKind::Executor | ActorKind::Advisor => {
@@ -983,9 +946,7 @@ impl<'a> WorkflowRunner<'a> {
                         &existing,
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow!("fire-and-forget ensemble dispatch '{target_id}': {e}")
-                    })?;
+                    .map_err(|e| anyhow!("fire-and-forget ensemble dispatch '{target_id}': {e}"))?;
                 self.log_event(
                     "fire_and_forget_ensemble",
                     json!({
@@ -1071,9 +1032,7 @@ impl<'a> WorkflowRunner<'a> {
                 let task_id = task.inner.lock().id.clone();
                 let completed = orch::wait_for_task_with_timeout(&task, Some(900.0)).await;
                 if !completed {
-                    bail!(
-                        "in-flight source '{source}' (task {task_id}) exceeded timeout"
-                    );
+                    bail!("in-flight source '{source}' (task {task_id}) exceeded timeout");
                 }
                 let result_json = orch::task_result_json(&task);
                 let output = result_json
@@ -1095,8 +1054,7 @@ impl<'a> WorkflowRunner<'a> {
                 let mut joinset = tokio::task::JoinSet::new();
                 for (member, task) in tasks {
                     joinset.spawn(async move {
-                        let completed =
-                            orch::wait_for_task_with_timeout(&task, Some(900.0)).await;
+                        let completed = orch::wait_for_task_with_timeout(&task, Some(900.0)).await;
                         let result_json = orch::task_result_json(&task);
                         let output = result_json
                             .get("result")
@@ -1120,9 +1078,7 @@ impl<'a> WorkflowRunner<'a> {
                     outs.push((member, output));
                 }
                 if timed_out {
-                    bail!(
-                        "in-flight source '{source}' (ensemble) had member timeouts"
-                    );
+                    bail!("in-flight source '{source}' (ensemble) had member timeouts");
                 }
                 outs.sort_by(|a, b| a.0.cmp(&b.0));
                 let merged = outs
@@ -1216,7 +1172,12 @@ impl<'a> WorkflowRunner<'a> {
         );
         let tasks = self
             .server
-            .workflow_dispatch_ensemble(team, prompt, self.project_dir.as_deref(), &existing_sessions)
+            .workflow_dispatch_ensemble(
+                team,
+                prompt,
+                self.project_dir.as_deref(),
+                &existing_sessions,
+            )
             .await
             .map_err(|e| anyhow!("dispatch for node '{node_id}': {e}"))?;
 
@@ -1281,7 +1242,8 @@ impl<'a> WorkflowRunner<'a> {
             .map(|(m, o)| format!("── {m} ──\n{o}"))
             .collect::<Vec<_>>()
             .join("\n\n");
-        self.node_outputs.insert(node_id.to_string(), merged.clone());
+        self.node_outputs
+            .insert(node_id.to_string(), merged.clone());
         if actor.durable {
             self.ensemble_sessions.insert(ensemble_key, member_sessions);
         }
@@ -1353,9 +1315,8 @@ impl<'a> WorkflowRunner<'a> {
             ),
         );
 
-        let compiled = super::compile(sub_spec).map_err(|e| {
-            anyhow!("subworkflow on node '{node_id}' failed to compile: {e}")
-        })?;
+        let compiled = super::compile(sub_spec)
+            .map_err(|e| anyhow!("subworkflow on node '{node_id}' failed to compile: {e}"))?;
         let project_dir = self.project_dir.clone();
         // Seed the sub-runner with the parent's node_outputs so sub
         // prompts can reference `${ParentNode.output}` the same way
@@ -1401,7 +1362,8 @@ impl<'a> WorkflowRunner<'a> {
             .map(|(n, o)| format!("── sub:{n} ──\n{o}"))
             .collect::<Vec<_>>()
             .join("\n\n");
-        self.node_outputs.insert(node_id.to_string(), merged.clone());
+        self.node_outputs
+            .insert(node_id.to_string(), merged.clone());
 
         self.log_event(
             "subworkflow_complete",
@@ -1630,7 +1592,9 @@ mod tests {
                     .last_verdict
                     .as_deref()
                     .ok_or_else(|| anyhow!("choice node '{current}' has no prior gate verdict"))?;
-                let matched = outgoing.iter().find(|e| e.label.as_deref() == Some(verdict));
+                let matched = outgoing
+                    .iter()
+                    .find(|e| e.label.as_deref() == Some(verdict));
                 match matched {
                     Some(edge) => Ok(edge.to.clone()),
                     None => {

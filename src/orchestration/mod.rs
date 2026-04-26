@@ -261,14 +261,18 @@ impl TaskStore {
 /// decays within-session on Claude Opus 4.7 and Gemini 2.5-flash:
 /// at ~15 turns of accumulated context, the session-start memory
 /// guidance no longer binds. Per-turn ambient injection survives
-/// because it rides with every turn. Codex gpt-5.4 does not appear
-/// to need this — Tier 1 instruction binds at depth there — but
-/// the extra reinforcement is harmless. Parallels the empirical
-/// fix for `bbox_note` emission (DEFAULT_COMPLETION_CONTRACT below).
+/// because it rides with every turn. Keep the wording calibrated as
+/// a knowledge/runbook recall check, not a mandatory first action, because Codex tends
+/// to over-comply with hard ordering language here. Parallels the
+/// empirical fix for `bbox_note` emission (DEFAULT_COMPLETION_CONTRACT
+/// below).
 pub const RECALL_DIRECTIVE: &str = "\
-Recall: your FIRST tool call on any substantive task must be \
-`bbox_knowledge(query=<one keyword>)`. Justification and fallback \
-procedure are in the managed tool reference.";
+Recall: early in tasks where durable knowledge, prior decisions, conventions, \
+or system runbooks could change the answer, query `bbox_knowledge` with a \
+short phrase from the user's request. It is not the surface for scoped pins, \
+side-channel notes, active threads, or transcripts. If the result is empty or \
+too broad, try one sharper phrase before relying on live filesystem state or \
+prior knowledge.";
 
 /// Ambient nudge for recursive orchestrators (allow_recursion=true).
 /// They're usually fan-out coordinators, and the most common silent
@@ -446,7 +450,7 @@ impl AmbientContext {
 ///
 /// The ambient prefix fires for every dispatch regardless of
 /// `allow_recursion`: the scope block lets the agent correlate notes,
-/// the recall directive triggers `bbox_knowledge` lookups, and the
+/// the recall directive prompts context lookup when relevant, and the
 /// orchestrator hint surfaces packet primitives for fan-out coordinators.
 /// These are purely textual — they don't interact with the mechanical
 /// recursion filter.
@@ -1300,7 +1304,11 @@ mod tests {
         let out = apply_ambient("work", &ctx);
         assert!(out.contains("[recall before acting]"));
         assert!(out.contains("bbox_knowledge"));
-        assert!(out.contains("FIRST tool call"));
+        assert!(out.contains("durable knowledge"));
+        assert!(out.contains("system runbooks"));
+        assert!(out.contains("not the surface for scoped pins"));
+        assert!(out.contains("short phrase"));
+        assert!(!out.contains("FIRST tool call"));
     }
 
     #[test]

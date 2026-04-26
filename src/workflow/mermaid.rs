@@ -69,9 +69,7 @@ pub fn parse_mermaid(src: &str) -> Result<MermaidGraph> {
                 header_seen = true;
                 continue;
             }
-            bail!(
-                "line {lineno}: expected `stateDiagram-v2` header first, got: {stripped}"
-            );
+            bail!("line {lineno}: expected `stateDiagram-v2` header first, got: {stripped}");
         }
 
         if let Some((id, kind)) = parse_state_decl(stripped) {
@@ -221,11 +219,7 @@ mod tests {
     B --> [*]
     C --> [*]"#;
         let g = parse_mermaid(src).unwrap();
-        let fork = g
-            .nodes
-            .iter()
-            .find(|n| n.id == "f")
-            .expect("fork declared");
+        let fork = g.nodes.iter().find(|n| n.id == "f").expect("fork declared");
         assert!(matches!(fork.kind, MermaidNodeKind::Fork));
         let async_edge = g
             .edges

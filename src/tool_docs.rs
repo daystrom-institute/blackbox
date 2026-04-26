@@ -188,9 +188,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
-        summary: "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (code-embedded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. For structured packet discovery + filtering, use bbox_packet_list.",
-        when_to_use: "Start here on substantive tasks. Use one distinctive keyword by default; when you need broader lookup, adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for a prior decision to supersede. System memories can also be fetched by canonical `sm-*` ID. Rule-packets appear in a separate section when the query hits their id / domain / rule ids / classifications — reach for bbox_packet_list when you want structured filters (scope, latest_per_domain) or richer per-packet previews.",
-        example: Some(r#"bbox_knowledge(query="retry")"#),
+        summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (code-embedded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. For structured packet discovery + filtering, use bbox_packet_list.",
+        when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes`/`bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for a prior decision to supersede. System memories can also be fetched by canonical `sm-*` ID. Rule-packets appear in a separate section when the query hits their id / domain / rule ids / classifications — reach for bbox_packet_list when you want structured filters (scope, latest_per_domain) or richer per-packet previews.",
+        example: Some(r#"bbox_knowledge(query="retry policy")"#),
     },
     ToolDoc {
         name: "bbox_forget",
@@ -553,10 +553,11 @@ pub fn render_markdown() -> String {
     );
     out.push_str("Do not hand-edit.\n\n");
 
-    out.push_str("## CORE RULE: recall first\n\n");
-    out.push_str("**On any substantive task, your FIRST tool call must be `bbox_knowledge(query=<one keyword>)` to check for stored project-specific context.** Not the second call after `ls`. Not after probing the live system. First.\n\n");
-    out.push_str("The signature failure mode here: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. This is not a suggestion.\n\n");
-    out.push_str("Use a single distinctive keyword from the task. If empty, try a different word. Do not fall back to filesystem exploration, process probing, or training-prior inference until at least 2 distinct queries have returned empty.\n\n");
+    out.push_str("## CORE RULE: contextual recall\n\n");
+    out.push_str("**Early in tasks where durable knowledge-store context could change the answer, query `bbox_knowledge` before committing to an approach.** This is a recall check, not a ritual call for every tiny command.\n\n");
+    out.push_str("Use it for prior decisions, project conventions, rendered rules, remembered facts, system runbooks, and packet discovery. It is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes` / `bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`).\n\n");
+    out.push_str("The signature failure mode here: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. Avoid that on work involving repo conventions, prior decisions, active runbooks, durable user preferences, bro/orchestration behavior, or anything where durable project memory could plausibly override defaults.\n\n");
+    out.push_str("Prefer a short phrase from the user's request over a single generic keyword. If the first query is empty or too broad, try one sharper phrase. Then proceed with filesystem exploration, process probing, or normal implementation work using the retrieved context.\n\n");
     out.push_str(
         "Cost of a wasted query: near zero. Cost of a confident wrong answer: the entire task.\n\n",
     );
@@ -702,6 +703,16 @@ mod tests {
         let md = render_markdown();
         assert!(md.contains("sm-rule-packets"));
         assert!(md.contains("bbox_knowledge(query=\"sm-rule-packets\")"));
+    }
+
+    #[test]
+    fn recall_guidance_prefers_phrase_queries() {
+        let md = render_markdown();
+        assert!(md.contains("short phrase"));
+        assert!(md.contains("single generic keyword"));
+        assert!(md.contains("bbox_knowledge(query=\"retry policy\")"));
+        assert!(!md.contains("bbox_knowledge(query=\"retry\")"));
+        assert!(!md.contains("query=<one keyword>"));
     }
 
     /// Parse `#[tool(...)]` attributes from main.rs. Tolerates:

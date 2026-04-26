@@ -3,6 +3,29 @@
 
 ## Conventions
 
+<!-- bb:entry=b12f4560 -->
+**LargeTalk inside-dispatch: use ./lt CLI, not MCP, in -p resume mode**
+
+When spawning `claude --resume <id> -p "prompt"` from inside the Pharo image (e.g., LTClaudeSession>>resume:), MCP tools appear as disconnected in the resumed session — this is a known Claude Code limitation. `--dangerously-skip-permissions` doesn't fix it. `--mcp-config <file>` doesn't fix it. Tools like mcp__largetalk__image_eval are unreachable.
+
+**Correct path:** expose a Bash CLI wrapper to the live image — `/home/invidious/repos/largetalk-spike/lt` — and teach inside-claude to use it via `Bash(./lt ...)`. The wrapper just POSTs to the MCP HTTP endpoint directly (urllib); works the same as MCP tool calls but over Bash.
+
+Example inside-claude prompt preamble (now baked into LTClaudeSession>>resume:):
+```
+INSIDE-PREAMBLE: You are in -p mode resumed into a Pharo image. MCP shows "disconnected" — use Bash + ./lt instead:
+  cd /home/invidious/repos/largetalk-spike && ./lt eval "42 * 42"
+  cd /home/invidious/repos/largetalk-spike && ./lt compile Class "method ^ body"
+  cd /home/invidious/repos/largetalk-spike && ./lt whoami
+ZnServer is single-threaded; avoid parallel ./lt calls; back off on >10s hangs.
+```
+
+**Verified behavior:** inside-claude correctly diagnosed the server saturation issue (reported "6 queued connections on :7270, ./lt calls timeout at 10s") — so the Bash path WORKS when the server is healthy. The saturation was self-inflicted by a chat-window bus-subscription firing on every event; fix: subscribe only to claude-home-reply/error, not claude-home-send.
+
+**Architecture note:** This means the inside/outside handoff is NOT via MCP-in-resumed-session. It's via Bash+HTTP. The session transcript (jsonl) stays the canonical shared record between inside and outside. Each side writes turns to it; the chat window seeds from it on open and refreshes on reply events.
+
+Tags: largetalk-spike, inside-dispatch, claude-resume, mcp-p-mode-limitation, lt-cli-wrapper, session-handoff, 2026-04-20
+
+<!-- /bb:entry=b12f4560 -->
 <!-- bb:entry=a3a8c3c1 -->
 **Pharo self-heal pattern: provenance + routed exception repair**
 
@@ -32,29 +55,6 @@ See r-provenance-healer.st in largetalk-spike for the full installation file.
 Tags: pharo, self-heal, provenance, exception-routing, originator-resume, bro_resume, LTExceptionHealer, LTProvenance, OupsDebuggerSystem, largetalk-spike
 
 <!-- /bb:entry=a3a8c3c1 -->
-<!-- bb:entry=b12f4560 -->
-**LargeTalk inside-dispatch: use ./lt CLI, not MCP, in -p resume mode**
-
-When spawning `claude --resume <id> -p "prompt"` from inside the Pharo image (e.g., LTClaudeSession>>resume:), MCP tools appear as disconnected in the resumed session — this is a known Claude Code limitation. `--dangerously-skip-permissions` doesn't fix it. `--mcp-config <file>` doesn't fix it. Tools like mcp__largetalk__image_eval are unreachable.
-
-**Correct path:** expose a Bash CLI wrapper to the live image — `/home/invidious/repos/largetalk-spike/lt` — and teach inside-claude to use it via `Bash(./lt ...)`. The wrapper just POSTs to the MCP HTTP endpoint directly (urllib); works the same as MCP tool calls but over Bash.
-
-Example inside-claude prompt preamble (now baked into LTClaudeSession>>resume:):
-```
-INSIDE-PREAMBLE: You are in -p mode resumed into a Pharo image. MCP shows "disconnected" — use Bash + ./lt instead:
-  cd /home/invidious/repos/largetalk-spike && ./lt eval "42 * 42"
-  cd /home/invidious/repos/largetalk-spike && ./lt compile Class "method ^ body"
-  cd /home/invidious/repos/largetalk-spike && ./lt whoami
-ZnServer is single-threaded; avoid parallel ./lt calls; back off on >10s hangs.
-```
-
-**Verified behavior:** inside-claude correctly diagnosed the server saturation issue (reported "6 queued connections on :7270, ./lt calls timeout at 10s") — so the Bash path WORKS when the server is healthy. The saturation was self-inflicted by a chat-window bus-subscription firing on every event; fix: subscribe only to claude-home-reply/error, not claude-home-send.
-
-**Architecture note:** This means the inside/outside handoff is NOT via MCP-in-resumed-session. It's via Bash+HTTP. The session transcript (jsonl) stays the canonical shared record between inside and outside. Each side writes turns to it; the chat window seeds from it on open and refreshes on reply events.
-
-Tags: largetalk-spike, inside-dispatch, claude-resume, mcp-p-mode-limitation, lt-cli-wrapper, session-handoff, 2026-04-20
-
-<!-- /bb:entry=b12f4560 -->
 
 ## Workflow
 
@@ -113,7 +113,7 @@ Maintained in `src/orchestration/providers.rs`:
 
 - **Claude**: Opus 4.7 (default, 1M context built-in), Opus 4.6 [1m]/200K, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (xhigh default, Opus-4.7-only; max unsupported on Haiku).
 - **OpenCode**: native `provider/model` routing with Z.AI Coding Plan GLM models exposed directly. Defaults to `zai-coding-plan/glm-5.1`, helper model `zai-coding-plan/glm-4.5-air`, and variant tiers `minimal`/`low`/`medium`/`high`/`max`.
-- **Codex**: gpt-5.5 family (default `gpt-5.5`; `-mini`/`-codex` variants are API-direct only and not available on ChatGPT-account auth). gpt-5.4 family retained as secondary. Effort tiers `minimal`/`low`/`medium`/`high`/`xhigh`.
+- **Codex**: gpt-5.4 family. Effort tiers `minimal`/`low`/`medium`/`high`/`xhigh`.
 - **Copilot**: tracks Anthropic + OpenAI models. Effort tiers `low`/`medium`/`high`/`xhigh`.
 - **Vibe**, **Gemini**: model lists only, no effort tier.
 

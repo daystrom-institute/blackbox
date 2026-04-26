@@ -238,13 +238,7 @@ impl Scope {
 }
 
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    schemars::JsonSchema,
-    strum::EnumString,
+    Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -278,13 +272,7 @@ impl Category {
 }
 
 #[derive(
-    Debug,
-    Clone,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    schemars::JsonSchema,
-    strum::EnumString,
+    Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema, strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -317,9 +305,7 @@ impl ResponseFormat {
         match s {
             None => Ok(Self::Text),
             Some(raw) => raw.parse().map_err(|_| {
-                anyhow::anyhow!(
-                    "invalid format: {raw:?} (expected \"text\" or \"json\")"
-                )
+                anyhow::anyhow!("invalid format: {raw:?} (expected \"text\" or \"json\")")
             }),
         }
     }
@@ -875,7 +861,8 @@ impl Knowledge {
     }
 
     pub fn learn(&mut self, p: &LearnParams, from_agent: bool) -> Result<String> {
-        self.learn_result(p, from_agent).map(|result| result.message)
+        self.learn_result(p, from_agent)
+            .map(|result| result.message)
     }
 
     /// Import a knowledge entry from external content. Used by absorb().
@@ -2794,11 +2781,17 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .unwrap();
         assert!(out.starts_with("Updated entry diffid01 ["), "got: {out}");
         assert!(out.contains("title:"), "title diff missing: {out}");
-        assert!(out.contains("content: 18→55 chars (+37)"), "content diff shape wrong: {out}");
+        assert!(
+            out.contains("content: 18→55 chars (+37)"),
+            "content diff shape wrong: {out}"
+        );
         assert!(out.contains("cluster:"), "cluster diff missing: {out}");
         assert!(out.contains("category:"), "category diff missing: {out}");
         // providers did not change → should not appear
-        assert!(!out.contains("providers:"), "unchanged providers leaked: {out}");
+        assert!(
+            !out.contains("providers:"),
+            "unchanged providers leaked: {out}"
+        );
     }
 
     #[test]
@@ -2888,7 +2881,12 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             last_recalled: None,
         });
         for (id, title, body, weight) in [
-            ("clust001", "Foreground push", "keep lt push in foreground", 20),
+            (
+                "clust001",
+                "Foreground push",
+                "keep lt push in foreground",
+                20,
+            ),
             ("clust002", "Require change", "gate on actual changes", 30),
         ] {
             kb.store.entries.push(KnowledgeEntry {
@@ -2932,8 +2930,14 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let first_clustered = out
             .find("**Foreground push**")
             .expect("clustered rule should render");
-        assert!(flat_idx < cluster_idx, "unclustered entries should stay flat first: {out}");
-        assert!(cluster_idx < first_clustered, "cluster heading should precede grouped entries: {out}");
+        assert!(
+            flat_idx < cluster_idx,
+            "unclustered entries should stay flat first: {out}"
+        );
+        assert!(
+            cluster_idx < first_clustered,
+            "cluster heading should precede grouped entries: {out}"
+        );
     }
 
     #[test]

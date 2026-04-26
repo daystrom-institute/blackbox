@@ -2711,13 +2711,21 @@ impl Packets {
     /// `PACKET_SELF_HEAL_ENABLED=true`. Also exposed for direct
     /// invocation from tests / operators.
     pub fn scanner_step(&self, config: &ScannerConfig) -> Result<Vec<RepairCandidate>> {
+        let now = crate::util::now_iso();
+        self.scanner_step_at(config, &now)
+    }
+
+    fn scanner_step_at(
+        &self,
+        config: &ScannerConfig,
+        now_iso: &str,
+    ) -> Result<Vec<RepairCandidate>> {
         // Pull a generous slice of the event log. The default 50 is too
         // small for aggregation; 10_000 keeps I/O bounded while giving
         // enough history to compute rates over a 24h window even on
         // busy installations.
         let events = self.list_events(None, None, None, None, 10_000)?;
-        let now = crate::util::now_iso();
-        let candidates = find_repair_candidates(&events, config, &now);
+        let candidates = find_repair_candidates(&events, config, now_iso);
 
         for cand in &candidates {
             let mut details = serde_json::Map::new();
@@ -3507,7 +3515,7 @@ mod tests {
         for e in &events {
             store.append_event(e);
         }
-        let written = store.scanner_step(&config).unwrap();
+        let written = store.scanner_step_at(&config, now).unwrap();
         assert_eq!(written.len(), 2);
         let log = store
             .list_events(Some("repair_candidate"), None, None, None, 50)

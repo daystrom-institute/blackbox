@@ -855,11 +855,12 @@ async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
         );
         let in_flight = s["in_flight_nodes"]
             .as_array()
-            .map(|a| a
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(", "))
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default();
         if !in_flight.is_empty() {
             println!("  in_flight: {in_flight}");
@@ -868,19 +869,12 @@ async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
             println!("  verdict:   {v}");
         }
         if let Some(vc) = s["visit_counts"].as_object() {
-            let mut pairs: Vec<String> =
-                vc.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let mut pairs: Vec<String> = vc.iter().map(|(k, v)| format!("{k}={v}")).collect();
             pairs.sort();
             println!("  visits:    {}", pairs.join(", "));
         }
-        println!(
-            "  started:   {}",
-            s["started_at"].as_str().unwrap_or("?")
-        );
-        println!(
-            "  updated:   {}",
-            s["updated_at"].as_str().unwrap_or("?")
-        );
+        println!("  started:   {}", s["started_at"].as_str().unwrap_or("?"));
+        println!("  updated:   {}", s["updated_at"].as_str().unwrap_or("?"));
         println!();
     }
     Ok(())
@@ -922,9 +916,7 @@ async fn orchestrate_list(args: OrchestrateListArgs) -> anyhow::Result<()> {
         let last = e["last_activity"].as_str().unwrap_or("");
         let anchor_full = e["latest_anchor"].as_str().unwrap_or("");
         let anchor: String = anchor_full.chars().take(60).collect();
-        println!(
-            "{tid:<18} {name:<22} {status:<10} {last:<22} {anchor}"
-        );
+        println!("{tid:<18} {name:<22} {status:<10} {last:<22} {anchor}");
     }
     if arr.len() > args.limit {
         println!(
@@ -955,7 +947,10 @@ async fn orchestrate_status(args: OrchestrateStatusArgs) -> anyhow::Result<()> {
         std::process::exit(1);
     }
     let parsed: serde_json::Value = serde_json::from_str(&text)?;
-    println!("arc thread: {}", parsed["thread_id"].as_str().unwrap_or("?"));
+    println!(
+        "arc thread: {}",
+        parsed["thread_id"].as_str().unwrap_or("?")
+    );
     if let Some(anchor) = parsed["latest_anchor"].as_str() {
         println!();
         println!("latest anchor:");
@@ -988,9 +983,7 @@ fn urlencoding_lite(s: &str) -> String {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
                 vec![c]
             } else {
-                format!("%{:02X}", c as u32)
-                    .chars()
-                    .collect::<Vec<_>>()
+                format!("%{:02X}", c as u32).chars().collect::<Vec<_>>()
             }
         })
         .collect()
@@ -1034,8 +1027,8 @@ async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
         eprintln!("{text}");
         std::process::exit(1);
     }
-    let parsed: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| "daemon returned non-JSON response")?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| "daemon returned non-JSON response")?;
     println!("status: {}", parsed["status"].as_str().unwrap_or("?"));
     println!();
     if let Some(plan) = parsed["plan"].as_str() {
@@ -1053,12 +1046,7 @@ async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
     println!();
     if let Some(outputs) = parsed["node_outputs"].as_object() {
         for (node, output) in outputs {
-            let preview: String = output
-                .as_str()
-                .unwrap_or("")
-                .chars()
-                .take(500)
-                .collect();
+            let preview: String = output.as_str().unwrap_or("").chars().take(500).collect();
             println!("─── {node} ───");
             println!("{preview}");
             println!();
@@ -1067,10 +1055,7 @@ async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn orchestrate_run_stream(
-    base_url: &str,
-    body: &serde_json::Value,
-) -> anyhow::Result<()> {
+async fn orchestrate_run_stream(base_url: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     use futures_util::StreamExt;
     let url = format!("{}/orchestrate/stream", base_url.trim_end_matches('/'));
     eprintln!("POST {url} (streaming)");
@@ -1139,12 +1124,8 @@ fn print_stream_event(data: &str) {
                 }
                 if let Some(outputs) = result["node_outputs"].as_object() {
                     for (node, out) in outputs {
-                        let preview: String = out
-                            .as_str()
-                            .unwrap_or("")
-                            .chars()
-                            .take(500)
-                            .collect();
+                        let preview: String =
+                            out.as_str().unwrap_or("").chars().take(500).collect();
                         println!("\n─── {node} ───\n{preview}");
                     }
                 }

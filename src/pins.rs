@@ -517,9 +517,7 @@ mod tests {
                     thread_id: None,
                     work_item_id: None,
                 })
-                .unwrap_or_else(|| {
-                    panic!("project-agnostic pin should match project={project:?}")
-                });
+                .unwrap_or_else(|| panic!("project-agnostic pin should match project={project:?}"));
             assert!(rendered.contains("cross-project arc note"));
         }
     }

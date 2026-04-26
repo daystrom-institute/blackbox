@@ -167,10 +167,8 @@ impl BlackboxServer {
             allow_recursion: false,
             provider: Some(provider),
         };
-        let final_prompt = orch::apply_brofile_lens(
-            &orch::apply_ambient(prompt, &ambient_ctx),
-            lens.as_deref(),
-        );
+        let final_prompt =
+            orch::apply_brofile_lens(&orch::apply_ambient(prompt, &ambient_ctx), lens.as_deref());
         let mut args = if is_resume {
             provider.build_resume_args(&session_id, &final_prompt, exec_opts.as_ref())
         } else {
@@ -240,12 +238,7 @@ impl BlackboxServer {
         for (member_name, brofile) in &members {
             let existing = existing_session_ids.get(member_name).cloned();
             let task = self
-                .workflow_dispatch_executor(
-                    brofile,
-                    prompt,
-                    cwd.as_deref(),
-                    existing.as_deref(),
-                )
+                .workflow_dispatch_executor(brofile, prompt, cwd.as_deref(), existing.as_deref())
                 .await
                 .map_err(|e| format!("member {member_name}: {e}"))?;
             launched.push((member_name.clone(), task));
@@ -527,7 +520,9 @@ impl BlackboxServer {
                         if let Some(w) = warning {
                             payload["warnings"] = serde_json::json!([w.trim().to_string()]);
                         }
-                        let bytes = serde_json::to_string(&payload).map(|s| s.len()).unwrap_or_default();
+                        let bytes = serde_json::to_string(&payload)
+                            .map(|s| s.len())
+                            .unwrap_or_default();
                         tracing::info!(target: "blackbox::tool", tool = "bbox_learn", elapsed_ms = ms, bytes, "ok");
                         Self::ok_json(&payload)
                     }
@@ -561,7 +556,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_knowledge",
-        description = "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (code-embedded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. For structured packet discovery + filtering, use bbox_packet_list."
+        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (code-embedded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. For structured packet discovery + filtering, use bbox_packet_list."
     )]
     fn bbox_knowledge(&self, Parameters(p): Parameters<KnowledgeListParams>) -> CallToolResult {
         Self::run("bbox_knowledge", || {
@@ -2738,8 +2733,7 @@ Constraints:\n\
             let result = workflow::engine::dry_run(&compiled);
             return Self::ok_json(&serde_json::to_value(&result).unwrap_or_default());
         }
-        let result =
-            workflow::run_workflow(self, &compiled, p.project_dir, p.max_steps).await;
+        let result = workflow::run_workflow(self, &compiled, p.project_dir, p.max_steps).await;
         Self::ok_json(&serde_json::to_value(&result).unwrap_or_default())
     }
 }
@@ -3852,8 +3846,7 @@ async fn orchestrate_list_handler(
                             .map(|(ts, _)| n.created_at.as_str() > ts.as_str())
                             .unwrap_or(true);
                         if is_newer {
-                            latest_anchor =
-                                Some((n.created_at.clone(), body.to_string()));
+                            latest_anchor = Some((n.created_at.clone(), body.to_string()));
                         }
                     }
                     if body.starts_with("workflow ") && body.contains("completed in") {
@@ -3904,14 +3897,12 @@ async fn orchestrate_peek_handler(
 ) -> impl axum::response::IntoResponse {
     let map = state.running_arcs.read();
     match q.thread_id {
-        Some(tid) => {
-            match map.get(&tid) {
-                Some(s) => axum::Json(serde_json::to_value(s).unwrap_or_default()),
-                None => axum::Json(serde_json::json!({
-                    "error": format!("no arc snapshot for thread_id={tid}")
-                })),
-            }
-        }
+        Some(tid) => match map.get(&tid) {
+            Some(s) => axum::Json(serde_json::to_value(s).unwrap_or_default()),
+            None => axum::Json(serde_json::json!({
+                "error": format!("no arc snapshot for thread_id={tid}")
+            })),
+        },
         None => {
             let mut all: Vec<&ArcSnapshot> = map.values().collect();
             all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -4795,7 +4786,9 @@ mod tests {
         )
         .await;
         assert!(
-            !at_ceiling.status.starts_with("error: subworkflow composition depth"),
+            !at_ceiling
+                .status
+                .starts_with("error: subworkflow composition depth"),
             "at-ceiling depth should not be rejected by the depth guard; got: {}",
             at_ceiling.status
         );
@@ -4811,7 +4804,9 @@ mod tests {
         )
         .await;
         assert!(
-            past_ceiling.status.starts_with("error: subworkflow composition depth"),
+            past_ceiling
+                .status
+                .starts_with("error: subworkflow composition depth"),
             "past-ceiling should error on depth; got: {}",
             past_ceiling.status
         );
@@ -4960,10 +4955,7 @@ mod tests {
             let result = store
                 .compile(&CompileParams {
                     domain: "advisor/demo-escalate".into(),
-                    classification_lattice: Some(vec![
-                        "escalate".into(),
-                        "continue".into(),
-                    ]),
+                    classification_lattice: Some(vec!["escalate".into(), "continue".into()]),
                     prefix_inference: Some(
                         [
                             ("escalate_".into(), "escalate".into()),
@@ -5031,7 +5023,9 @@ mod tests {
             &[json!({"taskId": "task-x", "status": "running"})],
         );
 
-        let verdict = server.apply_advisor_packet(&packet_id, &checkpoint).unwrap();
+        let verdict = server
+            .apply_advisor_packet(&packet_id, &checkpoint)
+            .unwrap();
         assert_eq!(verdict["match"], true);
         assert_eq!(verdict["ruleId"], "escalate_any_blocked");
         assert_eq!(verdict["classification"], "escalate");
@@ -5085,8 +5079,7 @@ mod tests {
                 .unwrap();
         }
 
-        let nag_arc =
-            server.arc_bound_warning(None, "For the 3-tier migration, avoid touching X");
+        let nag_arc = server.arc_bound_warning(None, "For the 3-tier migration, avoid touching X");
         assert!(
             nag_arc
                 .as_deref()
