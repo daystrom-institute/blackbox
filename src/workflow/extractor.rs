@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Selector {
     /// `$.user.login` style. Leading `$.` optional.
     JsonPath { path: String },

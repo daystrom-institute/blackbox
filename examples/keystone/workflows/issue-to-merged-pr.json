@@ -85,9 +85,9 @@
       ]
     },
     "AddressFeedback": {
-      "subworkflow_ref": "implementer-arc",
+      "subworkflow_ref": "implementer-feedback-arc",
       "imports": ["owner", "repo", "issue_number", "branch", "pr_number", "feedback_text"],
-      "exports": ["pr_number"]
+      "exports": []
     },
     "Done": {
       "actor": "noop",

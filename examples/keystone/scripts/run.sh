@@ -61,15 +61,28 @@ log "3/4 installing packets / workflows / webhook into blackboxd"
 "${ROOT}/scripts/install.sh"
 
 if [[ "${DISPATCH}" -eq 1 ]]; then
+    # Worktree hooks need a project_dir — the local clone of the
+    # Forgejo repo. Set PROJECT_DIR=/path/to/local/clone or we'll
+    # clone it under /tmp/keystone-clone for you.
+    if [[ -z "${PROJECT_DIR:-}" ]]; then
+        PROJECT_DIR="/tmp/keystone-clone-${FORGEJO_REPO}"
+        if [[ ! -d "${PROJECT_DIR}/.git" ]]; then
+            log "cloning ${FORGEJO_OWNER}/${FORGEJO_REPO} → ${PROJECT_DIR}"
+            git clone "${FORGEJO_BASE_URL}/${FORGEJO_OWNER}/${FORGEJO_REPO}.git" "${PROJECT_DIR}"
+        fi
+    fi
     log "4/4 directly dispatching arc against seeded issue (#1)"
+    log "    project_dir: ${PROJECT_DIR}"
     args=$(jq -nc \
         --arg owner "${FORGEJO_OWNER}" \
         --arg repo  "${FORGEJO_REPO}" \
+        --arg pd    "${PROJECT_DIR}" \
         '{
             workflow_id: "issue-to-merged-pr",
+            project_dir: $pd,
             initial_vars: { owner: $owner, repo: $repo, issue_number: 1 }
         }')
-    log "POST /orchestrate/by-id ${args}"
+    log "POST /orchestrate/by-id"
     curl -fsS -H 'Content-Type: application/json' \
         -X POST "http://127.0.0.1:${PORT}/orchestrate/by-id" \
         -d "${args}" | jq .

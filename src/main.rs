@@ -4723,6 +4723,232 @@ async fn orchestrate_by_id_handler(
     axum::Json(result).into_response()
 }
 
+// ── Admin HTTP endpoints (plain JSON; no MCP framing) ──────────────
+//
+// These wrap the same operations the MCP tools expose so install
+// scripts can use plain `curl`. They're loopback-only via the listener
+// binding.
+
+async fn admin_packet_compile(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let p: packets::CompileParams = match serde_json::from_value(req) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("compile params parse: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let result = state.packets.read().compile(&p);
+    match result {
+        Ok(msg) => axum::Json(json!({"status": "ok", "message": msg})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("compile: {e:#}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminWorkflowInstallReq {
+    #[serde(default)]
+    id: Option<String>,
+    spec: Value,
+}
+
+async fn admin_workflow_install(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<AdminWorkflowInstallReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let spec: workflow::Workflow = match serde_json::from_value(req.spec) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("workflow parse: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let compiled = match workflow::compile(spec.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("workflow compile: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let server = BlackboxServer::new(state.clone());
+    if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("capability validation: {e}"),
+        )
+            .into_response();
+    }
+    let id = req.id.unwrap_or_else(|| spec.name.clone());
+    let dir = state.store_dir.join("workflows");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{id}.json"));
+    if let Err(e) = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&spec).unwrap_or_default(),
+    ) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("workflow persist: {e}"),
+        )
+            .into_response();
+    }
+    state.workflow_registry.write().insert(id.clone(), spec);
+    axum::Json(json!({"status": "installed", "id": id})).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminWebhookInstallReq {
+    spec: Value,
+}
+
+async fn admin_webhook_install(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<AdminWebhookInstallReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let spec: webhooks::WebhookSpec = match serde_json::from_value(req.spec) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("webhook parse: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let dir = state.store_dir.join("webhooks");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.json", spec.name));
+    if let Err(e) = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&spec).unwrap_or_default(),
+    ) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("webhook persist: {e}"),
+        )
+            .into_response();
+    }
+    state.webhooks.install(spec.clone());
+    axum::Json(json!({
+        "status": "installed",
+        "name": spec.name,
+        "endpoint": format!("/webhook/{}", spec.name),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminBrofileUpsertReq {
+    name: String,
+    provider: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    lens: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
+}
+
+async fn admin_brofile_upsert(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<AdminBrofileUpsertReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let provider: orchestration::providers::Provider = match req.provider.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("unknown provider '{}'", req.provider),
+            )
+                .into_response();
+        }
+    };
+    let bf = orchestration::brofile::Brofile {
+        name: req.name.clone(),
+        provider,
+        account: req.account,
+        lens: req.lens,
+        model: req.model,
+        effort: req.effort,
+        filters: None,
+    };
+    orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None);
+    axum::Json(json!({"status": "upserted", "name": req.name})).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminTeamUpsertReq {
+    name: String,
+    members: Vec<String>,
+}
+
+async fn admin_team_upsert(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<AdminTeamUpsertReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let teamplate = orchestration::team::Teamplate {
+        name: req.name.clone(),
+        members: req
+            .members
+            .iter()
+            .enumerate()
+            .map(|(i, brofile)| orchestration::team::TeamplateMember {
+                brofile: brofile.clone(),
+                alias: Some(format!("m{}", i + 1)),
+                count: 1,
+            })
+            .collect(),
+        advisor: None,
+    };
+    orchestration::team::save_teamplate(&teamplate, "global", &state.store_dir, None);
+    let team = orchestration::team::Team {
+        name: req.name.clone(),
+        teamplate: req.name.clone(),
+        members: req
+            .members
+            .iter()
+            .enumerate()
+            .map(|(i, brofile)| orchestration::team::TeamMember {
+                name: format!("m{}", i + 1),
+                brofile: brofile.clone(),
+                session_id: None,
+                task_history: Vec::new(),
+            })
+            .collect(),
+        advisor: None,
+        project_dir: None,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    let _lock = orchestration::team::lock_teams();
+    orchestration::team::save_team(&team, &state.store_dir);
+    axum::Json(json!({"status": "upserted", "name": req.name})).into_response()
+}
+
 async fn signal_arc_dispatch(
     state: &Arc<SharedState>,
     signal: &str,
@@ -5321,6 +5547,26 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/orchestrate/by-id",
             axum::routing::post(orchestrate_by_id_handler),
+        )
+        .route(
+            "/admin/packet/compile",
+            axum::routing::post(admin_packet_compile),
+        )
+        .route(
+            "/admin/workflow/install",
+            axum::routing::post(admin_workflow_install),
+        )
+        .route(
+            "/admin/webhook/install",
+            axum::routing::post(admin_webhook_install),
+        )
+        .route(
+            "/admin/brofile/upsert",
+            axum::routing::post(admin_brofile_upsert),
+        )
+        .route(
+            "/admin/team/upsert",
+            axum::routing::post(admin_team_upsert),
         )
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);

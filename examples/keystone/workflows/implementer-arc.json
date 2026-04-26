@@ -62,10 +62,6 @@
           "on_failure": "warn"
         }
       ]
-    },
-    "AddressFeedback": {
-      "actor": "implementer",
-      "prompt": "Reviewer feedback on PR #${vars.pr_number} (iteration ${vars.review_iteration}):\n\n${vars.feedback_text}\n\nAddress the feedback in the same worktree (${meta.worktree}). Edit files, run tests, commit, then push to origin/${vars.branch} so Forgejo emits a new pull_request synchronize event.\n\nReturn a one-line summary of changes."
     }
   },
   "graph": "stateDiagram-v2\n    [*] --> FetchIssue\n    FetchIssue --> OpenPr\n    OpenPr --> [*]"

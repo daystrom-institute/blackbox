@@ -1,0 +1,27 @@
+{
+  "name": "implementer-feedback-arc",
+  "version": 1,
+  "vars_schema": {
+    "owner":         { "kind": "string", "required": true },
+    "repo":          { "kind": "string", "required": true },
+    "issue_number":  { "kind": "int",    "required": true },
+    "branch":        { "kind": "string", "required": true },
+    "pr_number":     { "kind": "int",    "required": true },
+    "feedback_text": { "kind": "string", "required": true }
+  },
+  "actors": {
+    "implementer": {
+      "kind": "executor",
+      "brofile": "keystone-impl",
+      "durable": true,
+      "compaction_anchor": true
+    }
+  },
+  "nodes": {
+    "AddressFeedback": {
+      "actor": "implementer",
+      "prompt": "Reviewer feedback on PR #${vars.pr_number} (iteration: see vars.review_iteration in parent context):\n\n${vars.feedback_text}\n\nAddress the feedback in worktree ${meta.worktree} (branch ${vars.branch}). Edit files, run tests, commit, then push to origin/${vars.branch} so Forgejo emits a new pull_request synchronize event.\n\nReturn a one-line summary of changes."
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> AddressFeedback\n    AddressFeedback --> [*]"
+}
