@@ -34,6 +34,12 @@ pub struct WebhookSpec {
     /// includes `X-Gitea-Delivery: <uuid>` on every dispatch.
     #[serde(default)]
     pub delivery_id_header: Option<String>,
+    /// Default project_dir used when a `start_arc` verdict spawns a
+    /// fresh arc. Worktree hooks need a parent repo to anchor on;
+    /// this is where they look. Override per-arc by setting
+    /// `${WEBHOOK_NAME}_PROJECT_DIR` in the daemon's environment.
+    #[serde(default)]
+    pub default_project_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

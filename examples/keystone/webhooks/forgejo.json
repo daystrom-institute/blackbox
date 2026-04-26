@@ -42,9 +42,13 @@
         "kind": "json_path",
         "path": "$.review.state"
       },
+      "owner": {
+        "kind": "json_path",
+        "path": "$.repository.owner.login"
+      },
       "repo": {
         "kind": "json_path",
-        "path": "$.repository.full_name"
+        "path": "$.repository.name"
       },
       "sender": {
         "kind": "json_path",
@@ -52,5 +56,6 @@
       }
     }
   },
-  "routing_packet": "domain:webhook-routing/forgejo"
+  "routing_packet": "domain:webhook-routing/forgejo",
+  "default_project_dir": "/tmp/keystone-fork-clone"
 }

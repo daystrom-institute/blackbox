@@ -8,6 +8,11 @@ ExecStart=%h/.local/bin/blackboxd-dev
 Restart=on-failure
 RestartSec=3
 Environment=BBOX_PORT=7265
+# HTTP listener bind. Defaults to 0.0.0.0 in dev so a Forgejo/Gitea
+# Docker container on the same host can deliver webhooks via
+# http://172.17.0.1:7265/webhook/<name>. Closed-network assumption.
+# Switch to 127.0.0.1 if you don't need container ingress.
+Environment=BBOX_BIND=0.0.0.0
 Environment=BLACKBOX_MCP_NAME=blackbox-dev
 Environment=BLACKBOX_STATE_DIR=%h/.local/state/blackbox-dev
 Environment=BLACKBOX_KNOWLEDGE_PATH=%h/.local/state/blackbox-dev/blackbox-knowledge.json

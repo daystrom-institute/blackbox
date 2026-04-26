@@ -78,6 +78,7 @@ pub enum OnFailure {
 
 /// Result of executing one HookOp. The runner applies these to its
 /// ArcContext.
+#[derive(Debug)]
 pub enum OpEffect {
     /// No-op (Shell with no into_var, etc.).
     None,
@@ -327,21 +328,51 @@ async fn exec_worktree_create(args: &Value, ctx: &ArcContext) -> Result<OpEffect
         .clone()
         .ok_or_else(|| anyhow!("WorktreeCreate: meta.project_dir not set"))?;
 
-    // Refuse to clobber an existing path.
+    // Refuse to clobber an existing path. Different issue from the
+    // existing-branch case below — a path collision means another arc
+    // is concurrently using this exact path or a previous one wasn't
+    // cleaned up. Either way, don't silently mutate.
     if Path::new(&path).exists() {
         bail!("WorktreeCreate: path {path} already exists");
     }
 
-    // git worktree add -b <branch> <path> <base>
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
+    // Branch existence check. Failed/killed arcs leave their branch
+    // behind (intentional under `keep-on-fail` cleanup policy), so
+    // creating a fresh branch with the same name (`-b`) on the next
+    // attempt blows up with `fatal: a branch named '<x>' already
+    // exists`. Two real cases:
+    //   (a) branch exists AND is checked out in another worktree → real
+    //       conflict (concurrent arc on same issue), fail loudly
+    //   (b) branch exists but no worktree references it → reuse it
+    //       (`git worktree add <path> <branch>` without `-b`)
+    //   (c) branch doesn't exist → fresh create (`-b <branch>` against
+    //       <base>)
+    let branch_status = branch_state(&repo_root, &branch).await?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
         .arg(&repo_root)
         .arg("worktree")
-        .arg("add")
-        .arg("-b")
-        .arg(&branch)
-        .arg(&path)
-        .arg(&base)
+        .arg("add");
+    match branch_status {
+        BranchState::AbsentLocal => {
+            // Case (c): create fresh.
+            cmd.arg("-b").arg(&branch).arg(&path).arg(&base);
+        }
+        BranchState::PresentFree => {
+            // Case (b): reuse existing branch — no `-b`.
+            cmd.arg(&path).arg(&branch);
+        }
+        BranchState::PresentInUse(other_path) => {
+            // Case (a): real conflict.
+            bail!(
+                "WorktreeCreate: branch '{branch}' is already checked out at {other_path} \
+                 (concurrent arc on same issue?). Either let the other arc finish, or \
+                 retire its worktree, or use a unique branch name (e.g. include \
+                 ${{meta.arc_id}} in the name)."
+            );
+        }
+    }
+    let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -355,6 +386,71 @@ async fn exec_worktree_create(args: &Value, ctx: &ArcContext) -> Result<OpEffect
         );
     }
     Ok(OpEffect::SetWorktree(Some(path)))
+}
+
+/// State of a local branch with respect to worktree usage.
+enum BranchState {
+    /// Branch does not exist locally.
+    AbsentLocal,
+    /// Branch exists but is not checked out by any worktree.
+    PresentFree,
+    /// Branch exists AND another worktree has it checked out (path).
+    PresentInUse(String),
+}
+
+/// Inspect a branch's worktree-occupancy in `repo_root`.
+async fn branch_state(repo_root: &str, branch: &str) -> Result<BranchState> {
+    // First: does the branch ref exist at all?
+    let exists = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(format!("refs/heads/{branch}"))
+        .status()
+        .await
+        .map_err(|e| anyhow!("git show-ref spawn: {e}"))?
+        .success();
+    if !exists {
+        return Ok(BranchState::AbsentLocal);
+    }
+    // Second: is some worktree currently checked out on it?
+    let porcelain = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain")
+        .output()
+        .await
+        .map_err(|e| anyhow!("git worktree list spawn: {e}"))?;
+    if !porcelain.status.success() {
+        bail!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&porcelain.stderr)
+        );
+    }
+    let text = String::from_utf8_lossy(&porcelain.stdout).into_owned();
+    // Records are separated by blank lines; each starts with `worktree
+    // <path>` and may include `branch refs/heads/<name>`.
+    let needle = format!("branch refs/heads/{branch}");
+    let mut current_path: Option<String> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current_path = Some(p.to_string());
+            continue;
+        }
+        if line.trim() == needle {
+            if let Some(p) = current_path.take() {
+                return Ok(BranchState::PresentInUse(p));
+            }
+        }
+        if line.trim().is_empty() {
+            current_path = None;
+        }
+    }
+    Ok(BranchState::PresentFree)
 }
 
 async fn exec_worktree_remove(args: &Value) -> Result<OpEffect> {
@@ -495,6 +591,115 @@ mod tests {
         };
         let effect = execute_op(&hook, &ctx, None).await.unwrap();
         assert!(matches!(effect, OpEffect::None));
+    }
+
+    #[tokio::test]
+    async fn worktree_create_reuses_existing_branch() {
+        // Regression: a previous arc died and left `fix/issue-N`
+        // around. The next arc tries WorktreeCreate with the same
+        // branch name. Old behavior: hard-fail with `git worktree add
+        // -b <branch>` saying the branch exists. New: detect the
+        // free branch and reuse it.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        // Initial repo with a commit on main.
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        // Create a stray branch as if a prior arc left it behind.
+        git(&["branch", "fix/issue-42"]);
+
+        let mut meta = ArcMeta::default();
+        meta.project_dir = Some(repo.to_string_lossy().into_owned());
+        let ctx = ArcContext::new(meta);
+
+        let wt_path = tmp.path().join("wt-arc-1");
+        let hook = HookOp {
+            op: OpKind::WorktreeCreate,
+            args: json!({
+                "path":   wt_path.to_string_lossy(),
+                "branch": "fix/issue-42",
+                "base":   "main",
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: None,
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetWorktree(Some(p)) => {
+                assert_eq!(p, wt_path.to_string_lossy());
+            }
+            other => panic!("expected SetWorktree(Some), got {:?}", std::mem::discriminant(&other)),
+        }
+        // The worktree should be on the reused branch.
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt_path)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        let head_branch = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        assert_eq!(head_branch, "fix/issue-42");
+    }
+
+    #[tokio::test]
+    async fn worktree_create_fails_when_branch_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        // Existing worktree on the contested branch.
+        let occupied = tmp.path().join("wt-occupied");
+        git(&["worktree", "add", "-b", "fix/issue-42", occupied.to_str().unwrap()]);
+
+        let mut meta = ArcMeta::default();
+        meta.project_dir = Some(repo.to_string_lossy().into_owned());
+        let ctx = ArcContext::new(meta);
+
+        let wt_path = tmp.path().join("wt-conflicting");
+        let hook = HookOp {
+            op: OpKind::WorktreeCreate,
+            args: json!({
+                "path":   wt_path.to_string_lossy(),
+                "branch": "fix/issue-42",
+                "base":   "main",
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: None,
+        };
+        let err = execute_op(&hook, &ctx, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("already checked out"),
+            "expected concurrent-arc error, got: {err}"
+        );
     }
 
     #[tokio::test]

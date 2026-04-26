@@ -4638,23 +4638,53 @@ async fn dispatch_verdict(
             let compiled = workflow::compile(workflow_spec)
                 .map_err(|e| anyhow::anyhow!("workflow compile: {e}"))?;
             let server = BlackboxServer::new(state.clone());
-            // Spawn — webhook returns immediately; the arc runs in
-            // the background. The arc_id is included in the response
-            // so callers can correlate later.
-            let project_dir: Option<String> = None;
+            // Merge: extracted entity → initial_vars → caller's
+            // explicit verdict initial_vars. Last writer wins, so
+            // a routing rule's verdict can override entity fields if
+            // it really needs to. Workflow vars_schema validates;
+            // unknown keys are accepted (open schema by design).
+            let mut merged_vars = serde_json::Map::new();
+            if let Value::Object(m) = &entity {
+                for (k, v) in m {
+                    // Skip the synthetic `_headers` collection — it's
+                    // there for routing predicates, not for the arc.
+                    if k == "_headers" {
+                        continue;
+                    }
+                    if !matches!(v, Value::Null) {
+                        merged_vars.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            for (k, v) in initial_vars {
+                merged_vars.insert(k, v);
+            }
+            // project_dir resolution priority:
+            //   1. ${WEBHOOK_NAME_UPPERCASE}_PROJECT_DIR env override
+            //   2. WebhookSpec.default_project_dir
+            //   3. None (worktree hooks will fail explicitly — better
+            //      than silent fallback to cwd)
+            let env_var = format!(
+                "{}_PROJECT_DIR",
+                spec.name.to_uppercase().replace('-', "_")
+            );
+            let project_dir = std::env::var(&env_var)
+                .ok()
+                .or_else(|| spec.default_project_dir.clone());
+            let workflow_id_clone = workflow_id.clone();
             tokio::spawn(async move {
                 let _ = workflow::run_workflow_with_initial_vars(
                     &server,
                     &compiled,
                     project_dir,
                     Some(50),
-                    initial_vars,
+                    merged_vars,
                 )
                 .await;
             });
             Ok(json!({
                 "status": "arc_started",
-                "workflow": workflow_id,
+                "workflow": workflow_id_clone,
             }))
         }
     }
@@ -5571,8 +5601,14 @@ async fn main() -> anyhow::Result<()> {
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
-    tracing::info!("blackboxd listening on http://127.0.0.1:{port}/mcp");
+    // Bind address is `127.0.0.1` by default for security (the
+    // daemon exposes broad MCP authority). Set BBOX_BIND=0.0.0.0
+    // to reach it from a Docker container on the same host
+    // (Forgejo webhook → http://172.17.0.1:port). Closed-network
+    // assumption applies; never set this on a public interface.
+    let bind_host = std::env::var("BBOX_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+    let listener = tokio::net::TcpListener::bind(format!("{bind_host}:{port}")).await?;
+    tracing::info!("blackboxd listening on http://{bind_host}:{port}/mcp");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
