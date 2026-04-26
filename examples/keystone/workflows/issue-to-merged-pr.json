@@ -1,0 +1,98 @@
+{
+  "name": "issue-to-merged-pr",
+  "version": 1,
+  "vars_schema": {
+    "owner":            { "kind": "string", "required": true },
+    "repo":             { "kind": "string", "required": true },
+    "issue_number":     { "kind": "int",    "required": true },
+    "issue_title":      { "kind": "string" },
+    "issue_body":       { "kind": "string" },
+    "branch":           { "kind": "string" },
+    "pr_number":        { "kind": "int" },
+    "feedback_text":    { "kind": "string" },
+    "review_iteration": { "kind": "int" },
+    "max_iterations":   { "kind": "int" }
+  },
+  "actors": {
+    "noop": { "kind": "noop" }
+  },
+  "policy_packet": "domain:workflow-policy/arc-budget",
+  "on_arc_exit": [
+    {
+      "op": "worktree_remove",
+      "args": { "path": "${meta.worktree}", "force": true },
+      "when": "domain:workflow-cleanup/keep-on-fail",
+      "on_failure": "warn"
+    }
+  ],
+  "nodes": {
+    "Setup": {
+      "actor": "noop",
+      "on_enter": [
+        { "op": "set_var", "args": { "key": "review_iteration", "value": 0 } },
+        { "op": "set_var", "args": { "key": "max_iterations",   "value": 5 } },
+        { "op": "set_var", "args": { "key": "branch", "value": "fix/issue-${vars.issue_number}" } },
+        {
+          "op": "worktree_create",
+          "args": {
+            "path":   "/tmp/keystone-arcs/${meta.arc_id}",
+            "branch": "${vars.branch}",
+            "base":   "main"
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "prompt": "Setup complete (no LLM dispatch — user-actor placeholder for hook execution)."
+    },
+    "Implement": {
+      "subworkflow_ref": "implementer-arc",
+      "imports": ["owner", "repo", "issue_number"],
+      "exports": ["pr_number", "branch"]
+    },
+    "AwaitReviewTrigger": {
+      "wait": {
+        "any_of": [
+          { "signal": "pr-ready",  "correlate": {} },
+          { "signal": "pr-merged", "correlate": {} }
+        ],
+        "timeout": "24h"
+      },
+      "gate": "domain:workflow-gate/merge-or-review"
+    },
+    "Review": {
+      "subworkflow_ref": "reviewer-arc",
+      "imports": ["owner", "repo", "pr_number"],
+      "exports": ["feedback_posted"]
+    },
+    "AwaitFeedbackOrMerge": {
+      "wait": {
+        "any_of": [
+          { "signal": "pr-feedback", "correlate": {} },
+          { "signal": "pr-merged",   "correlate": {} }
+        ],
+        "timeout": "7d"
+      },
+      "gate": "domain:workflow-gate/loop-or-exit",
+      "on_exit": [
+        {
+          "op": "set_var",
+          "args": { "key": "feedback_text", "value": "${last_signal.payload}" }
+        },
+        {
+          "op": "inc_var",
+          "args": { "key": "review_iteration" }
+        }
+      ]
+    },
+    "AddressFeedback": {
+      "subworkflow_ref": "implementer-arc",
+      "imports": ["owner", "repo", "issue_number", "branch", "pr_number", "feedback_text"],
+      "exports": ["pr_number"]
+    },
+    "Done": {
+      "actor": "noop",
+      "prompt": "Arc terminated."
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> Setup\n    Setup --> Implement\n    Implement --> AwaitReviewTrigger\n    AwaitReviewTrigger --> Review : ready\n    AwaitReviewTrigger --> Done : merged\n    Review --> AwaitFeedbackOrMerge\n    AwaitFeedbackOrMerge --> AddressFeedback : feedback\n    AwaitFeedbackOrMerge --> Done : merged\n    AddressFeedback --> AwaitReviewTrigger\n    Done --> [*]"
+}

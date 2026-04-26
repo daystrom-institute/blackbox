@@ -88,6 +88,12 @@ pub enum ActorKind {
     /// Human operator. Invoking a user node means: pause, surface to
     /// inbox, wait for resolve.
     User,
+    /// No-op actor. The node fires its on_enter / on_exit hooks then
+    /// returns — useful for Setup / Done nodes that exist only to host
+    /// hooks (worktree create, var initialization, terminal cleanup
+    /// trigger). The node's `prompt` is captured as the output for any
+    /// downstream template references.
+    Noop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -127,6 +133,12 @@ pub struct NodeSpec {
     /// sub-workflow to completion instead of dispatching an actor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subworkflow: Option<Box<Workflow>>,
+    /// Reference a workflow installed in the daemon registry by id.
+    /// Mutually exclusive with `subworkflow`. Resolved at dispatch
+    /// time (not compile time) so the registry can change without
+    /// recompiling parents that name it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subworkflow_ref: Option<String>,
     /// Vars to copy from parent into the subworkflow's fresh
     /// ArcContext. Only meaningful when `subworkflow` is set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

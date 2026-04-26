@@ -1,0 +1,34 @@
+{
+  "name": "reviewer-arc",
+  "version": 1,
+  "vars_schema": {
+    "owner":     { "kind": "string", "required": true },
+    "repo":      { "kind": "string", "required": true },
+    "pr_number": { "kind": "int",    "required": true },
+    "feedback_posted": { "kind": "bool", "required": false }
+  },
+  "actors": {
+    "reviewers": {
+      "kind": "ensemble",
+      "team": "keystone-reviewers",
+      "durable": false
+    }
+  },
+  "nodes": {
+    "Review": {
+      "actor": "reviewers",
+      "prompt": "PR #${vars.pr_number} on ${vars.owner}/${vars.repo} is up for review.\n\nFetch the PR diff and review it for:\n  1. Does it actually fix the issue described in the PR body?\n  2. Are tests added/updated to cover the behavior change?\n  3. Are there obvious bugs, edge cases, or regressions?\n\nUse:\n  curl -fsS -H \"Authorization: token $FORGEJO_TOKEN\" \"$FORGEJO_BASE_URL/api/v1/repos/${vars.owner}/${vars.repo}/pulls/${vars.pr_number}.diff\"\n\nReturn your verdict as ONE LINE: either `APPROVE` or `REQUEST CHANGES: <one-paragraph specific feedback>`.\n\nBe terse. No filler. The orchestrator aggregates these across reviewers and posts the result back as a PR comment."
+    },
+    "PostFeedback": {
+      "actor": "reviewers",
+      "prompt": "Aggregate feedback from prior reviewer round (yourself + peers) and post ONE consolidated comment on PR #${vars.pr_number}.\n\nIf any reviewer requested changes, the consolidated comment must list the requested changes clearly so the implementer can address them.\n\nIf all reviewers approved, post a brief approval comment AND approve the PR via:\n  curl -fsS -H \"Authorization: token $FORGEJO_TOKEN\" -H 'Content-Type: application/json' -X POST \"$FORGEJO_BASE_URL/api/v1/repos/${vars.owner}/${vars.repo}/pulls/${vars.pr_number}/reviews\" -d '{\"event\":\"APPROVED\",\"body\":\"LGTM\"}'\n\nFor REQUEST CHANGES, use event=\"REQUEST_CHANGES\" with body containing the consolidated feedback. The pull_request_review webhook will fire and resume the parent arc.\n\nReturn the literal string `posted` on success.",
+      "on_exit": [
+        {
+          "op": "set_var",
+          "args": { "key": "feedback_posted", "value": true }
+        }
+      ]
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> Review\n    Review --> PostFeedback\n    PostFeedback --> [*]"
+}

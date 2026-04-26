@@ -1,0 +1,39 @@
+{
+  "domain": "workflow-gate/loop-or-exit",
+  "scope": "global",
+  "classification_lattice": ["merged", "halt", "feedback"],
+  "rules": [
+    {
+      "id": "merged_exit",
+      "classification": "merged",
+      "antecedent": {
+        "op": "Eq", "field": "last_signal.name", "value": "pr-merged"
+      },
+      "consequent": "merged"
+    },
+    {
+      "id": "halt_max_iterations",
+      "classification": "halt",
+      "antecedent": {
+        "op": "FieldGe",
+        "lhs_field": "vars.review_iteration",
+        "rhs_field": "vars.max_iterations"
+      },
+      "consequent": "halt"
+    },
+    {
+      "id": "feedback_loop",
+      "classification": "feedback",
+      "antecedent": {
+        "op": "Eq", "field": "last_signal.name", "value": "pr-feedback"
+      },
+      "consequent": "feedback"
+    },
+    {
+      "id": "halt_on_unknown",
+      "classification": "halt",
+      "antecedent": { "op": "True" },
+      "consequent": "halt"
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "name": "implementer-arc",
+  "version": 1,
+  "vars_schema": {
+    "issue_number":  { "kind": "int",    "required": true },
+    "issue_title":   { "kind": "string", "required": false },
+    "issue_body":    { "kind": "string", "required": false },
+    "repo":          { "kind": "string", "required": true },
+    "owner":         { "kind": "string", "required": true },
+    "branch":        { "kind": "string", "required": false },
+    "pr_number":     { "kind": "int",    "required": false },
+    "feedback_text": { "kind": "string", "required": false }
+  },
+  "actors": {
+    "implementer": {
+      "kind": "executor",
+      "brofile": "keystone-impl",
+      "durable": true,
+      "compaction_anchor": true,
+      "requires": []
+    }
+  },
+  "nodes": {
+    "FetchIssue": {
+      "actor": "implementer",
+      "on_enter": [
+        {
+          "op": "forgejo_issue_fetch",
+          "args": {
+            "owner": "${vars.owner}",
+            "repo":  "${vars.repo}",
+            "index": "${vars.issue_number}"
+          },
+          "into_var": "issue_data",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "issue_title", "value": "${vars.issue_data.title}" }
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "issue_body",  "value": "${vars.issue_data.body}" }
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "branch", "value": "fix/issue-${vars.issue_number}" }
+        }
+      ],
+      "prompt": "You are an implementer working in worktree ${meta.worktree} on branch ${vars.branch}.\n\nIssue #${vars.issue_number}: ${vars.issue_title}\n\n${vars.issue_body}\n\nUnderstand the bug, fix it, write or update tests so the existing tests in test_calculator.py pass. Stage changes and commit with a clear message. Do NOT push or open a PR yet — that's the next step.\n\nWhen done, return a one-line summary of what you changed (no markdown). Keep edits minimal and focused on the issue."
+    },
+    "OpenPr": {
+      "actor": "implementer",
+      "prompt": "Push the branch ${vars.branch} to origin and open a Forgejo PR titled \"Fix #${vars.issue_number}: ${vars.issue_title}\" against base main, body referencing the issue. Use the forgejo CLI (`tea`) if installed, otherwise use:\n  git push -u origin ${vars.branch}\n  curl -fsS -H \"Authorization: token $FORGEJO_TOKEN\" -H 'Content-Type: application/json' -X POST \"$FORGEJO_BASE_URL/api/v1/repos/${vars.owner}/${vars.repo}/pulls\" -d '{\"title\":\"Fix #${vars.issue_number}: ${vars.issue_title}\",\"head\":\"${vars.branch}\",\"base\":\"main\",\"body\":\"Closes #${vars.issue_number}\"}'\n\nThe response is a JSON PR object — return ONLY the integer PR number on the last line, nothing else.",
+      "on_exit": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "pr_number",
+            "value": "${OpenPr.output}"
+          },
+          "on_failure": "warn"
+        }
+      ]
+    },
+    "AddressFeedback": {
+      "actor": "implementer",
+      "prompt": "Reviewer feedback on PR #${vars.pr_number} (iteration ${vars.review_iteration}):\n\n${vars.feedback_text}\n\nAddress the feedback in the same worktree (${meta.worktree}). Edit files, run tests, commit, then push to origin/${vars.branch} so Forgejo emits a new pull_request synchronize event.\n\nReturn a one-line summary of changes."
+    }
+  },
+  "graph": "stateDiagram-v2\n    [*] --> FetchIssue\n    FetchIssue --> OpenPr\n    OpenPr --> [*]"
+}

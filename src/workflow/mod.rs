@@ -71,6 +71,11 @@ fn cross_validate(spec: &Workflow, graph: &MermaidGraph) -> Result<()> {
     // has a subworkflow, in which case the sub-spec carries its own
     // actors and the parent-level actor field is just a breadcrumb.
     for (node_id, node) in &spec.nodes {
+        if node.subworkflow.is_some() && node.subworkflow_ref.is_some() {
+            bail!(
+                "node '{node_id}' has BOTH subworkflow (inline) and subworkflow_ref — pick one"
+            );
+        }
         if node.subworkflow.is_some() {
             // Recursively compile the sub-workflow so errors surface
             // at parent-compile time, not at dispatch time.
@@ -81,8 +86,19 @@ fn cross_validate(spec: &Workflow, graph: &MermaidGraph) -> Result<()> {
             }
             continue;
         }
+        if node.subworkflow_ref.is_some() {
+            // Validation deferred to dispatch time — registry might
+            // not contain the referenced workflow yet at parent
+            // install time, and we don't want install ordering to be
+            // load-bearing.
+            continue;
+        }
+        if node.wait.is_some() {
+            // Wait nodes don't need actors. Engine handles them.
+            continue;
+        }
         if node.actor.is_empty() {
-            bail!("node '{node_id}' has no actor and no subworkflow — at least one is required");
+            bail!("node '{node_id}' has no actor, no wait, and no subworkflow — at least one is required");
         }
         if !spec.actors.contains_key(&node.actor) {
             bail!(

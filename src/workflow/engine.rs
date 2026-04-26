@@ -923,10 +923,11 @@ impl<'a> WorkflowRunner<'a> {
             return Ok(());
         }
 
-        // Sub-workflow composition: if the node embeds a workflow, run
-        // it recursively instead of dispatching an actor. The parent
-        // node's output becomes the concatenated sub-node outputs.
-        if spec.subworkflow.is_some() {
+        // Sub-workflow composition: if the node embeds a workflow OR
+        // references one by id, run it recursively instead of
+        // dispatching an actor. The parent node's output becomes the
+        // concatenated sub-node outputs.
+        if spec.subworkflow.is_some() || spec.subworkflow_ref.is_some() {
             self.run_subworkflow_node(node_id).await?;
             self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
             self.apply_node_gate(node_id, &spec).await;
@@ -999,6 +1000,17 @@ impl<'a> WorkflowRunner<'a> {
             }
             ActorKind::User => {
                 self.run_user_node(node_id, &prompt)?;
+            }
+            ActorKind::Noop => {
+                // No dispatch — record the (rendered) prompt as the
+                // node output so downstream templates can reference
+                // ${NodeName.output} consistently. Hooks already
+                // fired around this branch via on_enter/on_exit.
+                self.record_output(node_id, prompt.clone());
+                self.log_event(
+                    "noop_complete",
+                    json!({"node": node_id, "output_bytes": prompt.len()}),
+                );
             }
         }
 
@@ -1299,6 +1311,11 @@ impl<'a> WorkflowRunner<'a> {
             }
             ActorKind::User => {
                 bail!("fork: async target '{target_id}' is a user node — can't fire-and-forget");
+            }
+            ActorKind::Noop => {
+                bail!(
+                    "fork: async target '{target_id}' is a noop node — fire-and-forget is meaningless (nothing to dispatch)"
+                );
             }
         }
         Ok(())
@@ -1611,12 +1628,17 @@ impl<'a> WorkflowRunner<'a> {
             .spec
             .nodes
             .get(node_id)
-            .ok_or_else(|| anyhow!("no metadata for subworkflow node '{node_id}'"))?;
-        let sub_spec = spec
-            .subworkflow
-            .as_ref()
-            .ok_or_else(|| anyhow!("subworkflow missing from node '{node_id}'"))?;
-        let sub_spec = (**sub_spec).clone();
+            .ok_or_else(|| anyhow!("no metadata for subworkflow node '{node_id}'"))?
+            .clone();
+        let sub_spec = if let Some(inline) = &spec.subworkflow {
+            (**inline).clone()
+        } else if let Some(id) = &spec.subworkflow_ref {
+            self.server
+                .resolve_workflow_by_id(id)
+                .ok_or_else(|| anyhow!("subworkflow_ref '{id}' on node '{node_id}' not in registry — install via bro_workflow_install"))?
+        } else {
+            bail!("subworkflow missing from node '{node_id}' (neither inline nor ref set)");
+        };
 
         // Depth is threaded through `run_workflow_at_depth`. Check at
         // dispatch time so the error surfaces here (with node context)

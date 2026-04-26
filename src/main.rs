@@ -358,6 +358,13 @@ impl BlackboxServer {
         &self.state.wait_store
     }
 
+    /// Resolve a workflow by registry id (set via `bro_workflow_install`
+    /// or restored from disk on startup). Returns a clone so the caller
+    /// can mutate locally without affecting the registry.
+    pub fn resolve_workflow_by_id(&self, id: &str) -> Option<workflow::Workflow> {
+        self.state.workflow_registry.read().get(id).cloned()
+    }
+
     /// Soft-nag classifier for `bbox_learn`: apply the latest
     /// `content-classification/arc-bound` packet (if one is compiled) to the
     /// entry's content and return a suggestion string when it classifies
@@ -2860,8 +2867,8 @@ Constraints:\n\
         use std::collections::HashSet;
         let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
         match actor.kind {
-            workflow::schema::ActorKind::User => {
-                // User nodes have no provider — capability check trivially OK.
+            workflow::schema::ActorKind::User | workflow::schema::ActorKind::Noop => {
+                // User / noop nodes have no provider — capability check trivially OK.
             }
             workflow::schema::ActorKind::Executor | workflow::schema::ActorKind::Advisor => {
                 let brofile_name = actor.brofile.as_deref().ok_or_else(|| {
@@ -4410,8 +4417,10 @@ async fn webhook_handler(
 async fn webhook_replay_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> impl axum::response::IntoResponse {
+    let header_map = headers_to_lowercase_map(&headers);
     use axum::response::IntoResponse;
     let spec = match state.webhooks.get(&name) {
         Some(s) => s,
@@ -4433,7 +4442,8 @@ async fn webhook_replay_handler(
                 .into_response();
         }
     };
-    let entity = match spec.extractor.extract(&payload) {
+    let combined = combine_payload_and_headers(&payload, &header_map);
+    let entity = match spec.extractor.extract(&combined) {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -4482,6 +4492,28 @@ fn headers_to_lowercase_map(headers: &axum::http::HeaderMap) -> HashMap<String, 
         .collect()
 }
 
+/// Wrap a webhook body into a single Value that the Extractor can
+/// project from. Body fields stay at the top level (so canonical
+/// `$.action` / `$.pull_request.number` paths work) and headers are
+/// available under `$._headers.<name>` for header-driven routing
+/// (Forgejo's event type is in `X-Gitea-Event`, not the body).
+fn combine_payload_and_headers(payload: &Value, headers: &HashMap<String, String>) -> Value {
+    let mut map = match payload {
+        Value::Object(m) => m.clone(),
+        other => {
+            let mut m = serde_json::Map::new();
+            m.insert("_payload".into(), other.clone());
+            m
+        }
+    };
+    let header_obj: serde_json::Map<String, Value> = headers
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    map.insert("_headers".into(), Value::Object(header_obj));
+    Value::Object(map)
+}
+
 async fn process_webhook(
     state: &Arc<SharedState>,
     name: &str,
@@ -4511,10 +4543,15 @@ async fn process_webhook(
     let payload: Value = serde_json::from_slice(body)
         .map_err(|e| anyhow::anyhow!("payload not JSON: {e}"))?;
 
+    // Combined extractor input: payload fields at top level (so
+    // ordinary Forgejo paths like `$.action`, `$.pull_request.number`
+    // work) PLUS `_headers` for header-driven event-type routing.
+    let combined = combine_payload_and_headers(&payload, headers);
+
     // Project payload via extractor.
     let entity = spec
         .extractor
-        .extract(&payload)
+        .extract(&combined)
         .map_err(|e| anyhow::anyhow!("extractor: {e}"))?;
 
     // Apply routing packet.
@@ -4621,6 +4658,69 @@ async fn dispatch_verdict(
             }))
         }
     }
+}
+
+/// Dispatch an installed workflow by registry id, with optional initial
+/// vars. Mirrors the `start_arc` routing verdict in webhook handling
+/// but exposes it for direct CLI / scripted invocation.
+#[derive(Debug, Deserialize)]
+struct OrchestrateByIdRequest {
+    workflow_id: String,
+    #[serde(default)]
+    initial_vars: serde_json::Map<String, Value>,
+    #[serde(default)]
+    project_dir: Option<String>,
+    #[serde(default)]
+    max_steps: Option<usize>,
+}
+
+async fn orchestrate_by_id_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<OrchestrateByIdRequest>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let spec = match state
+        .workflow_registry
+        .read()
+        .get(&req.workflow_id)
+        .cloned()
+    {
+        Some(s) => s,
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                format!("workflow id '{}' not in registry", req.workflow_id),
+            )
+                .into_response();
+        }
+    };
+    let compiled = match workflow::compile(spec) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("compile failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let server = BlackboxServer::new(state.clone());
+    if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("capability validation failed: {e}"),
+        )
+            .into_response();
+    }
+    let result = workflow::run_workflow_with_initial_vars(
+        &server,
+        &compiled,
+        req.project_dir,
+        req.max_steps,
+        req.initial_vars,
+    )
+    .await;
+    axum::Json(result).into_response()
 }
 
 async fn signal_arc_dispatch(
@@ -5218,6 +5318,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/webhook/{name}", axum::routing::post(webhook_handler))
         .route("/webhook/{name}/replay", axum::routing::post(webhook_replay_handler))
+        .route(
+            "/orchestrate/by-id",
+            axum::routing::post(orchestrate_by_id_handler),
+        )
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 

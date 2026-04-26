@@ -2140,6 +2140,26 @@ impl Packets {
 
     /// Search both scopes for a packet by canonical ID or bare suffix.
     pub fn load(&self, id: &str) -> Result<Packet> {
+        // Domain-shaped reference: `domain:<domain-name>` resolves to
+        // the most-recently-compiled packet matching that domain.
+        // Lets workflow + webhook specs reference packets by stable
+        // human name without pinning to a specific compile hash —
+        // recompiling the routing rules doesn't break the consumers.
+        if let Some(domain) = id.strip_prefix("domain:") {
+            let mut matches: Vec<Packet> = self
+                .list_all()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| p.domain == domain)
+                .collect();
+            if matches.is_empty() {
+                anyhow::bail!(
+                    "no packet found for domain '{domain}' (try `bbox_packet_list(query=\"{domain}\")`)"
+                );
+            }
+            matches.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            return Ok(matches.into_iter().next().unwrap());
+        }
         let needle = normalize_id(id);
         for scope in &["global", "project"] {
             let path = packet_path(&self.state_dir, scope, &needle);
@@ -2151,7 +2171,9 @@ impl Packets {
                 return Ok(packet);
             }
         }
-        anyhow::bail!("Packet not found: {id} (expected `packet-<8hex>`, e.g. `packet-a1b2c3d4`)")
+        anyhow::bail!(
+            "Packet not found: {id} (expected `packet-<8hex>` or `domain:<name>`, e.g. `packet-a1b2c3d4` or `domain:webhook-routing/forgejo`)"
+        )
     }
 
     pub fn list_all(&self) -> Result<Vec<Packet>> {
@@ -6230,6 +6252,45 @@ mod tests {
             case_insensitive: false,
         };
         assert!(!eval_simple(&pred, &entity));
+    }
+
+    #[test]
+    fn load_resolves_domain_prefix_to_latest() {
+        let (_dir, store) = tmp_packets();
+        // Compile two packets in the same domain.
+        let p1 = CompileParams {
+            domain: "demo/routing".into(),
+            rules: json!([{
+                "id": "fail_default",
+                "antecedent": {"op": "True"},
+                "consequent": "REJECT"
+            }]),
+            classification_lattice: None,
+            prefix_inference: None,
+            rank_table: None,
+            threshold_table: None,
+            rank_lookup_key: None,
+            threshold_lookup_key: None,
+            source_ids: None,
+            scope: Some("global".into()),
+            project: None,
+        };
+        let msg1 = store.compile(&p1).unwrap();
+        // Slight delay so created_at differs reliably.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let msg2 = store.compile(&p1).unwrap();
+        let id1 = msg1.split_whitespace().nth(1).unwrap();
+        let id2 = msg2.split_whitespace().nth(1).unwrap();
+        assert_ne!(id1, id2, "two compiles of same domain → distinct ids");
+        // domain: prefix resolves to the latest.
+        let resolved = store.load("domain:demo/routing").unwrap();
+        assert_eq!(resolved.id, id2);
+        // Bare id still works.
+        let resolved_old = store.load(id1).unwrap();
+        assert_eq!(resolved_old.id, id1);
+        // Unknown domain errors clearly.
+        let err = store.load("domain:does-not-exist").unwrap_err().to_string();
+        assert!(err.contains("no packet found for domain"), "got: {err}");
     }
 
     #[test]

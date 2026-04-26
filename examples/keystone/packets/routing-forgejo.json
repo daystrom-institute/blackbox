@@ -1,0 +1,88 @@
+{
+  "domain": "webhook-routing/forgejo",
+  "scope": "global",
+  "classification_lattice": ["start_arc", "signal_arc", "ignore", "dead_letter"],
+  "rules": [
+    {
+      "id": "start_arc_on_issue_opened",
+      "classification": "start_arc",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "Eq", "field": "event", "value": "issues" },
+          { "op": "Eq", "field": "action", "value": "opened" }
+        ]
+      },
+      "consequent": "{\"route\":\"start_arc\",\"workflow\":\"issue-to-merged-pr\",\"initial_vars\":{}}"
+    },
+    {
+      "id": "signal_pr_ready_on_pr_opened",
+      "classification": "signal_arc",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "Eq", "field": "event", "value": "pull_request" },
+          { "op": "In", "field": "action", "values": ["opened", "reopened"] }
+        ]
+      },
+      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-ready\",\"correlate\":{}}"
+    },
+    {
+      "id": "signal_pr_ready_on_synchronize",
+      "classification": "signal_arc",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "Eq", "field": "event", "value": "pull_request" },
+          { "op": "Eq", "field": "action", "value": "synchronize" }
+        ]
+      },
+      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-ready\",\"correlate\":{}}"
+    },
+    {
+      "id": "signal_pr_merged",
+      "classification": "signal_arc",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "Eq", "field": "event", "value": "pull_request" },
+          { "op": "Eq", "field": "action", "value": "closed" },
+          { "op": "Eq", "field": "merged", "value": true }
+        ]
+      },
+      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-merged\",\"correlate\":{}}"
+    },
+    {
+      "id": "signal_pr_feedback",
+      "classification": "signal_arc",
+      "antecedent": {
+        "op": "Eq", "field": "event", "value": "pull_request_review"
+      },
+      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-feedback\",\"correlate\":{}}"
+    },
+    {
+      "id": "ignore_issue_other_actions",
+      "classification": "ignore",
+      "antecedent": {
+        "op": "Eq", "field": "event", "value": "issues"
+      },
+      "consequent": "ignore"
+    },
+    {
+      "id": "ignore_pr_other_actions",
+      "classification": "ignore",
+      "antecedent": {
+        "op": "Eq", "field": "event", "value": "pull_request"
+      },
+      "consequent": "ignore"
+    },
+    {
+      "id": "ignore_push_events",
+      "classification": "ignore",
+      "antecedent": {
+        "op": "Eq", "field": "event", "value": "push"
+      },
+      "consequent": "ignore"
+    }
+  ]
+}
