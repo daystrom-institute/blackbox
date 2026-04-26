@@ -40,8 +40,19 @@
         "fallback": false
       },
       "review_state": {
-        "kind": "json_path",
-        "path": "$.review.state"
+        "kind": "coalesce",
+        "sources": [
+          { "kind": "json_path", "path": "$.review.state" },
+          { "kind": "const", "value": "comment" }
+        ]
+      },
+      "review_body": {
+        "kind": "coalesce",
+        "sources": [
+          { "kind": "json_path", "path": "$.review.body" },
+          { "kind": "json_path", "path": "$.comment.body" },
+          { "kind": "const", "value": "" }
+        ]
       },
       "owner": {
         "kind": "json_path",

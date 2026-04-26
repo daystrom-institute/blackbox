@@ -504,9 +504,13 @@ the engine doesn't know the sender) into a flat entity:
 ```
 
 Selector kinds: `json_path`, `const`, `default { inner, fallback }`,
-`concat { parts: [...] }`. Deliberately small — no transformations
-(regex, case folding, math). Those belong in packet predicates or
-downstream nodes.
+`concat { parts: [...] }`, `coalesce { sources: [...] }` (first
+non-null wins; lets one extractor field cover divergent payload
+shapes — e.g. Forgejo's `pull_request_review` puts the comment text
+at `.review.body` while `pull_request_review_comment` uses
+`.comment.body`). Deliberately small — no transformations (regex,
+case folding, math). Those belong in packet predicates or downstream
+nodes.
 
 ### Routing verdicts
 

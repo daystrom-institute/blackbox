@@ -8,7 +8,7 @@
     "branch":        { "kind": "string", "required": true },
     "worktree_path": { "kind": "string", "required": true },
     "pr_number":     { "kind": "int",    "required": true },
-    "feedback_text": { "kind": "any",    "required": false }
+    "feedback_text": { "kind": "string", "required": false }
   },
   "actors": {
     "implementer": {

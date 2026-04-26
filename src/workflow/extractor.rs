@@ -9,10 +9,19 @@
 //! - `JsonPath(p)`              — dotted path with array indexing
 //! - `Const(v)`                 — literal value, no input dependency
 //! - `Default(inner, fallback)` — `inner` if present, else `fallback`
+//!                                (literal Value)
 //! - `Concat(strs)`             — string concatenation of resolved
 //!                                inner extractors (used for
 //!                                composite keys in correlation
 //!                                tuples)
+//! - `Coalesce(sources)`        — first non-null result from a list
+//!                                of selectors. Used when a payload
+//!                                shape differs across event subtypes
+//!                                (e.g. Forgejo's `pull_request_review`
+//!                                puts the comment text at `.review.body`,
+//!                                `pull_request_review_comment` at
+//!                                `.comment.body` — Coalesce projects
+//!                                both into one extracted field).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -32,6 +41,10 @@ pub enum Selector {
     },
     /// Concatenate multiple inner selectors as strings.
     Concat { parts: Vec<Selector> },
+    /// Return the first source that resolves to a non-null value.
+    /// `Value::Null` if every source is null. Composable with
+    /// `Default` for a final literal fallback.
+    Coalesce { sources: Vec<Selector> },
 }
 
 impl Selector {
@@ -58,6 +71,15 @@ impl Selector {
                     }
                 }
                 Ok(Value::String(out))
+            }
+            Selector::Coalesce { sources } => {
+                for src in sources {
+                    let v = src.evaluate(input)?;
+                    if !matches!(v, Value::Null) {
+                        return Ok(v);
+                    }
+                }
+                Ok(Value::Null)
             }
         }
     }
@@ -186,6 +208,40 @@ mod tests {
             s.evaluate(&json!({"issue": {"number": 42}})).unwrap(),
             json!("issue-42")
         );
+    }
+
+    #[test]
+    fn coalesce_picks_first_non_null() {
+        let s = Selector::Coalesce {
+            sources: vec![
+                Selector::JsonPath { path: "$.review.body".into() },
+                Selector::JsonPath { path: "$.comment.body".into() },
+                Selector::Const { value: json!("(no body)") },
+            ],
+        };
+        // first source resolves -> wins
+        assert_eq!(
+            s.evaluate(&json!({"review": {"body": "lgtm"}, "comment": {"body": "meh"}})).unwrap(),
+            json!("lgtm")
+        );
+        // first source null -> second wins
+        assert_eq!(
+            s.evaluate(&json!({"comment": {"body": "inline note"}})).unwrap(),
+            json!("inline note")
+        );
+        // both null -> falls through to Const
+        assert_eq!(s.evaluate(&json!({})).unwrap(), json!("(no body)"));
+    }
+
+    #[test]
+    fn coalesce_returns_null_when_no_sources_resolve() {
+        let s = Selector::Coalesce {
+            sources: vec![
+                Selector::JsonPath { path: "$.x".into() },
+                Selector::JsonPath { path: "$.y".into() },
+            ],
+        };
+        assert_eq!(s.evaluate(&json!({})).unwrap(), Value::Null);
     }
 
     #[test]

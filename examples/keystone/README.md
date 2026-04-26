@@ -37,6 +37,7 @@ underlying engine semantics see [`../../WORKFLOWS.md`](../../WORKFLOWS.md).
 | Generic `find_first` for client-side array filtering                            | `PushAndOpenPr` GETs ALL open PRs (Forgejo's `head=` filter is unreliable), then `find_first { from: ${vars.all_open_prs}, where: { "head.ref": "${vars.branch}" } }` writes the matching PR (or null) into `vars.existing_pr`. Composable primitive — no platform-specific search op needed. |
 | Idempotent re-dispatch                                                          | `PushAndOpenPr` reuses a matching open PR (via `set_var pr_data = ${vars.existing_pr}` gated by `domain:hook-when/has-existing-pr`) instead of paving the prior arc's PR. Re-running an arc on the same issue+branch is safe. |
 | Auto-merge on approval                                                          | `reviewer-arc.PostReview` fires `http_json` POST `/merge` gated by `domain:hook-when/should-merge` (verdict-as-data from aggregator) — the merge fires `pull_request closed merged:true` webhook → `pr-merged` signal → arc terminates clean without manual intervention. |
+| Reviewer feedback body propagated to AddressFeedback                            | Webhook extractor `Coalesce` projects `review_body` from `.review.body` OR `.comment.body` (Forgejo's review-comment subtypes diverge). Routing carries the extracted entity as `${last_signal.payload}`. AwaitFeedbackOrMerge.on_exit pulls `${last_signal.payload.review_body}` into `vars.feedback_text` — the implementer LLM in `implementer-feedback-arc` sees a clean string of the actual review comment, not the raw webhook body. |
 
 ## Prerequisites
 
@@ -176,7 +177,7 @@ The reviewer (`workflows/reviewer-arc.json`):
    - `http_json` POST `/pulls/${vars.pr_number}/reviews` with the comment body.
    - `http_json` POST `/pulls/${vars.pr_number}/merge` **gated by `domain:hook-when/should-merge`** (`vars.review_payload.action == "merge"`) — fires `pull_request closed merged:true` webhook → routes to `pr-merged` signal → AwaitFeedbackOrMerge resolves on merged → arc terminates clean.
 
-The feedback-loop subworkflow (`workflows/implementer-feedback-arc.json`) runs in the SAME worktree on the SAME branch — the implementer addresses feedback + commits, on_exit `shell` push fires `pull_request.synchronize` → resumes the parent on `pr-ready`.
+The feedback-loop subworkflow (`workflows/implementer-feedback-arc.json`) runs in the SAME worktree on the SAME branch — the implementer addresses feedback + commits, on_exit `shell` push fires `pull_request.synchronize` → resumes the parent on `pr-ready`. The `vars.feedback_text` it receives is the literal reviewer comment body (extracted via the webhook's `Coalesce` projection over Forgejo's divergent `pull_request_review` / `pull_request_review_comment` payloads), not the raw webhook entity — so the LLM gets a focused string to act on.
 
 ## Live observation
 
