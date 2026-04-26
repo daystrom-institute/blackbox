@@ -170,8 +170,26 @@ pub async fn run_workflow_streaming_with_vars(
             arc_thread_id: None,
         };
     }
+    // Required-vars enforcement at arc start. seed_vars validates kind
+    // for whatever was passed; this catches keys declared `required:
+    // true` that were absent from initial_vars OR seeded as null.
+    if let Some(schema) = compiled.spec.vars_schema.as_ref() {
+        let missing = runner.ctx.missing_required_vars(schema);
+        if !missing.is_empty() {
+            let msg = format!("initial_vars missing required keys: {missing:?}");
+            return WorkflowRunResult {
+                status: format!("error: {msg}"),
+                events: vec![json!({"kind": "error", "data": {"message": msg.clone()}})],
+                node_outputs: HashMap::new(),
+                vars: Map::new(),
+                arc_id: runner.ctx.meta.arc_id.clone(),
+                plan: None,
+                arc_thread_id: None,
+            };
+        }
+    }
     runner.open_arc_thread();
-    let status = match runner.run().await {
+    let mut status = match runner.run().await {
         Ok(()) => "completed".to_string(),
         Err(e) => {
             runner.log_event("error", json!({"message": e.to_string()}));
@@ -204,6 +222,17 @@ pub async fn run_workflow_streaming_with_vars(
     });
     runner.ctx.meta.arc_outcome = Some(final_outcome);
     runner.run_arc_exit_hooks().await;
+    // Surface terminal-hook halt failures in `status` + the
+    // running_arcs snapshot. Operators polling /orchestrate/peek or
+    // reading WorkflowRunResult.status would otherwise see stale
+    // "completed" while meta.arc_outcome silently records the
+    // cleanup failure.
+    if let Some(outcome) = runner.ctx.meta.arc_outcome.clone() {
+        if outcome.starts_with("failed") && !status.starts_with("error") {
+            status = format!("error: {outcome}");
+            runner.update_arc_snapshot(&status, "(error)", None);
+        }
+    }
     WorkflowRunResult {
         status,
         events: runner.events,
@@ -274,8 +303,25 @@ pub async fn run_workflow_at_depth(
             arc_thread_id: None,
         };
     }
+    // Required-vars enforcement at sub-arc start. Catches subworkflow
+    // imports that omitted a required key OR fed it as null.
+    if let Some(schema) = compiled.spec.vars_schema.as_ref() {
+        let missing = runner.ctx.missing_required_vars(schema);
+        if !missing.is_empty() {
+            let msg = format!("subworkflow imports missing required keys: {missing:?}");
+            return WorkflowRunResult {
+                status: format!("error: {msg}"),
+                events: vec![json!({"kind": "error", "data": {"message": msg.clone()}})],
+                node_outputs: HashMap::new(),
+                vars: Map::new(),
+                arc_id: runner.ctx.meta.arc_id.clone(),
+                plan: None,
+                arc_thread_id: None,
+            };
+        }
+    }
     runner.open_arc_thread();
-    let status = match runner.run().await {
+    let mut status = match runner.run().await {
         Ok(()) => "completed".to_string(),
         Err(e) => {
             runner.log_event("error", json!({"message": e.to_string()}));
@@ -308,6 +354,17 @@ pub async fn run_workflow_at_depth(
     });
     runner.ctx.meta.arc_outcome = Some(final_outcome);
     runner.run_arc_exit_hooks().await;
+    // Surface terminal-hook halt failures in `status` + the
+    // running_arcs snapshot. Operators polling /orchestrate/peek or
+    // reading WorkflowRunResult.status would otherwise see stale
+    // "completed" while meta.arc_outcome silently records the
+    // cleanup failure.
+    if let Some(outcome) = runner.ctx.meta.arc_outcome.clone() {
+        if outcome.starts_with("failed") && !status.starts_with("error") {
+            status = format!("error: {outcome}");
+            runner.update_arc_snapshot(&status, "(error)", None);
+        }
+    }
     WorkflowRunResult {
         status,
         events: runner.events,
@@ -435,12 +492,45 @@ impl<'a> WorkflowRunner<'a> {
     /// failure handled per `on_failure`.
     async fn run_hooks(&mut self, hooks: &[HookOp], lifecycle: &str) -> Result<()> {
         for (idx, hook) in hooks.iter().enumerate() {
-            // Gate evaluation
+            // Gate evaluation. Three outcomes:
+            //   - Ok(Some(v)) → fire iff verdict reads as "allow"
+            //   - Ok(None)    → no rule matched; treat as "deny" (skip op)
+            //   - Err(e)      → packet evaluation itself failed; routed
+            //                   through the op's `on_failure` policy so a
+            //                   misspelled packet ref can't masquerade as
+            //                   a clean skip.
             if let Some(packet_id) = &hook.when {
                 let entity = self.ctx.flatten();
-                let allow = match self.server.apply_workflow_policy(packet_id, &entity) {
-                    Ok(Some(verdict)) => is_allow_verdict(&verdict),
-                    Ok(None) => false,
+                let op_kind = format!("{:?}", hook.op);
+                match self.server.apply_workflow_policy(packet_id, &entity) {
+                    Ok(Some(verdict)) => {
+                        if !is_allow_verdict(&verdict) {
+                            self.log_event(
+                                "hook_gated_out",
+                                json!({
+                                    "lifecycle": lifecycle,
+                                    "index": idx,
+                                    "op": op_kind,
+                                    "packet_id": packet_id,
+                                    "verdict": verdict,
+                                }),
+                            );
+                            continue;
+                        }
+                    }
+                    Ok(None) => {
+                        self.log_event(
+                            "hook_gated_out",
+                            json!({
+                                "lifecycle": lifecycle,
+                                "index": idx,
+                                "op": op_kind,
+                                "packet_id": packet_id,
+                                "reason": "no_match",
+                            }),
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         self.log_event(
                             "hook_gate_error",
@@ -448,23 +538,27 @@ impl<'a> WorkflowRunner<'a> {
                                 "lifecycle": lifecycle,
                                 "index": idx,
                                 "packet_id": packet_id,
-                                "error": e,
+                                "error": e.to_string(),
                             }),
                         );
-                        false
+                        match hook.on_failure {
+                            OnFailure::Halt => {
+                                bail!(
+                                    "hook {lifecycle}#{idx} {op_kind} gate '{packet_id}': {e}"
+                                );
+                            }
+                            OnFailure::Warn => {
+                                self.arc_note(
+                                    "surprise",
+                                    &format!(
+                                        "hook {lifecycle}#{idx} {op_kind} gate '{packet_id}' errored: {e}"
+                                    ),
+                                );
+                                continue;
+                            }
+                            OnFailure::Ignore => continue,
+                        }
                     }
-                };
-                if !allow {
-                    self.log_event(
-                        "hook_gated_out",
-                        json!({
-                            "lifecycle": lifecycle,
-                            "index": idx,
-                            "op": format!("{:?}", hook.op),
-                            "packet_id": packet_id,
-                        }),
-                    );
-                    continue;
                 }
             }
             let op_kind = format!("{:?}", hook.op);
@@ -534,9 +628,11 @@ impl<'a> WorkflowRunner<'a> {
 
     /// Workflow-level `on_arc_cancel` + `on_arc_exit` invocation. Run
     /// at terminal state. on_arc_cancel runs ONLY when the outcome is
-    /// `cancelled`; on_arc_exit runs in every terminal state. Errors
-    /// from terminal hooks are logged but never propagate (the arc is
-    /// already done).
+    /// `cancelled`; on_arc_exit runs in every terminal state. Each
+    /// hook's `on_failure` policy still applies — `halt` rewrites the
+    /// arc outcome to `failed` and the error surfaces in arc_outcome
+    /// + the engine's events log so cleanup failures aren't silent.
+    /// `warn` and `ignore` keep the original outcome intact.
     async fn run_arc_exit_hooks(&mut self) {
         let outcome = self.ctx.meta.arc_outcome.clone().unwrap_or_default();
         if outcome == "cancelled" && !self.compiled.spec.on_arc_cancel.is_empty() {
@@ -544,8 +640,10 @@ impl<'a> WorkflowRunner<'a> {
             if let Err(e) = self.run_hooks(&cancel_hooks, "arc_cancel").await {
                 self.log_event(
                     "arc_cancel_hook_error",
-                    json!({"error": e.to_string()}),
+                    json!({"error": e.to_string(), "rewrites_outcome": true}),
                 );
+                self.ctx.meta.arc_outcome =
+                    Some(format!("failed: arc_cancel hook halted: {e}"));
             }
         }
         if !self.compiled.spec.on_arc_exit.is_empty() {
@@ -553,8 +651,21 @@ impl<'a> WorkflowRunner<'a> {
             if let Err(e) = self.run_hooks(&exit_hooks, "arc_exit").await {
                 self.log_event(
                     "arc_exit_hook_error",
-                    json!({"error": e.to_string()}),
+                    json!({"error": e.to_string(), "rewrites_outcome": true}),
                 );
+                // Don't downgrade an already-failed outcome — the
+                // original failure is more informative than the
+                // cleanup failure.
+                if !self
+                    .ctx
+                    .meta
+                    .arc_outcome
+                    .as_deref()
+                    .is_some_and(|o| o.starts_with("failed"))
+                {
+                    self.ctx.meta.arc_outcome =
+                        Some(format!("failed: arc_exit hook halted: {e}"));
+                }
             }
         }
     }
@@ -1172,8 +1283,7 @@ impl<'a> WorkflowRunner<'a> {
             self.actor_sessions
                 .insert(actor_name.to_string(), session_id.clone());
         }
-        self.node_outputs
-            .insert(node_id.to_string(), output.clone());
+        self.record_output(node_id, output.clone());
 
         let output_preview: String = output.chars().take(160).collect();
         self.log_event(
@@ -1393,7 +1503,7 @@ impl<'a> WorkflowRunner<'a> {
                 if durable {
                     self.actor_sessions.insert(actor_name, session_id.clone());
                 }
-                self.node_outputs.insert(source.to_string(), output);
+                self.record_output(source, output);
             }
             InFlight::Ensemble {
                 actor_name,
@@ -1438,7 +1548,7 @@ impl<'a> WorkflowRunner<'a> {
                 if durable {
                     self.ensemble_sessions.insert(actor_name, sessions);
                 }
-                self.node_outputs.insert(source.to_string(), merged);
+                self.record_output(source, merged);
             }
         }
         Ok(true)
@@ -1591,8 +1701,10 @@ impl<'a> WorkflowRunner<'a> {
             .map(|(m, o)| format!("── {m} ──\n{o}"))
             .collect::<Vec<_>>()
             .join("\n\n");
-        self.node_outputs
-            .insert(node_id.to_string(), merged.clone());
+        // Mirror into ctx.outputs so downstream `${NodeName.output}`
+        // templates resolve consistently (see `record_output` —
+        // executor + ensemble + in-flight-join all use the same path).
+        self.record_output(node_id, merged.clone());
         if actor.durable {
             self.ensemble_sessions.insert(ensemble_key, member_sessions);
         }
@@ -1671,6 +1783,14 @@ impl<'a> WorkflowRunner<'a> {
 
         let compiled = super::compile(sub_spec)
             .map_err(|e| anyhow!("subworkflow on node '{node_id}' failed to compile: {e}"))?;
+        // Capability validation on the resolved sub-spec. Without this
+        // a brofile/team can change after install and a referenced
+        // subworkflow silently dispatches against a now-incapable
+        // provider. Ref-resolution is dispatch-time, so this check
+        // must happen here, not at parent compile.
+        self.server
+            .validate_workflow_capabilities(&compiled)
+            .map_err(|e| anyhow!("subworkflow on node '{node_id}' capability validation: {e}"))?;
         let project_dir = self.project_dir.clone();
         // Seed the sub-runner with the parent's node_outputs so sub
         // prompts can reference `${ParentNode.output}` the same way

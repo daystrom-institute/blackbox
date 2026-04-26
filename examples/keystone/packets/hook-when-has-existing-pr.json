@@ -1,0 +1,22 @@
+{
+  "domain": "hook-when/has-existing-pr",
+  "scope": "global",
+  "classification_lattice": ["allow", "deny"],
+  "rules": [
+    {
+      "id": "has_existing",
+      "classification": "allow",
+      "antecedent": {
+        "op": "IsNonNull",
+        "field": "vars.existing_pr"
+      },
+      "consequent": "allow"
+    },
+    {
+      "id": "fallback_deny",
+      "classification": "deny",
+      "antecedent": { "op": "True" },
+      "consequent": "deny"
+    }
+  ]
+}

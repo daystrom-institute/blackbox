@@ -8,8 +8,9 @@
     "issue_title":      { "kind": "string" },
     "issue_body":       { "kind": "string" },
     "branch":           { "kind": "string" },
+    "worktree_path":    { "kind": "string" },
     "pr_number":        { "kind": "int" },
-    "feedback_text":    { "kind": "string" },
+    "feedback_text":    { "kind": "any" },
     "review_iteration": { "kind": "int" },
     "max_iterations":   { "kind": "int" }
   },
@@ -40,13 +41,17 @@
             "base":   "main"
           },
           "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "worktree_path", "value": "${meta.worktree}" }
         }
       ],
       "prompt": "Setup complete (no LLM dispatch — user-actor placeholder for hook execution)."
     },
     "Implement": {
       "subworkflow_ref": "implementer-arc",
-      "imports": ["owner", "repo", "issue_number"],
+      "imports": ["owner", "repo", "issue_number", "worktree_path"],
       "exports": ["pr_number", "branch"]
     },
     "AwaitReviewTrigger": {
@@ -86,7 +91,7 @@
     },
     "AddressFeedback": {
       "subworkflow_ref": "implementer-feedback-arc",
-      "imports": ["owner", "repo", "issue_number", "branch", "pr_number", "feedback_text"],
+      "imports": ["owner", "repo", "issue_number", "branch", "pr_number", "feedback_text", "worktree_path"],
       "exports": []
     },
     "Done": {
@@ -94,5 +99,5 @@
       "prompt": "Arc terminated."
     }
   },
-  "graph": "stateDiagram-v2\n    [*] --> Setup\n    Setup --> Implement\n    Implement --> AwaitReviewTrigger\n    AwaitReviewTrigger --> Review : ready\n    AwaitReviewTrigger --> Done : merged\n    Review --> AwaitFeedbackOrMerge\n    AwaitFeedbackOrMerge --> AddressFeedback : feedback\n    AwaitFeedbackOrMerge --> Done : merged\n    AddressFeedback --> AwaitReviewTrigger\n    Done --> [*]"
+  "graph": "stateDiagram-v2\n    state ReviewOrDone <<choice>>\n    state FeedbackOrDone <<choice>>\n    [*] --> Setup\n    Setup --> Implement\n    Implement --> AwaitReviewTrigger\n    AwaitReviewTrigger --> ReviewOrDone\n    ReviewOrDone --> Review : ready\n    ReviewOrDone --> Done : merged\n    Review --> AwaitFeedbackOrMerge\n    AwaitFeedbackOrMerge --> FeedbackOrDone\n    FeedbackOrDone --> AddressFeedback : feedback\n    FeedbackOrDone --> Done : merged\n    AddressFeedback --> AwaitReviewTrigger\n    Done --> [*]"
 }

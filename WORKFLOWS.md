@@ -112,10 +112,12 @@ Optional `vars_schema` declares per-key kind and required-ness:
 
 Kinds: `bool` / `int` / `float` / `string` / `array` / `object` /
 `any`. Hook writes (`SetVar`, `IncVar`, `MergeVar`, `ParseJson`,
-Forgejo ops with `into_var`) are kind-validated against the schema —
-mismatches fail at write time, not later. Unknown keys are accepted
-(open schema by design — explicit `required` fields are how you lock
-down the surface).
+`HttpJson` with `into_var`) are kind-validated against the schema —
+mismatches fail at write time, not later. `required: true` keys are
+enforced at arc start (initial vars), at sub-arc start (imports), and
+at terminal state (exports). Unknown keys are accepted (open schema
+by design — explicit `required` fields are how you lock down the
+surface).
 
 ### Packet entity flatten
 
@@ -259,12 +261,10 @@ the operator-blessed allow set: `allow`, `pass`, `proceed`, `fire`,
 | `parse_json`          | Parse a string-shaped value into JSON; strips ```` ```json ```` fences. |
 | `shell`               | Sandboxed shell command (gated via packet policy in v-next; today reads `cwd` from `meta.worktree`). |
 | `worktree_create`     | `git worktree add` with smart branch reuse (see below). |
-| `worktree_remove`     | `git worktree remove`; falls back to `rm -rf` for orphans. Idempotent on missing path. |
+| `worktree_remove`     | `git worktree remove`; idempotent on missing path. No `rm -rf` fallback — surfaces git's error if the path is not a git-tracked worktree. |
 | `set_meta`            | Update `meta.worktree` directly (only mutable meta field today). |
-| `forgejo_issue_fetch` | GET issue → into_var.                                  |
-| `forgejo_issue_list`  | GET issues filtered by state/sort/limit → into_var.    |
-| `forgejo_pr_create`   | POST PR → into_var.                                    |
-| `forgejo_pr_comment`  | POST comment → into_var.                               |
+| `http_json`           | Generic HTTP request → response into_var. Workflow author composes URL/headers/body using `${env.X}` + `${vars.X}` templates to express any code-host integration without baking platform-specific ops into the engine. `response_kind`: `json` (default — parse, error on non-JSON), `text` (capture body as-is, e.g. for `.diff` URLs), or `auto` (try JSON, fall back to text). `expect_status`: optional override of the default 2xx success window. |
+| `find_first`          | Find the first element of an array variable whose nested fields all equal the targets in `where`, write into_var. Writes `Value::Null` (not Err) when no match — downstream `IsNull` / `IsNonNull` packets branch cleanly. Composable primitive for "find existing PR for this branch" / "find label by name" without baking platform-specific search ops or relying on upstream API filters that may be broken. `where` keys use dotted paths (e.g. `head.ref`). |
 
 ### `worktree_create` semantics
 
@@ -472,7 +472,9 @@ routing packet). The pipeline:
 
 ```text
 HTTP POST /webhook/<name>
-  → verify_signature(secret)         [HMAC-SHA256: Forgejo / GitHub / None]
+  → verify_signature(secret)         [HmacSha256 (configurable header
+                                       + optional `prefix=`) | None
+                                       (loopback-bind only)]
   → idempotency dedup                [delivery-id ring per webhook]
   → extractor.project(payload)       [JSON → flat entity]
   → routing_packet.apply(entity)     [verdict]
@@ -482,8 +484,8 @@ HTTP POST /webhook/<name>
 ### Extractor
 
 Tiny AST that projects a webhook payload (plus `_headers` map for
-header-driven routing like Forgejo's `X-Gitea-Event`) into a flat
-entity:
+header-driven routing — operator names the header in their extractor;
+the engine doesn't know the sender) into a flat entity:
 
 ```jsonc
 "extractor": {
@@ -628,20 +630,29 @@ spawn arc
 
 ## Currently implemented
 
-- ArcContext (vars / typed outputs / meta / last_signal / history) with full templating
+- ArcContext (vars / typed outputs / meta / last_signal / history) with full templating including `${env.X}` for credentials
 - Hook lifecycle: on_enter, on_exit, on_arc_exit, on_arc_cancel
 - Op catalog: SetVar, IncVar, AppendVar, MergeVar, ParseJson, Shell,
   WorktreeCreate (with smart branch reuse), WorktreeRemove, SetMeta,
-  ForgejoIssueFetch / IssueList / PrCreate / PrComment
+  HttpJson (generic HTTP; `response_kind: json|text|auto`),
+  FindFirst (array search by dotted-path equality — composable
+  primitive for idempotent lookups). Engine carries no platform
+  knowledge; workflow author composes generic ops + `${env.X}` +
+  `${vars.X}` to express any code-host integration.
 - Hook gating via `when: domain:...` + `on_failure: halt|warn|ignore`
+  (gate-packet errors route through `on_failure` too — no silent skips)
+- Terminal hook `halt` failures rewrite `meta.arc_outcome` to `failed:
+  ...` so cleanup failures are visible in the arc summary
 - Wait nodes with `any_of` race + correlation tuples + timeout
   (synthetic `__timeout__` signal)
-- Subworkflows: inline + by-id registry refs + imports/exports/renames
+- Subworkflows: inline + by-id registry refs + imports/exports/renames;
+  capability validation runs at dispatch, not just install
 - Capability tags: provider catalog + actor `requires` + workflow-compile validation
 - Domain-shaped packet refs (`domain:...`)
 - Noop actor for hook-only nodes
-- Webhook ingress: HMAC-SHA256 (Forgejo / GitHub) + None for closed
-  networks, idempotency dedup, replay endpoint, default-deny on no-match
+- Webhook ingress: HmacSha256 (configurable header + optional `prefix=`
+  for `sha256=` style senders), None for loopback-only testing,
+  idempotency dedup, replay endpoint, default-deny on no-match
 - Operator-blessed registries (workflows / webhooks) + admin HTTP
 - Actor kinds: executor, ensemble, advisor, user, noop
 - Graph shapes: sequential, `<<choice>>`, `<<fork>>`, back-edges,

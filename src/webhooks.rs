@@ -8,10 +8,11 @@
 //! installed in the global packet store; workflow specs name the
 //! webhook by id, never define routing inline.
 //!
-//! Forgejo-first signature scheme: HMAC-SHA256 over the raw body with
-//! a secret loaded from `secret_env`. `none` mode (lenient closed-
-//! network testing) accepts any payload but refuses to bind unless
-//! the daemon listener is on loopback.
+//! Signature scheme is generic HMAC-SHA256 with operator-configurable
+//! header name and optional prefix (e.g. `sha256=` for GitHub-shaped
+//! senders). `none` mode (lenient closed-network testing) refuses to
+//! install AND refuses to verify when the daemon listener is bound
+//! to a non-loopback address.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,8 +31,9 @@ pub struct WebhookSpec {
     pub signature: SignatureScheme,
     pub extractor: Extractor,
     pub routing_packet: String,
-    /// Optional cap on the same delivery_id arriving twice. Forgejo
-    /// includes `X-Gitea-Delivery: <uuid>` on every dispatch.
+    /// Optional header carrying a unique delivery id for idempotency
+    /// dedup (e.g. `X-Gitea-Delivery`, `X-GitHub-Delivery`). Operator
+    /// names the header; the engine doesn't know the sender.
     #[serde(default)]
     pub delivery_id_header: Option<String>,
     /// Default project_dir used when a `start_arc` verdict spawns a
@@ -45,31 +47,19 @@ pub struct WebhookSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignatureScheme {
-    /// Forgejo / Gitea: hex HMAC-SHA256 in `X-Gitea-Signature`.
-    Forgejo {
+    /// HMAC-SHA256 over the raw body, hex-encoded. Operator names the
+    /// header (e.g. `X-Gitea-Signature`, `X-Hub-Signature-256`) and
+    /// optional `prefix` stripped before hex-decode (e.g. `sha256=`).
+    HmacSha256 {
         secret_env: String,
-        /// Header name carrying the hex signature. Defaults to
-        /// `X-Gitea-Signature`.
-        #[serde(default = "default_forgejo_header")]
         header: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
     },
-    /// GitHub: `sha256=<hex>` in `X-Hub-Signature-256`.
-    Github {
-        secret_env: String,
-        #[serde(default = "default_github_header")]
-        header: String,
-    },
-    /// No signature verification. ONLY accepted when the daemon
-    /// listener is on loopback / closed networks.
+    /// No signature verification. ONLY accepted under loopback bind.
+    /// Both `install_check` and `verify_signature` reject this scheme
+    /// when the daemon's listener is on a non-loopback address.
     None,
-}
-
-fn default_forgejo_header() -> String {
-    "X-Gitea-Signature".into()
-}
-
-fn default_github_header() -> String {
-    "X-Hub-Signature-256".into()
 }
 
 /// In-memory webhook registry. Persists nowhere — reloads on daemon
@@ -151,49 +141,105 @@ pub fn load_all(dir: &std::path::Path) -> Vec<WebhookSpec> {
 }
 
 /// Verify signature scheme against headers + raw body. Returns Ok(())
-/// on pass, Err on missing header / invalid HMAC.
+/// on pass, Err on missing header / invalid HMAC / disallowed scheme.
+///
+/// `bind_is_loopback` reports whether the daemon's listener is bound
+/// to a loopback address. When false, `SignatureScheme::None` is
+/// rejected here (defense-in-depth alongside the install-time check).
 pub fn verify_signature(
     scheme: &SignatureScheme,
     headers: &HashMap<String, String>,
     body: &[u8],
+    bind_is_loopback: bool,
 ) -> Result<()> {
     match scheme {
-        SignatureScheme::None => Ok(()),
-        SignatureScheme::Forgejo { secret_env, header } => {
-            let sig = headers
-                .get(&header.to_lowercase())
-                .or_else(|| headers.get(header))
-                .ok_or_else(|| anyhow!("missing {header} header"))?;
-            let secret = std::env::var(secret_env)
-                .map_err(|_| anyhow!("env {secret_env} not set"))?;
-            if !crate::orchestration::forgejo::verify_signature(
-                secret.as_bytes(),
-                body,
-                sig,
-            ) {
-                anyhow::bail!("HMAC verification failed");
+        SignatureScheme::None => {
+            if !bind_is_loopback {
+                anyhow::bail!(
+                    "signature scheme 'none' requires daemon bound to loopback"
+                );
             }
             Ok(())
         }
-        SignatureScheme::Github { secret_env, header } => {
+        SignatureScheme::HmacSha256 {
+            secret_env,
+            header,
+            prefix,
+        } => {
             let sig = headers
                 .get(&header.to_lowercase())
                 .or_else(|| headers.get(header))
                 .ok_or_else(|| anyhow!("missing {header} header"))?;
             let secret = std::env::var(secret_env)
                 .map_err(|_| anyhow!("env {secret_env} not set"))?;
-            // GitHub uses the same HMAC-SHA256 with sha256= prefix —
-            // same verifier function.
-            if !crate::orchestration::forgejo::verify_signature(
+            if !verify_hmac_sha256_hex(
                 secret.as_bytes(),
                 body,
                 sig,
+                prefix.as_deref(),
             ) {
                 anyhow::bail!("HMAC verification failed");
             }
             Ok(())
         }
     }
+}
+
+/// Install-time check on a webhook spec: rejects schemes that are
+/// only safe under specific bind conditions when those conditions
+/// don't hold. Today: `None` requires loopback bind.
+pub fn install_check(scheme: &SignatureScheme, bind_is_loopback: bool) -> Result<()> {
+    match scheme {
+        SignatureScheme::None if !bind_is_loopback => {
+            anyhow::bail!(
+                "signature scheme 'none' requires daemon bound to loopback; \
+                 daemon is bound to a non-loopback address"
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+/// HMAC-SHA256 verifier with optional prefix stripping (e.g.
+/// `sha256=<hex>` style). Constant-time hex comparison.
+fn verify_hmac_sha256_hex(
+    secret: &[u8],
+    body: &[u8],
+    header: &str,
+    prefix: Option<&str>,
+) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256Type = Hmac<Sha256>;
+    let mut mac = match HmacSha256Type::new_from_slice(secret) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    let expected = mac.finalize().into_bytes();
+    let hex_part = match prefix {
+        Some(p) => header.strip_prefix(p).unwrap_or(header),
+        None => header,
+    };
+    let provided = match hex::decode(hex_part.trim()) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if provided.len() != expected.len() {
+        return false;
+    }
+    constant_time_eq(&provided, &expected)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Dispatch verdict produced by a routing packet. Routing packets'
@@ -213,6 +259,15 @@ pub enum RoutingVerdict {
         signal: String,
         #[serde(default)]
         correlate: serde_json::Map<String, Value>,
+        /// Optional payload delivered to the resumed wait as
+        /// `${last_signal.payload}`. When omitted, the dispatcher
+        /// substitutes the full webhook entity (extractor output) so
+        /// downstream hooks like `set_var feedback_text =
+        /// ${last_signal.payload.review.body}` can pull from the
+        /// real event body without the routing rule having to hand-
+        /// pick what to forward.
+        #[serde(default)]
+        payload: Option<Value>,
     },
     /// Match-and-cancel running arcs by correlation.
     CancelArc {
@@ -299,9 +354,33 @@ mod tests {
     fn routing_verdict_signal_arc() {
         let v = json!({"route": "signal_arc", "signal": "pr-merged", "correlate": {"pr": 42}});
         match RoutingVerdict::parse(&v).unwrap() {
-            RoutingVerdict::SignalArc { signal, correlate } => {
+            RoutingVerdict::SignalArc {
+                signal,
+                correlate,
+                payload,
+            } => {
                 assert_eq!(signal, "pr-merged");
                 assert_eq!(correlate.get("pr"), Some(&json!(42)));
+                assert!(payload.is_none(), "payload defaults to None when omitted");
+            }
+            _ => panic!("expected SignalArc"),
+        }
+    }
+
+    #[test]
+    fn routing_verdict_signal_arc_with_payload() {
+        let v = json!({
+            "route": "signal_arc",
+            "signal": "pr-feedback",
+            "correlate": {"pr": 42},
+            "payload": {"review": {"body": "looks good"}}
+        });
+        match RoutingVerdict::parse(&v).unwrap() {
+            RoutingVerdict::SignalArc { payload, .. } => {
+                assert_eq!(
+                    payload,
+                    Some(json!({"review": {"body": "looks good"}}))
+                );
             }
             _ => panic!("expected SignalArc"),
         }
@@ -322,34 +401,65 @@ mod tests {
     }
 
     #[test]
-    fn signature_none_passes() {
+    fn signature_none_passes_under_loopback() {
         let scheme = SignatureScheme::None;
         let headers = HashMap::new();
-        verify_signature(&scheme, &headers, b"any").unwrap();
+        verify_signature(&scheme, &headers, b"any", true).unwrap();
     }
 
     #[test]
-    fn forgejo_signature_verifies() {
+    fn signature_none_rejected_under_non_loopback() {
+        let scheme = SignatureScheme::None;
+        let headers = HashMap::new();
+        let err = verify_signature(&scheme, &headers, b"any", false).unwrap_err();
+        assert!(format!("{err}").contains("loopback"));
+        let err2 = install_check(&scheme, false).unwrap_err();
+        assert!(format!("{err2}").contains("loopback"));
+        // Loopback install passes.
+        install_check(&scheme, true).unwrap();
+    }
+
+    #[test]
+    fn hmac_sha256_signature_verifies_no_prefix() {
         std::env::set_var("WEBHOOK_TEST_SECRET", "hunter2");
-        let scheme = SignatureScheme::Forgejo {
+        let scheme = SignatureScheme::HmacSha256 {
             secret_env: "WEBHOOK_TEST_SECRET".into(),
-            header: default_forgejo_header(),
+            header: "X-Gitea-Signature".into(),
+            prefix: None,
         };
         let body = br#"{"x":1}"#;
-        // Compute the right signature.
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(b"hunter2").unwrap();
+        type HmacSha256Type = Hmac<Sha256>;
+        let mut mac = HmacSha256Type::new_from_slice(b"hunter2").unwrap();
         mac.update(body);
         let sig = hex::encode(mac.finalize().into_bytes());
         let mut headers = HashMap::new();
         headers.insert("x-gitea-signature".to_string(), sig);
-        verify_signature(&scheme, &headers, body).unwrap();
-        // Wrong sig fails.
+        verify_signature(&scheme, &headers, body, true).unwrap();
         let mut bad = HashMap::new();
         bad.insert("x-gitea-signature".to_string(), "deadbeef".into());
-        assert!(verify_signature(&scheme, &bad, body).is_err());
+        assert!(verify_signature(&scheme, &bad, body, true).is_err());
+    }
+
+    #[test]
+    fn hmac_sha256_signature_verifies_with_prefix() {
+        std::env::set_var("WEBHOOK_TEST_SECRET2", "hunter3");
+        let scheme = SignatureScheme::HmacSha256 {
+            secret_env: "WEBHOOK_TEST_SECRET2".into(),
+            header: "X-Hub-Signature-256".into(),
+            prefix: Some("sha256=".into()),
+        };
+        let body = br#"{"y":2}"#;
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256Type = Hmac<Sha256>;
+        let mut mac = HmacSha256Type::new_from_slice(b"hunter3").unwrap();
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HashMap::new();
+        headers.insert("x-hub-signature-256".to_string(), sig);
+        verify_signature(&scheme, &headers, body, true).unwrap();
     }
 }
 

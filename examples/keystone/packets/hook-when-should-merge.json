@@ -1,0 +1,23 @@
+{
+  "domain": "hook-when/should-merge",
+  "scope": "global",
+  "classification_lattice": ["allow", "deny"],
+  "rules": [
+    {
+      "id": "merge_on_approve",
+      "classification": "allow",
+      "antecedent": {
+        "op": "Eq",
+        "field": "vars.review_payload.action",
+        "value": "merge"
+      },
+      "consequent": "allow"
+    },
+    {
+      "id": "fallback_deny",
+      "classification": "deny",
+      "antecedent": { "op": "True" },
+      "consequent": "deny"
+    }
+  ]
+}

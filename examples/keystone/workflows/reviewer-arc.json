@@ -2,33 +2,105 @@
   "name": "reviewer-arc",
   "version": 1,
   "vars_schema": {
-    "owner":     { "kind": "string", "required": true },
-    "repo":      { "kind": "string", "required": true },
-    "pr_number": { "kind": "int",    "required": true },
+    "owner":         { "kind": "string", "required": true },
+    "repo":          { "kind": "string", "required": true },
+    "pr_number":     { "kind": "int",    "required": true },
+    "pr_diff":       { "kind": "any",    "required": false },
+    "review_payload":{ "kind": "object", "required": false },
     "feedback_posted": { "kind": "bool", "required": false }
   },
   "actors": {
     "reviewers": {
       "kind": "ensemble",
       "team": "keystone-reviewers",
-      "durable": false
-    }
+      "durable": false,
+      "requires": []
+    },
+    "aggregator": {
+      "kind": "executor",
+      "brofile": "keystone-review",
+      "durable": false,
+      "requires": []
+    },
+    "noop": { "kind": "noop", "requires": [] }
   },
   "nodes": {
+    "FetchDiff": {
+      "actor": "noop",
+      "prompt": "Mechanical PR diff fetch.",
+      "on_enter": [
+        {
+          "op": "http_json",
+          "args": {
+            "method": "GET",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/pulls/${vars.pr_number}.diff",
+            "headers": {
+              "Authorization": "token ${env.FORGEJO_TOKEN}",
+              "Accept": "text/plain"
+            },
+            "response_kind": "text",
+            "allow_empty_body": true
+          },
+          "into_var": "pr_diff",
+          "on_failure": "halt"
+        }
+      ]
+    },
     "Review": {
       "actor": "reviewers",
-      "prompt": "PR #${vars.pr_number} on ${vars.owner}/${vars.repo} is up for review.\n\nFetch the PR diff and review it for:\n  1. Does it actually fix the issue described in the PR body?\n  2. Are tests added/updated to cover the behavior change?\n  3. Are there obvious bugs, edge cases, or regressions?\n\nUse:\n  curl -fsS -H \"Authorization: token $FORGEJO_TOKEN\" \"$FORGEJO_BASE_URL/api/v1/repos/${vars.owner}/${vars.repo}/pulls/${vars.pr_number}.diff\"\n\nReturn your verdict as ONE LINE: either `APPROVE` or `REQUEST CHANGES: <one-paragraph specific feedback>`.\n\nBe terse. No filler. The orchestrator aggregates these across reviewers and posts the result back as a PR comment."
+      "prompt": "PR #${vars.pr_number} on ${vars.owner}/${vars.repo}.\n\nDIFF:\n${vars.pr_diff}\n\nReview against:\n  1. Does this fix the bug as described in the PR body?\n  2. Are tests added/updated to cover the change?\n  3. Any obvious regressions, edge cases, or incorrect logic?\n\nReturn ONE LINE — exactly one of:\n  APPROVE\n  REQUEST CHANGES: <one-paragraph specific feedback>\n\nBe terse, no filler. The aggregator step combines all reviewers' verdicts into one PR review."
     },
-    "PostFeedback": {
-      "actor": "reviewers",
-      "prompt": "Aggregate feedback from prior reviewer round (yourself + peers) and post ONE consolidated comment on PR #${vars.pr_number}.\n\nIf any reviewer requested changes, the consolidated comment must list the requested changes clearly so the implementer can address them.\n\nIf all reviewers approved, post a brief approval comment AND approve the PR via:\n  curl -fsS -H \"Authorization: token $FORGEJO_TOKEN\" -H 'Content-Type: application/json' -X POST \"$FORGEJO_BASE_URL/api/v1/repos/${vars.owner}/${vars.repo}/pulls/${vars.pr_number}/reviews\" -d '{\"event\":\"APPROVED\",\"body\":\"LGTM\"}'\n\nFor REQUEST CHANGES, use event=\"REQUEST_CHANGES\" with body containing the consolidated feedback. The pull_request_review webhook will fire and resume the parent arc.\n\nReturn the literal string `posted` on success.",
-      "on_exit": [
+    "Aggregate": {
+      "actor": "aggregator",
+      "prompt": "Aggregate the prior reviewer round into ONE structured review payload for PR #${vars.pr_number}.\n\nPRIOR ROUND OUTPUTS (one block per reviewer):\n${Review.output}\n\nReturn STRICT JSON with no surrounding prose, no markdown fences, exactly:\n{\n  \"event\": \"COMMENT\",\n  \"body\": \"<one-to-three sentence aggregate; lead with APPROVE or REQUEST CHANGES then the reasoning>\",\n  \"action\": \"merge\" | \"request_changes\"\n}\n\nUse action=merge ONLY when every reviewer line was APPROVE. Otherwise action=request_changes. event is always COMMENT (this demo runs single-user; Forgejo refuses APPROVED/REQUEST_CHANGES on own PRs). The downstream PostReview node reads `action` to decide whether to auto-merge: action=merge → POST /merge → fires pr-merged webhook → arc terminates clean. action=request_changes → no merge, the loop waits for the next pr-feedback signal."
+    },
+    "PostReview": {
+      "actor": "noop",
+      "prompt": "Mechanical: parse the aggregator's JSON output, post the PR review, and merge if approved.",
+      "on_enter": [
         {
-          "op": "set_var",
-          "args": { "key": "feedback_posted", "value": true }
-        }
+          "op": "parse_json",
+          "args": { "from": "${Aggregate.output}" },
+          "into_var": "review_payload",
+          "on_failure": "halt"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/pulls/${vars.pr_number}/reviews",
+            "headers": {
+              "Authorization": "token ${env.FORGEJO_TOKEN}",
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "event": "${vars.review_payload.event}",
+              "body":  "${vars.review_payload.body}"
+            },
+            "expect_status": [200, 201]
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/pulls/${vars.pr_number}/merge",
+            "headers": {
+              "Authorization": "token ${env.FORGEJO_TOKEN}",
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+            },
+            "body": { "Do": "merge" },
+            "expect_status": [200, 201, 204]
+          },
+          "when": "domain:hook-when/should-merge",
+          "on_failure": "halt"
+        },
+        { "op": "set_var", "args": { "key": "feedback_posted", "value": true } }
       ]
     }
   },
-  "graph": "stateDiagram-v2\n    [*] --> Review\n    Review --> PostFeedback\n    PostFeedback --> [*]"
+  "graph": "stateDiagram-v2\n    [*] --> FetchDiff\n    FetchDiff --> Review\n    Review --> Aggregate\n    Aggregate --> PostReview\n    PostReview --> [*]"
 }

@@ -80,6 +80,10 @@ struct SharedState {
     /// `start_arc{workflow: "name"}` routing verdicts to find their
     /// target without the webhook payload carrying the full spec.
     workflow_registry: Arc<RwLock<HashMap<String, workflow::Workflow>>>,
+    /// True iff the daemon's HTTP listener is bound to a loopback
+    /// address. Webhook signature scheme `none` is rejected at install
+    /// AND at verify when this is false (defense in depth).
+    bind_is_loopback: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2917,7 +2921,11 @@ Constraints:\n\
         Parameters(p): Parameters<ArcSignalParams>,
     ) -> CallToolResult {
         let correlation = p.correlate.unwrap_or_default();
-        let result = signal_arc_dispatch(&self.state, &p.signal, correlation).await;
+        let payload = p
+            .payload
+            .unwrap_or_else(|| Value::Object(correlation.clone()));
+        let result =
+            signal_arc_dispatch(&self.state, &p.signal, correlation, payload).await;
         Self::ok_json(&result)
     }
 
@@ -2977,6 +2985,13 @@ Constraints:\n\
             Ok(s) => s,
             Err(e) => return Self::err_text(&format!("webhook spec parse failed: {e}")),
         };
+        // Reject schemes that aren't safe under the daemon's bind
+        // (today: SignatureScheme::None requires loopback). Defense
+        // in depth — verify_signature also enforces, but rejecting
+        // here keeps the on-disk registry clean.
+        if let Err(e) = webhooks::install_check(&spec.signature, self.state.bind_is_loopback) {
+            return Self::err_text(&format!("webhook install rejected: {e}"));
+        }
         // Persist for restart durability.
         let dir = self.state.store_dir.join("webhooks");
         let _ = std::fs::create_dir_all(&dir);
@@ -3057,6 +3072,12 @@ struct ArcSignalParams {
     /// registered correlation. Empty correlation = broadcast.
     #[serde(default)]
     pub correlate: Option<serde_json::Map<String, Value>>,
+    /// Optional payload delivered to the resumed wait as
+    /// `${last_signal.payload}`. When omitted, the correlation
+    /// tuple is used (legacy default — kept so callers that don't
+    /// have a payload don't need to manufacture one).
+    #[serde(default)]
+    pub payload: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -4514,6 +4535,21 @@ fn combine_payload_and_headers(payload: &Value, headers: &HashMap<String, String
     Value::Object(map)
 }
 
+/// True iff the bind host string resolves to a loopback address.
+/// Recognized: `127.0.0.0/8` literals, `localhost` (string match —
+/// resolution is host-config dependent and we keep it conservative),
+/// `::1`. `0.0.0.0` and any other IPv4 are treated as non-loopback.
+fn is_loopback_bind(bind_host: &str) -> bool {
+    let h = bind_host.trim();
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
+}
+
 async fn process_webhook(
     state: &Arc<SharedState>,
     name: &str,
@@ -4525,8 +4561,9 @@ async fn process_webhook(
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("unknown webhook '{name}'"))?;
 
-    // Signature verification.
-    webhooks::verify_signature(&spec.signature, headers, body)
+    // Signature verification (loopback flag controls the `none`
+    // scheme escape hatch — defense in depth alongside install_check).
+    webhooks::verify_signature(&spec.signature, headers, body, state.bind_is_loopback)
         .map_err(|e| anyhow::anyhow!("signature: {e}"))?;
 
     // Delivery-id dedup (idempotency).
@@ -4605,9 +4642,19 @@ async fn dispatch_verdict(
                 "extracted_entity": entity,
             }))
         }
-        RoutingVerdict::SignalArc { signal, correlate } => {
-            // Look up matching wait + resolve.
-            let resolved = signal_arc_dispatch(&state, &signal, correlate).await;
+        RoutingVerdict::SignalArc {
+            signal,
+            correlate,
+            payload,
+        } => {
+            // Carry the routing verdict's payload (or, when absent,
+            // the full extracted entity) through to the resumed wait
+            // as `${last_signal.payload}`. Without this hooks like
+            // `set_var feedback_text = ${last_signal.payload.review.body}`
+            // would only see the correlation tuple.
+            let signal_payload = payload.unwrap_or_else(|| entity.clone());
+            let resolved =
+                signal_arc_dispatch(&state, &signal, correlate, signal_payload).await;
             Ok(resolved)
         }
         RoutingVerdict::CancelArc { correlate: _ } => {
@@ -4638,6 +4685,16 @@ async fn dispatch_verdict(
             let compiled = workflow::compile(workflow_spec)
                 .map_err(|e| anyhow::anyhow!("workflow compile: {e}"))?;
             let server = BlackboxServer::new(state.clone());
+            // Validate brofile/team capability composition against the
+            // workflow's actor `requires` lists. Webhook ingress used
+            // to skip this and let dispatch silently downgrade — fix
+            // is to gate the spawn on the same check the MCP / HTTP
+            // dispatch paths already use.
+            if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+                return Err(anyhow::anyhow!(
+                    "workflow '{workflow_id}' capability validation: {e}"
+                ));
+            }
             // Merge: extracted entity → initial_vars → caller's
             // explicit verdict initial_vars. Last writer wins, so
             // a routing rule's verdict can override entity fields if
@@ -4863,6 +4920,15 @@ async fn admin_webhook_install(
                 .into_response();
         }
     };
+    // Reject schemes incompatible with current bind (parallel to
+    // bro_webhook_install + restore-on-startup).
+    if let Err(e) = webhooks::install_check(&spec.signature, state.bind_is_loopback) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("webhook install rejected: {e}"),
+        )
+            .into_response();
+    }
     let dir = state.store_dir.join("webhooks");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("{}.json", spec.name));
@@ -4983,6 +5049,7 @@ async fn signal_arc_dispatch(
     state: &Arc<SharedState>,
     signal: &str,
     correlation: serde_json::Map<String, Value>,
+    payload: Value,
 ) -> Value {
     let store = &state.wait_store;
     let m = store.match_and_take(signal, &correlation);
@@ -4999,7 +5066,7 @@ async fn signal_arc_dispatch(
     };
     let sig = crate::workflow::context::SignalRef {
         name: signal.to_string(),
-        payload: Value::Object(correlation.clone()),
+        payload,
         correlation,
         received_at: util::now_iso(),
     };
@@ -5438,6 +5505,13 @@ async fn main() -> anyhow::Result<()> {
         std::time::Duration::from_secs(reindex_interval),
     );
 
+    // Bind address resolution is hoisted here so SharedState carries
+    // a definitive `bind_is_loopback` flag; the listener bind below
+    // uses the same value. Default 127.0.0.1; BBOX_BIND=0.0.0.0 to
+    // accept docker-bridged webhooks.
+    let bind_host = std::env::var("BBOX_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+    let bind_is_loopback = is_loopback_bind(&bind_host);
+
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
         kb: RwLock::new(kb),
@@ -5452,14 +5526,27 @@ async fn main() -> anyhow::Result<()> {
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
         webhooks: Arc::new(webhooks::WebhookRegistry::new()),
         workflow_registry: Arc::new(RwLock::new(HashMap::new())),
+        bind_is_loopback,
     });
 
     // Restore webhook + workflow registries from disk so installs
-    // survive daemon restart.
+    // survive daemon restart. Re-run install_check at restore time —
+    // a webhook installed under loopback that's now being restored
+    // under a public bind must NOT silently re-enable.
     let webhook_dir = shared.store_dir.join("webhooks");
     for spec in webhooks::load_all(&webhook_dir) {
-        tracing::info!("restoring webhook '{}'", spec.name);
-        shared.webhooks.install(spec);
+        match webhooks::install_check(&spec.signature, shared.bind_is_loopback) {
+            Ok(()) => {
+                tracing::info!("restoring webhook '{}'", spec.name);
+                shared.webhooks.install(spec);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "skipping restore of webhook '{}': install_check failed: {e}",
+                    spec.name
+                );
+            }
+        }
     }
     let workflow_dir = shared.store_dir.join("workflows");
     if workflow_dir.exists() {
@@ -5601,14 +5688,13 @@ async fn main() -> anyhow::Result<()> {
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 
-    // Bind address is `127.0.0.1` by default for security (the
-    // daemon exposes broad MCP authority). Set BBOX_BIND=0.0.0.0
-    // to reach it from a Docker container on the same host
-    // (Forgejo webhook → http://172.17.0.1:port). Closed-network
-    // assumption applies; never set this on a public interface.
-    let bind_host = std::env::var("BBOX_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+    // Bind address resolved above (hoisted so SharedState gets the
+    // loopback flag). Default `127.0.0.1`; BBOX_BIND=0.0.0.0 opens
+    // the listener to docker-bridged peers — closed-network only.
     let listener = tokio::net::TcpListener::bind(format!("{bind_host}:{port}")).await?;
-    tracing::info!("blackboxd listening on http://{bind_host}:{port}/mcp");
+    tracing::info!(
+        "blackboxd listening on http://{bind_host}:{port}/mcp (loopback={bind_is_loopback})"
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -5650,6 +5736,7 @@ mod tests {
             wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
             webhooks: Arc::new(webhooks::WebhookRegistry::new()),
             workflow_registry: Arc::new(RwLock::new(HashMap::new())),
+            bind_is_loopback: true,
         });
         BlackboxServer::new(state)
     }

@@ -6,21 +6,33 @@
     "repo":          { "kind": "string", "required": true },
     "issue_number":  { "kind": "int",    "required": true },
     "branch":        { "kind": "string", "required": true },
+    "worktree_path": { "kind": "string", "required": true },
     "pr_number":     { "kind": "int",    "required": true },
-    "feedback_text": { "kind": "string", "required": true }
+    "feedback_text": { "kind": "any",    "required": false }
   },
   "actors": {
     "implementer": {
       "kind": "executor",
       "brofile": "keystone-impl",
       "durable": true,
-      "compaction_anchor": true
+      "compaction_anchor": true,
+      "requires": []
     }
   },
   "nodes": {
     "AddressFeedback": {
       "actor": "implementer",
-      "prompt": "Reviewer feedback on PR #${vars.pr_number} (iteration: see vars.review_iteration in parent context):\n\n${vars.feedback_text}\n\nAddress the feedback in worktree ${meta.worktree} (branch ${vars.branch}). Edit files, run tests, commit, then push to origin/${vars.branch} so Forgejo emits a new pull_request synchronize event.\n\nReturn a one-line summary of changes."
+      "prompt": "Reviewer feedback on PR #${vars.pr_number}:\n\n${vars.feedback_text}\n\nAddress the feedback in worktree ${vars.worktree_path} (branch ${vars.branch}). Edit files, run tests, commit. Do NOT push — the workflow engine pushes mechanically once you return.\n\nReturn a one-line summary of changes.",
+      "on_exit": [
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["git", "push", "origin", "${vars.branch}"],
+            "cwd": "${vars.worktree_path}"
+          },
+          "on_failure": "halt"
+        }
+      ]
     }
   },
   "graph": "stateDiagram-v2\n    [*] --> AddressFeedback\n    AddressFeedback --> [*]"

@@ -1,8 +1,9 @@
 {
   "name": "forgejo",
   "signature": {
-    "kind": "forgejo",
-    "secret_env": "FORGEJO_WEBHOOK_SECRET"
+    "kind": "hmac_sha256",
+    "secret_env": "FORGEJO_WEBHOOK_SECRET",
+    "header": "X-Gitea-Signature"
   },
   "delivery_id_header": "X-Gitea-Delivery",
   "extractor": {

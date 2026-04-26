@@ -56,7 +56,14 @@
       "id": "signal_pr_feedback",
       "classification": "signal_arc",
       "antecedent": {
-        "op": "Eq", "field": "event", "value": "pull_request_review"
+        "op": "In",
+        "field": "event",
+        "values": [
+          "pull_request_review",
+          "pull_request_review_comment",
+          "pull_request_review_approved",
+          "pull_request_review_rejected"
+        ]
       },
       "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-feedback\",\"correlate\":{}}"
     },

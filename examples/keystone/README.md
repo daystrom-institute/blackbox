@@ -16,22 +16,27 @@ underlying engine semantics see [`../../WORKFLOWS.md`](../../WORKFLOWS.md).
 | Engine feature                                                                  | Where in this example                                                     |
 |---------------------------------------------------------------------------------|---------------------------------------------------------------------------|
 | Workflow + subworkflow_ref composition                                          | `workflows/issue-to-merged-pr.json` calls `implementer-arc` and `reviewer-arc` by id |
-| Subworkflow imports/exports contract                                            | Implementer exports `pr_number`/`branch`; parent threads them through      |
+| Subworkflow imports/exports contract                                            | Implementer exports `pr_number`/`branch`; parent threads them (incl. `worktree_path`) into AddressFeedback |
 | `vars_schema` declaration + initial seeding from webhook                        | Every workflow declares one; webhook routing seeds via entity merge        |
-| `${vars.x}` / `${meta.x}` / `${last_signal.x}` template resolution               | Every node prompt + every hook arg                                         |
-| Hooks: SetVar / IncVar / WorktreeCreate / WorktreeRemove / ParseJson / Forgejo* | Setup, AwaitFeedbackOrMerge, on_arc_exit                                   |
-| Hook gating via `when: domain:...` packet                                       | on_arc_exit cleanup conditional on `meta.arc_outcome`                      |
+| Template heads `${vars.x}` / `${outputs.x}` / `${meta.x}` / `${last_signal.x}` / `${env.X}` | Used everywhere; `${env.FORGEJO_*}` carries credentials into `http_json` URLs/headers |
+| Hooks: `set_var` / `inc_var` / `parse_json` / `worktree_create` / `worktree_remove` / `shell` / `http_json` | Setup, AwaitFeedbackOrMerge, PushAndOpenPr, FetchDiff, PostReview, on_arc_exit |
+| Hook gating via `when: domain:...` packet                                       | PushAndOpenPr (idempotent create-or-reopen), PostReview (auto-merge on approve), on_arc_exit cleanup |
 | Wait nodes with `any_of` race + timeout                                         | AwaitReviewTrigger (24h), AwaitFeedbackOrMerge (7d)                        |
 | Synthetic `__timeout__` signal as graceful-degrade path                         | Both Wait gates accept it (route → halt)                                   |
-| Gate packets routing graph branches by `last_signal.name`                       | merge-or-review, loop-or-exit                                              |
+| Choice nodes routing graph branches by gate verdict                             | `ReviewOrDone` consumes `merge-or-review`, `FeedbackOrDone` consumes `loop-or-exit` |
+| Gate packets routing on `last_signal.name`                                      | merge-or-review, loop-or-exit                                              |
 | Workflow-level policy packet (advisor-as-packet)                                | arc-budget caps step count                                                 |
 | Domain-shaped packet refs (`domain:...`)                                        | Every gate/policy/hook-when reference                                      |
 | Operator-blessed registries (workflows, webhooks, packets) persisted to disk    | All artifacts installed via `/admin/*` endpoints in `scripts/install.sh`   |
-| Webhook ingress with HMAC-SHA256 signature verification                         | `webhooks/forgejo.json` + Forgejo bootstrap configures the hook            |
-| Routing packet → start_arc / signal_arc / ignore                                | `packets/routing-forgejo.json`                                             |
+| Webhook ingress with generic `hmac_sha256` signature scheme                     | `webhooks/forgejo.json` (operator names header `X-Gitea-Signature`)        |
+| Routing packet → start_arc / signal_arc / ignore                                | `packets/routing-forgejo.json` (operator's mapping; engine knows nothing of forgejo) |
 | Webhook `default_project_dir` resolution                                        | Set in `webhooks/forgejo.json`; arcs created from the hook anchor here     |
 | Capability tags (no-op here — every actor's `requires` is empty)                | Demonstrates the slot; populate it when picking models with hard requirements |
-| Noop actor for hook-only nodes                                                  | `Setup` and `Done` nodes — fire hooks, no LLM dispatch                     |
+| Noop actor for hook-only nodes                                                  | `Setup`, `PushAndOpenPr`, `FetchDiff`, `PostReview`, `Done` — fire hooks, no LLM dispatch |
+| Generic `http_json` for any code-host integration                               | Issue fetch, PR list, PR create, PR diff (via `response_kind: text`), review post, merge — same op for all |
+| Generic `find_first` for client-side array filtering                            | `PushAndOpenPr` GETs ALL open PRs (Forgejo's `head=` filter is unreliable), then `find_first { from: ${vars.all_open_prs}, where: { "head.ref": "${vars.branch}" } }` writes the matching PR (or null) into `vars.existing_pr`. Composable primitive — no platform-specific search op needed. |
+| Idempotent re-dispatch                                                          | `PushAndOpenPr` reuses a matching open PR (via `set_var pr_data = ${vars.existing_pr}` gated by `domain:hook-when/has-existing-pr`) instead of paving the prior arc's PR. Re-running an arc on the same issue+branch is safe. |
+| Auto-merge on approval                                                          | `reviewer-arc.PostReview` fires `http_json` POST `/merge` gated by `domain:hook-when/should-merge` (verdict-as-data from aggregator) — the merge fires `pull_request closed merged:true` webhook → `pr-merged` signal → arc terminates clean without manual intervention. |
 
 ## Prerequisites
 
@@ -75,11 +80,14 @@ examples/keystone/
 │   ├── install.sh               # compile packets, install brofiles/teams/workflows/webhook
 │   └── run.sh                   # docker up → bootstrap → install → wait | --dispatch
 ├── packets/
-│   ├── routing-forgejo.json     # webhook event → routing verdict
-│   ├── gate-merge-or-review.json
-│   ├── gate-loop-or-exit.json
-│   ├── cleanup-policy.json      # keep-on-fail / delete-on-success
-│   └── policy-arc-budget.json   # arc-level budget guard
+│   ├── routing-forgejo.json            # webhook event → routing verdict
+│   ├── gate-merge-or-review.json       # AwaitReviewTrigger gate
+│   ├── gate-loop-or-exit.json          # AwaitFeedbackOrMerge gate
+│   ├── cleanup-policy.json             # keep-on-fail / delete-on-success
+│   ├── policy-arc-budget.json          # arc-level budget guard
+│   ├── hook-when-no-existing-pr.json   # PushAndOpenPr: gate POST /pulls when no open PR matches branch
+│   ├── hook-when-has-existing-pr.json  # PushAndOpenPr: gate "reuse pr_data from find_first match" when one does
+│   └── hook-when-should-merge.json     # PostReview: gate POST /merge when aggregator verdict is "merge"
 ├── webhooks/
 │   └── forgejo.json             # extractor + signature scheme + routing packet ref
 └── workflows/
@@ -109,45 +117,66 @@ examples/keystone/
 
 ```mermaid
 stateDiagram-v2
+    state ReviewOrDone <<choice>>
+    state FeedbackOrDone <<choice>>
     [*] --> Setup
     Setup --> Implement
     Implement --> AwaitReviewTrigger
-    AwaitReviewTrigger --> Review : ready
-    AwaitReviewTrigger --> Done : merged
+    AwaitReviewTrigger --> ReviewOrDone
+    ReviewOrDone --> Review : ready
+    ReviewOrDone --> Done : merged
     Review --> AwaitFeedbackOrMerge
-    AwaitFeedbackOrMerge --> AddressFeedback : feedback
-    AwaitFeedbackOrMerge --> Done : merged
+    AwaitFeedbackOrMerge --> FeedbackOrDone
+    FeedbackOrDone --> AddressFeedback : feedback
+    FeedbackOrDone --> Done : merged
     AddressFeedback --> AwaitReviewTrigger
     Done --> [*]
 ```
 
 | Node                | Kind                       | What happens                                                                 |
 |---------------------|----------------------------|------------------------------------------------------------------------------|
-| `Setup`             | Noop + on_enter hooks      | Initialize counter vars, derive branch name, `WorktreeCreate` for this arc. |
-| `Implement`         | subworkflow_ref            | Runs `implementer-arc`: fetch issue → LLM edits files → commit → open PR. Exports `pr_number`. |
-| `AwaitReviewTrigger`| Wait `any_of [pr-ready, pr-merged]`, 24h timeout | Suspends arc until either PR is ready for review or already merged. |
-| `Review`            | subworkflow_ref            | Runs `reviewer-arc`: ensemble reviews PR → posts consolidated comment + APPROVE / REQUEST_CHANGES. |
-| `AwaitFeedbackOrMerge` | Wait `any_of [pr-feedback, pr-merged]`, 7d timeout | Suspends arc; `on_exit` hooks capture feedback into `vars.feedback_text` and `inc_var review_iteration`. |
-| `AddressFeedback`   | subworkflow_ref            | Runs `implementer-feedback-arc`: revise + push → fires new `pull_request.synchronize` webhook → loops back to AwaitReviewTrigger. |
+| `Setup`             | Noop + on_enter hooks      | Initialize counter vars, derive branch name, `WorktreeCreate`, capture `worktree_path` into vars for sub-arcs. |
+| `Implement`         | subworkflow_ref            | Runs `implementer-arc`: `http_json` GET issue → LLM edits + commits → `shell` push → idempotent `http_json` POST/PATCH PR. Exports `pr_number`/`branch`. |
+| `AwaitReviewTrigger`| Wait `any_of [pr-ready, pr-merged]`, 24h timeout, `gate: merge-or-review` | Suspends until pr-ready or pr-merged; gate emits `ready`/`merged` verdict. |
+| `ReviewOrDone`      | `<<choice>>`               | Routes by gate verdict: `ready` → Review, `merged` → Done.                  |
+| `Review`            | subworkflow_ref            | Runs `reviewer-arc`: `http_json` GET diff (`response_kind: text`) → ensemble reviewers emit verdicts → single-actor aggregator emits `{event, body, action: "merge"\|"request_changes"}` JSON → PostReview parses, posts COMMENT, and `http_json` POST `/merge` gated by `should-merge`. |
+| `AwaitFeedbackOrMerge` | Wait `any_of [pr-feedback, pr-merged]`, 7d timeout, `gate: loop-or-exit` | Suspends; `on_exit` captures last_signal payload + increments `review_iteration`. Gate emits `merged`/`feedback`/`halt`. |
+| `FeedbackOrDone`    | `<<choice>>`               | Routes by gate verdict: `feedback` → AddressFeedback, `merged` → Done.       |
+| `AddressFeedback`   | subworkflow_ref            | Runs `implementer-feedback-arc`: revise + commit → on_exit `shell` push → fires `pull_request.synchronize` webhook → loops back to AwaitReviewTrigger. |
 | `Done`              | Noop                       | Terminal node. Triggers `on_arc_exit` hooks at workflow level. |
 
 `on_arc_exit` runs `WorktreeRemove` gated by `domain:workflow-cleanup/keep-on-fail` — keeps the worktree when `meta.arc_outcome` ∈ {`failed`, `cancelled`, `timeout`}, deletes on success.
 
 ### What the implementer / reviewer LLMs actually do
 
+LLMs do cognitive work only. Mechanical pieces (HTTP calls, git operations, JSON parsing, idempotency, gating) are workflow JSON composing the engine's generic ops. The engine knows nothing about Forgejo.
+
 The implementer (`workflows/implementer-arc.json`):
 
-1. `on_enter` hook: `forgejo_issue_fetch` → writes the issue title + body to `vars.issue_title` / `vars.issue_body`.
-2. `on_enter` hook: `set_var` derives `vars.branch = "fix/issue-${vars.issue_number}"`.
-3. **FetchIssue** node (`keystone-impl` actor) gets a prompt naming the worktree, branch, issue title + body, and instructions to fix-the-bug-then-commit-but-don't-push-yet.
-4. **OpenPr** node uses the same durable session and asks the implementer to push and open the Forgejo PR (via `tea` if installed, else raw `curl`). The integer PR number is captured into `vars.pr_number` via `on_exit` hook.
+1. **FetchIssue.on_enter hooks** (mechanical):
+   - `http_json` GET `${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/issues/${vars.issue_number}` with bearer auth from `${env.FORGEJO_TOKEN}` → response captured into `vars.issue_data`.
+   - `set_var` extracts `vars.issue_title` / `vars.issue_body` from `${vars.issue_data.*}`.
+   - `set_var` derives `vars.branch = "fix/issue-${vars.issue_number}"`.
+2. **FetchIssue prompt** (LLM): edit files in `${vars.worktree_path}` on `${vars.branch}` to fix the issue, commit. Do NOT push or open PR — that's mechanical.
+3. **PushAndOpenPr** (Noop with hooks — idempotent re-dispatch):
+   - `shell` `git push -u origin ${vars.branch}` (cwd=`${vars.worktree_path}`).
+   - `http_json` GET `pulls?state=open&limit=50` → `vars.all_open_prs`. Forgejo's `head=` query filter is broken in some versions, so we fetch the open set and filter client-side.
+   - `find_first { from: ${vars.all_open_prs}, where: { "head.ref": "${vars.branch}" } }` → `vars.existing_pr` (PR object or null).
+   - `http_json` POST `/pulls` (gated by `domain:hook-when/no-existing-pr`) → `vars.pr_data` — fires only when no open PR matches.
+   - `set_var pr_data = ${vars.existing_pr}` (gated by `domain:hook-when/has-existing-pr`) — reuses the matching PR otherwise.
+   - `set_var pr_number = ${vars.pr_data.number}` (always — both paths populate `pr_data`).
 
 The reviewer (`workflows/reviewer-arc.json`):
 
-1. **Review** node — ensemble of two haiku reviewers each fetch the PR diff and respond with `APPROVE` or `REQUEST CHANGES: <reason>`.
-2. **PostFeedback** node — same ensemble aggregates and posts ONE consolidated comment + a Forgejo PR review (APPROVED or REQUEST_CHANGES). The PR review fires `pull_request_review.submitted` → resumes the parent arc.
+1. **FetchDiff.on_enter** (mechanical): `http_json` GET `pulls/${vars.pr_number}.diff` with `response_kind: text` → `vars.pr_diff`.
+2. **Review node** (ensemble of two reviewers): each gets the diff in their prompt, returns one line: `APPROVE` or `REQUEST CHANGES: <reason>`.
+3. **Aggregate node** (single executor — must be single, not ensemble, so the JSON output is a single document not a merged blob): emits strict JSON `{event: "COMMENT", body, action: "merge"|"request_changes"}`. `event` is always COMMENT because Forgejo refuses APPROVED/REQUEST_CHANGES on a self-authored PR (single-user demo).
+4. **PostReview** (Noop with hooks):
+   - `parse_json ${Aggregate.output}` → `vars.review_payload`.
+   - `http_json` POST `/pulls/${vars.pr_number}/reviews` with the comment body.
+   - `http_json` POST `/pulls/${vars.pr_number}/merge` **gated by `domain:hook-when/should-merge`** (`vars.review_payload.action == "merge"`) — fires `pull_request closed merged:true` webhook → routes to `pr-merged` signal → AwaitFeedbackOrMerge resolves on merged → arc terminates clean.
 
-The feedback-loop subworkflow (`workflows/implementer-feedback-arc.json`) runs in the SAME worktree on the SAME branch — the implementer pushes additional commits, which fires `pull_request.synchronize` → resumes the parent on `pr-ready`.
+The feedback-loop subworkflow (`workflows/implementer-feedback-arc.json`) runs in the SAME worktree on the SAME branch — the implementer addresses feedback + commits, on_exit `shell` push fires `pull_request.synchronize` → resumes the parent on `pr-ready`.
 
 ## Live observation
 
@@ -175,8 +204,8 @@ curl -X POST -H 'Content-Type: application/json' \
 ### Adapting to a different code-host (GitHub instead of Forgejo)
 
 1. **Extractor** — GitHub puts the event type in `X-GitHub-Event` instead of `X-Gitea-Event`. Edit `webhooks/forgejo.json` (rename to `webhooks/github.json` for clarity), change the `event` selector path to `$._headers.x-github-event`. Most other paths (`$.action`, `$.issue.number`, `$.pull_request.number`) are identical.
-2. **Signature** — Switch the `signature.kind` to `github`; secret env name still works the same way.
-3. **API ops** — Forgejo and GitHub diverge on the `pulls` endpoint shape. The implementer/reviewer prompts use raw `curl` to talk to the API; replace `${FORGEJO_BASE_URL}` (`https://api.github.com`) and adjust the path templates.
+2. **Signature** — Keep `signature.kind: hmac_sha256`; change `header` to `X-Hub-Signature-256` and add `prefix: "sha256="`. Secret env name is operator-controlled.
+3. **API calls** — Forgejo and GitHub diverge on the `pulls` endpoint shape. All API calls in this example are `http_json` hooks templated against `${env.FORGEJO_BASE_URL}` + `${env.FORGEJO_TOKEN}`; for GitHub, set `${env.GITHUB_BASE_URL}=https://api.github.com` (or a per-host env var of your choice) and adjust the path templates in the workflow JSON. No engine changes required.
 4. **Routing packet** — keep the rule shapes; only `event` value matchers change in some edge cases (`pull_request_review` event has `action: "submitted"` on both — no change needed).
 
 ### Adapting to a different code-fix shape (not "fix a bug")
@@ -230,7 +259,7 @@ Concrete tweaks you'll likely want:
 
 The op catalog is in `src/workflow/ops.rs`. Add a variant to `OpKind` + a handler function + a test. Update [`WORKFLOWS.md` § Op catalog](../../WORKFLOWS.md#op-catalog-current) when you do.
 
-For most external API calls, the `forgejo_*` ops are the model: they return a JSON value, and `into_var` writes it to `vars[<name>]` for downstream nodes to template against.
+For most external API calls, `http_json` is the primitive: workflow author writes the URL/headers/body as templates over `${env.X}` (credentials, base URLs) and `${vars.X}` (workflow state); the response lands in `vars[into_var]` for downstream templates. The engine carries no platform-specific knowledge — adapting to GitHub, GitLab, Gitea, Bitbucket, or anything else is a workflow JSON change, not a code change.
 
 ### Adding a new webhook source
 
@@ -259,11 +288,12 @@ systemctl --user restart blackbox.service   # picks up the deletion
 
 | Gap                                    | Impact                                                                 | Fix sketch                                            |
 |----------------------------------------|------------------------------------------------------------------------|-------------------------------------------------------|
-| Webhook correlation = `{}` (broadcast) | Concurrent PRs would cross-resume each other's waits                    | Change `correlate` to `{pr: "${vars.pr_number}"}` AND have routing extract `pr_number` into the verdict |
-| Push-storm not debounced               | N commits → N reviewer dispatches                                       | `vars.review_in_progress` flag + routing-rule guard   |
-| Implementer relies on LLM to `git push`| If model forgets, arc hangs in `Wait`                                   | Promote push to a dedicated `Shell` op or a `forgejo_push` op |
+| Webhook correlation = `{}` (broadcast) | Two concurrent arcs on different PRs would cross-resume each other's waits | Change `correlate` to `{pr: "${vars.pr_number}"}` AND have routing extract `pr_number` into both the verdict and each `WaitSpec.correlate`. The single-issue demo never trips this; multi-issue concurrency does. |
+| Push-storm not debounced               | N commits → N `pull_request.synchronize` events → N reviewer dispatches  | `vars.review_in_progress` flag + routing-rule guard (see `WORKFLOWS.md` § Webhook ingress) |
+| PR reuse only handles open PRs         | A closed-but-unmerged PR for the same head will conflict on POST → halt. The `state=open&limit=50` GET also doesn't paginate. | Either paginate + scan all PRs (need `find_first` over multiple pages, or a follow-up `find_all` op) OR widen to `state=all` and add a PATCH-reopen branch — the workflow is already wired to handle either via packet gating. |
 | `Shell` op has no allowlist enforcement| Trusted-actor assumption                                                | Wire shell-policy packet (design in `WORKFLOWS.md`)   |
 | `cancel_arc` routing verdict           | Webhook can't terminate a running arc                                   | Engine cancellation primitive (phase-next)            |
 | `bro_workflow_uninstall` / `bro_webhook_uninstall` don't exist | Tear-down requires `rm` + restart                       | Add inverse MCP tools + matching `/admin/` endpoints  |
 | `WaitStore` is in-memory only          | Daemon restart loses every suspended arc                                | Disk-back: serialize on register, drop on resolve     |
 | Real LLM dispatch every run            | Burns tokens. No simulator mode                                         | `--dry-run` validates spec only; for actor simulation, a `simulator` actor kind is phase-next |
+| Self-review COMMENT event              | Forgejo refuses APPROVED / REQUEST_CHANGES on a self-authored PR. The aggregator emits `event: COMMENT` with the verdict in the body so single-user demos work; on a multi-user host you can switch to APPROVED / REQUEST_CHANGES. | Aggregator prompt + downstream routing on `pull_request_review.{approved,rejected}` events. |

@@ -5,11 +5,15 @@
     "issue_number":  { "kind": "int",    "required": true },
     "issue_title":   { "kind": "string", "required": false },
     "issue_body":    { "kind": "string", "required": false },
+    "issue_data":    { "kind": "object", "required": false },
     "repo":          { "kind": "string", "required": true },
     "owner":         { "kind": "string", "required": true },
     "branch":        { "kind": "string", "required": false },
-    "pr_number":     { "kind": "int",    "required": false },
-    "feedback_text": { "kind": "string", "required": false }
+    "worktree_path": { "kind": "string", "required": true },
+    "all_open_prs":  { "kind": "array",  "required": false },
+    "existing_pr":   { "kind": "any",    "required": false },
+    "pr_data":       { "kind": "object", "required": false },
+    "pr_number":     { "kind": "int",    "required": false }
   },
   "actors": {
     "implementer": {
@@ -18,51 +22,101 @@
       "durable": true,
       "compaction_anchor": true,
       "requires": []
-    }
+    },
+    "noop": { "kind": "noop", "requires": [] }
   },
   "nodes": {
     "FetchIssue": {
       "actor": "implementer",
       "on_enter": [
         {
-          "op": "forgejo_issue_fetch",
+          "op": "http_json",
           "args": {
-            "owner": "${vars.owner}",
-            "repo":  "${vars.repo}",
-            "index": "${vars.issue_number}"
+            "method": "GET",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/issues/${vars.issue_number}",
+            "headers": {
+              "Authorization": "token ${env.FORGEJO_TOKEN}",
+              "Accept": "application/json"
+            }
           },
           "into_var": "issue_data",
           "on_failure": "halt"
         },
-        {
-          "op": "set_var",
-          "args": { "key": "issue_title", "value": "${vars.issue_data.title}" }
-        },
-        {
-          "op": "set_var",
-          "args": { "key": "issue_body",  "value": "${vars.issue_data.body}" }
-        },
-        {
-          "op": "set_var",
-          "args": { "key": "branch", "value": "fix/issue-${vars.issue_number}" }
-        }
+        { "op": "set_var", "args": { "key": "issue_title", "value": "${vars.issue_data.title}" } },
+        { "op": "set_var", "args": { "key": "issue_body",  "value": "${vars.issue_data.body}" } },
+        { "op": "set_var", "args": { "key": "branch", "value": "fix/issue-${vars.issue_number}" } }
       ],
-      "prompt": "You are an implementer working in worktree ${meta.worktree} on branch ${vars.branch}.\n\nIssue #${vars.issue_number}: ${vars.issue_title}\n\n${vars.issue_body}\n\nUnderstand the bug, fix it, write or update tests so the existing tests in test_calculator.py pass. Stage changes and commit with a clear message. Do NOT push or open a PR yet — that's the next step.\n\nWhen done, return a one-line summary of what you changed (no markdown). Keep edits minimal and focused on the issue."
+      "prompt": "You are an implementer working in worktree ${vars.worktree_path} on branch ${vars.branch}.\n\nIssue #${vars.issue_number}: ${vars.issue_title}\n\n${vars.issue_body}\n\nUnderstand the bug, fix it, write or update tests so the existing tests pass. Stage changes and commit with a clear message.\n\nDo NOT push and do NOT open the PR — those are mechanical follow-ups handled by the workflow engine, not by you.\n\nReturn a one-line summary of what you changed (no markdown). Keep edits minimal and focused on the issue."
     },
-    "OpenPr": {
-      "actor": "implementer",
-      "prompt": "Push the branch ${vars.branch} to origin and open a Forgejo PR titled \"Fix #${vars.issue_number}: ${vars.issue_title}\" against base main, body referencing the issue. Use the forgejo CLI (`tea`) if installed, otherwise use:\n  git push -u origin ${vars.branch}\n  curl -fsS -H \"Authorization: token $FORGEJO_TOKEN\" -H 'Content-Type: application/json' -X POST \"$FORGEJO_BASE_URL/api/v1/repos/${vars.owner}/${vars.repo}/pulls\" -d '{\"title\":\"Fix #${vars.issue_number}: ${vars.issue_title}\",\"head\":\"${vars.branch}\",\"base\":\"main\",\"body\":\"Closes #${vars.issue_number}\"}'\n\nThe response is a JSON PR object — return ONLY the integer PR number on the last line, nothing else.",
-      "on_exit": [
+    "PushAndOpenPr": {
+      "actor": "noop",
+      "prompt": "Push branch + open-or-reuse PR (mechanical, no LLM dispatch). Idempotent: re-running an arc against the same issue+branch finds the existing open PR and reuses it (PATCH state=open) rather than creating a duplicate. Forgejo's `head=` query filter is unreliable in some versions, so we GET ALL open PRs and use `find_first` to scan client-side for one whose `.head.ref` matches our branch — the workflow author's job, not the engine's.",
+      "on_enter": [
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["git", "push", "-u", "origin", "${vars.branch}"],
+            "cwd": "${vars.worktree_path}"
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "GET",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/pulls?state=open&limit=50",
+            "headers": {
+              "Authorization": "token ${env.FORGEJO_TOKEN}",
+              "Accept": "application/json"
+            }
+          },
+          "into_var": "all_open_prs",
+          "on_failure": "halt"
+        },
+        {
+          "op": "find_first",
+          "args": {
+            "from": "${vars.all_open_prs}",
+            "where": { "head.ref": "${vars.branch}" }
+          },
+          "into_var": "existing_pr",
+          "on_failure": "halt"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/pulls",
+            "headers": {
+              "Authorization": "token ${env.FORGEJO_TOKEN}",
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "title": "Fix #${vars.issue_number}: ${vars.issue_title}",
+              "head": "${vars.branch}",
+              "base": "main",
+              "body": "Closes #${vars.issue_number}"
+            },
+            "expect_status": [200, 201]
+          },
+          "into_var": "pr_data",
+          "when": "domain:hook-when/no-existing-pr",
+          "on_failure": "halt"
+        },
         {
           "op": "set_var",
-          "args": {
-            "key": "pr_number",
-            "value": "${OpenPr.output}"
-          },
-          "on_failure": "warn"
+          "args": { "key": "pr_data", "value": "${vars.existing_pr}" },
+          "when": "domain:hook-when/has-existing-pr",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "pr_number", "value": "${vars.pr_data.number}" },
+          "on_failure": "halt"
         }
       ]
     }
   },
-  "graph": "stateDiagram-v2\n    [*] --> FetchIssue\n    FetchIssue --> OpenPr\n    OpenPr --> [*]"
+  "graph": "stateDiagram-v2\n    [*] --> FetchIssue\n    FetchIssue --> PushAndOpenPr\n    PushAndOpenPr --> [*]"
 }

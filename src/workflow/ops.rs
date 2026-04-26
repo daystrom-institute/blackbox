@@ -58,13 +58,21 @@ pub enum OpKind {
     WorktreeCreate,
     WorktreeRemove,
     SetMeta,
-    /// Forgejo HTTP ops (defined in this module to keep the catalog
-    /// in one place; backed by `crate::orchestration::forgejo` once
-    /// that module exists).
-    ForgejoIssueFetch,
-    ForgejoIssueList,
-    ForgejoPrCreate,
-    ForgejoPrComment,
+    /// Generic HTTP request → JSON-decoded response body. Workflow
+    /// authors compose URL/headers/body from `${env.X}` + `${vars.X}`
+    /// to express any code-host integration (issue fetch, PR create,
+    /// PR comment, …) without baking platform-specific ops into the
+    /// engine. Captures the response into `vars[into_var]` when set.
+    HttpJson,
+    /// Find the first element of an array variable whose nested field
+    /// equals a target value, write into `vars[into_var]`. Writes
+    /// `Value::Null` (not Err) when no match is found, so downstream
+    /// `IsNull` / `IsNonNull` packet predicates can branch cleanly.
+    /// Composable primitive that lets workflow authors express
+    /// "find existing PR for this branch" / "find label by name" / etc
+    /// without a code-host-specific search op AND without relying on
+    /// upstream API filters that may be broken or absent.
+    FindFirst,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -109,23 +117,144 @@ pub async fn execute_op(
         OpKind::ParseJson => exec_parse_json(&rendered_args, hook.into_var.as_deref()),
         OpKind::Shell => exec_shell(&rendered_args, ctx).await,
         OpKind::WorktreeCreate => exec_worktree_create(&rendered_args, ctx).await,
-        OpKind::WorktreeRemove => exec_worktree_remove(&rendered_args).await,
+        OpKind::WorktreeRemove => exec_worktree_remove(&rendered_args, ctx).await,
         OpKind::SetMeta => exec_set_meta(&rendered_args),
-        OpKind::ForgejoIssueFetch => {
-            crate::orchestration::forgejo::issue_fetch(&rendered_args, hook.into_var.as_deref())
-                .await
+        OpKind::HttpJson => exec_http_json(&rendered_args, hook.into_var.as_deref()).await,
+        OpKind::FindFirst => exec_find_first(&rendered_args, hook.into_var.as_deref()),
+    }
+}
+
+fn exec_find_first(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let into = into_var
+        .ok_or_else(|| anyhow!("FindFirst requires into_var on the HookOp spec"))?;
+    let arr = args
+        .get("from")
+        .ok_or_else(|| anyhow!("FindFirst requires args.from (array)"))?;
+    let where_obj = args
+        .get("where")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow!("FindFirst requires args.where (object of field→value)"))?;
+    let items: &[Value] = match arr {
+        Value::Array(a) => a.as_slice(),
+        Value::Null => &[],
+        other => bail!("FindFirst args.from must be array or null, got {other:?}"),
+    };
+    let mut found: Value = Value::Null;
+    'outer: for item in items {
+        for (k, expected) in where_obj {
+            // Walk dotted path inside the element.
+            let actual = walk_dotted(item, k);
+            if actual.as_ref() != Some(expected) {
+                continue 'outer;
+            }
         }
-        OpKind::ForgejoIssueList => {
-            crate::orchestration::forgejo::issue_list(&rendered_args, hook.into_var.as_deref())
-                .await
+        found = item.clone();
+        break;
+    }
+    Ok(OpEffect::SetVar {
+        key: into.to_string(),
+        value: found,
+    })
+}
+
+fn walk_dotted(root: &Value, path: &str) -> Option<Value> {
+    let mut cur = root.clone();
+    for seg in path.split('.') {
+        cur = match &cur {
+            Value::Object(m) => m.get(seg).cloned()?,
+            Value::Array(a) => {
+                let idx: usize = seg.parse().ok()?;
+                a.get(idx).cloned()?
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+async fn exec_http_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let url = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("HttpJson requires args.url"))?;
+    let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30);
+    let expect_status = args.get("expect_status").and_then(|v| v.as_array());
+    let allow_empty = args
+        .get("allow_empty_body")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    // response_kind: "json" (default — parse, error on non-JSON),
+    // "text" (capture body as-is into the var as a string), or
+    // "auto" (try JSON, fall back to text on parse failure).
+    let response_kind = args
+        .get("response_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("json");
+
+    let parsed_method = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|e| anyhow!("HttpJson invalid method '{method}': {e}"))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| anyhow!("HttpJson client build: {e}"))?;
+    let mut req = client.request(parsed_method, url);
+    if let Some(headers) = args.get("headers").and_then(|v| v.as_object()) {
+        for (k, v) in headers {
+            let vs = v
+                .as_str()
+                .ok_or_else(|| anyhow!("HttpJson header '{k}' must be string"))?;
+            req = req.header(k, vs);
         }
-        OpKind::ForgejoPrCreate => {
-            crate::orchestration::forgejo::pr_create(&rendered_args, hook.into_var.as_deref()).await
+    }
+    if let Some(body) = args.get("body") {
+        // Pass through whatever JSON shape the workflow author built.
+        req = req.json(body);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| anyhow!("HttpJson {method} {url}: send: {e}"))?;
+    let status = resp.status().as_u16();
+    let allow = match expect_status {
+        Some(arr) => arr.iter().any(|v| v.as_u64().is_some_and(|n| n as u16 == status)),
+        None => (200..300).contains(&status),
+    };
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| anyhow!("HttpJson {method} {url}: body: {e}"))?;
+    if !allow {
+        let preview: String = text.chars().take(500).collect();
+        bail!("HttpJson {method} {url}: HTTP {status}: {preview}");
+    }
+    let value = if text.trim().is_empty() {
+        if !allow_empty {
+            bail!("HttpJson {method} {url}: empty body but allow_empty_body=false");
         }
-        OpKind::ForgejoPrComment => {
-            crate::orchestration::forgejo::pr_comment(&rendered_args, hook.into_var.as_deref())
-                .await
+        Value::Null
+    } else {
+        match response_kind {
+            "text" => Value::String(text),
+            "auto" => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+            "json" => serde_json::from_str(&text).map_err(|e| {
+                let preview: String = text.chars().take(200).collect();
+                anyhow!("HttpJson {method} {url}: response not JSON: {e}: {preview}")
+            })?,
+            other => bail!(
+                "HttpJson {method} {url}: invalid response_kind '{other}' (expected json|text|auto)"
+            ),
         }
+    };
+    match into_var {
+        Some(k) => Ok(OpEffect::SetVar {
+            key: k.to_string(),
+            value,
+        }),
+        None => Ok(OpEffect::None),
     }
 }
 
@@ -453,7 +582,7 @@ async fn branch_state(repo_root: &str, branch: &str) -> Result<BranchState> {
     Ok(BranchState::PresentFree)
 }
 
-async fn exec_worktree_remove(args: &Value) -> Result<OpEffect> {
+async fn exec_worktree_remove(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
     let path = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -466,8 +595,23 @@ async fn exec_worktree_remove(args: &Value) -> Result<OpEffect> {
         return Ok(OpEffect::SetWorktree(None));
     }
 
+    // `git worktree remove` is a porcelain that needs to run inside
+    // the *parent* repo (the one that owns the worktree), not inside
+    // the worktree itself. Default to meta.project_dir; allow the
+    // workflow to override via args.repo_root if it knows better.
+    let repo_root = args
+        .get("repo_root")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| ctx.meta.project_dir.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "WorktreeRemove: no repo_root resolvable (set args.repo_root or meta.project_dir)"
+            )
+        })?;
+
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("worktree").arg("remove").arg(&path);
+    cmd.arg("-C").arg(&repo_root).arg("worktree").arg("remove").arg(&path);
     if force {
         cmd.arg("--force");
     }
@@ -479,15 +623,14 @@ async fn exec_worktree_remove(args: &Value) -> Result<OpEffect> {
         .await
         .map_err(|e| anyhow!("git worktree remove spawn: {e}"))?;
     if !output.status.success() {
-        // Fall back to `rm -rf` if the worktree wasn't tracked by git
-        // (manual mkdir, half-aborted prior arc, etc.). This is
-        // bounded by the path being inside the original
-        // ${meta.arc_workdir} which the engine controls.
-        let _ = tokio::process::Command::new("rm")
-            .arg("-rf")
-            .arg(&path)
-            .output()
-            .await;
+        // No `rm -rf` fallback — that would erase whatever path the
+        // workflow author templated, with no containment guarantee.
+        // Operator can clean a non-git-tracked path manually; engine
+        // surfaces the git error verbatim so the cause is visible.
+        bail!(
+            "git worktree remove failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     Ok(OpEffect::SetWorktree(None))
 }
@@ -517,6 +660,73 @@ fn exec_set_meta(args: &Value) -> Result<OpEffect> {
 mod tests {
     use super::*;
     use crate::workflow::context::{ArcContext, ArcMeta};
+
+    #[tokio::test]
+    async fn find_first_returns_match() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::FindFirst,
+            args: json!({
+                "from": [
+                    {"head": {"ref": "feat/x"}, "number": 1},
+                    {"head": {"ref": "fix/issue-42"}, "number": 2},
+                    {"head": {"ref": "fix/issue-99"}, "number": 3}
+                ],
+                "where": {"head.ref": "fix/issue-42"}
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("matched".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "matched");
+                assert_eq!(value, json!({"head": {"ref": "fix/issue-42"}, "number": 2}));
+            }
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn find_first_returns_null_on_no_match() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::FindFirst,
+            args: json!({
+                "from": [{"head": {"ref": "feat/x"}}],
+                "where": {"head.ref": "absent"}
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("matched".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { value, .. } => assert_eq!(value, Value::Null),
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn find_first_handles_null_input() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::FindFirst,
+            args: json!({
+                "from": null,
+                "where": {"x": 1}
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("matched".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { value, .. } => assert_eq!(value, Value::Null),
+            _ => panic!("expected SetVar"),
+        }
+    }
 
     #[tokio::test]
     async fn set_var_writes_value() {

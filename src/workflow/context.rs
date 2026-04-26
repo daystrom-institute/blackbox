@@ -257,7 +257,8 @@ impl ArcContext {
     /// 2. `head == "outputs"`  → walk into `outputs`
     /// 3. `head == "meta"`     → walk into `meta`
     /// 4. `head == "last_signal"` → walk into `last_signal`
-    /// 5. legacy `${NodeName.output}` form → equivalent to
+    /// 5. `head == "env"`      → process env var lookup (`${env.NAME}`)
+    /// 6. legacy `${NodeName.output}` form → equivalent to
     ///    `${outputs.NodeName}` when `tail == "output"`; this preserves
     ///    every existing template in the codebase.
     ///
@@ -315,6 +316,17 @@ impl ArcContext {
             "last_signal" => {
                 let s = serde_json::to_value(self.last_signal.as_ref()?).ok()?;
                 walk_value(&s, &parts[1..])
+            }
+            "env" => {
+                // ${env.NAME} — single-segment env lookup. Always
+                // returns Value::String. Missing env yields None so
+                // the templater leaves `${env.NAME}` verbatim — caller
+                // sees the unresolved reference instead of a silent
+                // empty substitution.
+                if parts.len() != 2 {
+                    return None;
+                }
+                std::env::var(parts[1]).ok().map(Value::String)
             }
             // Legacy ${NodeName.output} → outputs.NodeName
             other if parts.len() == 2 && parts[1] == "output" => {
@@ -382,10 +394,18 @@ fn value_kind_name(v: &Value) -> &'static str {
 pub fn resolve_arg_value(ctx: &ArcContext, raw: &Value) -> Result<Value> {
     match raw {
         Value::String(s) => {
-            // Whole-string templating: ${...} with no surrounding
-            // characters means "give me the resolved value, typed".
+            // Whole-string templating: a string that is EXACTLY one
+            // `${expr}` resolves to the typed value (so `${vars.n}`
+            // where n is an int yields Value::Number, not "42"). Any
+            // string with surrounding chars OR multiple interpolations
+            // renders as text — `${a}/x/${b}` must NOT be parsed as a
+            // single expression even though it starts/ends with the
+            // template delimiters.
             let trimmed = s.trim();
-            if trimmed.starts_with("${") && trimmed.ends_with('}') {
+            let is_whole_string_template = trimmed.starts_with("${")
+                && trimmed.ends_with('}')
+                && find_close_brace(trimmed, 2) == Some(trimmed.len() - 1);
+            if is_whole_string_template {
                 let expr = &trimmed[2..trimmed.len() - 1];
                 ctx.resolve(expr)
                     .ok_or_else(|| anyhow!("template expr '{expr}' did not resolve"))
@@ -521,6 +541,40 @@ mod tests {
         let c = ctx();
         let rendered = c.render_template("prior: ${Implement.output}");
         assert_eq!(rendered, "prior: PR #117 opened");
+    }
+
+    #[test]
+    fn render_template_resolves_env_head() {
+        let c = ctx();
+        std::env::set_var("CTX_TEST_HEAD", "hello");
+        let rendered = c.render_template("${env.CTX_TEST_HEAD} world");
+        assert_eq!(rendered, "hello world");
+    }
+
+    #[test]
+    fn resolve_arg_value_whole_string_keeps_typing() {
+        // Single ${vars.n} returns Value::Number, not stringified.
+        let c = ctx();
+        let raw = json!("${vars.issue}");
+        let resolved = resolve_arg_value(&c, &raw).unwrap();
+        assert_eq!(resolved, json!(42));
+    }
+
+    #[test]
+    fn resolve_arg_value_multi_interpolation_renders_as_string() {
+        // The bug: a URL with two interpolations starts with `${` and
+        // ends with `}` but is NOT a single whole-string template.
+        // Must render as text via the templater, not parsed as one
+        // expression — that produced the broken
+        // `'env.X}/path/${vars.y' did not resolve` error.
+        let c = ctx();
+        std::env::set_var("CTX_TEST_BASE", "http://host:3000");
+        let raw = json!("${env.CTX_TEST_BASE}/repos/${vars.repo}/issues/${vars.issue}");
+        let resolved = resolve_arg_value(&c, &raw).unwrap();
+        assert_eq!(
+            resolved,
+            json!("http://host:3000/repos/foo/bar/issues/42")
+        );
     }
 
     #[test]
