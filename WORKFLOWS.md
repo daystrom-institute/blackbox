@@ -627,6 +627,10 @@ returned `arc_thread_id` is the audit handle.
 | `bbox_notes(thread_id=<arc>)`            | Every structured note the engine wrote (kind: done / learned / surprise / blocked). |
 | `bbox_inbox`                              | Arcs currently flagged for attention (failed, blocked, etc.).          |
 | `bro_arc_status(arc_id=<id>)`            | Snapshot + pending-wait registrations for one arc.                     |
+| `bro_signals(signal=, since=, outcome=)` | Recent signal-dispatch events as a bounded ring buffer. Each entry: `(timestamp, signal, correlation, outcome, matched_arc_id, idle_pending)`. On `outcome=no_matching_wait` the `idle_pending` snapshot shows what waits were registered with the same signal name but didn't match — the diff between what arrived and what was waiting is one read away. |
+| `bro_webhook_deliveries(name=, since=, verdict_classification=)` | Recent webhook deliveries (live + replay). Each entry: extracted entity, routing verdict classification, response. Filter by name to focus on one inlet. |
+| `bro_webhook_replay(name, body, headers)` | Replay a synthetic payload through an installed webhook's extractor + routing packet WITHOUT dispatching. Returns the extracted entity + verdict consequent (after `${entity.X}` substitution). Recorded into the same delivery buffer with `source: replay`. |
+| `bro_arc_cancel(arc_id=<id>)`            | Trip an arc's cancellation token. Runner observes between node iterations and inside Wait suspensions, exits with status `cancelled`, runs `on_arc_cancel` + `on_arc_exit`. |
 | HTTP `GET /tail` (SSE)                   | Live event stream from the daemon — every node_dispatch / hook_ok / wait_registered / gate_applied / ... |
 
 Compaction anchors: at every node boundary the engine writes a
@@ -744,9 +748,15 @@ If you don't want to hand-write specs:
 - Always pair with `bro_orchestrate_run(workflow, dry_run=true)` to
   validate before dispatching.
 
-For runtime debugging:
+For runtime debugging — the canonical "an arc is stuck, why?" loop:
 
-- `POST /webhook/<name>/replay` with the actual payload to inspect
-  what the routing packet would do, no arc spawned.
-- `bro_arc_status(arc_id=<id>)` for the current snapshot + pending waits.
-- `bbox_notes(thread_id=<arc>)` for the audit trail.
+1. **`bro_arc_status`** — confirm the arc is parked, see which node, see the registered wait correlations.
+2. **`bro_signals(signal=<name>)`** — did the signal the arc is waiting on actually arrive? `outcome=matched` means the wait resolved (arc should have advanced; if it didn't, look at the gate). `outcome=no_matching_wait` means the signal arrived but its correlation didn't match any pending wait — `idle_pending` shows what was waiting at dispatch time, the diff between that and the signal's correlation IS the bug (typed `pr: 24` vs string `pr: "24"` is the classic).
+3. **`bro_webhook_deliveries(name=<webhook>)`** — if the signal never arrived, walk back one step. Did the webhook actually arrive? What did the routing packet classify it as? `verdict_classification` of `ignore` / `no_match` for an event you expected to route reveals a missing or mis-shaped routing rule. `extracted_entity` shows what the extractor projected — useful when the routing rule isn't matching because the event field's actual value differs from what the rule expects (Forgejo sends `action: synchronized` not `synchronize`, etc.).
+4. **`bro_webhook_replay(name, body, headers)`** — once you suspect a routing-rule fix, replay a synthetic payload through the same path the live webhook would take, see the verdict, iterate without needing the upstream to fire a real event.
+5. **`bbox_notes(thread_id=<arc>)`** — the arc's audit trail with structured notes (done / learned / surprise / blocked) and rolling `ANCHOR` compaction summaries.
+
+Control:
+
+- `bro_arc_cancel(arc_id)` — manually stop a runaway / mis-dispatched / no-longer-relevant arc. Cleanup hooks fire automatically.
+- `cancel_arc` routing verdict — emit from a routing packet to cancel arcs by correlation tuple (e.g. an upstream "PR closed without merge" event cancelling the arc that was waiting on its merge).

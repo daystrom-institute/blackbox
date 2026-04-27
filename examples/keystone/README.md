@@ -199,6 +199,21 @@ The feedback-loop subworkflow (`workflows/implementer-feedback-arc.json`) runs i
 
 ## Live observation
 
+The MCP-side observability surface (preferred — these stay inside the tool surface and don't need raw HTTP):
+
+| Goal | Tool |
+|---|---|
+| Live in-flight arc state + pending waits | `bro_arc_status` |
+| Recent signal-dispatch events: matched vs idle, with the pending-wait diff on idle | `bro_signals(signal=, since=, outcome=)` |
+| Recent webhook deliveries: extracted entity + routing verdict + response | `bro_webhook_deliveries(name=, since=)` |
+| Replay a synthetic webhook payload through the routing packet without firing an arc | `bro_webhook_replay(name, body, headers)` |
+| Cancel a runaway / mis-dispatched arc | `bro_arc_cancel(arc_id)` |
+| Arc audit trail + latest compaction anchor | `bbox_notes(thread_id=<arc>)` |
+
+Canonical "an arc is stuck, why?" loop: `bro_arc_status` → see which node + the wait correlation → `bro_signals(signal=<name>)` to see if the signal arrived (and on `no_matching_wait`, what waits had the same signal name with what correlations) → if no signal at all, `bro_webhook_deliveries(name=<webhook>)` to walk back to whether the webhook arrived and how it routed → if routing classified `ignore` / `no_match` for an event you expected to route, `bro_webhook_replay` to iterate on the rule.
+
+HTTP surfaces (when MCP isn't available — e.g. shell scripts):
+
 ```sh
 # stream every event the engine emits (SSE)
 curl -N http://127.0.0.1:7265/tail

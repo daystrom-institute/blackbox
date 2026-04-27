@@ -185,6 +185,23 @@ The arc is reconstructable from the thread alone. Observers (you, other sessions
 - **Durable actors persist within one arc, not across runs.** Fresh `bro orchestrate run` starts fresh sessions.
 - **Empty `actor` is legal** for hook-only / pure-routing nodes; the validator only complains when a non-empty actor name fails to resolve.
 
+## Debugging arcs at runtime
+
+When an arc parks unexpectedly or a webhook seems not to route, the canonical loop walks the chain backward from the arc to the inlet:
+
+1. **`bro_arc_status(arc_id=…)`** — confirm the arc is parked, see which node, see the registered wait correlations (typed `Number(24)` vs string `"24"` is a classic mismatch).
+2. **`bro_signals(signal=<name>)`** — did the signal the arc is waiting on actually arrive?
+   - `outcome=matched` → wait resolved (if arc still didn't advance, look at the gate that follows).
+   - `outcome=no_matching_wait` → signal arrived but its correlation didn't match any pending wait. The captured `idle_pending` snapshot shows what waits had the same signal name — the diff between that and the signal's correlation IS the bug.
+3. **`bro_webhook_deliveries(name=<webhook>)`** — if no signal arrived at all, walk back one step. Did the webhook arrive? What did the routing packet classify it as? `verdict_classification` of `ignore` / `no_match` for an event you expected to route reveals a missing or mis-shaped routing rule. `extracted_entity` shows what the extractor projected — useful when the routing rule isn't matching because the event's actual value differs from what the rule expects (e.g. Forgejo sends `action: "synchronized"` not `"synchronize"`).
+4. **`bro_webhook_replay(name, body, headers)`** — once you suspect a routing-rule fix, replay a synthetic payload through the same path the live webhook would take. See the verdict, iterate without needing the upstream to fire a real event.
+5. **`bbox_notes(thread_id=<arc>)`** — the arc's audit trail (done / learned / surprise / blocked) plus rolling `ANCHOR` compaction summaries.
+
+Control:
+
+- **`bro_arc_cancel(arc_id)`** — manually stop a runaway / mis-dispatched / no-longer-relevant arc. The runner observes between node iterations and inside Wait suspensions, exits with status `cancelled`, runs `on_arc_cancel` (if declared) followed by `on_arc_exit`. Cleanup hooks (worktree teardown, etc.) fire automatically.
+- **`cancel_arc` routing verdict** — emit from a routing packet to cancel arcs by correlation tuple (e.g. an upstream "PR closed without merge" event cancelling the arc that was waiting on its merge).
+
 ## When NOT to use a workflow
 
 - The problem genuinely needs free-form dialogue — a graph constraint fights you.
