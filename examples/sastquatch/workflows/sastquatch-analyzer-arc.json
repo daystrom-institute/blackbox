@@ -13,7 +13,7 @@
   },
   "actors": {
     "triager": {
-      "kind": "triager",
+      "kind": "executor",
       "brofile": "sastquatch-triager",
       "durable": false,
       "requires": []

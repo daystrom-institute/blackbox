@@ -1178,21 +1178,6 @@ impl<'a> WorkflowRunner<'a> {
                 self.run_ensemble_node(node_id, actor, &actor_name, &prompt)
                     .await?;
             }
-            ActorKind::Advisor | ActorKind::Planner | ActorKind::Triager => {
-                // Advisor / Planner / Triager are single-bro dispatches
-                // that share the executor mechanics — same session
-                // resolution, same retry path, same output capture.
-                // The distinction is the *contract*: advisors render
-                // judgment, planners author a plan/charter, triagers
-                // pick from a queue. Brofile lens carries the persona
-                // and an optional `output_schema` validator on the
-                // node's `on_exit` enforces structured output.
-                self.run_executor_node(node_id, actor, &actor_name, &prompt)
-                    .await?;
-            }
-            ActorKind::User => {
-                self.run_user_node(node_id, &prompt)?;
-            }
         }
 
         // Fork dispatch: if this activity node's `next` is a Fork,
@@ -1390,10 +1375,7 @@ impl<'a> WorkflowRunner<'a> {
         })?;
         let prompt = self.render_prompt(spec.prompt.as_deref().unwrap_or(""));
         match &actor.kind {
-            ActorKind::Executor
-            | ActorKind::Advisor
-            | ActorKind::Planner
-            | ActorKind::Triager => {
+            ActorKind::Executor => {
                 let brofile = actor.brofile.as_deref().ok_or_else(|| {
                     anyhow!("async target '{target_id}' executor missing brofile")
                 })?;
@@ -1470,9 +1452,6 @@ impl<'a> WorkflowRunner<'a> {
                         tasks,
                     },
                 );
-            }
-            ActorKind::User => {
-                bail!("fork: async target '{target_id}' is a user node — can't fire-and-forget");
             }
         }
         Ok(())
@@ -1927,27 +1906,6 @@ impl<'a> WorkflowRunner<'a> {
             ),
         );
         Ok(())
-    }
-
-    fn run_user_node(&mut self, node_id: &str, prompt: &str) -> Result<()> {
-        // v0 user semantics: halt the run with a structured escalation.
-        // Resume via re-invocation is phase-next (wants arc-thread
-        // persistence). For today, this is a clean stop with enough
-        // context for the user to respond in whatever channel they
-        // prefer.
-        let preview: String = prompt.chars().take(500).collect();
-        self.log_event(
-            "user_pause",
-            json!({
-                "node": node_id,
-                "message": preview.clone(),
-            }),
-        );
-        self.arc_note(
-            "blocked",
-            &format!("paused at user node '{node_id}' — {preview}"),
-        );
-        bail!("paused at user node '{node_id}' — resolve and re-dispatch");
     }
 
     fn render_prompt(&self, template: &str) -> String {

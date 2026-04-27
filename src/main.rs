@@ -17,6 +17,7 @@ mod threads;
 mod tool_docs;
 mod util;
 mod webhooks;
+mod whiteboards;
 mod workflow;
 
 use std::collections::{BTreeMap, HashMap};
@@ -2852,7 +2853,7 @@ impl BlackboxServer {
 === OUTPUT INSTRUCTIONS ===\n\
 Output ONLY the JSON workflow spec — no preamble, no prose explanation, no trailing commentary. Start with `{{` and end with `}}`. You may wrap in ```json fences; the parser handles both.\n\n\
 Constraints:\n\
-- Use actor kinds only from {{executor, ensemble, advisor, user}}.\n\
+- Use actor kinds only from {{executor, ensemble}}. Persona / role / contract (advisor, triager, planner, facilitator, specialist, …) is the brofile lens + prompt + on_exit `parse_json` validator — not an engine type.\n\
 - Cross-reference every `actor` field in nodes to a declared actor name.\n\
 - Every activity node in the graph must have a matching entry in `nodes`.\n\
 - Every `nodes` entry (except ones with `subworkflow`) needs an `actor`.\n\
@@ -3032,15 +3033,7 @@ Constraints:\n\
         use std::collections::HashSet;
         let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
         match actor.kind {
-            workflow::schema::ActorKind::User => {
-                // User nodes have no provider — capability check trivially OK.
-                // Hook-only / pure-routing nodes (empty actor name) are
-                // never resolved through this path.
-            }
-            workflow::schema::ActorKind::Executor
-            | workflow::schema::ActorKind::Advisor
-            | workflow::schema::ActorKind::Planner
-            | workflow::schema::ActorKind::Triager => {
+            workflow::schema::ActorKind::Executor => {
                 let brofile_name = actor.brofile.as_deref().ok_or_else(|| {
                     format!("actor (kind={:?}) missing brofile", actor.kind)
                 })?;

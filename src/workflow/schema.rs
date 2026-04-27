@@ -75,35 +75,32 @@ pub struct ActorSpec {
     pub requires: Vec<Capability>,
 }
 
+/// Engine-level actor kinds. Two values: `executor` for single-bro
+/// dispatch, `ensemble` for team broadcast. Persona / role / contract
+/// (advisor, planner, triager, facilitator, specialist, reviewer, …)
+/// is a workflow-author concern carried by the brofile lens + prompt
+/// + on_exit `parse_json` validation, not an engine type.
+///
+/// `user` is intentionally NOT an engine kind. Human-in-the-loop and
+/// agent-in-the-loop both work through the same primitives ensemble
+/// dispatches use: post to a whiteboard via the `whiteboard_*` MCP
+/// surface, and the arc resumes via `wait_for_phase` when the board
+/// transitions. See `WORKFLOWS.md` § Whiteboards.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorKind {
-    /// Single-bro worker (dispatched via bro_exec / bro_resume).
+    /// Single-bro worker. Dispatched via `bro_exec` (or `bro_resume`
+    /// when the actor is durable). Used for every single-bro role
+    /// the workflow declares — implementer, fixer, triager, planner,
+    /// facilitator, advisor, aggregator, synthesizer, etc. The
+    /// brofile + prompt carry the persona.
     Executor,
-    /// Ensemble broadcast (dispatched via bro_broadcast + bro_when_all).
+    /// Ensemble broadcast. Dispatched via `bro_broadcast` +
+    /// `bro_when_all`. Each member runs the same prompt; outputs are
+    /// labeled and concatenated. When the node has an associated
+    /// whiteboard board, each member's STRICT-JSON output is also
+    /// auto-posted to the board.
     Ensemble,
-    /// Advisor LLM — a single bro used for judgment calls, narrow tool
-    /// surface. Distinct from executor mainly by convention / lens.
-    Advisor,
-    /// Strategic actor: looks at arc state + accessible tools and
-    /// emits a plan / sequence / charter that downstream nodes
-    /// consume. Mechanically a single-bro dispatch (same path as
-    /// executor); the distinction is the contract — its output is
-    /// expected to be structured (often JSON) and to drive subsequent
-    /// dispatch shape, not user-facing text. Pair with an
-    /// `output_schema` validator hook on `on_exit` to enforce the
-    /// contract.
-    Planner,
-    /// Selection actor: takes a queue / set of candidates (typically
-    /// produced by an upstream `mcp_call` or planner) and picks the
-    /// next one(s) to act on, with rationale. Same dispatch path as
-    /// executor; distinct intent from planner — planner authors a
-    /// plan, triager picks from a plan or pool. Most arcs that have
-    /// a planner will also have a triager downstream.
-    Triager,
-    /// Human operator. Invoking a user node means: pause, surface to
-    /// inbox, wait for resolve.
-    User,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
