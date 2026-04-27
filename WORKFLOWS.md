@@ -157,10 +157,18 @@ Declared in the workflow's `actors` map and referenced by node specs.
 
 | Kind       | What it does                                            |
 |------------|---------------------------------------------------------|
-| `executor` | Single bro dispatched via `bro_exec` / `bro_resume`.    |
+| `executor` | Single bro dispatched via `bro_exec` / `bro_resume`. Does the work.    |
 | `ensemble` | Team broadcast: every member runs the same prompt; output is the labeled concatenation. |
-| `advisor`  | Like executor; convention is narrower tool surface / persona lens. |
+| `advisor`  | Like executor; convention is narrower tool surface / persona lens. Renders judgement, doesn't write code. |
+| `planner`  | Single bro (executor mechanics). Contract: emits a structured plan / sequence / charter that downstream nodes consume — output is dispatch-shape-driving, not user-facing text. Pair with `parse_json` on `on_exit` to enforce structured output. |
+| `triager`  | Single bro (executor mechanics). Contract: takes a queue / set of candidates (typically produced upstream by `mcp_call` or a planner) and picks the next one(s) to act on, with rationale. Same shape as planner, distinct intent: planner authors a plan, triager picks from a pool. |
 | `user`     | Halts the arc with a `blocked` note carrying the prompt. Resume = re-dispatch with whatever resolves the pause. |
+
+`planner` and `triager` are dispatch-mechanically identical to
+`executor` — same brofile resolution, same retry path, same output
+capture. The difference is the *contract* (structured selection vs.
+user-facing prose), enforced by convention + an `output_schema`-style
+hook on `on_exit`. The brofile lens carries the persona.
 
 For hook-only / pure-routing nodes (Setup / Done patterns where the
 work is on_enter / on_exit hooks and there's no LLM dispatch), leave
@@ -281,6 +289,7 @@ the operator-blessed allow set: `allow`, `pass`, `proceed`, `fire`,
 | `set_meta`            | Update `meta.worktree` directly (only mutable meta field today). |
 | `http_json`           | Generic HTTP request → response into_var. Workflow author composes URL/headers/body using `${env.X}` + `${vars.X}` templates to express any code-host integration without baking platform-specific ops into the engine. `response_kind`: `json` (default — parse, error on non-JSON), `text` (capture body as-is, e.g. for `.diff` URLs), or `auto` (try JSON, fall back to text). `expect_status`: optional override of the default 2xx success window. |
 | `find_first`          | Find the first element of an array variable whose nested fields all equal the targets in `where`, write into_var. Writes `Value::Null` (not Err) when no match — downstream `IsNull` / `IsNonNull` packets branch cleanly. Composable primitive for "find existing PR for this branch" / "find label by name" without baking platform-specific search ops or relying on upstream API filters that may be broken. `where` keys use dotted paths (e.g. `head.ref`). |
+| `mcp_call`            | Outbound MCP tool call — sibling of `http_json` but speaking MCP JSON-RPC. Resolves `args.server` against the existing `bro_mcp` registry (global `~/.bro/mcp.json` + project overlay), opens a transient client (stdio child-process or streamable HTTP), invokes `args.tool` with `args.arguments`, captures the result into `vars[into_var]`. Tool errors (`is_error: true`) become op failures so `on_failure` fires. Result normalization preserves typing when `structured_content` is present, falls back to JSON-parsed text content otherwise. Args: `{server, tool, arguments?, timeout_secs?}` (default 300s). Use for engine-level grounding calls — `sast_run` / `sast_findings` against biofilter, `bbox_thread` / `bbox_note` against blackbox-self — instead of dispatching a bro just to make a tool call. |
 
 ### `worktree_create` semantics
 
@@ -487,7 +496,31 @@ Domain refs let workflow + webhook specs survive packet recompiles
 without re-edit. Audit events name the resolved `packet-id` so you
 always know which compile actually fired.
 
-## Webhook ingress
+## Inlets — webhook, poller, cron
+
+Three inlet primitives, all converging on the same dispatch pipeline:
+
+```text
+<inlet emits a flat entity>
+  → extractor.project(payload)       [JSON → flat entity]
+  → routing_packet.apply(entity)     [verdict]
+  → routing::resolve_entity_template [substitute ${entity.X} with typed values]
+  → RoutingVerdict::parse            [typed verdict]
+  → dispatch_verdict(...)            [start_arc | signal_arc | cancel_arc | ignore | dead_letter]
+```
+
+The shared dispatch path is `crate::dispatch_routed_event`. Routing
+rules don't know which inlet fed them — they see a flat entity and a
+routing-packet id, the rest is the engine's problem. Pick the inlet
+that matches your trigger source:
+
+| Inlet     | Trigger source            | Spec lives in                | When to use |
+|-----------|---------------------------|------------------------------|-------------|
+| Webhook   | External HTTP POST + signature | `webhooks/<name>.json`  | Upstream pushes to you (Forgejo / GitHub / Stripe / generic JSON). Lower latency than polling, but needs ingress. |
+| Poller    | Scheduled HTTP fetch (data rides on the tick) | `pollers/<name>.json` | Upstream is poll-only OR you have no public ingress. Carries an `HttpFetchSpec` + optional `iterate` for array responses + dedup ring. |
+| Cron      | Calendar / clock (no fetch — entity is operator-supplied `payload`) | `crons/<name>.json` | Trigger is time-based, not event-based. Nightly maintenance, hourly sweeps, scheduled SAST squashing. The dispatched arc does its own data acquisition (typically via `mcp_call` hooks). Concurrency cap (default 1) skips ticks while a prior arc is still in flight. |
+
+### Webhook
 
 Webhooks are operator-installed (signature scheme + Extractor +
 routing packet). The pipeline:
@@ -591,6 +624,97 @@ POST `/webhook/<name>/replay` with the same payload runs extractor →
 routing packet → verdict **without dispatching**. Use to debug routing
 rules without firing arcs.
 
+### Poller
+
+Scheduled HTTP-source inlet — operationally "a webhook whose source is
+a tokio interval pulling from a URL instead of an inbound POST." Spec
+shape:
+
+```jsonc
+{
+  "name": "forgejo-open-issues",
+  "every_seconds": 120,
+  "source": {
+    "method": "GET",
+    "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/owner/repo/issues?state=open",
+    "headers": { "Accept": "application/json" }
+  },
+  "iterate":      { "kind": "json_path", "path": "$" },
+  "extractor":    { "outputs": { ... } },
+  "dedup_id_path": { "kind": "json_path", "path": "$.id" },
+  "routing_packet": "domain:webhook-routing/forgejo",
+  "default_project_dir": "/path/to/local/clone"
+}
+```
+
+- `every_seconds` is clamped above `BBOX_POLLER_MIN_INTERVAL_SECS`
+  (default 5s) — operators can't accidentally hammer an upstream.
+- `source` is the same `HttpFetchSpec` shape the workflow `http_json`
+  op consumes. `${env.X}` is resolved at spec-load time (no per-tick
+  ArcContext to resolve `${vars.X}` against — credentials live in env).
+- `iterate` (optional) — array path; each element becomes its own
+  event (extractor runs per-element). Absent → whole response is one
+  event.
+- `dedup_id_path` (optional) — stable id per item; in-memory recent-
+  seen ring (1024 cap, per-poller, resets on daemon restart). Repeated
+  items are dropped before dispatch.
+
+Manage with `bro_poller_install` / `bro_poller_list` MCP tools, or the
+plain-HTTP `/admin/poller/install` endpoint. Persisted under
+`store_dir/pollers/<name>.json`; restored on daemon startup.
+
+### Cron
+
+Calendar-driven inlet — sibling of webhook + poller. Distinction from
+poller: poller fetches HTTP per tick (data rides on the tick), cron
+carries no fetch (entity is operator-supplied `payload` plus synthetic
+`cron_name` + `tick_at` fields). Use cron when the trigger is time-
+based and the dispatched arc itself does the data acquisition.
+
+```jsonc
+{
+  "name": "sastquatch-daily",
+  "schedule": "0 0 9 * * *",       // 6-field: sec min hour dom mon dow
+  "payload": {
+    "owner": "sastquatch-admin",
+    "repo": "quat"
+  },
+  "concurrency": 1,                 // 0 disables the cap
+  "routing_packet": "domain:cron-routing/sastquatch",
+  "default_project_dir": "/path/to/local/clone"
+}
+```
+
+- `schedule` uses the `cron` crate's 6- or 7-field form (seconds-first;
+  prefix a classic 5-field cron with `0 ` to run-at-second-0). Validated
+  at install time. `bro_cron_upcoming` is a pure helper that returns
+  the next N scheduled times for a candidate expression — use to sanity-
+  check before installing.
+- `payload` is operator-supplied entity fields. Synthetic `cron_name`
+  and `tick_at` (RFC3339 UTC) are merged in at tick time so routing
+  rules can discriminate without operator boilerplate. Operator-supplied
+  keys win on collision.
+- `concurrency` caps in-flight arcs spawned by this cron. Default 1
+  (skip ticks while a prior arc is still running — the most common
+  case for daily sweeps). Set 0 to lift the cap. The counter
+  decrements when the dispatched arc terminates; failed dispatches
+  refund immediately.
+- The routing-packet entity sees `{cron_name, tick_at, ...payload}`.
+  Most cron arcs route to `start_arc` unconditionally, but you can
+  branch on `cron_name` if multiple crons share a routing packet.
+
+Manage with `bro_cron_install` / `bro_cron_list` / `bro_cron_upcoming`
+MCP tools, or the plain-HTTP `/admin/cron/install` endpoint. Persisted
+under `store_dir/crons/<name>.json`; restored on daemon startup.
+
+### Inlet selection cheat sheet
+
+- **Event arrives at known time, low frequency, you control the source** → webhook.
+- **Event arrives at known time but you can't push (closed network, polling-only API)** → poller.
+- **Trigger is time-based, no upstream event to react to** → cron.
+- **Resilience layering** → webhook + poller against the same upstream, accept the duplicate-dispatch cost (workflow-level idempotency catches it).
+- **Event-driven AND time-bounded** (e.g. "open a PR but auto-close after 7 days") → webhook for the open, cron sweeping for the close.
+
 ## Operator-blessed registries
 
 Three registries, all persisted to disk and restored on daemon
@@ -665,22 +789,31 @@ spawn arc
   `${entity.X}` template substitution (resolved against the
   extracted entity before verdict parse) — same `${X}` shape the
   workflow templater uses, applied to a different scope
-- Two convergent event inlets: webhook ingress (signed inbound POST)
-  and poller (scheduled HTTP fetch). Both extract → route → dispatch
-  through one shared `dispatch_routed_event` so a workflow doesn't
-  care how it was triggered. Pollers reuse `HttpFetchSpec` (same
-  primitive the `http_json` op consumes), explode array responses
-  via `iterate`, dedup by operator-named id field, and resolve
-  `${env.X}` in source URL/headers per-tick (no secrets persisted
-  to disk).
+- Three convergent event inlets: webhook (signed inbound POST), poller
+  (scheduled HTTP fetch — data rides on the tick), cron (calendar-
+  driven, no fetch — entity is operator-supplied `payload` plus
+  synthetic `cron_name` + `tick_at`). All three extract → route →
+  dispatch through one shared `dispatch_routed_event` so a workflow
+  doesn't care how it was triggered. Pollers reuse `HttpFetchSpec`
+  (same primitive the `http_json` op consumes), explode array
+  responses via `iterate`, dedup by operator-named id field, and
+  resolve `${env.X}` in source URL/headers per-tick (no secrets
+  persisted to disk). Crons use the `cron` crate's 6-field expression
+  form, support a `concurrency` cap (default 1, skip ticks while a
+  prior arc is in flight; set 0 to disable), and decrement the
+  in-flight counter when the dispatched arc terminates.
 - Hook lifecycle: on_enter, on_exit, on_arc_exit, on_arc_cancel
 - Op catalog: SetVar, IncVar, AppendVar, MergeVar, ParseJson, Shell,
   WorktreeCreate (with smart branch reuse), WorktreeRemove, SetMeta,
   HttpJson (generic HTTP; `response_kind: json|text|auto`),
   FindFirst (array search by dotted-path equality — composable
-  primitive for idempotent lookups). Engine carries no platform
-  knowledge; workflow author composes generic ops + `${env.X}` +
-  `${vars.X}` to express any code-host integration.
+  primitive for idempotent lookups), McpCall (outbound MCP tool
+  call — JSON-RPC over stdio child-process or streamable HTTP;
+  resolves server name through the existing `bro_mcp` registry; lets
+  hooks inject deterministic tool results without dispatching a bro).
+  Engine carries no platform knowledge; workflow author composes
+  generic ops + `${env.X}` + `${vars.X}` to express any code-host
+  integration.
 - Hook gating via `when: domain:...` + `on_failure: halt|warn|ignore`
   (gate-packet errors route through `on_failure` too — no silent skips)
 - Terminal hook `halt` failures rewrite `meta.arc_outcome` to `failed:
@@ -696,8 +829,12 @@ spawn arc
   for `sha256=` style senders), None for loopback-only testing,
   idempotency dedup, replay endpoint, default-deny on no-match
 - Operator-blessed registries (workflows / webhooks) + admin HTTP
-- Actor kinds: executor, ensemble, advisor, user (plus the empty
-  `actor` form for hook-only nodes)
+- Actor kinds: executor, ensemble, advisor, planner, triager, user
+  (plus the empty `actor` form for hook-only nodes). Planner +
+  triager are dispatch-mechanically identical to executor — same
+  brofile resolution, retry path, output capture — distinct only in
+  contract (planner authors a plan; triager picks from a pool). Pair
+  with `parse_json` on `on_exit` to enforce structured output.
 - Transition shapes: `goto` (forward edges + back-edges), `branch`
   (verdict-routed multi-way with optional `default`), `fork`
   (fire-and-forget side-dispatch + `continue_to`) paired with
@@ -730,6 +867,11 @@ spawn arc
 
 ## Examples
 
+- [`examples/sastquatch/`](examples/sastquatch/README.md) — end-to-end:
+  cron tick → analyzer (mcp_call → biofilter sast_*; triager picks a
+  finding cluster) → fixer subworkflow → wait → ensemble reviewer →
+  loop on feedback → auto-merge. The reference arc for cron + mcp_call +
+  planner/triager.
 - [`examples/keystone/`](examples/keystone/README.md) — end-to-end:
   Forgejo webhook → arc → implementer subworkflow → wait → reviewer
   ensemble → wait-loop until merged → cleanup hooks. Real LLM

@@ -7,3 +7,5 @@
 
 # keystone-arc demo writes admin token + webhook secret here on bootstrap.
 examples/keystone/.env
+# sastquatch demo: same pattern.
+examples/sastquatch/.env

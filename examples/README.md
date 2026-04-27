@@ -22,6 +22,17 @@ JSON specs consumed by `bro orchestrate run`. Each one declares actors and nodes
 
 See [`workflows/README.md`](workflows/README.md) for the authoring guide, the transition catalog, and the common traps.
 
+## End-to-end demos
+
+Operator-installable example arcs that wire a real upstream (Forgejo
+container) into the engine. Each ships a `docker-compose.yaml`,
+bootstrap, install, and run script.
+
+| Path | Trigger | What it does |
+|------|---------|--------------|
+| [`keystone/`](keystone/) | Forgejo `issues.opened` webhook (or poller alternative) | Implementer fixes the bug, opens a PR, reviewer ensemble votes, auto-merge on approval. The reference arc — most engine features touch it. |
+| [`sastquatch/`](sastquatch/) | Cron tick (calendar-driven; sibling primitive of webhook + poller) | Analyzer arc grounds itself by calling biofilter `sast_*` via `mcp_call`, triager picks a finding cluster, fixer arc applies the fix and opens a PR, ensemble reviewer votes, auto-merge. Exercises three primitives keystone doesn't: cron inlet, `mcp_call` op, `triager` actor kind. |
+
 ## Agents
 
 Drop-in subagent definitions for Claude Code. Install by copying into
