@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::workflow::extractor::Extractor;
-use crate::workflow::wait::canonicalize_correlation;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookSpec {
@@ -242,86 +241,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Dispatch verdict produced by a routing packet. Routing packets'
-/// rule consequents are JSON of this shape (or a simpler `route`-only
-/// form for `ignore` / `dead_letter`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "route", rename_all = "snake_case")]
-pub enum RoutingVerdict {
-    /// Spawn a fresh arc against the named workflow.
-    StartArc {
-        workflow: String,
-        #[serde(default)]
-        initial_vars: serde_json::Map<String, Value>,
-    },
-    /// Resolve a pending Wait by signal name + correlation tuple.
-    SignalArc {
-        signal: String,
-        #[serde(default)]
-        correlate: serde_json::Map<String, Value>,
-        /// Optional payload delivered to the resumed wait as
-        /// `${last_signal.payload}`. When omitted, the dispatcher
-        /// substitutes the full webhook entity (extractor output) so
-        /// downstream hooks like `set_var feedback_text =
-        /// ${last_signal.payload.review.body}` can pull from the
-        /// real event body without the routing rule having to hand-
-        /// pick what to forward.
-        #[serde(default)]
-        payload: Option<Value>,
-    },
-    /// Match-and-cancel running arcs by correlation.
-    CancelArc {
-        #[serde(default)]
-        correlate: serde_json::Map<String, Value>,
-    },
-    /// Drop silently (acknowledged but no action).
-    Ignore,
-    /// Drop loudly (write to bbox_inbox for forensics).
-    DeadLetter {
-        #[serde(default)]
-        reason: Option<String>,
-    },
-}
-
-impl RoutingVerdict {
-    pub fn parse(consequent: &Value) -> Result<RoutingVerdict> {
-        // Two shapes accepted:
-        // 1. Plain string shorthand: "ignore", "dead_letter".
-        // 2. JSON object with `route` discriminator. Because packet
-        //    rule consequents are typed packets::Value (scalar only),
-        //    routing rules carry the JSON object encoded as a string —
-        //    we try parse-as-JSON when we see a string starting with `{`.
-        // 3. Structured Value (already an object) — possible when the
-        //    consequent comes from a non-packet path (e.g. tests).
-        if let Some(s) = consequent.as_str() {
-            let trimmed = s.trim();
-            // Look for shorthand strings first.
-            match trimmed {
-                "ignore" => return Ok(RoutingVerdict::Ignore),
-                "dead_letter" => return Ok(RoutingVerdict::DeadLetter { reason: None }),
-                _ => {}
-            }
-            if trimmed.starts_with('{') {
-                let parsed: Value = serde_json::from_str(trimmed)
-                    .map_err(|e| anyhow!("routing verdict JSON in string: {e}"))?;
-                return serde_json::from_value(parsed)
-                    .map_err(|e| anyhow!("routing verdict shape: {e}"));
-            }
-            return Ok(RoutingVerdict::DeadLetter {
-                reason: Some(format!("unknown route shorthand '{trimmed}'")),
-            });
-        }
-        serde_json::from_value(consequent.clone())
-            .map_err(|e| anyhow!("routing verdict parse failed: {e}"))
-    }
-}
-
-/// Canonicalize a correlation tuple — same canonicalization the wait
-/// store uses, so equivalent tuples compare equal regardless of key
-/// order.
-pub fn canonicalize(corr: &serde_json::Map<String, Value>) -> String {
-    canonicalize_correlation(corr)
-}
+// `RoutingVerdict` lives in `crate::routing` — both webhook ingress
+// and (future) pollers feed extracted entities into the same dispatch
+// pipeline, so the verdict types are inlet-agnostic.
+pub use crate::routing::{canonicalize, RoutingVerdict};
 
 #[cfg(test)]
 mod tests {
@@ -338,67 +261,7 @@ mod tests {
         assert!(reg.check_delivery_id("wh", None));
     }
 
-    #[test]
-    fn routing_verdict_parses_canonical() {
-        let v = json!({"route": "start_arc", "workflow": "x", "initial_vars": {"a": 1}});
-        match RoutingVerdict::parse(&v).unwrap() {
-            RoutingVerdict::StartArc { workflow, initial_vars } => {
-                assert_eq!(workflow, "x");
-                assert_eq!(initial_vars.get("a"), Some(&json!(1)));
-            }
-            _ => panic!("expected StartArc"),
-        }
-    }
-
-    #[test]
-    fn routing_verdict_signal_arc() {
-        let v = json!({"route": "signal_arc", "signal": "pr-merged", "correlate": {"pr": 42}});
-        match RoutingVerdict::parse(&v).unwrap() {
-            RoutingVerdict::SignalArc {
-                signal,
-                correlate,
-                payload,
-            } => {
-                assert_eq!(signal, "pr-merged");
-                assert_eq!(correlate.get("pr"), Some(&json!(42)));
-                assert!(payload.is_none(), "payload defaults to None when omitted");
-            }
-            _ => panic!("expected SignalArc"),
-        }
-    }
-
-    #[test]
-    fn routing_verdict_signal_arc_with_payload() {
-        let v = json!({
-            "route": "signal_arc",
-            "signal": "pr-feedback",
-            "correlate": {"pr": 42},
-            "payload": {"review": {"body": "looks good"}}
-        });
-        match RoutingVerdict::parse(&v).unwrap() {
-            RoutingVerdict::SignalArc { payload, .. } => {
-                assert_eq!(
-                    payload,
-                    Some(json!({"review": {"body": "looks good"}}))
-                );
-            }
-            _ => panic!("expected SignalArc"),
-        }
-    }
-
-    #[test]
-    fn routing_verdict_string_shorthand() {
-        let v = json!("ignore");
-        assert!(matches!(
-            RoutingVerdict::parse(&v).unwrap(),
-            RoutingVerdict::Ignore
-        ));
-        let v = json!("dead_letter");
-        assert!(matches!(
-            RoutingVerdict::parse(&v).unwrap(),
-            RoutingVerdict::DeadLetter { .. }
-        ));
-    }
+    // RoutingVerdict tests live in `crate::routing` alongside the type.
 
     #[test]
     fn signature_none_passes_under_loopback() {

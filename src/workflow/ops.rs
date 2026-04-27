@@ -173,86 +173,16 @@ fn walk_dotted(root: &Value, path: &str) -> Option<Value> {
 }
 
 async fn exec_http_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
-    let url = args
-        .get("url")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("HttpJson requires args.url"))?;
-    let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
-    let timeout_secs = args
-        .get("timeout_secs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(30);
-    let expect_status = args.get("expect_status").and_then(|v| v.as_array());
-    let allow_empty = args
-        .get("allow_empty_body")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    // response_kind: "json" (default — parse, error on non-JSON),
-    // "text" (capture body as-is into the var as a string), or
-    // "auto" (try JSON, fall back to text on parse failure).
-    let response_kind = args
-        .get("response_kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("json");
-
-    let parsed_method = reqwest::Method::from_bytes(method.as_bytes())
-        .map_err(|e| anyhow!("HttpJson invalid method '{method}': {e}"))?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .map_err(|e| anyhow!("HttpJson client build: {e}"))?;
-    let mut req = client.request(parsed_method, url);
-    if let Some(headers) = args.get("headers").and_then(|v| v.as_object()) {
-        for (k, v) in headers {
-            let vs = v
-                .as_str()
-                .ok_or_else(|| anyhow!("HttpJson header '{k}' must be string"))?;
-            req = req.header(k, vs);
-        }
-    }
-    if let Some(body) = args.get("body") {
-        // Pass through whatever JSON shape the workflow author built.
-        req = req.json(body);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| anyhow!("HttpJson {method} {url}: send: {e}"))?;
-    let status = resp.status().as_u16();
-    let allow = match expect_status {
-        Some(arr) => arr.iter().any(|v| v.as_u64().is_some_and(|n| n as u16 == status)),
-        None => (200..300).contains(&status),
-    };
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| anyhow!("HttpJson {method} {url}: body: {e}"))?;
-    if !allow {
-        let preview: String = text.chars().take(500).collect();
-        bail!("HttpJson {method} {url}: HTTP {status}: {preview}");
-    }
-    let value = if text.trim().is_empty() {
-        if !allow_empty {
-            bail!("HttpJson {method} {url}: empty body but allow_empty_body=false");
-        }
-        Value::Null
-    } else {
-        match response_kind {
-            "text" => Value::String(text),
-            "auto" => serde_json::from_str(&text).unwrap_or(Value::String(text)),
-            "json" => serde_json::from_str(&text).map_err(|e| {
-                let preview: String = text.chars().take(200).collect();
-                anyhow!("HttpJson {method} {url}: response not JSON: {e}: {preview}")
-            })?,
-            other => bail!(
-                "HttpJson {method} {url}: invalid response_kind '{other}' (expected json|text|auto)"
-            ),
-        }
-    };
+    // Parse + execute via the shared HTTP-fetch primitive — same shape
+    // the daemon-level poller consumes. The op is a thin wrapper that
+    // also handles `into_var` capture; everything else (request build,
+    // status classification, response decoding) lives in http_fetch.
+    let spec = crate::orchestration::http_fetch::HttpFetchSpec::from_args(args)?;
+    let result = spec.execute().await?;
     match into_var {
         Some(k) => Ok(OpEffect::SetVar {
             key: k.to_string(),
-            value,
+            value: result.value,
         }),
         None => Ok(OpEffect::None),
     }

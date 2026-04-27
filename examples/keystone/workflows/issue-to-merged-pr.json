@@ -57,8 +57,8 @@
     "AwaitReviewTrigger": {
       "wait": {
         "any_of": [
-          { "signal": "pr-ready",  "correlate": {} },
-          { "signal": "pr-merged", "correlate": {} }
+          { "signal": "pr-ready",  "correlate": { "pr": "${vars.pr_number}" } },
+          { "signal": "pr-merged", "correlate": { "pr": "${vars.pr_number}" } }
         ],
         "timeout": "24h"
       },
@@ -72,8 +72,8 @@
     "AwaitFeedbackOrMerge": {
       "wait": {
         "any_of": [
-          { "signal": "pr-feedback", "correlate": {} },
-          { "signal": "pr-merged",   "correlate": {} }
+          { "signal": "pr-feedback", "correlate": { "pr": "${vars.pr_number}" } },
+          { "signal": "pr-merged",   "correlate": { "pr": "${vars.pr_number}" } }
         ],
         "timeout": "7d"
       },

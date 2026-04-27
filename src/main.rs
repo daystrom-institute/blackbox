@@ -8,6 +8,7 @@ mod parser;
 mod pins;
 mod query;
 mod render;
+mod routing;
 mod system_memory;
 mod threads;
 mod tool_docs;
@@ -4615,7 +4616,13 @@ async fn process_webhook(
         }
     };
 
-    let verdict = webhooks::RoutingVerdict::parse(&consequent_json)
+    // Resolve `${entity.X}` references inside the routing verdict
+    // (typed: `${entity.pr_number}` becomes `Number(117)`, not the
+    // string `"117"`) so routing rules can carry typed correlation
+    // tuples + payload selections without the rule author hand-
+    // encoding entity scalars.
+    let resolved_consequent = routing::resolve_entity_template(&entity, &consequent_json);
+    let verdict = routing::RoutingVerdict::parse(&resolved_consequent)
         .map_err(|e| anyhow::anyhow!("verdict parse: {e}"))?;
 
     dispatch_verdict(state.clone(), &spec, verdict, entity).await
@@ -4624,10 +4631,10 @@ async fn process_webhook(
 async fn dispatch_verdict(
     state: Arc<SharedState>,
     spec: &webhooks::WebhookSpec,
-    verdict: webhooks::RoutingVerdict,
+    verdict: routing::RoutingVerdict,
     entity: Value,
 ) -> anyhow::Result<Value> {
-    use webhooks::RoutingVerdict;
+    use routing::RoutingVerdict;
     match verdict {
         RoutingVerdict::Ignore => Ok(json!({"status": "ignored"})),
         RoutingVerdict::DeadLetter { reason } => {

@@ -635,6 +635,10 @@ spawn arc
 ## Currently implemented
 
 - ArcContext (vars / typed outputs / meta / last_signal / history) with full templating including `${env.X}` for credentials
+- Routing verdicts can carry typed correlation tuples + payload via
+  `${entity.X}` template substitution (resolved against the
+  extracted entity before verdict parse) — same `${X}` shape the
+  workflow templater uses, applied to a different scope
 - Hook lifecycle: on_enter, on_exit, on_arc_exit, on_arc_cancel
 - Op catalog: SetVar, IncVar, AppendVar, MergeVar, ParseJson, Shell,
   WorktreeCreate (with smart branch reuse), WorktreeRemove, SetMeta,

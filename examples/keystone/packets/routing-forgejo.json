@@ -25,7 +25,7 @@
           { "op": "In", "field": "action", "values": ["opened", "reopened"] }
         ]
       },
-      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-ready\",\"correlate\":{}}"
+      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-ready\",\"correlate\":{\"pr\":\"${entity.pr_number}\"}}"
     },
     {
       "id": "signal_pr_ready_on_synchronize",
@@ -37,7 +37,7 @@
           { "op": "Eq", "field": "action", "value": "synchronize" }
         ]
       },
-      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-ready\",\"correlate\":{}}"
+      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-ready\",\"correlate\":{\"pr\":\"${entity.pr_number}\"}}"
     },
     {
       "id": "signal_pr_merged",
@@ -50,7 +50,7 @@
           { "op": "Eq", "field": "merged", "value": true }
         ]
       },
-      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-merged\",\"correlate\":{}}"
+      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-merged\",\"correlate\":{\"pr\":\"${entity.pr_number}\"}}"
     },
     {
       "id": "signal_pr_feedback",
@@ -65,7 +65,7 @@
           "pull_request_review_rejected"
         ]
       },
-      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-feedback\",\"correlate\":{}}"
+      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-feedback\",\"correlate\":{\"pr\":\"${entity.pr_number}\"}}"
     },
     {
       "id": "ignore_issue_other_actions",

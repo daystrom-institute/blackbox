@@ -1,4 +1,5 @@
 pub mod brofile;
+pub mod http_fetch;
 pub mod mcp;
 pub mod providers;
 pub mod tail;
