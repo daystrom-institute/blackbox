@@ -22,9 +22,9 @@
       "durable": true,
       "compaction_anchor": true,
       "requires": []
-    },
-    "noop": { "kind": "noop", "requires": [] }
+    }
   },
+  "start": "FetchIssue",
   "nodes": {
     "FetchIssue": {
       "actor": "implementer",
@@ -46,10 +46,11 @@
         { "op": "set_var", "args": { "key": "issue_body",  "value": "${vars.issue_data.body}" } },
         { "op": "set_var", "args": { "key": "branch", "value": "fix/issue-${vars.issue_number}" } }
       ],
-      "prompt": "You are an implementer working in worktree ${vars.worktree_path} on branch ${vars.branch}.\n\nIssue #${vars.issue_number}: ${vars.issue_title}\n\n${vars.issue_body}\n\nUnderstand the bug, fix it, write or update tests so the existing tests pass. Stage changes and commit with a clear message.\n\nDo NOT push and do NOT open the PR — those are mechanical follow-ups handled by the workflow engine, not by you.\n\nReturn a one-line summary of what you changed (no markdown). Keep edits minimal and focused on the issue."
+      "prompt": "You are an implementer working in worktree ${vars.worktree_path} on branch ${vars.branch}.\n\nIssue #${vars.issue_number}: ${vars.issue_title}\n\n${vars.issue_body}\n\nUnderstand the bug, fix it, write or update tests so the existing tests pass. Stage changes and commit with a clear message.\n\nDo NOT push and do NOT open the PR — those are mechanical follow-ups handled by the workflow engine, not by you.\n\nReturn a one-line summary of what you changed (no markdown). Keep edits minimal and focused on the issue.",
+      "next": { "type": "goto", "to": "PushAndOpenPr" }
     },
     "PushAndOpenPr": {
-      "actor": "noop",
+      "actor": "",
       "prompt": "Push branch + open-or-reuse PR (mechanical, no LLM dispatch). Idempotent: re-running an arc against the same issue+branch finds the existing open PR and reuses it (PATCH state=open) rather than creating a duplicate. Forgejo's `head=` query filter is unreliable in some versions, so we GET ALL open PRs and use `find_first` to scan client-side for one whose `.head.ref` matches our branch — the workflow author's job, not the engine's.",
       "on_enter": [
         {
@@ -115,8 +116,8 @@
           "args": { "key": "pr_number", "value": "${vars.pr_data.number}" },
           "on_failure": "halt"
         }
-      ]
+      ],
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> FetchIssue\n    FetchIssue --> PushAndOpenPr\n    PushAndOpenPr --> [*]"
+  }
 }

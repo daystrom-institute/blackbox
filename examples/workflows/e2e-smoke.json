@@ -8,15 +8,17 @@
       "durable": true
     }
   },
+  "start": "Greet",
   "nodes": {
     "Greet": {
       "actor": "haiku",
-      "prompt": "Output exactly one sentence: a greeting from a fictional AI named Hermes. No preamble."
+      "prompt": "Output exactly one sentence: a greeting from a fictional AI named Hermes. No preamble.",
+      "next": { "type": "goto", "to": "Riff" }
     },
     "Riff": {
       "actor": "haiku",
-      "prompt": "Previously you said: ${Greet.output}\n\nNow riff on that in exactly one sentence, as the same character. No preamble."
+      "prompt": "Previously you said: ${Greet.output}\n\nNow riff on that in exactly one sentence, as the same character. No preamble.",
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> Greet\n    Greet --> Riff\n    Riff --> [*]"
+  }
 }

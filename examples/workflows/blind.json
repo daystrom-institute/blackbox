@@ -17,29 +17,39 @@
       "team": "blind-review-team"
     }
   },
+  "start": "Exec_Propose",
   "nodes": {
     "Exec_Propose": {
       "actor": "executor",
       "prompt": "Propose an implementation approach for: ${arc_goal}",
       "gate": "packet-proposal-well-formed",
-      "retry": { "max_generations": 5 }
+      "retry": { "max_generations": 5 },
+      "next": { "type": "goto", "to": "Ensemble_Blind_Iter" }
     },
     "Ensemble_Blind_Iter": {
       "actor": "ensemble_blind_pre",
       "prompt": "Review the proposal blind: ${Exec_Propose.output}",
-      "gate": "packet-ensemble-convergence"
+      "gate": "packet-ensemble-convergence",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "revise":    "Exec_Propose",
+          "converged": "Exec_Work"
+        }
+      }
     },
     "Exec_Work": {
       "actor": "executor",
       "prompt": "Implement the converged proposal: ${Exec_Propose.output}",
       "gate": "packet-done-claim",
-      "retry": { "max_generations": 3 }
+      "retry": { "max_generations": 3 },
+      "next": { "type": "goto", "to": "Ensemble_Blind_Final" }
     },
     "Ensemble_Blind_Final": {
       "actor": "ensemble_blind_post",
       "prompt": "Final blind review of implemented work: ${Exec_Work.output}",
-      "gate": "packet-final-review"
+      "gate": "packet-final-review",
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> Exec_Propose\n    Exec_Propose --> Ensemble_Blind_Iter\n    state convergence <<choice>>\n    Ensemble_Blind_Iter --> convergence\n    convergence --> Exec_Propose: revise\n    convergence --> Exec_Work: converged\n    Exec_Work --> Ensemble_Blind_Final\n    Ensemble_Blind_Final --> [*]"
+  }
 }

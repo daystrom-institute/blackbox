@@ -8,21 +8,30 @@
       "durable": true
     }
   },
+  "start": "Summarize",
   "nodes": {
     "Summarize": {
       "actor": "auditor",
-      "prompt": "You are reviewing a commit just shipped to the blackbox project (an MCP daemon for multi-provider agent orchestration). Here is the commit:\n\nTitle: Add workflow orchestration engine + bbox_learn arc-bound nag\n\nWhat it adds:\n- New src/workflow/ module: mermaid-shaped JSON workflow specs. A spec declares actors (executor/ensemble/advisor/user), nodes (prompt, optional gate packet, retry ceiling, late_inject from another node, subworkflow), and an embedded stateDiagram-v2 graph. The daemon's engine walks the graph, dispatches via existing bro_exec/bro_resume/bro_broadcast, applies gate packets (rule-packets) to classify outputs, routes <<choice>> nodes by verdict, dispatches <<fork>> async branches as fire-and-forget with late_inject join at downstream node entry, composes sub-workflows recursively (depth-limited to 5), and applies optional workflow-level policy_packet at each boundary to mechanize advisor-style halt/escalate/warn decisions.\n- Arc thread persistence: every run opens a bbox_thread(kind=work_item) with structured notes (done/learned/surprise/blocked) plus rolling 'ANCHOR' compaction notes.\n- bro orchestrate run <file.json> and bro orchestrate status <thread-id> CLI subcommands + /orchestrate HTTP endpoint. MCP tool bro_orchestrate_run.\n- Arc-bound classifier nag on bbox_learn: compiled rule-packet evaluates new entries and emits a soft pin-suggestion when content looks arc-scoped rather than a standing rule.\n- Prose updates in tool_docs.rs: CORE RULE rewritten as lane-selector ladder (thread → learn/decide → remember → pin).\n- 7 example workflow specs (smoke, gated, async-review, composition, policy, optimistic, blind) + documentation.\n\nStats: +3892 lines, -13 lines, 20 files changed.\n\nSummarize what this commit does in exactly 3 sentences. No preamble, no disclaimers. Be specific — the reader already knows the project."
+      "prompt": "You are reviewing a commit just shipped to the blackbox project (an MCP daemon for multi-provider agent orchestration). Here is the commit:\n\nTitle: Add workflow orchestration engine + bbox_learn arc-bound nag\n\nWhat it adds:\n- New src/workflow/ module: JSON workflow specs with per-node `next` transitions (goto / branch / fork / terminal). A spec declares actors (executor/ensemble/advisor/user), nodes (prompt, optional gate packet, retry ceiling, late_inject from another node, subworkflow). The daemon's engine walks the transitions, dispatches via existing bro_exec/bro_resume/bro_broadcast, applies gate packets (rule-packets) to classify outputs, routes branch transitions by verdict, dispatches fork branches as fire-and-forget with late_inject join at downstream node entry, composes sub-workflows recursively (depth-limited to 5), and applies optional workflow-level policy_packet at each boundary to mechanize advisor-style halt/escalate/warn decisions.\n- Arc thread persistence: every run opens a bbox_thread(kind=work_item) with structured notes (done/learned/surprise/blocked) plus rolling 'ANCHOR' compaction notes.\n- bro orchestrate run <file.json> and bro orchestrate status <thread-id> CLI subcommands + /orchestrate HTTP endpoint. MCP tool bro_orchestrate_run.\n- Arc-bound classifier nag on bbox_learn: compiled rule-packet evaluates new entries and emits a soft pin-suggestion when content looks arc-scoped rather than a standing rule.\n- Prose updates in tool_docs.rs: CORE RULE rewritten as lane-selector ladder (thread → learn/decide → remember → pin).\n- 7 example workflow specs (smoke, gated, async-review, composition, policy, optimistic, blind) + documentation.\n\nStats: +3892 lines, -13 lines, 20 files changed.\n\nSummarize what this commit does in exactly 3 sentences. No preamble, no disclaimers. Be specific — the reader already knows the project.",
+      "next": { "type": "goto", "to": "IdentifyConcerns" }
     },
     "IdentifyConcerns": {
       "actor": "auditor",
       "prompt": "Based on your summary, identify exactly 3 specific technical concerns with this commit. For each concern use this exact format:\n\nCONCERN 1:\nIssue: <what specifically is wrong or risky>\nScenario: <concrete situation where this would actually cause a problem — be specific, name a file/function/mechanism>\nFix: <concrete change that would address it>\n\nCONCERN 2:\n... (same shape)\n\nCONCERN 3:\n... (same shape)\n\nRules:\n- NO generic advice ('consider more tests', 'add documentation', 'needs observability'). Tied to specifics of what was shipped.\n- Each concern must point at something the author of this code would recognize as a real issue.\n- Scenarios must name mechanics (the engine's in_flight map, the gate-packet lattice, the depth-limit constant, the parking_lot locks, etc.).\n- Fixes must be concrete code/design changes, not vague process suggestions.\n\nNo preamble, no summary, no trailing commentary. Just the three concerns in the exact format above.",
       "gate": "packet-e51aeeed",
-      "retry": { "max_generations": 3 }
+      "retry": { "max_generations": 3 },
+      "next": {
+        "type": "branch",
+        "cases": {
+          "revise":   "IdentifyConcerns",
+          "concrete": "SanityCheck"
+        }
+      }
     },
     "SanityCheck": {
       "actor": "auditor",
-      "prompt": "Review your own 3 concerns. For each, honestly assess whether you've landed on something the author would likely agree is a real issue.\n\nFor each concern output exactly one line:\n\nCONCERN N: STRONG | MODERATE | WEAK — <one-sentence reasoning>\n\nAfter the three lines, exactly one additional sentence:\nOverall: <is this critique useful to the author or is it shovelware?>"
+      "prompt": "Review your own 3 concerns. For each, honestly assess whether you've landed on something the author would likely agree is a real issue.\n\nFor each concern output exactly one line:\n\nCONCERN N: STRONG | MODERATE | WEAK — <one-sentence reasoning>\n\nAfter the three lines, exactly one additional sentence:\nOverall: <is this critique useful to the author or is it shovelware?>",
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> Summarize\n    Summarize --> IdentifyConcerns\n    IdentifyConcerns --> ConcernRouter\n    state ConcernRouter <<choice>>\n    ConcernRouter --> IdentifyConcerns: revise\n    ConcernRouter --> SanityCheck: concrete\n    SanityCheck --> [*]"
+  }
 }

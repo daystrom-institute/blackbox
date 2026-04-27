@@ -8,20 +8,26 @@
       "durable": true
     }
   },
+  "start": "Decide",
   "nodes": {
     "Decide": {
       "actor": "haiku",
       "prompt": "Flip a mental coin. Output exactly one word — either YES or NO — in all caps. No other text.",
-      "gate": "packet-05f4ba16"
+      "gate": "packet-05f4ba16",
+      "next": {
+        "type": "branch",
+        "cases": { "yes": "Say_Yes", "no": "Say_No" }
+      }
     },
     "Say_Yes": {
       "actor": "haiku",
-      "prompt": "The coin came up YES. Say one short celebratory sentence. No preamble."
+      "prompt": "The coin came up YES. Say one short celebratory sentence. No preamble.",
+      "next": { "type": "terminal" }
     },
     "Say_No": {
       "actor": "haiku",
-      "prompt": "The coin came up NO. Say one short resigned sentence. No preamble."
+      "prompt": "The coin came up NO. Say one short resigned sentence. No preamble.",
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> Decide\n    state Decide_Route <<choice>>\n    Decide --> Decide_Route\n    Decide_Route --> Say_Yes: yes\n    Decide_Route --> Say_No: no\n    Say_Yes --> [*]\n    Say_No --> [*]"
+  }
 }

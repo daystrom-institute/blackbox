@@ -28,7 +28,7 @@ protocol agents use).
 
 ## TL;DR shape
 
-A workflow is one JSON file with two halves:
+A workflow is one JSON file:
 
 ```jsonc
 {
@@ -39,22 +39,32 @@ A workflow is one JSON file with two halves:
   "policy_packet":  "domain:workflow-policy/arc-budget",
   "on_arc_exit":    [ ... cleanup hooks ... ],
   "on_arc_cancel":  [ ... compensating hooks ... ],
+  "start": "Setup",
   "nodes": {
-    "Setup":     { "actor": "noop", "on_enter": [ ... ] },
+    "Setup":     { "actor": "", "on_enter": [ ... ],
+                   "next": { "type": "goto", "to": "Implement" } },
     "Implement": { "subworkflow_ref": "implementer-arc",
                    "imports": ["issue_number","owner","repo"],
-                   "exports": ["pr_number","branch"] },
-    "Wait":      { "wait": { "any_of": [{"signal":"pr-merged","correlate":{}}], "timeout": "24h" },
-                   "gate": "domain:workflow-gate/merge-or-review" }
-  },
-  "graph": "stateDiagram-v2\n[*] --> Setup\nSetup --> Implement\nImplement --> Wait\nWait --> [*]"
+                   "exports": ["pr_number","branch"],
+                   "next": { "type": "goto", "to": "Wait" } },
+    "Wait":      { "wait": { "any_of": [{"signal":"pr-merged",
+                                          "correlate":{"pr":{"kind":"json_path","path":"vars.pr_number"}}}],
+                              "timeout": "24h" },
+                   "gate": "domain:workflow-gate/merge-or-review",
+                   "next": { "type": "branch",
+                             "cases": { "merged": "Done", "ready": "Done" } } },
+    "Done":      { "actor": "", "next": { "type": "terminal" } }
+  }
 }
 ```
 
 The metadata declares `actors`, `nodes`, `vars_schema`, `policy_packet`,
-and arc-level hooks. The mermaid declares control flow. The daemon
-parses both and cross-validates that they agree before any dispatch
-fires.
+and arc-level hooks. Control flow lives on each node as a typed `next`
+clause (`goto` / `branch` / `fork` / `terminal`); top-level `start`
+names the entry node. The daemon validates every transition target,
+every actor reference, every late_inject source, and every node's
+reachability from `start` before any dispatch fires. The canonical
+JSON Schema is at `schema/workflow.schema.json`.
 
 ## ArcContext — the universal state container
 
@@ -151,7 +161,13 @@ Declared in the workflow's `actors` map and referenced by node specs.
 | `ensemble` | Team broadcast: every member runs the same prompt; output is the labeled concatenation. |
 | `advisor`  | Like executor; convention is narrower tool surface / persona lens. |
 | `user`     | Halts the arc with a `blocked` note carrying the prompt. Resume = re-dispatch with whatever resolves the pause. |
-| `noop`     | Fires hooks, captures rendered prompt as output, returns. Use for `Setup` / `Done` nodes that exist only to host hook ops. |
+
+For hook-only / pure-routing nodes (Setup / Done patterns where the
+work is on_enter / on_exit hooks and there's no LLM dispatch), leave
+the node's `actor` field empty (`""`). The validator only complains
+when a non-empty actor name fails to resolve. Hook-only nodes still
+fire hooks, capture their rendered `prompt` as the node output (so
+`${NodeName.output}` references stay legal), and follow `next`.
 
 Per-actor fields:
 
@@ -403,22 +419,28 @@ the parent fails. This is the contract.
 Composition depth is capped at `MAX_COMPOSITION_DEPTH = 5`; exceeding
 errors out at the offending nest.
 
-## Gates and choice nodes
+## Gates and branch transitions
 
 A gate packet runs after the node body, against the flattened
 ArcContext (with `node_output` exposed at the top level for legacy
-rules). The classification becomes the verdict; choice nodes pick the
-outgoing edge whose label matches.
+rules). The classification becomes the verdict; the same node's
+`next.branch.cases` selects the target whose key matches.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Decide
-    state Decide_Route <<choice>>
-    Decide --> Decide_Route
-    Decide_Route --> Yes : yes
-    Decide_Route --> No  : no
-    Yes --> [*]
-    No  --> [*]
+```jsonc
+{
+  "Decide": {
+    "actor": "worker",
+    "prompt": "...",
+    "gate": "packet-decide",
+    "next": {
+      "type": "branch",
+      "cases": { "yes": "Yes", "no": "No" },
+      "default": "No"      // optional fallback for unmatched verdicts
+    }
+  },
+  "Yes": { "actor": "worker", "next": { "type": "terminal" } },
+  "No":  { "actor": "worker", "next": { "type": "terminal" } }
+}
 ```
 
 Two modes:
@@ -665,14 +687,17 @@ spawn arc
   capability validation runs at dispatch, not just install
 - Capability tags: provider catalog + actor `requires` + workflow-compile validation
 - Domain-shaped packet refs (`domain:...`)
-- Noop actor for hook-only nodes
+- Hook-only nodes (empty `actor` field) for Setup / Done patterns
 - Webhook ingress: HmacSha256 (configurable header + optional `prefix=`
   for `sha256=` style senders), None for loopback-only testing,
   idempotency dedup, replay endpoint, default-deny on no-match
 - Operator-blessed registries (workflows / webhooks) + admin HTTP
-- Actor kinds: executor, ensemble, advisor, user, noop
-- Graph shapes: sequential, `<<choice>>`, `<<fork>>`, back-edges,
-  `<<join>>` synchronous fan-in
+- Actor kinds: executor, ensemble, advisor, user (plus the empty
+  `actor` form for hook-only nodes)
+- Transition shapes: `goto` (forward edges + back-edges), `branch`
+  (verdict-routed multi-way with optional `default`), `fork`
+  (fire-and-forget side-dispatch + `continue_to`) paired with
+  `wait_for` on the join node for fan-in, `terminal` (arc end)
 - Gate modes: `first` (single verdict), `all` (multi-finding aggregate)
 - Workflow-level `policy_packet` (advisor-as-packet)
 - `late_inject` for fire-and-forget → join-on-next-turn

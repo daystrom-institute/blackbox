@@ -1,6 +1,6 @@
-//! Workflow metadata schema. The embedded mermaid graph lives in
-//! `Workflow.graph` as a string; the parser/validator lives in
-//! [`super::mermaid`] and [`super`].
+//! Workflow metadata schema. Control flow is encoded directly on each
+//! node via `NodeSpec.next` (a tagged [`NodeTransition`]); there is no
+//! separate graph string. Cross-validation lives in [`super::compile`].
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -17,9 +17,9 @@ pub struct Workflow {
     pub version: u32,
     pub actors: HashMap<String, ActorSpec>,
     pub nodes: HashMap<String, NodeSpec>,
-    /// Embedded mermaid state-diagram (as string). Parsed by
-    /// [`super::mermaid::parse_mermaid`] during [`super::compile`].
-    pub graph: String,
+    /// Entry node id — the first node executed when the arc starts.
+    /// Must reference a key in `nodes`.
+    pub start: String,
     /// Optional packet ID applied to the arc's own state at each node
     /// boundary. The packet's entity is the flattened ArcContext
     /// (`{vars, outputs, meta, last_signal, …}`). Its classifications
@@ -88,12 +88,6 @@ pub enum ActorKind {
     /// Human operator. Invoking a user node means: pause, surface to
     /// inbox, wait for resolve.
     User,
-    /// No-op actor. The node fires its on_enter / on_exit hooks then
-    /// returns — useful for Setup / Done nodes that exist only to host
-    /// hooks (worktree create, var initialization, terminal cleanup
-    /// trigger). The node's `prompt` is captured as the output for any
-    /// downstream template references.
-    Noop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -117,7 +111,9 @@ pub struct NodeSpec {
     /// verdict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_mode: Option<GateMode>,
-    /// Sync (caller waits) vs. fire-and-forget.
+    /// Sync (caller waits) vs. fire-and-forget. Fire-and-forget is
+    /// only meaningful on nodes reached as the main walk continuation;
+    /// nodes spawned by a `Fork` transition are always fire-and-forget.
     #[serde(default)]
     pub mode: NodeMode,
     /// Retry ceiling — every retry increments a generation counter; once
@@ -155,7 +151,7 @@ pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub import_renames: HashMap<String, String>,
 
-    // ── New: hooks + Wait ──────────────────────────────────────
+    // ── hooks + Wait ──────────────────────────────────────
     /// Hooks fired BEFORE this node's actor dispatch (or before the
     /// Wait registers, or before subworkflow descent). Ops execute
     /// sequentially; failure semantics per-op.
@@ -172,6 +168,18 @@ pub struct NodeSpec {
     /// exclusive with `actor` and `subworkflow`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<WaitSpec>,
+    /// Names of nodes whose in-flight outputs must be joined before
+    /// this node's body runs. Used for fork → fan-in. The engine
+    /// awaits each listed node's task (single or ensemble), records
+    /// its output, and only then proceeds with on_enter / actor
+    /// dispatch / wait / subworkflow. Empty/None = no fan-in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wait_for: Vec<String>,
+
+    /// Control-flow successor for this node. Required on every node;
+    /// the arc terminates when control reaches a node whose
+    /// transition is `Terminal`.
+    pub next: NodeTransition,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -216,6 +224,57 @@ pub enum InjectPolicy {
     /// brief at the next turn boundary. The source's output is appended
     /// to this node's next prompt as late feedback.
     ResumeOnReturn,
+}
+
+/// Per-node control-flow successor. Tagged enum: serialized JSON looks
+/// like `{"type": "goto", "to": "Foo"}`, `{"type": "branch", ...}`,
+/// `{"type": "fork", ...}`, or `{"type": "terminal"}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NodeTransition {
+    /// Linear advance to a single named node. Use this for both
+    /// forward edges and back-edges (cycles).
+    Goto { to: String },
+    /// Multi-way branch keyed by the gate verdict (default selector).
+    /// `cases` keys SHOULD match the gate packet's classification
+    /// lattice; verdicts not enumerated fall through to `default` if
+    /// set, else error.
+    Branch {
+        #[serde(default)]
+        on: BranchSelector,
+        cases: HashMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<String>,
+    },
+    /// Fan-out: dispatch every name in `branches` fire-and-forget,
+    /// then advance the main walk to `continue_to`. To wait for the
+    /// branches before running a downstream node, set that node's
+    /// `wait_for` field.
+    Fork {
+        branches: Vec<String>,
+        continue_to: String,
+    },
+    /// Terminal sink — the arc ends successfully when control reaches
+    /// a node whose transition is `Terminal`.
+    Terminal,
+}
+
+impl Default for NodeTransition {
+    fn default() -> Self {
+        // Default to Terminal so `NodeSpec::default()` produces a
+        // structurally-valid stub. Real specs always set `next`
+        // explicitly; the default only exists for `..NodeSpec::default()`
+        // patterns inside tests and builders.
+        NodeTransition::Terminal
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchSelector {
+    /// Match `cases` against the most recent gate verdict. Default.
+    #[default]
+    GateVerdict,
 }
 
 /// Parse a workflow from a JSON string. (YAML loader is a trivial

@@ -21,12 +21,12 @@
       "brofile": "keystone-review",
       "durable": false,
       "requires": []
-    },
-    "noop": { "kind": "noop", "requires": [] }
+    }
   },
+  "start": "FetchDiff",
   "nodes": {
     "FetchDiff": {
-      "actor": "noop",
+      "actor": "",
       "prompt": "Mechanical PR diff fetch.",
       "on_enter": [
         {
@@ -44,18 +44,21 @@
           "into_var": "pr_diff",
           "on_failure": "halt"
         }
-      ]
+      ],
+      "next": { "type": "goto", "to": "Review" }
     },
     "Review": {
       "actor": "reviewers",
-      "prompt": "PR #${vars.pr_number} on ${vars.owner}/${vars.repo}.\n\nDIFF:\n${vars.pr_diff}\n\nReview against:\n  1. Does this fix the bug as described in the PR body?\n  2. Are tests added/updated to cover the change?\n  3. Any obvious regressions, edge cases, or incorrect logic?\n\nReturn ONE LINE — exactly one of:\n  APPROVE\n  REQUEST CHANGES: <one-paragraph specific feedback>\n\nBe terse, no filler. The aggregator step combines all reviewers' verdicts into one PR review."
+      "prompt": "PR #${vars.pr_number} on ${vars.owner}/${vars.repo}.\n\nDIFF:\n${vars.pr_diff}\n\nReview against:\n  1. Does this fix the bug as described in the PR body?\n  2. Are tests added/updated to cover the change?\n  3. Any obvious regressions, edge cases, or incorrect logic?\n\nReturn ONE LINE — exactly one of:\n  APPROVE\n  REQUEST CHANGES: <one-paragraph specific feedback>\n\nBe terse, no filler. The aggregator step combines all reviewers' verdicts into one PR review.",
+      "next": { "type": "goto", "to": "Aggregate" }
     },
     "Aggregate": {
       "actor": "aggregator",
-      "prompt": "Aggregate the prior reviewer round into ONE structured review payload for PR #${vars.pr_number}.\n\nPRIOR ROUND OUTPUTS (one block per reviewer):\n${Review.output}\n\nReturn STRICT JSON with no surrounding prose, no markdown fences, exactly:\n{\n  \"event\": \"COMMENT\",\n  \"body\": \"<one-to-three sentence aggregate; lead with APPROVE or REQUEST CHANGES then the reasoning>\",\n  \"action\": \"merge\" | \"request_changes\"\n}\n\nUse action=merge ONLY when every reviewer line was APPROVE. Otherwise action=request_changes. event is always COMMENT (this demo runs single-user; Forgejo refuses APPROVED/REQUEST_CHANGES on own PRs). The downstream PostReview node reads `action` to decide whether to auto-merge: action=merge → POST /merge → fires pr-merged webhook → arc terminates clean. action=request_changes → no merge, the loop waits for the next pr-feedback signal."
+      "prompt": "Aggregate the prior reviewer round into ONE structured review payload for PR #${vars.pr_number}.\n\nPRIOR ROUND OUTPUTS (one block per reviewer):\n${Review.output}\n\nReturn STRICT JSON with no surrounding prose, no markdown fences, exactly:\n{\n  \"event\": \"COMMENT\",\n  \"body\": \"<one-to-three sentence aggregate; lead with APPROVE or REQUEST CHANGES then the reasoning>\",\n  \"action\": \"merge\" | \"request_changes\"\n}\n\nUse action=merge ONLY when every reviewer line was APPROVE. Otherwise action=request_changes. event is always COMMENT (this demo runs single-user; Forgejo refuses APPROVED/REQUEST_CHANGES on own PRs). The downstream PostReview node reads `action` to decide whether to auto-merge: action=merge → POST /merge → fires pr-merged webhook → arc terminates clean. action=request_changes → no merge, the loop waits for the next pr-feedback signal.",
+      "next": { "type": "goto", "to": "PostReview" }
     },
     "PostReview": {
-      "actor": "noop",
+      "actor": "",
       "prompt": "Mechanical: parse the aggregator's JSON output, post the PR review, and merge if approved.",
       "on_enter": [
         {
@@ -99,8 +102,8 @@
           "on_failure": "halt"
         },
         { "op": "set_var", "args": { "key": "feedback_posted", "value": true } }
-      ]
+      ],
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> FetchDiff\n    FetchDiff --> Review\n    Review --> Aggregate\n    Aggregate --> PostReview\n    PostReview --> [*]"
+  }
 }

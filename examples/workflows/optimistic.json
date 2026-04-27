@@ -14,17 +14,24 @@
       "durable": true
     }
   },
+  "start": "P1_Executor",
   "nodes": {
     "P1_Executor": {
       "actor": "executor",
       "prompt": "${phase1_brief}",
       "gate": "packet-done-claim",
-      "retry": { "max_generations": 3 }
+      "retry": { "max_generations": 3 },
+      "next": {
+        "type": "fork",
+        "branches": ["Ensemble_Durable_Review_1"],
+        "continue_to": "P2_Executor"
+      }
     },
     "Ensemble_Durable_Review_1": {
       "actor": "ensemble_durable",
       "prompt": "Review the output of P1_Executor: ${P1_Executor.output}",
-      "mode": "fire_and_forget"
+      "mode": "fire_and_forget",
+      "next": { "type": "terminal" }
     },
     "P2_Executor": {
       "actor": "executor",
@@ -34,8 +41,8 @@
       "late_inject": {
         "from": "Ensemble_Durable_Review_1",
         "policy": "resume_on_return"
-      }
+      },
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> P1_Executor\n    state fork_phase1 <<fork>>\n    P1_Executor --> fork_phase1\n    fork_phase1 --> P2_Executor\n    fork_phase1 --> Ensemble_Durable_Review_1\n    Ensemble_Durable_Review_1 --> P2_Executor: late-inject\n    P2_Executor --> [*]"
+  }
 }

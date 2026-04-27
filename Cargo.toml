@@ -86,6 +86,7 @@ regex = "1"
 
 [dev-dependencies]
 tempfile = "3"
+jsonschema = { version = "0.17", default-features = false }
 
 [profile.release]
 opt-level = 3

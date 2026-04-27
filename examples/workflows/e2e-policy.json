@@ -9,19 +9,22 @@
       "durable": true
     }
   },
+  "start": "A",
   "nodes": {
     "A": {
       "actor": "haiku",
-      "prompt": "Output exactly one word: 'Alpha'. No other text."
+      "prompt": "Output exactly one word: 'Alpha'. No other text.",
+      "next": { "type": "goto", "to": "B" }
     },
     "B": {
       "actor": "haiku",
-      "prompt": "Output exactly one word: 'Beta'. No other text."
+      "prompt": "Output exactly one word: 'Beta'. No other text.",
+      "next": { "type": "goto", "to": "C" }
     },
     "C": {
       "actor": "haiku",
-      "prompt": "Output exactly one word: 'Gamma'. No other text."
+      "prompt": "Output exactly one word: 'Gamma'. No other text.",
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> A\n    A --> B\n    B --> C\n    C --> [*]"
+  }
 }

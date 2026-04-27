@@ -14,10 +14,9 @@
     "review_iteration": { "kind": "int" },
     "max_iterations":   { "kind": "int" }
   },
-  "actors": {
-    "noop": { "kind": "noop" }
-  },
+  "actors": {},
   "policy_packet": "domain:workflow-policy/arc-budget",
+  "start": "Setup",
   "on_arc_exit": [
     {
       "op": "worktree_remove",
@@ -28,10 +27,10 @@
   ],
   "nodes": {
     "Setup": {
-      "actor": "noop",
+      "actor": "",
       "on_enter": [
         { "op": "set_var", "args": { "key": "review_iteration", "value": 0 } },
-        { "op": "set_var", "args": { "key": "max_iterations",   "value": 5 } },
+        { "op": "set_var", "args": { "key": "max_iterations",   "value": 2 } },
         { "op": "set_var", "args": { "key": "branch", "value": "fix/issue-${vars.issue_number}" } },
         {
           "op": "worktree_create",
@@ -47,33 +46,47 @@
           "args": { "key": "worktree_path", "value": "${meta.worktree}" }
         }
       ],
-      "prompt": "Setup complete (no LLM dispatch — user-actor placeholder for hook execution)."
+      "prompt": "Setup complete (no LLM dispatch — hook-only node).",
+      "next": { "type": "goto", "to": "Implement" }
     },
     "Implement": {
+      "actor": "",
       "subworkflow_ref": "implementer-arc",
       "imports": ["owner", "repo", "issue_number", "worktree_path"],
-      "exports": ["pr_number", "branch"]
+      "exports": ["pr_number", "branch"],
+      "next": { "type": "goto", "to": "AwaitReviewTrigger" }
     },
     "AwaitReviewTrigger": {
+      "actor": "",
       "wait": {
         "any_of": [
-          { "signal": "pr-ready",  "correlate": { "pr": "${vars.pr_number}" } },
-          { "signal": "pr-merged", "correlate": { "pr": "${vars.pr_number}" } }
+          { "signal": "pr-ready",  "correlate": { "pr": { "kind": "json_path", "path": "vars.pr_number" } } },
+          { "signal": "pr-merged", "correlate": { "pr": { "kind": "json_path", "path": "vars.pr_number" } } }
         ],
         "timeout": "24h"
       },
-      "gate": "domain:workflow-gate/merge-or-review"
+      "gate": "domain:workflow-gate/merge-or-review",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "ready":  "Review",
+          "merged": "Done"
+        }
+      }
     },
     "Review": {
+      "actor": "",
       "subworkflow_ref": "reviewer-arc",
       "imports": ["owner", "repo", "pr_number"],
-      "exports": ["feedback_posted"]
+      "exports": ["feedback_posted"],
+      "next": { "type": "goto", "to": "AwaitFeedbackOrMerge" }
     },
     "AwaitFeedbackOrMerge": {
+      "actor": "",
       "wait": {
         "any_of": [
-          { "signal": "pr-feedback", "correlate": { "pr": "${vars.pr_number}" } },
-          { "signal": "pr-merged",   "correlate": { "pr": "${vars.pr_number}" } }
+          { "signal": "pr-feedback", "correlate": { "pr": { "kind": "json_path", "path": "vars.pr_number" } } },
+          { "signal": "pr-merged",   "correlate": { "pr": { "kind": "json_path", "path": "vars.pr_number" } } }
         ],
         "timeout": "7d"
       },
@@ -87,17 +100,27 @@
           "op": "inc_var",
           "args": { "key": "review_iteration" }
         }
-      ]
+      ],
+      "next": {
+        "type": "branch",
+        "cases": {
+          "feedback": "AddressFeedback",
+          "merged":   "Done"
+        },
+        "default": "Done"
+      }
     },
     "AddressFeedback": {
+      "actor": "",
       "subworkflow_ref": "implementer-feedback-arc",
       "imports": ["owner", "repo", "issue_number", "branch", "pr_number", "feedback_text", "worktree_path"],
-      "exports": []
+      "exports": [],
+      "next": { "type": "goto", "to": "AwaitReviewTrigger" }
     },
     "Done": {
-      "actor": "noop",
-      "prompt": "Arc terminated."
+      "actor": "",
+      "prompt": "Arc terminated.",
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    state ReviewOrDone <<choice>>\n    state FeedbackOrDone <<choice>>\n    [*] --> Setup\n    Setup --> Implement\n    Implement --> AwaitReviewTrigger\n    AwaitReviewTrigger --> ReviewOrDone\n    ReviewOrDone --> Review : ready\n    ReviewOrDone --> Done : merged\n    Review --> AwaitFeedbackOrMerge\n    AwaitFeedbackOrMerge --> FeedbackOrDone\n    FeedbackOrDone --> AddressFeedback : feedback\n    FeedbackOrDone --> Done : merged\n    AddressFeedback --> AwaitReviewTrigger\n    Done --> [*]"
+  }
 }

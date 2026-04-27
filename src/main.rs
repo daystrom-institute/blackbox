@@ -2668,7 +2668,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_orchestrate_author",
-        description = "Compile a prose charter into a validated workflow spec. Dispatches an authoring LLM with the sm-workflow-orchestration runbook + a minimal reference example, parses its JSON response, cross-validates via the engine's compile step, retries once on compile failure with the error appended, and returns the validated spec — ready to pass to `bro_orchestrate_run`. Closes the authoring loop: operators describe the arc in prose, get a mermaid-shaped spec back, dispatch without hand-writing the graph."
+        description = "Compile a prose charter into a validated workflow spec. Dispatches an authoring LLM with the sm-workflow-orchestration runbook + a minimal reference example, parses its JSON response, cross-validates via the engine's compile step, retries once on compile failure with the error appended, and returns the validated spec — ready to pass to `bro_orchestrate_run`. Closes the authoring loop: operators describe the arc in prose, get a JSON spec back (with per-node `next` transitions), dispatch without hand-writing the graph."
     )]
     async fn bro_orchestrate_author(
         &self,
@@ -2702,7 +2702,7 @@ Constraints:\n\
 - Cross-reference every `actor` field in nodes to a declared actor name.\n\
 - Every activity node in the graph must have a matching entry in `nodes`.\n\
 - Every `nodes` entry (except ones with `subworkflow`) needs an `actor`.\n\
-- The `graph` value must be a single string starting with `stateDiagram-v2\\n`, using only the mermaid subset the runbook documents.\n\
+- Top-level `start` names the entry node; every node carries a `next` clause whose `type` is one of `goto` / `branch` / `fork` / `terminal`. There is no `graph` string.\n\
 - If you reference a gate or policy packet ID, use a placeholder like `packet-TODO` — the operator will fill it in after compilation.\n\
 - Do NOT invent new actor kinds or graph primitives.\n",
             charter = p.charter,
@@ -2783,7 +2783,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_orchestrate_run",
-        description = "Dispatch a mermaid-shaped workflow. Takes a full workflow spec (actors, nodes, embedded stateDiagram-v2 graph) and blocks until the arc terminates. Returns the event log, per-node outputs, and the `arc_thread_id` for post-hoc audit via `bbox_notes(thread_id=...)` or `bro orchestrate status`. Pass `dry_run=true` to validate + summarize without dispatching any bros. Replaces long skill-prose protocols like overmind/crucible — the daemon owns the state machine, dispatched bros are stateless function-call turns. See `sm-workflow-orchestration` via `bbox_knowledge` and `examples/workflows/` for the shape catalog."
+        description = "Dispatch a workflow. Takes a full spec (actors, nodes with per-node `next` transitions: goto / branch / fork / terminal) and blocks until the arc terminates. Returns the event log, per-node outputs, and the `arc_thread_id` for post-hoc audit via `bbox_notes(thread_id=...)` or `bro orchestrate status`. Pass `dry_run=true` to validate + summarize without dispatching any bros. Replaces long skill-prose protocols like overmind/crucible — the daemon owns the state machine, dispatched bros are stateless function-call turns. See `sm-workflow-orchestration` via `bbox_knowledge`, `schema/workflow.schema.json` for the JSON Schema, and `examples/workflows/` for the shape catalog."
     )]
     async fn bro_orchestrate_run(
         &self,
@@ -2878,8 +2878,10 @@ Constraints:\n\
         use std::collections::HashSet;
         let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
         match actor.kind {
-            workflow::schema::ActorKind::User | workflow::schema::ActorKind::Noop => {
-                // User / noop nodes have no provider — capability check trivially OK.
+            workflow::schema::ActorKind::User => {
+                // User nodes have no provider — capability check trivially OK.
+                // Hook-only / pure-routing nodes (empty actor name) are
+                // never resolved through this path.
             }
             workflow::schema::ActorKind::Executor | workflow::schema::ActorKind::Advisor => {
                 let brofile_name = actor.brofile.as_deref().ok_or_else(|| {
@@ -3163,7 +3165,7 @@ struct WorkflowInstallParams {
 struct OrchestrateRunParams {
     /// Full workflow spec (Workflow struct serialized as JSON). Must
     /// contain `name`, `version`, `actors`, `nodes`, and `graph` (an
-    /// embedded stateDiagram-v2 string). Optional `policy_packet` for
+    /// per-node `next` transitions). Optional `policy_packet` for
     /// arc-level advisor-as-packet evaluation.
     pub workflow: Value,
     /// Working directory passed to every dispatched bro.
@@ -4660,8 +4662,9 @@ async fn process_webhook(
         Some(p) => p.consequent.to_json(),
         None => {
             tracing::warn!(
-                "webhook '{name}': routing packet '{}' produced no_match — dead-lettering",
-                spec.routing_packet
+                "webhook '{name}': routing packet '{}' produced no_match — dead-lettering. entity={}",
+                spec.routing_packet,
+                entity
             );
             return Ok(json!({
                 "status": "no_match",
@@ -5202,18 +5205,27 @@ async fn signal_arc_dispatch(
     payload: Value,
 ) -> Value {
     let store = &state.wait_store;
+    let pending_before: Vec<_> = store
+        .snapshot()
+        .into_iter()
+        .filter(|w| w.signal == signal)
+        .collect();
     let m = store.match_and_take(signal, &correlation);
     let Some((resolved_slot, notify, arc_id, wait_id)) = m else {
         tracing::info!(
-            "signal '{signal}' arrived with correlation {:?} — no matching wait (idle)",
-            correlation
+            "signal '{signal}' arrived with correlation {correlation:?} — no matching wait (idle). pending_with_same_signal={:?}",
+            pending_before.iter().map(|w| (w.arc_id.clone(), w.wait_id.clone(), w.correlation.clone())).collect::<Vec<_>>(),
         );
         return json!({
             "status": "no_matching_wait",
             "signal": signal,
             "correlation": correlation,
+            "pending_with_same_signal": pending_before,
         });
     };
+    tracing::info!(
+        "signal '{signal}' arrived with correlation {correlation:?} — resolved wait arc={arc_id} wait_id={wait_id}",
+    );
     let sig = crate::workflow::context::SignalRef {
         name: signal.to_string(),
         payload,
@@ -6080,8 +6092,8 @@ mod tests {
             "name": "depth-test",
             "version": 1,
             "actors": {"a": {"kind": "executor", "brofile": "b"}},
-            "nodes": {"N": {"actor": "a"}},
-            "graph": "stateDiagram-v2\n    [*] --> N\n    N --> [*]"
+            "nodes": {"N": {"actor": "a", "next": {"type": "terminal"}}},
+            "start": "N"
         }"#;
         let compiled = compile(load_workflow(json).unwrap()).unwrap();
 

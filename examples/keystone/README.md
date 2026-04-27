@@ -23,7 +23,7 @@ underlying engine semantics see [`../../WORKFLOWS.md`](../../WORKFLOWS.md).
 | Hook gating via `when: domain:...` packet                                       | PushAndOpenPr (idempotent create-or-reopen), PostReview (auto-merge on approve), on_arc_exit cleanup |
 | Wait nodes with `any_of` race + timeout                                         | AwaitReviewTrigger (24h), AwaitFeedbackOrMerge (7d)                        |
 | Synthetic `__timeout__` signal as graceful-degrade path                         | Both Wait gates accept it (route → halt)                                   |
-| Choice nodes routing graph branches by gate verdict                             | `ReviewOrDone` consumes `merge-or-review`, `FeedbackOrDone` consumes `loop-or-exit` |
+| Branch transitions routing on gate verdict                                      | `AwaitReviewTrigger.next.branch` consumes `merge-or-review`, `AwaitFeedbackOrMerge.next.branch` consumes `loop-or-exit` |
 | Gate packets routing on `last_signal.name`                                      | merge-or-review, loop-or-exit                                              |
 | Workflow-level policy packet (advisor-as-packet)                                | arc-budget caps step count                                                 |
 | Domain-shaped packet refs (`domain:...`)                                        | Every gate/policy/hook-when reference                                      |
@@ -32,7 +32,7 @@ underlying engine semantics see [`../../WORKFLOWS.md`](../../WORKFLOWS.md).
 | Routing packet → start_arc / signal_arc / ignore                                | `packets/routing-forgejo.json` (operator's mapping; engine knows nothing of forgejo) |
 | Webhook `default_project_dir` resolution                                        | Set in `webhooks/forgejo.json`; arcs created from the hook anchor here     |
 | Capability tags (no-op here — every actor's `requires` is empty)                | Demonstrates the slot; populate it when picking models with hard requirements |
-| Noop actor for hook-only nodes                                                  | `Setup`, `PushAndOpenPr`, `FetchDiff`, `PostReview`, `Done` — fire hooks, no LLM dispatch |
+| Hook-only nodes (empty `actor`)                                                 | `Setup`, `PushAndOpenPr`, `FetchDiff`, `PostReview`, `Done` — fire hooks, no LLM dispatch |
 | Generic `http_json` for any code-host integration                               | Issue fetch, PR list, PR create, PR diff (via `response_kind: text`), review post, merge — same op for all |
 | Generic `find_first` for client-side array filtering                            | `PushAndOpenPr` GETs ALL open PRs (Forgejo's `head=` filter is unreliable), then `find_first { from: ${vars.all_open_prs}, where: { "head.ref": "${vars.branch}" } }` writes the matching PR (or null) into `vars.existing_pr`. Composable primitive — no platform-specific search op needed. |
 | Idempotent re-dispatch                                                          | `PushAndOpenPr` reuses a matching open PR (via `set_var pr_data = ${vars.existing_pr}` gated by `domain:hook-when/has-existing-pr`) instead of paving the prior arc's PR. Re-running an arc on the same issue+branch is safe. |
@@ -141,35 +141,28 @@ examples/keystone/
 
 ### What the arc does
 
-```mermaid
-stateDiagram-v2
-    state ReviewOrDone <<choice>>
-    state FeedbackOrDone <<choice>>
-    [*] --> Setup
-    Setup --> Implement
-    Implement --> AwaitReviewTrigger
-    AwaitReviewTrigger --> ReviewOrDone
-    ReviewOrDone --> Review : ready
-    ReviewOrDone --> Done : merged
-    Review --> AwaitFeedbackOrMerge
-    AwaitFeedbackOrMerge --> FeedbackOrDone
-    FeedbackOrDone --> AddressFeedback : feedback
-    FeedbackOrDone --> Done : merged
-    AddressFeedback --> AwaitReviewTrigger
-    Done --> [*]
+Control flow is encoded as per-node `next` transitions in `workflows/issue-to-merged-pr.json`:
+
+```
+start: Setup
+Setup            → goto:Implement
+Implement        → goto:AwaitReviewTrigger
+AwaitReviewTrigger → branch{ready→Review, merged→Done}        (verdict from gate: merge-or-review)
+Review           → goto:AwaitFeedbackOrMerge
+AwaitFeedbackOrMerge → branch{feedback→AddressFeedback, merged→Done}  (verdict from gate: loop-or-exit)
+AddressFeedback  → goto:AwaitReviewTrigger                    (back-edge — the feedback cycle)
+Done             → terminal
 ```
 
 | Node                | Kind                       | What happens                                                                 |
 |---------------------|----------------------------|------------------------------------------------------------------------------|
-| `Setup`             | Noop + on_enter hooks      | Initialize counter vars, derive branch name, `WorktreeCreate`, capture `worktree_path` into vars for sub-arcs. |
+| `Setup`             | Hook-only (empty `actor`)  | Initialize counter vars, derive branch name, `WorktreeCreate`, capture `worktree_path` into vars for sub-arcs. |
 | `Implement`         | subworkflow_ref            | Runs `implementer-arc`: `http_json` GET issue → LLM edits + commits → `shell` push → idempotent `http_json` POST/PATCH PR. Exports `pr_number`/`branch`. |
-| `AwaitReviewTrigger`| Wait `any_of [pr-ready, pr-merged]`, 24h timeout, `gate: merge-or-review` | Suspends until pr-ready or pr-merged; gate emits `ready`/`merged` verdict. |
-| `ReviewOrDone`      | `<<choice>>`               | Routes by gate verdict: `ready` → Review, `merged` → Done.                  |
+| `AwaitReviewTrigger`| Wait `any_of [pr-ready, pr-merged]`, 24h timeout, `gate: merge-or-review` | Suspends until pr-ready or pr-merged; gate emits `ready`/`merged` verdict; node's `next.branch.cases` routes accordingly. |
 | `Review`            | subworkflow_ref            | Runs `reviewer-arc`: `http_json` GET diff (`response_kind: text`) → ensemble reviewers emit verdicts → single-actor aggregator emits `{event, body, action: "merge"\|"request_changes"}` JSON → PostReview parses, posts COMMENT, and `http_json` POST `/merge` gated by `should-merge`. |
-| `AwaitFeedbackOrMerge` | Wait `any_of [pr-feedback, pr-merged]`, 7d timeout, `gate: loop-or-exit` | Suspends; `on_exit` captures last_signal payload + increments `review_iteration`. Gate emits `merged`/`feedback`/`halt`. |
-| `FeedbackOrDone`    | `<<choice>>`               | Routes by gate verdict: `feedback` → AddressFeedback, `merged` → Done.       |
-| `AddressFeedback`   | subworkflow_ref            | Runs `implementer-feedback-arc`: revise + commit → on_exit `shell` push → fires `pull_request.synchronize` webhook → loops back to AwaitReviewTrigger. |
-| `Done`              | Noop                       | Terminal node. Triggers `on_arc_exit` hooks at workflow level. |
+| `AwaitFeedbackOrMerge` | Wait `any_of [pr-feedback, pr-merged]`, 7d timeout, `gate: loop-or-exit` | Suspends; `on_exit` captures last_signal payload + increments `review_iteration`. Gate emits `merged`/`feedback`/`halt`; node's `next.branch.cases` routes accordingly. |
+| `AddressFeedback`   | subworkflow_ref            | Runs `implementer-feedback-arc`: revise + commit → on_exit `shell` push → fires `pull_request.synchronize` webhook → `next.goto: AwaitReviewTrigger` closes the cycle. |
+| `Done`              | Hook-only + `next.terminal`| Terminal node. Triggers `on_arc_exit` hooks at workflow level. |
 
 `on_arc_exit` runs `WorktreeRemove` gated by `domain:workflow-cleanup/keep-on-fail` — keeps the worktree when `meta.arc_outcome` ∈ {`failed`, `cancelled`, `timeout`}, deletes on success.
 
@@ -264,7 +257,7 @@ Capability validation will refuse to install/dispatch the arc if any team member
 
 Concrete tweaks you'll likely want:
 
-- **Concurrent arcs on different PRs.** Today both `Wait` nodes correlate on `{}` (broadcast match). For multi-arc concurrency, change to `{ "pr": "${vars.pr_number}" }` so a `pr-merged` for PR #117 only resumes the arc waiting on PR #117. Routing packet's signal_arc verdict needs to extract `pr_number` from the entity into `correlate` too — currently it ships `correlate: {}`.
+- **Concurrent arcs on different PRs.** Wired by default: both `Wait` nodes correlate on `{ "pr": "${vars.pr_number}" }` and the routing packet's `signal_arc` verdicts emit `correlate: {"pr": "${entity.pr_number}"}`. The dispatch path runs `routing::resolve_entity_template` over the consequent before parse, so a `pr-merged` for PR #117 only resumes the arc waiting on PR #117 — concurrent arcs on different PRs don't cross-resume. To revert to broadcast match (single-arc demos that don't care about pinning), drop the `correlate` keys from both `Wait` nodes AND the routing rules.
 - **Push-storm debouncing.** Three commits to the PR fire three `pull_request.synchronize` webhooks → three `pr-ready` signals → three reviewer dispatches. Add a `vars.review_in_progress` flag in `Review`'s `on_enter`/`on_exit`, then add a routing rule that ignores `synchronize` events while it's set. Pattern documented in [`WORKFLOWS.md` § Webhook ingress](../../WORKFLOWS.md#webhook-ingress); not wired here for clarity.
 - **Different cleanup policy.** Edit `packets/cleanup-policy.json`. Three options ship as templates:
   - `keep-on-fail` (default here) — keep worktree for failed/cancelled/timeout, delete on success
@@ -275,7 +268,7 @@ Concrete tweaks you'll likely want:
 
 ### Adding a new actor
 
-1. Pick a `kind` (`executor` / `ensemble` / `advisor` / `user` / `noop`).
+1. Pick a `kind` (`executor` / `ensemble` / `advisor` / `user`). For pure hook-host / routing-only nodes, leave `actor` empty (`""`) instead of declaring a placeholder actor.
 2. Reference an existing brofile (or upsert a new one via `/admin/brofile/upsert` or `bro_brofile`).
 3. Add to `actors` in the appropriate workflow spec.
 4. Reference from a node via `actor: <name>`.

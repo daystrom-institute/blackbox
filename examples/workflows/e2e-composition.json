@@ -7,13 +7,16 @@
       "brofile": "probe-haiku"
     }
   },
+  "start": "Preamble",
   "nodes": {
     "Preamble": {
       "actor": "main",
-      "prompt": "Say in one sentence: 'Invoking a nested workflow for a two-turn exchange.' No preamble."
+      "prompt": "Say in one sentence: 'Invoking a nested workflow for a two-turn exchange.' No preamble.",
+      "next": { "type": "goto", "to": "SubGreet" }
     },
     "SubGreet": {
       "actor": "main",
+      "next": { "type": "goto", "to": "Closing" },
       "subworkflow": {
         "name": "greet-and-riff-sub",
         "version": 1,
@@ -24,23 +27,25 @@
             "durable": true
           }
         },
+        "start": "SubA",
         "nodes": {
           "SubA": {
             "actor": "sub_haiku",
-            "prompt": "Output exactly: 'Hello from the sub-workflow.' No preamble, no other text."
+            "prompt": "Output exactly: 'Hello from the sub-workflow.' No preamble, no other text.",
+            "next": { "type": "goto", "to": "SubB" }
           },
           "SubB": {
             "actor": "sub_haiku",
-            "prompt": "Now, in the same conversation, riff on what you just said in exactly one sentence. No preamble."
+            "prompt": "Now, in the same conversation, riff on what you just said in exactly one sentence. No preamble.",
+            "next": { "type": "terminal" }
           }
-        },
-        "graph": "stateDiagram-v2\n    [*] --> SubA\n    SubA --> SubB\n    SubB --> [*]"
+        }
       }
     },
     "Closing": {
       "actor": "main",
-      "prompt": "The nested sub-workflow produced these outputs:\n\n${SubGreet.output}\n\nIn one sentence, summarize what the sub-workflow said. No preamble."
+      "prompt": "The nested sub-workflow produced these outputs:\n\n${SubGreet.output}\n\nIn one sentence, summarize what the sub-workflow said. No preamble.",
+      "next": { "type": "terminal" }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> Preamble\n    Preamble --> SubGreet\n    SubGreet --> Closing\n    Closing --> [*]"
+  }
 }

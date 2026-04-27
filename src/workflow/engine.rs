@@ -1,18 +1,17 @@
 //! Workflow engine — walks a compiled workflow, dispatches activity
 //! nodes via the orchestration primitives, applies gate packets, follows
-//! choice-node branches by verdict, and enforces per-node retry ceilings.
+//! `next` transitions (goto / branch / fork / terminal), and enforces
+//! per-node retry ceilings.
 //!
-//! v0.2 scope:
-//! - Executor actors (bro_exec + durable bro_resume)
-//! - Sequential edges
-//! - Choice nodes with labeled-edge dispatch keyed on the last gate verdict
-//! - Back-edges (retry loops) with visit-count ceilings
+//! v0.3 scope:
+//! - Executor / Ensemble / Advisor / User / Noop actors
+//! - Per-node `NodeTransition` (goto / branch-by-verdict / fork / terminal)
+//! - Back-edges (cycles) expressed as plain Goto with retry-budget caps
 //! - Gate packets applied after each activity node completes
+//! - Fork = fire-and-forget side dispatch + main-walk continuation
+//! - `wait_for` = explicit fan-in: await listed in-flight sources at
+//!   node entry before running its body
 //! - `${NodeName.output}` prompt substitution + retry-context prepend
-//!
-//! Still phase-next: fork / join / fire-and-forget / late_inject /
-//! ensemble actors. Activity nodes whose spec uses unimplemented modes
-//! bail at runtime with a clear message.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,9 +24,13 @@ use tokio::sync::Notify;
 use super::context::{ArcContext, ArcMeta, SignalRef};
 use super::ops::{execute_op, HookOp, OnFailure, OpEffect};
 use super::wait::{canonicalize_correlation, PendingWait, WaitSpec};
-use super::{ActorKind, ActorSpec, CompiledWorkflow, GateMode, MermaidNodeKind, NodeMode};
+use super::{ActorKind, ActorSpec, CompiledWorkflow, GateMode, NodeMode, NodeTransition};
 use crate::orchestration as orch;
 use crate::BlackboxServer;
+
+/// Sentinel value returned by `next_node` when the arc has reached a
+/// `Terminal` transition. The main run loop exits on this value.
+const TERMINAL_SENTINEL: &str = "__terminal__";
 
 /// Handle to a dispatched-but-not-yet-waited-on task. Fork nodes
 /// register these for their async branches; a later `late_inject` pulls
@@ -792,7 +795,7 @@ impl<'a> WorkflowRunner<'a> {
         self.update_arc_snapshot("running", "(start)", Some(&entry));
         let mut current = entry;
         let mut steps = 0usize;
-        while current != "[*]" {
+        while current != TERMINAL_SENTINEL {
             if steps >= self.max_steps {
                 bail!("workflow exceeded max_steps ({})", self.max_steps);
             }
@@ -911,100 +914,104 @@ impl<'a> WorkflowRunner<'a> {
     }
 
     fn entry_node(&self) -> Result<String> {
-        self.compiled
-            .graph
-            .edges
-            .iter()
-            .find(|e| e.from == "[*]")
-            .map(|e| e.to.clone())
-            .ok_or_else(|| anyhow!("no entry edge from [*]"))
-    }
-
-    fn node_kind(&self, node_id: &str) -> MermaidNodeKind {
-        self.compiled
-            .graph
-            .nodes
-            .iter()
-            .find(|n| n.id == node_id)
-            .map(|n| n.kind.clone())
-            .unwrap_or(MermaidNodeKind::Activity)
+        Ok(self.compiled.spec.start.clone())
     }
 
     fn next_node(&self, current: &str) -> Result<String> {
-        let outgoing: Vec<_> = self
+        let node = self
             .compiled
-            .graph
-            .edges
-            .iter()
-            .filter(|e| e.from == current)
-            .collect();
-        if outgoing.is_empty() {
-            bail!("node '{current}' has no outgoing edges");
-        }
-
-        let kind = self.node_kind(current);
-        if matches!(kind, MermaidNodeKind::Fork) {
-            // Main walk follows the FIRST outgoing edge — that's the
-            // sync continuation. Remaining edges were dispatched as
-            // fire-and-forget at run_node time.
-            return Ok(outgoing[0].to.clone());
-        }
-        if matches!(kind, MermaidNodeKind::Choice) {
-            // Choice nodes dispatch by matching `last_verdict` against
-            // outgoing edge labels. This is how blind-style convergence
-            // loops express "revise" vs. "converged" branching.
-            let verdict = self.last_verdict.as_deref().ok_or_else(|| {
-                anyhow!(
-                    "choice node '{current}' reached with no prior gate verdict — \
-                     either the predecessor activity node has no `gate` packet \
-                     spec, or the gate fired but no rule matched the output \
-                     (packet returned None). Check the predecessor's gate \
-                     config and ensure the packet has a catchall fallback rule."
-                )
-            })?;
-            let matched = outgoing
-                .iter()
-                .find(|e| e.label.as_deref() == Some(verdict));
-            match matched {
-                Some(edge) => Ok(edge.to.clone()),
-                None => {
-                    let labels: Vec<&str> =
-                        outgoing.iter().filter_map(|e| e.label.as_deref()).collect();
-                    bail!(
-                        "choice '{current}' has no edge for verdict '{verdict}' (edge labels: {labels:?})"
-                    );
+            .spec
+            .nodes
+            .get(current)
+            .ok_or_else(|| anyhow!("no metadata for node '{current}'"))?;
+        match &node.next {
+            NodeTransition::Terminal => Ok(TERMINAL_SENTINEL.to_string()),
+            NodeTransition::Goto { to } => Ok(to.clone()),
+            NodeTransition::Fork { continue_to, .. } => Ok(continue_to.clone()),
+            NodeTransition::Branch { cases, default, .. } => {
+                let verdict = self.last_verdict.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "branch node '{current}' reached with no prior gate verdict — \
+                         either the node has no `gate` packet spec, the gate fired \
+                         but no rule matched (packet returned None), or the predecessor's \
+                         transition didn't run a gate. Ensure the gate has a catchall \
+                         fallback rule, or set `default` on the branch."
+                    )
+                })?;
+                if let Some(target) = cases.get(verdict) {
+                    return Ok(target.clone());
                 }
-            }
-        } else {
-            if outgoing.len() > 1 {
+                if let Some(d) = default {
+                    return Ok(d.clone());
+                }
+                let mut labels: Vec<&str> = cases.keys().map(String::as_str).collect();
+                labels.sort();
                 bail!(
-                    "v0 engine does not support fan-out on non-choice nodes: '{current}' has {} outgoing edges",
-                    outgoing.len()
+                    "branch '{current}' has no case for verdict '{verdict}' (cases: {labels:?}, no default)"
                 );
             }
-            Ok(outgoing[0].to.clone())
         }
     }
 
     async fn run_node(&mut self, node_id: &str) -> Result<()> {
-        let kind = self.node_kind(node_id);
-        match kind {
-            MermaidNodeKind::Choice => {
-                // Choice nodes are pure routing — no dispatch, no gate.
-                // next_node will consume last_verdict to pick an edge.
-                self.log_event(
-                    "choice_route",
-                    json!({
-                        "node": node_id,
-                        "verdict": self.last_verdict.clone(),
-                    }),
-                );
-                Ok(())
+        // wait_for: explicit fan-in. Join any listed in-flight sources
+        // before running the node body so their outputs are available
+        // for prompt rendering / gate evaluation.
+        let wait_for: Vec<String> = self
+            .compiled
+            .spec
+            .nodes
+            .get(node_id)
+            .map(|n| n.wait_for.clone())
+            .unwrap_or_default();
+        if !wait_for.is_empty() {
+            let mut joined = 0usize;
+            let mut already = 0usize;
+            for src in &wait_for {
+                if self.join_in_flight_source(src).await? {
+                    joined += 1;
+                } else {
+                    already += 1;
+                }
             }
-            MermaidNodeKind::Fork => self.run_fork_node(node_id).await,
-            MermaidNodeKind::Join => self.run_join_node(node_id).await,
-            MermaidNodeKind::Activity => self.run_activity_node(node_id).await,
+            self.log_event(
+                "fan_in",
+                json!({
+                    "node": node_id,
+                    "wait_for": wait_for,
+                    "joined": joined,
+                    "already_completed": already,
+                }),
+            );
         }
+        self.run_activity_node(node_id).await
+    }
+
+    async fn run_fork_dispatch(&mut self, node_id: &str) -> Result<()> {
+        let branches: Vec<String> = self
+            .compiled
+            .spec
+            .nodes
+            .get(node_id)
+            .and_then(|n| match &n.next {
+                NodeTransition::Fork { branches, .. } => Some(branches.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if branches.is_empty() {
+            return Ok(());
+        }
+        self.log_event(
+            "fork",
+            json!({
+                "node": node_id,
+                "branches": branches.clone(),
+            }),
+        );
+        for target in branches {
+            self.dispatch_fire_and_forget(&target).await?;
+        }
+        Ok(())
     }
 
     async fn run_activity_node(&mut self, node_id: &str) -> Result<()> {
@@ -1046,6 +1053,28 @@ impl<'a> WorkflowRunner<'a> {
         }
 
         let actor_name = spec.actor.clone();
+
+        // Hook-only / pure-routing node: no actor declared. The
+        // rendered prompt becomes the node's captured output (so
+        // downstream `${NodeName.output}` references stay legal),
+        // hooks have already fired around this point, gate runs as
+        // usual. Fork side-dispatch fires here too.
+        if actor_name.is_empty() {
+            let raw_template = spec.prompt.as_deref().unwrap_or("");
+            let prompt = self.render_prompt(raw_template);
+            self.record_output(node_id, prompt.clone());
+            self.log_event(
+                "node_complete_hookless",
+                json!({"node": node_id, "output_bytes": prompt.len()}),
+            );
+            if matches!(spec.next, NodeTransition::Fork { .. }) {
+                self.run_fork_dispatch(node_id).await?;
+            }
+            self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
+            self.apply_node_gate(node_id, &spec).await;
+            return Ok(());
+        }
+
         let actor = self.compiled.spec.actors.get(&actor_name).ok_or_else(|| {
             anyhow!("node '{node_id}' references undeclared actor '{actor_name}'")
         })?;
@@ -1112,17 +1141,13 @@ impl<'a> WorkflowRunner<'a> {
             ActorKind::User => {
                 self.run_user_node(node_id, &prompt)?;
             }
-            ActorKind::Noop => {
-                // No dispatch — record the (rendered) prompt as the
-                // node output so downstream templates can reference
-                // ${NodeName.output} consistently. Hooks already
-                // fired around this branch via on_enter/on_exit.
-                self.record_output(node_id, prompt.clone());
-                self.log_event(
-                    "noop_complete",
-                    json!({"node": node_id, "output_bytes": prompt.len()}),
-                );
-            }
+        }
+
+        // Fork dispatch: if this activity node's `next` is a Fork,
+        // spawn the side-branches fire-and-forget AFTER the main
+        // body has captured its output.
+        if matches!(spec.next, NodeTransition::Fork { .. }) {
+            self.run_fork_dispatch(node_id).await?;
         }
 
         // on_exit hooks — fire AFTER actor return but BEFORE gate so
@@ -1300,34 +1325,6 @@ impl<'a> WorkflowRunner<'a> {
         Ok(())
     }
 
-    async fn run_fork_node(&mut self, node_id: &str) -> Result<()> {
-        // First outgoing edge is the sync continuation; main walk picks
-        // it up via next_node. All other outgoing edges get their
-        // target dispatched fire-and-forget and stored in `in_flight`.
-        let async_targets: Vec<String> = self
-            .compiled
-            .graph
-            .edges
-            .iter()
-            .filter(|e| e.from == node_id)
-            .skip(1)
-            .map(|e| e.to.clone())
-            .filter(|t| t != "[*]")
-            .collect();
-
-        self.log_event(
-            "fork",
-            json!({
-                "node": node_id,
-                "async_targets": async_targets.clone(),
-            }),
-        );
-        for target in async_targets {
-            self.dispatch_fire_and_forget(&target).await?;
-        }
-        Ok(())
-    }
-
     async fn dispatch_fire_and_forget(&mut self, target_id: &str) -> Result<()> {
         let spec = self
             .compiled
@@ -1421,11 +1418,6 @@ impl<'a> WorkflowRunner<'a> {
             }
             ActorKind::User => {
                 bail!("fork: async target '{target_id}' is a user node — can't fire-and-forget");
-            }
-            ActorKind::Noop => {
-                bail!(
-                    "fork: async target '{target_id}' is a noop node — fire-and-forget is meaningless (nothing to dispatch)"
-                );
             }
         }
         Ok(())
@@ -1552,50 +1544,6 @@ impl<'a> WorkflowRunner<'a> {
             }
         }
         Ok(true)
-    }
-
-    /// `<<join>>` control node — synchronous fan-in. Waits for every
-    /// incoming edge's source that's currently in-flight, captures
-    /// their outputs into `node_outputs`, then advances via the single
-    /// outgoing edge. Sources already joined (e.g., via `late_inject`)
-    /// are skipped silently.
-    async fn run_join_node(&mut self, node_id: &str) -> Result<()> {
-        let incoming_sources: Vec<String> = self
-            .compiled
-            .graph
-            .edges
-            .iter()
-            .filter(|e| e.to == node_id && e.from != "[*]")
-            .map(|e| e.from.clone())
-            .collect();
-        let mut joined_count = 0usize;
-        let mut skipped_count = 0usize;
-        for source in &incoming_sources {
-            let joined = self.join_in_flight_source(source).await?;
-            if joined {
-                joined_count += 1;
-            } else {
-                skipped_count += 1;
-            }
-        }
-        self.log_event(
-            "join",
-            json!({
-                "node": node_id,
-                "incoming": incoming_sources,
-                "joined": joined_count,
-                "already_completed": skipped_count,
-            }),
-        );
-        if joined_count > 0 {
-            self.arc_note(
-                "surprise",
-                &format!(
-                    "join '{node_id}' fanned in {joined_count} async source(s) (+{skipped_count} already completed)"
-                ),
-            );
-        }
-        Ok(())
     }
 
     async fn run_ensemble_node(
@@ -2243,25 +2191,32 @@ mod tests {
             "version": 1,
             "actors": {"a": {"kind": "executor", "brofile": "b"}},
             "nodes": {
-                "N1": {"actor": "a", "prompt": "first node"},
-                "N2": {"actor": "a", "prompt": "echo ${N1.output}"}
+                "N1": {"actor": "a", "prompt": "first node", "next": {"type": "goto", "to": "N2"}},
+                "N2": {"actor": "a", "prompt": "echo ${N1.output}", "next": {"type": "terminal"}}
             },
-            "graph": "stateDiagram-v2\n    [*] --> N1\n    N1 --> N2\n    N2 --> [*]"
+            "start": "N1"
         }"#;
         compile(load_workflow(json).unwrap()).unwrap()
     }
 
-    fn choice_compiled() -> CompiledWorkflow {
+    fn branch_compiled() -> CompiledWorkflow {
         let json = r#"{
             "name": "t",
             "version": 1,
             "actors": {"a": {"kind": "executor", "brofile": "b"}},
             "nodes": {
-                "Decide": {"actor": "a", "gate": "packet-12345678"},
-                "Yes": {"actor": "a"},
-                "No": {"actor": "a"}
+                "Decide": {
+                    "actor": "a",
+                    "gate": "packet-12345678",
+                    "next": {
+                        "type": "branch",
+                        "cases": {"yes": "Yes", "no": "No"}
+                    }
+                },
+                "Yes": {"actor": "a", "next": {"type": "terminal"}},
+                "No":  {"actor": "a", "next": {"type": "terminal"}}
             },
-            "graph": "stateDiagram-v2\n    [*] --> Decide\n    state Decide_Pick <<choice>>\n    Decide --> Decide_Pick\n    Decide_Pick --> Yes: yes\n    Decide_Pick --> No: no\n    Yes --> [*]\n    No --> [*]"
+            "start": "Decide"
         }"#;
         compile(load_workflow(json).unwrap()).unwrap()
     }
@@ -2277,142 +2232,112 @@ mod tests {
     #[test]
     fn entry_walk_and_sequential_transitions() {
         let compiled = mini_compiled();
-        let (runner, _) = runner_for(&compiled);
+        let runner = runner_for(&compiled);
         assert_eq!(runner.entry_node().unwrap(), "N1");
         assert_eq!(runner.next_node("N1").unwrap(), "N2");
-        assert_eq!(runner.next_node("N2").unwrap(), "[*]");
+        assert_eq!(runner.next_node("N2").unwrap(), TERMINAL_SENTINEL);
     }
 
     #[test]
-    fn choice_routes_by_last_verdict() {
-        let compiled = choice_compiled();
-        let (mut runner, _) = runner_for(&compiled);
+    fn branch_routes_by_last_verdict() {
+        let compiled = branch_compiled();
+        let mut runner = runner_for(&compiled);
         runner.last_verdict = Some("yes".into());
-        assert_eq!(runner.next_node("Decide_Pick").unwrap(), "Yes");
+        assert_eq!(runner.next_node("Decide").unwrap(), "Yes");
         runner.last_verdict = Some("no".into());
-        assert_eq!(runner.next_node("Decide_Pick").unwrap(), "No");
+        assert_eq!(runner.next_node("Decide").unwrap(), "No");
     }
 
     #[test]
-    fn choice_without_verdict_errors() {
-        let compiled = choice_compiled();
-        let (runner, _) = runner_for(&compiled);
-        let err = runner.next_node("Decide_Pick").unwrap_err().to_string();
+    fn branch_without_verdict_errors() {
+        let compiled = branch_compiled();
+        let runner = runner_for(&compiled);
+        let err = runner.next_node("Decide").unwrap_err().to_string();
         assert!(err.contains("no prior gate verdict"), "err: {err}");
     }
 
     #[test]
-    fn choice_with_unmatched_verdict_errors() {
-        let compiled = choice_compiled();
-        let (mut runner, _) = runner_for(&compiled);
+    fn branch_with_unmatched_verdict_errors() {
+        let compiled = branch_compiled();
+        let mut runner = runner_for(&compiled);
         runner.last_verdict = Some("maybe".into());
-        let err = runner.next_node("Decide_Pick").unwrap_err().to_string();
-        assert!(err.contains("no edge for verdict 'maybe'"), "err: {err}");
+        let err = runner.next_node("Decide").unwrap_err().to_string();
+        assert!(err.contains("no case for verdict 'maybe'"), "err: {err}");
         assert!(err.contains("yes") && err.contains("no"));
     }
 
     #[test]
-    fn non_choice_fan_out_still_rejected() {
-        // Non-choice fan-out is a spec error. Build an activity node
-        // with two outgoing non-labeled edges.
+    fn branch_with_default_falls_through() {
         let json = r#"{
             "name": "t",
             "version": 1,
             "actors": {"a": {"kind": "executor", "brofile": "b"}},
             "nodes": {
-                "N1": {"actor": "a"},
-                "N2": {"actor": "a"},
-                "N3": {"actor": "a"}
+                "Decide": {
+                    "actor": "a",
+                    "gate": "packet-12345678",
+                    "next": {
+                        "type": "branch",
+                        "cases": {"yes": "Yes"},
+                        "default": "Fallback"
+                    }
+                },
+                "Yes": {"actor": "a", "next": {"type": "terminal"}},
+                "Fallback": {"actor": "a", "next": {"type": "terminal"}}
             },
-            "graph": "stateDiagram-v2\n    [*] --> N1\n    N1 --> N2\n    N1 --> N3\n    N2 --> [*]\n    N3 --> [*]"
+            "start": "Decide"
         }"#;
         let compiled = compile(load_workflow(json).unwrap()).unwrap();
-        let (runner, _) = runner_for(&compiled);
-        let err = runner.next_node("N1").unwrap_err().to_string();
-        assert!(err.contains("fan-out"), "err: {err}");
+        let mut runner = runner_for(&compiled);
+        runner.last_verdict = Some("anything-else".into());
+        assert_eq!(runner.next_node("Decide").unwrap(), "Fallback");
     }
 
-    // Build a runner against a dummy server ref. Since most control-flow
-    // tests don't dispatch, we just need a valid &BlackboxServer to borrow
-    // from. The tests that would dispatch are covered by the E2E CLI run.
-    fn runner_for(compiled: &CompiledWorkflow) -> (DummyRunner, ()) {
-        (
-            DummyRunner {
-                compiled,
-                node_outputs: HashMap::new(),
-                last_verdict: None,
-                visit_counts: HashMap::new(),
-            },
-            (),
-        )
+    fn runner_for(compiled: &CompiledWorkflow) -> DummyRunner {
+        DummyRunner {
+            compiled,
+            last_verdict: None,
+        }
     }
 
     // Mirror of WorkflowRunner's read-side helpers, free of the server
-    // ref. Keeps the graph-walk logic testable.
+    // ref. Keeps the transition-walk logic testable without spinning
+    // up the daemon.
     struct DummyRunner<'a> {
         compiled: &'a CompiledWorkflow,
-        node_outputs: HashMap<String, String>,
         last_verdict: Option<String>,
-        visit_counts: HashMap<String, u32>,
     }
 
     impl<'a> DummyRunner<'a> {
         fn entry_node(&self) -> Result<String> {
-            self.compiled
-                .graph
-                .edges
-                .iter()
-                .find(|e| e.from == "[*]")
-                .map(|e| e.to.clone())
-                .ok_or_else(|| anyhow!("no entry edge"))
-        }
-
-        fn node_kind(&self, node_id: &str) -> MermaidNodeKind {
-            self.compiled
-                .graph
-                .nodes
-                .iter()
-                .find(|n| n.id == node_id)
-                .map(|n| n.kind.clone())
-                .unwrap_or(MermaidNodeKind::Activity)
+            Ok(self.compiled.spec.start.clone())
         }
 
         fn next_node(&self, current: &str) -> Result<String> {
-            let outgoing: Vec<_> = self
+            let node = self
                 .compiled
-                .graph
-                .edges
-                .iter()
-                .filter(|e| e.from == current)
-                .collect();
-            if outgoing.is_empty() {
-                bail!("no outgoing from '{current}'");
-            }
-            let kind = self.node_kind(current);
-            if matches!(kind, MermaidNodeKind::Choice) {
-                let verdict = self
-                    .last_verdict
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("choice node '{current}' has no prior gate verdict"))?;
-                let matched = outgoing
-                    .iter()
-                    .find(|e| e.label.as_deref() == Some(verdict));
-                match matched {
-                    Some(edge) => Ok(edge.to.clone()),
-                    None => {
-                        let labels: Vec<&str> =
-                            outgoing.iter().filter_map(|e| e.label.as_deref()).collect();
-                        bail!("choice '{current}' has no edge for verdict '{verdict}' (edge labels: {labels:?})")
+                .spec
+                .nodes
+                .get(current)
+                .ok_or_else(|| anyhow!("no metadata for node '{current}'"))?;
+            match &node.next {
+                NodeTransition::Terminal => Ok(TERMINAL_SENTINEL.to_string()),
+                NodeTransition::Goto { to } => Ok(to.clone()),
+                NodeTransition::Fork { continue_to, .. } => Ok(continue_to.clone()),
+                NodeTransition::Branch { cases, default, .. } => {
+                    let verdict = self.last_verdict.as_deref().ok_or_else(|| {
+                        anyhow!("branch '{current}' has no prior gate verdict")
+                    })?;
+                    if let Some(t) = cases.get(verdict) {
+                        return Ok(t.clone());
                     }
+                    if let Some(d) = default {
+                        return Ok(d.clone());
+                    }
+                    let mut labels: Vec<&str> = cases.keys().map(String::as_str).collect();
+                    labels.sort();
+                    bail!("branch '{current}' has no case for verdict '{verdict}' (cases: {labels:?})")
                 }
-            } else {
-                if outgoing.len() > 1 {
-                    bail!(
-                        "v0 engine does not support fan-out on non-choice nodes: '{current}' has {} outgoing edges",
-                        outgoing.len()
-                    );
-                }
-                Ok(outgoing[0].to.clone())
             }
         }
     }
@@ -2424,21 +2349,5 @@ mod tests {
             out = out.replace(&key, output);
         }
         out
-    }
-
-    // Silence dead_code warnings on DummyRunner fields that aren't
-    // read by current tests but exist for parity with the runner.
-    #[test]
-    fn dummy_runner_field_parity_with_real_runner() {
-        let compiled = mini_compiled();
-        let mut d = DummyRunner {
-            compiled: &compiled,
-            node_outputs: HashMap::new(),
-            last_verdict: None,
-            visit_counts: HashMap::new(),
-        };
-        d.node_outputs.insert("N1".into(), "".into());
-        d.last_verdict = Some("x".into());
-        d.visit_counts.insert("N1".into(), 0);
     }
 }

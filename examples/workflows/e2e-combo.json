@@ -13,19 +13,29 @@
       "team": "ensemble-duo"
     }
   },
+  "start": "Draft",
   "nodes": {
     "Draft": {
       "actor": "author",
       "prompt": "Write a one-sentence product tagline for a fictional tool called 'Constellation' — a distributed tracing platform for async workloads. Under 15 words. No preamble, output only the tagline.",
-      "retry": { "max_generations": 3 }
+      "retry": { "max_generations": 3 },
+      "next": { "type": "goto", "to": "Panel" }
     },
     "Panel": {
       "actor": "panel",
       "prompt": "You are one of two reviewers evaluating a product tagline. Tagline:\n\n${Draft.output}\n\nIn your reply, the FIRST line must be exactly one of:\nVERDICT: APPROVE\nVERDICT: REVISE\n\nThen one sentence of reasoning. No preamble.\n\nApprove only if the tagline is concrete, non-generic, and mentions a distinguishing property. Revise if it's vague, cliche, or indistinct from other telemetry tools.",
-      "gate": "packet-078c52f5"
+      "gate": "packet-078c52f5",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "needs_revision":    "Draft",
+          "unanimous_approve": "Summary"
+        }
+      }
     },
     "Summary": {
       "actor": "author",
+      "next": { "type": "terminal" },
       "subworkflow": {
         "name": "combo-summary-sub",
         "version": 1,
@@ -36,19 +46,20 @@
             "durable": true
           }
         },
+        "start": "Restate",
         "nodes": {
           "Restate": {
             "actor": "summarizer",
-            "prompt": "Paraphrase this approved tagline in one sentence, preserving the key distinguishing property:\n\n${Draft.output}"
+            "prompt": "Paraphrase this approved tagline in one sentence, preserving the key distinguishing property:\n\n${Draft.output}",
+            "next": { "type": "goto", "to": "Rationale" }
           },
           "Rationale": {
             "actor": "summarizer",
-            "prompt": "In one sentence, explain why the panel approved: ${Panel.output}"
+            "prompt": "In one sentence, explain why the panel approved: ${Panel.output}",
+            "next": { "type": "terminal" }
           }
-        },
-        "graph": "stateDiagram-v2\n    [*] --> Restate\n    Restate --> Rationale\n    Rationale --> [*]"
+        }
       }
     }
-  },
-  "graph": "stateDiagram-v2\n    [*] --> Draft\n    Draft --> Panel\n    Panel --> PanelRoute\n    state PanelRoute <<choice>>\n    PanelRoute --> Draft: needs_revision\n    PanelRoute --> Summary: unanimous_approve\n    Summary --> [*]"
+  }
 }
