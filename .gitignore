@@ -3,6 +3,7 @@
 /.dev-agent-links
 /.direnv/
 /result
+/daystrom/
 
 # keystone-arc demo writes admin token + webhook secret here on bootstrap.
 examples/keystone/.env

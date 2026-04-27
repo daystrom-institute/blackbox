@@ -1,0 +1,38 @@
+{
+  "tools": {
+    "clippy": {
+      "run": "bash -c 'export PATH=\"$HOME/.cargo/bin:$PATH\"; set -o pipefail; cargo clippy --message-format=json --all-targets 2>/dev/null | clippy-sarif > daystrom/sast/clippy.sarif'",
+      "sarif": ["daystrom/sast/clippy.sarif"],
+      "dimensions": {
+        "clippy::unnecessary_sort_by": "efficiency",
+        "clippy::needless_collect": "efficiency",
+        "clippy::redundant_clone": "efficiency",
+        "clippy::large_enum_variant": "efficiency",
+        "clippy::inefficient_to_string": "efficiency",
+        "clippy::unwrap_used": "soundness",
+        "clippy::expect_used": "soundness",
+        "clippy::panic": "soundness",
+        "clippy::indexing_slicing": "soundness",
+        "clippy::integer_overflow": "soundness",
+        "clippy::cast_possible_truncation": "soundness",
+        "clippy::float_cmp": "soundness",
+        "clippy::nonminimal_bool": "soundness"
+      },
+      "default_dimension": "adoption"
+    },
+    "cargo-audit": {
+      "run": "bash -c 'export PATH=\"$HOME/.cargo/bin:$PATH\"; cargo audit --json | python3 scripts/sast/cargo-audit-to-sarif.py > daystrom/sast/cargo-audit.sarif'",
+      "sarif": ["daystrom/sast/cargo-audit.sarif"],
+      "dimensions": {
+        "vulnerability": "resilience",
+        "unsound": "soundness",
+        "unmaintained": "adoption",
+        "notice": "adoption",
+        "denial-of-service": "resilience",
+        "memory-corruption": "resilience",
+        "crypto-failure": "resilience"
+      },
+      "default_dimension": "resilience"
+    }
+  }
+}
