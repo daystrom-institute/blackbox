@@ -31,7 +31,8 @@ bootstrap, install, and run script.
 | Path | Trigger | What it does |
 |------|---------|--------------|
 | [`keystone/`](keystone/) | Forgejo `issues.opened` webhook (or poller alternative) | Implementer fixes the bug, opens a PR, reviewer ensemble votes, auto-merge on approval. The reference arc — most engine features touch it. |
-| [`sastquatch/`](sastquatch/) | Cron tick (calendar-driven; sibling primitive of webhook + poller) | Analyzer arc grounds itself by calling biofilter `sast_*` via `mcp_call`, triager picks a finding cluster, fixer arc applies the fix and opens a PR, ensemble reviewer votes, auto-merge. Exercises three primitives keystone doesn't: cron inlet, `mcp_call` op, `triager` actor kind. |
+| [`sastquatch/`](sastquatch/) | Cron tick (calendar-driven; sibling primitive of webhook + poller) | Analyzer arc grounds itself by calling biofilter `sast_*` via `mcp_call`, executor picks a finding cluster, fixer arc applies the fix and opens a PR, ensemble reviewer votes, auto-merge. Exercises three primitives keystone doesn't: cron inlet, `mcp_call` op, persona-via-brofile dispatch. |
+| [`whiteboard/`](whiteboard/) | ADR-tagged issue webhook | Three specialist agents (security / performance / design) post stances blind to a phaser-style whiteboard, transition through phases, debate + vote. Facilitator synthesizes an ADR markdown file, opens a PR, auto-merges on consensus. Exercises the engine's whiteboard primitive (absorbed phaser into `src/whiteboards.rs`), multi-round durable ensemble dispatch, and human-in-the-loop via the same `whiteboard_*` MCP surface specialists use. |
 
 ## Agents
 

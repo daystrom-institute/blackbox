@@ -154,21 +154,29 @@ indices: `vars.labels.0`. Quantified predicates work too:
 ## Actors
 
 Declared in the workflow's `actors` map and referenced by node specs.
+Two kinds.
 
 | Kind       | What it does                                            |
 |------------|---------------------------------------------------------|
-| `executor` | Single bro dispatched via `bro_exec` / `bro_resume`. Does the work.    |
-| `ensemble` | Team broadcast: every member runs the same prompt; output is the labeled concatenation. |
-| `advisor`  | Like executor; convention is narrower tool surface / persona lens. Renders judgement, doesn't write code. |
-| `planner`  | Single bro (executor mechanics). Contract: emits a structured plan / sequence / charter that downstream nodes consume — output is dispatch-shape-driving, not user-facing text. Pair with `parse_json` on `on_exit` to enforce structured output. |
-| `triager`  | Single bro (executor mechanics). Contract: takes a queue / set of candidates (typically produced upstream by `mcp_call` or a planner) and picks the next one(s) to act on, with rationale. Same shape as planner, distinct intent: planner authors a plan, triager picks from a pool. |
-| `user`     | Halts the arc with a `blocked` note carrying the prompt. Resume = re-dispatch with whatever resolves the pause. |
+| `executor` | Single bro dispatched via `bro_exec` / `bro_resume`. Used for every single-bro role the workflow declares — implementer, fixer, triager, planner, facilitator, advisor, aggregator, synthesizer, reviewer, etc. The brofile + prompt carry the persona. |
+| `ensemble` | Team broadcast: every member runs the same prompt; output is the labeled concatenation. When the node has an associated whiteboard (see §Whiteboards), each member's STRICT-JSON output is also auto-postable via `whiteboard_post` from inside the dispatched turn. |
 
-`planner` and `triager` are dispatch-mechanically identical to
-`executor` — same brofile resolution, same retry path, same output
-capture. The difference is the *contract* (structured selection vs.
-user-facing prose), enforced by convention + an `output_schema`-style
-hook on `on_exit`. The brofile lens carries the persona.
+**Why only two kinds.** Earlier iterations had `advisor`, `planner`,
+`triager`, `user` as marker types. They didn't pull engine weight —
+mechanically each was identical to `executor`, and the marker was
+never enforced. Persona / role / contract is a workflow-author concern
+carried by the brofile lens + prompt + on_exit `parse_json`
+validation. Engine vocabulary describes *dispatch shape*, not roles.
+
+**Human-in-the-loop without a `user` actor.** When a workflow needs
+human input — operator approval, external Claude weighing in,
+ntfy-routed acknowledgement — the pattern is: open a whiteboard,
+register the human as an `operator` role, suspend the arc on a
+`board-transitioned` signal correlated to `(board_id, target_phase)`.
+The human (or their Claude session, or a slack/ntfy adapter) calls
+`whiteboard_post` / `whiteboard_vote` / `whiteboard_transition`
+through the same MCP surface in-workflow specialists use. No special
+"user" type. See §Whiteboards.
 
 For hook-only / pure-routing nodes (Setup / Done patterns where the
 work is on_enter / on_exit hooks and there's no LLM dispatch), leave
@@ -715,6 +723,148 @@ under `store_dir/crons/<name>.json`; restored on daemon startup.
 - **Resilience layering** → webhook + poller against the same upstream, accept the duplicate-dispatch cost (workflow-level idempotency catches it).
 - **Event-driven AND time-bounded** (e.g. "open a PR but auto-close after 7 days") → webhook for the open, cron sweeping for the close.
 
+## Whiteboards
+
+Multi-agent deliberation surface, first-class in the engine. Posts
+(proposals / claims / concerns / informational), annotations
+(challenge / corroborate / resolve / validation), and votes accumulate
+on a board, advanced through phases (blind → read → validate →
+debate → resolve → archived) by a facilitator-or-operator role.
+
+Where webhooks and crons are *inlet* primitives (events arriving
+into the engine), whiteboards are a *deliberation* primitive — a
+shared structured log that any audience can read and write through
+the same MCP surface:
+
+- **In-workflow ensemble specialists.** Their dispatched bro
+  prompts instruct them to call `whiteboard_post` (and later
+  `whiteboard_annotate` / `whiteboard_vote`) from inside their turn.
+  Each member's brofile lens carries its `agent_name` so the bro
+  knows which name to use without prompt-side per-member
+  interpolation.
+- **In-workflow facilitators (single bro, executor mechanics).**
+  Drive phase transitions via `whiteboard_transition`. Phase
+  transitions emit a `board-transitioned` signal correlated to
+  `(board, target_phase)` through the shared
+  `dispatch_routed_event` pipeline — same machinery webhooks use.
+- **External agents — operator's Claude session, dispatched help,
+  eventually humans through slack / ntfy adapters.** Read board
+  state via `whiteboard_state`, act via the same write tools. The
+  board IS the human-in-the-loop surface; no separate escalation
+  registry, no `user` actor type.
+
+### Spec shape
+
+Whiteboards aren't operator-installed like webhooks/pollers/crons —
+they're created on demand by workflows (via `mcp_call → whiteboard_open`)
+or by external clients (via `whiteboard_open` MCP tool directly). The
+board id is the operator's choice; convention is
+`<workflow-name>-<arc_id>` or a deliberation-specific slug.
+
+```jsonc
+// In a workflow node's on_enter:
+{
+  "op": "mcp_call",
+  "args": {
+    "server": "blackbox",
+    "tool": "whiteboard_open",
+    "arguments": {
+      "board_id": "${vars.board_id}",
+      "topic": "ADR #${vars.issue_number}: ${vars.issue_title}",
+      "project": "${vars.worktree_path}",
+      "arc_thread_id": "${meta.arc_thread_id}",
+      "opened_by": "facilitator"
+    }
+  }
+}
+```
+
+### Phase protocol
+
+| Phase       | Allowed actions                                 |
+|-------------|-------------------------------------------------|
+| `blind`     | post (specialists post without seeing others)   |
+| `read`      | (none — observation phase, advance when ready)  |
+| `validate`  | annotate (validation only, with required result)|
+| `debate`    | annotate (challenge / corroborate / resolve), vote |
+| `resolve`   | (none — frozen, facilitator synthesizes outside)|
+| `archived`  | (terminal — board moved to `archive/` directory)|
+
+Skip rule: `read → debate` is legal (skip validate). All other
+transitions follow the canonical order.
+
+### Conflict detection
+
+`whiteboard_conflicts` evaluates the board state and returns three
+kinds of conflicts:
+
+- **direct_overlap** — two posts target the same `target_file` +
+  `target_location`
+- **cascade_collision** — post A's `cascade_targets` includes post
+  B's direct target
+- **severity_disagreement** — two posts share a `finding_ref` but
+  disagree on `severity`
+
+This generalizes phaser's domain-specific shapes; the operator's
+posts decide whether the conflict types apply by setting (or not
+setting) the relevant fields.
+
+### Resume on phase transition
+
+A workflow can suspend on a board's phase advance using the existing
+`wait` primitive — no new variant needed:
+
+```jsonc
+"AwaitResolve": {
+  "actor": "",
+  "wait": {
+    "any_of": [
+      {
+        "signal": "board-transitioned",
+        "correlate": {
+          "board": { "kind": "json_path", "path": "vars.board_id" },
+          "phase": { "kind": "const", "value": "resolve" }
+        }
+      }
+    ],
+    "timeout": "1h"
+  },
+  "next": { "type": "goto", "to": "Synthesize" }
+}
+```
+
+The transition tool fires the signal; the wait correlates on
+`(board, phase)`; routing-pipeline machinery resolves the wait and
+the arc resumes. Same shape webhook ingress uses to resume on PR
+events.
+
+### Persistence
+
+Boards are JSON files under `$store_dir/whiteboards/<id>.json`,
+atomically written via tempfile + rename, restored on daemon
+startup. Archived boards move to `$store_dir/whiteboards/archive/`
+and are not loaded back into memory — they exist for audit only.
+
+### Where to dispatch what
+
+| Surface | Who calls | Why |
+|---------|-----------|-----|
+| `whiteboard_open` from `on_enter` hook (mcp_call) | Engine, on Setup | Predictable id, deterministic registration |
+| `whiteboard_register` from `on_enter` hook (mcp_call) | Engine, on Setup | All specialists registered up-front so role checks work |
+| `whiteboard_post` / `whiteboard_annotate` / `whiteboard_vote` from inside dispatched bro | Specialist (LLM) | The structured deliberation IS the agent's output |
+| `whiteboard_transition` from `on_enter` hook (mcp_call) | Engine, on phase-advance node | Deterministic — facilitator's "decide to advance" is part of arc shape, not dispatched |
+| `whiteboard_state` / `whiteboard_summarize` | Anyone (specialist mid-turn, facilitator at synthesis, external Claude joining) | Read-only inspection |
+| `whiteboard_archive` from `on_enter` of Done | Engine, terminal | Strip live state after the artifact ships |
+
+### Comparison with phaser
+
+The engine's whiteboard machinery absorbs phaser's mk0 protocol
+(blind → read → debate → resolve, posts / annotations / votes,
+conflict detection, auto-transition advisory). Phaser stays peer
+software in the daystrom-claude-plugins monorepo; bridgecrew /
+isolinear / ARS keep using the stdio MCP until they migrate. The
+engine version is a same-shape superset accessible in-process.
+
 ## Operator-blessed registries
 
 Three registries, all persisted to disk and restored on daemon
@@ -829,12 +979,22 @@ spawn arc
   for `sha256=` style senders), None for loopback-only testing,
   idempotency dedup, replay endpoint, default-deny on no-match
 - Operator-blessed registries (workflows / webhooks) + admin HTTP
-- Actor kinds: executor, ensemble, advisor, planner, triager, user
-  (plus the empty `actor` form for hook-only nodes). Planner +
-  triager are dispatch-mechanically identical to executor — same
-  brofile resolution, retry path, output capture — distinct only in
-  contract (planner authors a plan; triager picks from a pool). Pair
-  with `parse_json` on `on_exit` to enforce structured output.
+- Actor kinds: just `executor` and `ensemble`. Persona / role /
+  contract (advisor, planner, triager, facilitator, specialist,
+  reviewer, aggregator, …) is brofile-lens + prompt + on_exit
+  `parse_json` validation, never an engine type. Empty `actor: ""`
+  for hook-only / pure-routing nodes.
+- Whiteboards: in-engine multi-agent deliberation primitive (port of
+  phaser's mk0 protocol). 10 `whiteboard_*` MCP tools, three
+  audiences (in-workflow ensemble specialists / facilitator,
+  external Claude operators, eventual humans through slack/ntfy
+  adapters) sharing one surface. Phase transitions emit
+  `board-transitioned` signals through the same dispatch_routed_event
+  pipeline webhooks use, so workflows resume on transitions via the
+  existing `wait` primitive correlated to `(board, target_phase)` —
+  no new wait variant needed. Replaces the deprecated `user` actor
+  kind: humans-in-the-loop join boards as agents, no special engine
+  type for them.
 - Transition shapes: `goto` (forward edges + back-edges), `branch`
   (verdict-routed multi-way with optional `default`), `fork`
   (fire-and-forget side-dispatch + `continue_to`) paired with
@@ -867,11 +1027,15 @@ spawn arc
 
 ## Examples
 
+- [`examples/whiteboard/`](examples/whiteboard/README.md) — end-to-end:
+  ADR-tagged issue webhook → 3-specialist ensemble posts blind to
+  whiteboard → debate (annotate + vote) → facilitator synthesizes ADR
+  markdown → PR opens → auto-merge. The reference arc for the
+  whiteboard primitive + multi-round durable ensemble.
 - [`examples/sastquatch/`](examples/sastquatch/README.md) — end-to-end:
-  cron tick → analyzer (mcp_call → biofilter sast_*; triager picks a
-  finding cluster) → fixer subworkflow → wait → ensemble reviewer →
-  loop on feedback → auto-merge. The reference arc for cron + mcp_call +
-  planner/triager.
+  cron tick → analyzer (mcp_call → biofilter sast_*; executor picks
+  a finding cluster) → fixer subworkflow → wait → ensemble reviewer →
+  loop on feedback → auto-merge. The reference arc for cron + mcp_call.
 - [`examples/keystone/`](examples/keystone/README.md) — end-to-end:
   Forgejo webhook → arc → implementer subworkflow → wait → reviewer
   ensemble → wait-loop until merged → cleanup hooks. Real LLM
