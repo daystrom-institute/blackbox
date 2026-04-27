@@ -6,6 +6,7 @@ mod orchestration;
 mod packets;
 mod parser;
 mod pins;
+mod pollers;
 mod query;
 mod render;
 mod routing;
@@ -77,6 +78,11 @@ struct SharedState {
     /// Operator-installed webhook endpoints. Each carries its
     /// signature scheme + extractor + routing-packet id.
     webhooks: webhooks::SharedRegistry,
+    /// Operator-installed pollers — scheduled HTTP-source inlets
+    /// that converge on the same `dispatch_routed_event` pipeline as
+    /// webhooks. Carries running-task handles so they can be aborted
+    /// on uninstall / replaced on reinstall.
+    pollers: pollers::SharedRegistry,
     /// Operator-installed workflow specs by id. Allows
     /// `start_arc{workflow: "name"}` routing verdicts to find their
     /// target without the webhook payload carrying the full spec.
@@ -3021,6 +3027,47 @@ Constraints:\n\
     }
 
     #[tool(
+        name = "bro_poller_install",
+        description = "Install a scheduled HTTP-source poller that converges on the same routing pipeline as webhook ingress. Use when the upstream doesn't push (no webhook capability) or the daemon has no public ingress. Spec carries: name, every_seconds (>= BBOX_POLLER_MIN_INTERVAL_SECS, default 5), source (HttpFetchSpec), optional iterate (Selector — array path to explode response into N events), per-event extractor, optional dedup_id_path (Selector for stable id, in-memory recent-seen ring per poller), routing_packet, optional default_project_dir. Persisted to disk + tick loop spawned immediately; reinstall replaces the running task."
+    )]
+    async fn bro_poller_install(
+        &self,
+        Parameters(p): Parameters<PollerInstallParams>,
+    ) -> CallToolResult {
+        let spec: pollers::PollerSpec = match serde_json::from_value(p.spec) {
+            Ok(s) => s,
+            Err(e) => return Self::err_text(&format!("poller spec parse failed: {e}")),
+        };
+        // Persist for restart durability.
+        let dir = self.state.store_dir.join("pollers");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{}.json", spec.name));
+        if let Err(e) = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&spec).unwrap_or_default(),
+        ) {
+            return Self::err_text(&format!("poller persist failed: {e}"));
+        }
+        self.state.pollers.install(spec.clone());
+        let handle = pollers::spawn_loop(self.state.clone(), spec.clone());
+        self.state.pollers.track_handle(&spec.name, handle);
+        Self::ok_json(&serde_json::json!({
+            "status": "installed",
+            "name": spec.name,
+            "every_seconds": spec.every_seconds,
+        }))
+    }
+
+    #[tool(
+        name = "bro_poller_list",
+        description = "List installed pollers with their schedule + source URL + routing packet."
+    )]
+    async fn bro_poller_list(&self) -> CallToolResult {
+        let list = self.state.pollers.list();
+        Self::ok_json(&serde_json::json!({"pollers": list}))
+    }
+
+    #[tool(
         name = "bro_workflow_install",
         description = "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced."
     )]
@@ -3092,6 +3139,14 @@ struct ArcStatusParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct WebhookInstallParams {
     /// Full WebhookSpec JSON (name, signature, extractor, routing_packet).
+    pub spec: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct PollerInstallParams {
+    /// Full PollerSpec JSON (name, every_seconds, source, optional
+    /// iterate, extractor, optional dedup_id_path, routing_packet,
+    /// optional default_project_dir).
     pub spec: Value,
 }
 
@@ -4625,12 +4680,58 @@ async fn process_webhook(
     let verdict = routing::RoutingVerdict::parse(&resolved_consequent)
         .map_err(|e| anyhow::anyhow!("verdict parse: {e}"))?;
 
-    dispatch_verdict(state.clone(), &spec, verdict, entity).await
+    dispatch_verdict(
+        state.clone(),
+        &spec.name,
+        spec.default_project_dir.clone(),
+        verdict,
+        entity,
+    )
+    .await
+}
+
+/// Apply a routing packet to an extracted entity and dispatch the
+/// resulting verdict. The shared dispatch entry point used by every
+/// event inlet (webhooks AND pollers) — both reduce to "I have an
+/// entity + a routing-packet id, route it." Inlet-specific concerns
+/// (signature verify, schedule, dedup) live in the caller.
+pub(crate) async fn dispatch_routed_event(
+    state: Arc<SharedState>,
+    inlet_name: &str,
+    routing_packet_id: &str,
+    entity: Value,
+    default_project_dir: Option<String>,
+) -> anyhow::Result<Value> {
+    let prediction = {
+        let store = state.packets.read();
+        let packet = store
+            .load(routing_packet_id)
+            .map_err(|e| anyhow::anyhow!("routing packet load: {e}"))?;
+        apply_packet_with(&packet, &entity, &*store)
+    };
+    let consequent_json = match prediction {
+        Some(p) => p.consequent.to_json(),
+        None => {
+            tracing::warn!(
+                "{inlet_name}: routing packet '{routing_packet_id}' produced no_match — dead-lettering",
+            );
+            return Ok(json!({
+                "status": "no_match",
+                "reason": "routing packet returned no_match (default → dead-letter)",
+                "extracted_entity": entity,
+            }));
+        }
+    };
+    let resolved_consequent = routing::resolve_entity_template(&entity, &consequent_json);
+    let verdict = routing::RoutingVerdict::parse(&resolved_consequent)
+        .map_err(|e| anyhow::anyhow!("verdict parse: {e}"))?;
+    dispatch_verdict(state, inlet_name, default_project_dir, verdict, entity).await
 }
 
 async fn dispatch_verdict(
     state: Arc<SharedState>,
-    spec: &webhooks::WebhookSpec,
+    inlet_name: &str,
+    default_project_dir: Option<String>,
     verdict: routing::RoutingVerdict,
     entity: Value,
 ) -> anyhow::Result<Value> {
@@ -4639,8 +4740,7 @@ async fn dispatch_verdict(
         RoutingVerdict::Ignore => Ok(json!({"status": "ignored"})),
         RoutingVerdict::DeadLetter { reason } => {
             tracing::warn!(
-                "webhook '{}': dead-lettered (reason={:?})",
-                spec.name,
+                "{inlet_name}: dead-lettered (reason={:?})",
                 reason
             );
             Ok(json!({
@@ -4670,8 +4770,7 @@ async fn dispatch_verdict(
             // cancellation is a separate primitive that we'll add when
             // a workflow needs it.)
             tracing::warn!(
-                "webhook '{}': cancel_arc verdict received but cancellation not yet implemented",
-                spec.name
+                "{inlet_name}: cancel_arc verdict received but cancellation not yet implemented",
             );
             Ok(json!({"status": "cancel_arc_not_implemented"}))
         }
@@ -4724,17 +4823,17 @@ async fn dispatch_verdict(
                 merged_vars.insert(k, v);
             }
             // project_dir resolution priority:
-            //   1. ${WEBHOOK_NAME_UPPERCASE}_PROJECT_DIR env override
-            //   2. WebhookSpec.default_project_dir
+            //   1. ${INLET_NAME_UPPERCASE}_PROJECT_DIR env override
+            //      (works for webhooks AND pollers — both pass their
+            //      `name` as inlet_name)
+            //   2. inlet's `default_project_dir`
             //   3. None (worktree hooks will fail explicitly — better
             //      than silent fallback to cwd)
             let env_var = format!(
                 "{}_PROJECT_DIR",
-                spec.name.to_uppercase().replace('-', "_")
+                inlet_name.to_uppercase().replace('-', "_")
             );
-            let project_dir = std::env::var(&env_var)
-                .ok()
-                .or_else(|| spec.default_project_dir.clone());
+            let project_dir = std::env::var(&env_var).ok().or(default_project_dir);
             let workflow_id_clone = workflow_id.clone();
             tokio::spawn(async move {
                 let _ = workflow::run_workflow_with_initial_vars(
@@ -4910,6 +5009,50 @@ async fn admin_workflow_install(
 #[derive(Debug, Deserialize)]
 struct AdminWebhookInstallReq {
     spec: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminPollerInstallReq {
+    spec: Value,
+}
+
+async fn admin_poller_install(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<AdminPollerInstallReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let spec: pollers::PollerSpec = match serde_json::from_value(req.spec) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("poller parse: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let dir = state.store_dir.join("pollers");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.json", spec.name));
+    if let Err(e) = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&spec).unwrap_or_default(),
+    ) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("poller persist: {e}"),
+        )
+            .into_response();
+    }
+    state.pollers.install(spec.clone());
+    let handle = pollers::spawn_loop(state.clone(), spec.clone());
+    state.pollers.track_handle(&spec.name, handle);
+    axum::Json(json!({
+        "status": "installed",
+        "name": spec.name,
+        "every_seconds": spec.every_seconds,
+    }))
+    .into_response()
 }
 
 async fn admin_webhook_install(
@@ -5532,6 +5675,7 @@ async fn main() -> anyhow::Result<()> {
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
         webhooks: Arc::new(webhooks::WebhookRegistry::new()),
+        pollers: Arc::new(pollers::PollerRegistry::new()),
         workflow_registry: Arc::new(RwLock::new(HashMap::new())),
         bind_is_loopback,
     });
@@ -5554,6 +5698,20 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+    }
+    // Pollers — re-spawn the per-spec tick loop on startup so installs
+    // survive daemon restart. Same store_dir/<name>.json shape as
+    // webhooks; tick loop owns the schedule.
+    let poller_dir = shared.store_dir.join("pollers");
+    for spec in pollers::load_all(&poller_dir) {
+        tracing::info!(
+            "restoring poller '{}' (every {}s)",
+            spec.name,
+            spec.every_seconds
+        );
+        shared.pollers.install(spec.clone());
+        let handle = pollers::spawn_loop(shared.clone(), spec.clone());
+        shared.pollers.track_handle(&spec.name, handle);
     }
     let workflow_dir = shared.store_dir.join("workflows");
     if workflow_dir.exists() {
@@ -5685,6 +5843,10 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::post(admin_webhook_install),
         )
         .route(
+            "/admin/poller/install",
+            axum::routing::post(admin_poller_install),
+        )
+        .route(
             "/admin/brofile/upsert",
             axum::routing::post(admin_brofile_upsert),
         )
@@ -5742,6 +5904,7 @@ mod tests {
             running_arcs: RwLock::new(HashMap::new()),
             wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
             webhooks: Arc::new(webhooks::WebhookRegistry::new()),
+            pollers: Arc::new(pollers::PollerRegistry::new()),
             workflow_registry: Arc::new(RwLock::new(HashMap::new())),
             bind_is_loopback: true,
         });

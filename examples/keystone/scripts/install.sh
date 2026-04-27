@@ -100,6 +100,17 @@ body=$(jq -nc --slurpfile spec "${ROOT}/webhooks/forgejo.json" \
     '{spec:$spec[0]}')
 post_admin /admin/webhook/install "${body}" >/dev/null
 
+# ── 5. Pollers (optional) ────────────────────────────────────
+if [[ -d "${ROOT}/pollers" ]]; then
+    for pf in "${ROOT}/pollers/"*.json; do
+        [[ -f "${pf}" ]] || continue
+        name=$(jq -r '.name' "${pf}")
+        log "installing poller '${name}'"
+        body=$(jq -nc --slurpfile spec "${pf}" '{spec:$spec[0]}')
+        post_admin /admin/poller/install "${body}" >/dev/null
+    done
+fi
+
 log "install complete"
 log "  daemon:  ${BBOX}"
 log "  forgejo: ${FORGEJO_BASE_URL:-(unset)}"

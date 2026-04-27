@@ -1,0 +1,26 @@
+{
+  "name": "forgejo-open-issues",
+  "every_seconds": 120,
+  "source": {
+    "method": "GET",
+    "url": "http://127.0.0.1:3000/api/v1/repos/keystone-admin/transcript-search-fork/issues?state=open&type=issues&sort=newest&limit=50",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "response_kind": "json"
+  },
+  "iterate": { "kind": "json_path", "path": "$" },
+  "extractor": {
+    "outputs": {
+      "event":        { "kind": "const", "value": "issues" },
+      "action":       { "kind": "const", "value": "opened" },
+      "issue_number": { "kind": "json_path", "path": "$.number" },
+      "issue_title":  { "kind": "json_path", "path": "$.title" },
+      "owner":        { "kind": "json_path", "path": "$.repository.owner.login" },
+      "repo":         { "kind": "json_path", "path": "$.repository.name" }
+    }
+  },
+  "dedup_id_path": { "kind": "json_path", "path": "$.id" },
+  "routing_packet": "domain:webhook-routing/forgejo",
+  "default_project_dir": "/tmp/keystone-fork-clone"
+}

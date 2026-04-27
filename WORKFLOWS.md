@@ -639,6 +639,14 @@ spawn arc
   `${entity.X}` template substitution (resolved against the
   extracted entity before verdict parse) — same `${X}` shape the
   workflow templater uses, applied to a different scope
+- Two convergent event inlets: webhook ingress (signed inbound POST)
+  and poller (scheduled HTTP fetch). Both extract → route → dispatch
+  through one shared `dispatch_routed_event` so a workflow doesn't
+  care how it was triggered. Pollers reuse `HttpFetchSpec` (same
+  primitive the `http_json` op consumes), explode array responses
+  via `iterate`, dedup by operator-named id field, and resolve
+  `${env.X}` in source URL/headers per-tick (no secrets persisted
+  to disk).
 - Hook lifecycle: on_enter, on_exit, on_arc_exit, on_arc_cancel
 - Op catalog: SetVar, IncVar, AppendVar, MergeVar, ParseJson, Shell,
   WorktreeCreate (with smart branch reuse), WorktreeRemove, SetMeta,

@@ -487,6 +487,22 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some("bro_webhook_list()"),
     },
     ToolDoc {
+        name: "bro_poller_install",
+        category: ToolCategory::Workflows,
+        summary: "Install a scheduled HTTP-source poller that converges on the same routing pipeline as webhook ingress. Use when the upstream doesn't push (no webhook capability) or the daemon has no public ingress. Spec carries: name, every_seconds (>= BBOX_POLLER_MIN_INTERVAL_SECS, default 5), source (HttpFetchSpec), optional iterate (Selector — array path to explode response into N events), per-event extractor, optional dedup_id_path (Selector for stable id, in-memory recent-seen ring per poller), routing_packet, optional default_project_dir. Persisted to disk + tick loop spawned immediately; reinstall replaces the running task.",
+        when_to_use: "Use when there's no webhook (closed-network upstream, no public ingress on the daemon, polling-only API) or when a clock-driven trigger is what you actually want. Routing packet evaluates against per-item extracted entity exactly the way webhook ingress does — same dispatch_routed_event entry point.",
+        example: Some(
+            r#"bro_poller_install(spec={"name":"forgejo-issues","every_seconds":120,"source":{"url":"http://127.0.0.1:3000/api/v1/repos/owner/repo/issues?state=open","headers":{"Authorization":"token ..."}},"iterate":{"kind":"json_path","path":"$"},"extractor":{...},"dedup_id_path":{"kind":"json_path","path":"$.id"},"routing_packet":"domain:webhook-routing/forgejo"})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bro_poller_list",
+        category: ToolCategory::Workflows,
+        summary: "List installed pollers with their schedule + source URL + routing packet.",
+        when_to_use: "Inventory check before installing to avoid duplicate names; also surfaces effective tick intervals (which may be clamped above your configured value via BBOX_POLLER_MIN_INTERVAL_SECS).",
+        example: Some("bro_poller_list()"),
+    },
+    ToolDoc {
         name: "bro_workflow_install",
         category: ToolCategory::Workflows,
         summary: "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced.",
