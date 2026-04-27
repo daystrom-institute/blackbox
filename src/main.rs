@@ -106,6 +106,14 @@ struct SharedState {
     /// MCP — replaces poking the upstream's hook-task table or
     /// reading daemon tracing logs to debug routing-rule misses.
     webhook_delivery_log: RwLock<std::collections::VecDeque<WebhookDelivery>>,
+    /// Cancellation tokens for in-flight workflow arcs, keyed by
+    /// `arc_id`. Created at run start, removed at terminus. The
+    /// `bro_arc_cancel` MCP tool and the `cancel_arc` routing verdict
+    /// look up the token and trigger `cancel()`; the runner observes
+    /// the token between node iterations and inside Wait suspensions
+    /// (via `tokio::select!`), bails out with status `cancelled`, and
+    /// runs `on_arc_cancel` + `on_arc_exit` hooks on the way out.
+    arc_cancel_tokens: RwLock<HashMap<String, CancellationToken>>,
 }
 
 const SIGNAL_LOG_CAP: usize = 200;
@@ -169,6 +177,41 @@ impl SharedState {
             log.pop_front();
         }
         log.push_back(d);
+    }
+
+    /// Register a cancel token for a freshly-spawned arc. Returns the
+    /// token so the runner can hold a clone for `is_cancelled()`
+    /// checks. Replaces any prior token for the same arc_id (e.g.
+    /// recycled arc_id under unusual restart races) — last writer
+    /// wins.
+    pub fn register_arc_cancel_token(&self, arc_id: &str) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.arc_cancel_tokens
+            .write()
+            .insert(arc_id.to_string(), token.clone());
+        token
+    }
+
+    /// Drop the cancel token for an arc that's reached terminal
+    /// state. Called from the runner's exit path so the map doesn't
+    /// grow unbounded across daemon uptime.
+    pub fn unregister_arc_cancel_token(&self, arc_id: &str) {
+        self.arc_cancel_tokens.write().remove(arc_id);
+    }
+
+    /// Trigger cancellation for a running arc. Returns whether a
+    /// matching token existed (and was triggered). The runner notices
+    /// at the next node boundary — or immediately if it's parked on
+    /// a Wait, since the wait's `tokio::select!` includes the token's
+    /// `cancelled()` arm.
+    pub fn cancel_arc(&self, arc_id: &str) -> bool {
+        match self.arc_cancel_tokens.read().get(arc_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -453,6 +496,23 @@ impl BlackboxServer {
     /// Server-owned WaitStore for suspendable arcs.
     pub fn wait_store(&self) -> &Arc<crate::workflow::wait::WaitStore> {
         &self.state.wait_store
+    }
+
+    /// Register an arc cancel token. Called by the workflow runner at
+    /// startup; returned token is stored on the runner and observed
+    /// between node iterations and inside Wait suspensions.
+    pub fn register_arc_cancel_token(&self, arc_id: &str) -> CancellationToken {
+        self.state.register_arc_cancel_token(arc_id)
+    }
+
+    /// Drop the arc's cancel token. Called by the runner at terminus.
+    pub fn unregister_arc_cancel_token(&self, arc_id: &str) {
+        self.state.unregister_arc_cancel_token(arc_id);
+    }
+
+    /// Trigger cancellation for a running arc.
+    pub fn cancel_arc(&self, arc_id: &str) -> bool {
+        self.state.cancel_arc(arc_id)
     }
 
     /// Resolve a workflow by registry id (set via `bro_workflow_install`
@@ -3069,6 +3129,21 @@ Constraints:\n\
     }
 
     #[tool(
+        name = "bro_arc_cancel",
+        description = "Cancel a running workflow arc by id. Trips the arc's cancellation token; the runner observes between node iterations and inside Wait suspensions, bails out with status `cancelled`, runs `on_arc_cancel` (if declared) followed by `on_arc_exit`, and writes a `blocked` note (`workflow cancelled`) on the arc's thread. Returns `{cancelled: true|false}` — false means no token registered for that arc id (already terminated, never started, or wrong id)."
+    )]
+    async fn bro_arc_cancel(
+        &self,
+        Parameters(p): Parameters<ArcCancelParams>,
+    ) -> CallToolResult {
+        let cancelled = self.state.cancel_arc(&p.arc_id);
+        Self::ok_json(&serde_json::json!({
+            "arc_id": p.arc_id,
+            "cancelled": cancelled,
+        }))
+    }
+
+    #[tool(
         name = "bro_signals",
         description = "Recent signal-dispatch events as a bounded ring buffer (last ~200). Every call to the signal router records one entry: (timestamp, signal, correlation, outcome, matched_arc_id, matched_wait_id, idle_pending). `outcome` is `matched` (resolved a wait) or `no_matching_wait` (fell idle); on idle, `idle_pending` carries the pending-with-same-signal snapshot at dispatch time so the diff between what arrived and what was waiting is one read away. Filter by `signal=` (exact match) and `since=` (ISO timestamp). Replaces the journalctl|grep workflow for debugging webhook → routing → signal → wait paths."
     )]
@@ -3312,6 +3387,12 @@ struct ArcStatusParams {
     /// When omitted, returns all running arcs + pending waits.
     #[serde(default)]
     pub arc_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ArcCancelParams {
+    /// Arc id (from `WorkflowRunResult.arc_id` / arc_thread_id) to cancel.
+    pub arc_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -5056,15 +5137,38 @@ async fn dispatch_verdict(
                 signal_arc_dispatch(&state, &signal, correlate, signal_payload).await;
             Ok(resolved)
         }
-        RoutingVerdict::CancelArc { correlate: _ } => {
-            // V1: cancellation is not implemented — log and respond.
-            // (Wait nodes can be cancelled via WaitStore.cancel; arc
-            // cancellation is a separate primitive that we'll add when
-            // a workflow needs it.)
-            tracing::warn!(
-                "{inlet_name}: cancel_arc verdict received but cancellation not yet implemented",
-            );
-            Ok(json!({"status": "cancel_arc_not_implemented"}))
+        RoutingVerdict::CancelArc { correlate } => {
+            // Match running arcs whose pending-wait correlation is a
+            // superset of `correlate`: every key in the verdict's
+            // tuple must be present with the same value somewhere on
+            // the arc's wait registrations. Empty correlate matches
+            // every running arc (the broadcast-cancel form). Each
+            // matching arc gets its CancellationToken tripped.
+            let mut cancelled: Vec<String> = Vec::new();
+            // Snapshot the wait store and find arc ids whose
+            // registrations contain a tuple matching `correlate`.
+            let snapshot = state.wait_store.snapshot();
+            let mut matching_arc_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for w in snapshot {
+                let matches = correlate.is_empty()
+                    || correlate
+                        .iter()
+                        .all(|(k, v)| w.correlation.get(k) == Some(v));
+                if matches {
+                    matching_arc_ids.insert(w.arc_id);
+                }
+            }
+            for arc_id in matching_arc_ids {
+                if state.cancel_arc(&arc_id) {
+                    cancelled.push(arc_id);
+                }
+            }
+            Ok(json!({
+                "status": "cancel_arc_dispatched",
+                "cancelled_arcs": cancelled,
+                "correlate": correlate,
+            }))
         }
         RoutingVerdict::StartArc {
             workflow: workflow_id,
@@ -6091,6 +6195,7 @@ async fn main() -> anyhow::Result<()> {
         bind_is_loopback,
         signal_log: RwLock::new(std::collections::VecDeque::with_capacity(SIGNAL_LOG_CAP)),
         webhook_delivery_log: RwLock::new(std::collections::VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
+        arc_cancel_tokens: RwLock::new(HashMap::new()),
     });
 
     // Restore webhook + workflow registries from disk so installs
@@ -6322,6 +6427,7 @@ mod tests {
             bind_is_loopback: true,
             signal_log: RwLock::new(std::collections::VecDeque::with_capacity(SIGNAL_LOG_CAP)),
             webhook_delivery_log: RwLock::new(std::collections::VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
+            arc_cancel_tokens: RwLock::new(HashMap::new()),
         });
         BlackboxServer::new(state)
     }
@@ -6544,6 +6650,95 @@ mod tests {
         );
         assert!(past_ceiling.events.is_empty());
         assert!(past_ceiling.arc_thread_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn bro_arc_cancel_trips_a_parked_wait_arc() {
+        // End-to-end cancel: spawn an arc that immediately parks on a
+        // long-timeout Wait, cancel it via the SharedState, observe
+        // that run() returns with status=cancelled. No LLM dispatch
+        // needed — the arc is hook-only and immediately blocks on the
+        // wait.
+        use crate::workflow::{compile, engine, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let json = r#"{
+            "name": "cancel-smoke",
+            "version": 1,
+            "actors": {},
+            "nodes": {
+                "WaitFor": {
+                    "actor": "",
+                    "wait": {
+                        "any_of": [{"signal": "never-arrives"}],
+                        "timeout": "30s"
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "WaitFor"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+
+        // Spawn the arc on a background task — it'll park inside the
+        // Wait until either the timeout fires or our cancel trips.
+        let server_state = server.state.clone();
+        let run_handle = tokio::spawn(async move {
+            let server2 = BlackboxServer::new(server_state);
+            engine::run_workflow_with_initial_vars(
+                &server2,
+                &compiled,
+                None,
+                Some(50),
+                serde_json::Map::new(),
+            )
+            .await
+        });
+
+        // Give the runner a moment to register the wait + cancel
+        // token, then observe the registered token and trip it. Yield
+        // a few times to let the task progress past wait registration
+        // without hard-coding a timing assumption.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let token_count = server.state.arc_cancel_tokens.read().len();
+            if token_count > 0 {
+                break;
+            }
+        }
+
+        // Cancel every registered arc (test fixture only spawns one).
+        let arc_ids: Vec<String> = server
+            .state
+            .arc_cancel_tokens
+            .read()
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            !arc_ids.is_empty(),
+            "expected an arc cancel token to be registered after dispatch"
+        );
+        for arc_id in &arc_ids {
+            let cancelled = server.state.cancel_arc(arc_id);
+            assert!(cancelled, "cancel_arc returned false for live arc {arc_id}");
+        }
+
+        // The runner should release the wait and return with
+        // status=cancelled.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+            .await
+            .expect("runner did not exit within 5s of cancel")
+            .expect("runner panicked");
+        assert_eq!(result.status, "cancelled", "got: {}", result.status);
+
+        // Token should have been unregistered at terminus.
+        assert!(
+            server.state.arc_cancel_tokens.read().is_empty(),
+            "cancel token still registered after arc terminated"
+        );
     }
 
     #[test]

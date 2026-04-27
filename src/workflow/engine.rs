@@ -195,11 +195,25 @@ pub async fn run_workflow_streaming_with_vars(
     let mut status = match runner.run().await {
         Ok(()) => "completed".to_string(),
         Err(e) => {
-            runner.log_event("error", json!({"message": e.to_string()}));
-            runner.arc_note("blocked", &format!("workflow errored: {e}"));
-            let status_str = format!("error: {e}");
-            runner.update_arc_snapshot(&status_str, "(error)", None);
-            status_str
+            let msg = e.to_string();
+            // "arc cancelled" is the canonical sentinel emitted by
+            // the runner when its CancellationToken trips. Surface
+            // it as a first-class terminal outcome (not an error) so
+            // on_arc_cancel hooks fire and consumers can distinguish
+            // a manual cancel from a runtime error.
+            if msg == "arc cancelled" {
+                runner.log_event("cancelled_terminal", json!({"message": msg}));
+                runner.arc_note("blocked", "workflow cancelled");
+                let status_str = "cancelled".to_string();
+                runner.update_arc_snapshot(&status_str, "(cancelled)", None);
+                status_str
+            } else {
+                runner.log_event("error", json!({"message": msg.clone()}));
+                runner.arc_note("blocked", &format!("workflow errored: {msg}"));
+                let status_str = format!("error: {msg}");
+                runner.update_arc_snapshot(&status_str, "(error)", None);
+                status_str
+            }
         }
     };
     let arc_thread_id = runner.arc_thread_id.clone();
@@ -236,6 +250,11 @@ pub async fn run_workflow_streaming_with_vars(
             runner.update_arc_snapshot(&status, "(error)", None);
         }
     }
+    // Release the arc's cancel-token registry entry. Doing this
+    // before moving fields out of the runner avoids needing a Drop
+    // impl (which would conflict with the by-value field moves into
+    // WorkflowRunResult below).
+    server.unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
     WorkflowRunResult {
         status,
         events: runner.events,
@@ -327,11 +346,25 @@ pub async fn run_workflow_at_depth(
     let mut status = match runner.run().await {
         Ok(()) => "completed".to_string(),
         Err(e) => {
-            runner.log_event("error", json!({"message": e.to_string()}));
-            runner.arc_note("blocked", &format!("workflow errored: {e}"));
-            let status_str = format!("error: {e}");
-            runner.update_arc_snapshot(&status_str, "(error)", None);
-            status_str
+            let msg = e.to_string();
+            // "arc cancelled" is the canonical sentinel emitted by
+            // the runner when its CancellationToken trips. Surface
+            // it as a first-class terminal outcome (not an error) so
+            // on_arc_cancel hooks fire and consumers can distinguish
+            // a manual cancel from a runtime error.
+            if msg == "arc cancelled" {
+                runner.log_event("cancelled_terminal", json!({"message": msg}));
+                runner.arc_note("blocked", "workflow cancelled");
+                let status_str = "cancelled".to_string();
+                runner.update_arc_snapshot(&status_str, "(cancelled)", None);
+                status_str
+            } else {
+                runner.log_event("error", json!({"message": msg.clone()}));
+                runner.arc_note("blocked", &format!("workflow errored: {msg}"));
+                let status_str = format!("error: {msg}");
+                runner.update_arc_snapshot(&status_str, "(error)", None);
+                status_str
+            }
         }
     };
     let arc_thread_id = runner.arc_thread_id.clone();
@@ -368,6 +401,7 @@ pub async fn run_workflow_at_depth(
             runner.update_arc_snapshot(&status, "(error)", None);
         }
     }
+    server.unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
     WorkflowRunResult {
         status,
         events: runner.events,
@@ -427,6 +461,11 @@ struct WorkflowRunner<'a> {
     /// clients see events as they happen rather than waiting for the
     /// terminal WorkflowRunResult. None for plain blocking runs.
     event_sink: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    /// Cancellation handle. Triggered by `bro_arc_cancel` MCP, the
+    /// `cancel_arc` routing verdict, or the cancel CLI subcommand.
+    /// The runner observes the token between node iterations and
+    /// inside Wait suspensions; both bail with `arc cancelled`.
+    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl<'a> WorkflowRunner<'a> {
@@ -449,6 +488,7 @@ impl<'a> WorkflowRunner<'a> {
             parent_arc_id: None,
             composition_depth,
         });
+        let cancel_token = server.register_arc_cancel_token(&arc_id);
         Self {
             server,
             compiled,
@@ -465,6 +505,7 @@ impl<'a> WorkflowRunner<'a> {
             arc_thread_id: None,
             composition_depth,
             event_sink: None,
+            cancel_token,
         }
     }
 
@@ -796,6 +837,13 @@ impl<'a> WorkflowRunner<'a> {
         let mut current = entry;
         let mut steps = 0usize;
         while current != TERMINAL_SENTINEL {
+            if self.cancel_token.is_cancelled() {
+                self.log_event(
+                    "cancelled",
+                    json!({"steps": steps, "next_was": current.clone()}),
+                );
+                bail!("arc cancelled");
+            }
             if steps >= self.max_steps {
                 bail!("workflow exceeded max_steps ({})", self.max_steps);
             }
@@ -2067,16 +2115,30 @@ impl<'a> WorkflowRunner<'a> {
             registered_ids.push((arc_id.clone(), wait_id));
         }
 
-        // Block on Notify with optional timeout. The store's
-        // match_and_take pops the first matching wait and inserts
-        // the SignalRef into resolved_slot before notifying.
+        // Block on Notify with optional timeout, OR an arc-cancel
+        // signal. Without the cancel arm, a parked arc on a
+        // long-timeout wait would only release on signal arrival or
+        // timeout — a manual cancel would have no observation point.
+        // The store's match_and_take pops the first matching wait
+        // and inserts the SignalRef into resolved_slot before
+        // notifying.
         let timeout = spec.timeout;
-        let waited = match timeout {
-            Some(d) => tokio::time::timeout(d, notify.notified()).await.is_ok(),
-            None => {
-                notify.notified().await;
-                true
-            }
+        let cancel_token = self.cancel_token.clone();
+        enum WaitOutcome {
+            Resolved,
+            Cancelled,
+            TimedOut,
+        }
+        let outcome = match timeout {
+            Some(d) => tokio::select! {
+                _ = notify.notified() => WaitOutcome::Resolved,
+                _ = cancel_token.cancelled() => WaitOutcome::Cancelled,
+                _ = tokio::time::sleep(d) => WaitOutcome::TimedOut,
+            },
+            None => tokio::select! {
+                _ = notify.notified() => WaitOutcome::Resolved,
+                _ = cancel_token.cancelled() => WaitOutcome::Cancelled,
+            },
         };
 
         // Cancel sibling waits — only the first to fire wins; the
@@ -2085,6 +2147,21 @@ impl<'a> WorkflowRunner<'a> {
         for (arc, wid) in &registered_ids {
             self.server.wait_store().cancel(arc, wid);
         }
+
+        if matches!(outcome, WaitOutcome::Cancelled) {
+            self.log_event(
+                "wait_cancelled",
+                json!({
+                    "node": node_id,
+                    "registered_waits": registered_ids
+                        .iter()
+                        .map(|(_, w)| w.clone())
+                        .collect::<Vec<_>>(),
+                }),
+            );
+            bail!("arc cancelled");
+        }
+        let waited = matches!(outcome, WaitOutcome::Resolved);
 
         if !waited {
             // Timeout — synthesize a __timeout__ signal payload so the

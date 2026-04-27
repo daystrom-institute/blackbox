@@ -487,6 +487,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bro_webhook_deliveries(name="forgejo", limit=10)"#),
     },
     ToolDoc {
+        name: "bro_arc_cancel",
+        category: ToolCategory::Workflows,
+        summary: "Cancel a running workflow arc by id. Trips the arc's cancellation token; the runner observes between node iterations and inside Wait suspensions, bails out with status `cancelled`, runs `on_arc_cancel` (if declared) followed by `on_arc_exit`, and writes a `blocked` note (`workflow cancelled`) on the arc's thread. Returns `{cancelled: true|false}` — false means no token registered for that arc id (already terminated, never started, or wrong id).",
+        when_to_use: "Use to manually stop a runaway, mis-dispatched, or no-longer-relevant arc without restarting the daemon. Pair with `bro_arc_status` to find the arc id first. Cleanup hooks fire automatically — workflows with worktree creation in `on_arc_exit` will tear down the worktree on cancel just as on success.",
+        example: Some(r#"bro_arc_cancel(arc_id="arc-9116dad8465043a39987a76cfa22108a")"#),
+    },
+    ToolDoc {
         name: "bro_signals",
         category: ToolCategory::Workflows,
         summary: "Recent signal-dispatch events as a bounded ring buffer (last ~200). Every call to the signal router records one entry: (timestamp, signal, correlation, outcome, matched_arc_id, matched_wait_id, idle_pending). `outcome` is `matched` (resolved a wait) or `no_matching_wait` (fell idle); on idle, `idle_pending` carries the pending-with-same-signal snapshot at dispatch time so the diff between what arrived and what was waiting is one read away. Filter by `signal=` (exact match) and `since=` (ISO timestamp). Replaces the journalctl|grep workflow for debugging webhook → routing → signal → wait paths.",
