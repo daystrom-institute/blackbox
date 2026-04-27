@@ -34,7 +34,7 @@
         "op": "All",
         "args": [
           { "op": "Eq", "field": "event", "value": "pull_request" },
-          { "op": "Eq", "field": "action", "value": "synchronize" }
+          { "op": "In", "field": "action", "values": ["synchronize", "synchronized"] }
         ]
       },
       "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-ready\",\"correlate\":{\"pr\":\"${entity.pr_number}\"}}"
@@ -62,7 +62,8 @@
           "pull_request_review",
           "pull_request_review_comment",
           "pull_request_review_approved",
-          "pull_request_review_rejected"
+          "pull_request_review_rejected",
+          "pull_request_comment"
         ]
       },
       "consequent": "{\"route\":\"signal_arc\",\"signal\":\"pr-feedback\",\"correlate\":{\"pr\":\"${entity.pr_number}\"}}"
