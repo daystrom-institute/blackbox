@@ -39,7 +39,7 @@ underlying engine semantics see [`../../WORKFLOWS.md`](../../WORKFLOWS.md).
 | Auto-merge on approval                                                          | `reviewer-arc.PostReview` fires `http_json` POST `/merge` gated by `domain:hook-when/should-merge` (verdict-as-data from aggregator) — the merge fires `pull_request closed merged:true` webhook → `pr-merged` signal → arc terminates clean without manual intervention. |
 | Reviewer feedback body propagated to AddressFeedback                            | Webhook extractor `Coalesce` projects `review_body` from `.review.body` OR `.comment.body` (Forgejo's review-comment subtypes diverge). Routing carries the extracted entity as `${last_signal.payload}`. AwaitFeedbackOrMerge.on_exit pulls `${last_signal.payload.review_body}` into `vars.feedback_text` — the implementer LLM in `implementer-feedback-arc` sees a clean string of the actual review comment, not the raw webhook body. |
 | Typed correlation tuples on signals                                             | Routing rules emit `correlate: {pr: "${entity.pr_number}"}`; AwaitReviewTrigger / AwaitFeedbackOrMerge waits register with `correlate: {pr: "${vars.pr_number}"}`. The dispatch path runs `routing::resolve_entity_template` over the consequent before parse, substituting `${entity.X}` to the typed value from the extracted entity. Two arcs concurrently waiting on different PRs no longer cross-resume. |
-| Poller inlet (alternative trigger to webhook)                                   | `pollers/forgejo-open-issues.json` schedules `GET /repos/.../issues?state=open`, explodes the array via `iterate: $`, extracts each issue (synthesizing `event:issues + action:opened` so the existing routing packet matches), dedups by `$.id` (per-poller in-memory ring), dispatches through the same `dispatch_routed_event` the webhook handler uses. Use this shape when the upstream doesn't push or the daemon has no public ingress. |
+| Poller inlet (alternative trigger to webhook)                                   | `pollers/forgejo-open-issues.json` schedules `GET /repos/.../issues?state=open`, explodes the array via `iterate: $`, extracts each issue (synthesizing `event:issues + action:opened` so the existing routing packet matches), dedups by `$.id` (per-poller in-memory ring), dispatches through the same `dispatch_routed_event` the webhook handler uses. Off by default — opt in with `KEYSTONE_INSTALL_POLLERS=1`. See "Choosing an inlet" below. |
 
 ## Prerequisites
 
@@ -72,6 +72,29 @@ cd examples/keystone
 ./scripts/run.sh --dispatch         # skip webhook wait; dispatch arc directly against issue #1
 ./scripts/run.sh --skip-forgejo     # if Forgejo is already up + bootstrapped
 ```
+
+## Choosing an inlet: webhook vs poller
+
+The example ships both a webhook spec (`webhooks/forgejo.json`) and a
+poller spec (`pollers/forgejo-open-issues.json`). They are **alternatives**,
+not complements — both feed the same routing packet → same workflow.
+Running both against the same upstream duplicates work (webhook fires
+on issue-open; poller's next tick picks up the same open issue).
+The workflow-side idempotency (`find_first` + `PushAndOpenPr`'s
+conditional create) catches the duplicate at the PR layer, but only
+*after* the implementer LLM has already run twice. Pick one for the
+common case:
+
+| Deployment shape                                  | Inlet         | How                                                          |
+|---------------------------------------------------|---------------|--------------------------------------------------------------|
+| Public-ingress daemon, code-host can push         | **Webhook**   | Default install (`./scripts/install.sh`). Lower latency, no polling cost. |
+| Closed network / no public ingress / poll-only API | **Poller**    | `KEYSTONE_INSTALL_POLLERS=1 ./scripts/install.sh` AND remove the webhook from Forgejo's hook config (or it'll dispatch in parallel). |
+| Resilience-layered (catch missed webhooks)        | **Both**      | `KEYSTONE_INSTALL_POLLERS=1 …`, accept the duplicate-dispatch cost; workflow idempotency catches it. |
+
+The poller and webhook share the routing packet (`packets/routing-forgejo.json`)
+on purpose — the routing rules don't care whether the entity arrived
+via push or pull. Adapting the demo to a polling-only deploy is just
+the install flag plus dropping the webhook from the upstream's config.
 
 ## Layout
 

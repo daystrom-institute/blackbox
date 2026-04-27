@@ -100,12 +100,30 @@ body=$(jq -nc --slurpfile spec "${ROOT}/webhooks/forgejo.json" \
     '{spec:$spec[0]}')
 post_admin /admin/webhook/install "${body}" >/dev/null
 
-# ── 5. Pollers (optional) ────────────────────────────────────
-if [[ -d "${ROOT}/pollers" ]]; then
+# ── 5. Pollers (opt-in alternative inlet) ───────────────────
+# Pollers are an ALTERNATIVE trigger to webhooks. Both inlets feed
+# the same routing packet → same dispatch pipeline; running both
+# against the same source duplicates work (webhook fires on issue-
+# open; poller's next tick picks up the same open issue), and the
+# workflow-side idempotency (find_first + PushAndOpenPr) catches it
+# at the PR layer but only after the implementer LLM has already run
+# twice. Default install is webhook-only. Opt in with:
+#
+#   KEYSTONE_INSTALL_POLLERS=1 ./scripts/install.sh
+#
+# Use cases for opting in:
+#   - No public ingress for the daemon → poller substitutes for
+#     webhook entirely (also remove the webhook from Forgejo's hook
+#     config, or it'll dispatch in parallel).
+#   - Resilience layering — catch issues missed during daemon
+#     downtime or webhook delivery failures, accepting the duplicate-
+#     dispatch cost.
+if [[ "${KEYSTONE_INSTALL_POLLERS:-0}" == "1" ]] && [[ -d "${ROOT}/pollers" ]]; then
+    log "installing pollers (KEYSTONE_INSTALL_POLLERS=1)"
     for pf in "${ROOT}/pollers/"*.json; do
         [[ -f "${pf}" ]] || continue
         name=$(jq -r '.name' "${pf}")
-        log "installing poller '${name}'"
+        log "  poller '${name}'"
         body=$(jq -nc --slurpfile spec "${pf}" '{spec:$spec[0]}')
         post_admin /admin/poller/install "${body}" >/dev/null
     done
