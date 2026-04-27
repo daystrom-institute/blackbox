@@ -28,6 +28,7 @@ pub enum ToolCategory {
     Packets,
     Orchestration,
     Workflows,
+    Whiteboards,
 }
 
 impl ToolCategory {
@@ -41,6 +42,7 @@ impl ToolCategory {
             Self::Packets => "Rule-packets",
             Self::Orchestration => "Bro orchestration",
             Self::Workflows => "Workflow orchestration",
+            Self::Whiteboards => "Whiteboards",
         }
     }
 
@@ -69,6 +71,9 @@ impl ToolCategory {
             }
             Self::Workflows => {
                 "Define multi-phase agent protocols as JSON specs with per-node `next` transitions and dispatch them as a unit. The daemon owns the state machine; actors (executor / ensemble) are dispatched INTO the loop as stateless turns — persona / role / contract is the brofile lens, not an engine type. Gate packets route choice nodes by verdict; retry ceilings cap back-edges; fork + `late_inject` express async steering; sub-workflows compose arcs like rule-packets compose via `Apply`; workflow-level `policy_packet` mechanizes arc-health decisions without an LLM advisor. Whiteboards (see `whiteboard_*` tools) provide multi-agent deliberation with phases + structured posts; `wait_for_phase` resumes arcs on board transitions. Every run opens a `bbox_thread(kind=work_item)` with structured notes + rolling compaction anchors. Replaces long skill-prose protocols (overmind, crucible). See `sm-workflow-orchestration` via `bbox_knowledge` for the full runbook and `examples/workflows/` for the catalog."
+            }
+            Self::Whiteboards => {
+                "Multi-agent deliberation surface. Posts (proposals / claims / concerns / informational), annotations (challenge / corroborate / resolve / validation), and votes accumulate on a board, advanced through phases (blind → read → validate → debate → resolve → archived) by a facilitator-or-operator role. Three audiences share one surface: in-workflow ensemble specialists (their structured outputs auto-post when the node has a `board:` field), in-workflow facilitators (single bro, drives transitions), and external agents — operator's Claude session, dispatched help, eventually humans through slack / ntfy adapters — that read state via `whiteboard_state` and act via `whiteboard_post` / `whiteboard_vote` / `whiteboard_transition`. Phase transitions emit `board-transitioned` signals through the same `dispatch_routed_event` pipeline webhooks use; arcs `wait_for_phase` to resume when the board advances. Replaces phaser as a peer external MCP server."
             }
         }
     }
@@ -571,6 +576,77 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Inventory check — what workflows can routing verdicts target on this daemon?",
         example: Some("bro_workflow_list()"),
     },
+    // ── Whiteboards ─────────────────────────────────────────────
+    ToolDoc {
+        name: "whiteboard_open",
+        category: ToolCategory::Whiteboards,
+        summary: "Open a new whiteboard for structured deliberation. The board collects posts (blind phase), annotations (validate/debate phases), and votes (debate phase) from registered agents, advanced through phases by a facilitator-or-operator role. Returns when the board is created and the opener is registered as facilitator. Idempotent re-open against an existing id is rejected — use whiteboard_state to inspect.",
+        when_to_use: "Use to start a deliberation. The opener becomes the facilitator. Pass `arc_thread_id` when the board belongs to a workflow arc — the engine threads it for inbox attribution. External clients (operator's Claude, dispatched help) can open ad-hoc boards by omitting `arc_thread_id`.",
+        example: Some(r#"whiteboard_open(board_id="adr-2026-04-27", topic="Adopt async runtime X?", opened_by="facilitator")"#),
+    },
+    ToolDoc {
+        name: "whiteboard_register",
+        category: ToolCategory::Whiteboards,
+        summary: "Register an agent on an existing board. Idempotent — re-registration with the same name is a no-op. Roles: `specialist` (post + annotate + vote), `facilitator` (transition + post + annotate + vote), `operator` (same powers as facilitator; convention is for human / external Claude joiners).",
+        when_to_use: "Use to join an open deliberation. Specialists can post in blind, annotate in validate / debate, and vote in debate. Facilitators / operators can additionally transition phases — the only role distinction that matters mechanically.",
+        example: Some(r#"whiteboard_register(board_id="adr-2026-04-27", agent_name="security", role="specialist", domain="threat-modeling")"#),
+    },
+    ToolDoc {
+        name: "whiteboard_post",
+        category: ToolCategory::Whiteboards,
+        summary: "Post a structured claim/proposal/concern to a whiteboard during its blind phase. Type one of: proposal, claim, concern, informational. Optional fields target_file / target_location / severity / finding_refs / cascade_targets enable conflict detection downstream.",
+        when_to_use: "Use during the blind phase to record your stance. Other agents' posts are not visible to you in blind — that's the point. Once the board transitions to read, everyone sees everything. Severity + finding_refs let `whiteboard_conflicts` surface severity-disagreement conflicts later.",
+        example: Some(r#"whiteboard_post(board_id="adr-2026-04-27", agent_name="security", type="concern", title="Async runtime increases attack surface", body="...", severity="medium")"#),
+    },
+    ToolDoc {
+        name: "whiteboard_state",
+        category: ToolCategory::Whiteboards,
+        summary: "Read board state filtered for the requesting agent. Phaser-style visibility: blind phase shows only own posts; later phases reveal full board. Includes phase, phase_age_secs, ready_for_transition advisory flag, post / annotation / vote arrays scoped to what this agent should see.",
+        when_to_use: "Use to inspect the board before posting / annotating / voting / transitioning. The `ready_for_transition` flag is advisory only — the facilitator still owns the actual decision. External Claudes joining mid-deliberation start here.",
+        example: Some(r#"whiteboard_state(board_id="adr-2026-04-27", agent_name="security")"#),
+    },
+    ToolDoc {
+        name: "whiteboard_annotate",
+        category: ToolCategory::Whiteboards,
+        summary: "Annotate a post during the validate or debate phase. Validate phase accepts only `validation` (with required `result`: confirmed / refuted / inconclusive). Debate phase accepts `challenge`, `corroborate`, or `resolve` (resolve must reference a challenge id via `resolves`).",
+        when_to_use: "Use to react to other specialists' posts. You can't annotate your own post. `challenge` says you disagree (typically with reasoning), `corroborate` adds supporting evidence, `resolve` closes a challenge with a position. The challenge → resolve graph is what `ready_for_transition` checks in debate phase.",
+        example: Some(r#"whiteboard_annotate(board_id="adr-2026-04-27", agent_name="perf", post_id="post-001", type="challenge", body="missing runtime cost analysis under load")"#),
+    },
+    ToolDoc {
+        name: "whiteboard_vote",
+        category: ToolCategory::Whiteboards,
+        summary: "Cast an advisory vote on a post during the debate phase. One vote per agent per post — re-vote replaces. Vote: accept, reject, or defer.",
+        when_to_use: "Use to record your position on each post during debate. Tallies are exposed via `whiteboard_summarize` and via the `board.vote_tally.<post_id>` template scope inside workflows. Gate packets in workflows can branch on tally shape (e.g. supermajority accept → merge).",
+        example: Some(r#"whiteboard_vote(board_id="adr-2026-04-27", agent_name="design", post_id="post-001", vote="accept", reason="aligns with the durable-state principle")"#),
+    },
+    ToolDoc {
+        name: "whiteboard_transition",
+        category: ToolCategory::Whiteboards,
+        summary: "Advance the board to a new phase. Facilitator or operator role required. Sequence: blind → read → validate → debate → resolve → archived; read → debate is a legal skip. Transition emits a `board-transitioned` signal correlated to (board_id, target_phase) so any wait node observing the board resumes.",
+        when_to_use: "Use to advance the deliberation when ready. Check `whiteboard_state.ready_for_transition` first as an advisory. Workflows can define a wait-on-phase node that resumes when the transition fires — this is how the engine drives multi-phase arcs through the board.",
+        example: Some(r#"whiteboard_transition(board_id="adr-2026-04-27", agent_name="facilitator", target_phase="debate", summary="all specialists posted; advancing")"#),
+    },
+    ToolDoc {
+        name: "whiteboard_conflicts",
+        category: ToolCategory::Whiteboards,
+        summary: "Auto-detect conflicts between posts on a board. Returns three kinds: `direct_overlap` (same target_file + identical target_location), `cascade_collision` (post A cascades to post B's direct target), `severity_disagreement` (same finding_ref, distinct severities). Available in any phase past blind.",
+        when_to_use: "Use during read / validate / debate to surface what specialists disagree on or where their proposed actions collide. The facilitator typically reviews this before transitioning to debate so contested points get explicit annotations.",
+        example: Some(r#"whiteboard_conflicts(board_id="adr-2026-04-27", agent_name="facilitator")"#),
+    },
+    ToolDoc {
+        name: "whiteboard_summarize",
+        category: ToolCategory::Whiteboards,
+        summary: "Condensed board summary without full post bodies. Returns counts per type, vote tally per post, conflict count, unresolved-challenge count, agent status (has_posted), phase age, ready_for_transition advisory.",
+        when_to_use: "Use for a quick read of board state without paying the full post-body cost. Good for inbox views, gate-packet entity inputs, and long-running observers (e.g. a polling external Claude).",
+        example: Some(r#"whiteboard_summarize(board_id="adr-2026-04-27", agent_name="facilitator")"#),
+    },
+    ToolDoc {
+        name: "whiteboard_archive",
+        category: ToolCategory::Whiteboards,
+        summary: "Archive the board. Resolve phase only. Strips active state, moves to `<store>/whiteboards/archive/<id>.json`, returns summary statistics.",
+        when_to_use: "Use after the deliberation completes and any synthesis artifact (ADR markdown, PR body, etc.) has been produced. Archived boards stay readable on disk for audit but no longer count toward inbox attention.",
+        example: Some(r#"whiteboard_archive(board_id="adr-2026-04-27", agent_name="facilitator")"#),
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\
@@ -701,6 +777,7 @@ pub fn render_markdown() -> String {
         ToolCategory::Packets,
         ToolCategory::Orchestration,
         ToolCategory::Workflows,
+        ToolCategory::Whiteboards,
     ];
 
     for cat in categories {
@@ -883,7 +960,10 @@ mod tests {
             let name = extract_string_arg(body, "name");
             let desc = extract_string_arg(body, "description");
             if let (Some(n), Some(d)) = (name, desc) {
-                if n.starts_with("bbox_") || n.starts_with("bro_") {
+                if n.starts_with("bbox_")
+                    || n.starts_with("bro_")
+                    || n.starts_with("whiteboard_")
+                {
                     out.push((n, d));
                 }
             }
