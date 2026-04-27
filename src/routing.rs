@@ -124,6 +124,25 @@ pub fn resolve_entity_template(entity: &Value, raw: &Value) -> Value {
     match raw {
         Value::String(s) => {
             let trimmed = s.trim();
+            // JSON-encoded object/array carrier: rule consequents are
+            // typed as packet scalar `Value::String` so the structured
+            // verdict travels as a JSON-encoded blob. Parse it first,
+            // resolve the parsed tree (so leaf `${entity.X}` strings hit
+            // the whole-string typing branch and preserve `Number` /
+            // `Bool`), then re-encode for the caller's parse step.
+            // Without this, `render_string` stringifies every leaf and
+            // a typed `correlate: {pr: Number(19)}` round-trips as
+            // `{pr: "19"}` — broken correlation matching.
+            if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            {
+                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                    let resolved = resolve_entity_template(entity, &parsed);
+                    return Value::String(
+                        serde_json::to_string(&resolved).unwrap_or_else(|_| s.clone()),
+                    );
+                }
+            }
             let is_whole = trimmed.starts_with("${")
                 && trimmed.ends_with('}')
                 && find_close_brace(trimmed, 2) == Some(trimmed.len() - 1);
@@ -293,6 +312,32 @@ mod tests {
                 "route": "signal_arc",
                 "signal": "pr-ready",
                 "correlate": {"pr": 117, "owner": "alice"}
+            })
+        );
+    }
+
+    #[test]
+    fn entity_template_json_encoded_string_preserves_typing() {
+        // Rule consequents arrive as `Value::String("{...}")` because the
+        // packet's typed scalar can't carry an Object. The resolver must
+        // detect that, parse the inner JSON, walk it, and re-encode — so
+        // leaf `${entity.X}` strings hit the whole-string typing branch
+        // instead of being stringified by `render_string`. This pins the
+        // bug fix for the keystone webhook → wait correlation path.
+        let entity = json!({"pr_number": 19});
+        let raw = json!(r#"{"route":"signal_arc","signal":"pr-ready","correlate":{"pr":"${entity.pr_number}"}}"#);
+        let resolved = resolve_entity_template(&entity, &raw);
+        // Result is still a JSON-encoded string (caller's parse step
+        // re-decodes it), but the embedded `pr` value is a JSON number,
+        // not a JSON string.
+        let resolved_str = resolved.as_str().expect("string carrier preserved");
+        let parsed: Value = serde_json::from_str(resolved_str).unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "route": "signal_arc",
+                "signal": "pr-ready",
+                "correlate": {"pr": 19}
             })
         );
     }
