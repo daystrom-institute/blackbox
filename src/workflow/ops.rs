@@ -73,6 +73,24 @@ pub enum OpKind {
     /// without a code-host-specific search op AND without relying on
     /// upstream API filters that may be broken or absent.
     FindFirst,
+    /// Outbound MCP tool call (sibling of HttpJson but speaking MCP
+    /// JSON-RPC instead of REST). Resolves `args.server` against the
+    /// blackbox MCP registry (global `~/.bro/mcp.json` + project
+    /// overlay), opens a transient client (stdio child-process or
+    /// streamable HTTP), invokes `args.tool` with `args.arguments`,
+    /// and captures the result into `vars[into_var]`. Tool-level
+    /// errors (`is_error: true`) become op failures so `on_failure`
+    /// fires.
+    ///
+    /// Why an op kind, not just a dispatched bro: this lets the engine
+    /// inject deterministic MCP results (`sast_run`, `sast_findings`,
+    /// `bbox_thread`, etc) into hooks at known boundaries — analyzer
+    /// arc creates a work-item thread before dispatch, fixer arc
+    /// re-runs SAST on its branch before opening a PR, reviewer arc
+    /// reads finding context the analyzer captured. Without this, the
+    /// arc has to dispatch a bro to make every grounding call, which
+    /// is both expensive and non-deterministic.
+    McpCall,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -121,6 +139,43 @@ pub async fn execute_op(
         OpKind::SetMeta => exec_set_meta(&rendered_args),
         OpKind::HttpJson => exec_http_json(&rendered_args, hook.into_var.as_deref()).await,
         OpKind::FindFirst => exec_find_first(&rendered_args, hook.into_var.as_deref()),
+        OpKind::McpCall => exec_mcp_call(&rendered_args, hook.into_var.as_deref(), ctx).await,
+    }
+}
+
+async fn exec_mcp_call(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let server = args
+        .get("server")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("McpCall requires args.server (MCP registry name, e.g. 'biofilter' or 'blackbox')"))?;
+    let tool = args
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("McpCall requires args.tool (tool name as the server registers it)"))?;
+    // arguments — must be an object (or absent → empty).
+    let arguments = match args.get("arguments") {
+        Some(Value::Object(m)) => m.clone(),
+        Some(Value::Null) | None => serde_json::Map::new(),
+        Some(other) => bail!("McpCall args.arguments must be an object, got {other:?}"),
+    };
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(300);
+    let project_dir = ctx.meta.project_dir.as_deref();
+    let result = crate::mcp_client::call_tool(server, tool, arguments, timeout_secs, project_dir)
+        .await
+        .map_err(|e| anyhow!("McpCall '{server}.{tool}': {e}"))?;
+    match into_var {
+        Some(k) => Ok(OpEffect::SetVar {
+            key: k.to_string(),
+            value: result,
+        }),
+        None => Ok(OpEffect::None),
     }
 }
 

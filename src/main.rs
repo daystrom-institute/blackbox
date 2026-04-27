@@ -1,6 +1,8 @@
+mod crons;
 mod inbox;
 mod index;
 mod knowledge;
+mod mcp_client;
 mod notes;
 mod orchestration;
 mod packets;
@@ -83,6 +85,12 @@ struct SharedState {
     /// webhooks. Carries running-task handles so they can be aborted
     /// on uninstall / replaced on reinstall.
     pollers: pollers::SharedRegistry,
+    /// Operator-installed crons — calendar-driven inlets (sibling to
+    /// webhooks/pollers). Same `dispatch_routed_event` convergence;
+    /// distinct registry because the spec shape and concurrency model
+    /// differ (pollers fetch HTTP per tick; crons dispatch arcs by
+    /// schedule and gate concurrency per-cron).
+    crons: crons::SharedRegistry,
     /// Operator-installed workflow specs by id. Allows
     /// `start_arc{workflow: "name"}` routing verdicts to find their
     /// target without the webhook payload carrying the full spec.
@@ -3029,7 +3037,10 @@ Constraints:\n\
                 // Hook-only / pure-routing nodes (empty actor name) are
                 // never resolved through this path.
             }
-            workflow::schema::ActorKind::Executor | workflow::schema::ActorKind::Advisor => {
+            workflow::schema::ActorKind::Executor
+            | workflow::schema::ActorKind::Advisor
+            | workflow::schema::ActorKind::Planner
+            | workflow::schema::ActorKind::Triager => {
                 let brofile_name = actor.brofile.as_deref().ok_or_else(|| {
                     format!("actor (kind={:?}) missing brofile", actor.kind)
                 })?;
@@ -3321,6 +3332,68 @@ Constraints:\n\
     }
 
     #[tool(
+        name = "bro_cron_install",
+        description = "Install a calendar-driven cron inlet — sibling of webhook + poller. Same routing pipeline (extractor → routing packet → dispatch_routed_event), different trigger source: wall-clock schedule, no fetch. Spec: name, schedule (6-field cron expr `sec min hour dom mon dow`), optional payload (operator-supplied entity fields), optional concurrency cap (default 1, set 0 to disable), routing_packet, optional default_project_dir. Synthetic entity fields `cron_name` + `tick_at` are merged in at tick time so routing rules can discriminate."
+    )]
+    async fn bro_cron_install(
+        &self,
+        Parameters(p): Parameters<CronInstallParams>,
+    ) -> CallToolResult {
+        let spec: crons::CronSpec = match serde_json::from_value(p.spec) {
+            Ok(s) => s,
+            Err(e) => return Self::err_text(&format!("cron spec parse failed: {e}")),
+        };
+        if let Err(e) = crons::validate_schedule(&spec.schedule) {
+            return Self::err_text(&format!("cron schedule invalid: {e}"));
+        }
+        let dir = self.state.store_dir.join("crons");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{}.json", spec.name));
+        if let Err(e) = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&spec).unwrap_or_default(),
+        ) {
+            return Self::err_text(&format!("cron persist failed: {e}"));
+        }
+        self.state.crons.install(spec.clone());
+        let handle = crons::spawn_loop(self.state.clone(), spec.clone());
+        self.state.crons.track_handle(&spec.name, handle);
+        Self::ok_json(&serde_json::json!({
+            "status": "installed",
+            "name": spec.name,
+            "schedule": spec.schedule,
+            "concurrency": spec.concurrency,
+        }))
+    }
+
+    #[tool(
+        name = "bro_cron_list",
+        description = "List installed crons with schedule + concurrency cap + routing packet."
+    )]
+    async fn bro_cron_list(&self) -> CallToolResult {
+        let list = self.state.crons.list();
+        Self::ok_json(&serde_json::json!({"crons": list}))
+    }
+
+    #[tool(
+        name = "bro_cron_upcoming",
+        description = "Compute the next N scheduled times for a cron expression as RFC3339 strings. Pure function — does not touch the registry."
+    )]
+    async fn bro_cron_upcoming(
+        &self,
+        Parameters(p): Parameters<CronUpcomingParams>,
+    ) -> CallToolResult {
+        let n = p.count.unwrap_or(5).clamp(1, 100);
+        match crons::upcoming_times(&p.schedule, n) {
+            Ok(times) => Self::ok_json(&serde_json::json!({
+                "schedule": p.schedule,
+                "upcoming": times,
+            })),
+            Err(e) => Self::err_text(&format!("schedule '{}': {e}", p.schedule)),
+        }
+    }
+
+    #[tool(
         name = "bro_workflow_install",
         description = "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced."
     )]
@@ -3454,6 +3527,22 @@ struct PollerInstallParams {
     /// iterate, extractor, optional dedup_id_path, routing_packet,
     /// optional default_project_dir).
     pub spec: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct CronInstallParams {
+    /// Full CronSpec JSON (name, schedule, optional payload, optional
+    /// concurrency cap, routing_packet, optional default_project_dir).
+    pub spec: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct CronUpcomingParams {
+    /// Cron schedule expression (6-field `sec min hour dom mon dow`).
+    pub schedule: String,
+    /// How many upcoming times to return. Default 5, max 100.
+    #[serde(default)]
+    pub count: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -5231,6 +5320,16 @@ async fn dispatch_verdict(
             );
             let project_dir = std::env::var(&env_var).ok().or(default_project_dir);
             let workflow_id_clone = workflow_id.clone();
+            // If the inlet that triggered this arc was a cron, the
+            // cron registry has already incremented its in-flight
+            // counter (in crons::run_one_tick → try_claim). Decrement
+            // when the arc terminates so the next tick is admissible.
+            // Inlets are labeled `cron:<name>` upstream; parse out the
+            // name here.
+            let cron_name = inlet_name
+                .strip_prefix("cron:")
+                .map(|s| s.to_string());
+            let crons_for_done = state.crons.clone();
             tokio::spawn(async move {
                 let _ = workflow::run_workflow_with_initial_vars(
                     &server,
@@ -5240,6 +5339,9 @@ async fn dispatch_verdict(
                     merged_vars,
                 )
                 .await;
+                if let Some(name) = cron_name {
+                    crons_for_done.mark_done(&name);
+                }
             });
             Ok(json!({
                 "status": "arc_started",
@@ -5447,6 +5549,58 @@ async fn admin_poller_install(
         "status": "installed",
         "name": spec.name,
         "every_seconds": spec.every_seconds,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminCronInstallReq {
+    spec: Value,
+}
+
+async fn admin_cron_install(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<AdminCronInstallReq>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    let spec: crons::CronSpec = match serde_json::from_value(req.spec) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("cron parse: {e}"),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = crons::validate_schedule(&spec.schedule) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("cron schedule invalid: {e}"),
+        )
+            .into_response();
+    }
+    let dir = state.store_dir.join("crons");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.json", spec.name));
+    if let Err(e) = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&spec).unwrap_or_default(),
+    ) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cron persist: {e}"),
+        )
+            .into_response();
+    }
+    state.crons.install(spec.clone());
+    let handle = crons::spawn_loop(state.clone(), spec.clone());
+    state.crons.track_handle(&spec.name, handle);
+    axum::Json(json!({
+        "status": "installed",
+        "name": spec.name,
+        "schedule": spec.schedule,
+        "concurrency": spec.concurrency,
     }))
     .into_response()
 }
@@ -6191,6 +6345,7 @@ async fn main() -> anyhow::Result<()> {
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
         webhooks: Arc::new(webhooks::WebhookRegistry::new()),
         pollers: Arc::new(pollers::PollerRegistry::new()),
+        crons: Arc::new(crons::CronRegistry::new()),
         workflow_registry: Arc::new(RwLock::new(HashMap::new())),
         bind_is_loopback,
         signal_log: RwLock::new(std::collections::VecDeque::with_capacity(SIGNAL_LOG_CAP)),
@@ -6230,6 +6385,32 @@ async fn main() -> anyhow::Result<()> {
         shared.pollers.install(spec.clone());
         let handle = pollers::spawn_loop(shared.clone(), spec.clone());
         shared.pollers.track_handle(&spec.name, handle);
+    }
+    // Crons — same restore-on-startup story. Schedule-validation
+    // failures here log + skip rather than crash the daemon, mirroring
+    // the webhook restore semantics (operator-installed specs may have
+    // outlived a syntax change).
+    let cron_dir = shared.store_dir.join("crons");
+    for spec in crons::load_all(&cron_dir) {
+        match crons::validate_schedule(&spec.schedule) {
+            Ok(()) => {
+                tracing::info!(
+                    "restoring cron '{}' (schedule '{}', concurrency {})",
+                    spec.name,
+                    spec.schedule,
+                    spec.concurrency
+                );
+                shared.crons.install(spec.clone());
+                let handle = crons::spawn_loop(shared.clone(), spec.clone());
+                shared.crons.track_handle(&spec.name, handle);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "skipping restore of cron '{}': {e}",
+                    spec.name
+                );
+            }
+        }
     }
     let workflow_dir = shared.store_dir.join("workflows");
     if workflow_dir.exists() {
@@ -6365,6 +6546,10 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::post(admin_poller_install),
         )
         .route(
+            "/admin/cron/install",
+            axum::routing::post(admin_cron_install),
+        )
+        .route(
             "/admin/brofile/upsert",
             axum::routing::post(admin_brofile_upsert),
         )
@@ -6423,6 +6608,7 @@ mod tests {
             wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
             webhooks: Arc::new(webhooks::WebhookRegistry::new()),
             pollers: Arc::new(pollers::PollerRegistry::new()),
+            crons: Arc::new(crons::CronRegistry::new()),
             workflow_registry: Arc::new(RwLock::new(HashMap::new())),
             bind_is_loopback: true,
             signal_log: RwLock::new(std::collections::VecDeque::with_capacity(SIGNAL_LOG_CAP)),

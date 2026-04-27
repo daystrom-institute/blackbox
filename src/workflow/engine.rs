@@ -1178,11 +1178,15 @@ impl<'a> WorkflowRunner<'a> {
                 self.run_ensemble_node(node_id, actor, &actor_name, &prompt)
                     .await?;
             }
-            ActorKind::Advisor => {
-                // Advisor actor is a single-bro dispatch with an
-                // advisor-lens prompt — functionally identical to an
-                // executor for engine purposes. The distinction exists
-                // at the brofile layer (tool filtering, lens prompt).
+            ActorKind::Advisor | ActorKind::Planner | ActorKind::Triager => {
+                // Advisor / Planner / Triager are single-bro dispatches
+                // that share the executor mechanics — same session
+                // resolution, same retry path, same output capture.
+                // The distinction is the *contract*: advisors render
+                // judgment, planners author a plan/charter, triagers
+                // pick from a queue. Brofile lens carries the persona
+                // and an optional `output_schema` validator on the
+                // node's `on_exit` enforces structured output.
                 self.run_executor_node(node_id, actor, &actor_name, &prompt)
                     .await?;
             }
@@ -1386,7 +1390,10 @@ impl<'a> WorkflowRunner<'a> {
         })?;
         let prompt = self.render_prompt(spec.prompt.as_deref().unwrap_or(""));
         match &actor.kind {
-            ActorKind::Executor | ActorKind::Advisor => {
+            ActorKind::Executor
+            | ActorKind::Advisor
+            | ActorKind::Planner
+            | ActorKind::Triager => {
                 let brofile = actor.brofile.as_deref().ok_or_else(|| {
                     anyhow!("async target '{target_id}' executor missing brofile")
                 })?;

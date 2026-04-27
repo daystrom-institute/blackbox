@@ -533,6 +533,29 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some("bro_poller_list()"),
     },
     ToolDoc {
+        name: "bro_cron_install",
+        category: ToolCategory::Workflows,
+        summary: "Install a calendar-driven cron inlet — sibling of webhook + poller. Same routing pipeline (extractor → routing packet → dispatch_routed_event), different trigger source: wall-clock schedule, no fetch. Spec: name, schedule (6-field cron expr `sec min hour dom mon dow`), optional payload (operator-supplied entity fields), optional concurrency cap (default 1, set 0 to disable), routing_packet, optional default_project_dir. Synthetic entity fields `cron_name` + `tick_at` are merged in at tick time so routing rules can discriminate.",
+        when_to_use: "Use when the trigger is time-based, not event-based — nightly maintenance arcs, hourly health sweeps, weekly report generation, scheduled SAST squashing. The dispatched arc is responsible for any data acquisition (typically via mcp_call hooks) since cron carries no fetch. Concurrency cap of 1 (default) skips ticks while a prior arc is still in flight — set higher for bursty parallelism, set 0 to lift the cap entirely.",
+        example: Some(
+            r#"bro_cron_install(spec={"name":"sastquatch-daily","schedule":"0 0 9 * * *","payload":{"owner":"sastquatch","repo":"demo"},"concurrency":1,"routing_packet":"domain:cron-routing/sastquatch"})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bro_cron_list",
+        category: ToolCategory::Workflows,
+        summary: "List installed crons with schedule + concurrency cap + routing packet.",
+        when_to_use: "Inventory check before installing; also surfaces in-flight count so you can tell whether a cap is currently blocking a tick.",
+        example: Some("bro_cron_list()"),
+    },
+    ToolDoc {
+        name: "bro_cron_upcoming",
+        category: ToolCategory::Workflows,
+        summary: "Compute the next N scheduled times for a cron expression as RFC3339 strings. Pure function — does not touch the registry.",
+        when_to_use: "Validate a schedule before installing or eyeball when a live cron will fire next. Useful for human review of `0 */15 * * * *` etc. without booting a daemon.",
+        example: Some(r#"bro_cron_upcoming(schedule="0 0 9 * * *", count=3)"#),
+    },
+    ToolDoc {
         name: "bro_workflow_install",
         category: ToolCategory::Workflows,
         summary: "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced.",

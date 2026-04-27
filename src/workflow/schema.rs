@@ -85,6 +85,22 @@ pub enum ActorKind {
     /// Advisor LLM — a single bro used for judgment calls, narrow tool
     /// surface. Distinct from executor mainly by convention / lens.
     Advisor,
+    /// Strategic actor: looks at arc state + accessible tools and
+    /// emits a plan / sequence / charter that downstream nodes
+    /// consume. Mechanically a single-bro dispatch (same path as
+    /// executor); the distinction is the contract — its output is
+    /// expected to be structured (often JSON) and to drive subsequent
+    /// dispatch shape, not user-facing text. Pair with an
+    /// `output_schema` validator hook on `on_exit` to enforce the
+    /// contract.
+    Planner,
+    /// Selection actor: takes a queue / set of candidates (typically
+    /// produced by an upstream `mcp_call` or planner) and picks the
+    /// next one(s) to act on, with rationale. Same dispatch path as
+    /// executor; distinct intent from planner — planner authors a
+    /// plan, triager picks from a plan or pool. Most arcs that have
+    /// a planner will also have a triager downstream.
+    Triager,
     /// Human operator. Invoking a user node means: pause, surface to
     /// inbox, wait for resolve.
     User,
