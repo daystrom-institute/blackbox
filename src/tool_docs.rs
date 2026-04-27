@@ -471,6 +471,29 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bro_arc_status(arc_id="thread-abc12345")"#),
     },
     ToolDoc {
+        name: "bro_webhook_replay",
+        category: ToolCategory::Workflows,
+        summary: "Replay an arbitrary payload through an installed webhook's extractor + routing packet WITHOUT dispatching the verdict. Returns the extracted entity, the routing verdict's classification, and the resolved consequent (after `${entity.X}` substitution). Skips signature verification — same path as the HTTP `/webhook/:name/replay` endpoint, surfaced as MCP so routing-rule iteration happens inside the tool surface. Records the replay into the same delivery ring buffer (`source: replay`) so `bro_webhook_deliveries` shows it.",
+        when_to_use: "Use to iterate on a routing-packet rule against a synthetic payload without needing the upstream code-host to fire a real event. Hand-craft (or copy from `bro_webhook_deliveries`) the body + headers that match what the upstream sends, replay, inspect the verdict, edit the rule, recompile the packet, replay again. Pairs with `bro_webhook_deliveries` for the captured-then-replay debug loop.",
+        example: Some(
+            r#"bro_webhook_replay(name="forgejo", body={"action":"synchronized","pull_request":{"number":42},"repository":{"name":"r","owner":{"login":"o"}}}, headers={"x-gitea-event":"pull_request"})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bro_webhook_deliveries",
+        category: ToolCategory::Workflows,
+        summary: "Recent webhook deliveries as a bounded ring buffer (last ~200). Each entry: (received_at, webhook_name, source, headers, extracted_entity, verdict_classification, response_status, response_body). `source` is `webhook` for live deliveries and `replay` for the no-signature replay endpoint. `verdict_classification` echoes how the routing packet classified the event (`start_arc` / `signal_arc` / `cancel_arc` / `ignore` / `dead_letter` / `no_match` / `duplicate_dropped` / `error`). Filter by `name=` (webhook name) and `since=` (ISO timestamp). Replaces poking the upstream code-host's hook-task table or grepping the daemon's tracing log to debug routing-rule misses.",
+        when_to_use: "Use when a webhook should have advanced an arc but didn't. Filter to the webhook name and inspect the most recent entry's `extracted_entity` to confirm the extractor projected the right fields, then `verdict_classification` to see what the routing packet decided. `no_match` / `ignore` for an event you expected to route reveals a missing or mis-shaped routing rule. Pair with `bro_signals` to see what (if any) signal made it past routing into the wait-resolution path.",
+        example: Some(r#"bro_webhook_deliveries(name="forgejo", limit=10)"#),
+    },
+    ToolDoc {
+        name: "bro_signals",
+        category: ToolCategory::Workflows,
+        summary: "Recent signal-dispatch events as a bounded ring buffer (last ~200). Every call to the signal router records one entry: (timestamp, signal, correlation, outcome, matched_arc_id, matched_wait_id, idle_pending). `outcome` is `matched` (resolved a wait) or `no_matching_wait` (fell idle); on idle, `idle_pending` carries the pending-with-same-signal snapshot at dispatch time so the diff between what arrived and what was waiting is one read away. Filter by `signal=` (exact match) and `since=` (ISO timestamp). Replaces the journalctl|grep workflow for debugging webhook → routing → signal → wait paths.",
+        when_to_use: "Use when an arc is parked on a Wait and you can't tell why a webhook didn't resolve it. Filter to the signal name in question and look at the most recent entries — `no_matching_wait` with `idle_pending` showing the right wait + a different correlation diff means the routing rule emitted the wrong correlation type/value. `matched` entries confirm the resolution path is wired.",
+        example: Some(r#"bro_signals(signal="pr-ready", limit=20)"#),
+    },
+    ToolDoc {
         name: "bro_webhook_install",
         category: ToolCategory::Workflows,
         summary: "Install a webhook endpoint reachable at POST /webhook/<name>. Signature verification, extractor projection, and routing-packet dispatch are mechanical at the daemon. Routing packets must already be operator-installed in the global packet store.",

@@ -91,6 +91,85 @@ struct SharedState {
     /// address. Webhook signature scheme `none` is rejected at install
     /// AND at verify when this is false (defense in depth).
     bind_is_loopback: bool,
+    /// Bounded ring buffer of recent signal-dispatch events. Every
+    /// call to `signal_arc_dispatch` records one entry — whether the
+    /// signal matched a pending wait (with the resolved arc/wait ids)
+    /// or fell idle (with the pending-with-same-signal snapshot at
+    /// dispatch time). Surfaced via `bro_signals` MCP for debugging
+    /// "did this webhook actually resolve a wait?" without grepping
+    /// the daemon's tracing log.
+    signal_log: RwLock<std::collections::VecDeque<SignalEvent>>,
+    /// Bounded ring buffer of recent webhook deliveries. Captured by
+    /// the webhook handler post-dispatch; carries the extracted
+    /// entity, the routing verdict's classification, and the response
+    /// returned to the caller. Surfaced via `bro_webhook_deliveries`
+    /// MCP — replaces poking the upstream's hook-task table or
+    /// reading daemon tracing logs to debug routing-rule misses.
+    webhook_delivery_log: RwLock<std::collections::VecDeque<WebhookDelivery>>,
+}
+
+const SIGNAL_LOG_CAP: usize = 200;
+const WEBHOOK_LOG_CAP: usize = 200;
+
+#[derive(Debug, Clone, Serialize)]
+struct SignalEvent {
+    timestamp: String,
+    signal: String,
+    correlation: serde_json::Map<String, Value>,
+    /// `"matched"` when a pending wait resolved, `"no_matching_wait"`
+    /// otherwise.
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_arc_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_wait_id: Option<String>,
+    /// Snapshot of pending waits with the same signal name at
+    /// dispatch time. Empty when the signal matched. When the signal
+    /// went idle this is the diff a debugger needs: which arcs were
+    /// waiting on this signal name, with what correlation, that
+    /// failed to match.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    idle_pending: Vec<crate::workflow::wait::WaitSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebhookDelivery {
+    received_at: String,
+    webhook_name: String,
+    /// `"webhook"` for live deliveries via `/webhook/:name`,
+    /// `"replay"` for the no-signature replay endpoint.
+    source: String,
+    /// Subset of inbound headers that drove routing (lowercased
+    /// `x-*` keys). Full header capture would balloon the buffer and
+    /// most non-`x-*` headers carry no routing signal.
+    headers: serde_json::Map<String, Value>,
+    extracted_entity: Value,
+    /// `"start_arc"` / `"signal_arc"` / `"cancel_arc"` / `"ignore"` /
+    /// `"dead_letter"` / `"no_match"` (when no rule fired) /
+    /// `"extractor_failed"` / `"signature_invalid"` /
+    /// `"idempotency_dropped"`. Single string keeps the schema
+    /// flat for filter queries.
+    verdict_classification: String,
+    response_status: u16,
+    response_body: Value,
+}
+
+impl SharedState {
+    fn record_signal(&self, ev: SignalEvent) {
+        let mut log = self.signal_log.write();
+        if log.len() >= SIGNAL_LOG_CAP {
+            log.pop_front();
+        }
+        log.push_back(ev);
+    }
+
+    fn record_webhook(&self, d: WebhookDelivery) {
+        let mut log = self.webhook_delivery_log.write();
+        if log.len() >= WEBHOOK_LOG_CAP {
+            log.pop_front();
+        }
+        log.push_back(d);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -265,6 +344,13 @@ impl BlackboxServer {
                 .workflow_dispatch_executor(brofile, prompt, cwd.as_deref(), existing.as_deref())
                 .await
                 .map_err(|e| format!("member {member_name}: {e}"))?;
+            // Stamp the precise team::member label, overriding the
+            // brofile fallback that workflow_dispatch_executor →
+            // record_task_to_bro set. Two team members sharing a
+            // brofile (the common keystone-reviewers shape) would
+            // otherwise be indistinguishable in `bro tail`.
+            task.inner.lock().bro_label =
+                Some(format!("{team_name}::{member_name}"));
             launched.push((member_name.clone(), task));
         }
         Ok(launched)
@@ -2983,6 +3069,96 @@ Constraints:\n\
     }
 
     #[tool(
+        name = "bro_signals",
+        description = "Recent signal-dispatch events as a bounded ring buffer (last ~200). Every call to the signal router records one entry: (timestamp, signal, correlation, outcome, matched_arc_id, matched_wait_id, idle_pending). `outcome` is `matched` (resolved a wait) or `no_matching_wait` (fell idle); on idle, `idle_pending` carries the pending-with-same-signal snapshot at dispatch time so the diff between what arrived and what was waiting is one read away. Filter by `signal=` (exact match) and `since=` (ISO timestamp). Replaces the journalctl|grep workflow for debugging webhook → routing → signal → wait paths."
+    )]
+    async fn bro_signals(
+        &self,
+        Parameters(p): Parameters<SignalsParams>,
+    ) -> CallToolResult {
+        let log = self.state.signal_log.read();
+        let limit = p.limit.unwrap_or(50).min(SIGNAL_LOG_CAP);
+        let mut out: Vec<&SignalEvent> = log
+            .iter()
+            .filter(|e| match &p.signal {
+                Some(s) => e.signal == *s,
+                None => true,
+            })
+            .filter(|e| match &p.since {
+                Some(ts) => e.timestamp.as_str() >= ts.as_str(),
+                None => true,
+            })
+            .filter(|e| match &p.outcome {
+                Some(o) => e.outcome == *o,
+                None => true,
+            })
+            .collect();
+        // Newest first.
+        out.reverse();
+        out.truncate(limit);
+        Self::ok_json(&serde_json::json!({
+            "events": out,
+            "total_in_buffer": log.len(),
+            "buffer_capacity": SIGNAL_LOG_CAP,
+        }))
+    }
+
+    #[tool(
+        name = "bro_webhook_replay",
+        description = "Replay an arbitrary payload through an installed webhook's extractor + routing packet WITHOUT dispatching the verdict. Returns the extracted entity, the routing verdict's classification, and the resolved consequent (after `${entity.X}` substitution). Skips signature verification — same path as the HTTP `/webhook/:name/replay` endpoint, surfaced as MCP so routing-rule iteration happens inside the tool surface. Records the replay into the same delivery ring buffer (`source: replay`) so `bro_webhook_deliveries` shows it."
+    )]
+    async fn bro_webhook_replay(
+        &self,
+        Parameters(p): Parameters<WebhookReplayParams>,
+    ) -> CallToolResult {
+        let headers = p.headers.unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k.to_lowercase(), v))
+            .collect();
+        match webhook_replay_inner(&self.state, &p.name, &p.body, &headers) {
+            Ok(v) => Self::ok_json(&v),
+            Err((status, msg)) => {
+                Self::err_text(&format!("replay failed ({}): {msg}", status.as_u16()))
+            }
+        }
+    }
+
+    #[tool(
+        name = "bro_webhook_deliveries",
+        description = "Recent webhook deliveries as a bounded ring buffer (last ~200). Each entry: (received_at, webhook_name, source, headers, extracted_entity, verdict_classification, response_status, response_body). `source` is `webhook` for live deliveries and `replay` for the no-signature replay endpoint. `verdict_classification` echoes how the routing packet classified the event (`start_arc` / `signal_arc` / `cancel_arc` / `ignore` / `dead_letter` / `no_match` / `duplicate_dropped` / `error`). Filter by `name=` (webhook name) and `since=` (ISO timestamp). Replaces poking the upstream code-host's hook-task table or grepping the daemon's tracing log to debug routing-rule misses."
+    )]
+    async fn bro_webhook_deliveries(
+        &self,
+        Parameters(p): Parameters<WebhookDeliveriesParams>,
+    ) -> CallToolResult {
+        let log = self.state.webhook_delivery_log.read();
+        let limit = p.limit.unwrap_or(50).min(WEBHOOK_LOG_CAP);
+        let mut out: Vec<&WebhookDelivery> = log
+            .iter()
+            .filter(|d| match &p.name {
+                Some(n) => d.webhook_name == *n,
+                None => true,
+            })
+            .filter(|d| match &p.since {
+                Some(ts) => d.received_at.as_str() >= ts.as_str(),
+                None => true,
+            })
+            .filter(|d| match &p.verdict_classification {
+                Some(v) => d.verdict_classification == *v,
+                None => true,
+            })
+            .collect();
+        // Newest first.
+        out.reverse();
+        out.truncate(limit);
+        Self::ok_json(&serde_json::json!({
+            "deliveries": out,
+            "total_in_buffer": log.len(),
+            "buffer_capacity": WEBHOOK_LOG_CAP,
+        }))
+    }
+
+    #[tool(
         name = "bro_webhook_install",
         description = "Install a webhook endpoint reachable at POST /webhook/<name>. Signature verification, extractor projection, and routing-packet dispatch are mechanical at the daemon. Routing packets must already be operator-installed in the global packet store."
     )]
@@ -3136,6 +3312,53 @@ struct ArcStatusParams {
     /// When omitted, returns all running arcs + pending waits.
     #[serde(default)]
     pub arc_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct WebhookReplayParams {
+    /// Installed webhook name to replay against.
+    pub name: String,
+    /// Webhook body payload (the JSON Forgejo / GitHub / etc. would
+    /// post). Top-level fields are extractor inputs.
+    pub body: Value,
+    /// Optional inbound headers; keys are lowercased before extractor
+    /// projection. Use this to provide event-type / delivery-id
+    /// headers (e.g. `{"x-gitea-event": "pull_request"}`) when the
+    /// extractor reads from `$._headers.<name>`.
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct WebhookDeliveriesParams {
+    /// Filter to a specific webhook name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Filter to deliveries at or after this ISO 8601 timestamp.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Filter by routing verdict classification.
+    #[serde(default)]
+    pub verdict_classification: Option<String>,
+    /// Max deliveries returned, newest-first. Default 50, max = buffer cap.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct SignalsParams {
+    /// Filter to a specific signal name (e.g. `pr-ready`). Exact match.
+    #[serde(default)]
+    pub signal: Option<String>,
+    /// Filter to events at or after this ISO 8601 timestamp.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Filter by outcome: `matched` or `no_matching_wait`.
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// Max events returned, newest-first. Default 50, max = buffer cap.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -4046,6 +4269,12 @@ Next step: <one concrete steering suggestion>\n"
     }
 
     fn record_task_to_bro(&self, bro_name: &str, task: &Arc<orch::Task>) {
+        // Stamp the task with a default label up-front so brofile-only
+        // dispatches (no team match) still surface in `bro tail` with a
+        // name. Team-attributed dispatches will overwrite below with a
+        // more precise `<team>::<member>` label.
+        task.inner.lock().bro_label = Some(bro_name.to_string());
+
         let _lock = orchestration::team::lock_teams();
         let tid = task.id();
         let teams = orchestration::team::load_all_teams(&self.state.store_dir);
@@ -4069,6 +4298,12 @@ Next step: <one concrete steering suggestion>\n"
             // so later team rounds fail closed instead of starting a
             // second session before provider-side discovery completes.
             member.session_id = Some(task_sid.clone());
+            // Stamp a precise team::member label on the task so the
+            // tail handler can attribute even when later resolution
+            // (find_bro_ref_for_task) hits the duplicate-name
+            // ambiguity case (two team members sharing a brofile).
+            task.inner.lock().bro_label =
+                Some(format!("{}::{}", team.name, member.name));
             orchestration::team::save_team(&team, &self.state.store_dir);
             break;
         }
@@ -4470,8 +4705,38 @@ async fn webhook_handler(
 ) -> impl axum::response::IntoResponse {
     use axum::response::IntoResponse;
     let header_map = headers_to_lowercase_map(&headers);
+    let header_subset = header_subset_for_log(&header_map);
     let body_bytes: &[u8] = &body;
     let outcome = process_webhook(&state, &name, &header_map, body_bytes).await;
+    let (status, response_body) = match &outcome {
+        Ok(v) => (200u16, v.clone()),
+        Err(e) => (400u16, json!({"error": e.to_string()})),
+    };
+    let entity = response_body
+        .get("extracted_entity")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let verdict_classification = response_body
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if status == 200 {
+                "unknown".into()
+            } else {
+                "error".into()
+            }
+        });
+    state.record_webhook(WebhookDelivery {
+        received_at: util::now_iso(),
+        webhook_name: name.clone(),
+        source: "webhook".into(),
+        headers: header_subset,
+        extracted_entity: entity,
+        verdict_classification,
+        response_status: status,
+        response_body: response_body.clone(),
+    });
     match outcome {
         Ok(verdict_json) => (
             axum::http::StatusCode::OK,
@@ -4501,16 +4766,6 @@ async fn webhook_replay_handler(
 ) -> impl axum::response::IntoResponse {
     let header_map = headers_to_lowercase_map(&headers);
     use axum::response::IntoResponse;
-    let spec = match state.webhooks.get(&name) {
-        Some(s) => s,
-        None => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                format!("unknown webhook '{name}'"),
-            )
-                .into_response();
-        }
-    };
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -4521,43 +4776,77 @@ async fn webhook_replay_handler(
                 .into_response();
         }
     };
-    let combined = combine_payload_and_headers(&payload, &header_map);
-    let entity = match spec.extractor.extract(&combined) {
-        Ok(e) => e,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("extractor failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-    let server = BlackboxServer::new(state.clone());
+    match webhook_replay_inner(&state, &name, &payload, &header_map) {
+        Ok(response_body) => axum::Json(response_body).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+/// Shared replay path used by both the HTTP `/webhook/:name/replay`
+/// endpoint and the `bro_webhook_replay` MCP tool. Records the result
+/// into the delivery ring buffer with `source: replay`.
+fn webhook_replay_inner(
+    state: &Arc<SharedState>,
+    name: &str,
+    payload: &Value,
+    headers: &HashMap<String, String>,
+) -> Result<Value, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    let spec = state
+        .webhooks
+        .get(name)
+        .ok_or((StatusCode::NOT_FOUND, format!("unknown webhook '{name}'")))?;
+    let combined = combine_payload_and_headers(payload, headers);
+    let entity = spec
+        .extractor
+        .extract(&combined)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("extractor failed: {e}")))?;
     let prediction = {
         let store = state.packets.read();
-        match store.load(&spec.routing_packet) {
-            Ok(packet) => apply_packet_with(&packet, &entity, &*store),
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("routing packet load: {e}"),
-                )
-                    .into_response();
-            }
-        }
+        let packet = store.load(&spec.routing_packet).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("routing packet load: {e}"),
+            )
+        })?;
+        apply_packet_with(&packet, &entity, &*store)
     };
-    let _ = server; // suppress unused
     let verdict_kind = prediction
         .as_ref()
         .map(|p| p.classification.clone())
         .unwrap_or_else(|| "no_match".into());
     let verdict = prediction.map(|p| p.consequent.to_json());
-    axum::Json(json!({
-        "entity": entity,
-        "verdict_classification": verdict_kind,
+    let response_body = json!({
+        "entity": entity.clone(),
+        "verdict_classification": verdict_kind.clone(),
         "verdict_consequent": verdict,
-    }))
-    .into_response()
+    });
+    state.record_webhook(WebhookDelivery {
+        received_at: util::now_iso(),
+        webhook_name: name.to_string(),
+        source: "replay".into(),
+        headers: header_subset_for_log(headers),
+        extracted_entity: entity,
+        verdict_classification: verdict_kind,
+        response_status: 200,
+        response_body: response_body.clone(),
+    });
+    Ok(response_body)
+}
+
+/// Subset of inbound headers preserved in the webhook delivery log.
+/// Lowercased `x-*` headers carry the routing-relevant signal (event
+/// type, delivery id, signature header). Bulk Forgejo/GitHub
+/// boilerplate (`accept`, `user-agent`, `content-length`) and the
+/// signature value itself are dropped — keeps the buffer small and
+/// avoids leaking signature bytes into the read surface.
+fn header_subset_for_log(headers: &HashMap<String, String>) -> serde_json::Map<String, Value> {
+    headers
+        .iter()
+        .filter(|(k, _)| k.starts_with("x-"))
+        .filter(|(k, _)| !k.contains("signature"))
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect()
 }
 
 fn headers_to_lowercase_map(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
@@ -5216,6 +5505,15 @@ async fn signal_arc_dispatch(
             "signal '{signal}' arrived with correlation {correlation:?} — no matching wait (idle). pending_with_same_signal={:?}",
             pending_before.iter().map(|w| (w.arc_id.clone(), w.wait_id.clone(), w.correlation.clone())).collect::<Vec<_>>(),
         );
+        state.record_signal(SignalEvent {
+            timestamp: util::now_iso(),
+            signal: signal.to_string(),
+            correlation: correlation.clone(),
+            outcome: "no_matching_wait".into(),
+            matched_arc_id: None,
+            matched_wait_id: None,
+            idle_pending: pending_before.clone(),
+        });
         return json!({
             "status": "no_matching_wait",
             "signal": signal,
@@ -5226,6 +5524,15 @@ async fn signal_arc_dispatch(
     tracing::info!(
         "signal '{signal}' arrived with correlation {correlation:?} — resolved wait arc={arc_id} wait_id={wait_id}",
     );
+    state.record_signal(SignalEvent {
+        timestamp: util::now_iso(),
+        signal: signal.to_string(),
+        correlation: correlation.clone(),
+        outcome: "matched".into(),
+        matched_arc_id: Some(arc_id.clone()),
+        matched_wait_id: Some(wait_id.clone()),
+        idle_pending: Vec::new(),
+    });
     let sig = crate::workflow::context::SignalRef {
         name: signal.to_string(),
         payload,
@@ -5332,6 +5639,60 @@ async fn roster_handler(
         }
     }
 
+    // Bro selectors that the team-walk above didn't resolve fall
+    // through here: we synthesize ad-hoc entries from currently-known
+    // tasks whose `bro_label` matches. This is the only path that
+    // surfaces brofile-only dispatched bros (workflow implementer /
+    // advisor nodes) — they have no team membership, so the team
+    // walk skips them. Without this, `bro tail keystone-impl` returns
+    // an empty roster and the CLI bails with "bro does not exist".
+    if !wanted_bros.is_empty() {
+        let task_store = state.task_store.read();
+        for task in task_store.all_tasks() {
+            let inner = task.inner.lock();
+            let label = match &inner.bro_label {
+                Some(l) => l.clone(),
+                None => continue,
+            };
+            // Match either bare-label (`keystone-impl`) or the
+            // `team::member` form so callers can use either.
+            let (team, member) = match label.split_once("::") {
+                Some((t, m)) => (t.to_string(), m.to_string()),
+                None => ("adhoc".to_string(), label.clone()),
+            };
+            let matches = wanted_bros
+                .iter()
+                .any(|w| w == &member || w == &label);
+            if !matches {
+                continue;
+            }
+            let key = format!("{team}::{member}");
+            if !seen.insert(key) {
+                continue;
+            }
+            let session_id = if inner.session_id == "pending" {
+                None
+            } else {
+                Some(inner.session_id.clone())
+            };
+            let jsonl_path = session_id.as_deref().and_then(|sid| {
+                index::find_session_file(sid, &config.roots, config.codex_root.as_deref())
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
+            entries.push(BroRosterEntry {
+                bro: member,
+                bro_selector: label,
+                team,
+                provider: inner.provider.to_string(),
+                account: None,
+                session_id,
+                jsonl_path,
+                brofile: String::new(),
+                model: None,
+            });
+        }
+    }
+
     if !wanted_providers.is_empty() {
         entries.retain(|e| {
             e.provider
@@ -5390,16 +5751,45 @@ async fn tail_handler(
             match rx.recv().await {
                 Ok(event) => {
                     let tid = event.task_id();
-                    let (task_provider, task_session_id) = {
+                    let (task_provider, task_session_id, task_bro_label) = {
                         let store = state.task_store.read();
                         store.get(tid)
                             .map(|t| {
                                 let inner = t.inner.lock();
-                                (Some(inner.provider), Some(inner.session_id.clone()))
+                                (
+                                    Some(inner.provider),
+                                    Some(inner.session_id.clone()),
+                                    inner.bro_label.clone(),
+                                )
                             })
-                            .unwrap_or((None, None))
+                            .unwrap_or((None, None, None))
                     };
                     let bro_ref = orchestration::team::find_bro_ref_for_task(tid, &store_dir);
+
+                    // Effective selector + label resolution. Team-based lookup
+                    // (find_bro_ref_for_task) wins when the dispatching path
+                    // attributed via task_history. Otherwise fall back to the
+                    // task's `bro_label` — set during dispatch so brofile-only
+                    // workflow nodes (implementer / advisor) and ensemble
+                    // members with duplicate-name brofiles surface in tail
+                    // instead of being anonymous.
+                    let (effective_member, effective_team, effective_label) = match &bro_ref {
+                        Some(r) => {
+                            let label = format!("{}::{}", r.team_name, r.member_name);
+                            (Some(r.member_name.clone()), Some(r.team_name.clone()), Some(label))
+                        }
+                        None => {
+                            let label = task_bro_label.clone();
+                            let (team, member) = match label.as_deref() {
+                                Some(s) => match s.split_once("::") {
+                                    Some((t, m)) => (Some(t.to_string()), Some(m.to_string())),
+                                    None => (None, Some(s.to_string())),
+                                },
+                                None => (None, None),
+                            };
+                            (member, team, label)
+                        }
+                    };
 
                     // Provider is a filter that applies on top of the selector
                     // union. Bros/sessions/teams are OR'd together: match ANY
@@ -5413,33 +5803,42 @@ async fn tail_handler(
                     let selector_match = if !selectors_specified {
                         true
                     } else {
-                        let bro_m = bro_ref.as_ref()
-                            .map(|r| {
-                                let selector = format!("{}::{}", r.team_name, r.member_name);
-                                wanted_bros.iter().any(|w| w == &r.member_name || w == &selector)
-                            })
-                            .unwrap_or(false);
+                        let bro_m = match (&effective_member, &effective_label) {
+                            (Some(m), Some(l)) => wanted_bros
+                                .iter()
+                                .any(|w| w == m || w == l),
+                            (Some(m), None) => wanted_bros.iter().any(|w| w == m),
+                            (None, Some(l)) => wanted_bros.iter().any(|w| w == l),
+                            _ => false,
+                        };
                         let session_m = task_session_id.as_deref()
                             .map(|s| wanted_sessions.iter().any(|w| w == s))
                             .unwrap_or(false);
-                        let team_m = wanted_teams.iter().any(|tn| {
+                        let team_m_via_history = wanted_teams.iter().any(|tn| {
                             orchestration::team::load_team(tn, &store_dir)
                                 .map(|team| team.members.iter()
                                     .any(|m| m.task_history.iter().any(|id| id == tid)))
                                 .unwrap_or(false)
                         });
-                        bro_m || session_m || team_m
+                        let team_m_via_label = match &effective_team {
+                            Some(t) => wanted_teams.iter().any(|w| w == t),
+                            None => false,
+                        };
+                        bro_m || session_m || team_m_via_history || team_m_via_label
                     };
                     if !(no_selectors || (provider_ok && selector_match)) {
                         continue;
                     }
 
                     let mut evt_json = serde_json::to_value(&event).unwrap_or_default();
-                    if let Some(ref bro_ref) = bro_ref {
-                        evt_json["bro_name"] = Value::String(bro_ref.member_name.clone());
-                        evt_json["bro_selector"] =
-                            Value::String(format!("{}::{}", bro_ref.team_name, bro_ref.member_name));
-                        evt_json["team_name"] = Value::String(bro_ref.team_name.clone());
+                    if let Some(member) = &effective_member {
+                        evt_json["bro_name"] = Value::String(member.clone());
+                    }
+                    if let Some(label) = &effective_label {
+                        evt_json["bro_selector"] = Value::String(label.clone());
+                    }
+                    if let Some(team) = &effective_team {
+                        evt_json["team_name"] = Value::String(team.clone());
                     }
                     if let Some(ref sid) = task_session_id {
                         if sid.as_str() != "pending" {
@@ -5690,6 +6089,8 @@ async fn main() -> anyhow::Result<()> {
         pollers: Arc::new(pollers::PollerRegistry::new()),
         workflow_registry: Arc::new(RwLock::new(HashMap::new())),
         bind_is_loopback,
+        signal_log: RwLock::new(std::collections::VecDeque::with_capacity(SIGNAL_LOG_CAP)),
+        webhook_delivery_log: RwLock::new(std::collections::VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
     });
 
     // Restore webhook + workflow registries from disk so installs
@@ -5919,6 +6320,8 @@ mod tests {
             pollers: Arc::new(pollers::PollerRegistry::new()),
             workflow_registry: Arc::new(RwLock::new(HashMap::new())),
             bind_is_loopback: true,
+            signal_log: RwLock::new(std::collections::VecDeque::with_capacity(SIGNAL_LOG_CAP)),
+            webhook_delivery_log: RwLock::new(std::collections::VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
         });
         BlackboxServer::new(state)
     }

@@ -55,6 +55,16 @@ pub struct TaskInner {
     pub completed_at: Option<u64>,
     pub exit_code: Option<i32>,
     pub cwd: Option<String>,
+    /// Caller-supplied identity for the dispatched bro. Format:
+    /// `<team>::<member>` for ensemble dispatch (carries which member
+    /// of which team this task belongs to), bare `<brofile>` for
+    /// brofile-only dispatch (no team context — implementer / advisor
+    /// nodes), or `None` for legacy direct dispatches that didn't
+    /// supply context. The tail handler reads this when team-based
+    /// `find_bro_ref_for_task` returns no match, so brofile-dispatched
+    /// tasks (workflow implementer, single-bro advisor) still surface
+    /// in `bro tail` with a name instead of being anonymous.
+    pub bro_label: Option<String>,
 }
 
 pub struct Task {
@@ -138,6 +148,8 @@ struct PersistedTask {
     completed_at: Option<u64>,
     exit_code: Option<i32>,
     cwd: Option<String>,
+    #[serde(default)]
+    bro_label: Option<String>,
 }
 
 impl TaskStore {
@@ -169,6 +181,7 @@ impl TaskStore {
                     completed_at: inner.completed_at,
                     exit_code: inner.exit_code,
                     cwd: inner.cwd.clone(),
+                    bro_label: inner.bro_label.clone(),
                 }
             })
             .collect();
@@ -221,6 +234,7 @@ impl TaskStore {
                     completed_at: rec.completed_at,
                     exit_code: rec.exit_code,
                     cwd: rec.cwd,
+                    bro_label: rec.bro_label,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -593,6 +607,7 @@ pub fn spawn_task(
                     completed_at: Some(now_ms()),
                     exit_code: None,
                     cwd,
+                    bro_label: None,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -621,6 +636,7 @@ pub fn spawn_task(
             completed_at: None,
             exit_code: None,
             cwd: cwd.clone(),
+            bro_label: None,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(pid),
@@ -1413,6 +1429,7 @@ mod tests {
                 completed_at: Some(5000),
                 exit_code: Some(0),
                 cwd: None,
+                bro_label: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1443,6 +1460,7 @@ mod tests {
                 completed_at: Some(2000),
                 exit_code: Some(1),
                 cwd: None,
+                bro_label: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1476,6 +1494,7 @@ mod tests {
             completed_at: None,
             exit_code: None,
             cwd: None,
+            bro_label: None,
         };
 
         reject_forked_session(&mut inner, "forked-session");
@@ -1517,6 +1536,7 @@ mod tests {
             completed_at: None,
             exit_code: None,
             cwd: None,
+            bro_label: None,
         };
 
         let sink = EventSink {
@@ -1572,6 +1592,7 @@ mod async_tests {
                 completed_at: Some(now_ms()),
                 exit_code: Some(0),
                 cwd: None,
+                bro_label: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1599,6 +1620,7 @@ mod async_tests {
                 completed_at: None,
                 exit_code: None,
                 cwd: None,
+                bro_label: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1639,6 +1661,7 @@ mod async_tests {
                 completed_at: None,
                 exit_code: None,
                 cwd: None,
+                bro_label: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
