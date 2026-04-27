@@ -167,9 +167,27 @@ async fn exec_mcp_call(
         .and_then(|v| v.as_u64())
         .unwrap_or(300);
     let project_dir = ctx.meta.project_dir.as_deref();
-    let result = crate::mcp_client::call_tool(server, tool, arguments, timeout_secs, project_dir)
-        .await
-        .map_err(|e| anyhow!("McpCall '{server}.{tool}': {e}"))?;
+    // cwd resolution: explicit args.cwd → arc's active worktree →
+    // arc's project_dir → None (daemon's cwd, almost never what you
+    // want for tools that read project state). MCP servers like
+    // biofilter resolve their root via `process.cwd()` so this
+    // matters for stdio transports.
+    let cwd_owned: Option<String> = args
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| ctx.meta.worktree.clone())
+        .or_else(|| ctx.meta.project_dir.clone());
+    let result = crate::mcp_client::call_tool(
+        server,
+        tool,
+        arguments,
+        timeout_secs,
+        project_dir,
+        cwd_owned.as_deref(),
+    )
+    .await
+    .map_err(|e| anyhow!("McpCall '{server}.{tool}': {e}"))?;
     match into_var {
         Some(k) => Ok(OpEffect::SetVar {
             key: k.to_string(),

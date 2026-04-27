@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
-# Bootstrap a freshly-started Forgejo instance for the SASTquatch demo.
+# Bootstrap the SASTquatch demo against an existing Forgejo instance.
+# Default: shares the keystone-forgejo container at :3000 + reuses
+# keystone's admin token (sourced from `examples/keystone/.env` if
+# present). Override via env to point at a fresh instance:
 #
-#   - Create admin user (`sastquatch-admin`)
-#   - Generate API token, write to .env
-#   - Create demo repo `sastquatch-admin/quat`
-#   - Seed Rust source with deliberate clippy + unsafe-deps issues +
+#   FORGEJO_HOST=http://127.0.0.1:3200 \
+#   FORGEJO_CONTAINER=mine-forgejo \
+#   ADMIN_USER=mine-admin \
+#     ./scripts/bootstrap.sh
+#
+# What it does:
+#   - Verifies Forgejo is reachable
+#   - Resolves an admin API token (reuses keystone's, or issues a
+#     fresh one against the configured admin)
+#   - Creates the demo repo `<ADMIN_USER>/quat` (idempotent)
+#   - Seeds Rust source with deliberate clippy + unsafe-deps issues +
 #     a Cargo.toml with one known-vulnerable crate so cargo-audit fires
-#   - Configure Forgejo webhook → http://host.docker.internal:7264/webhook/sastquatch
+#   - Configures the Forgejo webhook → /webhook/sastquatch on the
+#     daemon (distinct from keystone's /webhook/forgejo so the two
+#     demos can share Forgejo without collision)
 #
 # Idempotent: re-running on an already-bootstrapped instance is a no-op.
 #
@@ -16,13 +28,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
-FORGEJO_HOST="${FORGEJO_HOST:-http://127.0.0.1:3100}"
-ADMIN_USER="${ADMIN_USER:-sastquatch-admin}"
-ADMIN_PASS="${ADMIN_PASS:-sastquatch-demo-pass-1234}"
-ADMIN_EMAIL="${ADMIN_EMAIL:-admin@sastquatch.local}"
+FORGEJO_HOST="${FORGEJO_HOST:-http://127.0.0.1:3000}"
+FORGEJO_CONTAINER="${FORGEJO_CONTAINER:-keystone-forgejo}"
+ADMIN_USER="${ADMIN_USER:-keystone-admin}"
+ADMIN_PASS="${ADMIN_PASS:-keystone-demo-pass-1234}"
 REPO_NAME="${REPO_NAME:-quat}"
-WEBHOOK_SECRET="${WEBHOOK_SECRET:-sastquatch-webhook-secret-not-for-prod}"
-WEBHOOK_TARGET="${WEBHOOK_TARGET:-http://host.docker.internal:7264/webhook/sastquatch}"
+WEBHOOK_SECRET="${WEBHOOK_SECRET:-keystone-webhook-secret-not-for-prod}"
+WEBHOOK_NAME="${WEBHOOK_NAME:-sastquatch}"
+WEBHOOK_PORT="${WEBHOOK_PORT:-${BBOX_PORT:-7264}}"
+WEBHOOK_TARGET="${WEBHOOK_TARGET:-http://host.docker.internal:${WEBHOOK_PORT}/webhook/${WEBHOOK_NAME}}"
+KEYSTONE_ENV_FILE="${KEYSTONE_ENV_FILE:-${ROOT}/../keystone/.env}"
 
 # host.docker.internal works on Docker Desktop. On Linux compose
 # leaves the bridge gateway addressable on 172.17.0.1 (default).
@@ -45,31 +60,39 @@ wait_for_forgejo() {
     exit 1
 }
 
-create_admin() {
-    if docker exec sastquatch-forgejo su-exec git forgejo admin user list 2>/dev/null \
-        | awk 'NR>1 {print $2}' \
-        | grep -qx "${ADMIN_USER}"; then
-        log "admin user '${ADMIN_USER}' already exists"
-    else
-        log "creating admin user '${ADMIN_USER}'"
-        docker exec sastquatch-forgejo su-exec git forgejo admin user create \
-            --admin \
-            --username "${ADMIN_USER}" \
-            --password "${ADMIN_PASS}" \
-            --email "${ADMIN_EMAIL}" \
-            --must-change-password=false \
-            >/dev/null
-    fi
-}
-
-issue_token() {
+resolve_token() {
+    # Priority:
+    #   1. Existing $ENV_FILE — sastquatch's own bootstrap output
+    #   2. Adjacent keystone/.env — share keystone's admin token when
+    #      the two demos point at the same Forgejo (the default)
+    #   3. Issue a fresh token against ADMIN_USER:ADMIN_PASS
     if [[ -f "${ENV_FILE}" ]] && grep -q '^FORGEJO_TOKEN=' "${ENV_FILE}"; then
         log "token present in ${ENV_FILE}; reusing"
         # shellcheck disable=SC1090
         source "${ENV_FILE}"
         return 0
     fi
-    log "issuing API token"
+    if [[ -f "${KEYSTONE_ENV_FILE}" ]] && grep -q '^FORGEJO_TOKEN=' "${KEYSTONE_ENV_FILE}"; then
+        log "reusing keystone admin token from ${KEYSTONE_ENV_FILE}"
+        # shellcheck disable=SC1090
+        source "${KEYSTONE_ENV_FILE}"
+        # Override the repo to ours, keep the rest of keystone's vars.
+        FORGEJO_REPO="${REPO_NAME}"
+        {
+            echo "FORGEJO_BASE_URL=${FORGEJO_BASE_URL}"
+            echo "FORGEJO_TOKEN=${FORGEJO_TOKEN}"
+            echo "FORGEJO_OWNER=${FORGEJO_OWNER}"
+            echo "FORGEJO_REPO=${REPO_NAME}"
+            echo "FORGEJO_WEBHOOK_SECRET=${FORGEJO_WEBHOOK_SECRET}"
+        } >"${ENV_FILE}"
+        log "wrote ${ENV_FILE} (sharing keystone Forgejo)"
+        # ADMIN_USER for the rest of bootstrap = whoever owns the
+        # token (keystone-admin), not whatever was env-defaulted.
+        ADMIN_USER="${FORGEJO_OWNER}"
+        export FORGEJO_TOKEN
+        return 0
+    fi
+    log "issuing API token via ${ADMIN_USER}:${ADMIN_PASS}"
     local resp
     resp=$(curl -fsS -u "${ADMIN_USER}:${ADMIN_PASS}" \
         -H 'Content-Type: application/json' \
@@ -386,16 +409,16 @@ configure_webhook() {
 
 main() {
     wait_for_forgejo
-    create_admin
-    issue_token
+    resolve_token
     create_repo
     seed_repo
     configure_webhook
     log "bootstrap complete"
-    log "  admin:   ${ADMIN_USER} / ${ADMIN_PASS}"
+    log "  admin:   ${ADMIN_USER}"
     log "  api:     ${FORGEJO_HOST}/api/v1"
     log "  repo:    ${FORGEJO_HOST}/${ADMIN_USER}/${REPO_NAME}"
     log "  env:     ${ENV_FILE}"
+    log "  webhook: ${WEBHOOK_TARGET}"
 }
 
 main "$@"

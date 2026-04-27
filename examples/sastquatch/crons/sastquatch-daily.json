@@ -2,7 +2,7 @@
   "name": "sastquatch-daily",
   "schedule": "0 0 9 * * *",
   "payload": {
-    "owner": "sastquatch-admin",
+    "owner": "keystone-admin",
     "repo": "quat"
   },
   "concurrency": 1,

@@ -64,16 +64,22 @@ pub fn resolve_server(name: &str, project_dir: Option<&str>) -> Result<McpServer
 ///
 /// Tool error (`is_error: true`) is surfaced as Err with the
 /// concatenated text content as the message.
+///
+/// `cwd` is honored only for stdio transports — passes through as the
+/// child process's working directory. MCP servers like biofilter that
+/// resolve project state via `process.cwd()` need this set; the
+/// caller threads `vars.worktree_path` through the op's `args.cwd`.
 pub async fn call_tool(
     server_name: &str,
     tool_name: &str,
     arguments: serde_json::Map<String, Value>,
     timeout_secs: u64,
     project_dir: Option<&str>,
+    cwd: Option<&str>,
 ) -> Result<Value> {
     let cfg = resolve_server(server_name, project_dir)?;
     let dur = Duration::from_secs(timeout_secs.max(1));
-    let result = timeout(dur, do_call(cfg, tool_name, arguments)).await;
+    let result = timeout(dur, do_call(cfg, tool_name, arguments, cwd)).await;
     match result {
         Ok(inner) => inner,
         Err(_) => bail!("mcp_call '{server_name}.{tool_name}' timed out after {timeout_secs}s"),
@@ -84,10 +90,11 @@ async fn do_call(
     cfg: McpServerConfig,
     tool_name: &str,
     arguments: serde_json::Map<String, Value>,
+    cwd: Option<&str>,
 ) -> Result<Value> {
     match cfg {
         McpServerConfig::Stdio { command, args, env } => {
-            stdio_call(command, args, env, tool_name, arguments).await
+            stdio_call(command, args, env, tool_name, arguments, cwd).await
         }
         McpServerConfig::Http { url, headers, .. }
         | McpServerConfig::Sse { url, headers, .. } => {
@@ -102,6 +109,7 @@ async fn stdio_call(
     env: BTreeMap<String, String>,
     tool_name: &str,
     arguments: serde_json::Map<String, Value>,
+    cwd: Option<&str>,
 ) -> Result<Value> {
     // Resolve $HOME / common shell variables in `command` so
     // `${CLAUDE_PLUGIN_ROOT}` and friends pulled from the operator's
@@ -114,6 +122,9 @@ async fn stdio_call(
     command_builder.args(&resolved_args);
     for (k, v) in &env {
         command_builder.env(k, expand_simple_env(v));
+    }
+    if let Some(dir) = cwd {
+        command_builder.current_dir(expand_simple_env(dir));
     }
     let transport = TokioChildProcess::new(command_builder.configure(|_| {}))
         .with_context(|| {

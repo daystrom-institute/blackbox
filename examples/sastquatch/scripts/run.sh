@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
-# End-to-end SASTquatch runner. Brings up Forgejo, installs everything,
-# and either:
-#   - Waits for the next scheduled cron tick (default), or
-#   - Manually dispatches the arc immediately (`./run.sh --dispatch`),
-#     bypassing the cron, or
-#   - Installs an override-schedule cron that fires in 30s
-#     (`./run.sh --soon`) so the arc walks end-to-end without waiting
-#     overnight.
+# End-to-end SASTquatch runner. Default: shares the keystone-forgejo
+# at :3000 (bring it up first via `examples/keystone/run.sh
+# --skip-forgejo` is unnecessary — keystone's docker compose suffices).
+# Bootstrap creates a separate `quat` repo + sastquatch webhook on
+# that same Forgejo so the two demos don't collide.
 #
 # Order of operations:
-#   1. docker compose up forgejo
-#   2. ./scripts/bootstrap.sh — admin, repo, seed Rust crate, webhook
-#   3. ./scripts/install.sh   — packets, brofiles, team, workflows, webhook, cron
-#   4. Either: wait for cron, dispatch directly, or install --soon cron
-#   5. Tail the daemon's /tail SSE for live arc events
+#   1. ./scripts/bootstrap.sh — repo, seed Rust crate, webhook
+#      (assumes a Forgejo is reachable; defaults to keystone's at
+#      127.0.0.1:3000)
+#   2. ./scripts/install.sh   — packets, brofiles, team, workflows, webhook, cron
+#   3. Either: wait for cron, dispatch directly, or install --soon cron
+#   4. Tail the daemon's /tail SSE for live arc events
 
 set -euo pipefail
 
@@ -22,20 +20,22 @@ ENV_FILE="${ROOT}/.env"
 PORT="${BBOX_PORT:-7264}"
 DISPATCH=0
 SOON=0
-SKIP_FORGEJO=0
+SKIP_BOOTSTRAP=0
 
 usage() {
     cat <<EOF
 $(basename "$0") [options]
 
-Brings up the SASTquatch demo end-to-end.
+Brings up the SASTquatch demo end-to-end against an existing Forgejo
+(default: keystone-forgejo on 127.0.0.1:3000). Bring up Forgejo first
+via examples/keystone/scripts/run.sh if it isn't running yet.
 
 Options:
   --dispatch        Skip cron wait + webhook; directly dispatch
                     sastquatch-arc against the seeded repo.
   --soon            Install the cron with a schedule that fires ~30s
                     from now instead of the canonical 9am daily.
-  --skip-forgejo    Assume Forgejo is already running + bootstrapped.
+  --skip-bootstrap  Assume the demo repo + webhook are already configured.
   -h, --help        This help.
 EOF
 }
@@ -44,7 +44,7 @@ for arg in "$@"; do
     case "${arg}" in
         --dispatch) DISPATCH=1 ;;
         --soon) SOON=1 ;;
-        --skip-forgejo) SKIP_FORGEJO=1 ;;
+        --skip-bootstrap) SKIP_BOOTSTRAP=1 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; exit 1 ;;
     esac
@@ -52,11 +52,8 @@ done
 
 log() { printf '\033[36m[run]\033[0m %s\n' "$*"; }
 
-if [[ "${SKIP_FORGEJO}" -eq 0 ]]; then
-    log "1/4 starting Forgejo container"
-    (cd "${ROOT}" && docker compose up -d)
-
-    log "2/4 bootstrapping Forgejo (admin, repo, seed, webhook)"
+if [[ "${SKIP_BOOTSTRAP}" -eq 0 ]]; then
+    log "1/3 bootstrapping Forgejo (repo, seed, webhook)"
     "${ROOT}/scripts/bootstrap.sh"
 fi
 
@@ -65,7 +62,7 @@ if [[ -f "${ENV_FILE}" ]]; then
     source "${ENV_FILE}"
 fi
 
-log "3/4 installing packets / workflows / webhook / cron into blackboxd"
+log "2/3 installing packets / workflows / webhook / cron into blackboxd"
 if [[ "${SOON}" -eq 1 ]]; then
     # 30 seconds from now, expressed as 6-field cron (sec min hour dom mon dow).
     SOON_SCHED="$(date -u -d '+35 seconds' +'%-S %-M %-H %-d %-m * %Y')"
@@ -83,7 +80,7 @@ if [[ "${DISPATCH}" -eq 1 ]]; then
             git clone "${FORGEJO_BASE_URL}/${FORGEJO_OWNER}/${FORGEJO_REPO}.git" "${PROJECT_DIR}"
         fi
     fi
-    log "4/4 directly dispatching sastquatch-arc against ${FORGEJO_OWNER}/${FORGEJO_REPO}"
+    log "3/3 directly dispatching sastquatch-arc against ${FORGEJO_OWNER}/${FORGEJO_REPO}"
     log "    project_dir: ${PROJECT_DIR}"
     args=$(jq -nc \
         --arg owner "${FORGEJO_OWNER}" \
@@ -99,11 +96,11 @@ if [[ "${DISPATCH}" -eq 1 ]]; then
         -X POST "http://127.0.0.1:${PORT}/orchestrate/by-id" \
         -d "${args}" | jq .
 elif [[ "${SOON}" -eq 1 ]]; then
-    log "4/4 cron will fire shortly. Watch live events:"
+    log "3/3 cron will fire shortly. Watch live events:"
     log "    curl -N http://127.0.0.1:${PORT}/tail"
     log "    curl http://127.0.0.1:${PORT}/orchestrate/peek | jq"
 else
-    log "4/4 cron + webhook wired. Watch live events:"
+    log "3/3 cron + webhook wired. Watch live events:"
     log "    curl -N http://127.0.0.1:${PORT}/tail"
     log "    curl http://127.0.0.1:${PORT}/orchestrate/peek | jq"
     log
