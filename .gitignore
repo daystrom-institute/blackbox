@@ -9,3 +9,5 @@
 examples/keystone/.env
 # sastquatch demo: same pattern.
 examples/sastquatch/.env
+# whiteboard demo: same pattern.
+examples/whiteboard/.env

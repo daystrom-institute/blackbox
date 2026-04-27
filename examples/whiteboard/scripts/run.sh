@@ -60,8 +60,16 @@ if [[ "${DISPATCH}" -eq 1 ]]; then
     if [[ -z "${PROJECT_DIR:-}" ]]; then
         PROJECT_DIR="/tmp/whiteboard-clone-${FORGEJO_REPO}"
         if [[ ! -d "${PROJECT_DIR}/.git" ]]; then
+            # Embed the API token in the remote URL so the synthesizer's
+            # `git push` from the worktree authenticates without a
+            # credential helper. The clone is local + ephemeral; the
+            # token is the same shared admin token already in .env.
+            host_no_scheme="${FORGEJO_BASE_URL#http://}"
+            host_no_scheme="${host_no_scheme#https://}"
             log "cloning ${FORGEJO_OWNER}/${FORGEJO_REPO} → ${PROJECT_DIR}"
-            git clone "${FORGEJO_BASE_URL}/${FORGEJO_OWNER}/${FORGEJO_REPO}.git" "${PROJECT_DIR}"
+            git clone "http://${FORGEJO_OWNER}:${FORGEJO_TOKEN}@${host_no_scheme}/${FORGEJO_OWNER}/${FORGEJO_REPO}.git" "${PROJECT_DIR}"
+            git -C "${PROJECT_DIR}" config user.email "facilitator@whiteboard.local"
+            git -C "${PROJECT_DIR}" config user.name "whiteboard-facilitator"
         fi
     fi
     issue_number=$(curl -fsS -H "Authorization: token ${FORGEJO_TOKEN}" \

@@ -98,7 +98,7 @@
               "board_id": "${vars.board_id}",
               "topic": "ADR #${vars.issue_number}: ${vars.issue_title}",
               "project": "${vars.worktree_path}",
-              "arc_thread_id": "${meta.arc_thread_id}",
+              "arc_thread_id": "${meta.arc_id}",
               "opened_by": "facilitator",
               "domain": "facilitation"
             },

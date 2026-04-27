@@ -109,6 +109,29 @@ flowchart TB
 | Integration with arc lifecycle | Workflow-author wires every call | Workflow-author wires every call (today); engine-driven hooks possible (future) |
 | Audit trail | Board JSON | Board JSON + arc thread events |
 
+## What to expect on a clean run
+
+End-to-end against `keystone-admin/agora` on the shared keystone-forgejo:
+
+| Phase                | Wall time | Bro dispatches | Notes |
+|----------------------|-----------|----------------|-------|
+| Setup + OpenBoard    | ~5s       | 0 (mechanical) | Worktree create, board open, 4 agents registered |
+| BlindPost (ensemble) | ~30–60s   | 3× Sonnet      | Each specialist calls `whiteboard_post` from inside its turn |
+| TransitionToDebate   | <1s       | 0              | Two `whiteboard_transition` calls (read, debate) |
+| Debate (ensemble)    | ~60–90s   | 3× Sonnet (resumed) | Same sessions; each annotates + votes |
+| TransitionToResolve  | <1s       | 0              | One `whiteboard_transition` call |
+| Synthesize           | ~30–60s   | 1× Sonnet      | Reads board, writes `docs/adrs/adr-N.md`, commits |
+| PushAndOpenPr        | ~2s       | 0              | git push + http_json POST /pulls |
+| AwaitMerge           | ∞ (until merge) | 0      | Wait on `pr-merged` signal |
+| Done                 | <1s       | 0              | `whiteboard_archive` call |
+
+A successful sample run produced:
+- `docs/adrs/adr-1.md` — ~8 KB, 66 lines: status, context, three specialist stances (performance / security / design), discussion, decision, consequences, board reference + vote tally
+- Board state at archival: 3 posts, 6 corroborating annotations, 6 votes (6 accept / 0 reject / 0 defer), 0 conflicts, 0 unresolved challenges
+- PR #2 merged at commit `b1fcb6f8` after the operator (or webhook) signaled `pr-merged`
+
+The arc walk is repeatable — re-running against the same issue creates a new arc with a new board id, a new branch, and (because of `find_first` on existing PRs) reuses any already-open PR for the branch rather than creating a duplicate.
+
 ## See also
 
 - [`../keystone/README.md`](../keystone/README.md) — issue → fix → review → merge
