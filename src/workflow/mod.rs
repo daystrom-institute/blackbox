@@ -379,6 +379,32 @@ mod tests {
     }
 
     #[test]
+    fn sastquatch_workflows_compile() {
+        // The five JSON files under examples/sastquatch/workflows/
+        // are the production artifacts the install.sh script registers
+        // with the daemon. Compile-validate them in the test suite so
+        // schema drift surfaces immediately.
+        for path in &[
+            "../../examples/sastquatch/workflows/sastquatch-arc.json",
+            "../../examples/sastquatch/workflows/sastquatch-analyzer-arc.json",
+            "../../examples/sastquatch/workflows/sastquatch-fixer-arc.json",
+            "../../examples/sastquatch/workflows/sastquatch-feedback-arc.json",
+            "../../examples/sastquatch/workflows/sastquatch-reviewer-arc.json",
+        ] {
+            let full = format!(
+                "{}/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                path.trim_start_matches("../../")
+            );
+            let json = std::fs::read_to_string(&full)
+                .unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let spec = load_workflow(&json)
+                .unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
+            compile(spec).unwrap_or_else(|e| panic!("compile {path}: {e:?}"));
+        }
+    }
+
+    #[test]
     fn blind_workflow_loads_and_validates() {
         let json = include_str!("../../examples/workflows/blind.json");
         let spec = load_workflow(json).expect("parse blind spec");

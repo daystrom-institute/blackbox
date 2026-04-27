@@ -1,0 +1,65 @@
+{
+  "name": "sastquatch",
+  "signature": {
+    "kind": "hmac_sha256",
+    "secret_env": "FORGEJO_WEBHOOK_SECRET",
+    "header": "X-Gitea-Signature"
+  },
+  "delivery_id_header": "X-Gitea-Delivery",
+  "extractor": {
+    "outputs": {
+      "event": {
+        "kind": "default",
+        "inner": { "kind": "json_path", "path": "$._headers.x-gitea-event" },
+        "fallback": "unknown"
+      },
+      "action": {
+        "kind": "default",
+        "inner": { "kind": "json_path", "path": "$.action" },
+        "fallback": "unknown"
+      },
+      "pr_number": {
+        "kind": "json_path",
+        "path": "$.pull_request.number"
+      },
+      "pr_title": {
+        "kind": "json_path",
+        "path": "$.pull_request.title"
+      },
+      "merged": {
+        "kind": "default",
+        "inner": { "kind": "json_path", "path": "$.pull_request.merged" },
+        "fallback": false
+      },
+      "review_state": {
+        "kind": "coalesce",
+        "sources": [
+          { "kind": "json_path", "path": "$.review.state" },
+          { "kind": "const", "value": "comment" }
+        ]
+      },
+      "review_body": {
+        "kind": "coalesce",
+        "sources": [
+          { "kind": "json_path", "path": "$.review.body" },
+          { "kind": "json_path", "path": "$.comment.body" },
+          { "kind": "const", "value": "" }
+        ]
+      },
+      "owner": {
+        "kind": "json_path",
+        "path": "$.repository.owner.login"
+      },
+      "repo": {
+        "kind": "json_path",
+        "path": "$.repository.name"
+      },
+      "sender": {
+        "kind": "json_path",
+        "path": "$.sender.login"
+      }
+    }
+  },
+  "routing_packet": "domain:webhook-routing/sastquatch",
+  "default_project_dir": "/tmp/sastquatch-clone-quat"
+}

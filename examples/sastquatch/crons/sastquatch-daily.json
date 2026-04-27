@@ -1,0 +1,11 @@
+{
+  "name": "sastquatch-daily",
+  "schedule": "0 0 9 * * *",
+  "payload": {
+    "owner": "sastquatch-admin",
+    "repo": "quat"
+  },
+  "concurrency": 1,
+  "routing_packet": "domain:cron-routing/sastquatch",
+  "default_project_dir": "/tmp/sastquatch-clone-quat"
+}

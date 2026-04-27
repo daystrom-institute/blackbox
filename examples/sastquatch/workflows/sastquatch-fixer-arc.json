@@ -1,0 +1,131 @@
+{
+  "name": "sastquatch-fixer-arc",
+  "version": 1,
+  "vars_schema": {
+    "owner":         { "kind": "string", "required": true },
+    "repo":          { "kind": "string", "required": true },
+    "worktree_path": { "kind": "string", "required": true },
+    "branch":        { "kind": "string", "required": true },
+    "work_item_id":  { "kind": "string", "required": true },
+    "work_packet":   { "kind": "object", "required": true },
+    "sast_after_fix":{ "kind": "any" },
+    "all_open_prs":  { "kind": "array" },
+    "existing_pr":   { "kind": "any" },
+    "pr_data":       { "kind": "object" },
+    "pr_number":     { "kind": "int" }
+  },
+  "actors": {
+    "fixer": {
+      "kind": "executor",
+      "brofile": "sastquatch-fixer",
+      "durable": true,
+      "compaction_anchor": true,
+      "requires": []
+    }
+  },
+  "start": "ApplyFix",
+  "nodes": {
+    "ApplyFix": {
+      "actor": "fixer",
+      "prompt": "You are SASTquatch's fixer. Apply the fix described in the work packet to the worktree at ${vars.worktree_path} (branch ${vars.branch}). The work-item thread is ${vars.work_item_id} — emit a `done` note when you finish.\n\nWORK PACKET:\n  cluster_title : ${vars.work_packet.cluster_title}\n  dimension     : ${vars.work_packet.dimension}\n  target_files  : ${vars.work_packet.target_files}\n  finding_ids   : ${vars.work_packet.finding_ids}\n  finding_count : ${vars.work_packet.finding_count}\n  fix_brief     : ${vars.work_packet.fix_brief}\n\nRationale (from triager):\n${vars.work_packet.rationale}\n\nMake the smallest fix that addresses the cluster. Stage changes and commit with a message like 'sastquatch: <one-line>'. Run tests if cheap. Do NOT push, do NOT open the PR — those are mechanical steps the workflow owns.\n\nReturn ONE LINE — what you changed (no markdown).",
+      "on_exit": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "biofilter",
+            "tool": "sast_run",
+            "arguments": {},
+            "timeout_secs": 600
+          },
+          "into_var": "sast_after_fix",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "PushAndOpenPr" }
+    },
+    "PushAndOpenPr": {
+      "actor": "",
+      "prompt": "Mechanical: push the fixer's branch + open-or-reuse the PR.",
+      "on_enter": [
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["git", "push", "-u", "origin", "${vars.branch}"],
+            "cwd": "${vars.worktree_path}"
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "GET",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/pulls?state=open&limit=50",
+            "headers": {
+              "Authorization": "token ${env.FORGEJO_TOKEN}",
+              "Accept": "application/json"
+            }
+          },
+          "into_var": "all_open_prs",
+          "on_failure": "halt"
+        },
+        {
+          "op": "find_first",
+          "args": {
+            "from": "${vars.all_open_prs}",
+            "where": { "head.ref": "${vars.branch}" }
+          },
+          "into_var": "existing_pr",
+          "on_failure": "halt"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/pulls",
+            "headers": {
+              "Authorization": "token ${env.FORGEJO_TOKEN}",
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+            },
+            "body": {
+              "title": "sastquatch: ${vars.work_packet.cluster_title}",
+              "head": "${vars.branch}",
+              "base": "main",
+              "body": "Closes ${vars.work_packet.finding_count} finding(s) in dimension `${vars.work_packet.dimension}`.\n\n**Cluster:** ${vars.work_packet.cluster_title}\n**Rationale:** ${vars.work_packet.rationale}\n\n_work-item: ${vars.work_item_id}_"
+            },
+            "expect_status": [200, 201]
+          },
+          "into_var": "pr_data",
+          "when": "domain:hook-when/no-existing-pr",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "pr_data", "value": "${vars.existing_pr}" },
+          "when": "domain:hook-when/has-existing-pr",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "pr_number", "value": "${vars.pr_data.number}" }
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bbox_note",
+            "arguments": {
+              "kind": "done",
+              "body": "Fix applied + PR opened: ${vars.owner}/${vars.repo}#${vars.pr_number}",
+              "thread_id": "${vars.work_item_id}",
+              "project": "${vars.worktree_path}"
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

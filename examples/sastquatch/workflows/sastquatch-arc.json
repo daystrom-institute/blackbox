@@ -1,0 +1,151 @@
+{
+  "name": "sastquatch-arc",
+  "version": 1,
+  "vars_schema": {
+    "owner":            { "kind": "string", "required": true },
+    "repo":             { "kind": "string", "required": true },
+    "cron_name":        { "kind": "string" },
+    "tick_at":          { "kind": "string" },
+    "branch":           { "kind": "string" },
+    "worktree_path":    { "kind": "string" },
+    "work_item_id":     { "kind": "string" },
+    "work_packet":      { "kind": "object" },
+    "pr_number":        { "kind": "int" },
+    "feedback_text":    { "kind": "any" },
+    "review_iteration": { "kind": "int" },
+    "max_iterations":   { "kind": "int" }
+  },
+  "actors": {},
+  "policy_packet": "domain:workflow-policy/arc-budget",
+  "start": "Setup",
+  "on_arc_exit": [
+    {
+      "op": "worktree_remove",
+      "args": { "path": "${meta.worktree}", "force": true },
+      "when": "domain:workflow-cleanup/keep-on-fail",
+      "on_failure": "warn"
+    }
+  ],
+  "nodes": {
+    "Setup": {
+      "actor": "",
+      "prompt": "Setup — initialize counters + worktree for the SASTquatch arc.",
+      "on_enter": [
+        { "op": "set_var", "args": { "key": "review_iteration", "value": 0 } },
+        { "op": "set_var", "args": { "key": "max_iterations",   "value": 5 } },
+        { "op": "set_var", "args": { "key": "branch", "value": "sastquatch/${meta.arc_id}" } },
+        {
+          "op": "worktree_create",
+          "args": {
+            "path":   "/tmp/sastquatch-arcs/${meta.arc_id}",
+            "branch": "${vars.branch}",
+            "base":   "main"
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "worktree_path", "value": "${meta.worktree}" }
+        }
+      ],
+      "next": { "type": "goto", "to": "Analyze" }
+    },
+    "Analyze": {
+      "actor": "",
+      "subworkflow_ref": "sastquatch-analyzer-arc",
+      "imports": ["owner", "repo", "worktree_path", "branch"],
+      "exports": ["work_item_id", "work_packet"],
+      "next": { "type": "goto", "to": "Implement" }
+    },
+    "Implement": {
+      "actor": "",
+      "subworkflow_ref": "sastquatch-fixer-arc",
+      "imports": ["owner", "repo", "worktree_path", "branch", "work_item_id", "work_packet"],
+      "exports": ["pr_number"],
+      "next": { "type": "goto", "to": "AwaitReviewTrigger" }
+    },
+    "AwaitReviewTrigger": {
+      "actor": "",
+      "wait": {
+        "any_of": [
+          { "signal": "pr-ready",  "correlate": { "pr": { "kind": "json_path", "path": "vars.pr_number" } } },
+          { "signal": "pr-merged", "correlate": { "pr": { "kind": "json_path", "path": "vars.pr_number" } } }
+        ],
+        "timeout": "24h"
+      },
+      "gate": "domain:workflow-gate/merge-or-review",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "ready":  "Review",
+          "merged": "Done"
+        }
+      }
+    },
+    "Review": {
+      "actor": "",
+      "subworkflow_ref": "sastquatch-reviewer-arc",
+      "imports": ["owner", "repo", "pr_number", "work_item_id", "work_packet"],
+      "exports": ["feedback_posted"],
+      "next": { "type": "goto", "to": "AwaitFeedbackOrMerge" }
+    },
+    "AwaitFeedbackOrMerge": {
+      "actor": "",
+      "wait": {
+        "any_of": [
+          { "signal": "pr-feedback", "correlate": { "pr": { "kind": "json_path", "path": "vars.pr_number" } } },
+          { "signal": "pr-merged",   "correlate": { "pr": { "kind": "json_path", "path": "vars.pr_number" } } }
+        ],
+        "timeout": "7d"
+      },
+      "gate": "domain:workflow-gate/loop-or-exit",
+      "on_exit": [
+        {
+          "op": "set_var",
+          "args": { "key": "feedback_text", "value": "${last_signal.payload.review_body}" }
+        },
+        {
+          "op": "inc_var",
+          "args": { "key": "review_iteration" }
+        }
+      ],
+      "next": {
+        "type": "branch",
+        "cases": {
+          "feedback": "AddressFeedback",
+          "merged":   "Done"
+        },
+        "default": "Done"
+      }
+    },
+    "AddressFeedback": {
+      "actor": "",
+      "subworkflow_ref": "sastquatch-feedback-arc",
+      "imports": ["owner", "repo", "branch", "pr_number", "feedback_text", "worktree_path", "work_item_id"],
+      "exports": [],
+      "next": { "type": "goto", "to": "AwaitReviewTrigger" }
+    },
+    "Done": {
+      "actor": "",
+      "prompt": "Arc terminated.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bbox_thread",
+            "arguments": {
+              "action": "resolve",
+              "thread_id": "${vars.work_item_id}",
+              "resolution": "merged"
+            },
+            "timeout_secs": 60
+          },
+          "when": "domain:hook-when/has-work-item",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

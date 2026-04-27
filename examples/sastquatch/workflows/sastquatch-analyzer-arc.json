@@ -1,0 +1,122 @@
+{
+  "name": "sastquatch-analyzer-arc",
+  "version": 1,
+  "vars_schema": {
+    "owner":          { "kind": "string", "required": true },
+    "repo":           { "kind": "string", "required": true },
+    "worktree_path":  { "kind": "string", "required": true },
+    "branch":         { "kind": "string", "required": true },
+    "sast_run_result":{ "kind": "any" },
+    "sast_summary":   { "kind": "any" },
+    "sast_findings":  { "kind": "any" },
+    "thread_open":    { "kind": "any" },
+    "work_item_id":   { "kind": "string" },
+    "work_packet":    { "kind": "object" }
+  },
+  "actors": {
+    "triager": {
+      "kind": "triager",
+      "brofile": "sastquatch-triager",
+      "durable": false,
+      "requires": []
+    }
+  },
+  "start": "RunSast",
+  "nodes": {
+    "RunSast": {
+      "actor": "",
+      "prompt": "Mechanical: run all configured SAST tools in the seed worktree, ingest SARIF, fetch summary + findings via MCP.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "biofilter",
+            "tool": "sast_run",
+            "arguments": {},
+            "timeout_secs": 600
+          },
+          "into_var": "sast_run_result",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "biofilter",
+            "tool": "sast_summary",
+            "arguments": {},
+            "timeout_secs": 60
+          },
+          "into_var": "sast_summary",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "biofilter",
+            "tool": "sast_findings",
+            "arguments": { "limit": 100 },
+            "timeout_secs": 60
+          },
+          "into_var": "sast_findings",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "PickCluster" }
+    },
+    "PickCluster": {
+      "actor": "triager",
+      "prompt": "You are SASTquatch's triager. Look at the SAST data below and pick ONE cluster of findings to attack this run.\n\nA 'cluster' is a small set of findings (1–10) that share enough context to be fixed in a single PR — same rule, same module, related dimension, or all touching the same file. Prefer clusters that:\n  1. Have high payoff per fix (one edit closes many findings)\n  2. Don't require deep refactoring\n  3. Are in the soundness or resilience dimension when possible (real bugs > style)\n\nSAST SUMMARY:\n${vars.sast_summary}\n\nSAST FINDINGS (top 100):\n${vars.sast_findings}\n\nReturn STRICT JSON with no markdown, no prose, exactly this shape:\n{\n  \"cluster_title\": \"<terse title for the PR>\",\n  \"rationale\": \"<one paragraph: why this cluster, why now>\",\n  \"dimension\": \"soundness | efficiency | resilience | adoption\",\n  \"target_files\": [\"<path>\", ...],\n  \"finding_ids\": [\"<rule_id>\", ...],\n  \"finding_count\": <int>,\n  \"fix_brief\": \"<two or three sentences: what the fix should do, no code yet>\"\n}",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${PickCluster.output}" },
+          "into_var": "work_packet",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "OpenWorkItem" }
+    },
+    "OpenWorkItem": {
+      "actor": "",
+      "prompt": "Mechanical: open a bbox work-item thread for this cluster.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bbox_thread",
+            "arguments": {
+              "action": "open",
+              "topic": "SASTquatch: ${vars.work_packet.cluster_title}",
+              "kind": "work_item",
+              "project": "${vars.worktree_path}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "thread_open",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "work_item_id", "value": "${vars.thread_open.thread_id}" }
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bbox_note",
+            "arguments": {
+              "kind": "learned",
+              "body": "Cluster: ${vars.work_packet.cluster_title} (dim=${vars.work_packet.dimension}, n=${vars.work_packet.finding_count}). Rationale: ${vars.work_packet.rationale}",
+              "thread_id": "${vars.work_item_id}",
+              "project": "${vars.worktree_path}"
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}
