@@ -138,10 +138,12 @@ async fn stdio_call(
         .serve(transport)
         .await
         .with_context(|| format!("MCP handshake failed for stdio server '{resolved_cmd}'"))?;
-    let mut params = CallToolRequestParams::new(tool_name.to_string());
-    if !arguments.is_empty() {
-        params = params.with_arguments(arguments.into_iter().collect());
-    }
+    // Always send an arguments object — even empty. Some servers (e.g.
+    // biofilter's zod-validated schemas) require the field present;
+    // omitting it produces `Input validation` (-32602) errors at the
+    // server side. Empty-object is the right canonical form.
+    let params = CallToolRequestParams::new(tool_name.to_string())
+        .with_arguments(arguments.into_iter().collect());
     let resp = client
         .call_tool(params)
         .await
@@ -168,10 +170,12 @@ async fn http_call(
         .serve(transport)
         .await
         .with_context(|| format!("MCP handshake failed for http server '{url}'"))?;
-    let mut params = CallToolRequestParams::new(tool_name.to_string());
-    if !arguments.is_empty() {
-        params = params.with_arguments(arguments.into_iter().collect());
-    }
+    // Always send an arguments object — even empty. Some servers (e.g.
+    // biofilter's zod-validated schemas) require the field present;
+    // omitting it produces `Input validation` (-32602) errors at the
+    // server side. Empty-object is the right canonical form.
+    let params = CallToolRequestParams::new(tool_name.to_string())
+        .with_arguments(arguments.into_iter().collect());
     let resp = client
         .call_tool(params)
         .await

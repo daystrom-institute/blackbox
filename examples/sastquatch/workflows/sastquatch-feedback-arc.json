@@ -7,7 +7,6 @@
     "branch":        { "kind": "string", "required": true },
     "worktree_path": { "kind": "string", "required": true },
     "pr_number":     { "kind": "int",    "required": true },
-    "work_item_id":  { "kind": "string" },
     "feedback_text": { "kind": "string", "required": false },
     "sast_after_fix":{ "kind": "any" }
   },
@@ -24,7 +23,7 @@
   "nodes": {
     "AddressFeedback": {
       "actor": "fixer",
-      "prompt": "Reviewer feedback on PR #${vars.pr_number}:\n\n${vars.feedback_text}\n\nAddress the feedback in worktree ${vars.worktree_path} (branch ${vars.branch}). Edit, run tests if cheap, commit. The work-item thread is ${vars.work_item_id} — emit a `done` note when finished.\n\nDo NOT push — the workflow engine pushes mechanically once you return.\n\nReturn ONE LINE summarizing your changes.",
+      "prompt": "Reviewer feedback on PR #${vars.pr_number}:\n\n${vars.feedback_text}\n\nAddress the feedback in worktree ${vars.worktree_path} (branch ${vars.branch}). Edit, run tests if cheap, commit.\n\nDo NOT push — the workflow engine pushes mechanically once you return.\n\nReturn ONE LINE summarizing your changes.",
       "on_exit": [
         {
           "op": "mcp_call",

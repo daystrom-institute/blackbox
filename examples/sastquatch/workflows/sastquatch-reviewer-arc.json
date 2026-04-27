@@ -5,7 +5,6 @@
     "owner":         { "kind": "string", "required": true },
     "repo":          { "kind": "string", "required": true },
     "pr_number":     { "kind": "int",    "required": true },
-    "work_item_id":  { "kind": "string" },
     "work_packet":   { "kind": "object" },
     "pr_diff":       { "kind": "any" },
     "review_payload":{ "kind": "object" },
@@ -61,7 +60,7 @@
     },
     "PostReview": {
       "actor": "",
-      "prompt": "Mechanical: parse the aggregator's JSON, post the PR review, merge if approved, log to the work-item thread.",
+      "prompt": "Mechanical: parse the aggregator's JSON, post the PR review, merge if approved.",
       "on_enter": [
         {
           "op": "parse_json",
@@ -102,21 +101,6 @@
           },
           "when": "domain:hook-when/should-merge",
           "on_failure": "halt"
-        },
-        {
-          "op": "mcp_call",
-          "args": {
-            "server": "blackbox",
-            "tool": "bbox_note",
-            "arguments": {
-              "kind": "learned",
-              "body": "Review verdict ${vars.review_payload.action}: ${vars.review_payload.body}",
-              "thread_id": "${vars.work_item_id}"
-            },
-            "timeout_secs": 30
-          },
-          "when": "domain:hook-when/has-work-item",
-          "on_failure": "warn"
         },
         { "op": "set_var", "args": { "key": "feedback_posted", "value": true } }
       ],

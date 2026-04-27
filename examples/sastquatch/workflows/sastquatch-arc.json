@@ -8,7 +8,6 @@
     "tick_at":          { "kind": "string" },
     "branch":           { "kind": "string" },
     "worktree_path":    { "kind": "string" },
-    "work_item_id":     { "kind": "string" },
     "work_packet":      { "kind": "object" },
     "pr_number":        { "kind": "int" },
     "feedback_text":    { "kind": "any" },
@@ -54,13 +53,13 @@
       "actor": "",
       "subworkflow_ref": "sastquatch-analyzer-arc",
       "imports": ["owner", "repo", "worktree_path", "branch"],
-      "exports": ["work_item_id", "work_packet"],
+      "exports": ["work_packet"],
       "next": { "type": "goto", "to": "Implement" }
     },
     "Implement": {
       "actor": "",
       "subworkflow_ref": "sastquatch-fixer-arc",
-      "imports": ["owner", "repo", "worktree_path", "branch", "work_item_id", "work_packet"],
+      "imports": ["owner", "repo", "worktree_path", "branch", "work_packet"],
       "exports": ["pr_number"],
       "next": { "type": "goto", "to": "AwaitReviewTrigger" }
     },
@@ -85,7 +84,7 @@
     "Review": {
       "actor": "",
       "subworkflow_ref": "sastquatch-reviewer-arc",
-      "imports": ["owner", "repo", "pr_number", "work_item_id", "work_packet"],
+      "imports": ["owner", "repo", "pr_number", "work_packet"],
       "exports": ["feedback_posted"],
       "next": { "type": "goto", "to": "AwaitFeedbackOrMerge" }
     },
@@ -121,30 +120,13 @@
     "AddressFeedback": {
       "actor": "",
       "subworkflow_ref": "sastquatch-feedback-arc",
-      "imports": ["owner", "repo", "branch", "pr_number", "feedback_text", "worktree_path", "work_item_id"],
+      "imports": ["owner", "repo", "branch", "pr_number", "feedback_text", "worktree_path"],
       "exports": [],
       "next": { "type": "goto", "to": "AwaitReviewTrigger" }
     },
     "Done": {
       "actor": "",
       "prompt": "Arc terminated.",
-      "on_enter": [
-        {
-          "op": "mcp_call",
-          "args": {
-            "server": "blackbox",
-            "tool": "bbox_thread",
-            "arguments": {
-              "action": "resolve",
-              "thread_id": "${vars.work_item_id}",
-              "resolution": "merged"
-            },
-            "timeout_secs": 60
-          },
-          "when": "domain:hook-when/has-work-item",
-          "on_failure": "warn"
-        }
-      ],
       "next": { "type": "terminal" }
     }
   }

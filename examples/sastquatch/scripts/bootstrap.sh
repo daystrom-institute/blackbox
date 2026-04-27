@@ -255,7 +255,7 @@ RS
 {
   "tools": {
     "clippy": {
-      "run": "bash -c 'export PATH=\"$HOME/.cargo/bin:$PATH\"; set -o pipefail; cargo clippy --message-format=json --all-targets 2>/dev/null | clippy-sarif > daystrom/sast/clippy.sarif'",
+      "run": "bash -c 'export PATH=\"$HOME/.cargo/bin:$PATH\"; set -o pipefail; mkdir -p daystrom/sast; cargo clippy --message-format=json --all-targets 2>/dev/null | clippy-sarif > daystrom/sast/clippy.sarif'",
       "sarif": ["daystrom/sast/clippy.sarif"],
       "dimensions": {
         "clippy::unnecessary_sort_by": "efficiency",
@@ -267,7 +267,7 @@ RS
       "default_dimension": "adoption"
     },
     "cargo-audit": {
-      "run": "bash -c 'export PATH=\"$HOME/.cargo/bin:$PATH\"; cargo audit --json | python3 scripts/cargo-audit-to-sarif.py > daystrom/sast/cargo-audit.sarif'",
+      "run": "bash -c 'export PATH=\"$HOME/.cargo/bin:$PATH\"; mkdir -p daystrom/sast; cargo audit --json | python3 scripts/cargo-audit-to-sarif.py > daystrom/sast/cargo-audit.sarif'",
       "sarif": ["daystrom/sast/cargo-audit.sarif"],
       "dimensions": {
         "vulnerability": "resilience",

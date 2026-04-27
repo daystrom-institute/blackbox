@@ -9,8 +9,6 @@
     "sast_run_result":{ "kind": "any" },
     "sast_summary":   { "kind": "any" },
     "sast_findings":  { "kind": "any" },
-    "thread_open":    { "kind": "any" },
-    "work_item_id":   { "kind": "string" },
     "work_packet":    { "kind": "object" }
   },
   "actors": {
@@ -72,48 +70,6 @@
           "args": { "from": "${PickCluster.output}" },
           "into_var": "work_packet",
           "on_failure": "halt"
-        }
-      ],
-      "next": { "type": "goto", "to": "OpenWorkItem" }
-    },
-    "OpenWorkItem": {
-      "actor": "",
-      "prompt": "Mechanical: open a bbox work-item thread for this cluster.",
-      "on_enter": [
-        {
-          "op": "mcp_call",
-          "args": {
-            "server": "blackbox",
-            "tool": "bbox_thread",
-            "arguments": {
-              "action": "open",
-              "topic": "SASTquatch: ${vars.work_packet.cluster_title}",
-              "kind": "work_item",
-              "project": "${vars.worktree_path}"
-            },
-            "timeout_secs": 30
-          },
-          "into_var": "thread_open",
-          "on_failure": "halt"
-        },
-        {
-          "op": "set_var",
-          "args": { "key": "work_item_id", "value": "${vars.thread_open.thread_id}" }
-        },
-        {
-          "op": "mcp_call",
-          "args": {
-            "server": "blackbox",
-            "tool": "bbox_note",
-            "arguments": {
-              "kind": "learned",
-              "body": "Cluster: ${vars.work_packet.cluster_title} (dim=${vars.work_packet.dimension}, n=${vars.work_packet.finding_count}). Rationale: ${vars.work_packet.rationale}",
-              "thread_id": "${vars.work_item_id}",
-              "project": "${vars.worktree_path}"
-            },
-            "timeout_secs": 30
-          },
-          "on_failure": "warn"
         }
       ],
       "next": { "type": "terminal" }
