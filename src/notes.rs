@@ -77,6 +77,12 @@ pub struct NoteListParams {
     /// Include notes whose resolution is "addressed" (default: false)
     #[serde(default)]
     pub include_addressed: Option<bool>,
+    /// Render full note bodies. Default false → bodies are previewed at 200
+    /// chars with an ellipsis to keep the response under the MCP cap. Set
+    /// true when you need the complete body (e.g. structured `done` summaries
+    /// or multi-line `dispute` rationales).
+    #[serde(default)]
+    pub full: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -333,6 +339,7 @@ impl Notes {
             .map_err(|_| anyhow::anyhow!("Unknown resolution filter: {:?}", p.resolution))?;
 
         let include_addressed = p.include_addressed.unwrap_or(false);
+        let full = p.full.unwrap_or(false);
         let limit = p.limit.unwrap_or(50).max(1) as usize;
 
         let query_lower = p.query.as_deref().map(|s| s.to_lowercase());
@@ -406,14 +413,14 @@ impl Notes {
         let mut out = String::new();
         out.push_str(&format!("{} note(s)\n\n", results.len()));
         for n in &results {
-            let body_preview = if n.body.len() > 200 {
+            let body_preview = if full || n.body.len() <= 200 {
+                n.body.clone()
+            } else {
                 let mut end = 200;
                 while !n.body.is_char_boundary(end) {
                     end -= 1;
                 }
                 format!("{}…", &n.body[..end])
-            } else {
-                n.body.clone()
             };
             let ctx_bits = [
                 n.bro.as_deref().map(|b| format!("bro={b}")),
@@ -497,6 +504,7 @@ mod tests {
                 since: None,
                 limit: None,
                 include_addressed: None,
+                full: None,
             })
             .unwrap();
         assert!(out.contains("brief conflates schemas"));
@@ -586,6 +594,7 @@ mod tests {
                 since: None,
                 limit: None,
                 include_addressed: None,
+                full: None,
             })
             .unwrap();
         assert!(out.contains(&id));
@@ -611,6 +620,7 @@ mod tests {
                 since: None,
                 limit: None,
                 include_addressed: None,
+                full: None,
             })
             .unwrap();
         assert!(
@@ -631,6 +641,7 @@ mod tests {
                 since: None,
                 limit: None,
                 include_addressed: Some(true),
+                full: None,
             })
             .unwrap();
         assert!(out_all.contains(&id));
@@ -716,9 +727,66 @@ mod tests {
                 since: None,
                 limit: None,
                 include_addressed: None,
+                full: None,
             })
             .unwrap();
         assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn list_full_returns_untruncated_body() {
+        let (_tmp, mut notes) = mk_store();
+        let body = format!("{}END", "x".repeat(400));
+        notes
+            .create(&NoteParams {
+                kind: "done".into(),
+                body: body.clone(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+
+        let preview = notes
+            .list(&NoteListParams {
+                kind: None,
+                project: None,
+                session_id: None,
+                task_id: None,
+                thread_id: None,
+                bro: None,
+                resolution: None,
+                query: None,
+                since: None,
+                limit: None,
+                include_addressed: None,
+                full: None,
+            })
+            .unwrap();
+        assert!(preview.contains('…'));
+        assert!(!preview.contains("END"));
+
+        let full = notes
+            .list(&NoteListParams {
+                kind: None,
+                project: None,
+                session_id: None,
+                task_id: None,
+                thread_id: None,
+                bro: None,
+                resolution: None,
+                query: None,
+                since: None,
+                limit: None,
+                include_addressed: None,
+                full: Some(true),
+            })
+            .unwrap();
+        assert!(!full.contains('…'));
+        assert!(full.contains("END"));
     }
 
     #[test]

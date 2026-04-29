@@ -270,8 +270,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_notes",
         category: ToolCategory::Notes,
         summary: "List / filter notes by kind, project, session, thread, resolution.",
-        when_to_use: "Orchestrators reading what executors emitted this round, or auditing past dispatch for a work-item thread.",
-        example: Some(r#"bbox_notes(kind="assumption", thread_id="thread-abc")"#),
+        when_to_use: "Orchestrators reading what executors emitted this round, or auditing past dispatch for a work-item thread. Bodies are previewed at 200 chars by default; pass `full=true` to render complete bodies (useful for `done` summaries and structured `dispute` rationales).",
+        example: Some(r#"bbox_notes(kind="assumption", thread_id="thread-abc", full=true)"#),
     },
     ToolDoc {
         name: "bbox_note_resolve",
