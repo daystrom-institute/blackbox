@@ -123,7 +123,11 @@ impl CronRegistry {
 
     /// Number of arcs currently spawned by this cron. 0 if unknown.
     pub fn in_flight(&self, name: &str) -> u32 {
-        self.state.read().get(name).map(|s| s.in_flight).unwrap_or(0)
+        self.state
+            .read()
+            .get(name)
+            .map(|s| s.in_flight)
+            .unwrap_or(0)
     }
 
     pub fn track_handle(&self, name: &str, handle: JoinHandle<()>) {
@@ -156,10 +160,7 @@ pub fn load_all(dir: &std::path::Path) -> Vec<CronSpec> {
         if let Ok(bytes) = std::fs::read(&path) {
             match serde_json::from_slice::<CronSpec>(&bytes) {
                 Ok(spec) => out.push(spec),
-                Err(e) => tracing::warn!(
-                    "crons::load_all: bad spec at {}: {e}",
-                    path.display()
-                ),
+                Err(e) => tracing::warn!("crons::load_all: bad spec at {}: {e}", path.display()),
             }
         }
     }
@@ -193,10 +194,7 @@ fn build_entity(spec: &CronSpec) -> Value {
 /// shared routing pipeline. Returns Ok(true) if a tick fired (whether
 /// the arc spawned or skipped due to concurrency cap), Ok(false) if
 /// the routing packet returned no_match.
-pub async fn run_one_tick(
-    state: &Arc<crate::SharedState>,
-    spec: &CronSpec,
-) -> Result<bool> {
+pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &CronSpec) -> Result<bool> {
     // Concurrency check — claim a slot before dispatching, refund if
     // dispatch fails.
     if !state.crons.try_claim(&spec.name, spec.concurrency) {
@@ -287,10 +285,9 @@ pub fn spawn_loop(state: Arc<crate::SharedState>, spec: CronSpec) -> JoinHandle<
             tokio::time::sleep(wait).await;
             match run_one_tick(&state, &spec).await {
                 Ok(true) => tracing::debug!("cron '{}': tick fired", spec.name),
-                Ok(false) => tracing::debug!(
-                    "cron '{}': tick produced no_match or was capped",
-                    spec.name
-                ),
+                Ok(false) => {
+                    tracing::debug!("cron '{}': tick produced no_match or was capped", spec.name)
+                }
                 Err(e) => {
                     tracing::warn!("cron '{}': tick failed: {e}", spec.name)
                 }

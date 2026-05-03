@@ -24,9 +24,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content, RawContent};
-use rmcp::transport::{
-    ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess,
-};
+use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServiceExt;
 use serde_json::Value;
 use tokio::time::timeout;
@@ -96,8 +94,7 @@ async fn do_call(
         McpServerConfig::Stdio { command, args, env } => {
             stdio_call(command, args, env, tool_name, arguments, cwd).await
         }
-        McpServerConfig::Http { url, headers, .. }
-        | McpServerConfig::Sse { url, headers, .. } => {
+        McpServerConfig::Http { url, headers, .. } | McpServerConfig::Sse { url, headers, .. } => {
             http_call(url, headers, tool_name, arguments).await
         }
     }
@@ -126,8 +123,8 @@ async fn stdio_call(
     if let Some(dir) = cwd {
         command_builder.current_dir(expand_simple_env(dir));
     }
-    let transport = TokioChildProcess::new(command_builder.configure(|_| {}))
-        .with_context(|| {
+    let transport =
+        TokioChildProcess::new(command_builder.configure(|_| {})).with_context(|| {
             format!(
                 "spawning stdio MCP child '{} {}'",
                 resolved_cmd,
@@ -268,9 +265,7 @@ fn expand_simple_env(s: &str) -> String {
         {
             let name_start = i + 1;
             let mut j = name_start;
-            while j < bytes.len()
-                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
-            {
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                 j += 1;
             }
             let name = &s[name_start..j];

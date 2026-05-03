@@ -176,12 +176,13 @@ mod tests {
     #[test]
     fn default_uses_inner_when_present() {
         let s = Selector::Default {
-            inner: Box::new(Selector::JsonPath {
-                path: "$.x".into(),
-            }),
+            inner: Box::new(Selector::JsonPath { path: "$.x".into() }),
             fallback: json!("default"),
         };
-        assert_eq!(s.evaluate(&json!({"x": "actual"})).unwrap(), json!("actual"));
+        assert_eq!(
+            s.evaluate(&json!({"x": "actual"})).unwrap(),
+            json!("actual")
+        );
     }
 
     #[test]
@@ -214,19 +215,27 @@ mod tests {
     fn coalesce_picks_first_non_null() {
         let s = Selector::Coalesce {
             sources: vec![
-                Selector::JsonPath { path: "$.review.body".into() },
-                Selector::JsonPath { path: "$.comment.body".into() },
-                Selector::Const { value: json!("(no body)") },
+                Selector::JsonPath {
+                    path: "$.review.body".into(),
+                },
+                Selector::JsonPath {
+                    path: "$.comment.body".into(),
+                },
+                Selector::Const {
+                    value: json!("(no body)"),
+                },
             ],
         };
         // first source resolves -> wins
         assert_eq!(
-            s.evaluate(&json!({"review": {"body": "lgtm"}, "comment": {"body": "meh"}})).unwrap(),
+            s.evaluate(&json!({"review": {"body": "lgtm"}, "comment": {"body": "meh"}}))
+                .unwrap(),
             json!("lgtm")
         );
         // first source null -> second wins
         assert_eq!(
-            s.evaluate(&json!({"comment": {"body": "inline note"}})).unwrap(),
+            s.evaluate(&json!({"comment": {"body": "inline note"}}))
+                .unwrap(),
             json!("inline note")
         );
         // both null -> falls through to Const
@@ -266,9 +275,7 @@ mod tests {
                     Selector::JsonPath {
                         path: "$.repository.owner.login".into(),
                     },
-                    Selector::Const {
-                        value: json!("/"),
-                    },
+                    Selector::Const { value: json!("/") },
                     Selector::JsonPath {
                         path: "$.repository.name".into(),
                     },

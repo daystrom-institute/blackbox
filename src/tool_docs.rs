@@ -208,14 +208,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_render",
         category: ToolCategory::Knowledge,
         summary: "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md.",
-        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches host-wide memory files; `project` writes project-local files + PROJECT.md. Do not use render as a way to keep active-work guidance hot across turns — that is what `bbox_pin` is for. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches host-wide memory files; `project` writes project-local provider files that include PROJECT.md by reference. Do not use render as a way to keep active-work guidance hot across turns — that is what `bbox_pin` is for. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: Some(r#"bbox_render(scope="project", project="/repo/x")"#),
     },
     ToolDoc {
         name: "bbox_absorb",
         category: ToolCategory::Knowledge,
-        summary: "Import external edits to rendered files back as unverified entries.",
-        when_to_use: "Use when rendered memory files were edited manually and you want to import those edits back into the store for reconciliation. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        summary: "Compatibility no-op for the old rendered-file import path.",
+        when_to_use: "Rendered provider files are unidirectional projections now. Use `bbox_bootstrap` to import hand-authored instruction files before rendering. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: None,
     },
     ToolDoc {
@@ -296,21 +296,27 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Packets,
         summary: "Compile a rubric / judge / decision-function into a shareable packet. Reach here when you're writing a priority-ordered rubric, ranking proposals against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones. Symptom: you're about to paste the same rubric text into multiple sub-agent prompts — compile once and dispatch the packet_id instead. Rules are first-match-wins over a predicate AST; validate with bbox_audit before trusting. Packets compose via `Apply{packet_id, expect}` — extract `is_breaking` / `privileged_role` / etc. once, reuse across packets. Full workflow: sm-rule-packets via bbox_knowledge.",
         when_to_use: "Symptoms that mean \"compile a packet\": (1) you're coordinating multiple sub-agents and pasting the same rubric text into each prompt — compile once, dispatch `packet_id` instead, guarantees bit-identical standards; (2) you're ranking a batch of proposals/PRs/incidents against shared criteria; (3) you've got 10+ labeled examples and need a mechanism that generalizes to the 100+ unlabeled ones; (4) you're about to write Python/prose to implement a decision tree. First-match-wins so put anomalies before general rules. Always follow with `bbox_audit` to verify fidelity.",
-        example: Some(r#"bbox_compile(domain="pr-triage", classification_lattice=["fail","flag","manual","pass","info"], rules=[{"id":"fail_tests","classification":"fail","antecedent":{"op":"Eq","field":"tests_pass","value":false},"consequent":"REJECT"},{"id":"flag_api_change","classification":"flag","antecedent":{"op":"Eq","field":"api_surface_changed","value":true},"consequent":"FLAG"},{"id":"pass_default","classification":"pass","emit":"fallback","antecedent":{"op":"True"},"consequent":"ACCEPT"}])"#),
+        example: Some(
+            r#"bbox_compile(domain="pr-triage", classification_lattice=["fail","flag","manual","pass","info"], rules=[{"id":"fail_tests","classification":"fail","antecedent":{"op":"Eq","field":"tests_pass","value":false},"consequent":"REJECT"},{"id":"flag_api_change","classification":"flag","antecedent":{"op":"Eq","field":"api_surface_changed","value":true},"consequent":"FLAG"},{"id":"pass_default","classification":"pass","emit":"fallback","antecedent":{"op":"True"},"consequent":"ACCEPT"}])"#,
+        ),
     },
     ToolDoc {
         name: "bbox_apply",
         category: ToolCategory::Packets,
         summary: "Evaluate a packet against one entity — deterministic, no LLM. The receive-side of the packet workflow: a sub-agent that received packet_id from its orchestrator calls this to classify without reinterpreting the rubric. mode=\"first\" returns the first matching rule; mode=\"all\" returns every matching rule plus an aggregate verdict (for review / multi-finding shape). Cheap at arbitrary scale.",
         when_to_use: "The receive-side of the packet workflow. Use from a sub-agent that received `packet_id` from its orchestrator — no need to re-read or re-interpret the rubric, just evaluate. Also use yourself after compiling to spot-check on specific entities. If no rule matches, returns `{match: false}` rather than guessing — so missing catchalls surface immediately.",
-        example: Some(r#"bbox_apply(packet_id="packet-a1b2c3d4", entity={"tests_pass":true,"api_surface_changed":true,"migration_note_present":false}, mode="all")"#),
+        example: Some(
+            r#"bbox_apply(packet_id="packet-a1b2c3d4", entity={"tests_pass":true,"api_surface_changed":true,"migration_note_present":false}, mode="all")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_audit",
         category: ToolCategory::Packets,
         summary: "Run a packet against a {entity, expected}[] dataset; report fidelity + mismatching rule ids. The self-verify step: a packet with fidelity < 1.0 is lying about its training data. ALWAYS call this after bbox_compile against the observations you derived the rules from — catches over-generalization, rule-ordering bugs, and field-name typos.",
         when_to_use: "ALWAYS run this after `bbox_compile` against the observations you derived the rules from. Catches (a) rules that mis-generalized beyond the anomalies, (b) ordering bugs where a general rule shadows an anomaly, (c) typos in field names. Use `mode=\"all\"` when the packet is for multi-finding review and expected outputs are rule-id sets.",
-        example: Some(r#"bbox_audit(packet_id="packet-a1b2c3d4", dataset=[{"entity":{"tests_pass":false,...}, "expected":"REJECT"}, ...])"#),
+        example: Some(
+            r#"bbox_audit(packet_id="packet-a1b2c3d4", dataset=[{"entity":{"tests_pass":false,...}, "expected":"REJECT"}, ...])"#,
+        ),
     },
     ToolDoc {
         name: "bbox_packet_list",
@@ -331,7 +337,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Packets,
         summary: "Log a packet-authoring gap: 'I wanted to compile a rule but the AST couldn't express it'. Use when you fall back to prose, ad-hoc code, or a different tool because a primitive you needed isn't available. The `description` names what you wanted; `ast_feature_requested` names the primitive you wished existed (e.g. `RateCmp`, `StringMatches`, `Within{temporal}`). These gaps are the highest-signal input for prioritizing new AST primitives — every gap logged is a vote for what the packet system can't yet say. Query via bbox_packet_events(op='gap').",
         when_to_use: "Reach here when you've tried to compile a packet but the AST can't express part of what you need. Don't silently fall back to prose — logging the gap turns the blocker into a vote for a new primitive. Equally valid for partial-compile cases: compile the mechanizable part, log a gap for the rest.",
-        example: Some(r#"bbox_packet_gap(description="wanted regex matching on log messages; no StringContains-like primitive", ast_feature_requested="StringMatches")"#),
+        example: Some(
+            r#"bbox_packet_gap(description="wanted regex matching on log messages; no StringContains-like primitive", ast_feature_requested="StringMatches")"#,
+        ),
     },
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {
@@ -464,9 +472,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Workflows,
         summary: "Resolve a pending Wait by signal name + correlation tuple. Same dispatch path that the webhook router uses for `signal_arc` verdicts — surfaced as MCP so an operator can manually advance an arc that's blocked on an external event.",
         when_to_use: "Use to manually push an arc that's parked on a Wait node when the upstream event hasn't (or won't) arrive — e.g. testing, debugging, or rescuing an arc that missed its webhook. Empty `correlate` broadcasts to all matching waits.",
-        example: Some(
-            r#"bro_arc_signal(signal="pr-merged", correlate={"pr": 42})"#,
-        ),
+        example: Some(r#"bro_arc_signal(signal="pr-merged", correlate={"pr": 42})"#),
     },
     ToolDoc {
         name: "bro_arc_status",
@@ -565,9 +571,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Workflows,
         summary: "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced.",
         when_to_use: "Persist a workflow that webhooks or scheduled triggers will dispatch by name. Install alongside the routing packet that emits `start_arc` verdicts referencing this id.",
-        example: Some(
-            r#"bro_workflow_install(id="issue-to-pr", spec={...full Workflow JSON...})"#,
-        ),
+        example: Some(r#"bro_workflow_install(id="issue-to-pr", spec={...full Workflow JSON...})"#),
     },
     ToolDoc {
         name: "bro_workflow_list",
@@ -582,21 +586,27 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Whiteboards,
         summary: "Open a new whiteboard for structured deliberation. The board collects posts (blind phase), annotations (validate/debate phases), and votes (debate phase) from registered agents, advanced through phases by a facilitator-or-operator role. Returns when the board is created and the opener is registered as facilitator. Idempotent re-open against an existing id is rejected — use whiteboard_state to inspect.",
         when_to_use: "Use to start a deliberation. The opener becomes the facilitator. Pass `arc_thread_id` when the board belongs to a workflow arc — the engine threads it for inbox attribution. External clients (operator's Claude, dispatched help) can open ad-hoc boards by omitting `arc_thread_id`.",
-        example: Some(r#"whiteboard_open(board_id="adr-2026-04-27", topic="Adopt async runtime X?", opened_by="facilitator")"#),
+        example: Some(
+            r#"whiteboard_open(board_id="adr-2026-04-27", topic="Adopt async runtime X?", opened_by="facilitator")"#,
+        ),
     },
     ToolDoc {
         name: "whiteboard_register",
         category: ToolCategory::Whiteboards,
         summary: "Register an agent on an existing board. Idempotent — re-registration with the same name is a no-op. Roles: `specialist` (post + annotate + vote), `facilitator` (transition + post + annotate + vote), `operator` (same powers as facilitator; convention is for human / external Claude joiners).",
         when_to_use: "Use to join an open deliberation. Specialists can post in blind, annotate in validate / debate, and vote in debate. Facilitators / operators can additionally transition phases — the only role distinction that matters mechanically.",
-        example: Some(r#"whiteboard_register(board_id="adr-2026-04-27", agent_name="security", role="specialist", domain="threat-modeling")"#),
+        example: Some(
+            r#"whiteboard_register(board_id="adr-2026-04-27", agent_name="security", role="specialist", domain="threat-modeling")"#,
+        ),
     },
     ToolDoc {
         name: "whiteboard_post",
         category: ToolCategory::Whiteboards,
         summary: "Post a structured claim/proposal/concern to a whiteboard during its blind phase. Type one of: proposal, claim, concern, informational. Optional fields target_file / target_location / severity / finding_refs / cascade_targets enable conflict detection downstream.",
         when_to_use: "Use during the blind phase to record your stance. Other agents' posts are not visible to you in blind — that's the point. Once the board transitions to read, everyone sees everything. Severity + finding_refs let `whiteboard_conflicts` surface severity-disagreement conflicts later.",
-        example: Some(r#"whiteboard_post(board_id="adr-2026-04-27", agent_name="security", type="concern", title="Async runtime increases attack surface", body="...", severity="medium")"#),
+        example: Some(
+            r#"whiteboard_post(board_id="adr-2026-04-27", agent_name="security", type="concern", title="Async runtime increases attack surface", body="...", severity="medium")"#,
+        ),
     },
     ToolDoc {
         name: "whiteboard_state",
@@ -610,35 +620,45 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Whiteboards,
         summary: "Annotate a post during the validate or debate phase. Validate phase accepts only `validation` (with required `result`: confirmed / refuted / inconclusive). Debate phase accepts `challenge`, `corroborate`, or `resolve` (resolve must reference a challenge id via `resolves`).",
         when_to_use: "Use to react to other specialists' posts. You can't annotate your own post. `challenge` says you disagree (typically with reasoning), `corroborate` adds supporting evidence, `resolve` closes a challenge with a position. The challenge → resolve graph is what `ready_for_transition` checks in debate phase.",
-        example: Some(r#"whiteboard_annotate(board_id="adr-2026-04-27", agent_name="perf", post_id="post-001", type="challenge", body="missing runtime cost analysis under load")"#),
+        example: Some(
+            r#"whiteboard_annotate(board_id="adr-2026-04-27", agent_name="perf", post_id="post-001", type="challenge", body="missing runtime cost analysis under load")"#,
+        ),
     },
     ToolDoc {
         name: "whiteboard_vote",
         category: ToolCategory::Whiteboards,
         summary: "Cast an advisory vote on a post during the debate phase. One vote per agent per post — re-vote replaces. Vote: accept, reject, or defer.",
         when_to_use: "Use to record your position on each post during debate. Tallies are exposed via `whiteboard_summarize` and via the `board.vote_tally.<post_id>` template scope inside workflows. Gate packets in workflows can branch on tally shape (e.g. supermajority accept → merge).",
-        example: Some(r#"whiteboard_vote(board_id="adr-2026-04-27", agent_name="design", post_id="post-001", vote="accept", reason="aligns with the durable-state principle")"#),
+        example: Some(
+            r#"whiteboard_vote(board_id="adr-2026-04-27", agent_name="design", post_id="post-001", vote="accept", reason="aligns with the durable-state principle")"#,
+        ),
     },
     ToolDoc {
         name: "whiteboard_transition",
         category: ToolCategory::Whiteboards,
         summary: "Advance the board to a new phase. Facilitator or operator role required. Sequence: blind → read → validate → debate → resolve → archived; read → debate is a legal skip. Transition emits a `board-transitioned` signal correlated to (board_id, target_phase) so any wait node observing the board resumes.",
         when_to_use: "Use to advance the deliberation when ready. Check `whiteboard_state.ready_for_transition` first as an advisory. Workflows can define a wait-on-phase node that resumes when the transition fires — this is how the engine drives multi-phase arcs through the board.",
-        example: Some(r#"whiteboard_transition(board_id="adr-2026-04-27", agent_name="facilitator", target_phase="debate", summary="all specialists posted; advancing")"#),
+        example: Some(
+            r#"whiteboard_transition(board_id="adr-2026-04-27", agent_name="facilitator", target_phase="debate", summary="all specialists posted; advancing")"#,
+        ),
     },
     ToolDoc {
         name: "whiteboard_conflicts",
         category: ToolCategory::Whiteboards,
         summary: "Auto-detect conflicts between posts on a board. Returns three kinds: `direct_overlap` (same target_file + identical target_location), `cascade_collision` (post A cascades to post B's direct target), `severity_disagreement` (same finding_ref, distinct severities). Available in any phase past blind.",
         when_to_use: "Use during read / validate / debate to surface what specialists disagree on or where their proposed actions collide. The facilitator typically reviews this before transitioning to debate so contested points get explicit annotations.",
-        example: Some(r#"whiteboard_conflicts(board_id="adr-2026-04-27", agent_name="facilitator")"#),
+        example: Some(
+            r#"whiteboard_conflicts(board_id="adr-2026-04-27", agent_name="facilitator")"#,
+        ),
     },
     ToolDoc {
         name: "whiteboard_summarize",
         category: ToolCategory::Whiteboards,
         summary: "Condensed board summary without full post bodies. Returns counts per type, vote tally per post, conflict count, unresolved-challenge count, agent status (has_posted), phase age, ready_for_transition advisory.",
         when_to_use: "Use for a quick read of board state without paying the full post-body cost. Good for inbox views, gate-packet entity inputs, and long-running observers (e.g. a polling external Claude).",
-        example: Some(r#"whiteboard_summarize(board_id="adr-2026-04-27", agent_name="facilitator")"#),
+        example: Some(
+            r#"whiteboard_summarize(board_id="adr-2026-04-27", agent_name="facilitator")"#,
+        ),
     },
     ToolDoc {
         name: "whiteboard_archive",
@@ -960,10 +980,7 @@ mod tests {
             let name = extract_string_arg(body, "name");
             let desc = extract_string_arg(body, "description");
             if let (Some(n), Some(d)) = (name, desc) {
-                if n.starts_with("bbox_")
-                    || n.starts_with("bro_")
-                    || n.starts_with("whiteboard_")
-                {
+                if n.starts_with("bbox_") || n.starts_with("bro_") || n.starts_with("whiteboard_") {
                     out.push((n, d));
                 }
             }

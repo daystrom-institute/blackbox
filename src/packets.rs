@@ -799,11 +799,7 @@ fn validate_path(path: &str, context: &str) -> Result<()> {
     // `outputs.Plan.findings[*]`) since the ArcContext flatten emits
     // structured entities. Each segment must be non-empty.
     if inner.split('.').any(|seg| seg.is_empty()) {
-        anyhow::bail!(
-            "{}: dotted path '{}' has an empty segment",
-            context,
-            path
-        );
+        anyhow::bail!("{}: dotted path '{}' has an empty segment", context, path);
     }
     if inner.contains('[') || inner.contains(']') {
         anyhow::bail!(
@@ -1541,9 +1537,7 @@ fn eval_predicate(
             match builder.build() {
                 Ok(re) => re.is_match(&s),
                 Err(e) => {
-                    tracing::warn!(
-                        "StringMatches: invalid regex pattern {pattern:?}: {e}"
-                    );
+                    tracing::warn!("StringMatches: invalid regex pattern {pattern:?}: {e}");
                     false
                 }
             }

@@ -129,12 +129,7 @@ impl ArcContext {
 
     /// Validate-and-write a single var. Returns Err if a schema is
     /// provided and the value's kind doesn't match the schema entry.
-    pub fn set_var(
-        &mut self,
-        key: &str,
-        value: Value,
-        schema: Option<&VarsSchema>,
-    ) -> Result<()> {
+    pub fn set_var(&mut self, key: &str, value: Value, schema: Option<&VarsSchema>) -> Result<()> {
         if let Some(s) = schema {
             if let Some(entry) = s.get(key) {
                 if !entry.kind.matches(&value) {
@@ -170,12 +165,7 @@ impl ArcContext {
         schema
             .iter()
             .filter(|(_, e)| e.required)
-            .filter(|(k, _)| {
-                !self
-                    .vars
-                    .get(*k)
-                    .is_some_and(|v| !matches!(v, Value::Null))
-            })
+            .filter(|(k, _)| !self.vars.get(*k).is_some_and(|v| !matches!(v, Value::Null)))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -329,9 +319,7 @@ impl ArcContext {
                 std::env::var(parts[1]).ok().map(Value::String)
             }
             // Legacy ${NodeName.output} → outputs.NodeName
-            other if parts.len() == 2 && parts[1] == "output" => {
-                self.outputs.get(other).cloned()
-            }
+            other if parts.len() == 2 && parts[1] == "output" => self.outputs.get(other).cloned(),
             _ => None,
         }
     }
@@ -446,25 +434,19 @@ mod tests {
             parent_arc_id: None,
             composition_depth: 0,
         });
-        c.vars
-            .insert("issue".into(), json!(42));
-        c.vars
-            .insert("repo".into(), json!("foo/bar"));
-        c.vars.insert(
-            "labels".into(),
-            json!(["bug", "urgent"]),
-        );
+        c.vars.insert("issue".into(), json!(42));
+        c.vars.insert("repo".into(), json!("foo/bar"));
+        c.vars.insert("labels".into(), json!(["bug", "urgent"]));
         c.outputs.insert(
             "Plan".into(),
             json!({"branch_name": "fix/issue-42", "summary": "do the thing"}),
         );
-        c.outputs.insert("Implement".into(), json!("PR #117 opened"));
+        c.outputs
+            .insert("Implement".into(), json!("PR #117 opened"));
         c.last_signal = Some(SignalRef {
             name: "pr-merged".into(),
             payload: json!({"pr": 117, "merged_by": "alice"}),
-            correlation: serde_json::Map::from_iter(
-                [("pr".to_string(), json!(117))].into_iter(),
-            ),
+            correlation: serde_json::Map::from_iter([("pr".to_string(), json!(117))].into_iter()),
             received_at: "2026-04-26T00:01:00Z".into(),
         });
         c
@@ -523,10 +505,7 @@ mod tests {
         let rendered = c.render_template(
             "Issue ${vars.issue} in ${vars.repo}: branch=${outputs.Plan.branch_name}",
         );
-        assert_eq!(
-            rendered,
-            "Issue 42 in foo/bar: branch=fix/issue-42"
-        );
+        assert_eq!(rendered, "Issue 42 in foo/bar: branch=fix/issue-42");
     }
 
     #[test]
@@ -571,10 +550,7 @@ mod tests {
         std::env::set_var("CTX_TEST_BASE", "http://host:3000");
         let raw = json!("${env.CTX_TEST_BASE}/repos/${vars.repo}/issues/${vars.issue}");
         let resolved = resolve_arg_value(&c, &raw).unwrap();
-        assert_eq!(
-            resolved,
-            json!("http://host:3000/repos/foo/bar/issues/42")
-        );
+        assert_eq!(resolved, json!("http://host:3000/repos/foo/bar/issues/42"));
     }
 
     #[test]
@@ -632,11 +608,8 @@ mod tests {
         let v = resolve_arg_value(&c, &json!("issue-${vars.issue}")).unwrap();
         assert_eq!(v, json!("issue-42"));
         // Nested object resolves recursively.
-        let v = resolve_arg_value(
-            &c,
-            &json!({"branch": "${vars.repo}", "n": "${vars.issue}"}),
-        )
-        .unwrap();
+        let v = resolve_arg_value(&c, &json!({"branch": "${vars.repo}", "n": "${vars.issue}"}))
+            .unwrap();
         assert_eq!(v, json!({"branch": "foo/bar", "n": 42}));
     }
 

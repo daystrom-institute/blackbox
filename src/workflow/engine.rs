@@ -86,14 +86,7 @@ pub async fn run_workflow(
     project_dir: Option<String>,
     max_steps: Option<usize>,
 ) -> WorkflowRunResult {
-    run_workflow_with_initial_vars(
-        server,
-        compiled,
-        project_dir,
-        max_steps,
-        Map::new(),
-    )
-    .await
+    run_workflow_with_initial_vars(server, compiled, project_dir, max_steps, Map::new()).await
 }
 
 /// Variant of [`run_workflow`] that seeds initial vars into the
@@ -151,15 +144,12 @@ pub async fn run_workflow_streaming_with_vars(
     initial_vars: Map<String, Value>,
     event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
 ) -> WorkflowRunResult {
-    let mut runner = WorkflowRunner::new(
-        server,
-        compiled,
-        project_dir,
-        max_steps.unwrap_or(50),
-        0,
-    );
+    let mut runner = WorkflowRunner::new(server, compiled, project_dir, max_steps.unwrap_or(50), 0);
     runner.event_sink = Some(event_sink);
-    if let Err(e) = runner.ctx.seed_vars(initial_vars, compiled.spec.vars_schema.as_ref()) {
+    if let Err(e) = runner
+        .ctx
+        .seed_vars(initial_vars, compiled.spec.vars_schema.as_ref())
+    {
         return WorkflowRunResult {
             status: format!("error: initial_vars seed failed: {e}"),
             events: vec![json!({
@@ -587,9 +577,7 @@ impl<'a> WorkflowRunner<'a> {
                         );
                         match hook.on_failure {
                             OnFailure::Halt => {
-                                bail!(
-                                    "hook {lifecycle}#{idx} {op_kind} gate '{packet_id}': {e}"
-                                );
+                                bail!("hook {lifecycle}#{idx} {op_kind} gate '{packet_id}': {e}");
                             }
                             OnFailure::Warn => {
                                 self.arc_note(
@@ -686,8 +674,7 @@ impl<'a> WorkflowRunner<'a> {
                     "arc_cancel_hook_error",
                     json!({"error": e.to_string(), "rewrites_outcome": true}),
                 );
-                self.ctx.meta.arc_outcome =
-                    Some(format!("failed: arc_cancel hook halted: {e}"));
+                self.ctx.meta.arc_outcome = Some(format!("failed: arc_cancel hook halted: {e}"));
             }
         }
         if !self.compiled.spec.on_arc_exit.is_empty() {
@@ -707,8 +694,7 @@ impl<'a> WorkflowRunner<'a> {
                     .as_deref()
                     .is_some_and(|o| o.starts_with("failed"))
                 {
-                    self.ctx.meta.arc_outcome =
-                        Some(format!("failed: arc_exit hook halted: {e}"));
+                    self.ctx.meta.arc_outcome = Some(format!("failed: arc_exit hook halted: {e}"));
                 }
             }
         }
@@ -1862,13 +1848,14 @@ impl<'a> WorkflowRunner<'a> {
         for k in &spec.exports {
             match sub_result.vars.get(k) {
                 Some(v) => {
-                    if let Err(e) = self.ctx.set_var(
-                        k,
-                        v.clone(),
-                        self.compiled.spec.vars_schema.as_ref(),
-                    ) {
-                        bail!("subworkflow '{}' export '{k}' parent-write rejected: {e}",
-                            compiled.spec.name);
+                    if let Err(e) =
+                        self.ctx
+                            .set_var(k, v.clone(), self.compiled.spec.vars_schema.as_ref())
+                    {
+                        bail!(
+                            "subworkflow '{}' export '{k}' parent-write rejected: {e}",
+                            compiled.spec.name
+                        );
                     }
                     self.log_event(
                         "subworkflow_export",
@@ -1916,11 +1903,7 @@ impl<'a> WorkflowRunner<'a> {
         self.ctx.render_template(template)
     }
 
-    async fn run_node_exit_hooks(
-        &mut self,
-        hooks: &[HookOp],
-        node_id: &str,
-    ) -> Result<()> {
+    async fn run_node_exit_hooks(&mut self, hooks: &[HookOp], node_id: &str) -> Result<()> {
         if hooks.is_empty() {
             return Ok(());
         }
@@ -1934,11 +1917,7 @@ impl<'a> WorkflowRunner<'a> {
     /// receive the output string for backward compatibility; the
     /// flattened entity is added under `node_output_json` and via
     /// the gate-entity helpers in `apply_workflow_gate_*`.
-    async fn apply_node_gate(
-        &mut self,
-        node_id: &str,
-        spec: &super::schema::NodeSpec,
-    ) {
+    async fn apply_node_gate(&mut self, node_id: &str, spec: &super::schema::NodeSpec) {
         let Some(packet_id) = spec.gate.as_deref() else {
             return;
         };
@@ -2147,10 +2126,7 @@ impl<'a> WorkflowRunner<'a> {
                 }),
             );
             self.ctx.record_signal(sig.clone());
-            self.record_output(
-                node_id,
-                serde_json::to_string(&sig).unwrap_or_default(),
-            );
+            self.record_output(node_id, serde_json::to_string(&sig).unwrap_or_default());
             self.arc_note(
                 "surprise",
                 &format!("Wait '{node_id}' timed out after {:?}", timeout),
@@ -2170,10 +2146,7 @@ impl<'a> WorkflowRunner<'a> {
                 "correlation": sig.correlation,
             }),
         );
-        self.record_output(
-            node_id,
-            serde_json::to_string(&sig).unwrap_or_default(),
-        );
+        self.record_output(node_id, serde_json::to_string(&sig).unwrap_or_default());
         self.ctx.record_signal(sig.clone());
         self.arc_note(
             "done",
@@ -2210,15 +2183,7 @@ impl<'a> WorkflowRunner<'a> {
 fn is_allow_verdict(verdict: &str) -> bool {
     matches!(
         verdict,
-        "allow"
-            | "pass"
-            | "proceed"
-            | "fire"
-            | "ok"
-            | "delete"
-            | "keep"
-            | "yes"
-            | "true"
+        "allow" | "pass" | "proceed" | "fire" | "ok" | "delete" | "keep" | "yes" | "true"
     )
 }
 
@@ -2367,9 +2332,10 @@ mod tests {
                 NodeTransition::Goto { to } => Ok(to.clone()),
                 NodeTransition::Fork { continue_to, .. } => Ok(continue_to.clone()),
                 NodeTransition::Branch { cases, default, .. } => {
-                    let verdict = self.last_verdict.as_deref().ok_or_else(|| {
-                        anyhow!("branch '{current}' has no prior gate verdict")
-                    })?;
+                    let verdict = self
+                        .last_verdict
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("branch '{current}' has no prior gate verdict"))?;
                     if let Some(t) = cases.get(verdict) {
                         return Ok(t.clone());
                     }

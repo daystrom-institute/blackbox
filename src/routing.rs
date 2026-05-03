@@ -325,7 +325,9 @@ mod tests {
         // instead of being stringified by `render_string`. This pins the
         // bug fix for the keystone webhook → wait correlation path.
         let entity = json!({"pr_number": 19});
-        let raw = json!(r#"{"route":"signal_arc","signal":"pr-ready","correlate":{"pr":"${entity.pr_number}"}}"#);
+        let raw = json!(
+            r#"{"route":"signal_arc","signal":"pr-ready","correlate":{"pr":"${entity.pr_number}"}}"#
+        );
         let resolved = resolve_entity_template(&entity, &raw);
         // Result is still a JSON-encoded string (caller's parse step
         // re-decodes it), but the embedded `pr` value is a JSON number,
@@ -370,7 +372,9 @@ mod tests {
 
     #[test]
     fn parse_then_resolve_yields_typed_correlation() {
-        let consequent = json!(r#"{"route":"signal_arc","signal":"pr-ready","correlate":{"pr":"${entity.pr_number}"}}"#);
+        let consequent = json!(
+            r#"{"route":"signal_arc","signal":"pr-ready","correlate":{"pr":"${entity.pr_number}"}}"#
+        );
         let entity = json!({"pr_number": 117});
         // Step 1: parse the static shape.
         let verdict = RoutingVerdict::parse(&consequent).unwrap();
@@ -381,9 +385,9 @@ mod tests {
         let resolved = resolve_entity_template(&entity, &serialized);
         let final_verdict = RoutingVerdict::parse(&resolved).unwrap();
         match final_verdict {
-            RoutingVerdict::SignalArc {
-                correlate, ..
-            } => assert_eq!(correlate.get("pr"), Some(&json!(117))),
+            RoutingVerdict::SignalArc { correlate, .. } => {
+                assert_eq!(correlate.get("pr"), Some(&json!(117)))
+            }
             _ => panic!("expected SignalArc"),
         }
     }

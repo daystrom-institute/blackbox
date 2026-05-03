@@ -158,10 +158,7 @@ pub fn load_all(dir: &std::path::Path) -> Vec<PollerSpec> {
         if let Ok(bytes) = std::fs::read(&path) {
             match serde_json::from_slice::<PollerSpec>(&bytes) {
                 Ok(spec) => out.push(spec),
-                Err(e) => tracing::warn!(
-                    "pollers::load_all: bad spec at {}: {e}",
-                    path.display()
-                ),
+                Err(e) => tracing::warn!("pollers::load_all: bad spec at {}: {e}", path.display()),
             }
         }
     }
@@ -172,10 +169,7 @@ pub fn load_all(dir: &std::path::Path) -> Vec<PollerSpec> {
 /// extract → dedup → dispatch via the shared routing pipeline.
 /// Errors per-item are logged but do NOT abort the loop — a transient
 /// upstream failure shouldn't kill a long-lived poller.
-pub async fn run_one_tick(
-    state: &Arc<crate::SharedState>,
-    spec: &PollerSpec,
-) -> Result<usize> {
+pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &PollerSpec) -> Result<usize> {
     // Resolve `${env.X}` references in the source URL + headers
     // per-tick so secrets stay in the daemon's env (not persisted
     // on disk in the spec) and operators can rotate tokens without
@@ -224,10 +218,7 @@ pub async fn run_one_tick(
             .as_ref()
             .and_then(|sel| sel.evaluate(&item).ok())
             .and_then(|v| value_to_dedup_string(&v));
-        if !state
-            .pollers
-            .check_dedup(&spec.name, dedup_id.as_deref())
-        {
+        if !state.pollers.check_dedup(&spec.name, dedup_id.as_deref()) {
             tracing::debug!(
                 "poller '{}': dedup_id {:?} already seen, skipping",
                 spec.name,
@@ -278,11 +269,7 @@ pub fn spawn_loop(state: Arc<crate::SharedState>, spec: PollerSpec) -> JoinHandl
         loop {
             interval.tick().await;
             match run_one_tick(&state, &spec).await {
-                Ok(n) => tracing::info!(
-                    "poller '{}': tick dispatched {} item(s)",
-                    spec.name,
-                    n
-                ),
+                Ok(n) => tracing::info!("poller '{}': tick dispatched {} item(s)", spec.name, n),
                 Err(e) => {
                     tracing::warn!("poller '{}': tick failed: {e}", spec.name)
                 }

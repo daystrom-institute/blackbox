@@ -451,10 +451,12 @@ pub struct BoardView {
 }
 
 pub fn filter_for_agent(board: &Board, agent_name: &str) -> Result<BoardView> {
-    let agent = board
-        .agents
-        .get(agent_name)
-        .ok_or_else(|| anyhow!("agent '{agent_name}' is not registered on board '{}'", board.id))?;
+    let agent = board.agents.get(agent_name).ok_or_else(|| {
+        anyhow!(
+            "agent '{agent_name}' is not registered on board '{}'",
+            board.id
+        )
+    })?;
 
     let phase_started = board
         .phase_history
@@ -501,20 +503,20 @@ pub fn filter_for_agent(board: &Board, agent_name: &str) -> Result<BoardView> {
         }
     };
 
-    let votes: Vec<Vote> =
-        if board.phase == Phase::Resolve || matches!(agent.role, Role::Facilitator | Role::Operator)
-        {
-            board.votes.clone()
-        } else if board.phase == Phase::Debate {
-            board
-                .votes
-                .iter()
-                .filter(|v| v.agent == agent_name)
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let votes: Vec<Vote> = if board.phase == Phase::Resolve
+        || matches!(agent.role, Role::Facilitator | Role::Operator)
+    {
+        board.votes.clone()
+    } else if board.phase == Phase::Debate {
+        board
+            .votes
+            .iter()
+            .filter(|v| v.agent == agent_name)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let warning = if phase_age_secs > 5 * 60 {
         Some(format!(
@@ -585,14 +587,11 @@ impl WhiteboardRegistry {
                     match serde_json::from_slice::<Board>(&bytes) {
                         Ok(board) => {
                             let id = board.id.clone();
-                            self.boards
-                                .write()
-                                .insert(id, Arc::new(RwLock::new(board)));
+                            self.boards.write().insert(id, Arc::new(RwLock::new(board)));
                         }
-                        Err(e) => tracing::warn!(
-                            "whiteboards: bad spec at {}: {e}",
-                            path.display()
-                        ),
+                        Err(e) => {
+                            tracing::warn!("whiteboards: bad spec at {}: {e}", path.display())
+                        }
                     }
                 }
             }
@@ -615,8 +614,7 @@ impl WhiteboardRegistry {
         let body = serde_json::to_string_pretty(board)
             .map_err(|e| anyhow!("serialize board {id}: {e}"))?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)
-            .map_err(|e| anyhow!("write {}: {e}", tmp.display()))?;
+        std::fs::write(&tmp, body).map_err(|e| anyhow!("write {}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
             .map_err(|e| anyhow!("rename {} → {}: {e}", tmp.display(), path.display()))?;
         Ok(())
@@ -668,13 +666,7 @@ impl WhiteboardRegistry {
         Ok(())
     }
 
-    pub fn register(
-        &self,
-        id: &str,
-        agent_name: &str,
-        role: Role,
-        domain: &str,
-    ) -> Result<()> {
+    pub fn register(&self, id: &str, agent_name: &str, role: Role, domain: &str) -> Result<()> {
         let board_arc = self
             .boards
             .read()
@@ -1107,7 +1099,8 @@ mod tests {
         let r = fresh_registry();
         r.open("b1", "topic", "/proj", None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
-        r.register("b1", "bob", Role::Specialist, "security").unwrap();
+        r.register("b1", "bob", Role::Specialist, "security")
+            .unwrap();
         r.post(
             "b1",
             "bob",
@@ -1145,7 +1138,8 @@ mod tests {
         let r = fresh_registry();
         r.open("b1", "topic", "/proj", None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
-        r.register("b1", "bob", Role::Specialist, "security").unwrap();
+        r.register("b1", "bob", Role::Specialist, "security")
+            .unwrap();
         // Specialist cannot transition.
         let err = r.transition("b1", "bob", Phase::Read, None).unwrap_err();
         assert!(err.to_string().contains("only facilitator"));
@@ -1164,7 +1158,8 @@ mod tests {
         let r = fresh_registry();
         r.open("b1", "topic", "/proj", None, "alice").unwrap();
         r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
-        r.register("b1", "s1", Role::Specialist, "security").unwrap();
+        r.register("b1", "s1", Role::Specialist, "security")
+            .unwrap();
         r.register("b1", "s2", Role::Specialist, "perf").unwrap();
         let arc = r.get("b1").unwrap();
         assert!(!arc.read().ready_for_transition(0));

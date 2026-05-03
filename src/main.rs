@@ -408,8 +408,7 @@ impl BlackboxServer {
             // record_task_to_bro set. Two team members sharing a
             // brofile (the common keystone-reviewers shape) would
             // otherwise be indistinguishable in `bro tail`.
-            task.inner.lock().bro_label =
-                Some(format!("{team_name}::{member_name}"));
+            task.inner.lock().bro_label = Some(format!("{team_name}::{member_name}"));
             launched.push((member_name.clone(), task));
         }
         Ok(launched)
@@ -874,7 +873,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_absorb",
-        description = "Import external edits to rendered files back as unverified entries."
+        description = "Compatibility no-op for the old rendered-file import path."
     )]
     fn bbox_absorb(&self, Parameters(p): Parameters<AbsorbParams>) -> CallToolResult {
         Self::run("bbox_absorb", || self.state.kb.write().absorb(&p))
@@ -3041,9 +3040,10 @@ Constraints:\n\
         let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
         match actor.kind {
             workflow::schema::ActorKind::Executor => {
-                let brofile_name = actor.brofile.as_deref().ok_or_else(|| {
-                    format!("actor (kind={:?}) missing brofile", actor.kind)
-                })?;
+                let brofile_name = actor
+                    .brofile
+                    .as_deref()
+                    .ok_or_else(|| format!("actor (kind={:?}) missing brofile", actor.kind))?;
                 let bf = orchestration::brofile::resolve_brofile(
                     brofile_name,
                     &self.state.store_dir,
@@ -3082,16 +3082,12 @@ Constraints:\n\
         name = "bro_arc_signal",
         description = "Resolve a pending Wait by signal name + correlation tuple. Same dispatch path that the webhook router uses for `signal_arc` verdicts — surfaced as MCP so an operator can manually advance an arc that's blocked on an external event."
     )]
-    async fn bro_arc_signal(
-        &self,
-        Parameters(p): Parameters<ArcSignalParams>,
-    ) -> CallToolResult {
+    async fn bro_arc_signal(&self, Parameters(p): Parameters<ArcSignalParams>) -> CallToolResult {
         let correlation = p.correlate.unwrap_or_default();
         let payload = p
             .payload
             .unwrap_or_else(|| Value::Object(correlation.clone()));
-        let result =
-            signal_arc_dispatch(&self.state, &p.signal, correlation, payload).await;
+        let result = signal_arc_dispatch(&self.state, &p.signal, correlation, payload).await;
         Self::ok_json(&result)
     }
 
@@ -3099,10 +3095,7 @@ Constraints:\n\
         name = "bro_arc_status",
         description = "Read-only structured query against active and recently-finished arcs. Returns the current ArcSnapshot (current_node, completed_nodes, in_flight_nodes, last_verdict, visit_counts, started_at) plus pending-wait registrations for the arc."
     )]
-    async fn bro_arc_status(
-        &self,
-        Parameters(p): Parameters<ArcStatusParams>,
-    ) -> CallToolResult {
+    async fn bro_arc_status(&self, Parameters(p): Parameters<ArcStatusParams>) -> CallToolResult {
         let snapshots: Vec<&ArcSnapshot> = if let Some(arc_id) = &p.arc_id {
             self.state
                 .running_arcs
@@ -3143,10 +3136,7 @@ Constraints:\n\
         name = "bro_arc_cancel",
         description = "Cancel a running workflow arc by id. Trips the arc's cancellation token; the runner observes between node iterations and inside Wait suspensions, bails out with status `cancelled`, runs `on_arc_cancel` (if declared) followed by `on_arc_exit`, and writes a `blocked` note (`workflow cancelled`) on the arc's thread. Returns `{cancelled: true|false}` — false means no token registered for that arc id (already terminated, never started, or wrong id)."
     )]
-    async fn bro_arc_cancel(
-        &self,
-        Parameters(p): Parameters<ArcCancelParams>,
-    ) -> CallToolResult {
+    async fn bro_arc_cancel(&self, Parameters(p): Parameters<ArcCancelParams>) -> CallToolResult {
         let cancelled = self.state.cancel_arc(&p.arc_id);
         Self::ok_json(&serde_json::json!({
             "arc_id": p.arc_id,
@@ -3158,10 +3148,7 @@ Constraints:\n\
         name = "bro_signals",
         description = "Recent signal-dispatch events as a bounded ring buffer (last ~200). Every call to the signal router records one entry: (timestamp, signal, correlation, outcome, matched_arc_id, matched_wait_id, idle_pending). `outcome` is `matched` (resolved a wait) or `no_matching_wait` (fell idle); on idle, `idle_pending` carries the pending-with-same-signal snapshot at dispatch time so the diff between what arrived and what was waiting is one read away. Filter by `signal=` (exact match) and `since=` (ISO timestamp). Replaces the journalctl|grep workflow for debugging webhook → routing → signal → wait paths."
     )]
-    async fn bro_signals(
-        &self,
-        Parameters(p): Parameters<SignalsParams>,
-    ) -> CallToolResult {
+    async fn bro_signals(&self, Parameters(p): Parameters<SignalsParams>) -> CallToolResult {
         let log = self.state.signal_log.read();
         let limit = p.limit.unwrap_or(50).min(SIGNAL_LOG_CAP);
         let mut out: Vec<&SignalEvent> = log
@@ -3197,7 +3184,9 @@ Constraints:\n\
         &self,
         Parameters(p): Parameters<WebhookReplayParams>,
     ) -> CallToolResult {
-        let headers = p.headers.unwrap_or_default()
+        let headers = p
+            .headers
+            .unwrap_or_default()
             .into_iter()
             .map(|(k, v)| (k.to_lowercase(), v))
             .collect();
@@ -3443,9 +3432,11 @@ Constraints:\n\
             "specialist" => whiteboards::Role::Specialist,
             "facilitator" => whiteboards::Role::Facilitator,
             "operator" => whiteboards::Role::Operator,
-            other => return Self::err_text(&format!(
-                "whiteboard_register: unknown role '{other}' (use specialist / facilitator / operator)"
-            )),
+            other => {
+                return Self::err_text(&format!(
+                    "whiteboard_register: unknown role '{other}' (use specialist / facilitator / operator)"
+                ));
+            }
         };
         match self
             .state
@@ -3475,9 +3466,11 @@ Constraints:\n\
             "claim" => whiteboards::PostType::Claim,
             "concern" => whiteboards::PostType::Concern,
             "informational" => whiteboards::PostType::Informational,
-            other => return Self::err_text(&format!(
-                "whiteboard_post: unknown type '{other}' (use proposal / claim / concern / informational)"
-            )),
+            other => {
+                return Self::err_text(&format!(
+                    "whiteboard_post: unknown type '{other}' (use proposal / claim / concern / informational)"
+                ));
+            }
         };
         let severity = match p.severity.as_deref() {
             Some("critical") => Some(whiteboards::Severity::Critical),
@@ -3485,9 +3478,7 @@ Constraints:\n\
             Some("medium") => Some(whiteboards::Severity::Medium),
             Some("low") => Some(whiteboards::Severity::Low),
             Some(other) => {
-                return Self::err_text(&format!(
-                    "whiteboard_post: unknown severity '{other}'"
-                ));
+                return Self::err_text(&format!("whiteboard_post: unknown severity '{other}'"));
             }
             None => None,
         };
@@ -3522,10 +3513,12 @@ Constraints:\n\
     ) -> CallToolResult {
         let board_arc = match self.state.whiteboards.get(&p.board_id) {
             Some(b) => b,
-            None => return Self::err_text(&format!(
-                "whiteboard_state: board '{}' does not exist",
-                p.board_id
-            )),
+            None => {
+                return Self::err_text(&format!(
+                    "whiteboard_state: board '{}' does not exist",
+                    p.board_id
+                ));
+            }
         };
         let view = whiteboards::filter_for_agent(&board_arc.read(), &p.agent_name);
         match view {
@@ -3547,18 +3540,16 @@ Constraints:\n\
             "corroborate" => whiteboards::AnnotationType::Corroborate,
             "resolve" => whiteboards::AnnotationType::Resolve,
             "validation" => whiteboards::AnnotationType::Validation,
-            other => return Self::err_text(&format!(
-                "whiteboard_annotate: unknown type '{other}'"
-            )),
+            other => {
+                return Self::err_text(&format!("whiteboard_annotate: unknown type '{other}'"));
+            }
         };
         let result = match p.result.as_deref() {
             Some("confirmed") => Some(whiteboards::ValidationResult::Confirmed),
             Some("refuted") => Some(whiteboards::ValidationResult::Refuted),
             Some("inconclusive") => Some(whiteboards::ValidationResult::Inconclusive),
             Some(other) => {
-                return Self::err_text(&format!(
-                    "whiteboard_annotate: unknown result '{other}'"
-                ));
+                return Self::err_text(&format!("whiteboard_annotate: unknown result '{other}'"));
             }
             None => None,
         };
@@ -3593,9 +3584,7 @@ Constraints:\n\
             "accept" => whiteboards::VoteValue::Accept,
             "reject" => whiteboards::VoteValue::Reject,
             "defer" => whiteboards::VoteValue::Defer,
-            other => return Self::err_text(&format!(
-                "whiteboard_vote: unknown vote '{other}'"
-            )),
+            other => return Self::err_text(&format!("whiteboard_vote: unknown vote '{other}'")),
         };
         match self.state.whiteboards.vote(
             &p.board_id,
@@ -3628,9 +3617,11 @@ Constraints:\n\
             "debate" => whiteboards::Phase::Debate,
             "resolve" => whiteboards::Phase::Resolve,
             "archived" => whiteboards::Phase::Archived,
-            other => return Self::err_text(&format!(
-                "whiteboard_transition: unknown target_phase '{other}'"
-            )),
+            other => {
+                return Self::err_text(&format!(
+                    "whiteboard_transition: unknown target_phase '{other}'"
+                ));
+            }
         };
         let result = self.state.whiteboards.transition(
             &p.board_id,
@@ -3659,8 +3650,8 @@ Constraints:\n\
                         correlate,
                         payload: Some(entity.clone()),
                     };
-                    let _ = dispatch_routing_verdict_direct(state, "whiteboard", verdict, entity)
-                        .await;
+                    let _ =
+                        dispatch_routing_verdict_direct(state, "whiteboard", verdict, entity).await;
                 });
                 Self::ok_json(&serde_json::json!({
                     "status": "transitioned",
@@ -3683,10 +3674,12 @@ Constraints:\n\
     ) -> CallToolResult {
         let board_arc = match self.state.whiteboards.get(&p.board_id) {
             Some(b) => b,
-            None => return Self::err_text(&format!(
-                "whiteboard_conflicts: board '{}' does not exist",
-                p.board_id
-            )),
+            None => {
+                return Self::err_text(&format!(
+                    "whiteboard_conflicts: board '{}' does not exist",
+                    p.board_id
+                ));
+            }
         };
         let board = board_arc.read();
         if !board.agents.contains_key(&p.agent_name) {
@@ -3717,10 +3710,12 @@ Constraints:\n\
     ) -> CallToolResult {
         let board_arc = match self.state.whiteboards.get(&p.board_id) {
             Some(b) => b,
-            None => return Self::err_text(&format!(
-                "whiteboard_summarize: board '{}' does not exist",
-                p.board_id
-            )),
+            None => {
+                return Self::err_text(&format!(
+                    "whiteboard_summarize: board '{}' does not exist",
+                    p.board_id
+                ));
+            }
         };
         let board = board_arc.read();
         if !board.agents.contains_key(&p.agent_name) {
@@ -3851,7 +3846,10 @@ Constraints:\n\
         ) {
             return Self::err_text(&format!("workflow persist failed: {e}"));
         }
-        self.state.workflow_registry.write().insert(id.clone(), spec);
+        self.state
+            .workflow_registry
+            .write()
+            .insert(id.clone(), spec);
         Self::ok_json(&serde_json::json!({"status": "installed", "id": id}))
     }
 
@@ -5019,8 +5017,7 @@ Next step: <one concrete steering suggestion>\n"
             // tail handler can attribute even when later resolution
             // (find_bro_ref_for_task) hits the duplicate-name
             // ambiguity case (two team members sharing a brofile).
-            task.inner.lock().bro_label =
-                Some(format!("{}::{}", team.name, member.name));
+            task.inner.lock().bro_label = Some(format!("{}::{}", team.name, member.name));
             orchestration::team::save_team(&team, &self.state.store_dir);
             break;
         }
@@ -5455,11 +5452,7 @@ async fn webhook_handler(
         response_body: response_body.clone(),
     });
     match outcome {
-        Ok(verdict_json) => (
-            axum::http::StatusCode::OK,
-            axum::Json(verdict_json),
-        )
-            .into_response(),
+        Ok(verdict_json) => (axum::http::StatusCode::OK, axum::Json(verdict_json)).into_response(),
         Err(e) => {
             tracing::warn!("webhook /{name}: {e}");
             (
@@ -5637,12 +5630,15 @@ async fn process_webhook(
         .and_then(|h| headers.get(&h.to_lowercase()))
         .map(|s| s.as_str());
     if !state.webhooks.check_delivery_id(name, delivery_id) {
-        tracing::info!("webhook '{name}': dropped duplicate delivery {:?}", delivery_id);
+        tracing::info!(
+            "webhook '{name}': dropped duplicate delivery {:?}",
+            delivery_id
+        );
         return Ok(json!({"status": "duplicate_dropped"}));
     }
 
-    let payload: Value = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("payload not JSON: {e}"))?;
+    let payload: Value =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("payload not JSON: {e}"))?;
 
     // Combined extractor input: payload fields at top level (so
     // ordinary Forgejo paths like `$.action`, `$.pull_request.number`
@@ -5762,10 +5758,7 @@ async fn dispatch_verdict(
     match verdict {
         RoutingVerdict::Ignore => Ok(json!({"status": "ignored"})),
         RoutingVerdict::DeadLetter { reason } => {
-            tracing::warn!(
-                "{inlet_name}: dead-lettered (reason={:?})",
-                reason
-            );
+            tracing::warn!("{inlet_name}: dead-lettered (reason={:?})", reason);
             Ok(json!({
                 "status": "dead_letter",
                 "reason": reason,
@@ -5783,8 +5776,7 @@ async fn dispatch_verdict(
             // `set_var feedback_text = ${last_signal.payload.review.body}`
             // would only see the correlation tuple.
             let signal_payload = payload.unwrap_or_else(|| entity.clone());
-            let resolved =
-                signal_arc_dispatch(&state, &signal, correlate, signal_payload).await;
+            let resolved = signal_arc_dispatch(&state, &signal, correlate, signal_payload).await;
             Ok(resolved)
         }
         RoutingVerdict::CancelArc { correlate } => {
@@ -5830,9 +5822,7 @@ async fn dispatch_verdict(
                 map.get(&workflow_id).cloned()
             };
             let workflow_spec = spec_clone.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "start_arc verdict references unknown workflow id '{workflow_id}'"
-                )
+                anyhow::anyhow!("start_arc verdict references unknown workflow id '{workflow_id}'")
             })?;
             let compiled = workflow::compile(workflow_spec)
                 .map_err(|e| anyhow::anyhow!("workflow compile: {e}"))?;
@@ -5887,9 +5877,7 @@ async fn dispatch_verdict(
             // when the arc terminates so the next tick is admissible.
             // Inlets are labeled `cron:<name>` upstream; parse out the
             // name here.
-            let cron_name = inlet_name
-                .strip_prefix("cron:")
-                .map(|s| s.to_string());
+            let cron_name = inlet_name.strip_prefix("cron:").map(|s| s.to_string());
             let crons_for_done = state.crons.clone();
             tokio::spawn(async move {
                 let _ = workflow::run_workflow_with_initial_vars(
@@ -6322,7 +6310,10 @@ async fn signal_arc_dispatch(
     let Some((resolved_slot, notify, arc_id, wait_id)) = m else {
         tracing::info!(
             "signal '{signal}' arrived with correlation {correlation:?} — no matching wait (idle). pending_with_same_signal={:?}",
-            pending_before.iter().map(|w| (w.arc_id.clone(), w.wait_id.clone(), w.correlation.clone())).collect::<Vec<_>>(),
+            pending_before
+                .iter()
+                .map(|w| (w.arc_id.clone(), w.wait_id.clone(), w.correlation.clone()))
+                .collect::<Vec<_>>(),
         );
         state.record_signal(SignalEvent {
             timestamp: util::now_iso(),
@@ -6479,9 +6470,7 @@ async fn roster_handler(
                 Some((t, m)) => (t.to_string(), m.to_string()),
                 None => ("adhoc".to_string(), label.clone()),
             };
-            let matches = wanted_bros
-                .iter()
-                .any(|w| w == &member || w == &label);
+            let matches = wanted_bros.iter().any(|w| w == &member || w == &label);
             if !matches {
                 continue;
             }
@@ -6911,7 +6900,9 @@ async fn main() -> anyhow::Result<()> {
         workflow_registry: Arc::new(RwLock::new(HashMap::new())),
         bind_is_loopback,
         signal_log: RwLock::new(std::collections::VecDeque::with_capacity(SIGNAL_LOG_CAP)),
-        webhook_delivery_log: RwLock::new(std::collections::VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
+        webhook_delivery_log: RwLock::new(std::collections::VecDeque::with_capacity(
+            WEBHOOK_LOG_CAP,
+        )),
         arc_cancel_tokens: RwLock::new(HashMap::new()),
     });
 
@@ -6967,10 +6958,7 @@ async fn main() -> anyhow::Result<()> {
                 shared.crons.track_handle(&spec.name, handle);
             }
             Err(e) => {
-                tracing::warn!(
-                    "skipping restore of cron '{}': {e}",
-                    spec.name
-                );
+                tracing::warn!("skipping restore of cron '{}': {e}", spec.name);
             }
         }
     }
@@ -7099,7 +7087,10 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::get(orchestrate_peek_handler),
         )
         .route("/webhook/{name}", axum::routing::post(webhook_handler))
-        .route("/webhook/{name}/replay", axum::routing::post(webhook_replay_handler))
+        .route(
+            "/webhook/{name}/replay",
+            axum::routing::post(webhook_replay_handler),
+        )
         .route(
             "/orchestrate/by-id",
             axum::routing::post(orchestrate_by_id_handler),
@@ -7128,10 +7119,7 @@ async fn main() -> anyhow::Result<()> {
             "/admin/brofile/upsert",
             axum::routing::post(admin_brofile_upsert),
         )
-        .route(
-            "/admin/team/upsert",
-            axum::routing::post(admin_team_upsert),
-        )
+        .route("/admin/team/upsert", axum::routing::post(admin_team_upsert))
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 
@@ -7188,7 +7176,9 @@ mod tests {
             workflow_registry: Arc::new(RwLock::new(HashMap::new())),
             bind_is_loopback: true,
             signal_log: RwLock::new(std::collections::VecDeque::with_capacity(SIGNAL_LOG_CAP)),
-            webhook_delivery_log: RwLock::new(std::collections::VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
+            webhook_delivery_log: RwLock::new(std::collections::VecDeque::with_capacity(
+                WEBHOOK_LOG_CAP,
+            )),
             arc_cancel_tokens: RwLock::new(HashMap::new()),
         });
         BlackboxServer::new(state)

@@ -154,9 +154,7 @@ pub fn verify_signature(
     match scheme {
         SignatureScheme::None => {
             if !bind_is_loopback {
-                anyhow::bail!(
-                    "signature scheme 'none' requires daemon bound to loopback"
-                );
+                anyhow::bail!("signature scheme 'none' requires daemon bound to loopback");
             }
             Ok(())
         }
@@ -169,14 +167,9 @@ pub fn verify_signature(
                 .get(&header.to_lowercase())
                 .or_else(|| headers.get(header))
                 .ok_or_else(|| anyhow!("missing {header} header"))?;
-            let secret = std::env::var(secret_env)
-                .map_err(|_| anyhow!("env {secret_env} not set"))?;
-            if !verify_hmac_sha256_hex(
-                secret.as_bytes(),
-                body,
-                sig,
-                prefix.as_deref(),
-            ) {
+            let secret =
+                std::env::var(secret_env).map_err(|_| anyhow!("env {secret_env} not set"))?;
+            if !verify_hmac_sha256_hex(secret.as_bytes(), body, sig, prefix.as_deref()) {
                 anyhow::bail!("HMAC verification failed");
             }
             Ok(())
@@ -201,12 +194,7 @@ pub fn install_check(scheme: &SignatureScheme, bind_is_loopback: bool) -> Result
 
 /// HMAC-SHA256 verifier with optional prefix stripping (e.g.
 /// `sha256=<hex>` style). Constant-time hex comparison.
-fn verify_hmac_sha256_hex(
-    secret: &[u8],
-    body: &[u8],
-    header: &str,
-    prefix: Option<&str>,
-) -> bool {
+fn verify_hmac_sha256_hex(secret: &[u8], body: &[u8], header: &str, prefix: Option<&str>) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256Type = Hmac<Sha256>;

@@ -101,9 +101,9 @@ impl HttpFetchSpec {
             Some("text") => ResponseKind::Text,
             Some("auto") => ResponseKind::Auto,
             Some("json") | None => ResponseKind::Json,
-            Some(other) => bail!(
-                "http fetch: invalid response_kind '{other}' (expected json|text|auto)"
-            ),
+            Some(other) => {
+                bail!("http fetch: invalid response_kind '{other}' (expected json|text|auto)")
+            }
         };
         let mut headers = HashMap::new();
         if let Some(h) = args.get("headers").and_then(|v| v.as_object()) {
@@ -166,22 +166,16 @@ impl HttpFetchSpec {
         }
         let value = if text.trim().is_empty() {
             if !self.allow_empty_body {
-                bail!(
-                    "http fetch {method} {url}: empty body but allow_empty_body=false"
-                );
+                bail!("http fetch {method} {url}: empty body but allow_empty_body=false");
             }
             Value::Null
         } else {
             match self.response_kind {
                 ResponseKind::Text => Value::String(text),
-                ResponseKind::Auto => {
-                    serde_json::from_str(&text).unwrap_or(Value::String(text))
-                }
+                ResponseKind::Auto => serde_json::from_str(&text).unwrap_or(Value::String(text)),
                 ResponseKind::Json => serde_json::from_str(&text).map_err(|e| {
                     let preview: String = text.chars().take(200).collect();
-                    anyhow!(
-                        "http fetch {method} {url}: response not JSON: {e}: {preview}"
-                    )
+                    anyhow!("http fetch {method} {url}: response not JSON: {e}: {preview}")
                 })?,
             }
         };
@@ -235,17 +229,15 @@ mod tests {
 
     #[test]
     fn from_args_invalid_response_kind() {
-        let err =
-            HttpFetchSpec::from_args(&json!({"url": "http://x", "response_kind": "yaml"}))
-                .unwrap_err();
+        let err = HttpFetchSpec::from_args(&json!({"url": "http://x", "response_kind": "yaml"}))
+            .unwrap_err();
         assert!(format!("{err}").contains("response_kind"));
     }
 
     #[test]
     fn from_args_non_string_header_rejected() {
         let err =
-            HttpFetchSpec::from_args(&json!({"url": "http://x", "headers": {"X": 7}}))
-                .unwrap_err();
+            HttpFetchSpec::from_args(&json!({"url": "http://x", "headers": {"X": 7}})).unwrap_err();
         assert!(format!("{err}").contains("must be string"));
     }
 }

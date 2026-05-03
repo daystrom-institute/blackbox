@@ -57,9 +57,7 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
     // packet, actor, late_inject, subworkflow, wait_for cross-checks.
     for (node_id, node) in &spec.nodes {
         if node.subworkflow.is_some() && node.subworkflow_ref.is_some() {
-            bail!(
-                "node '{node_id}' has BOTH subworkflow (inline) and subworkflow_ref — pick one"
-            );
+            bail!("node '{node_id}' has BOTH subworkflow (inline) and subworkflow_ref — pick one");
         }
         if node.subworkflow.is_some() {
             // Recursively compile the sub-workflow so errors surface
@@ -95,9 +93,7 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
         // wait_for entries must reference declared nodes.
         for src in &node.wait_for {
             if !spec.nodes.contains_key(src) {
-                bail!(
-                    "node '{node_id}' wait_for entry '{src}' is not a declared node"
-                );
+                bail!("node '{node_id}' wait_for entry '{src}' is not a declared node");
             }
         }
 
@@ -133,11 +129,7 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
     Ok(())
 }
 
-fn validate_transition(
-    node_id: &str,
-    transition: &NodeTransition,
-    spec: &Workflow,
-) -> Result<()> {
+fn validate_transition(node_id: &str, transition: &NodeTransition, spec: &Workflow) -> Result<()> {
     match transition {
         NodeTransition::Goto { to } => {
             if !spec.nodes.contains_key(to) {
@@ -146,9 +138,7 @@ fn validate_transition(
         }
         NodeTransition::Branch { cases, default, .. } => {
             if cases.is_empty() && default.is_none() {
-                bail!(
-                    "node '{node_id}' branch transition has no cases and no default"
-                );
+                bail!("node '{node_id}' branch transition has no cases and no default");
             }
             for (verdict, target) in cases {
                 if !spec.nodes.contains_key(target) {
@@ -159,9 +149,7 @@ fn validate_transition(
             }
             if let Some(d) = default {
                 if !spec.nodes.contains_key(d) {
-                    bail!(
-                        "node '{node_id}' branch default → '{d}' is not a declared node"
-                    );
+                    bail!("node '{node_id}' branch default → '{d}' is not a declared node");
                 }
             }
         }
@@ -178,9 +166,7 @@ fn validate_transition(
                 }
             }
             if !spec.nodes.contains_key(continue_to) {
-                bail!(
-                    "node '{node_id}' fork continue_to='{continue_to}' is not a declared node"
-                );
+                bail!("node '{node_id}' fork continue_to='{continue_to}' is not a declared node");
             }
         }
         NodeTransition::Terminal => {}
@@ -333,9 +319,7 @@ impl CompiledWorkflow {
 fn format_transition(t: &NodeTransition) -> String {
     match t {
         NodeTransition::Goto { to } => format!("goto {to}"),
-        NodeTransition::Branch {
-            cases, default, ..
-        } => {
+        NodeTransition::Branch { cases, default, .. } => {
             let mut keys: Vec<&String> = cases.keys().collect();
             keys.sort();
             let arms = keys
@@ -396,10 +380,9 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 path.trim_start_matches("../../")
             );
-            let json = std::fs::read_to_string(&full)
-                .unwrap_or_else(|e| panic!("read {path}: {e}"));
-            let spec = load_workflow(&json)
-                .unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
+            let json =
+                std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let spec = load_workflow(&json).unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
             compile(spec).unwrap_or_else(|e| panic!("compile {path}: {e:?}"));
         }
     }
@@ -412,10 +395,9 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 path.trim_start_matches("../../")
             );
-            let json = std::fs::read_to_string(&full)
-                .unwrap_or_else(|e| panic!("read {path}: {e}"));
-            let spec = load_workflow(&json)
-                .unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
+            let json =
+                std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let spec = load_workflow(&json).unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
             compile(spec).unwrap_or_else(|e| panic!("compile {path}: {e:?}"));
         }
     }
@@ -438,10 +420,19 @@ mod tests {
             .get("Ensemble_Blind_Iter")
             .expect("convergence node present");
         let NodeTransition::Branch { cases, .. } = &iter.next else {
-            panic!("Ensemble_Blind_Iter expected a branch transition, got {:?}", iter.next);
+            panic!(
+                "Ensemble_Blind_Iter expected a branch transition, got {:?}",
+                iter.next
+            );
         };
-        assert_eq!(cases.get("revise").map(String::as_str), Some("Exec_Propose"));
-        assert_eq!(cases.get("converged").map(String::as_str), Some("Exec_Work"));
+        assert_eq!(
+            cases.get("revise").map(String::as_str),
+            Some("Exec_Propose")
+        );
+        assert_eq!(
+            cases.get("converged").map(String::as_str),
+            Some("Exec_Work")
+        );
         eprintln!("\n=== BLIND WORKFLOW DRY-RUN ===\n{}", compiled.summarize());
     }
 
@@ -473,7 +464,10 @@ mod tests {
         }"#;
         let spec = load_workflow(spec_json).unwrap();
         let err = compile(spec).unwrap_err().to_string();
-        assert!(err.contains("unreachable") && err.contains("Ghost"), "err: {err}");
+        assert!(
+            err.contains("unreachable") && err.contains("Ghost"),
+            "err: {err}"
+        );
     }
 
     #[test]
@@ -524,7 +518,10 @@ mod tests {
         }"#;
         let spec = load_workflow(spec_json).unwrap();
         let err = compile(spec).unwrap_err().to_string();
-        assert!(err.contains("late_inject") && err.contains("Ghost"), "err: {err}");
+        assert!(
+            err.contains("late_inject") && err.contains("Ghost"),
+            "err: {err}"
+        );
     }
 
     #[test]
@@ -716,62 +713,155 @@ mod tests {
             .expect("schema compiles");
 
         let cases: &[(&str, &str)] = &[
-            ("e2e-smoke",         include_str!("../../examples/workflows/e2e-smoke.json")),
-            ("e2e-gated",         include_str!("../../examples/workflows/e2e-gated.json")),
-            ("e2e-async-review",  include_str!("../../examples/workflows/e2e-async-review.json")),
-            ("e2e-fork-join",     include_str!("../../examples/workflows/e2e-fork-join.json")),
-            ("e2e-composition",   include_str!("../../examples/workflows/e2e-composition.json")),
-            ("e2e-policy",        include_str!("../../examples/workflows/e2e-policy.json")),
-            ("e2e-review-mode",   include_str!("../../examples/workflows/e2e-review-mode.json")),
-            ("e2e-self-audit",    include_str!("../../examples/workflows/e2e-self-audit.json")),
-            ("e2e-ensemble-vote", include_str!("../../examples/workflows/e2e-ensemble-vote.json")),
-            ("e2e-combo",         include_str!("../../examples/workflows/e2e-combo.json")),
-            ("optimistic",        include_str!("../../examples/workflows/optimistic.json")),
-            ("blind",             include_str!("../../examples/workflows/blind.json")),
-            ("keystone-issue-to-merged-pr",       include_str!("../../examples/keystone/workflows/issue-to-merged-pr.json")),
-            ("keystone-implementer-arc",          include_str!("../../examples/keystone/workflows/implementer-arc.json")),
-            ("keystone-reviewer-arc",             include_str!("../../examples/keystone/workflows/reviewer-arc.json")),
-            ("keystone-implementer-feedback-arc", include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json")),
+            (
+                "e2e-smoke",
+                include_str!("../../examples/workflows/e2e-smoke.json"),
+            ),
+            (
+                "e2e-gated",
+                include_str!("../../examples/workflows/e2e-gated.json"),
+            ),
+            (
+                "e2e-async-review",
+                include_str!("../../examples/workflows/e2e-async-review.json"),
+            ),
+            (
+                "e2e-fork-join",
+                include_str!("../../examples/workflows/e2e-fork-join.json"),
+            ),
+            (
+                "e2e-composition",
+                include_str!("../../examples/workflows/e2e-composition.json"),
+            ),
+            (
+                "e2e-policy",
+                include_str!("../../examples/workflows/e2e-policy.json"),
+            ),
+            (
+                "e2e-review-mode",
+                include_str!("../../examples/workflows/e2e-review-mode.json"),
+            ),
+            (
+                "e2e-self-audit",
+                include_str!("../../examples/workflows/e2e-self-audit.json"),
+            ),
+            (
+                "e2e-ensemble-vote",
+                include_str!("../../examples/workflows/e2e-ensemble-vote.json"),
+            ),
+            (
+                "e2e-combo",
+                include_str!("../../examples/workflows/e2e-combo.json"),
+            ),
+            (
+                "optimistic",
+                include_str!("../../examples/workflows/optimistic.json"),
+            ),
+            ("blind", include_str!("../../examples/workflows/blind.json")),
+            (
+                "keystone-issue-to-merged-pr",
+                include_str!("../../examples/keystone/workflows/issue-to-merged-pr.json"),
+            ),
+            (
+                "keystone-implementer-arc",
+                include_str!("../../examples/keystone/workflows/implementer-arc.json"),
+            ),
+            (
+                "keystone-reviewer-arc",
+                include_str!("../../examples/keystone/workflows/reviewer-arc.json"),
+            ),
+            (
+                "keystone-implementer-feedback-arc",
+                include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json"),
+            ),
         ];
 
         let mut failures: Vec<String> = Vec::new();
         for (name, src) in cases {
-            let v: serde_json::Value = serde_json::from_str(src)
-                .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
-            let errors_opt: Option<Vec<String>> = compiled
-                .validate(&v)
-                .err()
-                .map(|errs| errs.map(|e| format!("  {}: {}", e.instance_path, e)).collect());
+            let v: serde_json::Value =
+                serde_json::from_str(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+            let errors_opt: Option<Vec<String>> = compiled.validate(&v).err().map(|errs| {
+                errs.map(|e| format!("  {}: {}", e.instance_path, e))
+                    .collect()
+            });
             if let Some(msgs) = errors_opt {
                 failures.push(format!("{name}:\n{}", msgs.join("\n")));
             }
         }
-        assert!(failures.is_empty(), "schema validation failures:\n{}", failures.join("\n\n"));
+        assert!(
+            failures.is_empty(),
+            "schema validation failures:\n{}",
+            failures.join("\n\n")
+        );
     }
 
     #[test]
     fn every_example_workflow_compiles() {
         let cases: &[(&str, &str)] = &[
-            ("e2e-smoke",         include_str!("../../examples/workflows/e2e-smoke.json")),
-            ("e2e-gated",         include_str!("../../examples/workflows/e2e-gated.json")),
-            ("e2e-async-review",  include_str!("../../examples/workflows/e2e-async-review.json")),
-            ("e2e-fork-join",     include_str!("../../examples/workflows/e2e-fork-join.json")),
-            ("e2e-composition",   include_str!("../../examples/workflows/e2e-composition.json")),
-            ("e2e-policy",        include_str!("../../examples/workflows/e2e-policy.json")),
-            ("e2e-review-mode",   include_str!("../../examples/workflows/e2e-review-mode.json")),
-            ("e2e-self-audit",    include_str!("../../examples/workflows/e2e-self-audit.json")),
-            ("e2e-ensemble-vote", include_str!("../../examples/workflows/e2e-ensemble-vote.json")),
-            ("e2e-combo",         include_str!("../../examples/workflows/e2e-combo.json")),
-            ("optimistic",        include_str!("../../examples/workflows/optimistic.json")),
-            ("blind",             include_str!("../../examples/workflows/blind.json")),
-            ("keystone-issue-to-merged-pr",       include_str!("../../examples/keystone/workflows/issue-to-merged-pr.json")),
-            ("keystone-implementer-arc",          include_str!("../../examples/keystone/workflows/implementer-arc.json")),
-            ("keystone-reviewer-arc",             include_str!("../../examples/keystone/workflows/reviewer-arc.json")),
-            ("keystone-implementer-feedback-arc", include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json")),
+            (
+                "e2e-smoke",
+                include_str!("../../examples/workflows/e2e-smoke.json"),
+            ),
+            (
+                "e2e-gated",
+                include_str!("../../examples/workflows/e2e-gated.json"),
+            ),
+            (
+                "e2e-async-review",
+                include_str!("../../examples/workflows/e2e-async-review.json"),
+            ),
+            (
+                "e2e-fork-join",
+                include_str!("../../examples/workflows/e2e-fork-join.json"),
+            ),
+            (
+                "e2e-composition",
+                include_str!("../../examples/workflows/e2e-composition.json"),
+            ),
+            (
+                "e2e-policy",
+                include_str!("../../examples/workflows/e2e-policy.json"),
+            ),
+            (
+                "e2e-review-mode",
+                include_str!("../../examples/workflows/e2e-review-mode.json"),
+            ),
+            (
+                "e2e-self-audit",
+                include_str!("../../examples/workflows/e2e-self-audit.json"),
+            ),
+            (
+                "e2e-ensemble-vote",
+                include_str!("../../examples/workflows/e2e-ensemble-vote.json"),
+            ),
+            (
+                "e2e-combo",
+                include_str!("../../examples/workflows/e2e-combo.json"),
+            ),
+            (
+                "optimistic",
+                include_str!("../../examples/workflows/optimistic.json"),
+            ),
+            ("blind", include_str!("../../examples/workflows/blind.json")),
+            (
+                "keystone-issue-to-merged-pr",
+                include_str!("../../examples/keystone/workflows/issue-to-merged-pr.json"),
+            ),
+            (
+                "keystone-implementer-arc",
+                include_str!("../../examples/keystone/workflows/implementer-arc.json"),
+            ),
+            (
+                "keystone-reviewer-arc",
+                include_str!("../../examples/keystone/workflows/reviewer-arc.json"),
+            ),
+            (
+                "keystone-implementer-feedback-arc",
+                include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json"),
+            ),
         ];
         for (name, src) in cases {
-            let spec = load_workflow(src)
-                .unwrap_or_else(|e| panic!("{name}: parse failed: {e:?}"));
+            let spec = load_workflow(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e:?}"));
             compile(spec).unwrap_or_else(|e| panic!("{name}: compile failed: {e:?}"));
         }
     }
@@ -789,6 +879,9 @@ mod tests {
         }"#;
         let spec = load_workflow(spec_json).unwrap();
         let err = compile(spec).unwrap_err().to_string();
-        assert!(err.contains("branch case 'yes'") && err.contains("Ghost"), "err: {err}");
+        assert!(
+            err.contains("branch case 'yes'") && err.contains("Ghost"),
+            "err: {err}"
+        );
     }
 }

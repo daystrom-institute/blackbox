@@ -143,19 +143,13 @@ pub async fn execute_op(
     }
 }
 
-async fn exec_mcp_call(
-    args: &Value,
-    into_var: Option<&str>,
-    ctx: &ArcContext,
-) -> Result<OpEffect> {
-    let server = args
-        .get("server")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("McpCall requires args.server (MCP registry name, e.g. 'biofilter' or 'blackbox')"))?;
-    let tool = args
-        .get("tool")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("McpCall requires args.tool (tool name as the server registers it)"))?;
+async fn exec_mcp_call(args: &Value, into_var: Option<&str>, ctx: &ArcContext) -> Result<OpEffect> {
+    let server = args.get("server").and_then(|v| v.as_str()).ok_or_else(|| {
+        anyhow!("McpCall requires args.server (MCP registry name, e.g. 'biofilter' or 'blackbox')")
+    })?;
+    let tool = args.get("tool").and_then(|v| v.as_str()).ok_or_else(|| {
+        anyhow!("McpCall requires args.tool (tool name as the server registers it)")
+    })?;
     // arguments — must be an object (or absent → empty).
     let arguments = match args.get("arguments") {
         Some(Value::Object(m)) => m.clone(),
@@ -198,8 +192,7 @@ async fn exec_mcp_call(
 }
 
 fn exec_find_first(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
-    let into = into_var
-        .ok_or_else(|| anyhow!("FindFirst requires into_var on the HookOp spec"))?;
+    let into = into_var.ok_or_else(|| anyhow!("FindFirst requires into_var on the HookOp spec"))?;
     let arr = args
         .get("from")
         .ok_or_else(|| anyhow!("FindFirst requires args.from (array)"))?;
@@ -349,8 +342,7 @@ fn exec_merge_var(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
 }
 
 fn exec_parse_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
-    let into = into_var
-        .ok_or_else(|| anyhow!("ParseJson requires into_var on the HookOp spec"))?;
+    let into = into_var.ok_or_else(|| anyhow!("ParseJson requires into_var on the HookOp spec"))?;
     let from = args
         .get("from")
         .ok_or_else(|| anyhow!("ParseJson requires args.from (string or value)"))?;
@@ -362,9 +354,8 @@ fn exec_parse_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
             } else {
                 // Try fenced ```json blocks first — common LLM output shape.
                 let stripped = strip_code_fence(trimmed).unwrap_or(trimmed.to_string());
-                serde_json::from_str(&stripped).map_err(|e| {
-                    anyhow!("ParseJson: input did not parse as JSON: {e}")
-                })?
+                serde_json::from_str(&stripped)
+                    .map_err(|e| anyhow!("ParseJson: input did not parse as JSON: {e}"))?
             }
         }
         // Already structured — pass through.
@@ -382,8 +373,7 @@ fn strip_code_fence(s: &str) -> Option<String> {
         return None;
     }
     let first = lines[0].trim();
-    let opens_fence =
-        first == "```json" || first == "```JSON" || first == "```";
+    let opens_fence = first == "```json" || first == "```JSON" || first == "```";
     if !opens_fence {
         return None;
     }
@@ -481,10 +471,7 @@ async fn exec_worktree_create(args: &Value, ctx: &ArcContext) -> Result<OpEffect
     //       <base>)
     let branch_status = branch_state(&repo_root, &branch).await?;
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(&repo_root)
-        .arg("worktree")
-        .arg("add");
+    cmd.arg("-C").arg(&repo_root).arg("worktree").arg("add");
     match branch_status {
         BranchState::AbsentLocal => {
             // Case (c): create fresh.
@@ -614,7 +601,11 @@ async fn exec_worktree_remove(args: &Value, ctx: &ArcContext) -> Result<OpEffect
         })?;
 
     let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C").arg(&repo_root).arg("worktree").arg("remove").arg(&path);
+    cmd.arg("-C")
+        .arg(&repo_root)
+        .arg("worktree")
+        .arg("remove")
+        .arg(&path);
     if force {
         cmd.arg("--force");
     }
@@ -855,7 +846,10 @@ mod tests {
             OpEffect::SetWorktree(Some(p)) => {
                 assert_eq!(p, wt_path.to_string_lossy());
             }
-            other => panic!("expected SetWorktree(Some), got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected SetWorktree(Some), got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
         // The worktree should be on the reused branch.
         let head = std::process::Command::new("git")
@@ -890,7 +884,13 @@ mod tests {
 
         // Existing worktree on the contested branch.
         let occupied = tmp.path().join("wt-occupied");
-        git(&["worktree", "add", "-b", "fix/issue-42", occupied.to_str().unwrap()]);
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "fix/issue-42",
+            occupied.to_str().unwrap(),
+        ]);
 
         let mut meta = ArcMeta::default();
         meta.project_dir = Some(repo.to_string_lossy().into_owned());

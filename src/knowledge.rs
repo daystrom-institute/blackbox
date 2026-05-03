@@ -134,8 +134,9 @@ pub struct RenderParams {
     /// ~/.gemini/GEMINI.md) inside `<!-- bb:managed-* -->` markers and
     /// snapshots the original to ~/.local/state/blackbox/backups/ first.
     /// "project" writes <project>/{CLAUDE,AGENTS,GEMINI}.md from project-
-    /// scope entries + PROJECT.md only (no global content). "both" runs
-    /// both. Defaults to "both" if `project` is given, else "global".
+    /// scope entries plus an include reference to PROJECT.md (no global
+    /// content). "both" runs both. Defaults to "both" if `project` is
+    /// given, else "global".
     #[serde(default)]
     pub scope: Option<String>,
     /// Preview without writing (default: false)
@@ -149,12 +150,9 @@ pub struct AbsorbParams {
     /// ignored for scope=global.
     #[serde(default)]
     pub project: Option<String>,
-    /// "project" (default) absorbs from <project>/{CLAUDE,AGENTS,GEMINI}.md
-    /// (whole file is bbox-rendered). "global" absorbs from each provider's
-    /// global memory file (~/.claude-shared/CLAUDE.md, ~/.codex/AGENTS.md,
-    /// ~/.gemini/GEMINI.md), reading ONLY the managed region between
-    /// `<!-- bb:managed-start -->` markers — content outside the markers
-    /// (RTK steerage, hand-authored notes) is left alone.
+    /// Absorb is a compatibility no-op for generated projections. Use
+    /// bbox_bootstrap to import hand-authored instruction files, then render
+    /// unidirectionally from the knowledge store.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -865,50 +863,6 @@ impl Knowledge {
             .map(|result| result.message)
     }
 
-    /// Import a knowledge entry from external content. Used by absorb().
-    /// Always creates an Imported-approval entry; never updates in place.
-    fn import_entry(
-        &mut self,
-        content: String,
-        category: Category,
-        scope: Scope,
-        project: Option<String>,
-    ) -> Result<String> {
-        let title = derive_title(&content);
-        let now = Self::now_iso();
-        let id = Self::gen_id();
-
-        self.store.entries.push(KnowledgeEntry {
-            id: id.clone(),
-            title,
-            content,
-            cluster: None,
-            variants: HashMap::new(),
-            category,
-            scope,
-            project,
-            providers: Vec::new(),
-            priority: Priority::Standard,
-            weight: 100,
-            render: true,
-            decay: true,
-            review_at: None,
-            status: Status::Active,
-            approval: Approval::Imported,
-            supersedes: None,
-            rationale: None,
-            expires_at: None,
-            source: "imported".to_string(),
-            created_at: now.clone(),
-            updated_at: now,
-            recall_count: 0,
-            last_recalled: None,
-        });
-
-        self.save()?;
-        Ok(format!("Imported entry {id}"))
-    }
-
     /// Remember — store for on-demand recall only, never rendered into markdown.
     pub fn remember(&mut self, p: &RememberParams, from_agent: bool) -> Result<String> {
         // None → Memory (schema default). Some(invalid) → error rather than
@@ -1271,8 +1225,25 @@ impl Knowledge {
 
         let mut results = Vec::new();
 
-        // ── Global render: surgical patch into provider global-memory files ──
+        // ── Global render: small provider files + one shared include ──
         if do_global {
+            let common_target = crate::render::global_common_target_path()?;
+            let common_body = self.render_global_common_body()?;
+            let common_plan = crate::render::plan_managed_patch(&common_target, &common_body)?;
+            if dry_run {
+                results.push(format!(
+                    "[DRY-RUN] {}\n--- proposed managed region ---\n{}",
+                    common_plan.summary(),
+                    common_plan.managed_block().unwrap_or("<no change>"),
+                ));
+            } else {
+                let backup = crate::render::apply_managed_patch(&common_plan)?;
+                let backup_str = backup
+                    .map(|p| format!(" (backup: {})", p.display()))
+                    .unwrap_or_default();
+                results.push(format!("{}{}", common_plan.summary(), backup_str));
+            }
+
             for prov in &providers {
                 let Some(target_res) = crate::render::global_target_path(prov) else {
                     results.push(format!(
@@ -1282,7 +1253,7 @@ impl Knowledge {
                     continue;
                 };
                 let target = target_res?;
-                let body = self.render_global_body(prov)?;
+                let body = self.render_global_body(prov, &common_target)?;
                 let plan = crate::render::plan_managed_patch(&target, &body)?;
 
                 if dry_run {
@@ -1323,7 +1294,7 @@ impl Knowledge {
             }
         }
 
-        // ── Project render: project-scope entries + PROJECT.md only ──
+        // ── Project render: project-scope entries + PROJECT.md include only ──
         if do_project {
             let dir = project_dir.unwrap();
             for prov in &providers {
@@ -1332,7 +1303,7 @@ impl Knowledge {
 
                 if body.trim().is_empty() {
                     results.push(format!(
-                        "Skipped {} (no project-scope entries and no PROJECT.md content)",
+                        "Skipped {} (no project-scope entries and no PROJECT.md include)",
                         path.display()
                     ));
                     continue;
@@ -1344,11 +1315,22 @@ impl Knowledge {
                 full.push_str(&body);
 
                 if dry_run {
+                    let write_label = if should_write_project_projection(&path)? {
+                        "PROJECT"
+                    } else {
+                        "PROJECT REFUSED"
+                    };
                     results.push(format!(
-                        "[DRY-RUN] PROJECT {} ({} chars)\n{}",
+                        "[DRY-RUN] {} {} ({} chars)\n{}",
+                        write_label,
                         path.display(),
                         full.len(),
                         full
+                    ));
+                } else if !should_write_project_projection(&path)? {
+                    results.push(format!(
+                        "Refused project {}: existing file is not blackbox-generated; run bbox_bootstrap/import first or move hand-authored content to PROJECT.md",
+                        path.display()
                     ));
                 } else {
                     atomic_write(&path, &full)?;
@@ -1364,20 +1346,43 @@ impl Knowledge {
         Ok(results.join("\n\n"))
     }
 
-    /// Body for a global-memory file: global steerage + global shared
-    /// memory (including the auto-generated `bb-tool-reference` entry).
-    /// No hand-authored preamble — `tool_docs.rs` is the source of
-    /// truth for the tool surface and flows through the normal entry
-    /// render path.
-    fn render_global_body(&self, provider: &str) -> Result<String> {
+    /// Body for a global provider file: provider-scoped global entries plus a
+    /// reference to the shared global include. Provider-neutral entries,
+    /// including the generated tool reference, live in BLACKBOX.md.
+    fn render_global_body(&self, provider: &str, common_path: &Path) -> Result<String> {
         let mut md = String::new();
-        self.render_steerage(provider, ScopeFilter::Global, &mut md);
-        self.render_memory(provider, ScopeFilter::Global, &mut md);
+        self.render_steerage_filtered(provider, ScopeFilter::Global, &mut md, |e| {
+            !e.providers.is_empty()
+        });
+        if provider == "gemini" {
+            render_global_common_include(provider, common_path, &mut md);
+            self.render_memory_filtered(provider, ScopeFilter::Global, &mut md, |e| {
+                !e.providers.is_empty()
+            });
+        } else {
+            self.render_memory_filtered(provider, ScopeFilter::Global, &mut md, |e| {
+                !e.providers.is_empty()
+            });
+            render_global_common_include(provider, common_path, &mut md);
+        }
+        Ok(md)
+    }
+
+    /// Body for the shared global include: provider-neutral global entries only.
+    fn render_global_common_body(&self) -> Result<String> {
+        let mut md = String::new();
+        self.render_steerage_filtered("agents", ScopeFilter::Global, &mut md, |e| {
+            e.providers.is_empty()
+        });
+        self.render_memory_filtered("agents", ScopeFilter::Global, &mut md, |e| {
+            e.providers.is_empty()
+        });
         Ok(md)
     }
 
     /// Body for a project file: project-scope steerage + project-scope memory
-    /// + PROJECT.md. No global content (that lives in the global render).
+    /// + a PROJECT.md include. No global content (that lives in the global
+    /// render).
     fn render_project_body(&self, provider: &str, project_dir: &str) -> Result<String> {
         let mut body = String::new();
         let filter = ScopeFilter::Project(project_dir);
@@ -1387,17 +1392,29 @@ impl Knowledge {
         // Gemini deprioritizes content at the bottom, so PROJECT.md goes
         // between steerage and memory instead of after both.
         if provider == "gemini" {
-            self.render_project_md(Some(project_dir), &mut body);
+            self.render_project_include(provider, Some(project_dir), &mut body);
             self.render_memory(provider, filter, &mut body);
         } else {
             self.render_memory(provider, filter, &mut body);
-            self.render_project_md(Some(project_dir), &mut body);
+            self.render_project_include(provider, Some(project_dir), &mut body);
         }
 
         Ok(body)
     }
 
     fn render_steerage(&self, provider: &str, filter: ScopeFilter, md: &mut String) {
+        self.render_steerage_filtered(provider, filter, md, |_| true);
+    }
+
+    fn render_steerage_filtered<F>(
+        &self,
+        provider: &str,
+        filter: ScopeFilter,
+        md: &mut String,
+        include: F,
+    ) where
+        F: Fn(&KnowledgeEntry) -> bool,
+    {
         let heading = match provider {
             "claude" => "## Standing Orders",
             "gemini" => "## Foundational Mandates",
@@ -1409,6 +1426,7 @@ impl Knowledge {
             .filter(|e| e.category == Category::Steering)
             .filter(|e| entry_visible_to(e, provider))
             .filter(|e| filter.matches(e))
+            .filter(|e| include(e))
             .collect();
 
         if !steerage.is_empty() {
@@ -1421,6 +1439,18 @@ impl Knowledge {
     }
 
     fn render_memory(&self, provider: &str, filter: ScopeFilter, md: &mut String) {
+        self.render_memory_filtered(provider, filter, md, |_| true);
+    }
+
+    fn render_memory_filtered<F>(
+        &self,
+        provider: &str,
+        filter: ScopeFilter,
+        md: &mut String,
+        include: F,
+    ) where
+        F: Fn(&KnowledgeEntry) -> bool,
+    {
         let memory_categories = [
             Category::Profile,
             Category::Convention,
@@ -1439,6 +1469,9 @@ impl Knowledge {
                 continue;
             }
             if !filter.matches(entry) {
+                continue;
+            }
+            if !include(entry) {
                 continue;
             }
             let heading = entry.category.heading();
@@ -1462,20 +1495,16 @@ impl Knowledge {
         }
     }
 
-    fn render_project_md(&self, project_dir: Option<&str>, md: &mut String) {
+    fn render_project_include(&self, provider: &str, project_dir: Option<&str>, md: &mut String) {
         if let Some(dir) = project_dir {
-            let project_md = Path::new(dir).join("PROJECT.md");
+            let project_md = Path::new(dir).join(PROJECT_DOC_FILE);
             if project_md.exists() {
-                let content = fs::read_to_string(&project_md).unwrap_or_default();
-                if !content.is_empty() {
-                    // Delimit PROJECT.md content with an HTML comment so absorb()
-                    // can recognize and skip it. No visible wrapper heading —
-                    // PROJECT.md's own top-level heading stands.
-                    md.push_str("<!-- bb:project-md -->\n");
-                    md.push_str(&content);
-                    if !content.ends_with('\n') {
-                        md.push('\n');
-                    }
+                if fs::metadata(&project_md)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+                {
+                    md.push_str(project_include_instruction(provider));
+                    md.push('\n');
                 }
             }
         }
@@ -1499,192 +1528,16 @@ impl Knowledge {
     }
 
     fn absorb_project(&mut self, project_dir: &str) -> Result<String> {
-        let files = vec![
-            ("CLAUDE.md", "claude"),
-            ("AGENTS.md", "agents"),
-            ("GEMINI.md", "gemini"),
-        ];
-
-        let mut absorbed = 0u32;
-        let mut disabled = 0u32;
-
-        // Track which provider files were actually scanned
-        let mut scanned_providers: Vec<String> = Vec::new();
-
-        // Collect all entry IDs found across ALL rendered files
-        let mut all_found_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for (filename, provider) in &files {
-            let path = Path::new(project_dir).join(filename);
-            if !path.exists() {
-                continue;
-            }
-            scanned_providers.push(provider.to_string());
-
-            let content = fs::read_to_string(&path)?;
-
-            for line in content.lines() {
-                if let Some(id) = extract_marker_id(line) {
-                    all_found_ids.insert(id);
-                }
-            }
-
-            // Find unmarked content blocks (external additions)
-            let unmarked = extract_unmarked_sections(&content);
-            for section in &unmarked {
-                if section.trim().is_empty() {
-                    continue;
-                }
-                // Skip the generated header
-                if section.contains("Generated by blackbox") {
-                    continue;
-                }
-                // Skip PROJECT.md content (it's included verbatim, not an entry).
-                // Recognize both the new bb:project-md marker and the legacy
-                // "## Project Details" wrapper that was in use pre-2026-04.
-                if section.contains("<!-- bb:project-md -->")
-                    || section.contains("## Project Details")
-                {
-                    continue;
-                }
-                // Skip render-emitted category headings (e.g. "## Standing Orders",
-                // "## Workflow") that sit between marker-wrapped entries. These
-                // are structural, not content — absorbing them creates junk
-                // entries like "## Tools [imported]" with no body.
-                if is_structural_only(section) {
-                    continue;
-                }
-
-                self.import_entry(
-                    section.trim().to_string(),
-                    Category::Memory,
-                    Scope::Project,
-                    Some(project_dir.to_string()),
-                )?;
-                absorbed += 1;
-            }
-        }
-
-        // Disable entries missing from scanned files. Project-file absorption
-        // only touches project-scope entries — global entries live in the
-        // provider's global-memory file and are absorbed separately.
-        for entry in &mut self.store.entries {
-            if entry.status != Status::Active {
-                continue;
-            }
-            if entry.scope != Scope::Project || entry.project.as_deref() != Some(project_dir) {
-                continue;
-            }
-            if !entry.render {
-                continue;
-            }
-            let visible_to_scanned = scanned_providers.iter().any(|p| entry_visible_to(entry, p));
-            if !visible_to_scanned {
-                continue;
-            }
-            if !all_found_ids.contains(&entry.id) {
-                entry.status = Status::Disabled;
-                entry.updated_at = Self::now_iso();
-                disabled += 1;
-            }
-        }
-
-        self.save()?;
         Ok(format!(
-            "Absorbed {} new entries, disabled {} removed entries (project scope)",
-            absorbed, disabled
+            "Project absorb is no-op for {project_dir}: project CLAUDE.md/AGENTS.md/GEMINI.md are unidirectional bbox projections. Use bbox_bootstrap to import hand-authored project instruction files, then bbox_render to publish."
         ))
     }
 
-    /// Absorb the managed regions of provider global-memory files.
-    /// Hand-authored content OUTSIDE the markers (RTK steerage, user
-    /// notes) is never touched — only the managed region is bbox's
-    /// territory. New unmarked content inside the managed region is
-    /// imported as global-scope Memory entries (Approval=Imported);
-    /// global entries missing from every scanned provider's managed
-    /// region are disabled.
+    /// Global provider files are unidirectional projections now. Bootstrap
+    /// imports hand-authored files; render publishes the store into compact
+    /// provider files plus a common include.
     fn absorb_global(&mut self) -> Result<String> {
-        let providers = ["claude", "codex", "gemini"];
-        let mut absorbed = 0u32;
-        let mut disabled = 0u32;
-        let mut scanned_providers: Vec<String> = Vec::new();
-        let mut all_found_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for prov in &providers {
-            let Some(target_res) = crate::render::global_target_path(prov) else {
-                continue;
-            };
-            let path = target_res?;
-            if !path.exists() {
-                continue;
-            }
-            let content = fs::read_to_string(&path)?;
-            let Some(managed) = crate::render::extract_managed_region(&content) else {
-                // No managed region yet — nothing to absorb. The user
-                // may have hand-authored everything; render will create
-                // the managed region next time.
-                continue;
-            };
-            scanned_providers.push(prov.to_string());
-
-            for line in managed.lines() {
-                if let Some(id) = extract_marker_id(line) {
-                    all_found_ids.insert(id);
-                }
-            }
-
-            for section in extract_unmarked_sections(managed) {
-                if section.trim().is_empty() {
-                    continue;
-                }
-                if section.contains("Generated by blackbox") {
-                    continue;
-                }
-                if is_structural_only(&section) {
-                    continue;
-                }
-                self.import_entry(
-                    section.trim().to_string(),
-                    Category::Memory,
-                    Scope::Global,
-                    None,
-                )?;
-                absorbed += 1;
-            }
-        }
-
-        for entry in &mut self.store.entries {
-            if entry.status != Status::Active {
-                continue;
-            }
-            if entry.scope != Scope::Global {
-                continue;
-            }
-            if !entry.render {
-                continue;
-            }
-            let visible_to_scanned = scanned_providers.iter().any(|p| entry_visible_to(entry, p));
-            if !visible_to_scanned {
-                continue;
-            }
-            if !all_found_ids.contains(&entry.id) {
-                entry.status = Status::Disabled;
-                entry.updated_at = Self::now_iso();
-                disabled += 1;
-            }
-        }
-
-        self.save()?;
-        Ok(format!(
-            "Absorbed {} new entries, disabled {} removed entries (global scope; scanned {})",
-            absorbed,
-            disabled,
-            if scanned_providers.is_empty() {
-                "no providers".to_string()
-            } else {
-                scanned_providers.join(", ")
-            }
-        ))
+        Ok("Global absorb is no-op: rendered global files are unidirectional bbox projections. Use bbox_bootstrap to import hand-authored instruction files before rendering.".to_string())
     }
 
     // ── Lint ───────────────────────────────────────────────────────
@@ -1919,7 +1772,6 @@ impl<'a> ScopeFilter<'a> {
 
 fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String) {
     for entry in entries {
-        out.push_str(&format!("<!-- bb:entry={} -->\n", entry.id));
         let mark = match entry.approval {
             Approval::AgentInferred => " *(unverified)*",
             Approval::Imported => " *(imported)*",
@@ -1933,7 +1785,6 @@ fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String)
         let content = entry.variants.get(provider).unwrap_or(&entry.content);
         out.push_str(content);
         out.push_str("\n\n");
-        out.push_str(&format!("<!-- /bb:entry={} -->\n", entry.id));
     }
 }
 
@@ -1962,6 +1813,29 @@ fn render_entries_grouped(entries: &[&KnowledgeEntry], provider: &str, out: &mut
     }
 }
 
+const PROJECT_DOC_FILE: &str = "PROJECT.md";
+
+fn project_include_instruction(_provider: &str) -> &'static str {
+    "Read @PROJECT.md fully before acting; it contains the shared project context and instructions.\n\n@PROJECT.md"
+}
+
+fn render_global_common_include(provider: &str, common_path: &Path, out: &mut String) {
+    if out.trim_end().is_empty() {
+        // no-op
+    } else {
+        out.push('\n');
+    }
+    out.push_str(global_common_include_instruction(provider, common_path).as_str());
+    out.push('\n');
+}
+
+fn global_common_include_instruction(_provider: &str, common_path: &Path) -> String {
+    let include = format!("@{}", common_path.display());
+    format!(
+        "Read {include} fully before acting; it contains the shared global blackbox instructions and tool reference.\n\n{include}"
+    )
+}
+
 fn target_file(provider: &str, _project_dir: Option<&str>) -> String {
     match provider {
         "claude" => "CLAUDE.md".to_string(),
@@ -1971,65 +1845,12 @@ fn target_file(provider: &str, _project_dir: Option<&str>) -> String {
     }
 }
 
-fn extract_marker_id(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.starts_with("<!-- bb:entry=") && trimmed.ends_with(" -->") {
-        let inner = &trimmed[14..trimmed.len() - 4];
-        Some(inner.to_string())
-    } else {
-        None
+fn should_write_project_projection(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(true);
     }
-}
-
-/// True if a candidate section contains only markdown headings and
-/// whitespace — i.e. render-emitted category separators like
-/// "## Standing Orders" sitting between marker-wrapped entries. These
-/// are structure, not absorbable content.
-fn is_structural_only(section: &str) -> bool {
-    let mut saw_heading = false;
-    for line in section.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with('#') {
-            saw_heading = true;
-            continue;
-        }
-        return false;
-    }
-    saw_heading
-}
-
-/// Extract sections of content that are NOT wrapped in bb:entry markers.
-fn extract_unmarked_sections(content: &str) -> Vec<String> {
-    let mut sections = Vec::new();
-    let mut current = String::new();
-    let mut in_entry = false;
-
-    for line in content.lines() {
-        if line.trim().starts_with("<!-- bb:entry=") && !line.trim().starts_with("<!-- /bb:entry=")
-        {
-            // Starting a marked entry — flush any unmarked content
-            if !current.trim().is_empty() {
-                sections.push(current.clone());
-            }
-            current.clear();
-            in_entry = true;
-        } else if line.trim().starts_with("<!-- /bb:entry=") {
-            in_entry = false;
-        } else if !in_entry {
-            current.push_str(line);
-            current.push('\n');
-        }
-    }
-
-    // Flush remaining
-    if !current.trim().is_empty() {
-        sections.push(current);
-    }
-
-    sections
+    let existing = fs::read_to_string(path)?;
+    Ok(existing.contains("<!-- Generated by blackbox"))
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
@@ -2213,65 +2034,6 @@ impl Knowledge {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn structural_only_skips_bare_category_headings() {
-        assert!(is_structural_only("## Standing Orders\n"));
-        assert!(is_structural_only("\n## Conventions\n\n"));
-        assert!(is_structural_only("## A\n## B\n"));
-    }
-
-    #[test]
-    fn structural_only_rejects_heading_with_body() {
-        assert!(!is_structural_only(
-            "## New thing\n\nuser-written body text\n"
-        ));
-    }
-
-    #[test]
-    fn structural_only_rejects_empty() {
-        // A wholly-blank section isn't structural content either — it's
-        // filtered separately by the empty-trim check in absorb(). Be
-        // explicit about the contract: we require at least one heading.
-        assert!(!is_structural_only(""));
-        assert!(!is_structural_only("\n\n"));
-    }
-
-    #[test]
-    fn extract_unmarked_returns_category_headings_between_entries() {
-        // Regression: absorb used to ingest these as junk "## Tools" etc.
-        // entries. The fix is is_structural_only skipping them; this test
-        // just pins the shape extract_unmarked_sections produces so future
-        // refactors don't silently change it.
-        let content = "\
-## Standing Orders
-
-<!-- bb:entry=abc -->
-body
-<!-- /bb:entry=abc -->
-
-## Conventions
-
-<!-- bb:entry=def -->
-body
-<!-- /bb:entry=def -->
-";
-        let sections = extract_unmarked_sections(content);
-        assert!(
-            sections.iter().any(|s| s.contains("## Standing Orders")),
-            "expected Standing Orders heading to surface as unmarked"
-        );
-        assert!(
-            sections.iter().any(|s| s.contains("## Conventions")),
-            "expected Conventions heading to surface as unmarked"
-        );
-        for s in &sections {
-            assert!(
-                is_structural_only(s),
-                "all extracted sections should be structural-only in this shape: {s:?}"
-            );
-        }
-    }
 
     fn mk_kb() -> (tempfile::TempDir, Knowledge) {
         let dir = tempfile::tempdir().unwrap();
@@ -2556,38 +2318,23 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD");
         std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD");
 
-        assert!(report.contains("global scope"), "report: {report}");
-        // The "New imported section" content should be absorbed.
+        assert!(
+            report.contains("Global absorb is no-op"),
+            "report: {report}"
+        );
+        // Rendered files are projections now; external additions are not
+        // imported back from provider files.
         let imported: Vec<_> = kb
             .store
             .entries
             .iter()
             .filter(|e| e.approval == Approval::Imported && e.scope == Scope::Global)
             .collect();
-        assert!(!imported.is_empty(), "expected at least one imported entry");
         assert!(
-            imported
-                .iter()
-                .any(|e| e.content.contains("New imported section")),
-            "expected 'New imported section' to be absorbed; got: {:?}",
-            imported.iter().map(|e| &e.content).collect::<Vec<_>>()
+            imported.is_empty(),
+            "projected files should not import entries"
         );
-        // User-authored content OUTSIDE the markers must NOT be absorbed.
-        assert!(
-            !kb.store
-                .entries
-                .iter()
-                .any(|e| e.content.contains("User-authored steerage outside")),
-            "user content outside markers leaked into absorb"
-        );
-        assert!(
-            !kb.store
-                .entries
-                .iter()
-                .any(|e| e.content.contains("More user content after")),
-            "user content after markers leaked into absorb"
-        );
-        // The missing entry should be disabled.
+        // Missing rendered markers no longer disable entries.
         let stale = kb
             .store
             .entries
@@ -2596,8 +2343,8 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .unwrap();
         assert_eq!(
             stale.status,
-            Status::Disabled,
-            "missing entry should be disabled"
+            Status::Active,
+            "projection no-op should not disable missing entries"
         );
         // The existing tracked entry should remain Active.
         let existing = kb
@@ -2638,7 +2385,10 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD");
         std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD");
 
-        assert!(report.contains("Absorbed 0"), "report: {report}");
+        assert!(
+            report.contains("Global absorb is no-op"),
+            "report: {report}"
+        );
         assert!(kb
             .store
             .entries
@@ -2938,6 +2688,219 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             cluster_idx < first_clustered,
             "cluster heading should precede grouped entries: {out}"
         );
+    }
+
+    #[test]
+    fn render_project_body_references_project_md_instead_of_embedding() {
+        let (project_dir, mut kb) = mk_kb();
+        let project = project_dir.path().to_str().unwrap();
+        fs::write(
+            project_dir.path().join(PROJECT_DOC_FILE),
+            "# Project\n\nshared project details\n",
+        )
+        .unwrap();
+        kb.store.entries.push(KnowledgeEntry {
+            id: "mem00001".into(),
+            title: "Local rule".into(),
+            content: "provider-specific project memory".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Memory,
+            scope: Scope::Project,
+            project: Some(project.into()),
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        });
+
+        let out = kb
+            .render_project_body("claude", project)
+            .expect("render should succeed");
+
+        assert!(out.contains("**Local rule**"));
+        assert!(out.contains("@PROJECT.md"));
+        assert!(!out.contains("shared project details"));
+        let memory_idx = out.find("**Local rule**").unwrap();
+        let project_idx = out.find("@PROJECT.md").unwrap();
+        assert!(
+            memory_idx < project_idx,
+            "claude should keep PROJECT.md include after project memory: {out}"
+        );
+    }
+
+    #[test]
+    fn render_project_body_places_gemini_project_include_before_memory() {
+        let (project_dir, mut kb) = mk_kb();
+        let project = project_dir.path().to_str().unwrap();
+        fs::write(project_dir.path().join(PROJECT_DOC_FILE), "# Project\n").unwrap();
+        kb.store.entries.push(KnowledgeEntry {
+            id: "mem00002".into(),
+            title: "Gemini local rule".into(),
+            content: "provider-specific project memory".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Memory,
+            scope: Scope::Project,
+            project: Some(project.into()),
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        });
+
+        let out = kb
+            .render_project_body("gemini", project)
+            .expect("render should succeed");
+
+        let project_idx = out.find("@PROJECT.md").unwrap();
+        let memory_idx = out.find("**Gemini local rule**").unwrap();
+        assert!(
+            project_idx < memory_idx,
+            "gemini should keep PROJECT.md include before project memory: {out}"
+        );
+    }
+
+    #[test]
+    fn render_global_splits_common_entries_into_shared_include() {
+        let (tmp, mut kb) = mk_kb();
+        kb.store.entries.push(KnowledgeEntry {
+            id: "common01".into(),
+            title: "Common global rule".into(),
+            content: "provider-neutral global body".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Convention,
+            scope: Scope::Global,
+            project: None,
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 10,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        });
+        kb.store.entries.push(KnowledgeEntry {
+            id: "claude01".into(),
+            title: "Claude-only rule".into(),
+            content: "claude-specific global body".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Convention,
+            scope: Scope::Global,
+            project: None,
+            providers: vec!["claude".into()],
+            priority: Priority::Standard,
+            weight: 20,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        });
+
+        let common_path = tmp.path().join("BLACKBOX.md");
+        let common = kb.render_global_common_body().unwrap();
+        let claude = kb.render_global_body("claude", &common_path).unwrap();
+
+        assert!(common.contains("**Common global rule**"));
+        assert!(common.contains("provider-neutral global body"));
+        assert!(!common.contains("Claude-only rule"));
+        assert!(claude.contains("**Claude-only rule**"));
+        assert!(claude.contains(&format!("@{}", common_path.display())));
+        assert!(!claude.contains("provider-neutral global body"));
+        assert!(!common.contains("bb:entry"));
+        assert!(!claude.contains("bb:entry"));
+    }
+
+    #[test]
+    fn render_project_refuses_to_overwrite_hand_authored_provider_file() {
+        let (project_dir, mut kb) = mk_kb();
+        let project = project_dir.path().to_str().unwrap();
+        fs::write(project_dir.path().join(PROJECT_DOC_FILE), "# Project\n").unwrap();
+        fs::write(project_dir.path().join("CLAUDE.md"), "hand authored\n").unwrap();
+
+        kb.store.entries.push(KnowledgeEntry {
+            id: "mem00003".into(),
+            title: "Local rule".into(),
+            content: "project memory".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Memory,
+            scope: Scope::Project,
+            project: Some(project.into()),
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        });
+
+        let report = kb
+            .render(&RenderParams {
+                provider: Some("claude".into()),
+                project: Some(project.into()),
+                scope: Some("project".into()),
+                dry_run: Some(false),
+            })
+            .unwrap();
+
+        assert!(report.contains("Refused project"), "report: {report}");
+        let existing = fs::read_to_string(project_dir.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(existing, "hand authored\n");
     }
 
     #[test]

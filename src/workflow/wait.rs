@@ -32,7 +32,11 @@ pub struct WaitSpec {
     /// Optional timeout. On expiry, the arc resumes with a synthetic
     /// `__timeout__` signal. If absent, the arc waits indefinitely
     /// (suitable for never-firing-but-cancellable arcs).
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "duration_secs_opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "duration_secs_opt"
+    )]
     pub timeout: Option<Duration>,
 }
 
@@ -127,9 +131,9 @@ impl WaitStore {
         String, // wait_id
     )> {
         let mut pending = self.pending.write();
-        let idx = pending
-            .iter()
-            .position(|p| p.signal == signal_name && matches_correlation(&p.correlation, correlation))?;
+        let idx = pending.iter().position(|p| {
+            p.signal == signal_name && matches_correlation(&p.correlation, correlation)
+        })?;
         let p = pending.remove(idx);
         Some((p.resolved, p.notify, p.arc_id, p.wait_id))
     }
@@ -175,23 +179,20 @@ mod duration_secs_opt {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;
 
-    pub fn serialize<S: Serializer>(
-        value: &Option<Duration>,
-        ser: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(value: &Option<Duration>, ser: S) -> Result<S::Ok, S::Error> {
         match value {
             Some(d) => format!("{}s", d.as_secs()).serialize(ser),
             None => ser.serialize_none(),
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        de: D,
-    ) -> Result<Option<Duration>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Duration>, D::Error> {
         let opt: Option<String> = Option::deserialize(de)?;
         match opt {
             None => Ok(None),
-            Some(s) => parse_duration(&s).map(Some).map_err(serde::de::Error::custom),
+            Some(s) => parse_duration(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
         }
     }
 
@@ -221,7 +222,10 @@ mod tests {
     use serde_json::json;
 
     fn map(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     #[test]

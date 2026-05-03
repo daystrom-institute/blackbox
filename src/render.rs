@@ -52,6 +52,23 @@ pub fn global_target_path(provider: &str) -> Option<Result<PathBuf>> {
     }
 }
 
+/// Shared global-memory destination for provider-neutral content. Provider
+/// global files stay small and include this by reference.
+///
+/// Env override: `BLACKBOX_GLOBAL_COMMON_MD`.
+pub fn global_common_target_path() -> Result<PathBuf> {
+    if let Ok(v) = std::env::var("BLACKBOX_GLOBAL_COMMON_MD") {
+        return Ok(PathBuf::from(v));
+    }
+    let home = dirs::home_dir().context("home directory not found")?;
+    let shared = home.join(".claude-shared");
+    Ok(if shared.is_dir() {
+        shared.join("BLACKBOX.md")
+    } else {
+        home.join(".claude").join("BLACKBOX.md")
+    })
+}
+
 /// A planned managed-region patch. Each variant carries exactly the data
 /// relevant to its case — no optionals, no "this field is only set for
 /// that outcome" foot-guns. `apply_managed_patch` pattern-matches on this
