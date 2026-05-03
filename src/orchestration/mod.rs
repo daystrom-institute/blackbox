@@ -863,7 +863,7 @@ pub fn spawn_task(
             }
         }
 
-        if provider == Provider::Opencode {
+        if matches!(provider, Provider::Glm | Provider::Deepseek) {
             let session_id = {
                 let inner = task_ref_wait.inner.lock();
                 (inner.session_id != "pending").then(|| inner.session_id.clone())

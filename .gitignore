@@ -1,4 +1,5 @@
 /target/
+/.claude/
 /.dev-agent/
 /.dev-agent-links
 /.direnv/

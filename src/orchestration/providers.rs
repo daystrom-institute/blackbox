@@ -12,9 +12,10 @@ use serde_json::Value;
 #[strum(serialize_all = "lowercase")]
 pub enum Provider {
     Claude,
-    #[serde(alias = "glm")]
-    #[strum(serialize = "opencode", serialize = "glm")]
-    Opencode,
+    #[serde(alias = "opencode")]
+    #[strum(serialize = "glm", serialize = "opencode")]
+    Glm,
+    Deepseek,
     Codex,
     Copilot,
     Vibe,
@@ -66,7 +67,8 @@ pub enum Capability {
 impl Provider {
     pub const ALL: &[Provider] = &[
         Provider::Claude,
-        Provider::Opencode,
+        Provider::Glm,
+        Provider::Deepseek,
         Provider::Codex,
         Provider::Copilot,
         Provider::Vibe,
@@ -84,7 +86,8 @@ impl Provider {
         let v: &[Capability] = match self {
             Provider::Claude => &[StructuredOutput, Vision, LongContext, ToolUse, Resume],
             Provider::Codex => &[StructuredOutput, ToolUse, Resume],
-            Provider::Opencode => &[ToolUse, Resume],
+            Provider::Glm => &[ToolUse, Resume],
+            Provider::Deepseek => &[ToolUse, Resume],
             Provider::Copilot => &[ToolUse, Resume],
             Provider::Gemini => &[Vision, ToolUse],
             Provider::Vibe => &[],
@@ -95,7 +98,8 @@ impl Provider {
     pub fn as_str(&self) -> &'static str {
         match self {
             Provider::Claude => "claude",
-            Provider::Opencode => "opencode",
+            Provider::Glm => "glm",
+            Provider::Deepseek => "deepseek",
             Provider::Codex => "codex",
             Provider::Copilot => "copilot",
             Provider::Vibe => "vibe",
@@ -106,7 +110,8 @@ impl Provider {
     pub fn bin(&self) -> String {
         match self {
             Provider::Claude => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
-            Provider::Opencode => {
+            Provider::Glm => std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into()),
+            Provider::Deepseek => {
                 std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into())
             }
             Provider::Codex => std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into()),
@@ -120,7 +125,8 @@ impl Provider {
         matches!(
             self,
             Provider::Claude
-                | Provider::Opencode
+                | Provider::Glm
+                | Provider::Deepseek
                 | Provider::Codex
                 | Provider::Copilot
                 | Provider::Vibe
@@ -131,14 +137,19 @@ impl Provider {
     pub fn is_streaming_json(&self) -> bool {
         matches!(
             self,
-            Provider::Claude | Provider::Opencode | Provider::Codex | Provider::Copilot
+            Provider::Claude
+                | Provider::Glm
+                | Provider::Deepseek
+                | Provider::Codex
+                | Provider::Copilot
         )
     }
 
     pub fn models(&self) -> &'static [ModelInfo] {
         match self {
             Provider::Claude => CLAUDE_MODELS,
-            Provider::Opencode => OPENCODE_MODELS,
+            Provider::Glm => GLM_MODELS,
+            Provider::Deepseek => DEEPSEEK_MODELS,
             Provider::Codex => CODEX_MODELS,
             Provider::Copilot => COPILOT_MODELS,
             Provider::Vibe => VIBE_MODELS,
@@ -149,7 +160,8 @@ impl Provider {
     pub fn efforts(&self) -> &'static [EffortInfo] {
         match self {
             Provider::Claude => CLAUDE_EFFORTS,
-            Provider::Opencode => OPENCODE_VARIANTS,
+            Provider::Glm => OPENCODE_VARIANTS,
+            Provider::Deepseek => OPENCODE_VARIANTS,
             Provider::Codex => CODEX_EFFORTS,
             Provider::Copilot => COPILOT_EFFORTS,
             _ => &[],
@@ -271,7 +283,7 @@ impl Provider {
                 }
                 args
             }
-            Provider::Opencode => {
+            Provider::Glm | Provider::Deepseek => {
                 let mut args = vec![
                     "run".into(),
                     "--format".into(),
@@ -360,7 +372,7 @@ impl Provider {
     pub fn resolve_session_cwd(&self, session_id: &str) -> Option<std::path::PathBuf> {
         match self {
             Provider::Claude => resolve_claude_session_cwd(session_id),
-            Provider::Opencode => None,
+            Provider::Glm | Provider::Deepseek => None,
             Provider::Codex => resolve_codex_session_cwd(session_id),
             Provider::Gemini => resolve_gemini_session_cwd(session_id),
             Provider::Copilot | Provider::Vibe => None,
@@ -401,7 +413,7 @@ impl Provider {
                 }
                 args
             }
-            Provider::Opencode => {
+            Provider::Glm | Provider::Deepseek => {
                 let mut args = vec![
                     "run".into(),
                     "--format".into(),
@@ -574,7 +586,7 @@ impl Provider {
                 args.extend([name.into(), url.into()]);
                 Some(args)
             }
-            Provider::Opencode => None,
+            Provider::Glm | Provider::Deepseek => None,
             Provider::Copilot => {
                 if scope != "user" {
                     return None;
@@ -661,7 +673,7 @@ impl Provider {
                     name.into(),
                 ])
             }
-            Provider::Opencode => None,
+            Provider::Glm | Provider::Deepseek => None,
             Provider::Copilot => {
                 if scope != "user" {
                     return None;
@@ -701,7 +713,7 @@ impl Provider {
     pub fn build_mcp_list_args(&self) -> Option<Vec<String>> {
         match self {
             Provider::Claude => Some(vec!["mcp".into(), "list".into()]),
-            Provider::Opencode => None,
+            Provider::Glm | Provider::Deepseek => None,
             Provider::Copilot => Some(vec![
                 "copilot".into(),
                 "--".into(),
@@ -771,7 +783,7 @@ impl Provider {
                     args.push(expanded_allow.join(" "));
                 }
             }
-            Provider::Opencode => {}
+            Provider::Glm | Provider::Deepseek => {}
             Provider::Copilot => {
                 // Copilot's --deny-tool / --allow-tool expect
                 // `ServerName(tool_name)` format, not the MCP-prefixed
@@ -1029,7 +1041,7 @@ impl Provider {
     pub fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
         match self {
             Provider::Claude => parse_claude_event(evt, sink),
-            Provider::Opencode => parse_opencode_event(evt, sink),
+            Provider::Glm | Provider::Deepseek => parse_opencode_event(evt, sink),
             Provider::Codex => parse_codex_event(evt, sink),
             Provider::Copilot => parse_copilot_event(evt, sink),
             Provider::Vibe => parse_vibe_event(evt, sink),
@@ -1048,7 +1060,7 @@ impl Provider {
 
     pub fn build_export_args(&self, session_id: &str) -> Option<Vec<String>> {
         match self {
-            Provider::Opencode => Some(vec!["export".into(), session_id.into()]),
+            Provider::Glm | Provider::Deepseek => Some(vec!["export".into(), session_id.into()]),
             _ => None,
         }
     }
@@ -1769,7 +1781,7 @@ static CLAUDE_MODELS: &[ModelInfo] = &[
     },
 ];
 
-static OPENCODE_MODELS: &[ModelInfo] = &[
+static GLM_MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "zai-coding-plan/glm-5.1",
         description: "Z.AI Coding Plan flagship GLM model via OpenCode",
@@ -1833,6 +1845,29 @@ static OPENCODE_MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "zai-coding-plan/glm-5v-turbo",
         description: "Vision-capable GLM model via OpenCode",
+        default: false,
+    },
+];
+
+static DEEPSEEK_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "deepseek/deepseek-v4-pro",
+        description: "DeepSeek 4.1 Pro / V4 Pro reasoning model via OpenCode",
+        default: true,
+    },
+    ModelInfo {
+        id: "deepseek/deepseek-v4-flash",
+        description: "Fast DeepSeek V4 model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "deepseek/deepseek-reasoner",
+        description: "DeepSeek reasoning model via OpenCode",
+        default: false,
+    },
+    ModelInfo {
+        id: "deepseek/deepseek-chat",
+        description: "DeepSeek chat model via OpenCode",
         default: false,
     },
 ];
@@ -2033,6 +2068,7 @@ mod tests {
         for p in Provider::ALL {
             assert_eq!(Provider::from_str(p.as_str()).ok(), Some(*p));
         }
+        assert_eq!(Provider::from_str("opencode").ok(), Some(Provider::Glm));
         assert!(Provider::from_str("unknown").is_err());
     }
 

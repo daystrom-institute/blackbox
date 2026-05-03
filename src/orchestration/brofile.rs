@@ -194,34 +194,6 @@ pub fn effective_account(
         .or_else(|| provider_default_account(provider, store_dir))
 }
 
-fn load_settings_env(config_dir: &Path) -> HashMap<String, String> {
-    let settings_path = config_dir.join("settings.json");
-    let data = match fs::read_to_string(&settings_path) {
-        Ok(data) => data,
-        Err(_) => return HashMap::new(),
-    };
-
-    let value: Value = match serde_json::from_str(&data) {
-        Ok(value) => value,
-        Err(_) => return HashMap::new(),
-    };
-
-    value
-        .get("env")
-        .and_then(Value::as_object)
-        .map(|env| {
-            env.iter()
-                .filter_map(|(key, value)| match value {
-                    Value::String(s) => Some((key.clone(), s.clone())),
-                    Value::Number(n) => Some((key.clone(), n.to_string())),
-                    Value::Bool(b) => Some((key.clone(), b.to_string())),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn write_json_file(path: &Path, value: &Value) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -231,38 +203,45 @@ fn write_json_file(path: &Path, value: &Value) {
     }
 }
 
-fn default_opencode_config_path(store_dir: &Path) -> PathBuf {
-    store_dir.join("generated").join("opencode.json")
+fn default_opencode_config_path(store_dir: &Path, provider: Provider) -> PathBuf {
+    store_dir
+        .join("generated")
+        .join(format!("{}-opencode.json", provider.as_str()))
 }
 
-fn opencode_model_defaults(model: Option<&str>) -> (&str, &str) {
-    match model.map(str::trim).filter(|m| !m.is_empty()) {
-        Some(model) => (model, "zai-coding-plan/glm-4.5-air"),
-        None => ("zai-coding-plan/glm-5.1", "zai-coding-plan/glm-4.5-air"),
+struct OpencodeProfile {
+    default_model: &'static str,
+    small_model: &'static str,
+}
+
+fn opencode_profile(provider: Provider) -> Option<OpencodeProfile> {
+    match provider {
+        Provider::Glm => Some(OpencodeProfile {
+            default_model: "zai-coding-plan/glm-5.1",
+            small_model: "zai-coding-plan/glm-4.5-air",
+        }),
+        Provider::Deepseek => Some(OpencodeProfile {
+            default_model: "deepseek/deepseek-v4-pro",
+            small_model: "deepseek/deepseek-chat",
+        }),
+        _ => None,
     }
 }
 
-fn build_opencode_config(model: Option<&str>) -> Value {
-    let (model, small_model) = opencode_model_defaults(model);
-    let provider_id = model.split('/').next().unwrap_or_default();
+fn build_opencode_config(provider: Provider, model: Option<&str>) -> Value {
+    let profile = opencode_profile(provider).expect("provider must be OpenCode-backed");
+    let model = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(profile.default_model);
     let mut config = serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
         "model": model,
-        "small_model": small_model,
+        "small_model": profile.small_model,
         "tools": {
             "blackbox_bro_*": false
         }
     });
-
-    if provider_id == "zai-coding-plan" {
-        config["provider"] = serde_json::json!({
-            "zai-coding-plan": {
-                "options": {
-                    "apiKey": "{env:ANTHROPIC_AUTH_TOKEN}"
-                }
-            }
-        });
-    }
 
     if let Some(url) = super::providers::transient_blackbox_url() {
         config["mcp"] = serde_json::json!({
@@ -278,18 +257,13 @@ fn build_opencode_config(model: Option<&str>) -> Value {
 }
 
 fn default_opencode_env(
+    provider: Provider,
     store_dir: &Path,
-    home_dir: &Path,
     model: Option<&str>,
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
-    let settings_env = load_settings_env(&home_dir.join(".claude-zai"));
-    if let Some(token) = settings_env.get("ANTHROPIC_AUTH_TOKEN") {
-        env.insert("ANTHROPIC_AUTH_TOKEN".into(), token.clone());
-    }
-
-    let config_path = default_opencode_config_path(store_dir);
-    write_json_file(&config_path, &build_opencode_config(model));
+    let config_path = default_opencode_config_path(store_dir, provider);
+    write_json_file(&config_path, &build_opencode_config(provider, model));
     env.insert(
         "OPENCODE_CONFIG".into(),
         config_path.to_string_lossy().into_owned(),
@@ -341,7 +315,7 @@ fn synthesized_account_env_for_home(
         Provider::Codex => ("CODEX_HOME", format!(".codex{suffix}")),
         // `gh` respects GH_CONFIG_DIR; keep the same account suffix pattern.
         Provider::Copilot => ("GH_CONFIG_DIR", format!(".config/gh{suffix}")),
-        Provider::Opencode | Provider::Gemini | Provider::Vibe => return None,
+        Provider::Glm | Provider::Deepseek | Provider::Gemini | Provider::Vibe => return None,
     };
 
     Some(HashMap::from([(
@@ -357,16 +331,13 @@ pub fn resolve_provider_env(
     store_dir: &Path,
 ) -> Option<HashMap<String, String>> {
     let account_name = effective_account(provider, account_name, store_dir);
-    let mut env = dirs::home_dir()
-        .as_deref()
-        .map(|home| match provider {
-            Provider::Opencode => default_opencode_env(store_dir, home, model),
-            _ => HashMap::new(),
-        })
-        .unwrap_or_default();
+    let mut env = match provider {
+        Provider::Glm | Provider::Deepseek => default_opencode_env(provider, store_dir, model),
+        _ => HashMap::new(),
+    };
 
     if let Some(account_name) = account_name.as_deref() {
-        if provider != Provider::Opencode {
+        if !matches!(provider, Provider::Glm | Provider::Deepseek) {
             if let Some(account_env) = dirs::home_dir()
                 .as_deref()
                 .and_then(|home| synthesized_account_env_for_home(provider, account_name, home))
@@ -665,25 +636,16 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_provider_env_defaults_opencode_zai_config() {
+    fn test_resolve_provider_env_defaults_glm_opencode_config() {
         let store = temp_store();
         let home = temp_store();
-        let config_dir = home.path().join(".claude-zai");
-        fs::create_dir_all(&config_dir).unwrap();
-        fs::write(
-            config_dir.join("settings.json"),
-            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"token-from-settings"}} "#,
-        )
-        .unwrap();
 
         let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Opencode, None, None, store.path()).unwrap()
+            resolve_provider_env(Provider::Glm, None, None, store.path()).unwrap()
         });
-        assert_eq!(
-            resolved.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
-            Some("token-from-settings")
-        );
+        assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
         let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
+        assert!(config_path.ends_with("glm-opencode.json"));
         let config = fs::read_to_string(config_path).unwrap();
         assert!(config.contains("\"model\": \"zai-coding-plan/glm-5.1\""));
         assert!(config.contains("\"small_model\": \"zai-coding-plan/glm-4.5-air\""));
@@ -691,20 +653,13 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_provider_env_opencode_model_override_updates_config() {
+    fn test_resolve_provider_env_glm_model_override_updates_opencode_config() {
         let store = temp_store();
         let home = temp_store();
-        let config_dir = home.path().join(".claude-zai");
-        fs::create_dir_all(&config_dir).unwrap();
-        fs::write(
-            config_dir.join("settings.json"),
-            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"token-from-settings"}} "#,
-        )
-        .unwrap();
 
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(
-                Provider::Opencode,
+                Provider::Glm,
                 Some("yoloz"),
                 Some("zai-coding-plan/glm-4.7"),
                 store.path(),
@@ -714,5 +669,31 @@ mod tests {
         let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
         let config = fs::read_to_string(config_path).unwrap();
         assert!(config.contains("\"model\": \"zai-coding-plan/glm-4.7\""));
+    }
+
+    #[test]
+    fn test_build_opencode_config_defaults_deepseek_model() {
+        let config = build_opencode_config(Provider::Deepseek, None);
+        assert_eq!(
+            config.get("model").and_then(Value::as_str),
+            Some("deepseek/deepseek-v4-pro")
+        );
+        assert_eq!(
+            config.get("small_model").and_then(Value::as_str),
+            Some("deepseek/deepseek-chat")
+        );
+        assert!(config.get("provider").is_none());
+    }
+
+    #[test]
+    fn test_resolve_provider_env_defaults_deepseek_opencode_config() {
+        let store = temp_store();
+
+        let resolved = resolve_provider_env(Provider::Deepseek, None, None, store.path()).unwrap();
+        let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
+        assert!(config_path.ends_with("deepseek-opencode.json"));
+        let config = fs::read_to_string(config_path).unwrap();
+        assert!(config.contains("\"model\": \"deepseek/deepseek-v4-pro\""));
+        assert!(config.contains("\"small_model\": \"deepseek/deepseek-chat\""));
     }
 }
