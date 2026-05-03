@@ -863,7 +863,10 @@ pub fn spawn_task(
             }
         }
 
-        if matches!(provider, Provider::Glm | Provider::Deepseek) {
+        if matches!(
+            provider,
+            Provider::Glm | Provider::Deepseek | Provider::Inception
+        ) {
             let session_id = {
                 let inner = task_ref_wait.inner.lock();
                 (inner.session_id != "pending").then(|| inner.session_id.clone())

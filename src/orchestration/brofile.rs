@@ -224,6 +224,10 @@ fn opencode_profile(provider: Provider) -> Option<OpencodeProfile> {
             default_model: "deepseek/deepseek-v4-pro",
             small_model: "deepseek/deepseek-chat",
         }),
+        Provider::Inception => Some(OpencodeProfile {
+            default_model: "inception/mercury-2",
+            small_model: "inception/mercury-2",
+        }),
         _ => None,
     }
 }
@@ -315,7 +319,11 @@ fn synthesized_account_env_for_home(
         Provider::Codex => ("CODEX_HOME", format!(".codex{suffix}")),
         // `gh` respects GH_CONFIG_DIR; keep the same account suffix pattern.
         Provider::Copilot => ("GH_CONFIG_DIR", format!(".config/gh{suffix}")),
-        Provider::Glm | Provider::Deepseek | Provider::Gemini | Provider::Vibe => return None,
+        Provider::Glm
+        | Provider::Deepseek
+        | Provider::Inception
+        | Provider::Gemini
+        | Provider::Vibe => return None,
     };
 
     Some(HashMap::from([(
@@ -332,12 +340,17 @@ pub fn resolve_provider_env(
 ) -> Option<HashMap<String, String>> {
     let account_name = effective_account(provider, account_name, store_dir);
     let mut env = match provider {
-        Provider::Glm | Provider::Deepseek => default_opencode_env(provider, store_dir, model),
+        Provider::Glm | Provider::Deepseek | Provider::Inception => {
+            default_opencode_env(provider, store_dir, model)
+        }
         _ => HashMap::new(),
     };
 
     if let Some(account_name) = account_name.as_deref() {
-        if !matches!(provider, Provider::Glm | Provider::Deepseek) {
+        if !matches!(
+            provider,
+            Provider::Glm | Provider::Deepseek | Provider::Inception
+        ) {
             if let Some(account_env) = dirs::home_dir()
                 .as_deref()
                 .and_then(|home| synthesized_account_env_for_home(provider, account_name, home))
@@ -695,5 +708,18 @@ mod tests {
         let config = fs::read_to_string(config_path).unwrap();
         assert!(config.contains("\"model\": \"deepseek/deepseek-v4-pro\""));
         assert!(config.contains("\"small_model\": \"deepseek/deepseek-chat\""));
+    }
+
+    #[test]
+    fn test_resolve_provider_env_defaults_inception_opencode_config() {
+        let store = temp_store();
+
+        let resolved = resolve_provider_env(Provider::Inception, None, None, store.path()).unwrap();
+        let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
+        assert!(config_path.ends_with("inception-opencode.json"));
+        let config = fs::read_to_string(config_path).unwrap();
+        assert!(config.contains("\"model\": \"inception/mercury-2\""));
+        assert!(config.contains("\"small_model\": \"inception/mercury-2\""));
+        assert!(!config.contains("mercury-edit-2"));
     }
 }

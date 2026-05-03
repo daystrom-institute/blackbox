@@ -31,7 +31,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now blackbox.service
 ```
 
-One daemon serves every Claude / GLM / DeepSeek / Codex / Gemini / Copilot / Vibe CLI on the host, so they all share the same tantivy index, knowledge store, and orchestration state. Prod and dev should use separate installed daemon paths even when they come from the same built artifact, so restarting the dev unit never mutates the prod service binary in place. Upgrades: rebuild, `install` (atomic), `systemctl --user restart blackbox`.
+One daemon serves every Claude / GLM / DeepSeek / Inception / Codex / Gemini / Copilot / Vibe CLI on the host, so they all share the same tantivy index, knowledge store, and orchestration state. Prod and dev should use separate installed daemon paths even when they come from the same built artifact, so restarting the dev unit never mutates the prod service binary in place. Upgrades: rebuild, `install` (atomic), `systemctl --user restart blackbox`.
 
 Logs live in journald:
 ```bash
@@ -375,7 +375,7 @@ See [Knowledge lifecycle](#knowledge-lifecycle) for the narrative — quick refe
 
 ### Multi-provider orchestration (`bro_*`)
 
-Dispatch agent tasks to Claude, GLM, DeepSeek, Codex, Copilot, Vibe, or Gemini and coordinate them as teams.
+Dispatch agent tasks to Claude, GLM, DeepSeek, Inception, Codex, Copilot, Vibe, or Gemini and coordinate them as teams.
 
 | Tool | Description |
 |---|---|
@@ -448,6 +448,7 @@ Maintained in `src/orchestration/providers.rs`:
 - **Claude** — Opus 4.7 (default, 1M context built-in), Opus 4.6, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`; `xhigh` is Opus-4.7-only, `max` unsupported on Haiku). Runs with `--include-partial-messages` so progress notifiers see true delta streaming.
 - **GLM** — Z.AI Coding Plan API models via OpenCode transport. Defaults to `zai-coding-plan/glm-5.1`, helper model `zai-coding-plan/glm-4.5-air`, and OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
 - **DeepSeek** — DeepSeek API models via OpenCode transport. Defaults to `deepseek/deepseek-v4-pro`, helper model `deepseek/deepseek-chat`, and OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
+- **Inception** — Inception Mercury via OpenCode transport. Exposes only `inception/mercury-2` as the default/tool-capable model, with OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
 - **Codex** — gpt-5.4 family. Efforts `minimal`/`low`/`medium`/`high`/`xhigh`.
 - **Copilot** — Anthropic + OpenAI models. Efforts `low`/`medium`/`high`/`xhigh`.
 - **Vibe**, **Gemini** — model lists only.

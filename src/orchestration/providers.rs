@@ -16,6 +16,7 @@ pub enum Provider {
     #[strum(serialize = "glm", serialize = "opencode")]
     Glm,
     Deepseek,
+    Inception,
     Codex,
     Copilot,
     Vibe,
@@ -69,6 +70,7 @@ impl Provider {
         Provider::Claude,
         Provider::Glm,
         Provider::Deepseek,
+        Provider::Inception,
         Provider::Codex,
         Provider::Copilot,
         Provider::Vibe,
@@ -88,6 +90,7 @@ impl Provider {
             Provider::Codex => &[StructuredOutput, ToolUse, Resume],
             Provider::Glm => &[ToolUse, Resume],
             Provider::Deepseek => &[ToolUse, Resume],
+            Provider::Inception => &[ToolUse, Resume],
             Provider::Copilot => &[ToolUse, Resume],
             Provider::Gemini => &[Vision, ToolUse],
             Provider::Vibe => &[],
@@ -100,6 +103,7 @@ impl Provider {
             Provider::Claude => "claude",
             Provider::Glm => "glm",
             Provider::Deepseek => "deepseek",
+            Provider::Inception => "inception",
             Provider::Codex => "codex",
             Provider::Copilot => "copilot",
             Provider::Vibe => "vibe",
@@ -112,6 +116,9 @@ impl Provider {
             Provider::Claude => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
             Provider::Glm => std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into()),
             Provider::Deepseek => {
+                std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into())
+            }
+            Provider::Inception => {
                 std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into())
             }
             Provider::Codex => std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into()),
@@ -127,6 +134,7 @@ impl Provider {
             Provider::Claude
                 | Provider::Glm
                 | Provider::Deepseek
+                | Provider::Inception
                 | Provider::Codex
                 | Provider::Copilot
                 | Provider::Vibe
@@ -140,6 +148,7 @@ impl Provider {
             Provider::Claude
                 | Provider::Glm
                 | Provider::Deepseek
+                | Provider::Inception
                 | Provider::Codex
                 | Provider::Copilot
         )
@@ -150,6 +159,7 @@ impl Provider {
             Provider::Claude => CLAUDE_MODELS,
             Provider::Glm => GLM_MODELS,
             Provider::Deepseek => DEEPSEEK_MODELS,
+            Provider::Inception => INCEPTION_MODELS,
             Provider::Codex => CODEX_MODELS,
             Provider::Copilot => COPILOT_MODELS,
             Provider::Vibe => VIBE_MODELS,
@@ -162,6 +172,7 @@ impl Provider {
             Provider::Claude => CLAUDE_EFFORTS,
             Provider::Glm => OPENCODE_VARIANTS,
             Provider::Deepseek => OPENCODE_VARIANTS,
+            Provider::Inception => OPENCODE_VARIANTS,
             Provider::Codex => CODEX_EFFORTS,
             Provider::Copilot => COPILOT_EFFORTS,
             _ => &[],
@@ -283,7 +294,7 @@ impl Provider {
                 }
                 args
             }
-            Provider::Glm | Provider::Deepseek => {
+            Provider::Glm | Provider::Deepseek | Provider::Inception => {
                 let mut args = vec![
                     "run".into(),
                     "--format".into(),
@@ -372,7 +383,7 @@ impl Provider {
     pub fn resolve_session_cwd(&self, session_id: &str) -> Option<std::path::PathBuf> {
         match self {
             Provider::Claude => resolve_claude_session_cwd(session_id),
-            Provider::Glm | Provider::Deepseek => None,
+            Provider::Glm | Provider::Deepseek | Provider::Inception => None,
             Provider::Codex => resolve_codex_session_cwd(session_id),
             Provider::Gemini => resolve_gemini_session_cwd(session_id),
             Provider::Copilot | Provider::Vibe => None,
@@ -413,7 +424,7 @@ impl Provider {
                 }
                 args
             }
-            Provider::Glm | Provider::Deepseek => {
+            Provider::Glm | Provider::Deepseek | Provider::Inception => {
                 let mut args = vec![
                     "run".into(),
                     "--format".into(),
@@ -586,7 +597,7 @@ impl Provider {
                 args.extend([name.into(), url.into()]);
                 Some(args)
             }
-            Provider::Glm | Provider::Deepseek => None,
+            Provider::Glm | Provider::Deepseek | Provider::Inception => None,
             Provider::Copilot => {
                 if scope != "user" {
                     return None;
@@ -673,7 +684,7 @@ impl Provider {
                     name.into(),
                 ])
             }
-            Provider::Glm | Provider::Deepseek => None,
+            Provider::Glm | Provider::Deepseek | Provider::Inception => None,
             Provider::Copilot => {
                 if scope != "user" {
                     return None;
@@ -713,7 +724,7 @@ impl Provider {
     pub fn build_mcp_list_args(&self) -> Option<Vec<String>> {
         match self {
             Provider::Claude => Some(vec!["mcp".into(), "list".into()]),
-            Provider::Glm | Provider::Deepseek => None,
+            Provider::Glm | Provider::Deepseek | Provider::Inception => None,
             Provider::Copilot => Some(vec![
                 "copilot".into(),
                 "--".into(),
@@ -783,7 +794,7 @@ impl Provider {
                     args.push(expanded_allow.join(" "));
                 }
             }
-            Provider::Glm | Provider::Deepseek => {}
+            Provider::Glm | Provider::Deepseek | Provider::Inception => {}
             Provider::Copilot => {
                 // Copilot's --deny-tool / --allow-tool expect
                 // `ServerName(tool_name)` format, not the MCP-prefixed
@@ -1041,7 +1052,9 @@ impl Provider {
     pub fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
         match self {
             Provider::Claude => parse_claude_event(evt, sink),
-            Provider::Glm | Provider::Deepseek => parse_opencode_event(evt, sink),
+            Provider::Glm | Provider::Deepseek | Provider::Inception => {
+                parse_opencode_event(evt, sink)
+            }
             Provider::Codex => parse_codex_event(evt, sink),
             Provider::Copilot => parse_copilot_event(evt, sink),
             Provider::Vibe => parse_vibe_event(evt, sink),
@@ -1060,7 +1073,9 @@ impl Provider {
 
     pub fn build_export_args(&self, session_id: &str) -> Option<Vec<String>> {
         match self {
-            Provider::Glm | Provider::Deepseek => Some(vec!["export".into(), session_id.into()]),
+            Provider::Glm | Provider::Deepseek | Provider::Inception => {
+                Some(vec!["export".into(), session_id.into()])
+            }
             _ => None,
         }
     }
@@ -1872,6 +1887,12 @@ static DEEPSEEK_MODELS: &[ModelInfo] = &[
     },
 ];
 
+static INCEPTION_MODELS: &[ModelInfo] = &[ModelInfo {
+    id: "inception/mercury-2",
+    description: "Inception Mercury 2 tool-capable model via OpenCode",
+    default: true,
+}];
+
 static CODEX_MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "gpt-5.5",
@@ -2070,6 +2091,15 @@ mod tests {
         }
         assert_eq!(Provider::from_str("opencode").ok(), Some(Provider::Glm));
         assert!(Provider::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn test_inception_catalog_exposes_only_tool_capable_mercury() {
+        let models = Provider::Inception.models();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "inception/mercury-2");
+        assert!(models[0].default);
+        assert!(!models.iter().any(|m| m.id == "inception/mercury-edit-2"));
     }
 
     #[test]
