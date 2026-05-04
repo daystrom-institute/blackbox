@@ -4,11 +4,10 @@
 //! a matching stanza in `TOOL_DOCS`. A unit test enforces this.
 //!
 //! On daemon startup, `sync_into_knowledge` upserts a fixed-ID global
-//! knowledge entry (`bb-tool-reference`) rendered from `TOOL_DOCS` +
-//! `WORKFLOW_NOTES`. That entry lands in `~/.claude-shared/CLAUDE.md`
-//! / `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md` on the next
-//! `bbox_render` pass so every agent on every project sees a current
-//! tool map.
+//! knowledge entry (`bb-tool-reference`) rendered from the hot subset of
+//! `TOOL_DOCS` + `WORKFLOW_NOTES`. Deep topics stay as system memories,
+//! discoverable through `bbox_knowledge` when the agent actually needs the
+//! runbook, rather than bloating every global render.
 //!
 //! Adding or changing a tool = one edit here. No hand-curated drift.
 
@@ -76,6 +75,16 @@ impl ToolCategory {
                 "Multi-agent deliberation surface. Posts (proposals / claims / concerns / informational), annotations (challenge / corroborate / resolve / validation), and votes accumulate on a board, advanced through phases (blind → read → validate → debate → resolve → archived) by a facilitator-or-operator role. Three audiences share one surface: in-workflow ensemble specialists (their structured outputs auto-post when the node has a `board:` field), in-workflow facilitators (single bro, drives transitions), and external agents — operator's Claude session, dispatched help, eventually humans through slack / ntfy adapters — that read state via `whiteboard_state` and act via `whiteboard_post` / `whiteboard_vote` / `whiteboard_transition`. Phase transitions emit `board-transitioned` signals through the same `dispatch_routed_event` pipeline webhooks use; arcs `wait_for_phase` to resume when the board advances. Replaces phaser as a peer external MCP server."
             }
         }
+    }
+}
+
+fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
+    match category {
+        ToolCategory::Packets => Some("sm-rule-packets"),
+        ToolCategory::Orchestration => Some("sm-bro-dispatch-patterns"),
+        ToolCategory::Workflows => Some("sm-workflow-orchestration"),
+        ToolCategory::Whiteboards => Some("sm-whiteboards"),
+        _ => None,
     }
 }
 
@@ -754,8 +763,8 @@ pub fn blackbox_mcp_prefix() -> String {
 
 // ── Rendering ────────────────────────────────────────────────────────
 
-/// Render the full tool reference as markdown. Shape: category intros
-/// followed by per-tool stanzas, then workflow notes.
+/// Render the hot-path tool reference as markdown. Deep categories are
+/// rendered as on-demand system-memory pointers, not as full per-tool manuals.
 pub fn render_markdown() -> String {
     let mut out = String::new();
     out.push_str(
@@ -802,19 +811,27 @@ pub fn render_markdown() -> String {
 
     for cat in categories {
         out.push_str(&format!("## {}\n\n", cat.heading()));
-        out.push_str(cat.intro());
-        out.push_str("\n\n");
-        for doc in TOOL_DOCS.iter().filter(|d| d.category == cat) {
-            out.push_str(&format!("- **`{}`** — {}\n", doc.name, doc.summary));
-            out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
-            if let Some(ex) = doc.example {
-                out.push_str(&format!("  _Example:_ `{ex}`\n"));
+
+        if let Some(memory_id) = deferred_system_memory(cat) {
+            out.push_str(&format!(
+                "On-demand runbook: `{memory_id}` via `bbox_knowledge(query=\"{memory_id}\")`.\n\n"
+            ));
+            continue;
+        } else {
+            out.push_str(cat.intro());
+            out.push_str("\n\n");
+            for doc in TOOL_DOCS.iter().filter(|d| d.category == cat) {
+                out.push_str(&format!("- **`{}`** — {}\n", doc.name, doc.summary));
+                out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
+                if let Some(ex) = doc.example {
+                    out.push_str(&format!("  _Example:_ `{ex}`\n"));
+                }
+                if let Some(hint) = system_memory_hint(doc) {
+                    out.push_str(&hint);
+                }
             }
-            if let Some(hint) = system_memory_hint(doc) {
-                out.push_str(&hint);
-            }
+            out.push('\n');
         }
-        out.push('\n');
     }
 
     out.push_str(WORKFLOW_NOTES);
@@ -893,15 +910,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_contains_every_tool_name() {
+    fn render_contains_hot_tool_names() {
         let md = render_markdown();
         for doc in TOOL_DOCS {
+            if deferred_system_memory(doc.category).is_some() {
+                continue;
+            }
             assert!(
                 md.contains(doc.name),
                 "rendered markdown missing {}",
                 doc.name
             );
         }
+    }
+
+    #[test]
+    fn render_defers_deep_tool_categories_to_system_memories() {
+        let md = render_markdown();
+        for (cat, memory_id) in [
+            (ToolCategory::Packets, "sm-rule-packets"),
+            (ToolCategory::Orchestration, "sm-bro-dispatch-patterns"),
+            (ToolCategory::Workflows, "sm-workflow-orchestration"),
+            (ToolCategory::Whiteboards, "sm-whiteboards"),
+        ] {
+            assert!(md.contains(&format!("## {}", cat.heading())));
+            assert!(md.contains(&format!(
+                "`{memory_id}` via `bbox_knowledge(query=\"{memory_id}\")`"
+            )));
+            for doc in TOOL_DOCS.iter().filter(|d| d.category == cat) {
+                assert!(
+                    !md.contains(&format!("- **`{}`**", doc.name)),
+                    "deferred category rendered tool stanza for {}",
+                    doc.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_tool_reference_stays_prompt_sized() {
+        let md = render_markdown();
+        assert!(
+            md.len() < 25_000,
+            "rendered tool reference is too large for always-hot global memory: {} bytes",
+            md.len()
+        );
     }
 
     #[test]
@@ -917,6 +970,8 @@ mod tests {
         let md = render_markdown();
         assert!(md.contains("sm-rule-packets"));
         assert!(md.contains("bbox_knowledge(query=\"sm-rule-packets\")"));
+        assert!(md.contains("sm-whiteboards"));
+        assert!(md.contains("bbox_knowledge(query=\"sm-whiteboards\")"));
     }
 
     #[test]

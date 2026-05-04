@@ -312,6 +312,30 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
         ],
         content: include_str!("workflow-orchestration.md"),
     },
+    SystemMemory {
+        id: "sm-whiteboards",
+        title: "Whiteboards — multi-agent deliberation boards",
+        tags: &[
+            "whiteboard",
+            "whiteboards",
+            "deliberation",
+            "multi-agent",
+            "phase",
+            "phases",
+            "blind",
+            "validate",
+            "debate",
+            "resolve",
+            "facilitator",
+            "claims",
+            "concerns",
+            "votes",
+            "annotations",
+            "workflow",
+            "runbook",
+        ],
+        content: include_str!("whiteboards.md"),
+    },
 ];
 
 /// Lookup by exact ID. Accepts either canonical form (`sm-rule-packets`) or
