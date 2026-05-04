@@ -2,6 +2,7 @@ pub mod brofile;
 pub mod http_fetch;
 pub mod mcp;
 pub mod providers;
+pub mod resume_lease;
 pub mod tail;
 pub mod team;
 
@@ -77,6 +78,15 @@ pub struct Task {
 impl Task {
     pub fn id(&self) -> String {
         self.inner.lock().id.clone()
+    }
+
+    /// PID of the spawned provider child while the task is running.
+    /// `None` once the process has exited or `cancel_task` has taken
+    /// the handle. Council uses this to poll for actual child exit
+    /// after a SIGTERM, so the resume lease can be held until the
+    /// session jsonl writer is truly gone.
+    pub fn child_pid(&self) -> Option<u32> {
+        *self.child_id.lock()
     }
 }
 

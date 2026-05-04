@@ -73,6 +73,97 @@ enum BroCommand {
     Tail(TailArgs),
     /// Workflow orchestration — drive a mermaid-shaped flow through the daemon
     Orchestrate(OrchestrateArgs),
+    /// Multi-peer chat councils — convene a team into a deliberation
+    Council(CouncilArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Subcommands:\n  new <team>                create a new council bound to a team\n  list                       list known councils\n  show <id>                  print transcript\n  post <id> <body>           append a user turn\n  close <id>                 close a council"
+)]
+struct CouncilArgs {
+    #[command(subcommand)]
+    command: CouncilCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CouncilCommand {
+    /// Create a new council bound to an existing team
+    New(CouncilNewArgs),
+    /// List known councils, optionally filtered by project
+    List(CouncilListArgs),
+    /// Print a council's transcript to stdout
+    Show(CouncilShowArgs),
+    /// Append a user turn to the council; bros will respond asynchronously
+    Post(CouncilPostArgs),
+    /// Close a council; cancels drain workers, transcript is preserved
+    Close(CouncilCloseArgs),
+}
+
+#[derive(Debug, Args)]
+struct CouncilNewArgs {
+    /// Team name (must already exist via `bro_team`)
+    #[arg(value_name = "TEAM")]
+    team: String,
+    /// Topic — short description of what the council is for
+    #[arg(long)]
+    topic: String,
+    /// Optional charter override file. Defaults to the built-in
+    /// multi-peer chat charter.
+    #[arg(long, value_name = "FILE")]
+    charter: Option<std::path::PathBuf>,
+    /// Project_dir override. Defaults to the team's project_dir.
+    #[arg(long)]
+    project: Option<String>,
+    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CouncilListArgs {
+    /// Filter by project_dir
+    #[arg(long)]
+    project: Option<String>,
+    /// Daemon URL.
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CouncilShowArgs {
+    #[arg(value_name = "ID")]
+    id: String,
+    /// Print only posts with sequence > since
+    #[arg(long)]
+    since: Option<u64>,
+    /// Daemon URL.
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CouncilPostArgs {
+    #[arg(value_name = "ID")]
+    id: String,
+    /// Turn body (use `@name` to address a member directly)
+    #[arg(value_name = "BODY")]
+    body: String,
+    /// Sender label written into the post (default: `user`)
+    #[arg(long, default_value = "user")]
+    sender: String,
+    /// Daemon URL.
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CouncilCloseArgs {
+    #[arg(value_name = "ID")]
+    id: String,
+    /// Daemon URL.
+    #[arg(long)]
+    url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -804,6 +895,156 @@ async fn run_orchestrate(args: OrchestrateArgs) -> anyhow::Result<()> {
     }
 }
 
+fn council_base_url(url: Option<String>) -> String {
+    url.unwrap_or_else(|| {
+        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
+        format!("http://127.0.0.1:{port}")
+    })
+}
+
+async fn run_council(args: CouncilArgs) -> anyhow::Result<()> {
+    match args.command {
+        CouncilCommand::New(a) => council_new(a).await,
+        CouncilCommand::List(a) => council_list(a).await,
+        CouncilCommand::Show(a) => council_show(a).await,
+        CouncilCommand::Post(a) => council_post(a).await,
+        CouncilCommand::Close(a) => council_close(a).await,
+    }
+}
+
+async fn council_new(args: CouncilNewArgs) -> anyhow::Result<()> {
+    let charter = match &args.charter {
+        Some(p) => Some(std::fs::read_to_string(p)?),
+        None => None,
+    };
+    let body = serde_json::json!({
+        "team": args.team,
+        "topic": args.topic,
+        "charter": charter,
+        "project": args.project,
+    });
+    let base = council_base_url(args.url);
+    let url = format!("{}/council", base.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        eprintln!("daemon returned {status}\n{text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn council_list(args: CouncilListArgs) -> anyhow::Result<()> {
+    let base = council_base_url(args.url);
+    let mut url = format!("{}/council", base.trim_end_matches('/'));
+    if let Some(p) = &args.project {
+        url.push_str(&format!("?project={}", urlencoding_lite(p)));
+    }
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?;
+    let text = resp.text().await?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&text)?;
+    if entries.is_empty() {
+        println!("no councils");
+        return Ok(());
+    }
+    for e in entries {
+        println!(
+            "{}  team={}  status={}  posts={}  topic={:?}",
+            e["id"].as_str().unwrap_or("?"),
+            e["team_id"].as_str().unwrap_or("?"),
+            e["status"].as_str().unwrap_or("?"),
+            e["post_count"].as_u64().unwrap_or(0),
+            e["topic"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
+async fn council_show(args: CouncilShowArgs) -> anyhow::Result<()> {
+    let base = council_base_url(args.url);
+    let url = format!("{}/council/{}", base.trim_end_matches('/'), args.id);
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        eprintln!("daemon returned {status}\n{text}");
+        std::process::exit(1);
+    }
+    let body: serde_json::Value = serde_json::from_str(&text)?;
+    let summary = &body["summary"];
+    println!(
+        "council {}  team={}  status={}  topic={:?}",
+        summary["id"].as_str().unwrap_or("?"),
+        summary["team_id"].as_str().unwrap_or("?"),
+        summary["status"].as_str().unwrap_or("?"),
+        summary["topic"].as_str().unwrap_or(""),
+    );
+    println!();
+
+    if let Some(posts) = body["posts"].as_array() {
+        let since = args.since.unwrap_or(0);
+        for p in posts {
+            let seq = p["sequence"].as_u64().unwrap_or(0);
+            if seq <= since {
+                continue;
+            }
+            let kind = p["sender_kind"].as_str().unwrap_or("?");
+            let sender = p["sender_id"].as_str().unwrap_or("?");
+            let prefix = if kind == "user" {
+                "user".to_string()
+            } else {
+                sender.to_string()
+            };
+            let body_text = p["body"].as_str().unwrap_or("");
+            println!("turn {seq} [{prefix}]");
+            for line in body_text.lines() {
+                println!("  {line}");
+            }
+            println!();
+        }
+    }
+    Ok(())
+}
+
+async fn council_post(args: CouncilPostArgs) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "body": args.body,
+        "sender": args.sender,
+    });
+    let base = council_base_url(args.url);
+    let url = format!("{}/council/{}/post", base.trim_end_matches('/'), args.id);
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        eprintln!("daemon returned {status}\n{text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn council_close(args: CouncilCloseArgs) -> anyhow::Result<()> {
+    let base = council_base_url(args.url);
+    let url = format!("{}/council/{}", base.trim_end_matches('/'), args.id);
+    let client = reqwest::Client::new();
+    let resp = client.delete(&url).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await?;
+        eprintln!("daemon returned {status}\n{text}");
+        std::process::exit(1);
+    }
+    println!("closed");
+    Ok(())
+}
+
 async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
     let base_url = args.url.unwrap_or_else(|| {
         let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
@@ -1146,6 +1387,11 @@ fn main() -> anyhow::Result<()> {
         BroCommand::Tail(args) => TailSelectors::from(args),
         BroCommand::Orchestrate(args) => {
             let result = rt.block_on(run_orchestrate(args));
+            drop(rt);
+            return result;
+        }
+        BroCommand::Council(args) => {
+            let result = rt.block_on(run_council(args));
             drop(rt);
             return result;
         }

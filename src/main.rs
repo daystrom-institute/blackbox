@@ -1,3 +1,4 @@
+mod council;
 mod crons;
 mod inbox;
 mod index;
@@ -130,6 +131,18 @@ struct SharedState {
     /// (via `tokio::select!`), bails out with status `cancelled`, and
     /// runs `on_arc_cancel` + `on_arc_exit` hooks on the way out.
     arc_cancel_tokens: RwLock<HashMap<String, CancellationToken>>,
+    /// Multi-peer chat councils — TUI-driven deliberation surface.
+    /// One drain worker per (council × bro) serializes resumes for
+    /// that bro; daemon-wide collisions on the same provider session
+    /// are prevented via `resume_leases`.
+    councils: council::SharedRegistry,
+    /// Daemon-wide resume lease registry keyed `(provider, session_id)`.
+    /// Currently used only by the council drain worker — other resume
+    /// paths (`bro_broadcast`, ad-hoc `bro_resume`, advisor) remain a
+    /// single-resume-at-a-time assumption that this lease can later
+    /// mechanize. Acquire returns an owned guard held across spawn +
+    /// wait; drop on completion.
+    resume_leases: Arc<orchestration::resume_lease::ResumeLeaseRegistry>,
 }
 
 const SIGNAL_LOG_CAP: usize = 200;
@@ -1197,6 +1210,30 @@ struct DashboardParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct CouncilListParams {
+    /// Filter to councils whose `project` matches this exact path.
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct CouncilOpenParams {
+    /// Council ID (e.g. `council-7f01324e`).
+    pub id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct CouncilPostsParams {
+    pub id: String,
+    /// Return only posts with `sequence > since_seq`. Default 0 (all).
+    #[serde(default)]
+    pub since_seq: Option<u64>,
+    /// Cap the response (default 100, max 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct CancelParams {
     /// Task ID to cancel
     task_id: String,
@@ -1522,7 +1559,7 @@ fn resolve_dispatch_filters(
 /// Delete a Gemini policy tempfile once the associated task reaches a
 /// terminal state. Spawned as a detached tokio task from the dispatch
 /// path. No-op if path is None.
-fn cleanup_policy_file_when_done(task: std::sync::Arc<orch::Task>, path: Option<PathBuf>) {
+pub(crate) fn cleanup_policy_file_when_done(task: std::sync::Arc<orch::Task>, path: Option<PathBuf>) {
     let Some(path) = path else { return };
     tokio::spawn(async move {
         loop {
@@ -3861,6 +3898,69 @@ Constraints:\n\
         let map = self.state.workflow_registry.read();
         let names: Vec<String> = map.keys().cloned().collect();
         Self::ok_json(&serde_json::json!({"workflows": names}))
+    }
+
+    #[tool(
+        name = "bro_council_list",
+        description = "List active and closed councils. Optional `project` filter narrows by project_dir."
+    )]
+    fn bro_council_list(&self, Parameters(p): Parameters<CouncilListParams>) -> CallToolResult {
+        let summaries = self.state.councils.list_summaries(p.project.as_deref());
+        Self::ok_json(&serde_json::json!({"councils": summaries}))
+    }
+
+    #[tool(
+        name = "bro_council_open",
+        description = "Read full council state: metadata, charter, posts, and current envelope status."
+    )]
+    fn bro_council_open(&self, Parameters(p): Parameters<CouncilOpenParams>) -> CallToolResult {
+        let Some(council) = self.state.councils.get(&p.id) else {
+            return Self::err_text(&format!("unknown council: {}", p.id));
+        };
+        let s = council.session.read().clone();
+        let posts = council.posts.read().clone();
+        let envelopes = council.envelopes.read().clone();
+        let summary = council::CouncilSummary {
+            id: s.id.clone(),
+            team_id: s.team_id.clone(),
+            project: s.project.clone(),
+            topic: s.topic.clone(),
+            status: s.status,
+            members: s.member_sessions.keys().cloned().collect(),
+            created_at: s.created_at.clone(),
+            updated_at: s.updated_at.clone(),
+            post_count: posts.len() as u64,
+        };
+        Self::ok_json(&serde_json::json!({
+            "summary": summary,
+            "posts": posts,
+            "envelopes": envelopes,
+            "charter": s.charter,
+        }))
+    }
+
+    #[tool(
+        name = "bro_council_posts",
+        description = "Paginated council transcript. `since_seq` returns posts with sequence > since_seq; `limit` caps response (default 100, max 1000)."
+    )]
+    fn bro_council_posts(&self, Parameters(p): Parameters<CouncilPostsParams>) -> CallToolResult {
+        let Some(council) = self.state.councils.get(&p.id) else {
+            return Self::err_text(&format!("unknown council: {}", p.id));
+        };
+        let since = p.since_seq.unwrap_or(0);
+        let limit = p.limit.unwrap_or(100).min(1000);
+        let posts: Vec<council::CouncilPost> = council
+            .posts
+            .read()
+            .iter()
+            .filter(|post| post.sequence > since)
+            .take(limit)
+            .cloned()
+            .collect();
+        Self::ok_json(&serde_json::json!({
+            "council_id": p.id,
+            "posts": posts,
+        }))
     }
 }
 
@@ -6904,6 +7004,8 @@ async fn main() -> anyhow::Result<()> {
             WEBHOOK_LOG_CAP,
         )),
         arc_cancel_tokens: RwLock::new(HashMap::new()),
+        councils: Arc::new(council::CouncilRegistry::new()),
+        resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
     });
 
     // Restore webhook + workflow registries from disk so installs
@@ -6974,6 +7076,25 @@ async fn main() -> anyhow::Result<()> {
         if restored > 0 {
             tracing::info!("restored {restored} active whiteboard(s)");
         }
+    }
+    // Councils — restore session/posts/envelopes from
+    // <store>/councils/<id>/, then respawn drain workers for any
+    // queued envelopes. Envelopes left in `Draining` from a prior
+    // crash are reconciled by `respawn_workers_after_restart`:
+    // marked done if a referencing post landed before the crash,
+    // requeued (with attempt_count++) otherwise, failed once the
+    // attempt budget is exhausted.
+    let council_dir = shared.store_dir.join("councils");
+    if let Err(e) = shared.councils.set_storage_dir(council_dir.clone()) {
+        tracing::warn!("council storage init failed: {e}");
+    } else {
+        let restored = shared.councils.list_ids().len();
+        if restored > 0 {
+            tracing::info!("restored {restored} council(s)");
+        }
+        shared
+            .councils
+            .respawn_workers_after_restart(shared.clone());
     }
     let workflow_dir = shared.store_dir.join("workflows");
     if workflow_dir.exists() {
@@ -7120,6 +7241,22 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::post(admin_brofile_upsert),
         )
         .route("/admin/team/upsert", axum::routing::post(admin_team_upsert))
+        .route(
+            "/council",
+            axum::routing::post(council::http::create).get(council::http::list),
+        )
+        .route(
+            "/council/{id}",
+            axum::routing::get(council::http::open).delete(council::http::close),
+        )
+        .route(
+            "/council/{id}/post",
+            axum::routing::post(council::http::post),
+        )
+        .route(
+            "/council/{id}/tail",
+            axum::routing::get(council::http::tail),
+        )
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 
@@ -7180,6 +7317,8 @@ mod tests {
                 WEBHOOK_LOG_CAP,
             )),
             arc_cancel_tokens: RwLock::new(HashMap::new()),
+            councils: Arc::new(council::CouncilRegistry::new()),
+            resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
         });
         BlackboxServer::new(state)
     }
