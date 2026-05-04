@@ -929,11 +929,21 @@ async fn council_new(args: CouncilNewArgs) -> anyhow::Result<()> {
         Some(p) => Some(std::fs::read_to_string(p)?),
         None => None,
     };
+    // Default project to the invoking shell's cwd so dispatched bros
+    // run in the tree the user is working in, not in the daemon's
+    // home dir. `--project` overrides; explicit `--project ""` keeps
+    // it None for "no project scope".
+    let project = match args.project {
+        Some(p) => Some(p),
+        None => std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+    };
     let body = serde_json::json!({
         "team": args.team,
         "topic": args.topic,
         "charter": charter,
-        "project": args.project,
+        "project": project,
     });
     let base = council_base_url(args.url);
     let url = format!("{}/council", base.trim_end_matches('/'));

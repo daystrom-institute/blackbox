@@ -412,7 +412,16 @@ fn build_dispatch(
         model: bf.model.clone(),
         effort: bf.effort.clone(),
     });
-    let cwd = team.project_dir.clone();
+    // Council project_dir wins over team's — councils carry their own
+    // project scope (set at create time, defaults to the user's cwd if
+    // unspecified), and the deliberation should happen in that tree
+    // regardless of where the team was originally provisioned.
+    let cwd = council
+        .session
+        .read()
+        .project
+        .clone()
+        .or_else(|| team.project_dir.clone());
 
     let existing = council
         .session
@@ -511,7 +520,18 @@ fn build_dispatch(
         provider: Some(bf.provider),
     };
     let with_ambient = orch::apply_ambient(&body_with_council, &ambient_ctx);
-    let final_prompt = orch::apply_brofile_lens(&with_ambient, bf.lens.as_deref());
+    // Brofile lens (persona) is anchored at turn 1 — `apply_brofile_lens`
+    // text-prepends to the user prompt (it does NOT go to a separate
+    // system-prompt slot), so on resume the provider already has the
+    // lens in turn-1 context. Re-sending every turn is pure noise.
+    // The ambient + council blocks DO ride every turn — recall/task-
+    // shape decay at depth, queue-depth and addressed flags are per-
+    // turn signals.
+    let final_prompt = if is_resume {
+        with_ambient
+    } else {
+        orch::apply_brofile_lens(&with_ambient, bf.lens.as_deref())
+    };
 
     let mut args = if is_resume {
         bf.provider
