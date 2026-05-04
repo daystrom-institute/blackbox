@@ -66,6 +66,14 @@ pub struct TaskInner {
     /// tasks (workflow implementer, single-bro advisor) still surface
     /// in `bro tail` with a name instead of being anonymous.
     pub bro_label: Option<String>,
+    /// True when this task's terminal state is "the daemon killed it
+    /// because the process restarted, but the underlying provider
+    /// session_id is still valid on disk (rollout / session jsonl
+    /// persisted)." Calling agents that see `status=failed` AND
+    /// `recoverable=true` should retry via `bro_resume(session_id=...)`
+    /// rather than starting a fresh session — the conversation
+    /// history is intact. Surfaced through `bro_status` / `bro_wait`.
+    pub recoverable: bool,
 }
 
 pub struct Task {
@@ -160,6 +168,14 @@ struct PersistedTask {
     cwd: Option<String>,
     #[serde(default)]
     bro_label: Option<String>,
+    /// True when the previous daemon instance was running this task
+    /// at restart and the underlying provider session_id is still
+    /// recoverable on disk. Set during `TaskStore::load` when it
+    /// flips a `Running` task to `Failed`. Lets calling agents
+    /// distinguish "kill by restart, rollout intact, retry via
+    /// `bro_resume(session_id=...)`" from "task genuinely failed".
+    #[serde(default)]
+    recoverable: bool,
 }
 
 impl TaskStore {
@@ -192,6 +208,7 @@ impl TaskStore {
                     exit_code: inner.exit_code,
                     cwd: inner.cwd.clone(),
                     bro_label: inner.bro_label.clone(),
+                    recoverable: inner.recoverable,
                 }
             })
             .collect();
@@ -225,8 +242,13 @@ impl TaskStore {
             if rec.status == TaskStatus::Running {
                 rec.status = TaskStatus::Failed;
                 rec.completed_at = Some(now_ms());
-                rec.stderr
-                    .push_str("\n[blackbox] server restarted while task was running");
+                rec.stderr.push_str(
+                    "\n[blackbox] server restarted while task was running. \
+                     The provider session is still on disk; retry with \
+                     `bro_resume(session_id=...)` to continue the conversation \
+                     rather than starting a fresh session.",
+                );
+                rec.recoverable = true;
             }
             let task = Arc::new(Task {
                 inner: Mutex::new(TaskInner {
@@ -245,6 +267,7 @@ impl TaskStore {
                     exit_code: rec.exit_code,
                     cwd: rec.cwd,
                     bro_label: rec.bro_label,
+                    recoverable: rec.recoverable,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -618,6 +641,7 @@ pub fn spawn_task(
                     exit_code: None,
                     cwd,
                     bro_label: None,
+            recoverable: false,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -647,6 +671,7 @@ pub fn spawn_task(
             exit_code: None,
             cwd: cwd.clone(),
             bro_label: None,
+            recoverable: false,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(pid),
@@ -1088,10 +1113,26 @@ pub fn now_ms() -> u64 {
 }
 
 fn apply_sink_updates(inner: &mut TaskInner, sink: EventSink) {
-    inner.last_assistant_message = sink.last_assistant_message;
-    inner.usage = sink.usage;
-    inner.cost_usd = sink.cost_usd;
-    inner.num_turns = sink.num_turns;
+    // Merge — never CLEAR fields that were already captured during the
+    // streaming run by overwriting with None from a partial export.
+    // Observed failure: opencode's post-run `export` occasionally
+    // returns a messages array that hasn't yet flushed the new
+    // assistant turn (a session-DB write race), so sink ends up with
+    // last_assistant_message=None / num_turns=None. Without this guard
+    // we'd nuke valid streaming-captured text and the council drain
+    // would treat it as an empty reply.
+    if sink.last_assistant_message.is_some() {
+        inner.last_assistant_message = sink.last_assistant_message;
+    }
+    if sink.usage.is_some() {
+        inner.usage = sink.usage;
+    }
+    if sink.cost_usd.is_some() {
+        inner.cost_usd = sink.cost_usd;
+    }
+    if sink.num_turns.is_some() {
+        inner.num_turns = sink.num_turns;
+    }
 }
 
 fn reject_forked_session(inner: &mut TaskInner, emitted_session_id: &str) {
@@ -1149,6 +1190,16 @@ pub fn task_result_json(task: &Task) -> Value {
         if !inner.stderr.is_empty() {
             let truncated: String = inner.stderr.chars().take(2000).collect();
             obj["stderr"] = Value::String(truncated);
+        }
+        // Surface the recovery hint so calling agents can distinguish
+        // "task killed by daemon restart, retry via bro_resume" from
+        // "task genuinely failed, start fresh."
+        if inner.recoverable {
+            obj["recoverable"] = Value::Bool(true);
+            obj["recoveryHint"] = Value::String(format!(
+                "retry with bro_resume(session_id=\"{}\", provider=\"{}\")",
+                inner.session_id, inner.provider
+            ));
         }
     }
     obj
@@ -1443,6 +1494,7 @@ mod tests {
                 exit_code: Some(0),
                 cwd: None,
                 bro_label: None,
+            recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1474,6 +1526,7 @@ mod tests {
                 exit_code: Some(1),
                 cwd: None,
                 bro_label: None,
+            recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1508,6 +1561,7 @@ mod tests {
             exit_code: None,
             cwd: None,
             bro_label: None,
+            recoverable: false,
         };
 
         reject_forked_session(&mut inner, "forked-session");
@@ -1550,6 +1604,7 @@ mod tests {
             exit_code: None,
             cwd: None,
             bro_label: None,
+            recoverable: false,
         };
 
         let sink = EventSink {
@@ -1606,6 +1661,7 @@ mod async_tests {
                 exit_code: Some(0),
                 cwd: None,
                 bro_label: None,
+            recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1634,6 +1690,7 @@ mod async_tests {
                 exit_code: None,
                 cwd: None,
                 bro_label: None,
+            recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1675,6 +1732,7 @@ mod async_tests {
                 exit_code: None,
                 cwd: None,
                 bro_label: None,
+            recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),

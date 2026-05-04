@@ -1138,6 +1138,29 @@ fn parse_opencode_event(evt: &Value, sink: &mut EventSink) {
     if let Some(session_id) = evt["sessionID"].as_str() {
         sink.session_id = Some(session_id.to_string());
     }
+    // Extract assistant text directly from the streaming `text` events
+    // rather than relying solely on the post-run `opencode export`.
+    // The export occasionally returns a stale or partial messages
+    // array (observed: `messages` field present but the new turn's
+    // assistant message not yet flushed to opencode's session DB by
+    // the time export reads it), leaving last_assistant_message=None
+    // and tripping the council drain's "empty body" filter.
+    //
+    // Streaming events are first-hand evidence of what the model
+    // actually emitted. We OVERWRITE on every text event so the
+    // final user-facing text wins (intermediate "let me check..."
+    // texts in tool-using turns get superseded by the final answer
+    // text in the next step). step_start resets so a fresh resume
+    // turn doesn't carry text from a prior captured invocation.
+    if evt["type"].as_str() == Some("step_start") {
+        sink.last_assistant_message = None;
+    } else if evt["type"].as_str() == Some("text") {
+        if let Some(text) = evt["part"]["text"].as_str() {
+            if !text.is_empty() {
+                sink.last_assistant_message = Some(text.to_string());
+            }
+        }
+    }
 }
 
 pub fn parse_opencode_export(raw: &str, sink: &mut EventSink) {
