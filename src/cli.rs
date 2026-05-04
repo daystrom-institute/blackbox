@@ -25,7 +25,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use serde::Deserialize;
 
-#[path = "parser.rs"]
+mod council_tui;
 mod parser;
 use parser::{
     parse_codex_line_rich, parse_copilot_line_rich, parse_gemini_file_rich,
@@ -98,6 +98,8 @@ enum CouncilCommand {
     Post(CouncilPostArgs),
     /// Close a council; cancels drain workers, transcript is preserved
     Close(CouncilCloseArgs),
+    /// Open the TUI chat client for a council
+    Open(CouncilOpenArgs),
 }
 
 #[derive(Debug, Args)]
@@ -159,6 +161,15 @@ struct CouncilPostArgs {
 
 #[derive(Debug, Args)]
 struct CouncilCloseArgs {
+    #[arg(value_name = "ID")]
+    id: String,
+    /// Daemon URL.
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CouncilOpenArgs {
     #[arg(value_name = "ID")]
     id: String,
     /// Daemon URL.
@@ -909,6 +920,7 @@ async fn run_council(args: CouncilArgs) -> anyhow::Result<()> {
         CouncilCommand::Show(a) => council_show(a).await,
         CouncilCommand::Post(a) => council_post(a).await,
         CouncilCommand::Close(a) => council_close(a).await,
+        CouncilCommand::Open(a) => council_tui::run(a.id, a.url).await,
     }
 }
 
@@ -2224,7 +2236,7 @@ fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
 /// still carries its own Line/Span/Style/Color types distinct from
 /// ratatui-core's — structurally identical, nominally different — so we
 /// cross the boundary with a field-by-field copy.
-fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
+pub(crate) fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
     // tui-markdown puts heading/list/emphasis styles on `Line.style` with
     // default-styled spans inside. Relying on ratatui's Paragraph to patch
     // line-level style into default spans has been flaky in practice, so
@@ -2282,7 +2294,7 @@ fn is_ordered_list_marker_only(line: &Line<'_>) -> bool {
 /// Merge lines emitted by tui-markdown where an ordered-list marker has
 /// been split from its content: `"1. "` on one line followed by the item
 /// text on the next. Returns the post-processed line vec.
-fn stitch_ordered_list_markers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+pub(crate) fn stitch_ordered_list_markers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     let mut iter = lines.into_iter().peekable();
     while let Some(line) = iter.next() {
