@@ -1,0 +1,82 @@
+{
+  "name": "schema-migration-arc",
+  "version": 1,
+  "policy_packet": "domain:workflow-policy/arc-budget",
+  "vars_schema": {
+    "target_schema_version": { "kind": "string", "required": true },
+    "migration_required": { "kind": "bool" },
+    "search_quiesced": { "kind": "bool" },
+    "index_dropped": { "kind": "bool" },
+    "rebuild_started": { "kind": "bool" },
+    "verified": { "kind": "bool" },
+    "swapped": { "kind": "bool" }
+  },
+  "actors": {},
+  "start": "Setup",
+  "nodes": {
+    "Setup": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "target_schema_version", "value": "agentic-corpus-f3" }
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "migration_required", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "Quiesce" }
+    },
+    "Quiesce": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "search_quiesced", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "DropIndex" }
+    },
+    "DropIndex": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "index_dropped", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "Rebuild" }
+    },
+    "Rebuild": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "rebuild_started", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "Verify" }
+    },
+    "Verify": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "verified", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "Swap" }
+    },
+    "Swap": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "swapped", "value": true }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

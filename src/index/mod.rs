@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use tantivy::schema::*;
 use tantivy::{Index, IndexReader, ReloadPolicy};
 
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-f3";
+const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
+
 /// Metadata about an indexed file, for incremental updates.
 #[derive(Serialize, Deserialize)]
 pub(super) struct FileMeta {
@@ -30,6 +33,26 @@ pub struct FieldHandles {
     pub git_branch: Field,
     pub is_subagent: Field,
     pub agent_slug: Field,
+    pub doc_type: Field,
+    #[allow(dead_code)]
+    pub chunk_kind: Field,
+    #[allow(dead_code)]
+    pub language: Field,
+    #[allow(dead_code)]
+    pub symbol: Field,
+    #[allow(dead_code)]
+    pub symbol_exact: Field,
+    #[allow(dead_code)]
+    pub code_content: Field,
+    #[allow(dead_code)]
+    pub chunk_hash: Field,
+    #[allow(dead_code)]
+    pub entity_id: Field,
+    pub parser_version: Field,
+    #[allow(dead_code)]
+    pub commit_sha: Field,
+    #[allow(dead_code)]
+    pub repo_id: Field,
 }
 
 /// Config needed by the background reindex thread.
@@ -61,6 +84,7 @@ impl TranscriptIndex {
         roots: Vec<(String, PathBuf)>,
         codex_root: Option<PathBuf>,
     ) -> Result<Self> {
+        reset_index_on_schema_mismatch(index_path)?;
         let meta_path = index_path.join("_meta.json");
 
         // Build schema
@@ -77,6 +101,17 @@ impl TranscriptIndex {
             git_branch: builder.add_text_field("git_branch", STRING | STORED),
             is_subagent: builder.add_u64_field("is_subagent", INDEXED | STORED),
             agent_slug: builder.add_text_field("agent_slug", STRING | STORED),
+            doc_type: builder.add_text_field("doc_type", STRING | STORED),
+            chunk_kind: builder.add_text_field("chunk_kind", STRING | STORED),
+            language: builder.add_text_field("language", STRING | STORED),
+            symbol: builder.add_text_field("symbol", TEXT | STORED),
+            symbol_exact: builder.add_text_field("symbol_exact", STRING | STORED),
+            code_content: builder.add_text_field("code_content", TEXT | STORED),
+            chunk_hash: builder.add_text_field("chunk_hash", STRING | STORED),
+            entity_id: builder.add_text_field("entity_id", STRING | STORED),
+            parser_version: builder.add_text_field("parser_version", STRING | STORED),
+            commit_sha: builder.add_text_field("commit_sha", STRING | STORED),
+            repo_id: builder.add_text_field("repo_id", STRING | STORED),
         };
         let schema = builder.build();
 
@@ -93,6 +128,7 @@ impl TranscriptIndex {
                 Index::create_in_dir(index_path, schema.clone())?
             }
         };
+        write_schema_version_marker(index_path)?;
 
         let reader = index
             .reader_builder()
@@ -133,6 +169,68 @@ impl TranscriptIndex {
     pub fn is_empty(&self) -> bool {
         let searcher = self.reader.searcher();
         searcher.num_docs() == 0
+    }
+}
+
+fn reset_index_on_schema_mismatch(index_path: &Path) -> Result<()> {
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let marker_path = index_path.join(SCHEMA_VERSION_FILE);
+    let should_reset = match fs::read_to_string(&marker_path) {
+        Ok(raw) => raw.trim() != INDEX_SCHEMA_VERSION,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            index_path.read_dir()?.next().is_some()
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if should_reset {
+        tracing::info!(
+            path = %index_path.display(),
+            schema_version = INDEX_SCHEMA_VERSION,
+            "dropping transcript index for schema migration"
+        );
+        fs::remove_dir_all(index_path)?;
+    }
+    Ok(())
+}
+
+fn write_schema_version_marker(index_path: &Path) -> Result<()> {
+    fs::write(
+        index_path.join(SCHEMA_VERSION_FILE),
+        format!("{INDEX_SCHEMA_VERSION}\n"),
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_open_writes_schema_version_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+
+        let _index = TranscriptIndex::open_or_create(&index_path, Vec::new(), None).unwrap();
+
+        let marker = fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)).unwrap();
+        assert_eq!(marker.trim(), INDEX_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_version_mismatch_drops_existing_index_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join(SCHEMA_VERSION_FILE), "old-schema\n").unwrap();
+        fs::write(index_path.join("stale-file"), "stale").unwrap();
+
+        let _index = TranscriptIndex::open_or_create(&index_path, Vec::new(), None).unwrap();
+
+        assert!(!index_path.join("stale-file").exists());
+        let marker = fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)).unwrap();
+        assert_eq!(marker.trim(), INDEX_SCHEMA_VERSION);
     }
 }
 

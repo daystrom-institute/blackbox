@@ -11,6 +11,7 @@ use walkdir::WalkDir;
 
 use super::helpers::*;
 use super::{FieldHandles, FileMeta, ReindexConfig};
+use crate::entity_ref;
 use crate::parser;
 
 pub(super) fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
@@ -299,6 +300,7 @@ pub(super) fn event_to_doc_standalone(
     f: FieldHandles,
 ) -> TantivyDocument {
     let mut doc = TantivyDocument::new();
+    add_transcript_corpus_fields(&mut doc, f);
     doc.add_text(f.content, &event.content);
     doc.add_text(f.session_id, &event.session_id);
     doc.add_text(f.account, account);
@@ -324,6 +326,11 @@ pub(super) fn event_to_doc_standalone(
         doc.add_text(f.agent_slug, slug);
     }
     doc
+}
+
+fn add_transcript_corpus_fields(doc: &mut TantivyDocument, f: FieldHandles) {
+    doc.add_text(f.doc_type, "transcript");
+    doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
 }
 
 pub(super) fn should_skip_file(
@@ -404,6 +411,7 @@ pub(super) fn index_directory_standalone(
                 let proj = event.cwd.as_deref().unwrap_or(&project);
 
                 let mut doc = TantivyDocument::new();
+                add_transcript_corpus_fields(&mut doc, f);
                 doc.add_text(f.content, &event.content);
                 doc.add_text(f.session_id, &event.session_id);
                 doc.add_text(f.account, account_name);
@@ -634,5 +642,73 @@ pub(super) fn human_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{MessageRole, ParsedEvent};
+
+    #[test]
+    fn transcript_docs_include_doc_type_and_parser_version() {
+        let (_schema, fields) = test_schema();
+        let event = ParsedEvent {
+            role: MessageRole::User,
+            content: "schema migration smoke".to_string(),
+            session_id: "session-1".to_string(),
+            timestamp: None,
+            git_branch: None,
+            is_subagent: false,
+            agent_slug: None,
+            cwd: None,
+        };
+
+        let doc = event_to_doc_standalone(&event, "codex", "/tmp/session.jsonl", 0, false, fields);
+
+        assert_eq!(first_text(&doc, fields.doc_type), "transcript");
+        assert_eq!(
+            first_text(&doc, fields.parser_version),
+            entity_ref::PARSER_VERSION
+        );
+    }
+
+    fn first_text(doc: &TantivyDocument, field: Field) -> String {
+        doc.get_all(field)
+            .next()
+            .and_then(|v| match v {
+                tantivy::schema::OwnedValue::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn test_schema() -> (Schema, FieldHandles) {
+        let mut builder = Schema::builder();
+        let fields = FieldHandles {
+            content: builder.add_text_field("content", TEXT | STORED),
+            session_id: builder.add_text_field("session_id", STRING | STORED),
+            account: builder.add_text_field("account", STRING | STORED),
+            project: builder.add_text_field("project", TEXT | STORED),
+            role: builder.add_text_field("role", STRING | STORED),
+            timestamp: builder.add_text_field("timestamp", STRING | STORED),
+            file_path: builder.add_text_field("file_path", STRING | STORED),
+            byte_offset: builder.add_u64_field("byte_offset", STORED),
+            git_branch: builder.add_text_field("git_branch", STRING | STORED),
+            is_subagent: builder.add_u64_field("is_subagent", INDEXED | STORED),
+            agent_slug: builder.add_text_field("agent_slug", STRING | STORED),
+            doc_type: builder.add_text_field("doc_type", STRING | STORED),
+            chunk_kind: builder.add_text_field("chunk_kind", STRING | STORED),
+            language: builder.add_text_field("language", STRING | STORED),
+            symbol: builder.add_text_field("symbol", TEXT | STORED),
+            symbol_exact: builder.add_text_field("symbol_exact", STRING | STORED),
+            code_content: builder.add_text_field("code_content", TEXT | STORED),
+            chunk_hash: builder.add_text_field("chunk_hash", STRING | STORED),
+            entity_id: builder.add_text_field("entity_id", STRING | STORED),
+            parser_version: builder.add_text_field("parser_version", STRING | STORED),
+            commit_sha: builder.add_text_field("commit_sha", STRING | STORED),
+            repo_id: builder.add_text_field("repo_id", STRING | STORED),
+        };
+        (builder.build(), fields)
     }
 }

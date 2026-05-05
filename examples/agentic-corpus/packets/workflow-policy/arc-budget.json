@@ -1,0 +1,25 @@
+{
+  "domain": "workflow-policy/arc-budget",
+  "scope": "global",
+  "classification_lattice": ["halt", "warn", "continue"],
+  "rules": [
+    {
+      "id": "halt_on_step_overrun",
+      "classification": "halt",
+      "antecedent": { "op": "Ge", "field": "step", "value": 100 },
+      "consequent": "halt"
+    },
+    {
+      "id": "warn_on_step_threshold",
+      "classification": "warn",
+      "antecedent": { "op": "Ge", "field": "step", "value": 50 },
+      "consequent": "warn"
+    },
+    {
+      "id": "continue_default",
+      "classification": "continue",
+      "antecedent": { "op": "True" },
+      "consequent": "continue"
+    }
+  ]
+}
