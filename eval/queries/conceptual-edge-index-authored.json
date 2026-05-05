@@ -11,10 +11,13 @@
   ],
   "required_evidence": {
     "kind": "path",
-    "value": [
-      "REFERENCES",
-      "KnowledgeEntry.links"
-    ]
+    "value": {
+      "from": "design/agentic-corpus.md",
+      "to": "KnowledgeEntry.links",
+      "edge_types": [
+        "REFERENCES"
+      ]
+    }
   },
   "forbidden_stale_answers": [
     "Do not invent a standalone durable edge database; the design uses existing stores plus sidecars."

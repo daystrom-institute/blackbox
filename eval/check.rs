@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::entity_ref::{EntityRef, EntityType};
 
@@ -165,17 +164,15 @@ pub struct TargetLocator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RequiredEvidence {
-    pub kind: RequiredEvidenceKind,
-    pub value: Value,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequiredEvidenceKind {
-    EdgeFamily,
-    Path,
-    EntitySet,
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum RequiredEvidence {
+    EdgeFamily(String),
+    EntitySet(Vec<EntityType>),
+    Path {
+        from: String,
+        to: String,
+        edge_types: Vec<String>,
+    },
 }
 
 pub type CheckPassFn = fn(&[EntityRef]) -> (bool, Vec<String>);

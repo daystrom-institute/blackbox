@@ -16,10 +16,14 @@
   ],
   "required_evidence": {
     "kind": "path",
-    "value": [
-      "REFERENCES",
-      "DESCRIBES"
-    ]
+    "value": {
+      "from": "AGENTS.md",
+      "to": "src/orchestration/mcp.rs",
+      "edge_types": [
+        "REFERENCES",
+        "DESCRIBES"
+      ]
+    }
   },
   "forbidden_stale_answers": [
     "Do not describe the retired text-only recursion guard as the active mechanism."
