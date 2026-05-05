@@ -98,6 +98,11 @@ impl fmt::Display for EntityType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// Canonical entity references use `:` as the field delimiter. Provider names
+/// are short identifier-like strings and must not contain `:`; use
+/// [`EntityRef::try_render`] when constructing refs from untrusted provider
+/// strings so invalid values return a clear error instead of rendering an
+/// ambiguous grammar form.
 pub enum EntityRef {
     Knowledge {
         id: String,
@@ -200,36 +205,51 @@ impl EntityRef {
     }
 
     pub fn render(&self) -> String {
+        self.try_render()
+            .expect("EntityRef::render called with invalid in-memory entity ref")
+    }
+
+    pub fn try_render(&self) -> Result<String, EntityRefRenderError> {
         match self {
-            EntityRef::Knowledge { id } => format!("knowledge:{id}"),
+            EntityRef::Knowledge { id } => Ok(format!("knowledge:{id}")),
             EntityRef::Transcript {
                 provider,
                 session_id,
                 line_offset,
                 event_idx,
-            } => format!("transcript:{provider}:{session_id}:{line_offset}:{event_idx}"),
+            } => {
+                validate_provider(provider)?;
+                Ok(format!(
+                    "transcript:{provider}:{session_id}:{line_offset}:{event_idx}"
+                ))
+            }
             EntityRef::ProjectFile {
                 project_id,
                 rel_path_hash,
                 chunk_hash,
                 occurrence_idx,
-            } => format!("project_file:{project_id}:{rel_path_hash}:{chunk_hash}:{occurrence_idx}"),
+            } => Ok(format!(
+                "project_file:{project_id}:{rel_path_hash}:{chunk_hash}:{occurrence_idx}"
+            )),
             EntityRef::Session {
                 provider,
                 session_id,
-            } => format!("session:{provider}:{session_id}"),
-            EntityRef::Thread { thread_id } => format!("thread:{thread_id}"),
-            EntityRef::Note { note_id } => format!("note:{note_id}"),
+            } => {
+                validate_provider(provider)?;
+                Ok(format!("session:{provider}:{session_id}"))
+            }
+            EntityRef::Thread { thread_id } => Ok(format!("thread:{thread_id}")),
+            EntityRef::Note { note_id } => Ok(format!("note:{note_id}")),
             EntityRef::Symbol {
                 project_id,
                 qualified_name,
                 defn_hash,
-            } => format!("symbol:{project_id}:{qualified_name}:{defn_hash}"),
-            EntityRef::Brofile { name } => format!("brofile:{name}"),
-            EntityRef::Whiteboard { board_id } => format!("whiteboard:{board_id}"),
-            EntityRef::Commit { repo_id, sha } => format!("commit:{repo_id}:{sha}"),
-            EntityRef::Task { task_id } => format!("task:{task_id}"),
-            EntityRef::BashCall { session, turn } => format!("bash_call:{session}:{turn}"),
+            } => Ok(format!("symbol:{project_id}:{qualified_name}:{defn_hash}")),
+            EntityRef::Brofile { name } => Ok(format!("brofile:{name}")),
+            EntityRef::Whiteboard { board_id } => Ok(format!("whiteboard:{board_id}")),
+            EntityRef::Commit { repo_id, sha } => Ok(format!("commit:{repo_id}:{sha}")),
+            EntityRef::Task { task_id } => Ok(format!("task:{task_id}")),
+            EntityRef::BashCall { session, turn } => Ok(format!("bash_call:{session}:{turn}")),
         }
     }
 
@@ -255,9 +275,40 @@ impl EntityRef {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityRefRenderError {
+    pub field: &'static str,
+    pub message: String,
+}
+
+impl EntityRefRenderError {
+    fn invalid_provider(provider: &str) -> Self {
+        Self {
+            field: "provider",
+            message: format!("provider must be non-empty and must not contain ':': `{provider}`"),
+        }
+    }
+}
+
+impl fmt::Display for EntityRefRenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EntityRefRenderError {}
+
 impl fmt::Display for EntityRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.render())
+    }
+}
+
+fn validate_provider(provider: &str) -> Result<(), EntityRefRenderError> {
+    if provider.is_empty() || provider.contains(':') {
+        Err(EntityRefRenderError::invalid_provider(provider))
+    } else {
+        Ok(())
     }
 }
 
@@ -572,11 +623,32 @@ mod tests {
         let mut rng = Lcg::new(0x5eed_f1f1);
         for i in 0..10_000 {
             let entity = random_entity(&mut rng, i);
-            let rendered = entity.render();
-            let parsed = EntityRef::parse(&rendered).unwrap();
-            assert_eq!(parsed, entity);
-            assert_eq!(parsed.render(), rendered);
+            match entity.try_render() {
+                Ok(rendered) => {
+                    let parsed = EntityRef::parse(&rendered).unwrap();
+                    assert_eq!(parsed, entity);
+                    assert_eq!(parsed.render(), rendered);
+                }
+                Err(err) => {
+                    assert_eq!(err.field, "provider");
+                    assert!(matches!(
+                        entity,
+                        EntityRef::Transcript { .. } | EntityRef::Session { .. }
+                    ));
+                }
+            }
         }
+    }
+
+    #[test]
+    fn provider_colons_are_rejected_at_render_time() {
+        let entity = EntityRef::Session {
+            provider: "claude:code".to_string(),
+            session_id: "session-1".to_string(),
+        };
+        let err = entity.try_render().unwrap_err();
+        assert_eq!(err.field, "provider");
+        assert!(err.message.contains("must not contain ':'"));
     }
 
     #[test]
@@ -663,6 +735,15 @@ mod tests {
             out
         }
 
+        fn provider(&mut self, prefix: &str, allow_colon: bool) -> String {
+            let provider = self.token(prefix);
+            if allow_colon && self.bounded(3) == 0 {
+                format!("{}:{}", provider, self.token("sub-"))
+            } else {
+                provider
+            }
+        }
+
         fn hex(&mut self, len: usize) -> String {
             const HEX: &[u8] = b"0123456789abcdef";
             let mut out = String::with_capacity(len);
@@ -679,7 +760,7 @@ mod tests {
                 id: rng.token("know-"),
             },
             1 => EntityRef::Transcript {
-                provider: rng.token("p"),
+                provider: rng.provider("p", true),
                 session_id: format!("{}:{}", rng.token("sess-"), rng.token("turn-")),
                 line_offset: rng.next(),
                 event_idx: rng.next() as u32,
@@ -691,7 +772,7 @@ mod tests {
                 occurrence_idx: rng.next() as u32,
             },
             3 => EntityRef::Session {
-                provider: rng.token("p"),
+                provider: rng.provider("p", true),
                 session_id: format!("{}:{}", rng.token("sess-"), rng.token("sub-")),
             },
             4 => EntityRef::Thread {
