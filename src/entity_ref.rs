@@ -85,7 +85,7 @@ impl EntityType {
         matches!(self, EntityType::Task | EntityType::BashCall)
     }
 
-    fn from_prefix(prefix: &str) -> Option<Self> {
+    pub(crate) fn from_prefix(prefix: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|ty| ty.as_str() == prefix)
     }
 }
@@ -410,7 +410,11 @@ fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 }
 
 fn git_root_for_path(path: &Path) -> Option<PathBuf> {
-    let output = git_output(path, &["rev-parse", "--show-toplevel"], "deriving repository root")?;
+    let output = git_output(
+        path,
+        &["rev-parse", "--show-toplevel"],
+        "deriving repository root",
+    )?;
     if !output.status.success() {
         return None;
     }
@@ -453,12 +457,7 @@ fn git_remote_origin_for_path(path: &Path) -> Option<String> {
 }
 
 fn git_output(path: &Path, args: &[&str], action: &'static str) -> Option<std::process::Output> {
-    match Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()
-    {
+    match Command::new("git").arg("-C").arg(path).args(args).output() {
         Ok(output) => Some(output),
         Err(err) => {
             tracing::warn!(

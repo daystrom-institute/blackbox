@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::entity_ref::EntityRef;
+use crate::entity_ref::{EntityRef, EntityType};
 
 pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
     (
@@ -226,8 +227,21 @@ pub fn checker_by_name(name: &str) -> Option<CheckPassFn> {
 pub fn load_manifests() -> Result<Vec<EvalQueryManifest>, serde_json::Error> {
     MANIFEST_SOURCES
         .iter()
-        .map(|(_, raw)| serde_json::from_str::<EvalQueryManifest>(raw))
+        .map(|(name, raw)| load_manifest(name, raw))
         .collect()
+}
+
+fn load_manifest(name: &str, raw: &str) -> Result<EvalQueryManifest, serde_json::Error> {
+    let manifest = serde_json::from_str::<EvalQueryManifest>(raw)?;
+    for locator in &manifest.target_locators {
+        if EntityType::from_prefix(&locator.entity_type_hint).is_none() {
+            return Err(serde_json::Error::custom(format!(
+                "{name}: invalid entity_type_hint `{}` in locator `{}`",
+                locator.entity_type_hint, locator.description
+            )));
+        }
+    }
+    Ok(manifest)
 }
 
 fn default_stub_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>) {
@@ -335,5 +349,17 @@ mod tests {
         let (passed, messages) = check_pass(&[]);
         assert!(!passed);
         assert!(!messages.is_empty());
+    }
+
+    #[test]
+    fn load_manifest_rejects_invalid_entity_type_hint() {
+        let mut value: serde_json::Value = serde_json::from_str(MANIFEST_SOURCES[0].1).unwrap();
+        value["target_locators"][0]["entity_type_hint"] = "smbol".into();
+        let raw = serde_json::to_string(&value).unwrap();
+
+        let err = load_manifest("bogus-hint", &raw).unwrap_err();
+
+        assert!(err.to_string().contains("invalid entity_type_hint"));
+        assert!(err.to_string().contains("smbol"));
     }
 }
