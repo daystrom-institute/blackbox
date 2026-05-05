@@ -1,0 +1,21 @@
+{
+  "id": "exact-symbol-knowledge-store",
+  "query_class": "exact_symbol",
+  "query": "what file defines KnowledgeStore?",
+  "target_locators": [
+    {
+      "description": "The Rust struct definition for KnowledgeStore.",
+      "entity_type_hint": "symbol",
+      "path_hint": "src/knowledge.rs",
+      "symbol_hint": "KnowledgeStore"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "DEFINED_IN"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer with Knowledge, KnowledgeEntry, or design-only mentions when the symbol definition is requested."
+  ],
+  "pass_classifier": "check_exact_symbol_knowledge_store"
+}

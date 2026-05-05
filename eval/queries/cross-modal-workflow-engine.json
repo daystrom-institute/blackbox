@@ -1,0 +1,28 @@
+{
+  "id": "cross-modal-workflow-engine",
+  "query_class": "cross_modal_code_prose",
+  "query": "connect the workflow runbook to the workflow engine implementation.",
+  "target_locators": [
+    {
+      "description": "The workflow orchestration system memory or design prose explaining JSON arcs.",
+      "entity_type_hint": "knowledge",
+      "knowledge_hint": "sm-workflow-orchestration"
+    },
+    {
+      "description": "The Rust workflow compile/run implementation.",
+      "entity_type_hint": "project_file",
+      "path_hint": "src/workflow/mod.rs"
+    }
+  ],
+  "required_evidence": {
+    "kind": "entity_set",
+    "value": [
+      "knowledge",
+      "project_file"
+    ]
+  },
+  "forbidden_stale_answers": [
+    "Do not answer from examples/workflows only; include the engine implementation."
+  ],
+  "pass_classifier": "check_cross_modal_workflow_engine"
+}

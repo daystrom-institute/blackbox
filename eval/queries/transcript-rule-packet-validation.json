@@ -1,0 +1,20 @@
+{
+  "id": "transcript-rule-packet-validation",
+  "query_class": "transcript_provenance",
+  "query": "where did rule-packet validation get discussed?",
+  "target_locators": [
+    {
+      "description": "Transcript hits that cite decision 7ee3f895 or discuss rule-packet system validation.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "Rule-packet system validated"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer only with the stored decision; include the session provenance."
+  ],
+  "pass_classifier": "check_transcript_rule_packet_validation"
+}

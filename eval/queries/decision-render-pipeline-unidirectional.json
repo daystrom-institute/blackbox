@@ -1,0 +1,20 @@
+{
+  "id": "decision-render-pipeline-unidirectional",
+  "query_class": "stale_decision_lookup",
+  "query": "is bbox_absorb still the source of truth for rendered memory files?",
+  "target_locators": [
+    {
+      "description": "The render lifecycle system memory saying rendered provider files are unidirectional projections and bbox_absorb is a compatibility no-op.",
+      "entity_type_hint": "knowledge",
+      "knowledge_hint": "sm-render-lifecycle"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "REFERENCES"
+  },
+  "forbidden_stale_answers": [
+    "Do not describe rendered files as the authoritative editable store."
+  ],
+  "pass_classifier": "check_decision_render_pipeline_unidirectional"
+}

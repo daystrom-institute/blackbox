@@ -1,0 +1,20 @@
+{
+  "id": "decision-deep-docs-system-memory",
+  "query_class": "stale_decision_lookup",
+  "query": "where should deep blackbox tool documentation live?",
+  "target_locators": [
+    {
+      "description": "Knowledge entry e87292b0 stating that deep docs belong in code-owned system memories.",
+      "entity_type_hint": "knowledge",
+      "knowledge_hint": "e87292b0"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "KNOWLEDGE_FROM_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not say to hand-edit rendered provider memory files for deep tool docs."
+  ],
+  "pass_classifier": "check_decision_deep_docs_system_memory"
+}

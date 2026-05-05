@@ -1,0 +1,28 @@
+{
+  "id": "cross-modal-notes-side-channel",
+  "query_class": "cross_modal_code_prose",
+  "query": "connect side-channel note guidance to the Notes implementation.",
+  "target_locators": [
+    {
+      "description": "The side-channel notes system memory explaining note kinds and done notes.",
+      "entity_type_hint": "knowledge",
+      "knowledge_hint": "sm-side-channel-notes"
+    },
+    {
+      "description": "The Rust Notes store implementation.",
+      "entity_type_hint": "project_file",
+      "path_hint": "src/notes.rs"
+    }
+  ],
+  "required_evidence": {
+    "kind": "entity_set",
+    "value": [
+      "knowledge",
+      "project_file"
+    ]
+  },
+  "forbidden_stale_answers": [
+    "Do not answer only with user-facing note taxonomy; include the local notes store."
+  ],
+  "pass_classifier": "check_cross_modal_notes_side_channel"
+}

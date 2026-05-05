@@ -1,0 +1,20 @@
+{
+  "id": "transcript-voyage-embeddings",
+  "query_class": "transcript_provenance",
+  "query": "where did we discuss Voyage embeddings for agentic corpus?",
+  "target_locators": [
+    {
+      "description": "Transcript turns from the agentic-corpus design session that mention Voyage, voyage-code-3, or VOYAGE_API_KEY.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "Voyage embeddings agentic corpus"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer only from design files; this query asks for transcript provenance."
+  ],
+  "pass_classifier": "check_transcript_voyage_embeddings"
+}

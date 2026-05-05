@@ -1,0 +1,23 @@
+{
+  "id": "conceptual-workflow-foreach",
+  "query_class": "conceptual_design_doc",
+  "query": "why does the eval harness use a shell script instead of workflow foreach?",
+  "target_locators": [
+    {
+      "description": "The eval harness design note that shell iteration sidesteps the missing workflow-engine foreach primitive.",
+      "entity_type_hint": "project_file",
+      "path_hint": "design/agentic-corpus.md"
+    }
+  ],
+  "required_evidence": {
+    "kind": "path",
+    "value": [
+      "REFERENCES",
+      "thread-cba8bfa1"
+    ]
+  },
+  "forbidden_stale_answers": [
+    "Do not claim foreach already exists in the workflow engine."
+  ],
+  "pass_classifier": "check_conceptual_workflow_foreach"
+}

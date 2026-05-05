@@ -1,0 +1,21 @@
+{
+  "id": "exact-symbol-mcp-store",
+  "query_class": "exact_symbol",
+  "query": "where is McpStore implemented?",
+  "target_locators": [
+    {
+      "description": "The Rust struct and impl that load and save MCP server configuration.",
+      "entity_type_hint": "symbol",
+      "path_hint": "src/orchestration/mcp.rs",
+      "symbol_hint": "McpStore"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "DEFINED_IN"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer with rmcp SDK types or MCP client code; the local config store is the target."
+  ],
+  "pass_classifier": "check_exact_symbol_mcp_store"
+}

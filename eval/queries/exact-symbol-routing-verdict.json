@@ -1,0 +1,21 @@
+{
+  "id": "exact-symbol-routing-verdict",
+  "query_class": "exact_symbol",
+  "query": "where is RoutingVerdict defined?",
+  "target_locators": [
+    {
+      "description": "The Rust enum definition for RoutingVerdict.",
+      "entity_type_hint": "symbol",
+      "path_hint": "src/routing.rs",
+      "symbol_hint": "RoutingVerdict"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "DEFINED_IN"
+  },
+  "forbidden_stale_answers": [
+    "Do not stop at uses of RoutingVerdict in webhooks or main; the definition is the target."
+  ],
+  "pass_classifier": "check_exact_symbol_routing_verdict"
+}

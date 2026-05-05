@@ -1,0 +1,20 @@
+{
+  "id": "decision-distinct-daemon-paths",
+  "query_class": "stale_decision_lookup",
+  "query": "what was decided about prod and dev blackbox daemon install paths?",
+  "target_locators": [
+    {
+      "description": "Decision fdf7f59d that prod and dev services use distinct installed daemon paths.",
+      "entity_type_hint": "knowledge",
+      "knowledge_hint": "fdf7f59d"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "KNOWLEDGE_FROM_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not collapse blackboxd and blackboxd-dev onto the same installed executable path."
+  ],
+  "pass_classifier": "check_decision_distinct_daemon_paths"
+}

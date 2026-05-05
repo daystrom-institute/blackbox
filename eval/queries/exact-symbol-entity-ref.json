@@ -1,0 +1,21 @@
+{
+  "id": "exact-symbol-entity-ref",
+  "query_class": "exact_symbol",
+  "query": "where is EntityRef defined?",
+  "target_locators": [
+    {
+      "description": "The F1 EntityRef enum and parser surface.",
+      "entity_type_hint": "symbol",
+      "path_hint": "src/entity_ref.rs",
+      "symbol_hint": "EntityRef"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "DEFINED_IN"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer with the design grammar only; the implemented Rust enum is required."
+  ],
+  "pass_classifier": "check_exact_symbol_entity_ref"
+}

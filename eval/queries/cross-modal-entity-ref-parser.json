@@ -1,0 +1,29 @@
+{
+  "id": "cross-modal-entity-ref-parser",
+  "query_class": "cross_modal_code_prose",
+  "query": "show the entity-ref grammar and the parser that implements it.",
+  "target_locators": [
+    {
+      "description": "The entity-ref grammar in the agentic-corpus design.",
+      "entity_type_hint": "project_file",
+      "path_hint": "design/agentic-corpus.md"
+    },
+    {
+      "description": "The F1 Rust EntityRef parser implementation.",
+      "entity_type_hint": "project_file",
+      "path_hint": "src/entity_ref.rs",
+      "symbol_hint": "EntityRef"
+    }
+  ],
+  "required_evidence": {
+    "kind": "entity_set",
+    "value": [
+      "project_file",
+      "symbol"
+    ]
+  },
+  "forbidden_stale_answers": [
+    "Do not stop at the design grammar without surfacing src/entity_ref.rs."
+  ],
+  "pass_classifier": "check_cross_modal_entity_ref_parser"
+}

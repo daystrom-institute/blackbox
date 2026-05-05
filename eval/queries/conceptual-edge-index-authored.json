@@ -1,0 +1,23 @@
+{
+  "id": "conceptual-edge-index-authored",
+  "query_class": "conceptual_design_doc",
+  "query": "where do authored edges live versus projected edges?",
+  "target_locators": [
+    {
+      "description": "The EdgeIndex design section distinguishing projected edges from authored KnowledgeEntry.links and sidecar edges.",
+      "entity_type_hint": "project_file",
+      "path_hint": "design/agentic-corpus.md"
+    }
+  ],
+  "required_evidence": {
+    "kind": "path",
+    "value": [
+      "REFERENCES",
+      "KnowledgeEntry.links"
+    ]
+  },
+  "forbidden_stale_answers": [
+    "Do not invent a standalone durable edge database; the design uses existing stores plus sidecars."
+  ],
+  "pass_classifier": "check_conceptual_edge_index_authored"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "transcript-entity-ref-phase-f1",
+  "query_class": "transcript_provenance",
+  "query": "where was Phase F1 entity-ref parser implemented?",
+  "target_locators": [
+    {
+      "description": "The Codex transcript for Phase F1 that added src/entity_ref.rs and committed the entity-ref parser.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "phase F1 add entity ref parser"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer with F2a or later phase transcripts."
+  ],
+  "pass_classifier": "check_transcript_entity_ref_phase_f1"
+}

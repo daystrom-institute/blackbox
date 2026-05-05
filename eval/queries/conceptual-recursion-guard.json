@@ -1,0 +1,28 @@
+{
+  "id": "conceptual-recursion-guard",
+  "query_class": "conceptual_design_doc",
+  "query": "how does blackbox prevent bro orchestration recursion?",
+  "target_locators": [
+    {
+      "description": "The project documentation describing the mechanical recursion guard and provider-specific deny filters.",
+      "entity_type_hint": "project_file",
+      "path_hint": "AGENTS.md"
+    },
+    {
+      "description": "The code comments and config defaults for disallowing mcp__blackbox__bro_* tools.",
+      "entity_type_hint": "project_file",
+      "path_hint": "src/orchestration/mcp.rs"
+    }
+  ],
+  "required_evidence": {
+    "kind": "path",
+    "value": [
+      "REFERENCES",
+      "DESCRIBES"
+    ]
+  },
+  "forbidden_stale_answers": [
+    "Do not describe the retired text-only recursion guard as the active mechanism."
+  ],
+  "pass_classifier": "check_conceptual_recursion_guard"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "decision-bro-account-env",
+  "query_class": "stale_decision_lookup",
+  "query": "how should brofile account names affect provider environment?",
+  "target_locators": [
+    {
+      "description": "Decision 9d05efad that bro account dimension synthesizes provider env.",
+      "entity_type_hint": "knowledge",
+      "knowledge_hint": "9d05efad"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "KNOWLEDGE_FROM_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not treat account as a Claude-only field with no cross-provider effect."
+  ],
+  "pass_classifier": "check_decision_bro_account_env"
+}

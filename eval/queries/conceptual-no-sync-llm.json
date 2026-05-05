@@ -1,0 +1,20 @@
+{
+  "id": "conceptual-no-sync-llm",
+  "query_class": "conceptual_design_doc",
+  "query": "does bbox run an LLM in synchronous search calls?",
+  "target_locators": [
+    {
+      "description": "The design constraint saying no bbox-side LLM appears in the synchronous search path.",
+      "entity_type_hint": "project_file",
+      "path_hint": "design/agentic-corpus.md"
+    }
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "NEXT_SECTION"
+  },
+  "forbidden_stale_answers": [
+    "Do not describe an agentic runner workflow wrapping search tools; the calling LLM is the runner."
+  ],
+  "pass_classifier": "check_conceptual_no_sync_llm"
+}
