@@ -1071,12 +1071,12 @@ fn summarize_council_event(v: &Value) -> Option<CouncilRelay> {
             } else if kind == "system" {
                 Some(CouncilRelay {
                     sender: None,
-                    body: one_line(body, 360),
+                    body: body.to_string(),
                 })
             } else {
                 Some(CouncilRelay {
                     sender: Some(sender.to_string()),
-                    body: one_line(body, 360),
+                    body: body.to_string(),
                 })
             }
         }
@@ -1330,7 +1330,7 @@ async fn summarize_tail_event(
             }
             match result.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 Some(text) if last_output.as_deref().map(str::trim) == Some(text) => None,
-                Some(text) => Some(format!("{who}: {}", one_line(text, 360))),
+                Some(text) => Some(format!("{who}: {text}")),
                 None => None,
             }
         }
