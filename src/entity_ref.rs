@@ -376,10 +376,13 @@ pub fn hash_path(path: &Path) -> String {
 fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     if canonical.is_file() {
-        Ok(canonical
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or(canonical))
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "project path must be a directory, not a file: {}",
+                canonical.display()
+            ),
+        ))
     } else {
         Ok(canonical)
     }
@@ -649,6 +652,17 @@ mod tests {
         let err = entity.try_render().unwrap_err();
         assert_eq!(err.field, "provider");
         assert!(err.message.contains("must not contain ':'"));
+    }
+
+    #[test]
+    fn project_ids_reject_file_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("file.txt");
+        fs::write(&file_path, "not a directory").unwrap();
+
+        let err = project_id_for_path(&file_path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("must be a directory"));
     }
 
     #[test]
