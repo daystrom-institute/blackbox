@@ -1,5 +1,6 @@
 mod council;
 mod crons;
+pub mod entity_ref;
 mod inbox;
 mod index;
 mod knowledge;
