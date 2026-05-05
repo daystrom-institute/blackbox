@@ -1,5 +1,6 @@
 {
   "domain": "workflow-policy/arc-budget",
+  "version": 1,
   "scope": "global",
   "classification_lattice": ["halt", "warn", "continue"],
   "rules": [

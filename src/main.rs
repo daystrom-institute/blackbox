@@ -1,3 +1,4 @@
+mod artifacts;
 mod council;
 mod crons;
 pub mod entity_ref;
@@ -70,6 +71,7 @@ struct SharedState {
     notes: RwLock<Notes>,
     pins: RwLock<Pins>,
     packets: RwLock<Packets>,
+    artifacts: RwLock<artifacts::ArtifactCatalog>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
     store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
@@ -628,6 +630,7 @@ impl BlackboxServer {
 // Bbox tools (search, knowledge, threads)
 // ---------------------------------------------------------------------------
 
+use artifacts::{ArtifactInstallParams, ArtifactListParams, ArtifactSupersedeParams};
 use inbox::InboxParams;
 use index::{
     CiteParams, ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
@@ -727,6 +730,51 @@ impl BlackboxServer {
     )]
     fn bbox_stats(&self) -> CallToolResult {
         Self::run("bbox_stats", || self.state.idx.read().stats())
+    }
+
+    #[tool(
+        name = "bbox_artifact_install",
+        description = "Install a workflow, packet, or brofile artifact from a local JSON file path or http(s) URL into the versioned artifact catalog."
+    )]
+    async fn bbox_artifact_install(
+        &self,
+        Parameters(p): Parameters<ArtifactInstallParams>,
+    ) -> CallToolResult {
+        match install_artifact_from_params(&self.state, p).await {
+            Ok(meta) => Self::ok_json(&serde_json::to_value(meta).unwrap_or_default()),
+            Err(e) => Self::err_text(&format!("artifact install failed: {e:#}")),
+        }
+    }
+
+    #[tool(
+        name = "bbox_artifact_list",
+        description = "List installed workflow, packet, and brofile artifacts with version, source, active status, and supersession metadata."
+    )]
+    fn bbox_artifact_list(&self, Parameters(p): Parameters<ArtifactListParams>) -> CallToolResult {
+        Self::run("bbox_artifact_list", || {
+            let rows = self.state.artifacts.read().list(&p)?;
+            Ok(serde_json::to_string_pretty(
+                &serde_json::json!({ "artifacts": rows }),
+            )?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_artifact_supersede",
+        description = "Mark one installed artifact superseded by another artifact of the same kind."
+    )]
+    fn bbox_artifact_supersede(
+        &self,
+        Parameters(p): Parameters<ArtifactSupersedeParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_artifact_supersede", || {
+            let meta = self
+                .state
+                .artifacts
+                .write()
+                .supersede(p.kind, &p.name, &p.superseded_by)?;
+            Ok(serde_json::to_string_pretty(&meta)?)
+        })
     }
 
     #[tool(
@@ -1564,7 +1612,10 @@ fn resolve_dispatch_filters(
 /// Delete a Gemini policy tempfile once the associated task reaches a
 /// terminal state. Spawned as a detached tokio task from the dispatch
 /// path. No-op if path is None.
-pub(crate) fn cleanup_policy_file_when_done(task: std::sync::Arc<orch::Task>, path: Option<PathBuf>) {
+pub(crate) fn cleanup_policy_file_when_done(
+    task: std::sync::Arc<orch::Task>,
+    path: Option<PathBuf>,
+) {
     let Some(path) = path else { return };
     tokio::spawn(async move {
         loop {
@@ -6176,6 +6227,64 @@ async fn admin_packet_compile(
     }
 }
 
+async fn read_artifact_source(source: &str) -> anyhow::Result<Value> {
+    let raw = if source.starts_with("http://") || source.starts_with("https://") {
+        reqwest::get(source)
+            .await?
+            .error_for_status()?
+            .text()
+            .await?
+    } else {
+        std::fs::read_to_string(source)?
+    };
+    Ok(serde_json::from_str(&raw)?)
+}
+
+async fn install_artifact_from_params(
+    state: &Arc<SharedState>,
+    p: ArtifactInstallParams,
+) -> anyhow::Result<artifacts::ArtifactMetadata> {
+    let value = read_artifact_source(&p.source).await?;
+    install_artifact_value(state, p, value).await
+}
+
+async fn install_artifact_value(
+    state: &Arc<SharedState>,
+    p: ArtifactInstallParams,
+    value: Value,
+) -> anyhow::Result<artifacts::ArtifactMetadata> {
+    match p.kind {
+        artifacts::ArtifactKind::Workflow => {
+            let spec: workflow::Workflow = serde_json::from_value(value.clone())?;
+            let compiled = workflow::compile(spec.clone())?;
+            let server = BlackboxServer::new(state.clone());
+            if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+                anyhow::bail!("workflow capability validation failed: {e}");
+            }
+            let id = p.name.clone().unwrap_or_else(|| spec.name.clone());
+            let dir = state.store_dir.join("workflows");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join(format!("{id}.json")),
+                serde_json::to_string_pretty(&spec).unwrap_or_default(),
+            )?;
+            state.workflow_registry.write().insert(id, spec);
+        }
+        artifacts::ArtifactKind::Packet => {
+            let params: packets::CompileParams = serde_json::from_value(value.clone())?;
+            state.packets.read().compile(&params)?;
+        }
+        artifacts::ArtifactKind::Brofile => {
+            let brofile: orchestration::brofile::Brofile = serde_json::from_value(value.clone())?;
+            orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None);
+        }
+    }
+    state
+        .artifacts
+        .write()
+        .install_value(p.kind, p.source, &value, p.name, p.version, p.supersedes)
+}
+
 #[derive(Debug, Deserialize)]
 struct AdminWorkflowInstallReq {
     #[serde(default)]
@@ -6232,6 +6341,55 @@ async fn admin_workflow_install(
     }
     state.workflow_registry.write().insert(id.clone(), spec);
     axum::Json(json!({"status": "installed", "id": id})).into_response()
+}
+
+async fn admin_artifact_install(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<ArtifactInstallParams>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    match install_artifact_from_params(&state, req).await {
+        Ok(meta) => axum::Json(json!({"status": "installed", "artifact": meta})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("artifact install: {e:#}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_artifact_list(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    Query(query): Query<ArtifactListParams>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    match state.artifacts.read().list(&query) {
+        Ok(rows) => axum::Json(json!({"artifacts": rows})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("artifact list: {e:#}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_artifact_supersede(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<ArtifactSupersedeParams>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    match state
+        .artifacts
+        .write()
+        .supersede(req.kind, &req.name, &req.superseded_by)
+    {
+        Ok(meta) => axum::Json(json!({"status": "superseded", "artifact": meta})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("artifact supersede: {e:#}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -7030,6 +7188,10 @@ async fn main() -> anyhow::Result<()> {
     let packets_store = Packets::open(&packets_dir)?;
     tracing::info!("Packets store: {}", packets_dir.join("packets").display());
 
+    let artifacts_dir = util::blackbox_artifacts_dir(&home);
+    let artifacts_store = artifacts::ArtifactCatalog::open(&artifacts_dir)?;
+    tracing::info!("Artifact catalog: {}", artifacts_store.root().display());
+
     // Orchestration state
     let store_dir = PathBuf::from(
         std::env::var("BRO_STORE")
@@ -7069,6 +7231,7 @@ async fn main() -> anyhow::Result<()> {
         notes: RwLock::new(notes_store),
         pins: RwLock::new(pins_store),
         packets: RwLock::new(packets_store),
+        artifacts: RwLock::new(artifacts_store),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx: tail_tx.clone(),
         store_dir: store_dir.clone(),
@@ -7319,6 +7482,18 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::post(admin_workflow_install),
         )
         .route(
+            "/admin/artifact/install",
+            axum::routing::post(admin_artifact_install),
+        )
+        .route(
+            "/admin/artifact/list",
+            axum::routing::get(admin_artifact_list),
+        )
+        .route(
+            "/admin/artifact/supersede",
+            axum::routing::post(admin_artifact_supersede),
+        )
+        .route(
             "/admin/webhook/install",
             axum::routing::post(admin_webhook_install),
         )
@@ -7387,6 +7562,7 @@ mod tests {
         let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
         let pins = Pins::open(&tmp.path().join("pins.json")).unwrap();
         let packets = Packets::open(tmp.path()).unwrap();
+        let artifacts = artifacts::ArtifactCatalog::open(tmp.path().join("artifacts")).unwrap();
         let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
         let state = Arc::new(SharedState {
             idx: RwLock::new(index),
@@ -7395,6 +7571,7 @@ mod tests {
             notes: RwLock::new(notes),
             pins: RwLock::new(pins),
             packets: RwLock::new(packets),
+            artifacts: RwLock::new(artifacts),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,
             store_dir: tmp.path().join("bro"),
@@ -7432,6 +7609,69 @@ mod tests {
             &tmp.path().join("bro"),
             None,
         );
+    }
+
+    #[tokio::test]
+    async fn artifact_install_wires_f3_workflow_and_packet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/schema-migration-arc.json"
+        ))
+        .unwrap();
+        let packet_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/workflow-policy/arc-budget.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/schema-migration-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/workflow-policy/arc-budget.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            packet_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("schema-migration-arc"));
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:workflow-policy/arc-budget")
+            .is_ok());
+        let rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: None,
+                name: None,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

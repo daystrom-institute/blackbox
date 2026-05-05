@@ -24,6 +24,7 @@ pub enum ToolCategory {
     Threads,
     Notes,
     Inbox,
+    Artifacts,
     Packets,
     Orchestration,
     Workflows,
@@ -39,6 +40,7 @@ impl ToolCategory {
             Self::Threads => "Threads",
             Self::Notes => "Side-channel notes",
             Self::Inbox => "Attention / inbox",
+            Self::Artifacts => "Artifact catalog",
             Self::Packets => "Rule-packets",
             Self::Orchestration => "Bro orchestration",
             Self::Workflows => "Workflow orchestration",
@@ -63,6 +65,9 @@ impl ToolCategory {
             }
             Self::Inbox => {
                 "Attention aggregator: a single read that surfaces unresolved notes, stale threads, unverified knowledge, and failed tasks. Run at round boundaries, morning-brief style, and whenever you're unsure what needs attention next."
+            }
+            Self::Artifacts => {
+                "Versioned install catalog for producer-side workflows, rule-packets, and brofiles. Use this surface instead of hand-copying shipped artifacts into daemon state; metadata tracks source, active version, and supersession."
             }
             Self::Packets => {
                 "Reusable judges compiled from examples or stated rules. If your task involves writing a priority-ordered rubric, ranking a batch against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones — compile a packet. `bbox_compile` authors the mechanism, `bbox_apply` evaluates any entity deterministically (no LLM), `bbox_audit` self-validates against known labels. Packets are portable: dispatch `packet_id` to sub-agents and every one of them produces bit-identical output. See `sm-rule-packets` via `bbox_knowledge` for the full runbook."
@@ -303,6 +308,28 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Aggregate attention layer across every store.",
         when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view.",
         example: Some(r#"bbox_inbox(project="/repo/x", stale_days=3)"#),
+    },
+    // ── Artifact catalog ─────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_artifact_install",
+        category: ToolCategory::Artifacts,
+        summary: "Install a workflow, packet, or brofile artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
+        when_to_use: "Use for producer-side artifacts shipped under examples/agentic-corpus or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, or brofile registry, then records version/source/supersession metadata in the catalog.",
+        example: Some(r#"bbox_artifact_install(kind="workflow", source="examples/agentic-corpus/workflows/schema-migration-arc.json")"#),
+    },
+    ToolDoc {
+        name: "bbox_artifact_list",
+        category: ToolCategory::Artifacts,
+        summary: "List installed workflow, packet, and brofile artifacts with version, source, active status, and supersession metadata.",
+        when_to_use: "Inventory check before installing or superseding producer machinery. Use kind/name filters to inspect a specific artifact family.",
+        example: Some(r#"bbox_artifact_list(kind="packet")"#),
+    },
+    ToolDoc {
+        name: "bbox_artifact_supersede",
+        category: ToolCategory::Artifacts,
+        summary: "Mark one installed artifact superseded by another artifact of the same kind.",
+        when_to_use: "Use when a customized workflow/packet/brofile replaces an installed version but you want the old version retained for audit.",
+        example: Some(r#"bbox_artifact_supersede(kind="workflow", name="auto-digest-arc", superseded_by="auto-digest-arc-v2")"#),
     },
     // ── Rule-packets ─────────────────────────────────────────────────
     ToolDoc {
@@ -831,6 +858,7 @@ pub fn render_markdown() -> String {
         ToolCategory::Threads,
         ToolCategory::Notes,
         ToolCategory::Inbox,
+        ToolCategory::Artifacts,
         ToolCategory::Packets,
         ToolCategory::Orchestration,
         ToolCategory::Workflows,

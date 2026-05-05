@@ -2,6 +2,7 @@ use anyhow::Result;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+use crate::artifacts;
 use crate::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
 use crate::notes::{NoteKind, NoteResolution, Notes};
 use crate::orchestration::{TaskStatus, TaskStore};
@@ -75,6 +76,20 @@ pub fn compute_inbox(
             out.push_str(&format!("  {} — {}\n", n.id, truncate(&n.body, 120)));
         }
         out.push('\n');
+    }
+
+    if let Some(project) = p.project.as_deref() {
+        let discovered = artifacts::discover_project_artifacts(std::path::Path::new(project))?;
+        if !discovered.is_empty() {
+            out.push_str(&format!(
+                "## Discovered .bbox artifacts ({})\n",
+                discovered.len()
+            ));
+            for a in discovered.iter().take(limit) {
+                out.push_str(&format!("  [{}] {}\n", a.kind, a.path));
+            }
+            out.push('\n');
+        }
     }
 
     // 3. Stale threads — still open/active past threshold

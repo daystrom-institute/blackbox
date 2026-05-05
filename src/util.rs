@@ -73,6 +73,10 @@ pub fn blackbox_packets_dir(home: &Path) -> PathBuf {
     env_path("BLACKBOX_PACKETS_DIR").unwrap_or_else(|| blackbox_state_dir(home))
 }
 
+pub fn blackbox_artifacts_dir(home: &Path) -> PathBuf {
+    env_path("BLACKBOX_ARTIFACTS_DIR").unwrap_or_else(|| blackbox_state_dir(home).join("artifacts"))
+}
+
 pub fn bro_home_dir(home: &Path) -> PathBuf {
     env_path("BRO_HOME").unwrap_or_else(|| blackbox_state_dir(home).join("bro"))
 }
