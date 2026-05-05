@@ -358,7 +358,15 @@ pub fn project_id_for_path(path: impl AsRef<Path>) -> io::Result<String> {
 
 pub fn repo_id_for_path(path: impl AsRef<Path>) -> io::Result<String> {
     let canonical = canonical_input_path(path)?;
-    let repo_root = git_root_for_path(&canonical).unwrap_or(canonical);
+    let Some(repo_root) = git_root_for_path(&canonical) else {
+        return Ok(hash_path(&canonical));
+    };
+    if let Some(first_commit) = git_first_commit_for_path(&repo_root) {
+        return Ok(hash_string(&first_commit));
+    }
+    if let Some(remote_url) = git_remote_origin_for_path(&repo_root) {
+        return Ok(hash_string(&remote_url));
+    }
     Ok(hash_path(&repo_root))
 }
 
@@ -372,8 +380,16 @@ pub fn realpath_hash(path: impl AsRef<Path>) -> io::Result<String> {
 /// That is intentionally compact for local project/entity IDs and is not a
 /// cryptographic uniqueness guarantee.
 pub fn hash_path(path: &Path) -> String {
+    hash_bytes(path.to_string_lossy().as_bytes())
+}
+
+fn hash_string(value: &str) -> String {
+    hash_bytes(value.as_bytes())
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(bytes);
     let digest = hasher.finalize();
     hex::encode(&digest[..4])
 }
@@ -394,28 +410,66 @@ fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 }
 
 fn git_root_for_path(path: &Path) -> Option<PathBuf> {
-    let output = match Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("rev-parse")
-        .arg("--show-toplevel")
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "failed to execute git while deriving repository root"
-            );
-            return None;
-        }
-    };
+    let output = git_output(path, &["rev-parse", "--show-toplevel"], "deriving repository root")?;
     if !output.status.success() {
         return None;
     }
     let root = String::from_utf8(output.stdout).ok()?;
     fs::canonicalize(root.trim()).ok()
+}
+
+fn git_first_commit_for_path(path: &Path) -> Option<String> {
+    let output = git_output(
+        path,
+        &["rev-list", "--max-parents=0", "HEAD"],
+        "deriving first commit",
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+}
+
+fn git_remote_origin_for_path(path: &Path) -> Option<String> {
+    let output = git_output(
+        path,
+        &["config", "remote.origin.url"],
+        "deriving remote origin URL",
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8(output.stdout).ok()?;
+    let remote = remote.trim();
+    if remote.is_empty() {
+        None
+    } else {
+        Some(remote.to_string())
+    }
+}
+
+fn git_output(path: &Path, args: &[&str], action: &'static str) -> Option<std::process::Output> {
+    match Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+    {
+        Ok(output) => Some(output),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                action,
+                "failed to execute git"
+            );
+            None
+        }
+    }
 }
 
 fn parse_single(
@@ -681,7 +735,40 @@ mod tests {
     }
 
     #[test]
-    fn commit_ref_round_trips_with_realpath_hash_repo_id() {
+    fn git_repo_id_uses_first_commit_hash_not_realpath_hash() {
+        let repo_path = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let first_commit = git_first_commit_for_path(repo_path).unwrap();
+        let repo_id = repo_id_for_path(repo_path).unwrap();
+        let realpath_id = realpath_hash(repo_path).unwrap();
+
+        assert_eq!(repo_id, hash_string(&first_commit));
+        assert_ne!(repo_id, realpath_id);
+    }
+
+    #[test]
+    fn repo_id_falls_back_to_remote_origin_without_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .arg("init")
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        let remote = "https://example.invalid/transcript-search.git";
+        let remote_add = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["remote", "add", "origin", remote])
+            .output()
+            .unwrap();
+        assert!(remote_add.status.success());
+
+        assert_eq!(repo_id_for_path(dir.path()).unwrap(), hash_string(remote));
+    }
+
+    #[test]
+    fn commit_ref_round_trips_with_repo_id() {
         let repo_id = repo_id_for_path(env!("CARGO_MANIFEST_DIR")).unwrap();
         assert_eq!(repo_id.len(), 8);
         let entity = EntityRef::Commit {
