@@ -304,7 +304,8 @@ mod tests {
 
         let mut ids = BTreeSet::new();
         let mut class_counts = BTreeMap::<QueryClass, usize>::new();
-        for manifest in &manifests {
+        for ((name, _), manifest) in MANIFEST_SOURCES.iter().zip(&manifests) {
+            assert_eq!(&manifest.id, name, "manifest id must match filename stem");
             assert!(
                 ids.insert(manifest.id.clone()),
                 "duplicate id {}",
