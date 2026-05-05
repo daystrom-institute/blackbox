@@ -394,13 +394,23 @@ fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 }
 
 fn git_root_for_path(path: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
+    let output = match Command::new("git")
         .arg("-C")
         .arg(path)
         .arg("rev-parse")
         .arg("--show-toplevel")
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to execute git while deriving repository root"
+            );
+            return None;
+        }
+    };
     if !output.status.success() {
         return None;
     }
