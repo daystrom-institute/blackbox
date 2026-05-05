@@ -6063,6 +6063,64 @@ async fn orchestrate_by_id_handler(
     axum::Json(result).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct IrcStatusQuery {
+    #[serde(default)]
+    tail: Option<usize>,
+}
+
+async fn irc_exec_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<ExecParams>,
+) -> axum::Json<CallToolResult> {
+    axum::Json(BlackboxServer::new(state).bro_exec(Parameters(req)).await)
+}
+
+async fn irc_resume_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<ResumeParams>,
+) -> axum::Json<CallToolResult> {
+    axum::Json(BlackboxServer::new(state).bro_resume(Parameters(req)).await)
+}
+
+async fn irc_broadcast_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<BroadcastParams>,
+) -> axum::Json<CallToolResult> {
+    axum::Json(
+        BlackboxServer::new(state)
+            .bro_broadcast(Parameters(req))
+            .await,
+    )
+}
+
+async fn irc_status_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Query(query): Query<IrcStatusQuery>,
+) -> axum::Json<CallToolResult> {
+    axum::Json(
+        BlackboxServer::new(state).bro_status(Parameters(StatusParams {
+            task_id,
+            tail: query.tail,
+        })),
+    )
+}
+
+async fn irc_dashboard_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    Query(query): Query<DashboardParams>,
+) -> axum::Json<CallToolResult> {
+    axum::Json(BlackboxServer::new(state).bro_dashboard(Parameters(query)))
+}
+
+async fn irc_cancel_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<CancelParams>,
+) -> axum::Json<CallToolResult> {
+    axum::Json(BlackboxServer::new(state).bro_cancel(Parameters(req)))
+}
+
 // ── Admin HTTP endpoints (plain JSON; no MCP framing) ──────────────
 //
 // These wrap the same operations the MCP tools expose so install
@@ -7216,6 +7274,15 @@ async fn main() -> anyhow::Result<()> {
             "/orchestrate/by-id",
             axum::routing::post(orchestrate_by_id_handler),
         )
+        .route("/irc/exec", axum::routing::post(irc_exec_handler))
+        .route("/irc/resume", axum::routing::post(irc_resume_handler))
+        .route("/irc/broadcast", axum::routing::post(irc_broadcast_handler))
+        .route(
+            "/irc/status/{task_id}",
+            axum::routing::get(irc_status_handler),
+        )
+        .route("/irc/dashboard", axum::routing::get(irc_dashboard_handler))
+        .route("/irc/cancel", axum::routing::post(irc_cancel_handler))
         .route(
             "/admin/packet/compile",
             axum::routing::post(admin_packet_compile),

@@ -258,6 +258,7 @@ async fn process_envelope(
         shared.task_store.clone(),
         shared.tail_tx.clone(),
     );
+    task.inner.lock().bro_label = Some(format!("{}::{}", council_id, bro_id));
     crate::cleanup_policy_file_when_done(task.clone(), dispatch._policy_file);
 
     let completed = orch::wait_for_task_with_timeout(&task, Some(TURN_TIMEOUT_SECS)).await;

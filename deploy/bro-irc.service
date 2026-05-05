@@ -1,0 +1,16 @@
+[Unit]
+Description=blackbox IRC bridge - LAN couch steering
+After=network.target blackbox.service
+Wants=blackbox.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bro-irc --irc-host 192.168.0.251 --irc-port 6667 --channel #bros --daemon-url http://127.0.0.1:7264
+Restart=on-failure
+RestartSec=3
+WorkingDirectory=%h
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
