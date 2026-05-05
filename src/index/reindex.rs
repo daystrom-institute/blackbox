@@ -10,7 +10,7 @@ use tantivy::{Index, IndexWriter, TantivyDocument};
 use walkdir::WalkDir;
 
 use super::helpers::*;
-use super::{FieldHandles, FileMeta, ReindexConfig};
+use super::{build_schema, FieldHandles, FileMeta, ReindexConfig};
 use crate::entity_ref;
 use crate::parser;
 
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn transcript_docs_include_doc_type_and_parser_version() {
-        let (_schema, fields) = test_schema();
+        let (_schema, fields) = build_schema();
         let event = ParsedEvent {
             role: MessageRole::User,
             content: "schema migration smoke".to_string(),
@@ -677,34 +677,5 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_default()
-    }
-
-    fn test_schema() -> (Schema, FieldHandles) {
-        let mut builder = Schema::builder();
-        let fields = FieldHandles {
-            content: builder.add_text_field("content", TEXT | STORED),
-            session_id: builder.add_text_field("session_id", STRING | STORED),
-            account: builder.add_text_field("account", STRING | STORED),
-            project: builder.add_text_field("project", TEXT | STORED),
-            role: builder.add_text_field("role", STRING | STORED),
-            timestamp: builder.add_text_field("timestamp", STRING | STORED),
-            file_path: builder.add_text_field("file_path", STRING | STORED),
-            byte_offset: builder.add_u64_field("byte_offset", STORED),
-            git_branch: builder.add_text_field("git_branch", STRING | STORED),
-            is_subagent: builder.add_u64_field("is_subagent", INDEXED | STORED),
-            agent_slug: builder.add_text_field("agent_slug", STRING | STORED),
-            doc_type: builder.add_text_field("doc_type", STRING | STORED),
-            chunk_kind: builder.add_text_field("chunk_kind", STRING | STORED),
-            language: builder.add_text_field("language", STRING | STORED),
-            symbol: builder.add_text_field("symbol", TEXT | STORED),
-            symbol_exact: builder.add_text_field("symbol_exact", STRING | STORED),
-            code_content: builder.add_text_field("code_content", TEXT | STORED),
-            chunk_hash: builder.add_text_field("chunk_hash", STRING | STORED),
-            entity_id: builder.add_text_field("entity_id", STRING | STORED),
-            parser_version: builder.add_text_field("parser_version", STRING | STORED),
-            commit_sha: builder.add_text_field("commit_sha", STRING | STORED),
-            repo_id: builder.add_text_field("repo_id", STRING | STORED),
-        };
-        (builder.build(), fields)
     }
 }
