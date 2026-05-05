@@ -444,11 +444,18 @@ fn git_first_commit_for_path(path: &Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout)
-        .ok()?
+    git_first_commit_from_stdout(&output.stdout)
+}
+
+fn git_first_commit_from_stdout(stdout: &[u8]) -> Option<String> {
+    let raw = String::from_utf8(stdout.to_vec()).ok()?;
+    let mut roots: Vec<&str> = raw
         .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    roots.sort_unstable();
+    roots.first().map(|line| (*line).to_string())
 }
 
 fn git_remote_origin_for_path(path: &Path) -> Option<String> {
@@ -790,6 +797,17 @@ mod tests {
         assert!(remote_add.status.success());
 
         assert_eq!(repo_id_for_path(dir.path()).unwrap(), hash_string(remote));
+    }
+
+    #[test]
+    fn first_commit_stdout_uses_lexicographic_min_root() {
+        let stdout =
+            b"ffff000000000000000000000000000000000000\n1111000000000000000000000000000000000000\n";
+
+        assert_eq!(
+            git_first_commit_from_stdout(stdout).as_deref(),
+            Some("1111000000000000000000000000000000000000")
+        );
     }
 
     #[test]
