@@ -102,7 +102,9 @@ impl fmt::Display for EntityType {
 /// are short identifier-like strings and must not contain `:`; use
 /// [`EntityRef::try_render`] when constructing refs from untrusted provider
 /// strings so invalid values return a clear error instead of rendering an
-/// ambiguous grammar form.
+/// ambiguous grammar form. `Display` is non-panicking and falls back to an
+/// explicit invalid-entity sentinel for malformed in-memory values; use
+/// `try_render` for boundary serialization that must reject invalid refs.
 pub enum EntityRef {
     Knowledge {
         id: String,
@@ -278,6 +280,7 @@ impl EntityRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityRefRenderError {
     pub field: &'static str,
+    pub value: String,
     pub message: String,
 }
 
@@ -285,6 +288,7 @@ impl EntityRefRenderError {
     fn invalid_provider(provider: &str) -> Self {
         Self {
             field: "provider",
+            value: provider.to_string(),
             message: format!("provider must be non-empty and must not contain ':': `{provider}`"),
         }
     }
@@ -300,7 +304,16 @@ impl std::error::Error for EntityRefRenderError {}
 
 impl fmt::Display for EntityRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.render())
+        match self.try_render() {
+            Ok(rendered) => f.write_str(&rendered),
+            Err(err) => write!(
+                f,
+                "<invalid entity-ref kind={} field={} value={}>",
+                self.entity_type(),
+                err.field,
+                err.value
+            ),
+        }
     }
 }
 
@@ -720,6 +733,19 @@ mod tests {
         let err = entity.try_render().unwrap_err();
         assert_eq!(err.field, "provider");
         assert!(err.message.contains("must not contain ':'"));
+    }
+
+    #[test]
+    fn display_of_invalid_provider_is_non_panicking_sentinel() {
+        let entity = EntityRef::Session {
+            provider: "claude:code".to_string(),
+            session_id: "session-1".to_string(),
+        };
+
+        assert_eq!(
+            entity.to_string(),
+            "<invalid entity-ref kind=session field=provider value=claude:code>"
+        );
     }
 
     #[test]
