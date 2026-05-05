@@ -6,6 +6,11 @@
   drops the derived transcript index on first daemon start after upgrade.
 - The background reindexer rebuilds from immutable transcript sources; search
   may report an empty index until that first rebuild commits.
+- `schema-migration-arc.json` currently documents the migration shape; actual
+  drop+rebuild runs in `TranscriptIndex::open_or_create` until hook ops
+  `schema_migration_drop` / `schema_migration_rebuild` are wired in a later
+  phase. The workflow + packet are installed via the F4 catalog so the spec
+  lives alongside the mechanism.
 
 ## F4
 
