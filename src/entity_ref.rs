@@ -366,6 +366,11 @@ pub fn realpath_hash(path: impl AsRef<Path>) -> io::Result<String> {
     canonical_input_path(path).map(|path| hash_path(&path))
 }
 
+/// Hashes a canonical path to 8 lowercase hex characters.
+///
+/// The value is the first 4 bytes of SHA-256, giving a 32-bit collision space.
+/// That is intentionally compact for local project/entity IDs and is not a
+/// cryptographic uniqueness guarantee.
 pub fn hash_path(path: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(path.to_string_lossy().as_bytes());
