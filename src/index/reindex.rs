@@ -299,12 +299,25 @@ pub(super) fn event_to_doc_standalone(
     is_subagent: bool,
     f: FieldHandles,
 ) -> TantivyDocument {
+    build_transcript_doc(event, account, file_path, byte_offset, is_subagent, "", f)
+}
+
+pub(crate) fn build_transcript_doc(
+    event: &parser::ParsedEvent,
+    account: &str,
+    file_path: &str,
+    byte_offset: u64,
+    is_subagent: bool,
+    project_fallback: &str,
+    f: FieldHandles,
+) -> TantivyDocument {
     let mut doc = TantivyDocument::new();
-    add_transcript_corpus_fields(&mut doc, f);
+    doc.add_text(f.doc_type, "transcript");
+    doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
     doc.add_text(f.content, &event.content);
     doc.add_text(f.session_id, &event.session_id);
     doc.add_text(f.account, account);
-    doc.add_text(f.project, event.cwd.as_deref().unwrap_or(""));
+    doc.add_text(f.project, event.cwd.as_deref().unwrap_or(project_fallback));
     doc.add_text(f.role, event.role.as_ref());
     doc.add_text(f.file_path, file_path);
     doc.add_u64(f.byte_offset, byte_offset);
@@ -326,11 +339,6 @@ pub(super) fn event_to_doc_standalone(
         doc.add_text(f.agent_slug, slug);
     }
     doc
-}
-
-fn add_transcript_corpus_fields(doc: &mut TantivyDocument, f: FieldHandles) {
-    doc.add_text(f.doc_type, "transcript");
-    doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
 }
 
 pub(super) fn should_skip_file(
@@ -408,27 +416,15 @@ pub(super) fn index_directory_standalone(
 
             for event in parser::parse_transcript_line(&line) {
                 let is_sub = event.is_subagent || is_subagent;
-                let proj = event.cwd.as_deref().unwrap_or(&project);
-
-                let mut doc = TantivyDocument::new();
-                add_transcript_corpus_fields(&mut doc, f);
-                doc.add_text(f.content, &event.content);
-                doc.add_text(f.session_id, &event.session_id);
-                doc.add_text(f.account, account_name);
-                doc.add_text(f.project, proj);
-                doc.add_text(f.role, event.role.as_ref());
-                doc.add_text(f.file_path, &path_str);
-                doc.add_u64(f.byte_offset, line_offset);
-                doc.add_u64(f.is_subagent, if is_sub { 1 } else { 0 });
-                if let Some(ref ts) = event.timestamp {
-                    doc.add_text(f.timestamp, ts);
-                }
-                if let Some(ref branch) = event.git_branch {
-                    doc.add_text(f.git_branch, branch);
-                }
-                if let Some(ref slug) = event.agent_slug {
-                    doc.add_text(f.agent_slug, slug);
-                }
+                let doc = build_transcript_doc(
+                    &event,
+                    account_name,
+                    &path_str,
+                    line_offset,
+                    is_sub,
+                    &project,
+                    f,
+                );
                 writer.add_document(doc)?;
                 *indexed_docs += 1;
             }
