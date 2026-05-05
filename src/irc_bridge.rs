@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -112,15 +112,66 @@ struct CouncilListEntry {
     status: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct TeamMembersResponse {
+    members: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct CouncilPostRequest {
     body: String,
     sender: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct BridgeState {
+    server: IrcServerConfig,
     council_channels: Arc<Mutex<HashMap<String, String>>>,
+    instances: Arc<Mutex<HashMap<String, CouncilInstances>>>,
+}
+
+#[derive(Clone)]
+struct IrcServerConfig {
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone, Default)]
+struct CouncilInstances {
+    by_member: HashMap<String, BroInstance>,
+    nick_to_member: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct BroInstance {
+    nick: String,
+    tx: tokio::sync::mpsc::UnboundedSender<InstanceOutbound>,
+}
+
+#[derive(Debug)]
+enum InstanceOutbound {
+    Privmsg { target: String, body: String },
+    Join { channel: String },
+    Part { channel: String },
+}
+
+impl BridgeState {
+    fn new(server: IrcServerConfig) -> Self {
+        Self {
+            server,
+            council_channels: Arc::new(Mutex::new(HashMap::new())),
+            instances: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn is_instance_nick(&self, nick: &str) -> bool {
+        let nick = nick.to_ascii_lowercase();
+        self.instances
+            .lock()
+            .expect("instance map")
+            .values()
+            .any(|instances| instances.nick_to_member.contains_key(&nick))
+    }
 }
 
 #[derive(Debug)]
@@ -154,7 +205,10 @@ async fn main() -> Result<()> {
     let sender = client.sender();
     let mut stream = client.stream()?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
-    let bridge_state = BridgeState::default();
+    let bridge_state = BridgeState::new(IrcServerConfig {
+        host: args.irc_host.clone(),
+        port: args.irc_port,
+    });
 
     tokio::spawn(tail_loop(daemon.clone(), args.channel.clone(), tx.clone()));
     tokio::spawn(restore_council_channels_loop(
@@ -178,6 +232,9 @@ async fn main() -> Result<()> {
                     if !allowed(&allow_nicks, nick) {
                         continue;
                     }
+                    if bridge_state.is_instance_nick(nick) {
+                        continue;
+                    }
                     if let Some(command) = body.strip_prefix(&args.prefix) {
                         let reply_target = if target == &args.nick { nick } else { target };
                         if let Err(e) = handle_command(&daemon, &args.channel, &bridge_state, nick, target, command.trim(), reply_target, &tx).await {
@@ -189,7 +246,8 @@ async fn main() -> Result<()> {
                     } else if nick != args.nick {
                         if let Some(council_id) = ensure_council_for_target(&bridge_state, &tx, daemon.clone(), target) {
                             let client = reqwest::Client::new();
-                            if let Err(e) = post_council_turn(&client, &daemon, &council_id, nick, body).await {
+                            let body = normalize_instance_mentions(&bridge_state, target, body);
+                            if let Err(e) = post_council_turn(&client, &daemon, &council_id, nick, &body).await {
                                 tx.send(Outbound::Privmsg {
                                     target: target.to_string(),
                                     body: format!("error: {e:#}"),
@@ -561,6 +619,15 @@ async fn restore_council_channels_once(
             continue;
         }
         let channel = council_channel(&council.id);
+        ensure_council_instances(
+            client,
+            daemon,
+            bridge_state,
+            &council.id,
+            &council.team_id,
+            &channel,
+        )
+        .await?;
         let is_new = bind_council_channel(
             bridge_state,
             tx,
@@ -605,6 +672,7 @@ async fn create_council_thread(
     )
     .await?;
     let channel = council_channel(&created.id);
+    ensure_council_instances(client, daemon, bridge_state, &created.id, team, &channel).await?;
     let is_new = bind_council_channel(
         bridge_state,
         tx,
@@ -634,6 +702,125 @@ async fn create_council_thread(
     ))
 }
 
+async fn ensure_council_instances(
+    client: &reqwest::Client,
+    daemon: &Url,
+    bridge_state: &BridgeState,
+    council_id: &str,
+    team: &str,
+    channel: &str,
+) -> Result<()> {
+    let roster: TeamMembersResponse = get_json(client, daemon, &format!("irc/team/{team}")).await?;
+    let mut used = HashSet::new();
+    let mut to_spawn = Vec::new();
+
+    {
+        let mut all = bridge_state.instances.lock().expect("instance map");
+        let instances = all.entry(council_id.to_string()).or_default();
+        for (idx, member) in roster.members.iter().enumerate() {
+            if let Some(existing) = instances.by_member.get(member) {
+                used.insert(existing.nick.to_ascii_lowercase());
+                existing
+                    .tx
+                    .send(InstanceOutbound::Join {
+                        channel: channel.to_string(),
+                    })
+                    .ok();
+                continue;
+            }
+            let nick = unique_instance_nick(member, council_id, idx, &mut used);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            instances
+                .nick_to_member
+                .insert(nick.to_ascii_lowercase(), member.clone());
+            instances.by_member.insert(
+                member.clone(),
+                BroInstance {
+                    nick: nick.clone(),
+                    tx: tx.clone(),
+                },
+            );
+            to_spawn.push((member.clone(), nick, tx, rx));
+        }
+    }
+
+    for (_member, nick, tx, rx) in to_spawn {
+        tokio::spawn(instance_loop(bridge_state.server.clone(), nick, rx));
+        tx.send(InstanceOutbound::Join {
+            channel: channel.to_string(),
+        })
+        .ok();
+    }
+
+    Ok(())
+}
+
+async fn instance_loop(
+    server: IrcServerConfig,
+    nick: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<InstanceOutbound>,
+) {
+    loop {
+        match run_instance_once(&server, &nick, &mut rx).await {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("irc instance {nick} disconnected: {e:#}; reconnecting");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+async fn run_instance_once(
+    server: &IrcServerConfig,
+    nick: &str,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<InstanceOutbound>,
+) -> Result<()> {
+    let config = Config {
+        nickname: Some(nick.to_string()),
+        username: Some(nick.to_string()),
+        realname: Some(format!("blackbox bro instance {nick}")),
+        server: Some(server.host.clone()),
+        port: Some(server.port),
+        ..Default::default()
+    };
+    let mut client = Client::from_config(config).await?;
+    client.identify()?;
+    let sender = client.sender();
+    let mut stream = client.stream()?;
+
+    loop {
+        tokio::select! {
+            maybe_msg = stream.next() => {
+                let Some(message) = maybe_msg.transpose()? else {
+                    return Err(anyhow!("instance stream ended"));
+                };
+                if let Command::INVITE(_, ref channel) = message.command {
+                    sender.send_join(channel)?;
+                }
+            }
+            outbound = rx.recv() => {
+                let Some(outbound) = outbound else {
+                    return Ok(());
+                };
+                match outbound {
+                    InstanceOutbound::Privmsg { target, body } => {
+                        for line in irc_lines(&body) {
+                            sender.send_privmsg(&target, &line)?;
+                        }
+                    }
+                    InstanceOutbound::Join { channel } => {
+                        sender.send_join(&channel)?;
+                    }
+                    InstanceOutbound::Part { channel } => {
+                        sender.send_part(&channel)?;
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn close_council_room(
     client: &reqwest::Client,
     daemon: &Url,
@@ -643,6 +830,7 @@ async fn close_council_room(
 ) -> Result<String> {
     delete_json(client, daemon, &format!("council/{council_id}")).await?;
     let channels = unbind_council(bridge_state, council_id);
+    let instances = remove_council_instances(bridge_state, council_id);
     let part_channel = if channels.is_empty() {
         council_channel(council_id)
     } else {
@@ -652,6 +840,14 @@ async fn close_council_room(
         channel: part_channel.clone(),
     })
     .ok();
+    for instance in instances {
+        instance
+            .tx
+            .send(InstanceOutbound::Part {
+                channel: part_channel.clone(),
+            })
+            .ok();
+    }
     Ok(format!("closed {council_id}; parted {part_channel}"))
 }
 
@@ -711,6 +907,16 @@ fn unbind_council(bridge_state: &BridgeState, council_id: &str) -> Vec<String> {
         }
     });
     removed
+}
+
+fn remove_council_instances(bridge_state: &BridgeState, council_id: &str) -> Vec<BroInstance> {
+    bridge_state
+        .instances
+        .lock()
+        .expect("instance map")
+        .remove(council_id)
+        .map(|instances| instances.by_member.into_values().collect())
+        .unwrap_or_default()
 }
 
 fn channel_is_bound_to(bridge_state: &BridgeState, channel: &str, council_id: &str) -> bool {
@@ -775,7 +981,9 @@ async fn council_tail_loop(
         if !channel_is_bound_to(&bridge_state, &channel, &council_id) {
             return;
         }
-        if let Err(e) = council_tail_once(&client, &daemon, &channel, &council_id, &tx).await {
+        if let Err(e) =
+            council_tail_once(&client, &daemon, &bridge_state, &channel, &council_id, &tx).await
+        {
             eprintln!("council tail disconnected: {e:#}; reconnecting");
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -785,6 +993,7 @@ async fn council_tail_loop(
 async fn council_tail_once(
     client: &reqwest::Client,
     daemon: &Url,
+    bridge_state: &BridgeState,
     channel: &str,
     council_id: &str,
     tx: &tokio::sync::mpsc::UnboundedSender<Outbound>,
@@ -817,19 +1026,34 @@ async fn council_tail_once(
             let Ok(value) = serde_json::from_str::<Value>(&payload) else {
                 continue;
             };
-            if let Some(line) = summarize_council_event(&value) {
-                tx.send(Outbound::Privmsg {
-                    target: channel.to_string(),
-                    body: line,
-                })
-                .ok();
+            if let Some(relay) = summarize_council_event(&value) {
+                if let Some(sender) = relay.sender {
+                    send_instance_privmsg(
+                        bridge_state,
+                        council_id,
+                        &sender,
+                        channel,
+                        &display_instance_mentions(bridge_state, council_id, &relay.body),
+                    );
+                } else {
+                    tx.send(Outbound::Privmsg {
+                        target: channel.to_string(),
+                        body: relay.body,
+                    })
+                    .ok();
+                }
             }
         }
     }
     Err(anyhow!("council tail stream ended"))
 }
 
-fn summarize_council_event(v: &Value) -> Option<String> {
+struct CouncilRelay {
+    sender: Option<String>,
+    body: String,
+}
+
+fn summarize_council_event(v: &Value) -> Option<CouncilRelay> {
     match v.get("kind")?.as_str()? {
         "post" => {
             let post = v.get("post")?;
@@ -845,12 +1069,21 @@ fn summarize_council_event(v: &Value) -> Option<String> {
             if body.is_empty() {
                 None
             } else if kind == "system" {
-                Some(one_line(body, 360))
+                Some(CouncilRelay {
+                    sender: None,
+                    body: one_line(body, 360),
+                })
             } else {
-                Some(format!("{sender}: {}", one_line(body, 360)))
+                Some(CouncilRelay {
+                    sender: Some(sender.to_string()),
+                    body: one_line(body, 360),
+                })
             }
         }
-        "closed" => Some("council closed".to_string()),
+        "closed" => Some(CouncilRelay {
+            sender: None,
+            body: "council closed".to_string(),
+        }),
         _ => None,
     }
 }
@@ -866,6 +1099,150 @@ fn parse_council_channel(channel: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn unique_instance_nick(
+    member: &str,
+    council_id: &str,
+    index: usize,
+    used: &mut HashSet<String>,
+) -> String {
+    for attempt in 0..10 {
+        let candidate = candidate_instance_nick(member, council_id, attempt);
+        if used.insert(candidate.to_ascii_lowercase()) {
+            return candidate;
+        }
+    }
+    let fallback = format!("bro{:06}", index % 1_000_000);
+    used.insert(fallback.clone());
+    fallback
+}
+
+fn candidate_instance_nick(member: &str, council_id: &str, index: usize) -> String {
+    const NICK_LIMIT: usize = 9;
+    let suffix = council_id
+        .strip_prefix("council-")
+        .unwrap_or(council_id)
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(2)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let suffix = if suffix.is_empty() {
+        "xx".to_string()
+    } else {
+        suffix
+    };
+    let discriminator = (index > 0).then(|| char::from(b'0' + (index % 10) as u8));
+    let reserved = 1 + suffix.len() + discriminator.map(|_| 1).unwrap_or(0);
+    let base_len = NICK_LIMIT.saturating_sub(reserved).max(1);
+    let base = member
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(base_len)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let base = if base.is_empty() {
+        "bro".to_string()
+    } else {
+        base
+    };
+    match discriminator {
+        Some(d) => format!("{base}-{suffix}{d}"),
+        None => format!("{base}-{suffix}"),
+    }
+}
+
+fn send_instance_privmsg(
+    bridge_state: &BridgeState,
+    council_id: &str,
+    member: &str,
+    target: &str,
+    body: &str,
+) -> bool {
+    let tx = bridge_state
+        .instances
+        .lock()
+        .expect("instance map")
+        .get(council_id)
+        .and_then(|instances| instances.by_member.get(member))
+        .map(|instance| instance.tx.clone());
+    tx.map(|tx| {
+        tx.send(InstanceOutbound::Privmsg {
+            target: target.to_string(),
+            body: body.to_string(),
+        })
+        .is_ok()
+    })
+    .unwrap_or(false)
+}
+
+fn normalize_instance_mentions(bridge_state: &BridgeState, channel: &str, body: &str) -> String {
+    let Some(council_id) = council_for_target(bridge_state, channel) else {
+        return body.to_string();
+    };
+    let mappings = instance_mappings(bridge_state, &council_id);
+    let mut out = body.to_string();
+
+    for (member, nick) in &mappings {
+        for marker in [":", ","] {
+            let prefix = format!("{nick}{marker}");
+            if out
+                .get(..prefix.len())
+                .map(|s| s.eq_ignore_ascii_case(&prefix))
+                .unwrap_or(false)
+            {
+                let rest = out[prefix.len()..].trim_start();
+                out = format!("@{member} {rest}");
+                break;
+            }
+        }
+        out = replace_ascii_case(&out, &format!("@{nick}"), &format!("@{member}"));
+    }
+
+    out
+}
+
+fn display_instance_mentions(bridge_state: &BridgeState, council_id: &str, body: &str) -> String {
+    let mut out = body.to_string();
+    for (member, nick) in instance_mappings(bridge_state, council_id) {
+        out = replace_ascii_case(&out, &format!("@{member}"), &format!("@{nick}"));
+    }
+    out
+}
+
+fn instance_mappings(bridge_state: &BridgeState, council_id: &str) -> Vec<(String, String)> {
+    bridge_state
+        .instances
+        .lock()
+        .expect("instance map")
+        .get(council_id)
+        .map(|instances| {
+            instances
+                .by_member
+                .iter()
+                .map(|(member, instance)| (member.clone(), instance.nick.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn replace_ascii_case(input: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return input.to_string();
+    }
+    let lower_input = input.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut cursor = 0;
+    while let Some(pos) = lower_input[cursor..].find(&lower_needle) {
+        let abs = cursor + pos;
+        out.push_str(&input[cursor..abs]);
+        out.push_str(replacement);
+        cursor = abs + needle.len();
+    }
+    out.push_str(&input[cursor..]);
+    out
 }
 
 fn normalize_channel(channel: &str) -> String {

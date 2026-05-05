@@ -30,6 +30,7 @@ use parking_lot::RwLock;
 
 use axum::extract::{Query, State as AxumState};
 use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
 use futures::stream::Stream;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -6121,6 +6122,24 @@ async fn irc_cancel_handler(
     axum::Json(BlackboxServer::new(state).bro_cancel(Parameters(req)))
 }
 
+async fn irc_team_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::extract::Path(team_name): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    match orchestration::team::load_team(&team_name, &state.store_dir) {
+        Some(team) => axum::Json(json!({
+            "team": team.name,
+            "members": team.members.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            format!("unknown team: {team_name}"),
+        )
+            .into_response(),
+    }
+}
+
 // ── Admin HTTP endpoints (plain JSON; no MCP framing) ──────────────
 //
 // These wrap the same operations the MCP tools expose so install
@@ -7283,6 +7302,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/irc/dashboard", axum::routing::get(irc_dashboard_handler))
         .route("/irc/cancel", axum::routing::post(irc_cancel_handler))
+        .route(
+            "/irc/team/{team_name}",
+            axum::routing::get(irc_team_handler),
+        )
         .route(
             "/admin/packet/compile",
             axum::routing::post(admin_packet_compile),
