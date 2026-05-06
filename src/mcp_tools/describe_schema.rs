@@ -1,10 +1,29 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use serde::Serialize;
 use serde_json::json;
 
 use crate::providers;
 
-pub fn describe_schema(counts: &BTreeMap<String, usize>) -> anyhow::Result<String> {
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSchemaEntry {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub when_to_use: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub anti_patterns: Vec<String>,
+    pub cost_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_adapter: Option<String>,
+    pub example_invocation: String,
+}
+
+pub fn describe_schema(
+    counts: &BTreeMap<String, usize>,
+    agents: &[AgentSchemaEntry],
+) -> anyhow::Result<String> {
     let vertex_types = providers::all_providers()
         .iter()
         .map(|provider| {
@@ -21,16 +40,26 @@ pub fn describe_schema(counts: &BTreeMap<String, usize>) -> anyhow::Result<Strin
         })
         .collect::<Vec<_>>();
     let edge_families = edge_families();
-    let text = render_text(&vertex_types, &edge_families);
-    Ok(serde_json::to_string_pretty(&json!({
+    let agents_by_adapter = group_agents_by_adapter(agents);
+    let text = render_text(&vertex_types, &edge_families, agents);
+    let mut response = json!({
         "status": "ok",
         "text": text,
         "vertex_types": vertex_types,
         "edge_families": edge_families,
-    }))?)
+    });
+    if !agents.is_empty() {
+        response["agents"] = json!(agents);
+        response["agents_by_dispatch_adapter"] = json!(agents_by_adapter);
+    }
+    Ok(serde_json::to_string_pretty(&response)?)
 }
 
-fn render_text(vertex_types: &[serde_json::Value], edge_families: &[serde_json::Value]) -> String {
+fn render_text(
+    vertex_types: &[serde_json::Value],
+    edge_families: &[serde_json::Value],
+    agents: &[AgentSchemaEntry],
+) -> String {
     let mut text = String::from("## Agentic Corpus Schema\n\n### Vertex Types\n");
     for vertex in vertex_types {
         text.push_str(&format!(
@@ -54,7 +83,36 @@ fn render_text(vertex_types: &[serde_json::Value], edge_families: &[serde_json::
                 .unwrap_or_default()
         ));
     }
+    if !agents.is_empty() {
+        text.push_str("\n### Installed Agents\n");
+        for agent in agents {
+            text.push_str(&format!(
+                "- **{}** (v{}, {}): {}\n",
+                agent.name,
+                agent.version,
+                agent.cost_class,
+                agent.description
+            ));
+            if !agent.when_to_use.is_empty() {
+                for w in &agent.when_to_use {
+                    text.push_str(&format!("  - use: {w}\n"));
+                }
+            }
+        }
+    }
     text
+}
+
+fn group_agents_by_adapter(agents: &[AgentSchemaEntry]) -> HashMap<String, Vec<&str>> {
+    let mut groups: HashMap<String, Vec<&str>> = HashMap::new();
+    for agent in agents {
+        let key = agent
+            .dispatch_adapter
+            .clone()
+            .unwrap_or_else(|| "direct".to_string());
+        groups.entry(key).or_default().push(&agent.name);
+    }
+    groups
 }
 
 fn edge_families() -> Vec<serde_json::Value> {
@@ -154,7 +212,7 @@ mod tests {
 
     #[test]
     fn schema_lists_all_d1_entity_types() {
-        let rendered = describe_schema(&BTreeMap::new()).unwrap();
+        let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let vertex_types = value["vertex_types"].as_array().unwrap();
         assert_eq!(vertex_types.len(), 13);
@@ -167,5 +225,78 @@ mod tests {
         assert!(vertex_types
             .iter()
             .any(|value| value["entity_type"] == "agent"));
+    }
+
+    #[test]
+    fn schema_agents_section_structure() {
+        let agents = vec![
+            AgentSchemaEntry {
+                name: "reviewer".into(),
+                version: "2".into(),
+                description: "Reviews code.".into(),
+                when_to_use: vec!["PR review".into()],
+                anti_patterns: vec!["Large diffs".into()],
+                cost_class: "normal".into(),
+                dispatch_adapter: None,
+                example_invocation: "bro_agent_dispatch(agent=\"reviewer\", args={...})".into(),
+            },
+            AgentSchemaEntry {
+                name: "badge-tester".into(),
+                version: "1".into(),
+                description: "Badgey adapter.".into(),
+                when_to_use: vec![],
+                anti_patterns: vec![],
+                cost_class: "cheap".into(),
+                dispatch_adapter: Some("badgey".into()),
+                example_invocation: "bro_agent_dispatch(agent=\"badge-tester\", args={...})".into(),
+            },
+        ];
+        let rendered = describe_schema(&BTreeMap::new(), &agents).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert!(value["agents"].is_array(), "agents should be array");
+        let agents_arr = value["agents"].as_array().unwrap();
+        assert_eq!(agents_arr.len(), 2);
+        assert_eq!(agents_arr[0]["name"].as_str(), Some("reviewer"));
+        assert_eq!(agents_arr[0]["cost_class"].as_str(), Some("normal"));
+        assert_eq!(agents_arr[0]["when_to_use"].as_array().unwrap().len(), 1);
+        assert_eq!(agents_arr[0]["anti_patterns"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            agents_arr[0]["example_invocation"].as_str(),
+            Some("bro_agent_dispatch(agent=\"reviewer\", args={...})")
+        );
+        assert_eq!(agents_arr[1]["dispatch_adapter"].as_str(), Some("badgey"));
+
+        let by_adapter = value["agents_by_dispatch_adapter"].as_object().unwrap();
+        assert_eq!(by_adapter.len(), 2);
+        let direct = by_adapter["direct"].as_array().unwrap();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].as_str(), Some("reviewer"));
+        let badgey = by_adapter["badgey"].as_array().unwrap();
+        assert_eq!(badgey.len(), 1);
+        assert_eq!(badgey[0].as_str(), Some("badge-tester"));
+
+        let text = value["text"].as_str().unwrap();
+        assert!(text.contains("### Installed Agents"));
+        assert!(text.contains("**reviewer** (v2, normal)"));
+    }
+
+    #[test]
+    fn schema_no_agents_section_when_empty() {
+        let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert!(
+            value.get("agents").is_none(),
+            "agents should be absent when empty"
+        );
+        assert!(
+            value.get("agents_by_dispatch_adapter").is_none(),
+            "agents_by_dispatch_adapter should be absent when empty"
+        );
+        let text = value["text"].as_str().unwrap();
+        assert!(
+            !text.contains("### Installed Agents"),
+            "no agents header when empty"
+        );
     }
 }

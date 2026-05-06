@@ -482,6 +482,43 @@ impl BlackboxServer {
         counts
     }
 
+    fn build_agent_schema_entries(&self) -> Vec<mcp_tools::describe_schema::AgentSchemaEntry> {
+        use orchestration::agents::registry::AgentRegistry;
+        let catalog = self.state.artifacts.read();
+        let registry = AgentRegistry::new(&catalog);
+        let filter = orchestration::agents::registry::ListFilter::default();
+        let Ok(summaries) = registry.list(&filter) else {
+            return Vec::new();
+        };
+        summaries
+            .into_iter()
+            .filter(|s| s.active)
+            .filter_map(|s| {
+                let (manifest, _) = registry.load_manifest_degraded(&s.name);
+                let manifest = manifest?;
+                let cost_str = match manifest.cost_class {
+                    orchestration::agents::types::AgentCostClass::Cheap => "cheap",
+                    orchestration::agents::types::AgentCostClass::Normal => "normal",
+                    orchestration::agents::types::AgentCostClass::Expensive => "expensive",
+                };
+                let example = format!(
+                    "bro_agent_dispatch(agent=\"{}\", args={{...}})",
+                    s.name
+                );
+                Some(mcp_tools::describe_schema::AgentSchemaEntry {
+                    name: s.name,
+                    version: s.version,
+                    description: manifest.description,
+                    when_to_use: manifest.when_to_use,
+                    anti_patterns: manifest.anti_patterns,
+                    cost_class: cost_str.to_string(),
+                    dispatch_adapter: manifest.dispatch_adapter,
+                    example_invocation: example,
+                })
+            })
+            .collect()
+    }
+
     fn ambient_pin_block(
         &self,
         project_dir: Option<&str>,
@@ -1084,7 +1121,11 @@ impl BlackboxServer {
     )]
     fn bbox_describe_schema(&self) -> CallToolResult {
         Self::run("bbox_describe_schema", || {
-            mcp_tools::describe_schema::describe_schema(&self.describe_schema_counts())
+            let agents = self.build_agent_schema_entries();
+            mcp_tools::describe_schema::describe_schema(
+                &self.describe_schema_counts(),
+                &agents,
+            )
         })
     }
 
@@ -12344,6 +12385,80 @@ mod tests {
             text.contains("schema_validation_failed"),
             "should reject via prefixItems: {text}"
         );
+    }
+
+    #[test]
+    fn bbox_describe_schema_includes_installed_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "schema-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "schema-tester",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent for schema test.",
+                    "when_to_use": ["use when testing schema"],
+                    "anti_patterns": ["do not use in prod"],
+                    "brofile_inline": {"provider": "claude"},
+                    "cost_class": "normal",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "badgey-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "badgey-agent",
+                "version": 3,
+                "manifest": {
+                    "description": "Badgey-backed agent.",
+                    "brofile_inline": {"provider": "claude"},
+                    "cost_class": "cheap",
+                    "dispatch_adapter": "badgey",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        drop(cat);
+
+        let result = server.bbox_describe_schema();
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let agents = body["agents"].as_array().expect("agents array");
+        assert_eq!(agents.len(), 2);
+        let schema_tester = agents.iter().find(|a| a["name"] == "schema-tester").unwrap();
+        assert_eq!(schema_tester["version"].as_str(), Some("1"));
+        assert_eq!(schema_tester["cost_class"].as_str(), Some("normal"));
+        assert_eq!(
+            schema_tester["when_to_use"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            schema_tester["anti_patterns"].as_array().unwrap().len(),
+            1
+        );
+        assert!(schema_tester["dispatch_adapter"].is_null());
+
+        let badgey = agents.iter().find(|a| a["name"] == "badgey-agent").unwrap();
+        assert_eq!(badgey["dispatch_adapter"].as_str(), Some("badgey"));
+
+        let by_adapter = body["agents_by_dispatch_adapter"]
+            .as_object()
+            .expect("agents_by_dispatch_adapter object");
+        assert_eq!(by_adapter["direct"].as_array().unwrap().len(), 1);
+        assert_eq!(by_adapter["badgey"].as_array().unwrap().len(), 1);
     }
 
     #[test]
