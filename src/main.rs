@@ -174,6 +174,11 @@ struct SharedState {
     /// catalog opens so AS-I1 validation can check dispatch_adapter
     /// membership against the live registry.
     agent_adapter_registry: Arc<RwLock<orchestration::agents::adapter::AgentAdapterRegistry>>,
+    /// Badgey wrapper state. W1 keeps the live badgey_id mapping in
+    /// memory; proposals and action journal are durable under BRO_STORE.
+    badgey_registry: Arc<orchestration::badgey::BadgeyRegistry>,
+    badgey_proposals: Arc<orchestration::badgey::ProposalStore>,
+    badgey_journal: Arc<orchestration::badgey::ActionJournal>,
 }
 
 const SIGNAL_LOG_CAP: usize = 200;
@@ -9182,6 +9187,10 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(86_400_000u64);
     let task_store = TaskStore::load(&store_dir, task_ttl);
+    let badgey_proposals = Arc::new(orchestration::badgey::ProposalStore::new(
+        store_dir.clone(),
+    )?);
+    let badgey_journal = Arc::new(orchestration::badgey::ActionJournal::new(store_dir.clone())?);
 
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);
 
@@ -9244,6 +9253,9 @@ async fn main() -> anyhow::Result<()> {
         councils: Arc::new(council::CouncilRegistry::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
         agent_adapter_registry: agent_adapter_registry.clone(),
+        badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),
+        badgey_proposals,
+        badgey_journal,
     });
     std::thread::Builder::new()
         .name("blackbox-vectors-warmup".into())
@@ -9696,6 +9708,13 @@ mod tests {
             agent_adapter_registry: Arc::new(RwLock::new(
                 orchestration::agents::adapter::AgentAdapterRegistry::new(),
             )),
+            badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),
+            badgey_proposals: Arc::new(
+                orchestration::badgey::ProposalStore::new(tmp.path().join("bro")).unwrap(),
+            ),
+            badgey_journal: Arc::new(
+                orchestration::badgey::ActionJournal::new(tmp.path().join("bro")).unwrap(),
+            ),
         });
         BlackboxServer::new(state)
     }

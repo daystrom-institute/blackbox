@@ -35,6 +35,7 @@ clap = { version = "4.5", features = ["derive"] }
 walkdir = "2"
 dirs = "6"
 ignore = "0.4"
+fs2 = "0.4"
 
 # Code parsing
 tree-sitter = "0.26"

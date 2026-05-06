@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod badgey;
 pub mod brofile;
 pub mod http_fetch;
 pub mod mcp;
@@ -7,7 +8,7 @@ pub mod resume_lease;
 pub mod tail;
 pub mod team;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -110,12 +111,14 @@ impl Task {
 
 pub struct TaskStore {
     tasks: HashMap<String, Arc<Task>>,
+    reserved: HashSet<String>,
 }
 
 impl TaskStore {
     pub fn new() -> Self {
         Self {
             tasks: HashMap::new(),
+            reserved: HashSet::new(),
         }
     }
 
@@ -123,8 +126,46 @@ impl TaskStore {
         self.tasks.get(id).cloned()
     }
 
-    pub fn insert(&mut self, id: String, task: Arc<Task>) {
+    pub fn contains(&self, id: &str) -> bool {
+        self.tasks.contains_key(id) || self.reserved.contains(id)
+    }
+
+    pub fn reserve_id(&mut self, id: &str) -> Result<(), BroSpawnError> {
+        if self.contains(id) {
+            return Err(BroSpawnError::DuplicateTaskId { id: id.to_string() });
+        }
+        self.reserved.insert(id.to_string());
+        Ok(())
+    }
+
+    pub fn insert(&mut self, id: String, task: Arc<Task>) -> Result<(), BroSpawnError> {
+        if self.tasks.contains_key(&id) {
+            return Err(BroSpawnError::DuplicateTaskId { id });
+        }
+        if self.reserved.contains(&id) {
+            return Err(BroSpawnError::ReservedTaskId { id });
+        }
         self.tasks.insert(id, task);
+        Ok(())
+    }
+
+    fn insert_reserved(&mut self, id: String, task: Arc<Task>) -> Result<(), BroSpawnError> {
+        if self.tasks.contains_key(&id) {
+            self.reserved.remove(&id);
+            return Err(BroSpawnError::DuplicateTaskId { id });
+        }
+        self.reserved.remove(&id);
+        self.tasks.insert(id, task);
+        Ok(())
+    }
+
+    fn insert_loaded(&mut self, id: String, task: Arc<Task>) {
+        self.reserved.remove(&id);
+        self.tasks.entry(id).or_insert(task);
+    }
+
+    fn release_reservation(&mut self, id: &str) {
+        self.reserved.remove(id);
     }
 
     pub fn all_tasks(&self) -> Vec<Arc<Task>> {
@@ -282,7 +323,7 @@ impl TaskStore {
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
             });
-            store.insert(rec.id, task);
+            store.insert_loaded(rec.id, task);
         }
         store
     }
@@ -572,6 +613,82 @@ pub fn apply_brofile_lens(prompt: &str, lens: Option<&str>) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroSpawnError {
+    DuplicateTaskId { id: String },
+    ReservedTaskId { id: String },
+}
+
+impl std::fmt::Display for BroSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateTaskId { id } => write!(f, "duplicate task id: {id}"),
+            Self::ReservedTaskId { id } => write!(f, "task id is already reserved: {id}"),
+        }
+    }
+}
+
+impl std::error::Error for BroSpawnError {}
+
+pub struct SpawnTaskParams {
+    pub provider: Provider,
+    pub args: Vec<String>,
+    /// Provider session id to record once known. Badgey callers must
+    /// not pre-mint provider session ids; this is only copied from the
+    /// provider path, or left as the existing provider-specific
+    /// placeholder such as Gemini's `pending`.
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub env_overrides: Option<HashMap<String, String>>,
+    pub store_dir: std::path::PathBuf,
+    pub task_store: Arc<RwLock<TaskStore>>,
+    pub tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    pub bro_label: Option<String>,
+    pub agent_label: Option<String>,
+}
+
+pub fn spawn_with_pre_minted_id(
+    task_id: String,
+    params: SpawnTaskParams,
+) -> Result<Arc<Task>, BroSpawnError> {
+    params.task_store.write().reserve_id(&task_id)?;
+    Ok(spawn_task_reserved(task_id, params))
+}
+
+fn failed_duplicate_task(
+    task_id: String,
+    provider: Provider,
+    session_id: String,
+    cwd: Option<String>,
+    bro_label: Option<String>,
+    agent_label: Option<String>,
+    message: String,
+) -> Arc<Task> {
+    Arc::new(Task {
+        inner: Mutex::new(TaskInner {
+            id: task_id,
+            provider,
+            session_id,
+            events: vec![],
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            stderr: message,
+            status: TaskStatus::Failed,
+            started_at: now_ms(),
+            completed_at: Some(now_ms()),
+            exit_code: None,
+            cwd,
+            bro_label,
+            agent_label,
+            recoverable: false,
+        }),
+        notify: Arc::new(Notify::new()),
+        child_id: Mutex::new(None),
+    })
+}
+
 /// Spawn a provider CLI process and return a tracked Task.
 ///
 /// `task_id` is pre-generated by the caller so it can be threaded into
@@ -592,6 +709,50 @@ pub fn spawn_task(
     bro_label: Option<String>,
     agent_label: Option<String>,
 ) -> Arc<Task> {
+    if let Err(err) = task_store.write().reserve_id(&task_id) {
+        if let Some(existing) = task_store.read().get(&task_id) {
+            return existing;
+        }
+        return failed_duplicate_task(
+            task_id,
+            provider,
+            session_id,
+            cwd,
+            bro_label,
+            agent_label,
+            err.to_string(),
+        );
+    }
+
+    let params = SpawnTaskParams {
+        provider,
+        args,
+        session_id,
+        cwd,
+        env_overrides,
+        store_dir,
+        task_store,
+        tail_tx,
+        bro_label,
+        agent_label,
+    };
+
+    spawn_task_reserved(task_id, params)
+}
+
+fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
+    let SpawnTaskParams {
+        provider,
+        args,
+        session_id,
+        cwd,
+        env_overrides,
+        store_dir,
+        task_store,
+        tail_tx,
+        bro_label,
+        agent_label,
+    } = params;
     let id = task_id;
 
     let extra_path = std::env::var("BRO_EXTRA_PATH").unwrap_or_else(|_| {
@@ -659,7 +820,7 @@ pub fn spawn_task(
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
             });
-            task_store.write().insert(id, task.clone());
+            let _ = task_store.write().insert_reserved(id, task.clone());
             task_store.read().persist(&store_dir);
             task.notify.notify_waiters();
             return task;
@@ -691,7 +852,20 @@ pub fn spawn_task(
         child_id: Mutex::new(pid),
     });
 
-    task_store.write().insert(id.clone(), task.clone());
+    if let Err(err) = task_store.write().insert_reserved(id.clone(), task.clone()) {
+        task_store.write().release_reservation(&id);
+        let failed = failed_duplicate_task(
+            id,
+            provider,
+            session_id,
+            cwd,
+            None,
+            None,
+            err.to_string(),
+        );
+        failed.notify.notify_waiters();
+        return failed;
+    }
 
     // Emit tail event
     let _ = tail_tx.send(tail::TailEvent::TaskStarted {
@@ -1284,6 +1458,147 @@ mod tests {
         assert!(TaskStatus::Completed.is_terminal());
         assert!(TaskStatus::Failed.is_terminal());
         assert!(TaskStatus::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn task_store_rejects_duplicate_task_ids_without_overwrite() {
+        let mut store = TaskStore::new();
+        let first = Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: "task-known".to_string(),
+                provider: Provider::Codex,
+                session_id: "session-a".to_string(),
+                events: vec![],
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: String::new(),
+                status: TaskStatus::Running,
+                started_at: now_ms(),
+                completed_at: None,
+                exit_code: None,
+                cwd: None,
+                bro_label: None,
+                agent_label: None,
+                recoverable: false,
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+        });
+        let second = Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: "task-known".to_string(),
+                provider: Provider::Codex,
+                session_id: "session-b".to_string(),
+                events: vec![],
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: String::new(),
+                status: TaskStatus::Running,
+                started_at: now_ms(),
+                completed_at: None,
+                exit_code: None,
+                cwd: None,
+                bro_label: None,
+                agent_label: None,
+                recoverable: false,
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+        });
+
+        store.insert("task-known".to_string(), first).unwrap();
+        assert!(matches!(
+            store.insert("task-known".to_string(), second),
+            Err(BroSpawnError::DuplicateTaskId { .. })
+        ));
+        assert_eq!(
+            store.get("task-known").unwrap().inner.lock().session_id,
+            "session-a"
+        );
+    }
+
+    #[test]
+    fn task_store_reservation_blocks_duplicate_insert_until_used() {
+        let mut store = TaskStore::new();
+        store.reserve_id("task-reserved").unwrap();
+        let task = Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: "task-reserved".to_string(),
+                provider: Provider::Codex,
+                session_id: "session-a".to_string(),
+                events: vec![],
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: String::new(),
+                status: TaskStatus::Running,
+                started_at: now_ms(),
+                completed_at: None,
+                exit_code: None,
+                cwd: None,
+                bro_label: None,
+                agent_label: None,
+                recoverable: false,
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+        });
+        assert!(matches!(
+            store.insert("task-reserved".to_string(), task.clone()),
+            Err(BroSpawnError::ReservedTaskId { .. })
+        ));
+        store
+            .insert_reserved("task-reserved".to_string(), task)
+            .unwrap();
+        assert!(store.get("task-reserved").is_some());
+    }
+
+    #[tokio::test]
+    async fn spawn_with_pre_minted_id_tracks_known_id() {
+        let prior_bin = std::env::var("CODEX_BIN").ok();
+        std::env::set_var("CODEX_BIN", "/bin/true");
+        let tmp = tempfile::tempdir().unwrap();
+        let task_store = Arc::new(RwLock::new(TaskStore::new()));
+        let (tail_tx, _) = tokio::sync::broadcast::channel(8);
+        let task = spawn_with_pre_minted_id(
+            "task-known-id".to_string(),
+            SpawnTaskParams {
+                provider: Provider::Codex,
+                args: Vec::new(),
+                session_id: "observed-session".to_string(),
+                cwd: None,
+                env_overrides: None,
+                store_dir: tmp.path().to_path_buf(),
+                task_store: task_store.clone(),
+                tail_tx,
+                bro_label: None,
+                agent_label: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(task.id(), "task-known-id");
+        assert!(wait_for_task_with_timeout(&task, Some(2.0)).await);
+        assert_eq!(
+            task_store
+                .read()
+                .get("task-known-id")
+                .unwrap()
+                .inner
+                .lock()
+                .session_id,
+            "observed-session"
+        );
+
+        match prior_bin {
+            Some(value) => std::env::set_var("CODEX_BIN", value),
+            None => std::env::remove_var("CODEX_BIN"),
+        }
     }
 
     #[test]
