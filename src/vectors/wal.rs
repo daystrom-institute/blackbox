@@ -43,6 +43,13 @@ impl WalRecord {
 }
 
 pub fn append(path: &Path, record: &WalRecord) -> Result<()> {
+    append_many(path, std::slice::from_ref(record))
+}
+
+pub fn append_many(path: &Path, records: &[WalRecord]) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating vector WAL dir {}", parent.display()))?;
@@ -52,9 +59,11 @@ pub fn append(path: &Path, record: &WalRecord) -> Result<()> {
         .append(true)
         .open(path)
         .with_context(|| format!("opening vector WAL {}", path.display()))?;
-    serde_json::to_writer(&mut file, record).context("serializing vector WAL record")?;
-    file.write_all(b"\n")
-        .context("writing vector WAL newline")?;
+    for record in records {
+        serde_json::to_writer(&mut file, record).context("serializing vector WAL record")?;
+        file.write_all(b"\n")
+            .context("writing vector WAL newline")?;
+    }
     file.sync_data().context("fsync vector WAL")?;
     Ok(())
 }

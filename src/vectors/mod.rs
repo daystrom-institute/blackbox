@@ -116,9 +116,7 @@ impl VectorStore {
     pub fn upsert_batch(&self, route: &str, records: Vec<VectorUpsert>) -> Result<()> {
         let partition = self.partition(route)?;
         let mut partition = partition.write();
-        for record in records {
-            partition.upsert(&record.entity_id, &record.content_hash, record.vector)?;
-        }
+        partition.upsert_batch(records)?;
         partition
             .flush_derived_files()
             .with_context(|| format!("flushing vector partition {route}"))
@@ -280,18 +278,48 @@ impl Partition {
 
     fn upsert(&mut self, entity_id: &str, content_hash: &str, vector: Vec<f32>) -> Result<()> {
         let record = WalRecord::upsert(&self.route, entity_id, content_hash, vector.clone());
-        if !self.slab.upsert(entity_id, content_hash, vector.clone())? {
+        if !self.apply_upsert(entity_id, content_hash, vector)? {
             return Ok(());
         }
         wal::append(&self.wal_path(), &record)?;
         self.wal_records += 1;
+        Ok(())
+    }
+
+    fn upsert_batch(&mut self, records: Vec<VectorUpsert>) -> Result<()> {
+        let mut wal_records = Vec::new();
+        for record in records {
+            let wal_record = WalRecord::upsert(
+                &self.route,
+                &record.entity_id,
+                &record.content_hash,
+                record.vector.clone(),
+            );
+            if self.apply_upsert(&record.entity_id, &record.content_hash, record.vector)? {
+                wal_records.push(wal_record);
+            }
+        }
+        wal::append_many(&self.wal_path(), &wal_records)?;
+        self.wal_records += wal_records.len();
+        Ok(())
+    }
+
+    fn apply_upsert(
+        &mut self,
+        entity_id: &str,
+        content_hash: &str,
+        vector: Vec<f32>,
+    ) -> Result<bool> {
+        if !self.slab.upsert(entity_id, content_hash, vector.clone())? {
+            return Ok(false);
+        }
         match self.hnsw.as_mut() {
             Some(hnsw) => hnsw
                 .push(entity_id.to_string(), vector)
                 .map_err(anyhow::Error::msg)?,
             None => self.rebuild_hnsw()?,
         }
-        Ok(())
+        Ok(true)
     }
 
     fn delete(&mut self, entity_id: &str) -> Result<()> {
