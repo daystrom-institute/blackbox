@@ -5187,6 +5187,7 @@ Constraints:\n\
             "task_id": task_id,
             "resolved_brofile": brofile_name,
             "merged_filters": merged,
+            "agentLabel": bro_label,
         }))
     }
 
@@ -12378,6 +12379,11 @@ mod tests {
         })));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(
+            body["agentLabel"].as_str(),
+            Some("agent:labeled-agent@v3"),
+            "response should carry agentLabel: {body}"
+        );
         let task_id = body["task_id"].as_str().unwrap();
         let task = server.state.task_store.read().get(task_id).unwrap();
         let label = task.inner.lock().bro_label.clone();
