@@ -320,6 +320,7 @@ impl EdgeIndex {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                tracing::debug!(path = %path.display(), "skipping non-jsonl edge sidecar file");
                 continue;
             }
             let Ok(file) = fs::File::open(&path) else {
