@@ -46,19 +46,19 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use axum::extract::{Query, State as AxumState};
-use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use futures::{stream::Stream, StreamExt};
+use axum::response::sse::{Event, Sse};
+use futures::{StreamExt, stream::Stream};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, IntoContents, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -501,10 +501,7 @@ impl BlackboxServer {
                     orchestration::agents::types::AgentCostClass::Normal => "normal",
                     orchestration::agents::types::AgentCostClass::Expensive => "expensive",
                 };
-                let example = format!(
-                    "bro_agent_dispatch(agent=\"{}\", args={{...}})",
-                    s.name
-                );
+                let example = format!("bro_agent_dispatch(agent=\"{}\", args={{...}})", s.name);
                 Some(mcp_tools::describe_schema::AgentSchemaEntry {
                     name: s.name,
                     version: s.version,
@@ -924,9 +921,8 @@ use mcp_tools::inspect::InspectEntityParams;
 use mcp_tools::provenance::ProvenanceParams;
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
-    apply_with as apply_packet_with, packet_matches_query, packet_summary,
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
-    PacketListParams,
+    PacketListParams, apply_with as apply_packet_with, packet_matches_query, packet_summary,
 };
 use threads::{ThreadListParams, ThreadParams};
 
@@ -1122,10 +1118,7 @@ impl BlackboxServer {
     fn bbox_describe_schema(&self) -> CallToolResult {
         Self::run("bbox_describe_schema", || {
             let agents = self.build_agent_schema_entries();
-            mcp_tools::describe_schema::describe_schema(
-                &self.describe_schema_counts(),
-                &agents,
-            )
+            mcp_tools::describe_schema::describe_schema(&self.describe_schema_counts(), &agents)
         })
     }
 
@@ -1944,6 +1937,17 @@ struct AgentSearchParams {
     provenance_kind: Option<String>,
     #[serde(default)]
     exclude_anti_pattern_matches: Option<bool>,
+    #[serde(default)]
+    include_vectors: Option<bool>,
+    #[serde(default)]
+    query_vector: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentVectorPlan {
+    search: Option<orchestration::agents::registry::AgentVectorSearch>,
+    route: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -4586,15 +4590,16 @@ Constraints:\n\
         let reg = AgentRegistry::new(&catalog);
         let cost_class = match p.cost_class.as_deref() {
             Some(s) => {
-                let parsed: AgentCostClass =
-                    match serde_json::from_value(serde_json::Value::String(s.to_string())) {
-                        Ok(c) => c,
-                        Err(_) => {
-                            return Self::err_text(&format!(
-                                "unknown cost_class: {s} (expected one of: cheap, normal, expensive)"
-                            ))
-                        }
-                    };
+                let parsed: AgentCostClass = match serde_json::from_value(
+                    serde_json::Value::String(s.to_string()),
+                ) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Self::err_text(&format!(
+                            "unknown cost_class: {s} (expected one of: cheap, normal, expensive)"
+                        ));
+                    }
+                };
                 Some(parsed)
             }
             None => None,
@@ -4664,27 +4669,43 @@ Constraints:\n\
                     ("name".into(), serde_json::Value::String(rec.name)),
                     ("version".into(), serde_json::Value::String(rec.version)),
                     ("active".into(), serde_json::Value::Bool(rec.active)),
-                    ("installed_at".into(), serde_json::Value::String(rec.installed_at)),
+                    (
+                        "installed_at".into(),
+                        serde_json::Value::String(rec.installed_at),
+                    ),
                     ("source".into(), serde_json::Value::String(rec.source)),
                 ]);
                 if let Some(s) = rec.metadata.supersedes {
                     m.insert("supersedes".into(), serde_json::Value::String(s));
                 }
                 if !rec.metadata.supersedes_chain.is_empty() {
-                    m.insert("supersedes_chain".into(), serde_json::Value::Array(
-                        rec.metadata.supersedes_chain.into_iter().map(serde_json::Value::String).collect()
-                    ));
+                    m.insert(
+                        "supersedes_chain".into(),
+                        serde_json::Value::Array(
+                            rec.metadata
+                                .supersedes_chain
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
                 }
                 if let Some(s) = rec.metadata.superseded_by {
                     m.insert("superseded_by".into(), serde_json::Value::String(s));
                 }
                 if let Some(parse_err) = rec.manifest_parse_error {
-                    m.insert("manifest_parse_error".into(), serde_json::Value::String(parse_err));
+                    m.insert(
+                        "manifest_parse_error".into(),
+                        serde_json::Value::String(parse_err),
+                    );
                 }
                 if let Some(manifest) = rec.manifest {
-                    m.insert("manifest".into(), serde_json::to_value(manifest).unwrap_or_else(|e| {
-                        serde_json::Value::String(format!("<serialize error: {e}>"))
-                    }));
+                    m.insert(
+                        "manifest".into(),
+                        serde_json::to_value(manifest).unwrap_or_else(|e| {
+                            serde_json::Value::String(format!("<serialize error: {e}>"))
+                        }),
+                    );
                 }
                 Self::ok_json(&serde_json::Value::Object(m))
             }
@@ -4706,6 +4727,25 @@ Constraints:\n\
             }
         }
         result
+    }
+
+    fn embed_agent_query(query: &str) -> anyhow::Result<Vec<f32>> {
+        let provider = embed::EmbeddingRouter::load_default()?
+            .route_for(embed::Bucket::AgentManifest, None)?;
+        let texts = vec![query.to_string()];
+        let vectors = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tokio::task::block_in_place(|| handle.block_on(provider.embed_batch(&texts)))
+            }
+            Err(_) => {
+                let runtime = tokio::runtime::Runtime::new()?;
+                runtime.block_on(provider.embed_batch(&texts))
+            }
+        }?;
+        vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("embedding provider returned no query vector"))
     }
 
     fn extract_inline_filters(inline: &serde_json::Value) -> (Vec<String>, Vec<String>) {
@@ -4738,10 +4778,7 @@ Constraints:\n\
         name = "bro_agent_describe",
         description = "Full manifest + resolved brofile + merged filters for one agent. Returns the computed dispatch surface (deny-wins filter merge of brofile + overlay), brofile info, embedding status, and any warnings."
     )]
-    fn bro_agent_describe(
-        &self,
-        Parameters(p): Parameters<AgentDescribeParams>,
-    ) -> CallToolResult {
+    fn bro_agent_describe(&self, Parameters(p): Parameters<AgentDescribeParams>) -> CallToolResult {
         use orchestration::agents::registry::AgentRegistry;
         use orchestration::agents::types::MergedFilters;
         let catalog = self.state.artifacts.read();
@@ -4767,11 +4804,8 @@ Constraints:\n\
 
         let (brofile_kind, brofile_name, brofile_provider, brofile_body, base_allow, base_disallow) =
             if let Some(ref br) = manifest.brofile_ref {
-                let resolved = orchestration::brofile::resolve_brofile(
-                    br,
-                    &self.state.store_dir,
-                    None,
-                );
+                let resolved =
+                    orchestration::brofile::resolve_brofile(br, &self.state.store_dir, None);
                 match resolved {
                     Some(bf) => {
                         let (ba, bd) = match &bf.filters {
@@ -4813,7 +4847,11 @@ Constraints:\n\
                 ("none", String::new(), None, None, Vec::new(), Vec::new())
             };
 
-        let merged = MergedFilters::merge(&base_allow, &base_disallow, manifest.filter_overlay.as_ref());
+        let merged = MergedFilters::merge(
+            &base_allow,
+            &base_disallow,
+            manifest.filter_overlay.as_ref(),
+        );
 
         let embedding_status = match manifest.embedding {
             Some(_) => "embedded",
@@ -4842,10 +4880,16 @@ Constraints:\n\
             ),
         ]);
         if !brofile_name.is_empty() {
-            result.insert("brofile_name".into(), serde_json::Value::String(brofile_name));
+            result.insert(
+                "brofile_name".into(),
+                serde_json::Value::String(brofile_name),
+            );
         }
         if let Some(provider) = brofile_provider {
-            result.insert("brofile_provider".into(), serde_json::Value::String(provider));
+            result.insert(
+                "brofile_provider".into(),
+                serde_json::Value::String(provider),
+            );
         }
         if let Some(body) = brofile_body {
             result.insert("brofile".into(), body);
@@ -4873,7 +4917,7 @@ Constraints:\n\
         description = "Search installed agents by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and matched anti-patterns."
     )]
     fn bro_agent_search(&self, Parameters(p): Parameters<AgentSearchParams>) -> CallToolResult {
-        use orchestration::agents::registry::{AgentRegistry, SearchFilter};
+        use orchestration::agents::registry::{AgentRegistry, AgentVectorSearch, SearchFilter};
         use orchestration::agents::types::AgentCostClass;
         let query = p.query.trim();
         if query.is_empty() {
@@ -4894,7 +4938,35 @@ Constraints:\n\
         let exclude_ap = p.exclude_anti_pattern_matches.unwrap_or(true);
         let catalog = self.state.artifacts.read();
         let reg = AgentRegistry::new(&catalog);
-        let results = match reg.search(query, limit, &filter, exclude_ap) {
+        let active_agents = match reg.list(&orchestration::agents::registry::ListFilter::default())
+        {
+            Ok(list) => list,
+            Err(e) => return Self::err_text(&format!("registry list failed: {e}")),
+        };
+        let embedded_agents = active_agents
+            .iter()
+            .filter(|agent| agent.embedding_pending == Some(false))
+            .count();
+        let vector_plan = if p.include_vectors.unwrap_or(true) {
+            resolve_agent_vector_search(query, p.query_vector.as_deref())
+        } else {
+            AgentVectorPlan {
+                search: None,
+                route: None,
+                error: Some("vector search disabled by caller".into()),
+            }
+        };
+        let vector_search = vector_plan.search.as_ref().map(|search| AgentVectorSearch {
+            route: search.route.clone(),
+            query_vector: search.query_vector.clone(),
+        });
+        let results = match reg.search_with_vectors(
+            query,
+            limit,
+            &filter,
+            exclude_ap,
+            vector_search.as_ref(),
+        ) {
             Ok(r) => r,
             Err(e) => return Self::err_text(&format!("search failed: {e}")),
         };
@@ -4910,6 +4982,7 @@ Constraints:\n\
                     "anti_patterns": r.anti_patterns,
                     "cost_class": r.cost_class,
                     "provenance_kind": r.provenance_kind,
+                    "sources": r.sources,
                 });
                 if !exclude_ap {
                     obj["matched_anti_patterns"] = serde_json::json!(r.matched_anti_patterns);
@@ -4917,23 +4990,28 @@ Constraints:\n\
                 obj
             })
             .collect();
-        let active_count = match reg.list(&orchestration::agents::registry::ListFilter::default())
-        {
-            Ok(list) => list.len(),
-            Err(_) => 0,
+        let active_count = active_agents.len();
+        let vector_available = vector_plan.search.is_some();
+        let coverage_ratio = if active_count == 0 {
+            1.0
+        } else {
+            embedded_agents as f64 / active_count as f64
         };
         Self::ok_json(&serde_json::json!({
             "results": json_results,
-            "search_mode": "keyword",
+            "search_mode": if vector_available { "hybrid" } else { "keyword" },
             "total_matched": json_results.len(),
             "active_agents": active_count,
             "degraded": {
-                "embedding_pending": true,
-                "vector_search_unavailable": true,
+                "embedding_pending": embedded_agents < active_count,
+                "vector_search_unavailable": !vector_available,
+                "vector_error": vector_plan.error,
             },
             "vector_status": {
-                "coverage_ratio": 0.0,
-                "note": "keyword-only mode; agent embedding pipeline not yet built (AS-I2)",
+                "coverage_ratio": coverage_ratio,
+                "embedded_agents": embedded_agents,
+                "active_agents": active_count,
+                "route": vector_plan.route,
             },
         }))
     }
@@ -4946,9 +5024,7 @@ Constraints:\n\
         &self,
         Parameters(p): Parameters<AgentDispatchParams>,
     ) -> CallToolResult {
-        use orchestration::agents::adapter::{
-            AgentAdapterRegistry, DispatchContext,
-        };
+        use orchestration::agents::adapter::DispatchContext;
         use orchestration::agents::registry::AgentRegistry;
         use orchestration::agents::types::{AgentRef, AgentSession, MergedFilters};
 
@@ -5000,7 +5076,10 @@ Constraints:\n\
             };
             let ctx = DispatchContext {
                 project_dir: p.project_dir.clone(),
-                ambient: p.ambient.as_ref().and_then(|v| serde_json::to_string(v).ok()),
+                ambient: p
+                    .ambient
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok()),
                 bro_label_prefix: Some(bro_label),
                 caller_provider: None,
                 caller_session_id: None,
@@ -5030,10 +5109,7 @@ Constraints:\n\
                 ) {
                     Some(b) => b,
                     None => {
-                        return Self::err_text(&format!(
-                            "brofile_ref '{}' not found",
-                            br
-                        ));
+                        return Self::err_text(&format!("brofile_ref '{}' not found", br));
                     }
                 };
                 let (ba, bd) = match &bf.filters {
@@ -5077,13 +5153,22 @@ Constraints:\n\
                 );
                 let opts = if inline.get("model").is_some() || inline.get("effort").is_some() {
                     Some(ExecOpts {
-                        model: inline.get("model").and_then(|v| v.as_str()).map(String::from),
-                        effort: inline.get("effort").and_then(|v| v.as_str()).map(String::from),
+                        model: inline
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        effort: inline
+                            .get("effort")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                     })
                 } else {
                     None
                 };
-                let lens = inline.get("lens").and_then(|v| v.as_str()).map(String::from);
+                let lens = inline
+                    .get("lens")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 (provider, lens, None, ba, bd, opts, env)
             } else {
                 return Self::err_text("manifest has neither brofile_ref nor brofile_inline");
@@ -5105,7 +5190,7 @@ Constraints:\n\
                     Err(e) => {
                         return Self::err_text(&format!(
                             "error.internal(code=invalid_schema): manifest schema failed to compile: {e}"
-                        ))
+                        ));
                     }
                 };
                 let args_to_validate = if p.args.is_null() {
@@ -5170,10 +5255,8 @@ Constraints:\n\
             allow_recursion: false,
             provider: Some(provider),
         };
-        let final_prompt = orch::apply_brofile_lens(
-            &orch::apply_ambient(&prompt, &ambient_ctx),
-            lens.as_deref(),
-        );
+        let final_prompt =
+            orch::apply_brofile_lens(&orch::apply_ambient(&prompt, &ambient_ctx), lens.as_deref());
 
         let mut args = provider.build_exec_args(
             &final_prompt,
@@ -5186,13 +5269,8 @@ Constraints:\n\
             disallow: merged.disallow.clone(),
         };
         let extra = combine_dispatch_filters(Some(&brofile_filters), None);
-        let dispatch_filters = resolve_dispatch_filters(
-            provider,
-            cwd.as_deref(),
-            false,
-            &task_id,
-            extra.as_ref(),
-        );
+        let dispatch_filters =
+            resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, extra.as_ref());
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
@@ -6860,8 +6938,8 @@ async fn orchestrate_stream_handler(
 ) -> axum::response::Sse<
     impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
-    use axum::response::sse::Event;
     use axum::response::Sse;
+    use axum::response::sse::Event;
     let compiled = workflow::compile(req.workflow);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
 
@@ -7655,8 +7733,12 @@ async fn install_artifact_from_params(
 async fn install_artifact_value(
     state: &Arc<SharedState>,
     p: ArtifactInstallParams,
-    value: Value,
+    mut value: Value,
 ) -> anyhow::Result<artifacts::ArtifactMetadata> {
+    let mut installed_agent: Option<(
+        orchestration::agents::types::AgentRef,
+        orchestration::agents::types::AgentManifest,
+    )> = None;
     match p.kind {
         artifacts::ArtifactKind::Workflow => {
             let spec: workflow::Workflow = serde_json::from_value(value.clone())?;
@@ -7685,8 +7767,7 @@ async fn install_artifact_value(
             if !value.is_object() {
                 anyhow::bail!("agent artifact must be a JSON object");
             }
-            let adapter_registry =
-                state.agent_adapter_registry.read();
+            let adapter_registry = state.agent_adapter_registry.read();
             let catalog = state.artifacts.read();
             let ctx = orchestration::agents::validate::InstallCtx {
                 adapter_registry: &adapter_registry,
@@ -7707,9 +7788,36 @@ async fn install_artifact_value(
             };
             orchestration::agents::validate::validate_agent_install(&value, &ctx)?;
             drop(catalog);
+            let manifest_value = value
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("agent artifact missing manifest"))?;
+            let mut manifest: orchestration::agents::types::AgentManifest =
+                serde_json::from_value(manifest_value)?;
+            let name = p
+                .name
+                .clone()
+                .or_else(|| {
+                    value
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| anyhow::anyhow!("agent artifact missing name"))?;
+            let version = p
+                .version
+                .clone()
+                .or_else(|| value.get("version").and_then(artifact_version_string))
+                .ok_or_else(|| anyhow::anyhow!("agent artifact missing version"))?
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("agent artifact version must parse as u32"))?;
+            let agent_ref = orchestration::agents::types::AgentRef { name, version };
+            manifest.embedding = Some(embed_queue::agent_manifest_embedding(&agent_ref, &manifest));
+            value["manifest"]["embedding"] = serde_json::to_value(&manifest.embedding)?;
+            installed_agent = Some((agent_ref, manifest));
         }
     }
-    state
+    let meta = state
         .artifacts
         .write()
         .install_value(p.kind, p.source, &value, p.name, p.version, p.supersedes)
@@ -7718,7 +7826,75 @@ async fn install_artifact_value(
                 deactivate_artifact(state, meta.kind, prev)?;
             }
             Ok(meta)
-        })
+        })?;
+    if let Some((agent_ref, manifest)) = installed_agent {
+        embed_queue::enqueue_agent_manifest(&agent_ref, &manifest);
+        persist_agent_provenance_edges(state, &agent_ref, &manifest)?;
+    }
+    Ok(meta)
+}
+
+fn artifact_version_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn persist_agent_provenance_edges(
+    state: &Arc<SharedState>,
+    agent_ref: &orchestration::agents::types::AgentRef,
+    manifest: &orchestration::agents::types::AgentManifest,
+) -> anyhow::Result<()> {
+    use orchestration::agents::types::AgentProvenance;
+    let Some(AgentProvenance::Distilled {
+        evidence_session_ids,
+        created_from_threads,
+        ..
+    }) = manifest.provenance.as_ref()
+    else {
+        return Ok(());
+    };
+    let source = entity_ref::EntityRef::Agent {
+        name: agent_ref.name.clone(),
+        version: agent_ref.version,
+    };
+    let mut edges = Vec::new();
+    for session in evidence_session_ids {
+        let target = entity_ref::EntityRef::parse(session)?;
+        if !matches!(target, entity_ref::EntityRef::Session { .. }) {
+            anyhow::bail!("distilled agent evidence ref is not a session: {session}");
+        }
+        edges.push(agent_derived_from_edge(source.clone(), target));
+    }
+    for thread in created_from_threads {
+        let target = entity_ref::EntityRef::parse(thread)?;
+        if !matches!(target, entity_ref::EntityRef::Thread { .. }) {
+            anyhow::bail!("distilled agent thread ref is not a thread: {thread}");
+        }
+        edges.push(agent_derived_from_edge(source.clone(), target));
+    }
+    let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let written = edge_index::append_edges_dedup(&edges_dir, "agents", &edges)?;
+    if written > 0 {
+        rebuild_edge_index_from_shared(state);
+    }
+    Ok(())
+}
+
+fn agent_derived_from_edge(
+    source: entity_ref::EntityRef,
+    target: entity_ref::EntityRef,
+) -> edge_index::Edge {
+    edge_index::Edge {
+        source,
+        kind: "DERIVED_FROM".into(),
+        target,
+        provenance: chunker::EdgeProvenance::Explicit,
+        confidence: chunker::EdgeConfidence::Exact,
+        metadata: Default::default(),
+    }
 }
 
 fn deactivate_artifact(
@@ -8425,6 +8601,78 @@ async fn roster_handler(
     }
 
     Ok(axum::Json(entries))
+}
+
+fn resolve_agent_vector_search(
+    query: &str,
+    supplied_query_vector: Option<&[f32]>,
+) -> AgentVectorPlan {
+    #[cfg(test)]
+    if supplied_query_vector.is_none() {
+        return AgentVectorPlan {
+            search: None,
+            route: None,
+            error: Some("live query embedding disabled in unit tests".into()),
+        };
+    }
+    let route = match embed::EmbeddingRouter::load_default()
+        .and_then(|router| router.route(embed::Bucket::AgentManifest, None))
+    {
+        Ok(route) => route.vector_route_id(),
+        Err(err) => {
+            return AgentVectorPlan {
+                search: None,
+                route: None,
+                error: Some(format!("agent_manifest route unavailable: {err}")),
+            };
+        }
+    };
+    let Some(metrics) = vectors::metrics().get(&route).cloned() else {
+        return AgentVectorPlan {
+            search: None,
+            route: Some(route),
+            error: Some("agent_manifest vector partition has no active records".into()),
+        };
+    };
+    if metrics.active_count == 0 {
+        return AgentVectorPlan {
+            search: None,
+            route: Some(route),
+            error: Some("agent_manifest vector partition has no active records".into()),
+        };
+    }
+    let query_vector = match supplied_query_vector {
+        Some(vector) => vector.to_vec(),
+        None => match BlackboxServer::embed_agent_query(query) {
+            Ok(vector) => vector,
+            Err(err) => {
+                return AgentVectorPlan {
+                    search: None,
+                    route: Some(route),
+                    error: Some(format!("agent_manifest query embedding failed: {err}")),
+                };
+            }
+        },
+    };
+    if query_vector.len() != metrics.dims {
+        return AgentVectorPlan {
+            search: None,
+            route: Some(route),
+            error: Some(format!(
+                "query vector dims {} do not match agent_manifest partition dims {}",
+                query_vector.len(),
+                metrics.dims
+            )),
+        };
+    }
+    AgentVectorPlan {
+        search: Some(orchestration::agents::registry::AgentVectorSearch {
+            route: route.clone(),
+            query_vector,
+        }),
+        route: Some(route),
+        error: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9367,17 +9615,21 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(server
-            .state
-            .workflow_registry
-            .read()
-            .contains_key("schema-migration-arc"));
-        assert!(server
-            .state
-            .packets
-            .read()
-            .load("domain:workflow-policy/arc-budget")
-            .is_ok());
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("schema-migration-arc")
+        );
+        assert!(
+            server
+                .state
+                .packets
+                .read()
+                .load("domain:workflow-policy/arc-budget")
+                .is_ok()
+        );
         let rows = server
             .state
             .artifacts
@@ -9414,11 +9666,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(server
-            .state
-            .workflow_registry
-            .read()
-            .contains_key("project-bootstrap-arc"));
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("project-bootstrap-arc")
+        );
         let rows = server
             .state
             .artifacts
@@ -9466,10 +9720,12 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(snapshot.status, "completed");
-        assert!(snapshot
-            .completed_nodes
-            .iter()
-            .any(|node| node == "Publish"));
+        assert!(
+            snapshot
+                .completed_nodes
+                .iter()
+                .any(|node| node == "Publish")
+        );
     }
 
     #[tokio::test]
@@ -9529,23 +9785,29 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(server
-            .state
-            .workflow_registry
-            .read()
-            .contains_key("embed-compaction-arc"));
-        assert!(server
-            .state
-            .packets
-            .read()
-            .load("domain:embed/compaction-policy")
-            .is_ok());
-        assert!(server
-            .state
-            .packets
-            .read()
-            .load("domain:cron-routing/embed-compaction")
-            .is_ok());
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("embed-compaction-arc")
+        );
+        assert!(
+            server
+                .state
+                .packets
+                .read()
+                .load("domain:embed/compaction-policy")
+                .is_ok()
+        );
+        assert!(
+            server
+                .state
+                .packets
+                .read()
+                .load("domain:cron-routing/embed-compaction")
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -9612,17 +9874,14 @@ mod tests {
         assert_eq!(result.status, "completed");
         assert_eq!(result.vars.get("rebuild_started"), Some(&Value::Bool(true)));
         assert_eq!(result.vars.get("swapped"), Some(&Value::Bool(true)));
-        assert!(result
-            .events
-            .iter()
-            .any(
-                |event| event.get("kind").and_then(Value::as_str) == Some("gate_applied")
-                    && event
-                        .get("data")
-                        .and_then(|data| data.get("verdict"))
-                        .and_then(Value::as_str)
-                        == Some("compact")
-            ));
+        assert!(result.events.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("gate_applied")
+                && event
+                    .get("data")
+                    .and_then(|data| data.get("verdict"))
+                    .and_then(Value::as_str)
+                    == Some("compact")
+        }));
         let after = vector_store.metrics().remove(route).unwrap();
         assert_eq!(after.active_count, 6);
         assert_eq!(after.deleted_count, 0);
@@ -9724,29 +9983,37 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(server
-            .state
-            .workflow_registry
-            .read()
-            .contains_key("auto-digest-arc"));
-        assert!(server
-            .state
-            .packets
-            .read()
-            .load("domain:auto-digest/entry-quality")
-            .is_ok());
-        assert!(server
-            .state
-            .packets
-            .read()
-            .load("domain:auto-digest/task-completed-routing")
-            .is_ok());
-        assert!(orchestration::brofile::resolve_brofile(
-            "digest-extractor",
-            &server.state.store_dir,
-            None
-        )
-        .is_some());
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("auto-digest-arc")
+        );
+        assert!(
+            server
+                .state
+                .packets
+                .read()
+                .load("domain:auto-digest/entry-quality")
+                .is_ok()
+        );
+        assert!(
+            server
+                .state
+                .packets
+                .read()
+                .load("domain:auto-digest/task-completed-routing")
+                .is_ok()
+        );
+        assert!(
+            orchestration::brofile::resolve_brofile(
+                "digest-extractor",
+                &server.state.store_dir,
+                None
+            )
+            .is_some()
+        );
 
         let cases: Value =
             serde_json::from_str(include_str!("../eval/audit/auto-digest/cases.json")).unwrap();
@@ -9862,11 +10129,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(server
-            .state
-            .workflow_registry
-            .read()
-            .contains_key("contradiction-review-arc"));
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("contradiction-review-arc")
+        );
         let packet_store = server.state.packets.read();
         let packet = packet_store
             .load("domain:contradiction/review-synthesis")
@@ -9878,12 +10147,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prediction.classification, "contradicts");
-        assert!(orchestration::brofile::resolve_brofile(
-            "contradiction-facilitator",
-            &server.state.store_dir,
-            None
-        )
-        .is_some());
+        assert!(
+            orchestration::brofile::resolve_brofile(
+                "contradiction-facilitator",
+                &server.state.store_dir,
+                None
+            )
+            .is_some()
+        );
     }
 
     #[tokio::test]
@@ -9988,11 +10259,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(server
-            .state
-            .workflow_registry
-            .read()
-            .contains_key("auto-edge-arc"));
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("auto-edge-arc")
+        );
 
         let packet_store = server.state.packets.read();
         let packet = packet_store
@@ -10061,10 +10334,12 @@ mod tests {
         });
         let source_ref = entity_ref::EntityRef::parse(source).unwrap();
         let target_ref = entity_ref::EntityRef::parse(target).unwrap();
-        assert!(edge_index
-            .forward_edges(&source_ref)
-            .iter()
-            .any(|edge| edge.kind == "DESCRIBES" && edge.target == target_ref));
+        assert!(
+            edge_index
+                .forward_edges(&source_ref)
+                .iter()
+                .any(|edge| edge.kind == "DESCRIBES" && edge.target == target_ref)
+        );
     }
 
     #[tokio::test]
@@ -10259,11 +10534,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(server
-            .state
-            .workflow_registry
-            .read()
-            .contains_key("workflow-a"));
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("workflow-a")
+        );
 
         install_artifact_value(
             &server.state,
@@ -10279,22 +10556,28 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!server
-            .state
-            .workflow_registry
-            .read()
-            .contains_key("workflow-a"));
-        assert!(server
-            .state
-            .workflow_registry
-            .read()
-            .contains_key("workflow-a2"));
-        assert!(!server
-            .state
-            .store_dir
-            .join("workflows")
-            .join("workflow-a.json")
-            .exists());
+        assert!(
+            !server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("workflow-a")
+        );
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("workflow-a2")
+        );
+        assert!(
+            !server
+                .state
+                .store_dir
+                .join("workflows")
+                .join("workflow-a.json")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -11124,15 +11407,11 @@ mod tests {
         }));
         assert_ne!(result.is_error, Some(true));
 
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let agents = body["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 2);
 
-        let reviewer = agents
-            .iter()
-            .find(|a| a["name"] == "reviewer")
-            .unwrap();
+        let reviewer = agents.iter().find(|a| a["name"] == "reviewer").unwrap();
         assert_eq!(reviewer["version"], "1");
         assert_eq!(reviewer["active"], true);
         assert_eq!(reviewer["cost_class"], "expensive");
@@ -11176,8 +11455,7 @@ mod tests {
         }));
         assert_ne!(result.is_error, Some(true));
 
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["name"], "reviewer");
         assert_eq!(body["version"], "3");
         assert_eq!(body["active"], true);
@@ -11214,8 +11492,7 @@ mod tests {
         }));
         assert_ne!(result.is_error, Some(true));
 
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["version"], "5");
     }
 
@@ -11224,9 +11501,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
 
-        let result = server.bro_agent_get(Parameters(AgentGetParams {
-            name: "@v2".into(),
-        }));
+        let result = server.bro_agent_get(Parameters(AgentGetParams { name: "@v2".into() }));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
         assert!(text.contains("requires a name"), "got: {text}");
@@ -11278,8 +11553,7 @@ mod tests {
             limit: Some(2),
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["agents"].as_array().unwrap().len(), 2);
     }
 
@@ -11304,8 +11578,7 @@ mod tests {
             limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let agents = body["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["name"], "distilled");
@@ -11398,7 +11671,10 @@ mod tests {
             all_names.contains(&"old-agent"),
             "superseded agent should appear with include_superseded=true: {all_names:?}"
         );
-        let old = all_agents.iter().find(|a| a["name"] == "old-agent").unwrap();
+        let old = all_agents
+            .iter()
+            .find(|a| a["name"] == "old-agent")
+            .unwrap();
         assert_eq!(old["active"], false);
     }
 
@@ -11418,8 +11694,7 @@ mod tests {
             agent: "reviewer".into(),
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["name"], "reviewer");
         assert_eq!(body["version"], "1");
         assert_eq!(body["active"], true);
@@ -11468,16 +11743,19 @@ mod tests {
             agent: "inline-filtered".into(),
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let allow = body["merged_filters"]["allow"].as_array().unwrap();
         let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
         assert!(
-            allow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
+            allow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
             "inline allow should appear in merged: {allow:?}"
         );
         assert!(
-            disallow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
+            disallow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
             "inline disallow should appear in merged: {disallow:?}"
         );
     }
@@ -11534,8 +11812,7 @@ mod tests {
             agent: "conflict".into(),
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let allow = body["merged_filters"]["allow"]
             .as_array()
             .unwrap()
@@ -11618,8 +11895,7 @@ mod tests {
             agent: "auditor-agent".into(),
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["brofile_kind"], "ref");
         assert_eq!(body["brofile_name"], "auditor");
         assert_eq!(body["brofile_provider"], "claude");
@@ -11629,11 +11905,15 @@ mod tests {
         let allow = body["merged_filters"]["allow"].as_array().unwrap();
         let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
         assert!(
-            allow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
+            allow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
             "brofile allow in merged: {allow:?}"
         );
         assert!(
-            disallow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
+            disallow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
             "brofile disallow in merged: {disallow:?}"
         );
     }
@@ -11662,10 +11942,14 @@ mod tests {
             agent: "broken".into(),
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["name"], "broken");
-        assert!(body["error"].as_str().unwrap().contains("manifest parse failed"));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("manifest parse failed")
+        );
     }
 
     #[test]
@@ -11699,10 +11983,11 @@ mod tests {
             cost_class: None,
             provenance_kind: None,
             exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["search_mode"], "keyword");
         assert!(body["results"].is_array());
         assert!(body["total_matched"].as_u64().unwrap() > 0);
@@ -11715,6 +12000,149 @@ mod tests {
         assert!(first["description"].is_string());
         assert!(first["when_to_use"].is_array());
         assert!(first["anti_patterns"].is_array());
+    }
+
+    #[test]
+    fn bro_agent_search_uses_agent_manifest_vectors_when_available() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let vector_store =
+            std::sync::Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+        let _guard = vectors::install_test_global(vector_store.clone());
+        let route = embed::EmbeddingRouter::default()
+            .route(embed::Bucket::AgentManifest, None)
+            .unwrap()
+            .vector_route_id();
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "semantic-reviewer.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "semantic-reviewer",
+                "version": 1,
+                "manifest": {
+                    "description": "Reviews change sets with semantic ranking.",
+                    "when_to_use": ["when a vector query should find this agent"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let agent = orchestration::agents::types::AgentRef {
+            name: "semantic-reviewer".into(),
+            version: 1,
+        };
+        vector_store
+            .upsert(
+                &route,
+                &embed_queue::agent_component_entity_id(
+                    &agent,
+                    embed_queue::AgentManifestComponent::Primary,
+                ),
+                "h1",
+                vec![1.0, 0.0, 0.0],
+            )
+            .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "orthogonal words".into(),
+            limit: Some(5),
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+            include_vectors: Some(true),
+            query_vector: Some(vec![1.0, 0.0, 0.0]),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["search_mode"], "hybrid");
+        let first = &body["results"][0];
+        assert_eq!(first["name"], "semantic-reviewer");
+        assert!(first["sources"]["vector_primary"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn agent_install_stamps_embeddings_and_distilled_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let artifact = serde_json::json!({
+            "kind": "agent",
+            "name": "distilled-reviewer",
+            "version": 1,
+            "manifest": {
+                "description": "Reviews recurring code patterns.",
+                "when_to_use": ["when recurring review work appears"],
+                "anti_patterns": ["one-off typo fixes"],
+                "brofile_inline": {"provider": "claude"},
+                "provenance": {
+                    "kind": "distilled",
+                    "distilled_by": "badgey-01",
+                    "evidence_session_ids": ["session:claude:sess-1"],
+                    "created_from_threads": ["thread:thread-abc"],
+                    "accept_count": 1,
+                    "reject_count": 0
+                }
+            }
+        });
+        rt.block_on(install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "distilled-reviewer.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            artifact,
+        ))
+        .unwrap();
+
+        let stored = server
+            .state
+            .artifacts
+            .read()
+            .load_artifact_value(artifacts::ArtifactKind::Agent, "distilled-reviewer")
+            .unwrap()
+            .unwrap();
+        let embedding = &stored["manifest"]["embedding"];
+        assert_eq!(
+            embedding["components"]["primary"],
+            "agent_embed:distilled-reviewer:v1:primary"
+        );
+        assert_eq!(
+            embedding["components"]["when_to_use"],
+            "agent_embed:distilled-reviewer:v1:when_to_use"
+        );
+        assert_eq!(
+            embedding["components"]["anti_patterns"],
+            "agent_embed:distilled-reviewer:v1:anti_patterns"
+        );
+
+        let agent_ref = entity_ref::EntityRef::Agent {
+            name: "distilled-reviewer".into(),
+            version: 1,
+        };
+        let edge_index = server.state.edge_index.read();
+        let edges = edge_index.forward_edges_filtered(&agent_ref, &["DERIVED_FROM"]);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|edge| {
+            edge.target
+                == entity_ref::EntityRef::Session {
+                    provider: "claude".into(),
+                    session_id: "sess-1".into(),
+                }
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge.target
+                == entity_ref::EntityRef::Thread {
+                    thread_id: "thread-abc".into(),
+                }
+        }));
     }
 
     #[test]
@@ -11749,10 +12177,11 @@ mod tests {
             cost_class: None,
             provenance_kind: None,
             exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert!(body["results"].as_array().unwrap().len() <= 2);
     }
 
@@ -11766,6 +12195,8 @@ mod tests {
             cost_class: None,
             provenance_kind: None,
             exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
         }));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -11803,10 +12234,11 @@ mod tests {
             cost_class: None,
             provenance_kind: None,
             exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let results = body["results"].as_array().unwrap();
         assert!(
             results.is_empty(),
@@ -11845,15 +12277,21 @@ mod tests {
             cost_class: None,
             provenance_kind: None,
             exclude_anti_pattern_matches: Some(false),
+            include_vectors: None,
+            query_vector: None,
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let results = body["results"].as_array().unwrap();
-        assert!(!results.is_empty(), "should return result when exclude=false");
+        assert!(
+            !results.is_empty(),
+            "should return result when exclude=false"
+        );
         let matched_ap = results[0]["matched_anti_patterns"].as_array().unwrap();
         assert!(
-            matched_ap.iter().any(|v| v.as_str().unwrap().contains("untested")),
+            matched_ap
+                .iter()
+                .any(|v| v.as_str().unwrap().contains("untested")),
             "matched_anti_patterns should include the matching anti-pattern: {matched_ap:?}"
         );
     }
@@ -11924,19 +12362,26 @@ mod tests {
             cost_class: None,
             provenance_kind: None,
             exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
         }));
         assert_ne!(result.is_error, Some(true));
-        let body: serde_json::Value =
-            serde_json::from_str(&extract_text(&result)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let results = body["results"].as_array().unwrap();
         let retired_entries: Vec<_> = results
             .iter()
             .filter(|r| r["name"].as_str() == Some("retired-agent"))
             .collect();
-        assert_eq!(retired_entries.len(), 1, "only v2 of retired-agent should appear");
+        assert_eq!(
+            retired_entries.len(),
+            1,
+            "only v2 of retired-agent should appear"
+        );
         assert_eq!(retired_entries[0]["version"], "2");
         assert!(
-            results.iter().any(|r| r["name"].as_str() == Some("active-agent")),
+            results
+                .iter()
+                .any(|r| r["name"].as_str() == Some("active-agent")),
             "active-agent should appear: {results:?}"
         );
     }
@@ -11951,6 +12396,8 @@ mod tests {
             cost_class: Some("invalid".into()),
             provenance_kind: None,
             exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
         }));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -12096,13 +12543,25 @@ mod tests {
 
         struct NoopAdapter;
         impl orchestration::agents::adapter::AgentDispatchAdapter for NoopAdapter {
-            fn name(&self) -> &'static str { "noop" }
+            fn name(&self) -> &'static str {
+                "noop"
+            }
             fn dispatch(
                 &self,
                 _manifest: &orchestration::agents::types::AgentManifest,
                 _args: serde_json::Value,
                 _ctx: orchestration::agents::adapter::DispatchContext,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<orchestration::agents::adapter::AgentDispatchResult, orchestration::agents::adapter::AgentDispatchError>> + Send + '_>> {
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                orchestration::agents::adapter::AgentDispatchResult,
+                                orchestration::agents::adapter::AgentDispatchError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
                 Box::pin(async {
                     Ok(orchestration::agents::adapter::AgentDispatchResult {
                         session: orchestration::agents::types::AgentSession {
@@ -12122,15 +12581,21 @@ mod tests {
                 })
             }
         }
-        server.state.agent_adapter_registry.write().register(std::sync::Arc::new(NoopAdapter));
+        server
+            .state
+            .agent_adapter_registry
+            .write()
+            .register(std::sync::Arc::new(NoopAdapter));
 
-        let result = server.bro_agent_dispatch(Parameters(AgentDispatchParams {
-            agent: "noop-agent".into(),
-            args: serde_json::json!({"prompt": "hello"}),
-            project_dir: None,
-            bro: None,
-            ambient: None,
-        })).await;
+        let result = server
+            .bro_agent_dispatch(Parameters(AgentDispatchParams {
+                agent: "noop-agent".into(),
+                args: serde_json::json!({"prompt": "hello"}),
+                project_dir: None,
+                bro: None,
+                ambient: None,
+            }))
+            .await;
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["session"]["session_id"], "test-session-123");
@@ -12141,10 +12606,8 @@ mod tests {
     async fn bro_agent_dispatch_handle_shape_reference_agent_noop_adapter() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let mut diff_narrator: serde_json::Value = serde_json::from_str(
-            include_str!("../examples/agents/diff-narrator.json"),
-        )
-        .unwrap();
+        let mut diff_narrator: serde_json::Value =
+            serde_json::from_str(include_str!("../examples/agents/diff-narrator.json")).unwrap();
         diff_narrator["manifest"]["dispatch_adapter"] = serde_json::json!("noop-ref");
         let cat = &server.state.artifacts.read();
         cat.install_value(
@@ -12223,10 +12686,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
 
         // Verify handle shape: every field the agent-system.md 5.3 contract requires
-        assert!(
-            body["session"].is_object(),
-            "should have session object"
-        );
+        assert!(body["session"].is_object(), "should have session object");
         assert!(
             body["session"]["session_id"].is_string(),
             "session.session_id must be a string"
@@ -12354,7 +12814,10 @@ mod tests {
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
-        assert!(text.contains("neither brofile_ref nor brofile_inline"), "got: {text}");
+        assert!(
+            text.contains("neither brofile_ref nor brofile_inline"),
+            "got: {text}"
+        );
     }
 
     #[test]
@@ -12605,17 +13068,14 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let agents = body["agents"].as_array().expect("agents array");
         assert_eq!(agents.len(), 2);
-        let schema_tester = agents.iter().find(|a| a["name"] == "schema-tester").unwrap();
+        let schema_tester = agents
+            .iter()
+            .find(|a| a["name"] == "schema-tester")
+            .unwrap();
         assert_eq!(schema_tester["version"].as_str(), Some("1"));
         assert_eq!(schema_tester["cost_class"].as_str(), Some("normal"));
-        assert_eq!(
-            schema_tester["when_to_use"].as_array().unwrap().len(),
-            1
-        );
-        assert_eq!(
-            schema_tester["anti_patterns"].as_array().unwrap().len(),
-            1
-        );
+        assert_eq!(schema_tester["when_to_use"].as_array().unwrap().len(), 1);
+        assert_eq!(schema_tester["anti_patterns"].as_array().unwrap().len(), 1);
         assert!(schema_tester["dispatch_adapter"].is_null());
 
         let badgey = agents.iter().find(|a| a["name"] == "badgey-agent").unwrap();
@@ -12787,8 +13247,7 @@ mod tests {
             status: None,
             team: None,
         }));
-        let dash_body: serde_json::Value =
-            serde_json::from_str(&extract_text(&dash)).unwrap();
+        let dash_body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
         let tasks = dash_body["tasks"].as_array().unwrap();
         let found = tasks.iter().find(|t| t["taskId"].as_str() == Some(task_id));
         assert!(found.is_some(), "task should appear in dashboard");

@@ -190,9 +190,26 @@ pub enum AgentProvenance {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentEmbedding {
+    /// Back-compat primary vector reference. New code should read
+    /// `components.primary`, but this field keeps the manifest easy to scan.
     pub model: String,
     pub computed_at: String,
+    #[serde(default)]
     pub vector_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_route: Option<String>,
+    #[serde(default)]
+    pub components: AgentEmbeddingComponents,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEmbeddingComponents {
+    #[serde(default)]
+    pub primary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_to_use: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anti_patterns: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,14 +335,10 @@ impl Default for AgentManifest {
 pub fn validate_description_length(desc: &str) -> Result<(), String> {
     let len = desc.len();
     if len < 10 {
-        return Err(format!(
-            "description too short ({len} chars, minimum 10)"
-        ));
+        return Err(format!("description too short ({len} chars, minimum 10)"));
     }
     if len > 500 {
-        return Err(format!(
-            "description too long ({len} chars, maximum 500)"
-        ));
+        return Err(format!("description too long ({len} chars, maximum 500)"));
     }
     Ok(())
 }
@@ -534,7 +547,11 @@ mod tests {
 
     #[test]
     fn composition_shape_serde_round_trip() {
-        for shape in &[CompositionShape::Chain, CompositionShape::FanOut, CompositionShape::Escalation] {
+        for shape in &[
+            CompositionShape::Chain,
+            CompositionShape::FanOut,
+            CompositionShape::Escalation,
+        ] {
             let json = serde_json::to_string(&shape).unwrap();
             let parsed: CompositionShape = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, *shape);

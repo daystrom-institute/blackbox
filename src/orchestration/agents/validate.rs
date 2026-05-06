@@ -2,7 +2,8 @@ use anyhow::Result;
 
 use super::adapter::AgentAdapterRegistry;
 use super::types::{
-    validate_description_length, validate_when_to_use_nonempty, AgentFilterOverlay, AgentManifest,
+    AgentFilterOverlay, AgentManifest, AgentProvenance, validate_description_length,
+    validate_when_to_use_nonempty,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +207,9 @@ fn lint_manifest<B: Fn(&str) -> bool, A: Fn(&str) -> bool>(
         if let Some(schema) = &inputs.schema {
             validate_json_schema_ish(schema, "inputs.schema")?;
         }
+        if let Some(template) = &inputs.prompt_template {
+            validate_prompt_template(template, inputs.schema.as_ref())?;
+        }
     }
 
     if let Some(outputs) = &manifest.outputs {
@@ -231,11 +235,124 @@ fn lint_manifest<B: Fn(&str) -> bool, A: Fn(&str) -> bool>(
         validate_composition(composition, &ctx.agent_exists)?;
     }
 
+    validate_provenance_refs(manifest)?;
+
     Ok(())
 }
 
-const FAN_OUT_AGGREGATOR_VARIANTS: &[&str] =
-    &["vote-majority", "ensemble-merge", "first-success"];
+fn validate_provenance_refs(manifest: &AgentManifest) -> Result<(), ValidationError> {
+    let Some(AgentProvenance::Distilled {
+        evidence_session_ids,
+        created_from_threads,
+        ..
+    }) = manifest.provenance.as_ref()
+    else {
+        return Ok(());
+    };
+    for session in evidence_session_ids {
+        match crate::entity_ref::EntityRef::parse(session) {
+            Ok(crate::entity_ref::EntityRef::Session { .. }) => {}
+            Ok(other) => {
+                return Err(ValidationError {
+                    step: "lint_provenance",
+                    message: format!(
+                        "evidence_session_ids entry `{session}` must be a session ref, got {:?}",
+                        other.entity_type()
+                    ),
+                });
+            }
+            Err(err) => {
+                return Err(ValidationError {
+                    step: "lint_provenance",
+                    message: format!(
+                        "evidence_session_ids entry `{session}` is not a canonical entity ref: {err}"
+                    ),
+                });
+            }
+        }
+    }
+    for thread in created_from_threads {
+        match crate::entity_ref::EntityRef::parse(thread) {
+            Ok(crate::entity_ref::EntityRef::Thread { .. }) => {}
+            Ok(other) => {
+                return Err(ValidationError {
+                    step: "lint_provenance",
+                    message: format!(
+                        "created_from_threads entry `{thread}` must be a thread ref, got {:?}",
+                        other.entity_type()
+                    ),
+                });
+            }
+            Err(err) => {
+                return Err(ValidationError {
+                    step: "lint_provenance",
+                    message: format!(
+                        "created_from_threads entry `{thread}` is not a canonical entity ref: {err}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_prompt_template(
+    template: &str,
+    schema: Option<&serde_json::Value>,
+) -> Result<(), ValidationError> {
+    let allowed_props = schema
+        .and_then(|schema| schema.get("properties"))
+        .and_then(|props| props.as_object())
+        .map(|props| {
+            props
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        });
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            return Err(ValidationError {
+                step: "lint_prompt_template",
+                message: "prompt_template has an unclosed `{{` placeholder".into(),
+            });
+        };
+        let name = after[..end].trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(ValidationError {
+                step: "lint_prompt_template",
+                message: format!(
+                    "prompt_template placeholder `{name}` is not a simple property name"
+                ),
+            });
+        }
+        if let Some(allowed) = &allowed_props {
+            if !allowed.contains(name) {
+                return Err(ValidationError {
+                    step: "lint_prompt_template",
+                    message: format!(
+                        "prompt_template placeholder `{name}` is not declared in inputs.schema.properties"
+                    ),
+                });
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    if rest.contains("}}") {
+        return Err(ValidationError {
+            step: "lint_prompt_template",
+            message: "prompt_template has a closing `}}` without an opening `{{`".into(),
+        });
+    }
+    Ok(())
+}
+
+const FAN_OUT_AGGREGATOR_VARIANTS: &[&str] = &["vote-majority", "ensemble-merge", "first-success"];
 
 fn validate_composition(
     composition: &super::types::AgentComposition,
@@ -302,7 +419,14 @@ fn validate_json_schema_ish(
                     });
                 }
             }
-            Ok(())
+            jsonschema::JSONSchema::options()
+                .with_draft(jsonschema::Draft::Draft202012)
+                .compile(value)
+                .map(|_| ())
+                .map_err(|e| ValidationError {
+                    step: "lint_schema",
+                    message: format!("{field_name}: invalid JSON Schema 2020-12: {e}"),
+                })
         }
         _ => Err(ValidationError {
             step: "lint_schema",
@@ -439,6 +563,39 @@ mod tests {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx(&registry);
         validate_agent_install(&minimal_valid_agent(), &ctx).unwrap();
+    }
+
+    #[test]
+    fn accepts_canonical_distilled_provenance_refs() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["provenance"] = serde_json::json!({
+            "kind": "distilled",
+            "distilled_by": "badgey-01",
+            "evidence_session_ids": ["session:claude:sess-1"],
+            "created_from_threads": ["thread:thread-abc"],
+            "accept_count": 1,
+            "reject_count": 0
+        });
+        validate_agent_install(&v, &ctx).unwrap();
+    }
+
+    #[test]
+    fn rejects_noncanonical_distilled_provenance_refs() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["provenance"] = serde_json::json!({
+            "kind": "distilled",
+            "distilled_by": "badgey-01",
+            "evidence_session_ids": ["sess-1"],
+            "created_from_threads": ["thread-abc"],
+            "accept_count": 1,
+            "reject_count": 0
+        });
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "lint_provenance");
     }
 
     #[test]
@@ -950,9 +1107,11 @@ mod tests {
                     > + Send,
             >,
         > {
-            Box::pin(async { Err(super::super::adapter::AgentDispatchError::AdapterFailed {
-                message: "not implemented".into(),
-            }) })
+            Box::pin(async {
+                Err(super::super::adapter::AgentDispatchError::AdapterFailed {
+                    message: "not implemented".into(),
+                })
+            })
         }
     }
 
@@ -961,10 +1120,8 @@ mod tests {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx(&registry);
         let src = include_str!("../../../examples/agents/diff-narrator.json");
-        let v: serde_json::Value = serde_json::from_str(src)
-            .expect("diff-narrator.json parses");
-        validate_agent_install(&v, &ctx)
-            .expect("diff-narrator validates cleanly");
+        let v: serde_json::Value = serde_json::from_str(src).expect("diff-narrator.json parses");
+        validate_agent_install(&v, &ctx).expect("diff-narrator validates cleanly");
     }
 
     #[test]
@@ -976,10 +1133,8 @@ mod tests {
             agent_exists: |name: &str| name == "diff-narrator",
         };
         let src = include_str!("../../../examples/agents/code-reviewer.json");
-        let v: serde_json::Value = serde_json::from_str(src)
-            .expect("code-reviewer.json parses");
-        validate_agent_install(&v, &ctx)
-            .expect("code-reviewer validates cleanly");
+        let v: serde_json::Value = serde_json::from_str(src).expect("code-reviewer.json parses");
+        validate_agent_install(&v, &ctx).expect("code-reviewer validates cleanly");
     }
 
     #[test]
@@ -987,8 +1142,7 @@ mod tests {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx_brofile_missing(&registry);
         let src = include_str!("../../../examples/agents/code-reviewer.json");
-        let v: serde_json::Value = serde_json::from_str(src)
-            .expect("code-reviewer.json parses");
+        let v: serde_json::Value = serde_json::from_str(src).expect("code-reviewer.json parses");
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "brofile_resolution");
     }
@@ -1003,10 +1157,8 @@ mod tests {
             agent_exists: |_name: &str| true,
         };
         let src = include_str!("../../../examples/agents/badgey.json");
-        let v: serde_json::Value = serde_json::from_str(src)
-            .expect("badgey.json parses");
-        validate_agent_install(&v, &ctx)
-            .expect("badgey validates cleanly");
+        let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
+        validate_agent_install(&v, &ctx).expect("badgey validates cleanly");
     }
 
     #[test]
@@ -1014,8 +1166,7 @@ mod tests {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx(&registry);
         let src = include_str!("../../../examples/agents/badgey.json");
-        let v: serde_json::Value = serde_json::from_str(src)
-            .expect("badgey.json parses");
+        let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_dispatch_adapter");
     }
@@ -1060,7 +1211,11 @@ mod tests {
                         > + Send,
                 >,
             > {
-                Box::pin(async { Err(super::super::adapter::AgentDispatchError::AdapterFailed { message: "stub".into() }) })
+                Box::pin(async {
+                    Err(super::super::adapter::AgentDispatchError::AdapterFailed {
+                        message: "stub".into(),
+                    })
+                })
             }
         }
         registry.register(Arc::new(TestBadgeyAdapter));
@@ -1071,17 +1226,22 @@ mod tests {
             include_str!("../../../examples/agents/badgey.json"),
         ];
         for src in agents {
-            let v: serde_json::Value = serde_json::from_str(src)
-                .expect("agent JSON parses");
+            let v: serde_json::Value = serde_json::from_str(src).expect("agent JSON parses");
             let ctx = InstallCtx {
                 adapter_registry: &registry,
                 brofile_exists: |name: &str| -> bool {
-                    catalog.metadata_for(crate::artifacts::ArtifactKind::Brofile, name)
-                        .ok().flatten().is_some_and(|m| m.active)
+                    catalog
+                        .metadata_for(crate::artifacts::ArtifactKind::Brofile, name)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.active)
                 },
                 agent_exists: |name: &str| -> bool {
-                    catalog.metadata_for(crate::artifacts::ArtifactKind::Agent, name)
-                        .ok().flatten().is_some_and(|m| m.active)
+                    catalog
+                        .metadata_for(crate::artifacts::ArtifactKind::Agent, name)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.active)
                 },
             };
             let agent_name = v["name"].as_str().unwrap_or("unknown");
@@ -1107,8 +1267,14 @@ mod tests {
             })
             .unwrap();
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"code-reviewer"), "code-reviewer not in catalog");
-        assert!(names.contains(&"diff-narrator"), "diff-narrator not in catalog");
+        assert!(
+            names.contains(&"code-reviewer"),
+            "code-reviewer not in catalog"
+        );
+        assert!(
+            names.contains(&"diff-narrator"),
+            "diff-narrator not in catalog"
+        );
         assert!(names.contains(&"badgey"), "badgey not in catalog");
     }
 
@@ -1135,7 +1301,11 @@ mod tests {
                         > + Send,
                 >,
             > {
-                Box::pin(async { Err(super::super::adapter::AgentDispatchError::AdapterFailed { message: "stub".into() }) })
+                Box::pin(async {
+                    Err(super::super::adapter::AgentDispatchError::AdapterFailed {
+                        message: "stub".into(),
+                    })
+                })
             }
         }
         registry.register(Arc::new(TestBadgeyAdapter));
@@ -1143,13 +1313,10 @@ mod tests {
         let src = include_str!("../../../examples/agents/badgey.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
         let ctx = make_ctx(&registry);
-        validate_agent_install(&v, &ctx)
-            .expect("badgey with registered adapter should validate");
+        validate_agent_install(&v, &ctx).expect("badgey with registered adapter should validate");
 
-        let manifest = serde_json::from_value::<AgentManifest>(
-            v["manifest"].clone(),
-        )
-        .expect("manifest deserializes");
+        let manifest = serde_json::from_value::<AgentManifest>(v["manifest"].clone())
+            .expect("manifest deserializes");
         assert!(
             manifest.brofile_inline.is_some(),
             "badgey declares inline brofile for documentation/identity"
@@ -1214,17 +1381,21 @@ mod tests {
         registry.register(Arc::new(DispatchingNoopAdapter));
 
         for (agent_name, agent_src) in [
-            ("code-reviewer", include_str!("../../../examples/agents/code-reviewer.json")),
-            ("diff-narrator", include_str!("../../../examples/agents/diff-narrator.json")),
+            (
+                "code-reviewer",
+                include_str!("../../../examples/agents/code-reviewer.json"),
+            ),
+            (
+                "diff-narrator",
+                include_str!("../../../examples/agents/diff-narrator.json"),
+            ),
         ] {
-            let v: serde_json::Value =
-                serde_json::from_str(agent_src).expect("agent parses");
-            let manifest = serde_json::from_value::<AgentManifest>(
-                v["manifest"].clone(),
-            )
-            .expect("manifest deserializes");
+            let v: serde_json::Value = serde_json::from_str(agent_src).expect("agent parses");
+            let manifest = serde_json::from_value::<AgentManifest>(v["manifest"].clone())
+                .expect("manifest deserializes");
 
-            let test_args = serde_json::json!({"diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new"});
+            let test_args =
+                serde_json::json!({"diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new"});
             let ctx = super::super::adapter::DispatchContext {
                 project_dir: Some("/tmp/test-project".into()),
                 ambient: None,
@@ -1232,8 +1403,7 @@ mod tests {
                 caller_provider: None,
                 caller_session_id: None,
             };
-            let adapter = registry.get("noop-dispatch")
-                .expect("adapter registered");
+            let adapter = registry.get("noop-dispatch").expect("adapter registered");
             let result = tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(adapter.dispatch(&manifest, test_args, ctx))

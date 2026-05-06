@@ -8,17 +8,17 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::SharedState;
 use crate::chunker::Chunk;
 use crate::entity_ref::EntityRef;
 use crate::index::EmbeddingSourceDoc;
-use crate::SharedState;
 
 pub const VOYAGE_PROVIDER_ID: &str = "voyage";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";
@@ -43,10 +43,11 @@ pub enum Bucket {
     GitMessage,
     Notes,
     Threads,
+    AgentManifest,
 }
 
 impl Bucket {
-    pub const ALL: [Bucket; 7] = [
+    pub const ALL: [Bucket; 8] = [
         Bucket::Knowledge,
         Bucket::Code,
         Bucket::Docs,
@@ -54,6 +55,7 @@ impl Bucket {
         Bucket::GitMessage,
         Bucket::Notes,
         Bucket::Threads,
+        Bucket::AgentManifest,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -65,6 +67,7 @@ impl Bucket {
             Self::GitMessage => "git_message",
             Self::Notes => "notes",
             Self::Threads => "threads",
+            Self::AgentManifest => "agent_manifest",
         }
     }
 }
@@ -144,6 +147,7 @@ pub struct RoutesConfig {
     pub git_message: Option<String>,
     pub notes: Option<String>,
     pub threads: Option<String>,
+    pub agent_manifest: Option<String>,
     #[serde(default)]
     pub per_project: BTreeMap<String, BucketRoutes>,
 }
@@ -157,6 +161,7 @@ pub struct BucketRoutes {
     pub git_message: Option<String>,
     pub notes: Option<String>,
     pub threads: Option<String>,
+    pub agent_manifest: Option<String>,
 }
 
 impl BucketRoutes {
@@ -169,6 +174,7 @@ impl BucketRoutes {
             Bucket::GitMessage => self.git_message.as_deref(),
             Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
+            Bucket::AgentManifest => self.agent_manifest.as_deref(),
         }
     }
 }
@@ -183,6 +189,7 @@ impl RoutesConfig {
             Bucket::GitMessage => self.git_message.as_deref(),
             Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
+            Bucket::AgentManifest => self.agent_manifest.as_deref(),
         }
     }
 }
@@ -367,6 +374,35 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
         })
 }
 
+fn count_reembed_entities(state: &Arc<SharedState>, buckets: &[Bucket]) -> Result<usize> {
+    let knowledge_count = if buckets.contains(&Bucket::Knowledge) {
+        state.kb.read().all_entries().len()
+    } else {
+        0
+    };
+    let note_count = if buckets.contains(&Bucket::Notes) {
+        state.notes.read().all().len()
+    } else {
+        0
+    };
+    let agent_count = if buckets.contains(&Bucket::AgentManifest) {
+        count_agent_manifest_components(state)?
+    } else {
+        0
+    };
+    let docs = if buckets.iter().any(|bucket| {
+        matches!(
+            bucket,
+            Bucket::Code | Bucket::Docs | Bucket::Transcripts | Bucket::GitMessage
+        )
+    }) {
+        state.idx.read().embedding_source_docs()?
+    } else {
+        Vec::new()
+    };
+    Ok(knowledge_count + note_count + agent_count + count_reembed_index_docs(buckets, &docs))
+}
+
 fn enqueue_reembed_routes(
     state: &Arc<SharedState>,
     buckets: &[Bucket],
@@ -402,6 +438,13 @@ fn enqueue_reembed_routes(
             enqueued += 1;
         }
     }
+    if buckets.contains(&Bucket::AgentManifest) {
+        let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
+        enqueued += enqueue_agent_manifest_artifacts(state, remaining)?;
+        if limit_reached(max_entities, enqueued) {
+            return Ok(enqueued);
+        }
+    }
     let doc_types = reembed_index_doc_types(buckets);
     if !doc_types.is_empty() {
         let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
@@ -410,6 +453,70 @@ fn enqueue_reembed_routes(
             .read()
             .embedding_source_docs_for_doc_types(&doc_types, remaining)?;
         enqueued += enqueue_reembed_index_docs(buckets, &docs, remaining);
+    }
+    Ok(enqueued)
+}
+
+fn count_agent_manifest_components(state: &Arc<SharedState>) -> Result<usize> {
+    let catalog = state.artifacts.read();
+    let entries = catalog.list(&crate::artifacts::ArtifactListParams {
+        kind: Some(crate::artifacts::ArtifactKind::Agent),
+        name: None,
+        include_superseded: true,
+    })?;
+    let mut count = 0usize;
+    for entry in entries {
+        let Some(value) =
+            catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
+        else {
+            continue;
+        };
+        let manifest_value = value.get("manifest").unwrap_or(&value);
+        let Ok(manifest) = serde_json::from_value::<
+            crate::orchestration::agents::types::AgentManifest,
+        >(manifest_value.clone()) else {
+            continue;
+        };
+        count += crate::embed_queue::agent_manifest_component_count(&manifest);
+    }
+    Ok(count)
+}
+
+fn enqueue_agent_manifest_artifacts(
+    state: &Arc<SharedState>,
+    max_entities: Option<usize>,
+) -> Result<usize> {
+    let catalog = state.artifacts.read();
+    let entries = catalog.list(&crate::artifacts::ArtifactListParams {
+        kind: Some(crate::artifacts::ArtifactKind::Agent),
+        name: None,
+        include_superseded: true,
+    })?;
+    let mut enqueued = 0usize;
+    for entry in entries {
+        if limit_reached(max_entities, enqueued) {
+            break;
+        }
+        let Some(value) =
+            catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
+        else {
+            continue;
+        };
+        let manifest_value = value.get("manifest").unwrap_or(&value);
+        let Ok(manifest) = serde_json::from_value::<
+            crate::orchestration::agents::types::AgentManifest,
+        >(manifest_value.clone()) else {
+            continue;
+        };
+        let Ok(version) = entry.version.parse::<u32>() else {
+            continue;
+        };
+        let agent = crate::orchestration::agents::types::AgentRef {
+            name: entry.name,
+            version,
+        };
+        enqueued += crate::embed_queue::agent_manifest_component_count(&manifest);
+        crate::embed_queue::enqueue_agent_manifest(&agent, &manifest);
     }
     Ok(enqueued)
 }
@@ -466,7 +573,7 @@ fn enqueue_reembed_index_docs(
                 crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content);
                 enqueued += 1;
             }
-            Bucket::Knowledge | Bucket::Notes | Bucket::Threads => {}
+            Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => {}
         }
     }
     enqueued

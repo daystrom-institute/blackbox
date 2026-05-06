@@ -5,16 +5,19 @@ use parking_lot::RwLock;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::SharedState;
 use crate::chunker::Chunk;
 use crate::embed::queue::{EmbedQueueHandle, EmbedRequest, EmbedStatusResponse};
-use crate::embed::{queue, Bucket};
+use crate::embed::{Bucket, queue};
 use crate::entity_ref::EntityRef;
 use crate::knowledge::KnowledgeEntry;
 use crate::notes::Note;
 use crate::notes::NoteParams;
+use crate::orchestration::agents::types::{
+    AgentEmbedding, AgentEmbeddingComponents, AgentManifest, AgentRef,
+};
 use crate::routing::RoutingVerdict;
 use crate::threads::Thread;
-use crate::SharedState;
 
 static GLOBAL_QUEUE: OnceLock<RwLock<Option<EmbedQueueHandle>>> = OnceLock::new();
 static CONTRADICTION_STATE: OnceLock<RwLock<Option<std::sync::Arc<SharedState>>>> = OnceLock::new();
@@ -135,6 +138,173 @@ pub(crate) fn enqueue_thread(thread: &Thread) {
         chunk_hash: thread_chunk_hash(thread),
         text: thread_text(thread),
     });
+}
+
+pub(crate) fn agent_manifest_embedding(
+    agent: &AgentRef,
+    manifest: &AgentManifest,
+) -> AgentEmbedding {
+    let route = crate::embed::EmbeddingRouter::load_default()
+        .and_then(|router| router.route(Bucket::AgentManifest, None))
+        .ok();
+    let model = route
+        .as_ref()
+        .map(|route| route.model.clone())
+        .unwrap_or_else(|| "unavailable".into());
+    let vector_route = route.map(|route| route.vector_route_id());
+    let primary = agent_component_entity_id(agent, AgentManifestComponent::Primary);
+    let when_to_use = if manifest.when_to_use.is_empty() {
+        None
+    } else {
+        Some(agent_component_entity_id(
+            agent,
+            AgentManifestComponent::WhenToUse,
+        ))
+    };
+    let anti_patterns = if manifest.anti_patterns.is_empty() {
+        None
+    } else {
+        Some(agent_component_entity_id(
+            agent,
+            AgentManifestComponent::AntiPatterns,
+        ))
+    };
+    AgentEmbedding {
+        model,
+        computed_at: crate::util::now_iso(),
+        vector_ref: primary.clone(),
+        vector_route,
+        components: AgentEmbeddingComponents {
+            primary,
+            when_to_use,
+            anti_patterns,
+        },
+    }
+}
+
+pub(crate) fn enqueue_agent_manifest(agent: &AgentRef, manifest: &AgentManifest) {
+    for component in agent_manifest_components(manifest) {
+        enqueue(EmbedRequest {
+            bucket: Bucket::AgentManifest,
+            project_id: None,
+            entity_id: agent_component_entity_id(agent, component.kind),
+            chunk_hash: content_hash(&component.text),
+            text: component.text,
+        });
+    }
+}
+
+pub(crate) fn agent_manifest_component_count(manifest: &AgentManifest) -> usize {
+    agent_manifest_components(manifest).len()
+}
+
+pub(crate) fn agent_component_entity_id(
+    agent: &AgentRef,
+    component: AgentManifestComponent,
+) -> String {
+    format!(
+        "agent_embed:{}:v{}:{}",
+        agent.name,
+        agent.version,
+        component.as_str()
+    )
+}
+
+pub(crate) fn parse_agent_component_entity_id(
+    entity_id: &str,
+) -> Option<(AgentRef, AgentManifestComponent)> {
+    let rest = entity_id.strip_prefix("agent_embed:")?;
+    let (agent_part, component_part) = rest.rsplit_once(':')?;
+    let (name, version_part) = agent_part.rsplit_once(":v")?;
+    let version = version_part.parse::<u32>().ok()?;
+    Some((
+        AgentRef {
+            name: name.to_string(),
+            version,
+        },
+        AgentManifestComponent::parse(component_part)?,
+    ))
+}
+
+pub(crate) fn agent_component_hash(
+    manifest: &AgentManifest,
+    component: AgentManifestComponent,
+) -> Option<String> {
+    let text = agent_manifest_component_text(manifest, component)?;
+    Some(content_hash(&text))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AgentManifestComponent {
+    Primary,
+    WhenToUse,
+    AntiPatterns,
+}
+
+impl AgentManifestComponent {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::WhenToUse => "when_to_use",
+            Self::AntiPatterns => "anti_patterns",
+        }
+    }
+
+    fn parse(input: &str) -> Option<Self> {
+        match input {
+            "primary" => Some(Self::Primary),
+            "when_to_use" => Some(Self::WhenToUse),
+            "anti_patterns" => Some(Self::AntiPatterns),
+            _ => None,
+        }
+    }
+}
+
+struct AgentComponentText {
+    kind: AgentManifestComponent,
+    text: String,
+}
+
+fn agent_manifest_components(manifest: &AgentManifest) -> Vec<AgentComponentText> {
+    let mut components = Vec::new();
+    for kind in [
+        AgentManifestComponent::Primary,
+        AgentManifestComponent::WhenToUse,
+        AgentManifestComponent::AntiPatterns,
+    ] {
+        if let Some(text) = agent_manifest_component_text(manifest, kind) {
+            components.push(AgentComponentText { kind, text });
+        }
+    }
+    components
+}
+
+fn agent_manifest_component_text(
+    manifest: &AgentManifest,
+    component: AgentManifestComponent,
+) -> Option<String> {
+    match component {
+        AgentManifestComponent::Primary => Some(format!(
+            "description: {}\nwhen_to_use:\n{}\nanti_patterns:\n{}",
+            manifest.description,
+            manifest.when_to_use.join("\n"),
+            manifest.anti_patterns.join("\n")
+        )),
+        AgentManifestComponent::WhenToUse => {
+            if manifest.when_to_use.is_empty() {
+                None
+            } else {
+                Some(manifest.when_to_use.join("\n"))
+            }
+        }
+        AgentManifestComponent::AntiPatterns => {
+            if manifest.anti_patterns.is_empty() {
+                None
+            } else {
+                Some(manifest.anti_patterns.join("\n"))
+            }
+        }
+    }
 }
 
 pub(crate) fn enqueue_transcript(

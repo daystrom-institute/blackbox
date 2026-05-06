@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 
@@ -34,6 +35,20 @@ pub struct AgentSearchResult {
     pub cost_class: Option<AgentCostClass>,
     pub provenance_kind: Option<String>,
     pub matched_anti_patterns: Vec<String>,
+    pub sources: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentVectorSearch {
+    pub route: String,
+    pub query_vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ComponentScores {
+    primary: f64,
+    when_to_use: f64,
+    anti_patterns: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +149,11 @@ impl<'a> AgentRegistry<'a> {
             let embedding_pending = if parse_err.is_some() {
                 None
             } else {
-                Some(manifest.as_ref().is_some_and(|m| m.embedding.is_none()))
+                Some(
+                    manifest
+                        .as_ref()
+                        .is_none_or(|m| manifest_embedding_pending(&entry.name, &entry.version, m)),
+                )
             };
             out.push(AgentSummary {
                 name: entry.name,
@@ -209,6 +228,28 @@ impl<'a> AgentRegistry<'a> {
         filter: &SearchFilter,
         exclude_anti_pattern_matches: bool,
     ) -> Result<Vec<AgentSearchResult>> {
+        self.search_inner(query, limit, filter, exclude_anti_pattern_matches, None)
+    }
+
+    pub fn search_with_vectors(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &SearchFilter,
+        exclude_anti_pattern_matches: bool,
+        vector: Option<&AgentVectorSearch>,
+    ) -> Result<Vec<AgentSearchResult>> {
+        self.search_inner(query, limit, filter, exclude_anti_pattern_matches, vector)
+    }
+
+    fn search_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &SearchFilter,
+        exclude_anti_pattern_matches: bool,
+        vector: Option<&AgentVectorSearch>,
+    ) -> Result<Vec<AgentSearchResult>> {
         let params = ArtifactListParams {
             kind: Some(ArtifactKind::Agent),
             name: None,
@@ -217,6 +258,10 @@ impl<'a> AgentRegistry<'a> {
         let entries = self.catalog.list(&params)?;
         let query_lower = query.to_lowercase();
         let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+        let vector_scores = vector
+            .map(|v| agent_component_scores(&v.route, &v.query_vector, limit.max(10) * 16))
+            .transpose()?
+            .unwrap_or_default();
 
         let mut candidates: Vec<AgentSearchResult> = Vec::new();
 
@@ -247,13 +292,28 @@ impl<'a> AgentRegistry<'a> {
             }
 
             let desc_lower = manifest.description.to_lowercase();
-            let wtu_lower: Vec<String> =
-                manifest.when_to_use.iter().map(|s| s.to_lowercase()).collect();
-            let ap_lower: Vec<String> =
-                manifest.anti_patterns.iter().map(|s| s.to_lowercase()).collect();
+            let wtu_lower: Vec<String> = manifest
+                .when_to_use
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect();
+            let ap_lower: Vec<String> = manifest
+                .anti_patterns
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect();
 
             let positive_score = text_relevance(&query_terms, &desc_lower, &wtu_lower);
             let anti_score = text_relevance(&query_terms, "", &ap_lower);
+            let agent_ref = super::types::AgentRef {
+                name: entry.name.clone(),
+                version: entry.version.parse::<u32>().unwrap_or(1),
+            };
+            let component_scores = vector_scores
+                .get(&agent_ref.render())
+                .cloned()
+                .unwrap_or_default();
+            let vector_positive = component_scores.primary.max(component_scores.when_to_use);
 
             let mut matched_anti_patterns = Vec::new();
             for (i, ap) in manifest.anti_patterns.iter().enumerate() {
@@ -264,11 +324,19 @@ impl<'a> AgentRegistry<'a> {
                 let _ = i;
             }
 
-            if positive_score == 0.0 {
+            if positive_score == 0.0 && vector_positive == 0.0 {
                 continue;
             }
 
-            if exclude_anti_pattern_matches && anti_score > positive_score {
+            if exclude_anti_pattern_matches
+                && (anti_score > positive_score && anti_score > vector_positive)
+            {
+                continue;
+            }
+            if exclude_anti_pattern_matches
+                && component_scores.anti_patterns > vector_positive
+                && component_scores.anti_patterns > positive_score
+            {
                 continue;
             }
 
@@ -276,8 +344,32 @@ impl<'a> AgentRegistry<'a> {
                 0.3 * anti_score
             } else {
                 0.0
+            } + if component_scores.anti_patterns > vector_positive {
+                0.5 * component_scores.anti_patterns
+            } else {
+                0.0
             };
-            let final_score = (positive_score - penalty).max(0.0);
+            let mut sources = BTreeMap::new();
+            if positive_score > 0.0 {
+                sources.insert("keyword".into(), positive_score);
+            }
+            if component_scores.primary > 0.0 {
+                sources.insert("vector_primary".into(), component_scores.primary);
+            }
+            if component_scores.when_to_use > 0.0 {
+                sources.insert("vector_when_to_use".into(), component_scores.when_to_use);
+            }
+            if component_scores.anti_patterns > 0.0 {
+                sources.insert(
+                    "vector_anti_patterns".into(),
+                    component_scores.anti_patterns,
+                );
+            }
+            let final_score = (positive_score
+                + (2.0 * component_scores.primary)
+                + (1.5 * component_scores.when_to_use)
+                - penalty)
+                .max(0.0);
 
             if final_score <= 0.0 {
                 continue;
@@ -293,6 +385,7 @@ impl<'a> AgentRegistry<'a> {
                 cost_class: Some(cost_class),
                 provenance_kind: provenance_kind.map(String::from),
                 matched_anti_patterns,
+                sources,
             });
         }
 
@@ -300,14 +393,105 @@ impl<'a> AgentRegistry<'a> {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(Ordering::Equal)
-                .then_with(|| {
-                    cost_rank(a.cost_class).cmp(&cost_rank(b.cost_class))
-                })
+                .then_with(|| cost_rank(a.cost_class).cmp(&cost_rank(b.cost_class)))
         });
         candidates.truncate(limit);
 
         Ok(candidates)
     }
+}
+
+fn manifest_embedding_pending(name: &str, version: &str, manifest: &AgentManifest) -> bool {
+    let Some(embedding) = &manifest.embedding else {
+        return true;
+    };
+    let Ok(version) = version.parse::<u32>() else {
+        return true;
+    };
+    let route = embedding.vector_route.as_deref().unwrap_or("");
+    if route.is_empty() {
+        return true;
+    }
+    let agent = super::types::AgentRef {
+        name: name.to_string(),
+        version,
+    };
+    let when_to_use_ref = if manifest.when_to_use.is_empty() {
+        None
+    } else {
+        match embedding.components.when_to_use.as_deref() {
+            Some(vector_ref) => Some(vector_ref),
+            None => return true,
+        }
+    };
+    let anti_patterns_ref = if manifest.anti_patterns.is_empty() {
+        None
+    } else {
+        match embedding.components.anti_patterns.as_deref() {
+            Some(vector_ref) => Some(vector_ref),
+            None => return true,
+        }
+    };
+    let checks = [
+        (
+            crate::embed_queue::AgentManifestComponent::Primary,
+            Some(embedding.components.primary.as_str()),
+        ),
+        (
+            crate::embed_queue::AgentManifestComponent::WhenToUse,
+            when_to_use_ref,
+        ),
+        (
+            crate::embed_queue::AgentManifestComponent::AntiPatterns,
+            anti_patterns_ref,
+        ),
+    ];
+    for (component, vector_ref) in checks {
+        let Some(vector_ref) = vector_ref else {
+            continue;
+        };
+        let expected = crate::embed_queue::agent_component_entity_id(&agent, component);
+        if vector_ref != expected {
+            return true;
+        }
+        let Some(hash) = crate::embed_queue::agent_component_hash(manifest, component) else {
+            continue;
+        };
+        match crate::vectors::contains_active(route, vector_ref, &hash) {
+            Ok(true) => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+fn agent_component_scores(
+    vector_route: &str,
+    query_vector: &[f32],
+    fetch: usize,
+) -> Result<BTreeMap<String, ComponentScores>> {
+    let hits = crate::vectors::search(vector_route, query_vector, fetch)?;
+    let mut out = BTreeMap::<String, ComponentScores>::new();
+    for hit in hits {
+        let Some((agent, component)) = crate::embed_queue::parse_agent_component_entity_id(&hit.id)
+        else {
+            continue;
+        };
+        let score = (1.0 - hit.distance).max(0.0) as f64;
+        let entry = out.entry(agent.render()).or_default();
+        match component {
+            crate::embed_queue::AgentManifestComponent::Primary => {
+                entry.primary = entry.primary.max(score);
+            }
+            crate::embed_queue::AgentManifestComponent::WhenToUse => {
+                entry.when_to_use = entry.when_to_use.max(score);
+            }
+            crate::embed_queue::AgentManifestComponent::AntiPatterns => {
+                entry.anti_patterns = entry.anti_patterns.max(score);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Parse an agent name or versioned ref into `(name, optional_version)`.
@@ -391,6 +575,7 @@ fn cost_rank(cc: Option<AgentCostClass>) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::{AgentEmbedding, AgentEmbeddingComponents};
     use super::*;
 
     fn setup_catalog(dir: &tempfile::TempDir) -> ArtifactCatalog {
@@ -571,6 +756,63 @@ mod tests {
     }
 
     #[test]
+    fn legacy_embedding_shape_stays_parseable_and_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "legacy.json".into(),
+                &serde_json::json!({
+                    "name": "legacy",
+                    "version": 1,
+                    "manifest": {
+                        "description": "Legacy embedded agent manifest.",
+                        "when_to_use": ["when checking compatibility"],
+                        "brofile_inline": {"provider": "claude"},
+                        "embedding": {
+                            "model": "old-model",
+                            "computed_at": "2026-01-01T00:00:00Z",
+                            "vector_ref": "agent:legacy@v1"
+                        }
+                    }
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let registry = AgentRegistry::new(&catalog);
+        let results = registry.list(&ListFilter::default()).unwrap();
+        let legacy = results.iter().find(|r| r.name == "legacy").unwrap();
+        assert_eq!(legacy.embedding_pending, Some(true));
+        assert!(registry.get("legacy").unwrap().unwrap().manifest.is_some());
+    }
+
+    #[test]
+    fn anti_pattern_manifest_requires_anti_pattern_component_ref() {
+        let manifest = AgentManifest {
+            description: "Agent with anti pattern embeddings.".into(),
+            when_to_use: vec!["when checking component coverage".into()],
+            anti_patterns: vec!["when not to use it".into()],
+            brofile_inline: Some(serde_json::json!({"provider": "claude"})),
+            embedding: Some(AgentEmbedding {
+                model: "test-model".into(),
+                computed_at: "2026-01-01T00:00:00Z".into(),
+                vector_ref: "agent_embed:component-test:v1:primary".into(),
+                vector_route: Some("test-route".into()),
+                components: AgentEmbeddingComponents {
+                    primary: "agent_embed:component-test:v1:primary".into(),
+                    when_to_use: Some("agent_embed:component-test:v1:when_to_use".into()),
+                    anti_patterns: None,
+                },
+            }),
+            ..Default::default()
+        };
+        assert!(manifest_embedding_pending("component-test", "1", &manifest));
+    }
+
+    #[test]
     fn embedding_pending_none_for_malformed_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
@@ -698,7 +940,10 @@ mod tests {
     fn text_relevance_multi_occurrence_boosts() {
         let one = text_relevance(&["agent"], "agent", &[]);
         let two = text_relevance(&["agent"], "agent agent", &[]);
-        assert!(two > one, "more occurrences should score higher: {one} vs {two}");
+        assert!(
+            two > one,
+            "more occurrences should score higher: {one} vs {two}"
+        );
     }
 
     #[test]
