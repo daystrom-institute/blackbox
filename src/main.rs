@@ -19,6 +19,7 @@ mod packets;
 mod parser;
 mod pins;
 mod pollers;
+mod providers;
 mod projects;
 mod query;
 mod render;
