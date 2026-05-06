@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tree_sitter::Node;
-use tree_sitter_language_pack::{get_parser, process, ProcessConfig, ProcessResult, StructureItem};
+use tree_sitter_language_pack::{ProcessConfig, ProcessResult, StructureItem, get_parser, process};
 
-use super::{placeholder_chunk, Chunk, Edge, SourceFormatChunker};
+use super::{Chunk, Edge, SourceFormatChunker, placeholder_chunk};
 
 pub struct CodeChunker;
 
@@ -34,11 +35,7 @@ impl SourceFormatChunker for CodeChunker {
             .with_chunking(super::MAX_CHUNK_BYTES)
             .all();
         let processed = process(source, &config).unwrap_or_else(|err| {
-            tracing::debug!(
-                language,
-                error = %err,
-                "tree-sitter-language-pack process unavailable; using direct grammar fallback"
-            );
+            log_language_pack_failure(language, &err);
             ProcessResult::default()
         });
 
@@ -59,6 +56,28 @@ impl SourceFormatChunker for CodeChunker {
             chunks_from_symbols(path, language, source, specs)
         };
         Ok((chunks, Vec::new()))
+    }
+}
+
+fn log_language_pack_failure(language: &'static str, err: &dyn std::fmt::Display) {
+    static WARNED_LANGUAGES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let warned = WARNED_LANGUAGES.get_or_init(|| Mutex::new(HashSet::new()));
+    let first_failure = warned
+        .lock()
+        .map(|mut languages| languages.insert(language))
+        .unwrap_or(false);
+    if first_failure {
+        tracing::warn!(
+            language,
+            error = %err,
+            "tree-sitter-language-pack process unavailable; using direct grammar fallback"
+        );
+    } else {
+        tracing::debug!(
+            language,
+            error = %err,
+            "tree-sitter-language-pack process unavailable; using direct grammar fallback"
+        );
     }
 }
 
@@ -377,9 +396,11 @@ impl Display for EntityRef {
         let (chunks, _edges) = CodeChunker
             .chunk(Path::new("src/entity_ref.rs"), source)
             .unwrap();
-        assert!(chunks
-            .iter()
-            .any(|chunk| chunk.content.contains("impl Display for EntityRef")));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.content.contains("impl Display for EntityRef"))
+        );
         assert!(chunks.iter().any(|chunk| chunk.symbol.is_some()));
     }
 }
