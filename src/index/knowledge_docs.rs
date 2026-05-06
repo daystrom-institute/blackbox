@@ -84,6 +84,10 @@ pub(crate) fn upsert_knowledge_entry(
     knowledge_path: &Path,
     entry: &KnowledgeEntry,
 ) -> Result<()> {
+    // NOTE: opens a fresh writer per call. Acceptable at low knowledge-write volume
+    // (typical: <10 writes/min from operator + agent activity). If burst writes start
+    // appearing in logs, share a long-lived writer in SharedState with debounced
+    // commits, or hand off to the existing reindex thread via a channel.
     let mut writer: IndexWriter = index.writer(50_000_000)?;
     let entity_id = knowledge_entity_id(&entry.id);
     writer.delete_term(Term::from_field_text(fields.entity_id, &entity_id));
@@ -99,6 +103,10 @@ pub(crate) fn delete_knowledge_entry(
     fields: FieldHandles,
     entry_id: &str,
 ) -> Result<()> {
+    // NOTE: opens a fresh writer per call. Acceptable at low knowledge-write volume
+    // (typical: <10 writes/min from operator + agent activity). If burst writes start
+    // appearing in logs, share a long-lived writer in SharedState with debounced
+    // commits, or hand off to the existing reindex thread via a channel.
     let mut writer: IndexWriter = index.writer(50_000_000)?;
     writer.delete_term(Term::from_field_text(
         fields.entity_id,
