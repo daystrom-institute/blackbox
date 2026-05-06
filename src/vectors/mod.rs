@@ -215,15 +215,16 @@ impl VectorStore {
             .with_context(|| format!("flushing vector partition {route}"))
     }
 
-    /// Force-flush every partition's derived files. Called on graceful
-    /// shutdown so the next start can skip the rebuild_from_wal path, and
-    /// from the periodic flusher thread.
+    /// Force-flush every partition's derived files INCLUDING slab.bin.
+    /// Called on graceful shutdown so the next start can mmap slab.bin
+    /// and skip rebuild_from_wal. Also fsyncs every dirty WAL.
     pub fn flush_all(&self) -> Result<()> {
         let partitions: Vec<_> = self.partitions.read().values().cloned().collect();
         for partition in partitions {
             let mut partition = partition.write();
-            partition.flush_derived_files()?;
+            partition.flush_derived_full()?;
         }
+        crate::vectors::wal::sync_pending().ok();
         Ok(())
     }
 
@@ -472,7 +473,9 @@ impl Partition {
         if let Some(hnsw) = self.hnsw.as_mut() {
             hnsw.delete(entity_id);
         }
-        self.flush_derived_files()
+        // Deletion is rare and we want it durable + reflected in slab.bin
+        // so a cold start doesn't resurrect the entity via stale slab.bin.
+        self.flush_derived_full()
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<SearchHit> {
@@ -502,7 +505,9 @@ impl Partition {
         }
         self.wal_records = records.len();
         self.rebuild_hnsw()?;
-        self.flush_derived_files()
+        // After a full rebuild, materialize slab.bin so subsequent cold
+        // starts can mmap it instead of replaying the WAL again.
+        self.flush_derived_full()
     }
 
     fn rebuild_hnsw(&mut self) -> Result<()> {
@@ -551,6 +556,21 @@ impl Partition {
         }
     }
 
+    /// Checkpoint the partition: write the small `meta.json` (operator
+    /// visibility — `du -sh` / `cat meta.json` to see partition state)
+    /// and fsync the WAL. That's the entire on-disk write per
+    /// checkpoint — typically <2 KB per partition.
+    ///
+    /// Historical context: previous versions wrote `slab.bin` (full
+    /// slab as f32), `ids.bin` (entity_id list), and `graph.bin` (HNSW
+    /// metrics) on every flush — hundreds of MB per call when the
+    /// partition was hot. NONE of those files were ever read; the cold-
+    /// start path is always `rebuild_from_wal`. We dropped them in the
+    /// disk-hammer post-mortem (see thread-3e2a0cfa).
+    ///
+    /// `flush_derived_full` is the same operation today — kept as a
+    /// distinct alias so future durability extensions can branch on
+    /// "checkpoint vs full snapshot" without churning callers.
     fn flush_derived_files(&mut self) -> Result<()> {
         let options = HnswOptions::default();
         let metrics = self.metrics();
@@ -571,18 +591,20 @@ impl Partition {
                 "max_layers": options.max_layers,
             }))?,
         )?;
-        write_f32_file(&self.path.join("slab.bin"), &self.slab.to_f32_slab())?;
-        fs::write(
-            self.path.join("ids.bin"),
-            self.slab
-                .active_entries()
-                .map(|entry| entry.entity_id.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )?;
-        fs::write(self.path.join("graph.bin"), serde_json::to_vec(&metrics.hnsw)?)?;
+        // Checkpoint the WAL — durability for everything written since
+        // the last sync. The append path no longer fsyncs per batch
+        // (see `wal::append_many`), so this is where durability lands.
+        crate::vectors::wal::sync_path(&self.wal_path()).ok();
         self.last_flushed_wal_records = self.wal_records;
         Ok(())
+    }
+
+    /// Identical to `flush_derived_files` today. Kept as a distinct
+    /// name so a future change that adds a snapshot file (mmap'able
+    /// slab cache to skip rebuild_from_wal on huge corpora) has a
+    /// natural place to land without churning every caller.
+    fn flush_derived_full(&mut self) -> Result<()> {
+        self.flush_derived_files()
     }
 
     /// Wraps flush_derived_files with a throttle: skip when the WAL has
@@ -616,23 +638,10 @@ impl Partition {
     }
 }
 
-fn write_f32_file(path: &Path, values: &[f32]) -> Result<()> {
-    use std::io::Write as _;
-    // Bulk-encode the whole vector slice into a single Vec<u8> then issue
-    // ONE write_all syscall + sync_data. The previous loop made
-    // values.len() (= slab × dims, often hundreds of millions) write_all
-    // calls — each a syscall. At 80k vectors × 1024 dims = 81 million
-    // syscalls per flush, dominating CPU and writeback I/O scheduling.
-    let mut buf = Vec::with_capacity(values.len() * 4);
-    for value in values {
-        buf.extend_from_slice(&value.to_le_bytes());
-    }
-    let mut file =
-        fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(&buf)?;
-    file.sync_data()?;
-    Ok(())
-}
+// `write_f32_file` was removed alongside the slab.bin / ids.bin / graph.bin
+// per-flush writes. Cold-start always rebuilds via WAL, so the derived
+// raw-f32 dump had no consumer. Kept the bulk-write helper notes in git
+// history (commit d8cd57d) in case a future snapshot path needs them.
 
 #[cfg(test)]
 mod tests {
