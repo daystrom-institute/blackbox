@@ -119,6 +119,16 @@ impl EdgeIndex {
             .push(edge);
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_edges_for_tests(edges: Vec<Edge>) -> Self {
+        let mut index = Self::default();
+        let mut seen = HashSet::new();
+        for edge in edges {
+            index.insert(edge, &mut seen);
+        }
+        index
+    }
+
     fn project_knowledge_edges(&mut self, knowledge: &Knowledge, seen: &mut HashSet<Edge>) {
         for entry in knowledge.all_entries() {
             if let Some(target) = &entry.supersedes {

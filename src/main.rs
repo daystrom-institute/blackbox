@@ -18,6 +18,7 @@ mod notes;
 mod orchestration;
 mod packets;
 mod parser;
+mod path_cache;
 mod pins;
 mod pollers;
 mod projects;
@@ -84,6 +85,7 @@ struct SharedState {
     artifacts: RwLock<artifacts::ArtifactCatalog>,
     #[allow(dead_code)]
     edge_index: RwLock<edge_index::EdgeIndex>,
+    path_cache: RwLock<path_cache::PathCache>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
     store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
@@ -679,6 +681,8 @@ use knowledge::{
     AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeListParams, LearnParams,
     RememberParams, RenderParams, ResponseFormat, ReviewParams,
 };
+use mcp_tools::bundle_evidence::BundleEvidenceParams;
+use mcp_tools::find_paths::FindPathsParams;
 use mcp_tools::inspect::InspectEntityParams;
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
@@ -807,6 +811,41 @@ impl BlackboxServer {
     fn bbox_describe_schema(&self) -> CallToolResult {
         Self::run("bbox_describe_schema", || {
             mcp_tools::describe_schema::describe_schema(&self.describe_schema_counts())
+        })
+    }
+
+    #[tool(
+        name = "bbox_find_paths",
+        description = "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence."
+    )]
+    fn bbox_find_paths(&self, Parameters(p): Parameters<FindPathsParams>) -> CallToolResult {
+        Self::run("bbox_find_paths", || {
+            let provider_ctx = ProviderContext::new(&self.state);
+            mcp_tools::find_paths::find_paths(
+                &p,
+                &provider_ctx,
+                &self.state.edge_index.read(),
+                &mut self.state.path_cache.write(),
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_bundle_evidence",
+        description = "Package selected entity refs and cached path IDs into a structured evidence bundle. Use after bbox_find_paths to close the loop before answering; stale path IDs degrade explicitly under degraded.stale_path_ids instead of failing the whole response."
+    )]
+    fn bbox_bundle_evidence(
+        &self,
+        Parameters(p): Parameters<BundleEvidenceParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_bundle_evidence", || {
+            let provider_ctx = ProviderContext::new(&self.state);
+            mcp_tools::bundle_evidence::bundle_evidence(
+                &p,
+                &provider_ctx,
+                &self.state.edge_index.read(),
+                &self.state.path_cache.read(),
+            )
         })
     }
 
@@ -7496,6 +7535,7 @@ async fn main() -> anyhow::Result<()> {
         packets: RwLock::new(packets_store),
         artifacts: RwLock::new(artifacts_store),
         edge_index: RwLock::new(edge_index),
+        path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx: tail_tx.clone(),
         store_dir: store_dir.clone(),
@@ -7845,6 +7885,7 @@ mod tests {
             packets: RwLock::new(packets),
             artifacts: RwLock::new(artifacts),
             edge_index: RwLock::new(edge_index::EdgeIndex::default()),
+            path_cache: RwLock::new(path_cache::PathCache::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,
             store_dir: tmp.path().join("bro"),

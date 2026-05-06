@@ -199,6 +199,24 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use before `bbox_inspect_entity`, `bbox_find_paths`, or evidence bundling when you need the graph vocabulary or want to choose edge filters deliberately.",
         example: Some("bbox_describe_schema()"),
     },
+    ToolDoc {
+        name: "bbox_find_paths",
+        category: ToolCategory::Graph,
+        summary: "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence.",
+        when_to_use: "Use when the answer depends on a chain, not a single entity. Prefer narrow `edge_types`, set `to` or `to_type` when known, and pass returned path IDs to `bbox_bundle_evidence` before making a provenance-sensitive claim.",
+        example: Some(
+            r#"bbox_find_paths(from="knowledge:abc12345", edge_types="SUPERSEDES", max_depth=3)"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_bundle_evidence",
+        category: ToolCategory::Graph,
+        summary: "Package selected entity refs and cached path IDs into a structured evidence bundle. Use after bbox_find_paths to close the loop before answering; stale path IDs degrade explicitly under degraded.stale_path_ids instead of failing the whole response.",
+        when_to_use: "Use after seed/search, inspect, and path traversal when you have the entities and paths that support an answer. This tool packages evidence only; it does not synthesize the answer for you.",
+        example: Some(
+            r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"])"#,
+        ),
+    },
     // ── Projects ─────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_project_register",
@@ -944,7 +962,7 @@ pub fn render_markdown() -> String {
 }
 
 fn hot_summary(summary: &'static str) -> Cow<'static, str> {
-    const MAX_SUMMARY_BYTES: usize = 70;
+    const MAX_SUMMARY_BYTES: usize = 24;
     if summary.len() <= MAX_SUMMARY_BYTES {
         return Cow::Borrowed(summary);
     }

@@ -233,11 +233,7 @@ fn filter_and_limit(
     out
 }
 
-pub(crate) fn render_edges(
-    ctx: &ProviderContext<'_>,
-    edges: &[Edge],
-    direction: &str,
-) -> Vec<RenderedEdge> {
+fn render_edges(ctx: &ProviderContext<'_>, edges: &[Edge], direction: &str) -> Vec<RenderedEdge> {
     edges
         .iter()
         .map(|edge| RenderedEdge {

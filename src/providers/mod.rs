@@ -67,7 +67,7 @@ impl<'a> ProviderContext<'a> {
     }
 
     #[cfg(test)]
-    fn empty_for_tests() -> Self {
+    pub(crate) fn empty_for_tests() -> Self {
         Self { state: None }
     }
 
