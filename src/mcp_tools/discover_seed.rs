@@ -236,13 +236,15 @@ fn render_text(query: &str, seeds: &[SeedEntity]) -> String {
     out.push_str("Search results are seeds, not proof. Inspect the best 1-3 hits before answering or traversing further.\n\n");
     for (idx, seed) in seeds.iter().enumerate() {
         out.push_str(&format!(
-            "{}. {} — {:.5} ({})\n   {}\n",
+            "{}. {} — {:.5} ({})\n",
             idx + 1,
             seed.label,
             seed.score,
-            seed.match_source,
-            seed.entity_ref
+            seed.match_source
         ));
+        if seed.label == seed.entity_ref {
+            out.push_str(&format!("   {}\n", seed.entity_ref));
+        }
         for edge in &seed.notable_edges {
             let arrow = if edge.direction == "out" { "-->" } else { "<--" };
             out.push_str(&format!(
@@ -306,5 +308,36 @@ mod tests {
         let seed = seed_from_hybrid_result(&ctx, &EdgeIndex::default(), &result).unwrap();
         assert!(seed.notable_edges.is_empty());
         assert_eq!(seed.match_source, "bm25");
+    }
+
+    #[test]
+    fn render_text_hides_entity_ref_when_label_is_real() {
+        let seed = SeedEntity {
+            entity_ref: "project_file:abc:def:0".into(),
+            label: "src/main.rs".into(),
+            score: 0.5,
+            match_source: "hybrid".into(),
+            notable_edges: Vec::new(),
+        };
+
+        let text = render_text("main", &[seed]);
+
+        assert!(text.contains("src/main.rs"));
+        assert!(!text.contains("project_file:abc:def:0"));
+    }
+
+    #[test]
+    fn render_text_keeps_entity_ref_for_fallback_label() {
+        let seed = SeedEntity {
+            entity_ref: "project_file:abc:def:0".into(),
+            label: "project_file:abc:def:0".into(),
+            score: 0.5,
+            match_source: "hybrid".into(),
+            notable_edges: Vec::new(),
+        };
+
+        let text = render_text("main", &[seed]);
+
+        assert!(text.contains("project_file:abc:def:0"));
     }
 }
