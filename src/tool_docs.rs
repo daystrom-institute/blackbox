@@ -129,16 +129,16 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_hybrid_search",
         category: ToolCategory::Graph,
-        summary: "Hybrid BM25+vector search over typed entities. vector_weight=0.6 by default; set 0.0 for BM25-only behavior, 1.0 for vector-only.",
-        when_to_use: "Use for mixed questions. `vector_weight=0.6` is default; set 0.0 for BM25-only behavior, 1.0 for vector-only.",
-        example: None,
+        summary: "Hybrid BM25+vector+path-token search over typed entities. Returns mixed-modal seeds (code, docs, commits, knowledge, transcripts) ranked by RRF fusion, with per-file collapse and modal diversification so top-N covers distinct files and chunk_kinds. vector_weight=0.6 by default; set 0.0 for BM25-only, 1.0 for vector-only.",
+        when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question. Trust topical hits — top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes.",
+        example: Some(r#"bbox_hybrid_search(query="triad implementation", limit=10)"#),
     },
     ToolDoc {
         name: "bbox_discover_seed_entities",
         category: ToolCategory::Graph,
-        summary: "Find seed entities with notable_edges; inspect before answering.",
-        when_to_use: "Use before inspect.",
-        example: None,
+        summary: "Hybrid search variant that emphasizes orientation: returns ranked seeds with their notable_edges (semantic-first prioritization) so you can pick the next inspect target without a separate call.",
+        when_to_use: "Alternate Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`) — same blender as `bbox_hybrid_search` but with `notable_edges` rendered for each seed. Reach for it when the next step will be `bbox_inspect_entity` and you want pre-vetted hops.",
+        example: Some(r#"bbox_discover_seed_entities(query="triad closure convergence test", limit=5)"#),
     },
     ToolDoc {
         name: "bbox_cite",
@@ -215,7 +215,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_inspect_entity",
         category: ToolCategory::Graph,
         summary: "Inspect a vertex: returns properties AND targeted edges in one call. Prefer targeted inspection over broad exploration: 1) Set edge_types to the specific edges you want (e.g. 'SUPERSEDES,DERIVED_FROM'). 2) Set direction to 'out' or 'in' when you know which way to traverse. 3) Use 'both' only for initial orientation on an unfamiliar entity. 4) Set per_type_limit=0 for property-only inspection. property_mode controls detail: 'summary' (names/titles only), 'smart' (full text <=300 chars, truncated for longer - default), 'full' (no truncation).",
-        when_to_use: "Prefer targeted inspection over broad sweeps. Set `edge_types` to the specific edges you want, set `direction` to `out` or `in` when known, use `both` only for initial orientation, and set `per_type_limit=0` for property-only inspection. Do not answer lifecycle or history questions from one inspect call when the claim depends on a multi-hop chain.",
+        when_to_use: "Step 3 of the agentic opening sequence (`sm-agentic-opening-sequence`). Prefer targeted inspection over broad sweeps. Set `edge_types` to the specific edges you want, set `direction` to `out` or `in` when known, use `both` only for initial orientation, and set `per_type_limit=0` for property-only inspection. Follow the `recommended_next_hops` list returned in the response — it is ordered semantic-first.",
         example: Some(
             r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", edge_types="SUPERSEDES,DERIVED_FROM", direction="both")"#,
         ),
@@ -224,14 +224,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_describe_schema",
         category: ToolCategory::Graph,
         summary: "Catalog agentic-corpus entity types and edge families. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips.",
-        when_to_use: "Use before `bbox_inspect_entity`, `bbox_find_paths`, or evidence bundling when you need the graph vocabulary or want to choose edge filters deliberately.",
+        when_to_use: "Step 1 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use once per session for orientation; cache the schema mentally. Returns 12 entity types + 7 edge families with population counts.",
         example: Some("bbox_describe_schema()"),
     },
     ToolDoc {
         name: "bbox_find_paths",
         category: ToolCategory::Graph,
         summary: "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence. edge_types accepts a comma-separated string (e.g. 'CALLS,CALLED_BY') OR a JSON array of strings. Both shapes are equivalent.",
-        when_to_use: "Use when the answer depends on a chain, not a single entity. Prefer narrow `edge_types`, set `to` or `to_type` when known, and pass returned path IDs to `bbox_bundle_evidence` before making a provenance-sensitive claim.",
+        when_to_use: "Step 4 of the agentic opening sequence (`sm-agentic-opening-sequence`) — only when the answer depends on a chain, not a single entity. Prefer narrow `edge_types`, set `to` or `to_type` when known, and pass returned path IDs to `bbox_bundle_evidence` before making a provenance-sensitive claim. State edge directions as the path returned them; do not invert from memory.",
         example: Some(
             r#"bbox_find_paths(from="knowledge:abc12345", edge_types="SUPERSEDES", max_depth=3)"#,
         ),
@@ -240,7 +240,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_bundle_evidence",
         category: ToolCategory::Graph,
         summary: "Package selected entity refs and cached path IDs into a structured evidence bundle. Use after bbox_find_paths to close the loop before answering; stale path IDs degrade explicitly under degraded.stale_path_ids instead of failing the whole response.",
-        when_to_use: "Use after seed/search, inspect, and path traversal when you have the entities and paths that support an answer. This tool packages evidence only; it does not synthesize the answer for you.",
+        when_to_use: "Step 5 of the agentic opening sequence (`sm-agentic-opening-sequence`) — close the loop before answering. Pass `path_ids` from `bbox_find_paths` directly; do not reconstruct path text from memory (the server holds the validated graph). This tool packages evidence only; it does not synthesize the answer for you.",
         example: Some(
             r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"])"#,
         ),
@@ -949,11 +949,30 @@ pub fn render_markdown() -> String {
     );
     out.push_str("Do not hand-edit.\n\n");
 
-    out.push_str("## CORE RULE: contextual recall\n\n");
-    out.push_str("**Early in tasks where durable knowledge-store context could change the answer, query `bbox_knowledge` before committing to an approach.** This is a recall check, not a ritual call for every tiny command.\n\n");
-    out.push_str("Use it for prior decisions, project conventions, rendered rules, remembered facts, system runbooks, and packet discovery. It is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes` / `bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`).\n\n");
-    out.push_str("The signature failure mode here: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. Avoid that on work involving repo conventions, prior decisions, active runbooks, durable user preferences, bro/orchestration behavior, or anything where durable project memory could plausibly override defaults.\n\n");
-    out.push_str("Prefer a short phrase from the user's request over a single generic keyword. If the first query is empty or too broad, try one sharper phrase. Then proceed with filesystem exploration, process probing, or normal implementation work using the retrieved context.\n\n");
+    out.push_str("## CORE RULE: agentic opening sequence\n\n");
+    out.push_str("**For any task that touches the codebase, prior decisions, or conversational history, run this five-step sequence before falling back to filesystem search or training-prior answers:**\n\n");
+    out.push_str("```\n");
+    out.push_str("1. bbox_describe_schema           # orient — entity types + edge families\n");
+    out.push_str("2. bbox_hybrid_search(q, k=5)     # seeds — mixed-modal results with notable_edges\n");
+    out.push_str("3. bbox_inspect_entity(ref)       # confirm — properties + edges in one call\n");
+    out.push_str("4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS chains (when multi-hop)\n");
+    out.push_str("5. bbox_bundle_evidence(...)      # answer — package refs + path_ids\n");
+    out.push_str("```\n\n");
+    out.push_str("Step 1 is one-time per session — cache the schema mentally. Step 4 is conditional (skip when the question is single-hop). Step 5 is the close-the-loop write that lets the user re-query your evidence.\n\n");
+    out.push_str("`bbox_blame(file, line)` is the line-level provenance escape hatch when the question is \"who/why does this line exist?\" rather than a graph walk.\n\n");
+    out.push_str("**Hard rules (break these and quality collapses):**\n\n");
+    out.push_str("1. Entity refs are canonical `<type>:<segments>` — when a tool returns `error.bad_input` with a `suggested_fix`, use the suggestion verbatim, don't guess.\n");
+    out.push_str("2. Don't restate paths from memory — pass `path_ids` from `bbox_find_paths` directly to `bbox_bundle_evidence` (the server holds the validated graph).\n");
+    out.push_str("3. Targeted inspection beats broad inspection — pass `edge_types` and `direction` once you know what you're looking for; default `direction=both` is for orientation only.\n");
+    out.push_str("4. Follow `recommended_next_hops` from `bbox_inspect_entity` — they're ordered semantic-first, structural-last.\n");
+    out.push_str("5. Trust topical hits — `bbox_hybrid_search` blends BM25 + vector + path-token boost. Top seed is the canonical entity even when wording doesn't exactly match.\n\n");
+    out.push_str("Final-answer protocol by question type and pattern recipes (where/what/who/why/how/replacement/historical/impact) live in `sm-agentic-opening-sequence`. Pull it via `bbox_knowledge(query=\"sm-agentic-opening-sequence\")` the first time you handle one of those question shapes.\n\n");
+
+    out.push_str("## CORE RULE: contextual recall fallback\n\n");
+    out.push_str("**When the opening sequence above doesn't fit (fast lookup of stored rules, no graph walk needed), query `bbox_knowledge` directly before committing to an approach.** This is a recall check, not a ritual call for every tiny command.\n\n");
+    out.push_str("Use it for prior decisions, project conventions, rendered rules, remembered facts, system runbooks (sm-* IDs), and packet discovery. It is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes` / `bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`).\n\n");
+    out.push_str("The signature failure mode: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. Avoid that on work involving repo conventions, prior decisions, active runbooks, durable user preferences, bro/orchestration behavior, or anything where durable project memory could plausibly override defaults.\n\n");
+    out.push_str("Prefer a short phrase from the user's request over a single generic keyword. If the first query is empty or too broad, try one sharper phrase or escalate to `bbox_hybrid_search` (vector lane catches paraphrases). Then proceed with the opening sequence above or normal implementation work using the retrieved context.\n\n");
     out.push_str(
         "Cost of a wasted query: near zero. Cost of a confident wrong answer: the entire task.\n\n",
     );
