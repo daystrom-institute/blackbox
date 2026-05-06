@@ -83,6 +83,10 @@ pub trait InspectableEntityProvider: Send + Sync {
         false
     }
 
+    /// Load scalar/entity-specific properties from the provider's backing
+    /// store. The returned `EntityView.neighborhood` is intentionally empty;
+    /// callers populate it from `EdgeIndex` before rendering or calling
+    /// `recommended_next_hops`.
     fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView>;
     fn schema(&self) -> EntitySchemaView;
     fn expected_edge_families(&self, r: &EntityRef) -> Vec<EdgeFamilyExpectation>;
