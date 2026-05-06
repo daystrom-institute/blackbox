@@ -827,7 +827,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_find_paths",
-        description = "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence."
+        description = "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence. edge_types accepts a comma-separated string (e.g. 'CALLS,CALLED_BY') OR a JSON array of strings. Both shapes are equivalent."
     )]
     fn bbox_find_paths(&self, Parameters(p): Parameters<FindPathsParams>) -> CallToolResult {
         Self::run("bbox_find_paths", || {
