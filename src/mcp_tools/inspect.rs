@@ -165,16 +165,16 @@ pub fn inspect_entity(
         })
         .collect::<Vec<_>>();
     let properties = render_properties(&entity, property_mode);
-    let text = render_text(
+    let text = render_text(InspectText {
         ctx,
         r,
-        &entity,
-        &properties,
-        &rendered_forward,
-        &rendered_reverse,
-        &recommended,
-        &coverage,
-    );
+        entity: &entity,
+        properties: &properties,
+        forward: &rendered_forward,
+        reverse: &rendered_reverse,
+        recommended: &recommended,
+        coverage: &coverage,
+    });
     Ok(serde_json::to_string_pretty(&json!({
         "status": "ok",
         "text": text,
@@ -308,16 +308,28 @@ fn render_properties(entity: &EntityView, property_mode: PropertyMode) -> BTreeM
         .collect()
 }
 
-fn render_text(
-    ctx: &ProviderContext<'_>,
-    r: &EntityRef,
-    entity: &EntityView,
-    properties: &BTreeMap<String, String>,
-    forward: &[RenderedEdge],
-    reverse: &[RenderedEdge],
-    recommended: &[RenderedNextHop],
-    coverage: &[RenderedCoverage],
-) -> String {
+struct InspectText<'a> {
+    ctx: &'a ProviderContext<'a>,
+    r: &'a EntityRef,
+    entity: &'a EntityView,
+    properties: &'a BTreeMap<String, String>,
+    forward: &'a [RenderedEdge],
+    reverse: &'a [RenderedEdge],
+    recommended: &'a [RenderedNextHop],
+    coverage: &'a [RenderedCoverage],
+}
+
+fn render_text(input: InspectText<'_>) -> String {
+    let InspectText {
+        ctx,
+        r,
+        entity,
+        properties,
+        forward,
+        reverse,
+        recommended,
+        coverage,
+    } = input;
     let header =
         compact_label(ctx, r, Some(&entity.properties)).unwrap_or_else(|| entity.ref_string.clone());
     let mut text = format!("## {header}\n\n");

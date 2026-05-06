@@ -16,7 +16,7 @@ pub(crate) fn label_from_properties(properties: &BTreeMap<String, String>) -> Op
         .iter()
         .find_map(|key| properties.get(*key))
         .filter(|value| !value.trim().is_empty())
-        .map(|value| providers::truncate_label(value))
+        .map(providers::truncate_label)
 }
 
 pub(crate) fn compact_label(
