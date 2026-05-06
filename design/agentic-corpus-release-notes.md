@@ -144,6 +144,11 @@ JSON, and `contradiction/review-synthesis` routes the result into
 `SUPERSEDES` link for graph traversal; primary decision supersession should
 still use `bbox_decide(supersedes=...)`.
 
+Before running the arc, install the ensemble team with
+`examples/agentic-corpus/scripts/install-teams.sh`. It creates
+`contradiction-specialists` with the three specialist brofiles. The F4 catalog
+installs the brofiles and workflow; teams remain an operator setup step in v1.
+
 Tier-0 contradiction detection runs in the knowledge embedding success path.
 When a new knowledge vector has cosine > 0.85 against another knowledge entry
 outside the immediate supersession relation, bbox starts
