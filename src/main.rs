@@ -6,6 +6,7 @@ pub mod entity_ref;
 #[cfg(test)]
 #[path = "../eval/check.rs"]
 mod eval_check;
+mod git;
 mod inbox;
 mod index;
 mod knowledge;

@@ -2,13 +2,13 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const PARSER_VERSION: &str = "entity-ref-v1";
+pub(crate) use crate::git::git_root_for_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -378,10 +378,10 @@ pub fn repo_id_for_path(path: impl AsRef<Path>) -> io::Result<String> {
 }
 
 pub(crate) fn repo_id_for_root(git_root: &Path) -> io::Result<String> {
-    if let Some(first_commit) = git_first_commit_for_path(git_root) {
+    if let Some(first_commit) = crate::git::git_first_commit_for_path(git_root) {
         return Ok(hash_string(&first_commit));
     }
-    if let Some(remote_url) = git_remote_origin_for_path(git_root) {
+    if let Some(remote_url) = crate::git::git_remote_origin_for_path(git_root) {
         return Ok(hash_string(&remote_url));
     }
     Ok(hash_path(git_root))
@@ -423,75 +423,6 @@ pub(crate) fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf
         ))
     } else {
         Ok(canonical)
-    }
-}
-
-pub(crate) fn git_root_for_path(path: &Path) -> Option<PathBuf> {
-    let output = git_output(
-        path,
-        &["rev-parse", "--show-toplevel"],
-        "deriving repository root",
-    )?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?;
-    fs::canonicalize(root.trim()).ok()
-}
-
-fn git_first_commit_for_path(path: &Path) -> Option<String> {
-    let output = git_output(
-        path,
-        &["rev-list", "--max-parents=0", "HEAD"],
-        "deriving first commit",
-    )?;
-    if !output.status.success() {
-        return None;
-    }
-    git_first_commit_from_stdout(&output.stdout)
-}
-
-fn git_first_commit_from_stdout(stdout: &[u8]) -> Option<String> {
-    let raw = String::from_utf8(stdout.to_vec()).ok()?;
-    let mut roots: Vec<&str> = raw
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    roots.sort_unstable();
-    roots.first().map(|line| (*line).to_string())
-}
-
-fn git_remote_origin_for_path(path: &Path) -> Option<String> {
-    let output = git_output(
-        path,
-        &["config", "remote.origin.url"],
-        "deriving remote origin URL",
-    )?;
-    if !output.status.success() {
-        return None;
-    }
-    let remote = String::from_utf8(output.stdout).ok()?;
-    let remote = remote.trim();
-    if remote.is_empty() {
-        None
-    } else {
-        Some(remote.to_string())
-    }
-}
-
-fn git_output(path: &Path, args: &[&str], action: &'static str) -> Option<std::process::Output> {
-    match Command::new("git").arg("-C").arg(path).args(args).output() {
-        Ok(output) => Some(output),
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                action,
-                "failed to execute git"
-            );
-            None
-        }
     }
 }
 
@@ -712,6 +643,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn round_trip_property_10k_random_entities() {
@@ -773,7 +705,7 @@ mod tests {
     #[test]
     fn git_repo_id_uses_first_commit_hash_not_realpath_hash() {
         let repo_path = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let first_commit = git_first_commit_for_path(repo_path).unwrap();
+        let first_commit = crate::git::git_first_commit_for_path(repo_path).unwrap();
         let repo_id = repo_id_for_path(repo_path).unwrap();
         let realpath_id = realpath_hash(repo_path).unwrap();
 
@@ -809,7 +741,7 @@ mod tests {
             b"ffff000000000000000000000000000000000000\n1111000000000000000000000000000000000000\n";
 
         assert_eq!(
-            git_first_commit_from_stdout(stdout).as_deref(),
+            crate::git::git_first_commit_from_stdout(stdout).as_deref(),
             Some("1111000000000000000000000000000000000000")
         );
     }

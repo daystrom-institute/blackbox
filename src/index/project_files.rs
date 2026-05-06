@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
@@ -121,7 +120,7 @@ fn index_project(
     stats: &mut ProjectIndexStats,
 ) -> Result<()> {
     let registry = chunker::default_registry();
-    let commit_sha = current_head(root);
+    let commit_sha = crate::git::current_head(root);
     let mut files = Vec::new();
     let mut pending = Vec::new();
     scan_project_files(root, &mut files)?;
@@ -528,25 +527,6 @@ fn chunk_ref(chunk: &Chunk) -> EntityRef {
 
 fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(4096).any(|byte| *byte == 0)
-}
-
-fn current_head(root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8(output.stdout).ok()?;
-    let sha = sha.trim();
-    if sha.is_empty() {
-        None
-    } else {
-        Some(sha.to_string())
-    }
 }
 
 fn full_hash(bytes: &[u8]) -> String {
