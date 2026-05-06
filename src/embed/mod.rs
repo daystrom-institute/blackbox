@@ -18,6 +18,8 @@ pub const OLLAMA_PROVIDER_ID: &str = "ollama";
 
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
+    /// Embed a batch once. Transient errors propagate to the caller;
+    /// retry policy and exponential backoff are owned by the E2 queue.
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     fn dimensions(&self) -> usize;
     fn model_name(&self) -> &str;
