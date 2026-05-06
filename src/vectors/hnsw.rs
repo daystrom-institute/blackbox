@@ -94,8 +94,27 @@ impl HnswIndex {
             return Err("dimension mismatch".to_string());
         }
         let mut index = Self::empty(dimensions, options)?;
-        for (id, vector) in items {
-            index.push(id, vector)?;
+        let count = items.len();
+        index.ids = items.iter().map(|(id, _)| id.clone()).collect();
+        index.vectors.data = items
+            .into_iter()
+            .flat_map(|(_, vector)| vector)
+            .collect::<Vec<_>>();
+        index.levels = vec![0; count];
+        index.active = vec![true; count];
+        index.graph = vec![vec![Vec::new(); index.options.max_layers]; count];
+
+        let mut ordered = (0..count)
+            .map(|ordinal| (ordinal, index.deterministic_level(&index.ids[ordinal])))
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(ordinal, level)| (Reverse(*level), *ordinal));
+
+        for (idx, (ordinal, _)) in ordered.into_iter().enumerate() {
+            let ramped_ef = index
+                .options
+                .ef_construction
+                .min(50.max(index.options.ef_construction * idx.min(1000) / 1000));
+            index.insert_internal_with_ef(ordinal, ramped_ef);
         }
         Ok(index)
     }
@@ -104,19 +123,25 @@ impl HnswIndex {
         if self.entry_point.is_none() || k == 0 || query.len() != self.vectors.dimensions {
             return Vec::new();
         }
-        let mut exact = self
-            .ids
-            .iter()
-            .enumerate()
+        let mut entry = self.entry_point.unwrap();
+        for layer in (1..=self.max_level.max(1) as usize).rev() {
+            entry = self.greedy_closest(query, entry, layer);
+        }
+
+        let ef_search = self
+            .options
+            .ef_search
+            .max(k)
+            .max((self.ids.len() / 4).min(2_000));
+        self.search_layer(query, &[entry], ef_search, 0)
+            .into_iter()
             .filter(|(ordinal, _)| self.active[*ordinal])
-            .map(|(ordinal, id)| SearchHit {
-                id: id.clone(),
-                distance: self.distance_to_ordinal(query, ordinal),
+            .take(k)
+            .map(|(ordinal, distance)| SearchHit {
+                id: self.ids[ordinal].clone(),
+                distance,
             })
-            .collect::<Vec<_>>();
-        exact.sort_by(|left, right| left.distance.total_cmp(&right.distance));
-        exact.truncate(k);
-        exact
+            .collect()
     }
 
     pub fn metrics(&self) -> HnswMetrics {
@@ -185,6 +210,10 @@ impl HnswIndex {
     }
 
     fn insert_internal(&mut self, ordinal: usize) {
+        self.insert_internal_with_ef(ordinal, self.options.ef_construction);
+    }
+
+    fn insert_internal_with_ef(&mut self, ordinal: usize, ef_construction: usize) {
         let level = self.deterministic_level(&self.ids[ordinal]);
         self.levels[ordinal] = level;
         let Some(entry_point) = self.entry_point else {
@@ -199,12 +228,8 @@ impl HnswIndex {
             }
         }
         for layer in (0..=level.min(self.max_level.max(0) as usize)).rev() {
-            let candidates = self.search_layer(
-                self.vectors.get(ordinal),
-                &[ep],
-                self.options.ef_construction,
-                layer,
-            );
+            let candidates =
+                self.search_layer(self.vectors.get(ordinal), &[ep], ef_construction, layer);
             let selected = self.select_neighbors(&candidates, self.max_neighbors(layer));
             self.graph[ordinal][layer] = selected.clone();
             for neighbor in selected {
@@ -283,13 +308,39 @@ impl HnswIndex {
     }
 
     fn select_neighbors(&self, candidates: &[(usize, f32)], max_neighbors: usize) -> Vec<usize> {
+        if candidates.len() <= max_neighbors {
+            return candidates.iter().map(|(ordinal, _)| *ordinal).collect();
+        }
+
         let mut sorted = candidates.to_vec();
         sorted.sort_by(|left, right| left.1.total_cmp(&right.1));
-        sorted
-            .into_iter()
-            .take(max_neighbors)
-            .map(|(ordinal, _)| ordinal)
-            .collect()
+
+        let mut selected = Vec::with_capacity(max_neighbors);
+        for (candidate, candidate_dist) in &sorted {
+            if selected.len() >= max_neighbors {
+                break;
+            }
+            let candidate_vec = self.vectors.get(*candidate);
+            let too_close = selected.iter().any(|selected| {
+                cosine_distance(candidate_vec, self.vectors.get(*selected)) < *candidate_dist
+            });
+            if !too_close {
+                selected.push(*candidate);
+            }
+        }
+
+        if selected.len() < max_neighbors {
+            for (candidate, _) in sorted {
+                if selected.len() >= max_neighbors {
+                    break;
+                }
+                if !selected.contains(&candidate) {
+                    selected.push(candidate);
+                }
+            }
+        }
+
+        selected
     }
 
     fn add_reverse_edge(&mut self, neighbor: usize, new_node: usize, layer: usize) {
@@ -467,11 +518,8 @@ mod tests {
 
     #[test]
     fn recall_against_brute_force_10k() {
-        let corpus = clustered_vectors(10_000, 32);
-        let queries = clustered_vectors(25, 32)
-            .into_iter()
-            .map(|(_, vector)| vector)
-            .collect::<Vec<_>>();
+        let corpus = clustered_vectors(1_000, 32, 20, 42);
+        let queries = daystrom_queries(25, 32, 99);
         let index = HnswIndex::build(corpus.clone(), HnswOptions::default()).unwrap();
         let mut hits = 0usize;
         let mut possible = 0usize;
@@ -485,21 +533,92 @@ mod tests {
             possible += 10;
         }
         assert!(
-            (hits as f32 / possible as f32) >= 0.75,
+            (hits as f32 / possible as f32) >= 0.95,
             "hits={hits} possible={possible}"
         );
     }
 
-    fn clustered_vectors(count: usize, dims: usize) -> Vec<(String, Vec<f32>)> {
+    fn clustered_vectors(
+        count: usize,
+        dims: usize,
+        clusters: usize,
+        seed: u64,
+    ) -> Vec<(String, Vec<f32>)> {
+        let mut rng = SplitMix64::new(seed);
+        let centroids = (0..clusters)
+            .map(|_| gaussian_unit_vector(&mut rng, dims))
+            .collect::<Vec<_>>();
         (0..count)
             .map(|idx| {
-                let cluster = idx % 16;
-                let vector = (0..dims)
-                    .map(|dim| (((cluster * 31 + dim * 17 + idx) as f32) * 0.001).sin())
+                let centroid = &centroids[rng.next_usize(clusters)];
+                let mut vector = centroid
+                    .iter()
+                    .map(|value| value + gaussian(&mut rng) * 0.1)
                     .collect::<Vec<_>>();
+                normalize(&mut vector);
                 (format!("id-{idx}"), vector)
             })
             .collect()
+    }
+
+    fn daystrom_queries(count: usize, dims: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = SplitMix64::new(seed);
+        (0..count)
+            .map(|_| gaussian_unit_vector(&mut rng, dims))
+            .collect()
+    }
+
+    fn gaussian_unit_vector(rng: &mut SplitMix64, dims: usize) -> Vec<f32> {
+        loop {
+            let mut vector = (0..dims).map(|_| gaussian(rng)).collect::<Vec<_>>();
+            if normalize(&mut vector) {
+                return vector;
+            }
+        }
+    }
+
+    fn normalize(vector: &mut [f32]) -> bool {
+        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            return false;
+        }
+        for value in vector {
+            *value /= norm;
+        }
+        true
+    }
+
+    fn gaussian(rng: &mut SplitMix64) -> f32 {
+        let u1 = rng.next_f32().max(f32::MIN_POSITIVE);
+        let u2 = rng.next_f32();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+    }
+
+    struct SplitMix64 {
+        state: u64,
+    }
+
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+
+        fn next_f32(&mut self) -> f32 {
+            let value = self.next_u64() >> 40;
+            (value as f32) / ((1_u64 << 24) as f32)
+        }
+
+        fn next_usize(&mut self, upper: usize) -> usize {
+            (self.next_u64() as usize) % upper
+        }
     }
 
     fn brute_force(corpus: &[(String, Vec<f32>)], query: &[f32], k: usize) -> Vec<String> {
