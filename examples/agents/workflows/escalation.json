@@ -9,7 +9,7 @@
   },
   "start": "CheapAttempt",
   "vars_schema": {
-    "prompt": { "kind": "string", "required": true },
+    "diff": { "kind": "string", "required": true },
     "cheap_handle": { "kind": "any" },
     "cheap_output": { "kind": "any" },
     "expensive_handle": { "kind": "any" }
@@ -17,7 +17,7 @@
   "nodes": {
     "CheapAttempt": {
       "actor": "placeholder",
-      "prompt": "Escalation: dispatching cheap agent, then evaluating output quality.",
+      "prompt": "Escalation: dispatching cheap diff-narrator, then evaluating output quality.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -25,8 +25,8 @@
             "server": "blackbox",
             "tool": "bro_agent_dispatch",
             "arguments": {
-              "agent": "cheap-agent",
-              "args": { "prompt": "${vars.prompt}" }
+              "agent": "diff-narrator",
+              "args": { "diff": "${vars.diff}" }
             },
             "timeout_secs": 60
           },
@@ -39,7 +39,7 @@
             "server": "blackbox",
             "tool": "bro_wait",
             "arguments": {
-              "task_id": "${vars.cheap_handle.taskId}",
+              "task_id": "${vars.cheap_handle.task_id}",
               "timeout_seconds": 60
             },
             "timeout_secs": 70
@@ -60,7 +60,7 @@
     },
     "Escalate": {
       "actor": "placeholder",
-      "prompt": "Escalating to expensive agent. Cheap agent output was unsuitable.",
+      "prompt": "Escalating to code-reviewer. Diff-narrator output was unsuitable.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -68,11 +68,8 @@
             "server": "blackbox",
             "tool": "bro_agent_dispatch",
             "arguments": {
-              "agent": "expensive-agent",
-              "args": {
-                "prompt": "${vars.prompt}",
-                "context": "Cheap agent result: ${vars.cheap_output.result}"
-              }
+              "agent": "code-reviewer",
+              "args": { "diff": "${vars.diff}" }
             },
             "timeout_secs": 120
           },
@@ -84,7 +81,7 @@
     },
     "Done": {
       "actor": "placeholder",
-      "prompt": "Cheap agent output was sufficient. Result: ${vars.cheap_output.result}",
+      "prompt": "Diff-narrator output was sufficient. Result: ${vars.cheap_output.result}",
       "next": { "type": "terminal" }
     }
   }

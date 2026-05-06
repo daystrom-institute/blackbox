@@ -12122,6 +12122,158 @@ mod tests {
         assert_eq!(body["task_id"], "test-task-456");
     }
 
+    #[tokio::test]
+    async fn bro_agent_dispatch_handle_shape_reference_agent_noop_adapter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let mut diff_narrator: serde_json::Value = serde_json::from_str(
+            include_str!("../examples/agents/diff-narrator.json"),
+        )
+        .unwrap();
+        diff_narrator["manifest"]["dispatch_adapter"] = serde_json::json!("noop-ref");
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "diff-narrator-ref.json".into(),
+            &diff_narrator,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        struct RefNoopAdapter;
+        impl orchestration::agents::adapter::AgentDispatchAdapter for RefNoopAdapter {
+            fn name(&self) -> &'static str {
+                "noop-ref"
+            }
+            fn dispatch(
+                &self,
+                manifest: &orchestration::agents::types::AgentManifest,
+                _args: serde_json::Value,
+                ctx: orchestration::agents::adapter::DispatchContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                orchestration::agents::adapter::AgentDispatchResult,
+                                orchestration::agents::adapter::AgentDispatchError,
+                            >,
+                        > + Send,
+                >,
+            > {
+                let description = manifest.description.clone();
+                Box::pin(async move {
+                    Ok(orchestration::agents::adapter::AgentDispatchResult {
+                        session: orchestration::agents::types::AgentSession {
+                            session_id: format!("ref-session-{description}"),
+                            provider: "stub-provider".into(),
+                            project_dir: ctx.project_dir.clone(),
+                            agent: orchestration::agents::types::AgentRef {
+                                name: "diff-narrator".into(),
+                                version: 1,
+                            },
+                            task_id: Some(format!("ref-task-{description}")),
+                        },
+                        resolved_brofile: Some("diff-narrator-inline-brofile".into()),
+                        merged_filters: orchestration::agents::types::MergedFilters {
+                            allow: vec!["mcp__blackbox__bbox_*".into()],
+                            disallow: vec![],
+                        },
+                        degraded: None,
+                    })
+                })
+            }
+        }
+        server
+            .state
+            .agent_adapter_registry
+            .write()
+            .register(std::sync::Arc::new(RefNoopAdapter));
+
+        let result = server
+            .bro_agent_dispatch(Parameters(AgentDispatchParams {
+                agent: "diff-narrator".into(),
+                args: serde_json::json!({"diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new"}),
+                project_dir: Some("/tmp/test".into()),
+                bro: None,
+                ambient: None,
+            }))
+            .await;
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "bro_agent_dispatch should succeed: {}",
+            extract_text(&result)
+        );
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+
+        // Verify handle shape — every field the agent-system.md §5.3 contract requires
+        assert!(
+            body["session"].is_object(),
+            "should have session object"
+        );
+        assert!(
+            body["session"]["session_id"].is_string(),
+            "session.session_id must be a string"
+        );
+        assert!(
+            !body["session"]["session_id"].as_str().unwrap().is_empty(),
+            "session_id must be non-empty"
+        );
+        assert_eq!(
+            body["session"]["provider"], "stub-provider",
+            "session.provider should match adapter output"
+        );
+        assert_eq!(
+            body["session"]["project_dir"], "/tmp/test",
+            "session.project_dir should echo DispatchContext"
+        );
+        assert!(
+            body["session"]["agent"].is_object(),
+            "session.agent must be an object"
+        );
+        assert_eq!(
+            body["session"]["agent"]["name"], "diff-narrator",
+            "agent.name should be diff-narrator"
+        );
+        assert_eq!(
+            body["session"]["agent"]["version"], 1,
+            "agent.version should be 1"
+        );
+        assert!(
+            body["session"]["task_id"].is_string(),
+            "session.task_id must be a string"
+        );
+        assert!(
+            !body["session"]["task_id"].as_str().unwrap().is_empty(),
+            "session.task_id must be non-empty"
+        );
+        assert!(
+            body["task_id"].is_string(),
+            "top-level task_id must be a string"
+        );
+        assert!(
+            !body["task_id"].as_str().unwrap().is_empty(),
+            "top-level task_id must be non-empty"
+        );
+        assert_eq!(
+            body["task_id"], body["session"]["task_id"],
+            "top-level task_id should match session.task_id"
+        );
+        assert!(
+            body["resolved_brofile"].is_string(),
+            "resolved_brofile should be present"
+        );
+        assert!(
+            body["merged_filters"].is_object(),
+            "merged_filters should be an object"
+        );
+        assert!(
+            body["degraded"].is_null(),
+            "degraded should be null for successful dispatch"
+        );
+    }
+
     #[test]
     fn bro_agent_dispatch_unparseable_manifest_error() {
         let tmp = tempfile::tempdir().unwrap();

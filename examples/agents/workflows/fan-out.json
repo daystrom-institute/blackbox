@@ -7,18 +7,18 @@
       "brofile": "probe-haiku"
     }
   },
-  "start": "FanOut",
+  "start": "DispatchBoth",
   "vars_schema": {
-    "prompt": { "kind": "string", "required": true },
+    "diff": { "kind": "string", "required": true },
     "left_handle": { "kind": "any" },
     "right_handle": { "kind": "any" },
     "left_output": { "kind": "any" },
     "right_output": { "kind": "any" }
   },
   "nodes": {
-    "FanOut": {
+    "DispatchBoth": {
       "actor": "placeholder",
-      "prompt": "Fan-out: dispatching left and right agents in parallel.",
+      "prompt": "Fan-out: dispatching diff-narrator and code-reviewer sequentially (engine on_enter hooks run in order); then waiting for both.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -26,8 +26,8 @@
             "server": "blackbox",
             "tool": "bro_agent_dispatch",
             "arguments": {
-              "agent": "left-agent",
-              "args": { "prompt": "${vars.prompt}" }
+              "agent": "diff-narrator",
+              "args": { "diff": "${vars.diff}" }
             },
             "timeout_secs": 120
           },
@@ -40,8 +40,8 @@
             "server": "blackbox",
             "tool": "bro_agent_dispatch",
             "arguments": {
-              "agent": "right-agent",
-              "args": { "prompt": "${vars.prompt}" }
+              "agent": "code-reviewer",
+              "args": { "diff": "${vars.diff}" }
             },
             "timeout_secs": 120
           },
@@ -49,15 +49,11 @@
           "on_failure": "warn"
         }
       ],
-      "next": {
-        "type": "fork",
-        "branches": ["WaitLeft", "WaitRight"],
-        "continue_to": "Aggregate"
-      }
+      "next": { "type": "goto", "to": "WaitBoth" }
     },
-    "WaitLeft": {
+    "WaitBoth": {
       "actor": "placeholder",
-      "prompt": "Waiting for left agent to complete.",
+      "prompt": "Waiting for both agents to complete.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -65,28 +61,21 @@
             "server": "blackbox",
             "tool": "bro_wait",
             "arguments": {
-              "task_id": "${vars.left_handle.taskId}",
+              "task_id": "${vars.left_handle.task_id}",
               "timeout_seconds": 120
             },
             "timeout_secs": 130
           },
           "into_var": "left_output",
           "on_failure": "warn"
-        }
-      ],
-      "next": { "type": "terminal" }
-    },
-    "WaitRight": {
-      "actor": "placeholder",
-      "prompt": "Waiting for right agent to complete.",
-      "on_enter": [
+        },
         {
           "op": "mcp_call",
           "args": {
             "server": "blackbox",
             "tool": "bro_wait",
             "arguments": {
-              "task_id": "${vars.right_handle.taskId}",
+              "task_id": "${vars.right_handle.task_id}",
               "timeout_seconds": 120
             },
             "timeout_secs": 130
@@ -95,12 +84,11 @@
           "on_failure": "warn"
         }
       ],
-      "next": { "type": "terminal" }
+      "next": { "type": "goto", "to": "Aggregate" }
     },
     "Aggregate": {
       "actor": "placeholder",
-      "wait_for": ["WaitLeft", "WaitRight"],
-      "prompt": "Fan-out aggregation. Synthesize both agent outputs into a balanced recommendation.\n\nLeft agent output:\n${vars.left_output.result}\n\nRight agent output:\n${vars.right_output.result}",
+      "prompt": "Fan-out aggregation. Synthesize both agent outputs into a balanced recommendation.\n\nDiff-narrator output:\n${vars.left_output.result}\n\nCode-reviewer output:\n${vars.right_output.result}",
       "next": { "type": "terminal" }
     }
   }

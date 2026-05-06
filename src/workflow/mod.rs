@@ -973,26 +973,103 @@ mod tests {
         assert_eq!(ops.len(), 2, "RunFirst should have 2 hooks: dispatch + wait");
         assert!(matches!(ops[0].op, super::ops::OpKind::McpCall));
         assert!(matches!(ops[1].op, super::ops::OpKind::McpCall));
+        let dispatch_args = ops[0].args.as_object().expect("dispatch args object");
+        assert_eq!(
+            dispatch_args.get("tool").and_then(|v| v.as_str()),
+            Some("bro_agent_dispatch")
+        );
+        let dispatch_arguments = dispatch_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("bro_agent_dispatch arguments");
+        assert_eq!(
+            dispatch_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("diff-narrator"),
+            "chain first agent should be diff-narrator"
+        );
         let wait_args = ops[1].args.as_object().expect("wait args object");
         assert_eq!(wait_args.get("tool").and_then(|v| v.as_str()), Some("bro_wait"));
+        let wait_arguments = wait_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("bro_wait arguments");
+        assert!(
+            wait_arguments.get("task_id").is_some(),
+            "bro_wait should use task_id (snake_case), not taskId"
+        );
+        let run_second = spec.nodes.get("RunSecond").expect("RunSecond node");
+        assert_eq!(run_second.on_enter.len(), 1, "RunSecond dispatches code-reviewer");
+        let r2_args = run_second.on_enter[0]
+            .args
+            .as_object()
+            .expect("RunSecond dispatch args");
+        let r2_arguments = r2_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("RunSecond dispatch arguments");
+        assert_eq!(
+            r2_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("code-reviewer"),
+            "chain second agent should be code-reviewer"
+        );
     }
 
     #[test]
-    fn agent_fan_out_uses_fork_and_wait_for() {
+    fn agent_fan_out_uses_sequential_dispatch_wait_aggregate() {
         let src = include_str!("../../examples/agents/workflows/fan-out.json");
         let spec = load_workflow(src).unwrap();
-        let fan_out = spec.nodes.get("FanOut").expect("FanOut node");
-        match &fan_out.next {
-            super::NodeTransition::Fork { branches, continue_to } => {
-                assert!(branches.contains(&"WaitLeft".to_string()));
-                assert!(branches.contains(&"WaitRight".to_string()));
-                assert_eq!(continue_to, "Aggregate");
-            }
-            other => panic!("FanOut next should be Fork, got: {other:?}"),
-        }
+        let dispatch_both = spec.nodes.get("DispatchBoth").expect("DispatchBoth node");
+        assert_eq!(
+            dispatch_both.on_enter.len(),
+            2,
+            "DispatchBoth should dispatch two agents"
+        );
+        let left_args = dispatch_both.on_enter[0]
+            .args
+            .as_object()
+            .expect("left dispatch args");
+        let left_arguments = left_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("left dispatch arguments");
+        assert_eq!(
+            left_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("diff-narrator"),
+            "fan-out left should be diff-narrator"
+        );
+        let right_args = dispatch_both.on_enter[1]
+            .args
+            .as_object()
+            .expect("right dispatch args");
+        let right_arguments = right_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("right dispatch arguments");
+        assert_eq!(
+            right_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("code-reviewer"),
+            "fan-out right should be code-reviewer"
+        );
+        let wait_both = spec.nodes.get("WaitBoth").expect("WaitBoth node");
+        assert_eq!(wait_both.on_enter.len(), 2, "WaitBoth should wait for two tasks");
+        let w1_args = wait_both.on_enter[0]
+            .args
+            .as_object()
+            .expect("wait args");
+        let w1_arguments = w1_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("wait arguments");
+        assert!(
+            w1_arguments.get("task_id").is_some(),
+            "bro_wait should use task_id (snake_case), not taskId"
+        );
         let agg = spec.nodes.get("Aggregate").expect("Aggregate node");
-        assert!(agg.wait_for.contains(&"WaitLeft".to_string()));
-        assert!(agg.wait_for.contains(&"WaitRight".to_string()));
+        assert!(
+            agg.prompt.as_deref().unwrap_or("").contains("left_output")
+                && agg.prompt.as_deref().unwrap_or("").contains("right_output"),
+            "Aggregate should reference both left_output and right_output"
+        );
     }
 
     #[test]
@@ -1003,6 +1080,31 @@ mod tests {
         assert!(cheap.gate.is_some(), "CheapAttempt should have a gate packet");
         assert_eq!(cheap.gate.as_deref(), Some("packet-escalation-judge"));
         assert_eq!(cheap.on_enter.len(), 2, "should have dispatch + wait hooks");
+        let dispatch_args = cheap.on_enter[0]
+            .args
+            .as_object()
+            .expect("dispatch args");
+        let dispatch_arguments = dispatch_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("dispatch arguments");
+        assert_eq!(
+            dispatch_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("diff-narrator"),
+            "escalation cheap agent should be diff-narrator"
+        );
+        let wait_args = cheap.on_enter[1]
+            .args
+            .as_object()
+            .expect("wait args");
+        let wait_arguments = wait_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("wait arguments");
+        assert!(
+            wait_arguments.get("task_id").is_some(),
+            "bro_wait should use task_id (snake_case), not taskId"
+        );
         match &cheap.next {
             super::NodeTransition::Branch { cases, default, .. } => {
                 assert!(cases.contains_key("escalate"));
@@ -1011,5 +1113,19 @@ mod tests {
             }
             other => panic!("CheapAttempt next should be Branch, got: {other:?}"),
         }
+        let escalate = spec.nodes.get("Escalate").expect("Escalate node");
+        let esc_args = escalate.on_enter[0]
+            .args
+            .as_object()
+            .expect("escalate dispatch args");
+        let esc_arguments = esc_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("escalate dispatch arguments");
+        assert_eq!(
+            esc_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("code-reviewer"),
+            "escalation expensive agent should be code-reviewer"
+        );
     }
 }

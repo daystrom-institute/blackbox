@@ -17,7 +17,7 @@
   "nodes": {
     "RunFirst": {
       "actor": "placeholder",
-      "prompt": "Chain: dispatching first agent, then waiting for completion.",
+      "prompt": "Chain: dispatching diff-narrator, then waiting for completion.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -25,8 +25,8 @@
             "server": "blackbox",
             "tool": "bro_agent_dispatch",
             "arguments": {
-              "agent": "first-agent",
-              "args": { "input": "${vars.input}" }
+              "agent": "diff-narrator",
+              "args": { "diff": "${vars.input}" }
             },
             "timeout_secs": 120
           },
@@ -39,7 +39,7 @@
             "server": "blackbox",
             "tool": "bro_wait",
             "arguments": {
-              "task_id": "${vars.first_handle.taskId}",
+              "task_id": "${vars.first_handle.task_id}",
               "timeout_seconds": 120
             },
             "timeout_secs": 130
@@ -52,7 +52,7 @@
     },
     "RunSecond": {
       "actor": "placeholder",
-      "prompt": "Chain: dispatching second agent with first agent's output.",
+      "prompt": "Chain: dispatching code-reviewer with diff-narrator output as context.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -60,8 +60,8 @@
             "server": "blackbox",
             "tool": "bro_agent_dispatch",
             "arguments": {
-              "agent": "second-agent",
-              "args": { "input": "${vars.first_output.result}" }
+              "agent": "code-reviewer",
+              "args": { "diff": "${vars.input}", "context_refs": ["${vars.first_output.result}"] }
             },
             "timeout_secs": 120
           },
