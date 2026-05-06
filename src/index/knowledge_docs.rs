@@ -48,7 +48,9 @@ pub(crate) fn build_knowledge_doc(
 }
 
 pub(crate) fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
-    entry.status == Status::Active
+    // Superseded entries remain searchable so history queries can find the
+    // original decision; H1 rerank should downweight them by status.
+    matches!(entry.status, Status::Active | Status::Superseded)
 }
 
 pub(crate) fn reindex_knowledge_store_standalone(
@@ -170,6 +172,39 @@ mod tests {
         assert_eq!(first_text(&doc, fields.doc_type), "knowledge");
         assert_eq!(first_text(&doc, fields.entity_id), "knowledge:abc12345");
         assert!(first_text(&doc, fields.content).contains("bbox_render"));
+    }
+
+    #[test]
+    fn superseded_knowledge_entries_remain_indexable() {
+        let mut entry = KnowledgeEntry {
+            id: "abc12345".into(),
+            title: "Original decision".into(),
+            content: "first decision about postgres consolidation".into(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Decision,
+            scope: Scope::Global,
+            project: None,
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Superseded,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            rationale: Some("fixture".into()),
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-05-05T17:30:00Z".into(),
+            updated_at: "2026-05-05T17:30:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        assert!(indexable_knowledge_entry(&entry));
+        entry.status = Status::Deleted;
+        assert!(!indexable_knowledge_entry(&entry));
     }
 
     fn first_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
