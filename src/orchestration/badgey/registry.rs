@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::orchestration::providers::Provider;
 
+use super::queue::{PendingTurn, QueueError, QueueStatus, ResumeQueue};
 use super::types::{now_rfc3339, BadgeyId, BadgeyScope};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +55,7 @@ pub enum RegistryError {
     NotFound { id: BadgeyId },
     AlreadyExists { id: BadgeyId },
     Dismissed { id: BadgeyId },
+    QueueRejected { id: BadgeyId, err: QueueError },
 }
 
 impl std::fmt::Display for RegistryError {
@@ -61,6 +64,7 @@ impl std::fmt::Display for RegistryError {
             Self::NotFound { id } => write!(f, "badgey instance not found: {id}"),
             Self::AlreadyExists { id } => write!(f, "badgey instance already exists: {id}"),
             Self::Dismissed { id } => write!(f, "badgey instance dismissed: {id}"),
+            Self::QueueRejected { id, err } => write!(f, "badgey instance {id}: {err}"),
         }
     }
 }
@@ -70,6 +74,7 @@ impl std::error::Error for RegistryError {}
 #[derive(Default)]
 pub struct BadgeyRegistry {
     instances: RwLock<HashMap<BadgeyId, BadgeyInstance>>,
+    queues: RwLock<HashMap<BadgeyId, Arc<ResumeQueue>>>,
 }
 
 impl BadgeyRegistry {
@@ -84,7 +89,12 @@ impl BadgeyRegistry {
                 id: instance.id.clone(),
             });
         }
-        instances.insert(instance.id.clone(), instance);
+        let id = instance.id.clone();
+        instances.insert(id.clone(), instance);
+        self.queues
+            .write()
+            .entry(id)
+            .or_insert_with(|| Arc::new(ResumeQueue::default()));
         Ok(())
     }
 
@@ -119,23 +129,9 @@ impl BadgeyRegistry {
         let now = now_rfc3339();
         instance.dismissed_at = Some(now.clone());
         instance.updated_at = now;
-        Ok(instance.clone())
-    }
-
-    pub fn update_provider_session_id(
-        &self,
-        id: &BadgeyId,
-        observed_provider_session_id: String,
-    ) -> Result<BadgeyInstance, RegistryError> {
-        let mut instances = self.instances.write();
-        let instance = instances
-            .get_mut(id)
-            .ok_or_else(|| RegistryError::NotFound { id: id.clone() })?;
-        if instance.is_dismissed() {
-            return Err(RegistryError::Dismissed { id: id.clone() });
+        if let Some(queue) = self.queues.read().get(id) {
+            queue.close_and_clear();
         }
-        instance.provider_session_id = observed_provider_session_id;
-        instance.updated_at = now_rfc3339();
         Ok(instance.clone())
     }
 
@@ -143,6 +139,49 @@ impl BadgeyRegistry {
         let mut instances: Vec<_> = self.instances.read().values().cloned().collect();
         instances.sort_by(|a, b| a.id.cmp(&b.id));
         instances
+    }
+
+    pub fn enqueue_resume(
+        &self,
+        id: &BadgeyId,
+        turn: PendingTurn,
+    ) -> Result<usize, RegistryError> {
+        let queue = self.queue_for_active_instance(id)?;
+        queue
+            .enqueue(turn)
+            .map_err(|err| RegistryError::QueueRejected { id: id.clone(), err })
+    }
+
+    pub fn enqueue_priority_resume(
+        &self,
+        id: &BadgeyId,
+        turn: PendingTurn,
+    ) -> Result<usize, RegistryError> {
+        let queue = self.queue_for_active_instance(id)?;
+        queue
+            .enqueue_priority(turn)
+            .map_err(|err| RegistryError::QueueRejected { id: id.clone(), err })
+    }
+
+    pub fn pop_next_resume(&self, id: &BadgeyId) -> Result<Option<PendingTurn>, RegistryError> {
+        Ok(self.queue_for_active_instance(id)?.pop_next())
+    }
+
+    pub fn queue_status(&self, id: &BadgeyId) -> Result<QueueStatus, RegistryError> {
+        Ok(self.queue_for_existing_instance(id)?.status())
+    }
+
+    fn queue_for_active_instance(&self, id: &BadgeyId) -> Result<Arc<ResumeQueue>, RegistryError> {
+        self.get(id)?;
+        self.queue_for_existing_instance(id)
+    }
+
+    fn queue_for_existing_instance(&self, id: &BadgeyId) -> Result<Arc<ResumeQueue>, RegistryError> {
+        self.queues
+            .read()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| RegistryError::NotFound { id: id.clone() })
     }
 }
 
@@ -183,23 +222,56 @@ mod tests {
     }
 
     #[test]
-    fn updates_observed_provider_session_id() {
+    fn registry_queue_serializes_resumes_and_closes_on_dismiss() {
         let registry = BadgeyRegistry::new();
         let id = BadgeyId::from_str("bg-3f7a91c4-91ff04cc").unwrap();
-        let instance = BadgeyInstance::new(
-            id.clone(),
-            BadgeyScope {
-                project_id: "proj".to_string(),
-                initial_brief: None,
-            },
-            Provider::Gemini,
-            "pending".to_string(),
-            "thread-1".to_string(),
-        );
-        registry.register(instance).unwrap();
-        let updated = registry
-            .update_provider_session_id(&id, "gemini-session-1".to_string())
+        registry
+            .register(BadgeyInstance::new(
+                id.clone(),
+                BadgeyScope {
+                    project_id: "proj".to_string(),
+                    initial_brief: None,
+                },
+                Provider::Codex,
+                "session-1".to_string(),
+                "thread-1".to_string(),
+            ))
             .unwrap();
-        assert_eq!(updated.provider_session_id, "gemini-session-1");
+
+        registry
+            .enqueue_resume(
+                &id,
+                PendingTurn {
+                    turn_id: "turn-1".to_string(),
+                    prompt: "first".to_string(),
+                },
+            )
+            .unwrap();
+        registry
+            .enqueue_priority_resume(
+                &id,
+                PendingTurn {
+                    turn_id: "dismiss".to_string(),
+                    prompt: "dismiss".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(registry.queue_status(&id).unwrap().depth, 2);
+        assert_eq!(
+            registry.pop_next_resume(&id).unwrap().unwrap().turn_id,
+            "dismiss"
+        );
+        registry.dismiss(&id).unwrap();
+        assert!(matches!(
+            registry.enqueue_resume(
+                &id,
+                PendingTurn {
+                    turn_id: "turn-2".to_string(),
+                    prompt: "second".to_string(),
+                },
+            ),
+            Err(RegistryError::Dismissed { .. })
+        ));
+        assert!(registry.queue_status(&id).unwrap().closed);
     }
 }
