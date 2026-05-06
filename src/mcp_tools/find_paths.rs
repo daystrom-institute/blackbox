@@ -202,7 +202,7 @@ pub(crate) fn render_path(ctx: &ProviderContext<'_>, path: &CachedPath) -> Strin
 }
 
 pub(crate) fn render_node(ctx: &ProviderContext<'_>, r: &EntityRef) -> String {
-    match compact_label(ctx, r) {
+    match compact_label(ctx, r, None) {
         Some(label) => format!("{r} ({label})"),
         None => r.to_string(),
     }

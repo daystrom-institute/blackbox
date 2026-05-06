@@ -240,16 +240,20 @@ fn render_edges(ctx: &ProviderContext<'_>, edges: &[Edge], direction: &str) -> V
         .map(|edge| RenderedEdge {
             kind: edge.kind.clone(),
             source: edge.source.to_string(),
-            source_label: compact_label(ctx, &edge.source),
+            source_label: compact_label(ctx, &edge.source, None),
             target: edge.target.to_string(),
-            target_label: compact_label(ctx, &edge.target),
+            target_label: compact_label(ctx, &edge.target, None),
             direction: direction.to_string(),
         })
         .collect()
 }
 
-pub(crate) fn compact_label(ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
-    providers::provider_for(r.entity_type()).compact_label(ctx, r)
+pub(crate) fn compact_label(
+    ctx: &ProviderContext<'_>,
+    r: &EntityRef,
+    loaded: Option<&BTreeMap<String, String>>,
+) -> Option<String> {
+    entity_loader::compact_label(ctx, r, loaded)
 }
 
 fn render_properties(entity: &EntityView, property_mode: PropertyMode) -> BTreeMap<String, String> {
