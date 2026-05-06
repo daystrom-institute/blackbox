@@ -210,67 +210,28 @@ pub struct NormalizedEvent {
     #[serde(rename = "type")]
     pub type_discrim: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_type: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_type: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub ts: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_ts: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub subtype: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_id: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reaction: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub item_ts: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub command_text: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_url: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_id: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub action_id: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub action_value: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub view_id: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub view_state_values: Option<Value>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub files: Vec<Value>,
 
     pub raw: Value,
@@ -308,25 +269,30 @@ pub struct EventHeaders {
 /// Normalize a raw Socket Mode envelope into the blackbox webhook shape.
 ///
 /// The `envelope_json` should be the complete JSON message received
-/// over the Socket Mode WebSocket. Returns `Some(NormalizedEvent)` on
-/// success, or `None` when the event should be dropped (self-loop).
+/// over the Socket Mode WebSocket.
+///
+/// Returns:
+///   `Ok(Some(event))` — valid event, should be forwarded to daemon
+///   `Ok(None)`        — self-loop, should be acked and dropped
+///   `Err(reason)`     — malformed envelope, should be acked-and-dropped
+///                       with a warning (missing envelope_id, missing/unknown type)
 pub fn normalize_envelope(
     envelope_json: &Value,
     identities: &SlackIdentities,
     self_user_id: &str,
     self_bot_id: &str,
     retry_attempt: u32,
-) -> Option<NormalizedEvent> {
+) -> Result<Option<NormalizedEvent>, String> {
     let envelope_id = envelope_json
         .get("envelope_id")
         .and_then(Value::as_str)
-        .unwrap_or("unknown")
+        .ok_or_else(|| "missing envelope_id".to_string())?
         .to_string();
 
     let sm_type = envelope_json
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or("events_api");
+        .ok_or_else(|| format!("missing type field in envelope {envelope_id}"))?;
 
     let payload = envelope_json.get("payload").cloned().unwrap_or(Value::Null);
     let _accepts_response = envelope_json
@@ -376,7 +342,7 @@ pub fn normalize_envelope(
 
             // Self-loop filter
             if is_self_loop(event.user.as_deref(), event.bot_id.as_deref(), self_user_id, self_bot_id) {
-                return None;
+                return Ok(None);
             }
         }
         "slash_commands" => {
@@ -391,7 +357,7 @@ pub fn normalize_envelope(
 
             // Self-loop filter (slash commands can't loop but be defensive)
             if is_self_loop(event.user.as_deref(), None, self_user_id, self_bot_id) {
-                return None;
+                return Ok(None);
             }
         }
         "interactive" => {
@@ -450,13 +416,11 @@ pub fn normalize_envelope(
 
             // Self-loop filter
             if is_self_loop(event.user.as_deref(), None, self_user_id, self_bot_id) {
-                return None;
+                return Ok(None);
             }
         }
-        _ => {
-            tracing::warn!("unknown Socket Mode type: {sm_type}");
-            // Still return the event with raw payload; the routing packet
-            // decides whether to ignore it.
+        other => {
+            return Err(format!("unknown Socket Mode type '{other}' in envelope {envelope_id}"));
         }
     }
 
@@ -477,7 +441,7 @@ pub fn normalize_envelope(
 
     event.meta.workspace_id = event.team_id.clone().unwrap_or_default();
 
-    Some(event)
+    Ok(Some(event))
 }
 
 impl NormalizedEvent {
@@ -531,7 +495,11 @@ impl NormalizedEvent {
     }
 }
 
-/// Map a Slack channel ID prefix to a human-readable type.
+/// Best-effort inference of channel type from ID prefix.
+/// Slack conventions: C=channel, G=group/private-channel, D=IM,
+/// M/E=mpim. Prefer `channel_type` from Events API payloads when
+/// available; this is a fallback for slash-commands and interactive
+/// payloads that don't carry explicit type information.
 fn channel_type_from_id(channel_id: &str) -> String {
     match channel_id.chars().next() {
         Some('C') => "channel".into(),
@@ -861,13 +829,20 @@ where
     S::Error: std::fmt::Display + Send + Sync + 'static,
 {
     // 2. Normalize (includes self-loop filter)
-    let Some(normalized) = normalize_envelope(
+    let normalized = match normalize_envelope(
         envelope_json, ctx.identities, ctx.self_user_id, ctx.self_bot_id, 0,
-    ) else {
-        // Self-loop: ack and drop silently
-        tracing::debug!(envelope_id = envelope_id, "self-loop event dropped");
-        ack_to_slack(ws_write, envelope_id).await?;
-        return Ok(true);
+    ) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            tracing::debug!(envelope_id = envelope_id, "self-loop event dropped");
+            ack_to_slack(ws_write, envelope_id).await?;
+            return Ok(true);
+        }
+        Err(e) => {
+            tracing::warn!(envelope_id = envelope_id, error = %e, "malformed envelope, ack-and-drop");
+            ack_to_slack(ws_write, envelope_id).await?;
+            return Ok(true);
+        }
     };
 
     // 3. POST to daemon with bounded retry
@@ -1002,6 +977,12 @@ async fn main() -> Result<()> {
         tracing::warn!("SLACK_APP_TOKEN does not start with 'xapp-'; Socket Mode may fail");
     }
     let _signing_secret = std::env::var(&args.signing_secret_env).ok();
+    if _signing_secret.is_none() || _signing_secret.as_deref() == Some("") {
+        tracing::info!("signing secret not set ({}); Events API signature verification inactive", args.signing_secret_env);
+    }
+    if args.health_port.is_some() {
+        tracing::warn!("--health-port is not yet implemented (v1 sidecar scope)");
+    }
 
     tracing::info!(
         "bro-slack configured: daemon={} webhook={} self_user={} self_bot={}",
@@ -1196,7 +1177,7 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.type_discrim, "events_api");
         assert_eq!(norm.event_type.as_deref(), Some("app_mention"));
         assert_eq!(norm.user.as_deref(), Some("Uhuman"));
@@ -1234,7 +1215,7 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.event_type.as_deref(), Some("reaction_added"));
         assert_eq!(norm.reaction.as_deref(), Some("white_check_mark"));
         assert_eq!(norm.item_ts.as_deref(), Some("123.500"));
@@ -1260,7 +1241,7 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0);
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok");
         assert!(norm.is_none(), "self-loop should drop bot's own message");
     }
 
@@ -1284,7 +1265,7 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0);
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok");
         assert!(norm.is_none(), "bot_message subtype with bot_id should be dropped");
     }
 
@@ -1308,7 +1289,7 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.files.len(), 1);
         assert_eq!(norm.files[0]["id"], "F01");
     }
@@ -1330,7 +1311,7 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.team_id.as_deref(), Some("TfromEvent"));
     }
 
@@ -1358,7 +1339,7 @@ mod tests {
             scopes: vec!["all".into()],
             email: None,
         });
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.type_discrim, "slash_commands");
         assert!(norm.event_type.is_none());
         assert_eq!(norm.command.as_deref(), Some("/bbox"));
@@ -1398,7 +1379,7 @@ mod tests {
             scopes: vec!["all".into()],
             email: None,
         });
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.type_discrim, "interactive");
         assert_eq!(norm.event_type.as_deref(), Some("block_actions"));
         assert_eq!(norm.action_id.as_deref(), Some("apply_proposal"));
@@ -1436,7 +1417,7 @@ mod tests {
             }
         });
         let ids = identities_fixture();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.event_type.as_deref(), Some("view_submission"));
         assert_eq!(norm.view_id.as_deref(), Some("V01"));
         let vsv = norm.view_state_values.as_ref().unwrap();
@@ -1459,7 +1440,7 @@ mod tests {
             }
         });
         let ids = identities_fixture();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.channel.as_deref(), Some("D01"));
         assert_eq!(norm.channel_type.as_deref(), Some("im"));
     }
@@ -1483,7 +1464,7 @@ mod tests {
             }
         });
         let ids = identities_fixture();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.meta.bbox_user, "alice");
         assert_eq!(norm.meta.bbox_scopes, vec!["all"]);
         assert!(norm.meta.bbox_can_dispatch);
@@ -1506,7 +1487,7 @@ mod tests {
             }
         });
         let ids = identities_fixture();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         assert_eq!(norm.meta.bbox_user, "bob");
         assert_eq!(norm.meta.bbox_scopes, vec!["read"]);
         assert!(!norm.meta.bbox_can_dispatch);
@@ -1575,7 +1556,7 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
         let serialized = serde_json::to_value(&norm).unwrap();
 
         // Top-level discriminators
@@ -1599,11 +1580,11 @@ mod tests {
         assert!(serialized["raw"].is_object());
         assert_eq!(serialized["raw"]["event"]["type"], "app_mention");
 
-        // Fields not present in this event should be absent
-        assert!(serialized.get("command").is_none());
-        assert!(serialized.get("action_id").is_none());
-        // files field is skipped when empty (Vec::is_empty)
-        assert!(serialized.get("files").is_none());
+        // Fields not present in this event should be null
+        assert!(serialized.get("command").and_then(Value::as_str).is_none());
+        assert!(serialized.get("action_id").and_then(Value::as_str).is_none());
+        // files is always emitted (empty array when no files)
+        assert_eq!(serialized["files"].as_array().unwrap().len(), 0);
     }
 
     // ── Channel type detection ──────────────────────────────────
@@ -1815,7 +1796,7 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0);
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok");
         assert!(norm.is_none());
     }
 
@@ -1830,6 +1811,45 @@ mod tests {
     }
 
     // ── Normalize passes retry_attempt into meta ────────────────
+
+    // ── Malformed envelope rejection ───────────────────────────
+
+    #[test]
+    fn test_normalize_missing_envelope_id_returns_error() {
+        let envelope = json!({
+            "type": "events_api",
+            "payload": { "event": { "type": "app_mention", "user": "Uhuman", "text": "hi", "ts": "1.0", "channel": "C01" } }
+        });
+        let ids = SlackIdentities::default();
+        let result = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing envelope_id"));
+    }
+
+    #[test]
+    fn test_normalize_missing_type_returns_error() {
+        let envelope = json!({
+            "envelope_id": "env-err",
+            "payload": { "event": { "type": "app_mention", "user": "Uhuman", "text": "hi", "ts": "1.0", "channel": "C01" } }
+        });
+        let ids = SlackIdentities::default();
+        let result = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing type"));
+    }
+
+    #[test]
+    fn test_normalize_unknown_type_returns_error() {
+        let envelope = json!({
+            "envelope_id": "env-err2",
+            "type": "bogus_type",
+            "payload": {}
+        });
+        let ids = SlackIdentities::default();
+        let result = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown Socket Mode type"));
+    }
 
     #[test]
     fn test_normalize_stamps_retry_attempt() {
@@ -1848,7 +1868,7 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 2).unwrap();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 2).expect("ok").expect("some");
         assert_eq!(norm.meta.retry_attempt, 2);
     }
 }

@@ -1,0 +1,53 @@
+{
+  "name": "slack-badgey-readonly",
+  "version": 1,
+  "vars_schema": {
+    "channel": { "kind": "string" },
+    "user": { "kind": "string" },
+    "thread_ts": { "kind": "string" },
+    "text": { "kind": "string" },
+    "response_url": { "kind": "string" },
+    "team_id": { "kind": "string" },
+    "bbox_user": { "kind": "string" }
+  },
+  "actors": {
+    "badgey": {
+      "kind": "executor",
+      "brofile": "badgey-slack",
+      "durable": true
+    }
+  },
+  "start": "Answer",
+  "nodes": {
+    "Answer": {
+      "actor": "badgey",
+      "prompt": "[scope]\nbright\nblackboard\n\nSlack user @${vars.bbox_user} (read-only / anonymous) asked in channel ${vars.channel}:\n\n${vars.text}\n\nYou have read-only access. Answer the query if it's informational (status, explain, inbox). If the user asks for a destructive action or dispatch, reply: \"Insufficient scope — your workspace admin can grant dispatch access via `~/.bro/slack-identities.json`. Use `/bbox status` or `/bbox inbox` for read-only commands.\" Use Slack-compatible mrkdwn.",
+      "next": { "type": "goto", "to": "PostReply" }
+    },
+    "PostReply": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/chat.postEphemeral",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel}",
+              "user": "${vars.user}",
+              "text": "${outputs.Answer}"
+            },
+            "expect_status": [200]
+          },
+          "into_var": "post_response",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

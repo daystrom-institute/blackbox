@@ -1,0 +1,54 @@
+{
+  "name": "slack-bbox-command",
+  "version": 1,
+  "vars_schema": {
+    "channel": { "kind": "string" },
+    "user": { "kind": "string" },
+    "command": { "kind": "string" },
+    "command_text": { "kind": "string" },
+    "response_url": { "kind": "string" },
+    "trigger_id": { "kind": "string" },
+    "team_id": { "kind": "string" },
+    "bbox_user": { "kind": "string" }
+  },
+  "actors": {
+    "badgey": {
+      "kind": "executor",
+      "brofile": "badgey-slack",
+      "durable": true
+    }
+  },
+  "start": "Dispatch",
+  "nodes": {
+    "Dispatch": {
+      "actor": "badgey",
+      "prompt": "[scope]\nbright\nblackboard\n\nSlack user @${vars.bbox_user} ran `/bbox ${vars.command_text}` in channel ${vars.channel}.\n\nYou have full dispatch access. Interpret the command text and take appropriate action:\n\n- `status [arc_id]` → report recent arcs or a specific one\n- `inbox` → summarize the user's bbox_inbox\n- `triage` → kick a badgey-triage workflow for ${vars.bbox_user}\n- `<free-text question>` → answer as badgey-ask\n- `cosession start` → guide the user through starting a cosession\n\nReply concisely as a Slack-threaded reply using mrkdwn.",
+      "next": { "type": "goto", "to": "PostReply" }
+    },
+    "PostReply": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/chat.postMessage",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel}",
+              "text": "${outputs.Dispatch}",
+              "mrkdwn": true
+            },
+            "expect_status": [200]
+          },
+          "into_var": "post_response",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

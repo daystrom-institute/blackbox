@@ -1,0 +1,409 @@
+# bro-slack v1 — Slack sidecar bridge for blackbox
+
+End-to-end example of the Slack transport adapter pattern. The `bro-slack`
+binary owns the Socket Mode WebSocket connection; the daemon routes
+events through packets and workflows. The daemon never links a Slack crate.
+
+## Layout
+
+```
+examples/slack/
+├── webhooks/
+│   └── slack.json              # extractor + signature + routing packet ref (§6.5)
+├── packets/
+│   └── routing-slack.json      # webhook event → routing verdict (§7.2)
+├── workflows/
+│   ├── slack-badgey-ask.json   # dispatch-capable app mention handler
+│   ├── slack-badgey-readonly.json # read-only mention / anonymous slash handler
+│   └── slack-bbox-command.json # /bbox slash command dispatch handler
+├── scripts/
+│   └── install.sh              # compile + install artifacts via /admin/* endpoints
+└── README.md                   # this file
+```
+
+## Prerequisites
+
+- `blackboxd` running (default `127.0.0.1:7264`)
+- `bro-slack` binary compiled (`cargo build --release --bin bro-slack`)
+- A Slack app with Socket Mode enabled and the following scopes granted:
+  - `connections:write` (app-level token for Socket Mode)
+  - `app_mentions:read`, `chat:write`, `commands`, `reactions:read`, `users:read`
+  - `channels:history` (or `groups:history` / `im:history` as needed)
+- Environment variables for the sidecar:
+  - `SLACK_APP_TOKEN` (xapp-1-*)
+  - `SLACK_SIGNING_SECRET` (optional for Events API; unused on Socket Mode path)
+- Environment variables for the daemon:
+  - `SLACK_BOT_TOKEN` (xoxb-*) for outbound `http_json` to `slack.com/api/*`
+- Optional: `BRO_SLACK_SHARED_SECRET` for HMAC on the sidecar→daemon hop (both processes)
+- `jq`, `curl`
+
+## Quick start
+
+### 1. Install artifacts into the daemon
+
+```sh
+cd examples/slack
+./scripts/install.sh
+```
+
+This compiles the routing packet, installs the three workflow specs,
+and installs the webhook spec. All are idempotent (re-run safe).
+
+### 2. Configure identities
+
+Create `~/.bro/slack-identities.json`:
+
+```jsonc
+{
+  "T01234567": {
+    "U01ABC": { "bbox_user": "alice", "scopes": ["all"] },
+    "U02DEF": { "bbox_user": "bob",   "scopes": ["read"] }
+  }
+}
+```
+
+Users with `"all"` scope can dispatch; `"read"` users get the read-only
+workflow. Unmapped users are `"anonymous"` with read-only access.
+
+### 3. Run the sidecar
+
+```sh
+bro-slack \
+  --self-user-id U0BOTUSR0 \
+  --self-bot-id  B0BOTBOT0 \
+  --log-level debug
+```
+
+The sidecar opens a Socket Mode connection and forwards normalized
+events to `http://127.0.0.1:7264/webhook/slack`.
+
+### 4. Interact in Slack
+
+- `@bot ask about project X` → badgey-ask (dispatch) or badgey-readonly (read-only)
+- `/bbox inbox` → inbox summary
+- `/bbox status [arc_id]` → arc status
+- React with `:white_check_mark:` on a bot-posted proposal → resumes the arc
+- Click "Apply" button on a Block Kit proposal → resumes the arc with `proposal_id`
+
+## Replay — iterate on routing rules without firing arcs
+
+The daemon provides `POST /webhook/:name/replay` for testing routing
+rules against synthetic payloads. Useful when iterating on the routing
+packet or debugging "why didn't my event route?"
+
+### App mention (dispatch-capable user)
+
+```sh
+curl -s -X POST http://127.0.0.1:7264/webhook/slack/replay \
+  -H 'Content-Type: application/json' \
+  -H 'X-Slack-Envelope-Id: replay-001' \
+  -d '{
+    "_meta": {
+      "source": "bro-slack",
+      "workspace_id": "T01",
+      "self_bot_id": "Bbot",
+      "self_user_id": "Ubot",
+      "received_at": "2026-05-05T12:34:56.789Z",
+      "envelope_id": "replay-001",
+      "retry_attempt": 0,
+      "bbox_user": "alice",
+      "bbox_scopes": ["all"],
+      "bbox_can_dispatch": true
+    },
+    "_headers": {
+      "x-slack-envelope-id": "replay-001"
+    },
+    "type": "events_api",
+    "event_type": "app_mention",
+    "team_id": "T01",
+    "channel": "C01",
+    "channel_type": "channel",
+    "user": "Ualice",
+    "ts": "1730816096.000300",
+    "thread_ts": "1730816060.000100",
+    "text": "<@Ubot> can you triage #ops",
+    "subtype": null,
+    "bot_id": null,
+    "reaction": null,
+    "item_ts": null,
+    "command": null,
+    "command_text": null,
+    "response_url": null,
+    "trigger_id": null,
+    "action_id": null,
+    "action_value": null,
+    "view_id": null,
+    "view_state_values": null,
+    "files": [],
+    "raw": {
+      "event": {
+        "type": "app_mention",
+        "user": "Ualice",
+        "text": "<@Ubot> can you triage #ops",
+        "ts": "1730816096.000300",
+        "thread_ts": "1730816060.000100",
+        "channel": "C01"
+      }
+    }
+  }' | jq
+```
+
+Expect: `verdict_classification: "start_arc"`, `workflow: "slack-badgey-ask"`.
+
+### App mention (anonymous / read-only user)
+
+```sh
+curl -s -X POST http://127.0.0.1:7264/webhook/slack/replay \
+  -H 'Content-Type: application/json' \
+  -H 'X-Slack-Envelope-Id: replay-002' \
+  -d '{
+    "_meta": {
+      "source": "bro-slack",
+      "workspace_id": "T01",
+      "self_bot_id": "Bbot",
+      "self_user_id": "Ubot",
+      "received_at": "2026-05-05T12:34:56.789Z",
+      "envelope_id": "replay-002",
+      "retry_attempt": 0,
+      "bbox_user": "anonymous",
+      "bbox_scopes": ["read"],
+      "bbox_can_dispatch": false
+    },
+    "_headers": { "x-slack-envelope-id": "replay-002" },
+    "type": "events_api",
+    "event_type": "app_mention",
+    "team_id": "T01",
+    "channel": "C01",
+    "channel_type": "channel",
+    "user": "Uunknown",
+    "ts": "1730816096.000300",
+    "thread_ts": null,
+    "text": "<@Ubot> what is the project status?",
+    "subtype": null,
+    "bot_id": null,
+    "reaction": null,
+    "item_ts": null,
+    "command": null,
+    "command_text": null,
+    "response_url": null,
+    "trigger_id": null,
+    "action_id": null,
+    "action_value": null,
+    "view_id": null,
+    "view_state_values": null,
+    "files": [],
+    "raw": {
+      "event": {
+        "type": "app_mention",
+        "user": "Uunknown",
+        "text": "<@Ubot> what is the project status?",
+        "ts": "1730816096.000300",
+        "channel": "C01"
+      }
+    }
+  }' | jq
+```
+
+Expect: `verdict_classification: "start_arc"`, `workflow: "slack-badgey-readonly"`.
+
+### Reaction added (white_check_mark)
+
+```sh
+curl -s -X POST http://127.0.0.1:7264/webhook/slack/replay \
+  -H 'Content-Type: application/json' \
+  -H 'X-Slack-Envelope-Id: replay-003' \
+  -d '{
+    "_meta": {
+      "source": "bro-slack",
+      "workspace_id": "T01",
+      "self_bot_id": "Bbot",
+      "self_user_id": "Ubot",
+      "received_at": "2026-05-05T12:34:56.789Z",
+      "envelope_id": "replay-003",
+      "retry_attempt": 0,
+      "bbox_user": "alice",
+      "bbox_scopes": ["all"],
+      "bbox_can_dispatch": true
+    },
+    "_headers": { "x-slack-envelope-id": "replay-003" },
+    "type": "events_api",
+    "event_type": "reaction_added",
+    "team_id": "T01",
+    "channel": "C01",
+    "channel_type": "channel",
+    "user": "Ualice",
+    "ts": null,
+    "thread_ts": null,
+    "text": null,
+    "subtype": null,
+    "bot_id": null,
+    "reaction": "white_check_mark",
+    "item_ts": "1730816096.000300",
+    "command": null,
+    "command_text": null,
+    "response_url": null,
+    "trigger_id": null,
+    "action_id": null,
+    "action_value": null,
+    "view_id": null,
+    "view_state_values": null,
+    "files": [],
+    "raw": {
+      "event": {
+        "type": "reaction_added",
+        "user": "Ualice",
+        "reaction": "white_check_mark",
+        "item": { "channel": "C01", "ts": "1730816096.000300" }
+      }
+    }
+  }' | jq
+```
+
+Expect: `verdict_classification: "signal_arc"`, `signal: "proposal-approved"`.
+
+### Block Kit action (apply_proposal)
+
+```sh
+curl -s -X POST http://127.0.0.1:7264/webhook/slack/replay \
+  -H 'Content-Type: application/json' \
+  -H 'X-Slack-Envelope-Id: replay-004' \
+  -d '{
+    "_meta": {
+      "source": "bro-slack",
+      "workspace_id": "T01",
+      "self_bot_id": "Bbot",
+      "self_user_id": "Ubot",
+      "received_at": "2026-05-05T12:34:56.789Z",
+      "envelope_id": "replay-004",
+      "retry_attempt": 0,
+      "bbox_user": "alice",
+      "bbox_scopes": ["all"],
+      "bbox_can_dispatch": true
+    },
+    "_headers": { "x-slack-envelope-id": "replay-004" },
+    "type": "interactive",
+    "event_type": "block_actions",
+    "team_id": "T01",
+    "channel": "C01",
+    "channel_type": "channel",
+    "user": "Ualice",
+    "ts": null,
+    "thread_ts": null,
+    "text": null,
+    "subtype": null,
+    "bot_id": null,
+    "reaction": null,
+    "item_ts": null,
+    "command": null,
+    "command_text": null,
+    "response_url": null,
+    "trigger_id": "trig-7",
+    "action_id": "apply_proposal",
+    "action_value": "P-3",
+    "view_id": null,
+    "view_state_values": null,
+    "files": [],
+    "raw": {
+      "type": "block_actions",
+      "user": { "id": "Ualice" },
+      "channel": { "id": "C01" },
+      "team": { "id": "T01" },
+      "actions": [{ "action_id": "apply_proposal", "value": "P-3" }]
+    }
+  }' | jq
+```
+
+Expect: `verdict_classification: "signal_arc"`, `signal: "proposal-applied"`.
+
+### Self-loop / bot message (should be ignored)
+
+```sh
+curl -s -X POST http://127.0.0.1:7264/webhook/slack/replay \
+  -H 'Content-Type: application/json' \
+  -H 'X-Slack-Envelope-Id: replay-005' \
+  -d '{
+    "_meta": {
+      "source": "bro-slack",
+      "workspace_id": "T01",
+      "self_bot_id": "Bbot",
+      "self_user_id": "Ubot",
+      "received_at": "2026-05-05T12:34:56.789Z",
+      "envelope_id": "replay-005",
+      "retry_attempt": 0,
+      "bbox_user": "anonymous",
+      "bbox_scopes": ["read"],
+      "bbox_can_dispatch": false
+    },
+    "_headers": { "x-slack-envelope-id": "replay-005" },
+    "type": "events_api",
+    "event_type": "message",
+    "team_id": "T01",
+    "channel": "C01",
+    "channel_type": "channel",
+    "user": null,
+    "ts": "1730816096.000300",
+    "thread_ts": null,
+    "text": "bot reply here",
+    "subtype": "bot_message",
+    "bot_id": "Bbot",
+    "reaction": null,
+    "item_ts": null,
+    "command": null,
+    "command_text": null,
+    "response_url": null,
+    "trigger_id": null,
+    "action_id": null,
+    "action_value": null,
+    "view_id": null,
+    "view_state_values": null,
+    "files": [],
+    "raw": {
+      "event": {
+        "type": "message",
+        "subtype": "bot_message",
+        "bot_id": "Bbot",
+        "text": "bot reply here",
+        "ts": "1730816096.000300",
+        "channel": "C01"
+      }
+    }
+  }' | jq
+```
+
+Expect: `verdict_classification: "ignore"`.
+
+## Observability
+
+The daemon's generic webhook tools work for Slack the same as for any
+other webhook source:
+
+| Goal | Tool |
+|---|---|
+| Recent deliveries + routing verdicts | `bro_webhook_deliveries(name="slack")` |
+| Replay routing without dispatching | `bro_webhook_replay(name="slack", body=..., headers=...)` |
+| Active arcs from Slack | `bro_arc_status` |
+| Signal match/miss history | `bro_signals(signal=...)` |
+
+The sidecar logs to stderr in `tracing` JSON format. Cross-process
+correlation key is `envelope_id`.
+
+## Known limitations (v1)
+
+- **No persistent buffer.** Daemon down past 3-retry budget → events dropped.
+- **No start_arc idempotency.** Two app_mentions on the same thread before the
+  arc registers a Wait → duplicate arcs race.
+- **Reactions on mid-thread messages.** `item.ts != thread_ts` → correlation
+  misses. Only bot-posted parent messages can serve as reaction targets.
+- **No outbound 429 handling.** Workflow nodes that hit Slack rate limits fail
+  the node; no automatic retry-after-aware backoff.
+- **No modal flows or App Home.** v1.5 surface.
+
+## v1 boundary
+
+See `design/bro-slack.md` §15 for what bro-slack is **not**:
+- Not a Slack-specific daemon module (daemon links no Slack crate)
+- Not a workflow engine (no retry/state/correlation — just POSTs envelopes)
+- Not a router (routing lives in packets)
+- Not a token broker (each process reads its own env)
+- Not exposed as MCP tools (existing `bro_webhook_*` works for Slack)
+- Not an ingestion arc (file/channel indexing is Phase II)
