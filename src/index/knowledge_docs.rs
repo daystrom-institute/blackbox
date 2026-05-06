@@ -25,6 +25,9 @@ pub(crate) fn knowledge_chunk_hash(entry: &KnowledgeEntry) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Build a tantivy document for a knowledge entry. `account` and `role` fields
+/// are transcript-only; queries scoped by account/role return only transcript
+/// hits, not knowledge entries.
 pub(crate) fn build_knowledge_doc(
     entry: &KnowledgeEntry,
     knowledge_path: &Path,
@@ -36,8 +39,6 @@ pub(crate) fn build_knowledge_doc(
     doc.add_text(f.entity_id, knowledge_entity_id(&entry.id));
     doc.add_text(f.chunk_hash, knowledge_chunk_hash(entry));
     doc.add_text(f.chunk_kind, "knowledge_entry");
-    doc.add_text(f.account, "knowledge");
-    doc.add_text(f.role, "knowledge");
     doc.add_text(f.file_path, knowledge_path.to_string_lossy());
     doc.add_text(f.timestamp, &entry.updated_at);
     if let Some(project) = &entry.project {
@@ -171,6 +172,8 @@ mod tests {
 
         assert_eq!(first_text(&doc, fields.doc_type), "knowledge");
         assert_eq!(first_text(&doc, fields.entity_id), "knowledge:abc12345");
+        assert_eq!(first_text(&doc, fields.account), "");
+        assert_eq!(first_text(&doc, fields.role), "");
         assert!(first_text(&doc, fields.content).contains("bbox_render"));
     }
 
