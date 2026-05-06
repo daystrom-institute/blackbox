@@ -851,7 +851,9 @@ impl BlackboxServer {
         match (|| {
             let warning = self.arc_bound_warning(p.id.as_deref(), &p.content);
             let result = self.state.kb.write().learn_result(&p, false)?;
-            self.sync_knowledge_entry_to_index(&result.id)?;
+            if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
+            }
             Ok::<_, anyhow::Error>((result, warning))
         })() {
             Ok((result, warning)) => {
@@ -902,7 +904,9 @@ impl BlackboxServer {
     fn bbox_remember(&self, Parameters(p): Parameters<RememberParams>) -> CallToolResult {
         Self::run("bbox_remember", || {
             let result = self.state.kb.write().remember_result(&p, false)?;
-            self.sync_knowledge_entry_to_index(&result.id)?;
+            if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
+            }
             Ok(result.message)
         })
     }
@@ -914,7 +918,9 @@ impl BlackboxServer {
     fn bbox_decide(&self, Parameters(p): Parameters<DecideParams>) -> CallToolResult {
         Self::run("bbox_decide", || {
             let result = self.state.kb.write().decide_result(&p, false)?;
-            self.sync_knowledge_entry_to_index(&result.id)?;
+            if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
+            }
             if let Some(old_id) = result.superseded.as_deref() {
                 self.tombstone_knowledge_entry_in_index(old_id)?;
             }
