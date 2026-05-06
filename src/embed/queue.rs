@@ -596,14 +596,17 @@ async fn schedule_retry_or_drop(
     }
 }
 
-// Voyage API caps: 128 docs/request and ~120k tokens/request. We pin the
-// per-batch document count to voyage's hard limit and cap bytes at 200 KB
-// (well under 120k tokens for typical text). The earlier 64/80KB defaults
-// were over-conservative — voyage's tier-1 plan allows 2000 RPM so a
-// single worker doing 128-doc batches sequentially uses < 5% of available
-// throughput.
+// Voyage API caps: 128 docs/request and ~120k tokens/request. The bytes
+// cap is the worst-case-token guard: voyage tokenizes raw text, and in the
+// pathological case (single-char tokens — backticks, hyphens, code-fence
+// boundaries dominate markdown chunks) the ratio is ~1 char / 1 token. So
+// to stay under 120k tokens we cap at ~100 KB of input. A previous
+// 200 KB cap accepted 16-doc batches at 168k tokens and ate voyage 400s.
+//
+// Document count is capped at voyage's hard 128 limit; the bytes guard
+// usually triggers first on dense text.
 const MAX_BATCH_DOCS: usize = 128;
-const MAX_BATCH_BYTES: usize = 200 * 1024;
+const MAX_BATCH_BYTES: usize = 100 * 1024;
 // Per-worker concurrency: we dispatch multiple full batches in parallel
 // before awaiting any of them. With 4 in-flight batches at ~1.5s each =
 // ~2.7 batches/sec/worker = ~21 RPM/worker. Across 6 routes that's well

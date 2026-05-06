@@ -177,6 +177,15 @@ fn try_background_reindex(
         }
         Err(e) => return Err(e.into()),
     };
+    // Disable background segment merges. Tantivy's default LogMergePolicy
+    // fires on every commit; with our 1.3 GB / 1.18M-doc corpus on a
+    // slow disk that read+wrote multi-GB during ingest and pinned 400+
+    // MB/s sustained for hours during the agentic-corpus backfill.
+    // Segment count is bounded by reindex tick cadence (every 120s adds
+    // at most one segment per active writer), so we trade some search
+    // overhead for predictable I/O. Manual `bbox_reindex(full=true)`
+    // can rebuild + compact when the operator wants.
+    writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
 
     // 3. Reload meta AFTER acquiring lock (another process may have committed)
     let mut meta = load_meta(&config.meta_path).unwrap_or_default();

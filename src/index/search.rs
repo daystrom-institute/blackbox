@@ -1375,6 +1375,14 @@ impl TranscriptIndex {
 
     pub fn build_index(&mut self, full: bool) -> Result<String> {
         let mut writer: IndexWriter = self.index.writer(100_000_000)?;
+        // For incremental rebuilds, disable background segment merges to
+        // avoid the disk-I/O thrash documented in thread-3e2a0cfa. For
+        // explicit full rebuilds (`bbox_reindex full=true`), allow the
+        // default LogMergePolicy so the operator's intentional re-build
+        // also compacts the segment count.
+        if !full {
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        }
 
         let mut meta: HashMap<String, FileMeta> = if !full {
             load_meta(&self.config.meta_path).unwrap_or_default()
