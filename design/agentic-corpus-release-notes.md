@@ -80,7 +80,10 @@ existing rebuild path.
 The `read_vector_status` hook writes vector metrics into `vars.vector_status`
 and the gate packet reads `vars.vector_status.max_deleted_ratio`. This is the
 closest current workflow-engine shape to the design's "Decide against
-deleted_ratio" intent. The shipped cron spec is an example inlet; cron
+deleted_ratio" intent. An integration test now verifies that node gates evaluate
+against the workflow context's flattened `vars` object, so the compaction
+packet can select the `compact` branch from vector-status metrics rather than
+falling through to `skip`. The shipped cron spec is an example inlet; cron
 installation remains through the existing cron admin/MCP surface, while the
 workflow and packets install through the artifact catalog.
 

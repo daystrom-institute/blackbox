@@ -8314,6 +8314,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embed_compaction_arc_gates_against_vector_status_vars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vector_store =
+            Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+        let _guard = vectors::install_test_global(vector_store.clone());
+        let route = "test-compaction-route";
+        for idx in 0..10 {
+            let theta = idx as f32 * 0.01;
+            vector_store
+                .upsert(
+                    route,
+                    &format!("entity-{idx}"),
+                    &format!("hash-{idx}"),
+                    vec![theta.cos(), theta.sin(), 0.0, 0.0],
+                )
+                .unwrap();
+        }
+        for idx in 0..4 {
+            vector_store
+                .delete(route, &format!("entity-{idx}"))
+                .unwrap();
+        }
+        let before = vector_store.metrics().remove(route).unwrap();
+        assert_eq!(before.active_count, 6);
+        assert_eq!(before.deleted_count, 4);
+        assert!(before.deleted_ratio > 0.3);
+
+        let server = test_server(&tmp);
+        let packet_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/embed/compaction-policy.json"
+        ))
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/embed/compaction-policy.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            packet_value,
+        )
+        .await
+        .unwrap();
+
+        let workflow_spec: workflow::Workflow = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/embed-compaction-arc.json"
+        ))
+        .unwrap();
+        let compiled = workflow::compile(workflow_spec).unwrap();
+        let result = workflow::run_workflow_with_initial_vars(
+            &server,
+            &compiled,
+            Some(tmp.path().to_string_lossy().into_owned()),
+            Some(20),
+            serde_json::Map::new(),
+        )
+        .await;
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.vars.get("rebuild_started"), Some(&Value::Bool(true)));
+        assert_eq!(result.vars.get("swapped"), Some(&Value::Bool(true)));
+        assert!(result
+            .events
+            .iter()
+            .any(
+                |event| event.get("kind").and_then(Value::as_str) == Some("gate_applied")
+                    && event
+                        .get("data")
+                        .and_then(|data| data.get("verdict"))
+                        .and_then(Value::as_str)
+                        == Some("compact")
+            ));
+        let after = vector_store.metrics().remove(route).unwrap();
+        assert_eq!(after.active_count, 6);
+        assert_eq!(after.deleted_count, 0);
+    }
+
+    #[tokio::test]
     async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);

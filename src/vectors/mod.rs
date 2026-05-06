@@ -23,11 +23,43 @@ const VECTOR_SCHEMA_VERSION: &str = "agentic-corpus-e3";
 
 static GLOBAL_STORE: OnceLock<Arc<VectorStore>> = OnceLock::new();
 
+#[cfg(test)]
+static TEST_GLOBAL_STORE: OnceLock<RwLock<Option<Arc<VectorStore>>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_global_store() -> &'static RwLock<Option<Arc<VectorStore>>> {
+    TEST_GLOBAL_STORE.get_or_init(|| RwLock::new(None))
+}
+
+#[cfg(test)]
+pub struct TestGlobalStoreGuard {
+    previous: Option<Arc<VectorStore>>,
+}
+
+#[cfg(test)]
+impl Drop for TestGlobalStoreGuard {
+    fn drop(&mut self) {
+        *test_global_store().write() = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+pub fn install_test_global(store: Arc<VectorStore>) -> TestGlobalStoreGuard {
+    let mut slot = test_global_store().write();
+    let previous = slot.replace(store);
+    TestGlobalStoreGuard { previous }
+}
+
 pub fn install_global(store: Arc<VectorStore>) {
     let _ = GLOBAL_STORE.set(store);
 }
 
 pub fn global() -> Arc<VectorStore> {
+    #[cfg(test)]
+    if let Some(store) = test_global_store().read().clone() {
+        return store;
+    }
+
     GLOBAL_STORE
         .get_or_init(|| {
             Arc::new(
