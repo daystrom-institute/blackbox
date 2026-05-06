@@ -22,6 +22,7 @@ pub(super) struct ProjectIndexStats {
     pub indexed_docs: u64,
     pub skipped: u64,
     pub emitted_edges: u64,
+    pub indexed_commits: u64,
     pub call_edges: u64,
     pub resolved_call_edges: u64,
 }
@@ -34,6 +35,16 @@ struct PendingProjectFile {
     chunks: Vec<Chunk>,
 }
 
+struct ProjectIndexContext<'a> {
+    f: FieldHandles,
+    writer: &'a mut IndexWriter,
+    meta: &'a mut HashMap<String, FileMeta>,
+    stats: &'a mut ProjectIndexStats,
+    edges_dir: &'a Path,
+    git_meta_dir: &'a Path,
+    force_git_full: bool,
+}
+
 pub(super) fn scan_registered_project_files(
     config: &ReindexConfig,
 ) -> Result<Vec<(String, u64, u64)>> {
@@ -41,6 +52,15 @@ pub(super) fn scan_registered_project_files(
     for project in ProjectRegistry::load_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
         scan_project_files(&root, &mut files)?;
+        if project.repo_id.is_some() {
+            if let Some(head) = crate::git::head_fingerprint(&root) {
+                files.push((
+                    super::git_history::git_source_key(&project.project_id),
+                    0,
+                    head,
+                ));
+            }
+        }
     }
     Ok(files)
 }
@@ -50,15 +70,26 @@ pub(super) fn index_registered_projects_standalone(
     f: FieldHandles,
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
+    force_git_full: bool,
 ) -> Result<ProjectIndexStats> {
     let mut stats = ProjectIndexStats::default();
     let edges_dir = crate::edge_index::edges_dir_from_projects_path(&config.projects_path);
+    let git_meta_dir = super::git_history::git_meta_dir_from_projects_path(&config.projects_path);
     for project in ProjectRegistry::load_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
         if !root.exists() {
             continue;
         }
-        index_project(&project, &root, f, writer, meta, &mut stats, &edges_dir)?;
+        let mut ctx = ProjectIndexContext {
+            f,
+            writer,
+            meta,
+            stats: &mut stats,
+            edges_dir: &edges_dir,
+            git_meta_dir: &git_meta_dir,
+            force_git_full,
+        };
+        index_project(&project, &root, &mut ctx)?;
     }
     Ok(stats)
 }
@@ -115,11 +146,7 @@ pub(crate) fn build_project_file_doc(
 fn index_project(
     project: &ProjectRecord,
     root: &Path,
-    f: FieldHandles,
-    writer: &mut IndexWriter,
-    meta: &mut HashMap<String, FileMeta>,
-    stats: &mut ProjectIndexStats,
-    edges_dir: &Path,
+    ctx: &mut ProjectIndexContext<'_>,
 ) -> Result<()> {
     let registry = chunker::default_registry();
     let commit_sha = crate::git::current_head(root);
@@ -128,12 +155,13 @@ fn index_project(
     let mut project_edges = Vec::new();
     scan_project_files(root, &mut files)?;
     for (path_str, mtime, size) in files {
-        if let Some(prev) = meta.get(path_str.as_str()) {
+        if let Some(prev) = ctx.meta.get(path_str.as_str()) {
             if prev.mtime == mtime && prev.size == size {
-                stats.skipped += 1;
+                ctx.stats.skipped += 1;
                 continue;
             }
-            writer.delete_term(Term::from_field_text(f.file_path, &path_str));
+            ctx.writer
+                .delete_term(Term::from_field_text(ctx.f.file_path, &path_str));
         }
 
         let path = PathBuf::from(&path_str);
@@ -145,7 +173,7 @@ fn index_project(
             }
         };
         if is_binary(&bytes) {
-            stats.skipped += 1;
+            ctx.stats.skipped += 1;
             continue;
         }
         let sniff_len = bytes.len().min(4096);
@@ -153,7 +181,7 @@ fn index_project(
             .iter()
             .find(|chunker| chunker.claims(&path, &bytes[..sniff_len]))
         else {
-            stats.skipped += 1;
+            ctx.stats.skipped += 1;
             continue;
         };
         let (chunks, edges) = format
@@ -163,7 +191,7 @@ fn index_project(
         let chunks = finalize_chunks(project, rel_path, chunks);
         let bounded_chunks = bound_chunks(&chunks);
         let edges = derive_edges(&bounded_chunks, edges);
-        stats.emitted_edges += edges.len() as u64;
+        ctx.stats.emitted_edges += edges.len() as u64;
         project_edges.extend(edges);
         pending.push(PendingProjectFile {
             path_str,
@@ -175,31 +203,53 @@ fn index_project(
     }
 
     let symbol_table = build_symbol_table(&pending);
+    let mut current_chunk_targets = HashMap::new();
     for file in pending {
-        let code_edges = derive_code_edges(&file.chunks, &symbol_table, stats);
-        stats.emitted_edges += code_edges.len() as u64;
+        let code_edges = derive_code_edges(&file.chunks, &symbol_table, ctx.stats);
+        ctx.stats.emitted_edges += code_edges.len() as u64;
         project_edges.extend(code_edges);
+        current_chunk_targets.extend(super::git_history::current_chunk_targets(&file.chunks));
         for chunk in file.chunks {
             let doc = build_project_file_doc(
                 &chunk,
                 project,
                 &file.absolute_path,
                 commit_sha.as_deref(),
-                f,
+                ctx.f,
             );
-            writer.add_document(doc)?;
-            stats.indexed_docs += 1;
+            ctx.writer.add_document(doc)?;
+            ctx.stats.indexed_docs += 1;
         }
-        meta.insert(
+        ctx.meta.insert(
             file.path_str,
             FileMeta {
                 mtime: file.mtime,
                 size: file.size,
             },
         );
-        stats.indexed_files += 1;
+        ctx.stats.indexed_files += 1;
     }
-    crate::edge_index::append_project_edges(edges_dir, &project.project_id, &project_edges)?;
+    crate::edge_index::append_project_edges(ctx.edges_dir, &project.project_id, &project_edges)?;
+    let mut git_ctx = super::git_history::GitIndexContext {
+        f: ctx.f,
+        writer: ctx.writer,
+        meta: ctx.meta,
+        edges_dir: ctx.edges_dir,
+        git_meta_dir: ctx.git_meta_dir,
+        force_full: ctx.force_git_full,
+    };
+    let git_stats = super::git_history::index_git_history_for_project(
+        project,
+        root,
+        &current_chunk_targets,
+        &mut git_ctx,
+    )?;
+    ctx.stats.indexed_commits += git_stats.indexed_commits;
+    ctx.stats.indexed_docs += git_stats.indexed_commits;
+    if git_stats.indexed_commits > 0 {
+        ctx.stats.indexed_files += 1;
+    }
+    ctx.stats.emitted_edges += git_stats.emitted_edges;
     Ok(())
 }
 

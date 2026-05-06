@@ -508,6 +508,7 @@ mod tests {
 }
 
 mod code_tokenizer;
+mod git_history;
 mod helpers;
 mod knowledge_docs;
 mod project_files;

@@ -1309,10 +1309,12 @@ impl TranscriptIndex {
             f,
             &mut writer,
             &mut meta,
+            full,
         )?;
         if project_stats.emitted_edges > 0 {
             tracing::debug!(
                 emitted_edges = project_stats.emitted_edges,
+                indexed_commits = project_stats.indexed_commits,
                 call_edges = project_stats.call_edges,
                 resolved_call_edges = project_stats.resolved_call_edges,
                 "manual reindex: accumulated project-file edges"
@@ -1382,6 +1384,8 @@ impl TranscriptIndex {
 
 #[cfg(test)]
 mod agentic_project_file_tests {
+    use std::process::Command;
+
     use super::*;
     use crate::projects::ProjectRegistry;
 
@@ -1497,5 +1501,73 @@ mod agentic_project_file_tests {
         assert!(hits.contains("durable"), "{hits}");
         assert!(hits.contains("zebra"), "{hits}");
         assert!(hits.contains("phrase"), "{hits}");
+    }
+
+    #[test]
+    fn registered_git_project_commit_messages_are_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        run_git(&repo, &["config", "user.email", "test@example.test"]);
+        std::fs::write(repo.join("README.md"), "one\n").unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "-m", "initial commit search fixture"]);
+        std::fs::write(repo.join("README.md"), "two\n").unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "second git message searchable by bbox search",
+            ],
+        );
+
+        let projects_path = dir.path().join("projects.json");
+        let mut projects = ProjectRegistry::open(&projects_path).unwrap();
+        projects.register_path(&repo).unwrap();
+        let mut index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            projects_path,
+            dir.path().join("knowledge.json"),
+        )
+        .unwrap();
+        index.build_index(false).unwrap();
+
+        let hits = index
+            .search(&SearchParams {
+                query: "\"second git message searchable\"".into(),
+                mode: Some("fulltext".into()),
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(5),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(hits.contains("**second**"), "{hits}");
+        assert!(hits.contains("**git**"), "{hits}");
+        assert!(hits.contains("**message**"), "{hits}");
+        assert!(hits.contains("**searchable**"), "{hits}");
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

@@ -17,3 +17,13 @@ pub(crate) fn tombstone_knowledge(entity_id: &str) {
         "embedding queue unavailable until E2; accepted tombstone stub"
     );
 }
+
+pub(crate) fn enqueue_git_message(entity_id: &str, chunk_hash: &str, message: &str) {
+    tracing::debug!(
+        route = "git_message",
+        entity_id,
+        chunk_hash,
+        bytes = message.len(),
+        "embedding queue unavailable until E2; accepted enqueue stub"
+    );
+}
