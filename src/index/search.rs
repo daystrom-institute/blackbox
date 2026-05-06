@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -1326,10 +1327,14 @@ impl TranscriptIndex {
         }
 
         let index_size = dir_size(self.config.meta_path.parent().unwrap_or(Path::new(".")));
+        let tool_call_edges = count_tool_call_edges(
+            &crate::edge_index::edges_dir_from_projects_path(&self.config.projects_path),
+        );
 
         format!(
             "Index documents: {total_docs}\n\
              Index size: {}\n\
+             Tool-call edges: {tool_call_edges}\n\
              Source files:\n\
              {}",
             human_bytes(index_size),
@@ -1503,6 +1508,24 @@ impl TranscriptIndex {
             })
             .unwrap_or_default()
     }
+}
+
+fn count_tool_call_edges(edges_dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(edges_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .filter_map(|path| fs::File::open(path).ok())
+        .flat_map(|file| std::io::BufReader::new(file).lines().map_while(Result::ok))
+        .filter(|line| {
+            serde_json::from_str::<crate::edge_index::Edge>(line)
+                .ok()
+                .is_some_and(|edge| matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE" | "RAN_BASH"))
+        })
+        .count() as u64
 }
 
 #[cfg(test)]
