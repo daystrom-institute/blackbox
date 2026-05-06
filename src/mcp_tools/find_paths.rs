@@ -67,17 +67,59 @@ pub fn find_paths(
         return Ok(bad_input("limit", "limit must be between 1 and 30"));
     }
     let edge_filter = parse_edge_filter(p.edge_types.as_ref());
-    let paths = bfs(
+    // Over-fetch so we can dedup terminal-file collisions and still return
+    // `limit` distinct files. Without this, queries terminating at chunked
+    // doc files (which have many chunks) return N near-identical paths
+    // pointing at successive chunks of the same file, starving the agent
+    // of breadth across other files reachable in the same step budget.
+    let raw_limit = limit.saturating_mul(8).max(20);
+    let raw = bfs(
         edge_index,
         from,
         to.as_ref(),
         to_type,
         edge_filter.as_ref(),
         max_depth,
-        limit,
+        raw_limit,
     );
-    let cached = cache.insert_paths(PROCESS_SESSION_KEY, paths);
+    let collapsed = collapse_paths_by_terminal_file(raw, limit);
+    let cached = cache.insert_paths(PROCESS_SESSION_KEY, collapsed);
     Ok(render_response(ctx, &cached))
+}
+
+/// Collapses paths whose terminal step lands on a different chunk of the
+/// same project_file down to the first (BFS-order = shortest) path per
+/// file. Other terminal entity types (commits, sessions, knowledge) are
+/// passed through unchanged. Applied AFTER bfs so we still preserve the
+/// distinct intermediate paths the agent might want to compare.
+fn collapse_paths_by_terminal_file(paths: Vec<Vec<PathStep>>, limit: usize) -> Vec<Vec<PathStep>> {
+    let mut seen_files = HashSet::<String>::new();
+    let mut out = Vec::with_capacity(limit);
+    for path in paths {
+        if let Some(last) = path.last() {
+            if let Some(key) = path_terminal_file_key(&last.to) {
+                if !seen_files.insert(key) {
+                    continue;
+                }
+            }
+        }
+        out.push(path);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn path_terminal_file_key(entity: &EntityRef) -> Option<String> {
+    match entity {
+        EntityRef::ProjectFile {
+            project_id,
+            rel_path_hash,
+            ..
+        } => Some(format!("project_file:{project_id}:{rel_path_hash}")),
+        _ => None,
+    }
 }
 
 fn bfs(
