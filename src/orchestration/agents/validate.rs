@@ -226,6 +226,40 @@ fn lint_manifest<F: Fn(&str) -> bool>(
         }
     }
 
+    if let Some(composition) = &manifest.composition {
+        validate_composition(composition)?;
+    }
+
+    Ok(())
+}
+
+const FAN_OUT_AGGREGATOR_VARIANTS: &[&str] =
+    &["vote-majority", "ensemble-merge", "first-success"];
+
+fn validate_composition(
+    composition: &super::types::AgentComposition,
+) -> Result<(), ValidationError> {
+    for name in &composition.chainable_after {
+        if name.is_empty() {
+            return Err(ValidationError {
+                step: "lint_composition",
+                message: "composition.chainable_after contains an empty string".into(),
+            });
+        }
+    }
+
+    if let Some(ref aggregator) = composition.fan_out_aggregator {
+        if !FAN_OUT_AGGREGATOR_VARIANTS.contains(&aggregator.as_str()) {
+            return Err(ValidationError {
+                step: "lint_composition",
+                message: format!(
+                    "composition.fan_out_aggregator must be one of {:?}, got `{aggregator}`",
+                    FAN_OUT_AGGREGATOR_VARIANTS
+                ),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -750,5 +784,70 @@ mod tests {
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_filter_overlay");
         assert!(err.message.contains("-"));
+    }
+
+    #[test]
+    fn accepts_valid_composition() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["composition"] = serde_json::json!({
+            "chainable_after": ["analyzer"],
+            "parallel_safe": true,
+            "fan_out_aggregator": "vote-majority",
+        });
+        validate_agent_install(&v, &ctx).unwrap();
+    }
+
+    #[test]
+    fn accepts_empty_chainable_after() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["composition"] = serde_json::json!({
+            "chainable_after": [],
+            "parallel_safe": false,
+        });
+        validate_agent_install(&v, &ctx).unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_chainable_after_entry() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["composition"] = serde_json::json!({
+            "chainable_after": [""],
+        });
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "lint_composition");
+        assert!(err.message.contains("empty string"));
+    }
+
+    #[test]
+    fn rejects_invalid_fan_out_aggregator() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["composition"] = serde_json::json!({
+            "fan_out_aggregator": "invalid-mode",
+        });
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "lint_composition");
+        assert!(err.message.contains("fan_out_aggregator"));
+        assert!(err.message.contains("vote-majority"));
+    }
+
+    #[test]
+    fn accepts_all_valid_aggregator_variants() {
+        for variant in &["vote-majority", "ensemble-merge", "first-success"] {
+            let registry = AgentAdapterRegistry::new();
+            let ctx = make_ctx(&registry);
+            let mut v = minimal_valid_agent();
+            v["manifest"]["composition"] = serde_json::json!({
+                "fan_out_aggregator": variant,
+            });
+            validate_agent_install(&v, &ctx).unwrap();
+        }
     }
 }

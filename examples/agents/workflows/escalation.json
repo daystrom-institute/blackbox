@@ -1,0 +1,43 @@
+{
+  "name": "agent-escalation",
+  "version": 1,
+  "actors": {
+    "cheap": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    },
+    "expensive": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    }
+  },
+  "start": "CheapAttempt",
+  "nodes": {
+    "CheapAttempt": {
+      "actor": "cheap",
+      "prompt": "Answer the following question concisely. If you are not confident in your answer, start your response with 'UNCERTAIN:'.\n\n${initial_args.prompt}",
+      "next": {
+        "type": "branch",
+        "default": { "type": "terminal" },
+        "branches": [
+          {
+            "match": { "field": "output", "pattern": "^UNCERTAIN:" },
+            "then": { "type": "goto", "to": "Escalate" }
+          }
+        ]
+      }
+    },
+    "Escalate": {
+      "actor": "expensive",
+      "prompt": "A cheaper agent was uncertain about this question. Provide a thorough, confident answer.\n\nOriginal question: ${initial_args.prompt}\n\nCheaper agent's uncertain response: ${CheapAttempt.output}\n\nProvide a definitive answer. No preamble.",
+      "next": { "type": "terminal" }
+    }
+  },
+  "vars_schema": {
+    "type": "object",
+    "required": ["prompt"],
+    "properties": {
+      "prompt": { "type": "string" }
+    }
+  }
+}

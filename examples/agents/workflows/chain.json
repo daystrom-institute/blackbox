@@ -1,0 +1,34 @@
+{
+  "name": "agent-chain",
+  "version": 1,
+  "actors": {
+    "first": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    },
+    "second": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    }
+  },
+  "start": "First",
+  "nodes": {
+    "First": {
+      "actor": "first",
+      "prompt": "Analyze the following input and produce a structured summary. Input: ${initial_args.input}. Output exactly one paragraph summary, no preamble.",
+      "next": { "type": "goto", "to": "Second" }
+    },
+    "Second": {
+      "actor": "second",
+      "prompt": "Based on this summary, produce actionable recommendations.\n\nSummary: ${First.output}\n\nList exactly 3 recommendations, numbered. No preamble.",
+      "next": { "type": "terminal" }
+    }
+  },
+  "vars_schema": {
+    "type": "object",
+    "required": ["input"],
+    "properties": {
+      "input": { "type": "string" }
+    }
+  }
+}

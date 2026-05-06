@@ -1,0 +1,55 @@
+{
+  "name": "agent-fan-out",
+  "version": 1,
+  "actors": {
+    "coordinator": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    },
+    "left": {
+      "kind": "executor",
+      "brofile": "probe-haiku"
+    },
+    "right": {
+      "kind": "executor",
+      "brofile": "probe-haiku-b"
+    }
+  },
+  "start": "Setup",
+  "nodes": {
+    "Setup": {
+      "actor": "coordinator",
+      "prompt": "Output exactly this prompt, verbatim, no other text:\n\n'${initial_args.prompt}'",
+      "next": {
+        "type": "fork",
+        "branches": ["LeftBranch", "RightBranch"],
+        "continue_to": "Aggregate"
+      }
+    },
+    "LeftBranch": {
+      "actor": "left",
+      "prompt": "Answer the following from a conservative perspective, in exactly one sentence.\n\n${Setup.output}",
+      "mode": "fire_and_forget",
+      "next": { "type": "terminal" }
+    },
+    "RightBranch": {
+      "actor": "right",
+      "prompt": "Answer the following from a progressive perspective, in exactly one sentence.\n\n${Setup.output}",
+      "mode": "fire_and_forget",
+      "next": { "type": "terminal" }
+    },
+    "Aggregate": {
+      "actor": "coordinator",
+      "prompt": "Two perspectives were given on this prompt:\n\nPrompt: ${Setup.output}\n\nConservative: ${LeftBranch.output}\n\nProgressive: ${RightBranch.output}\n\nSynthesize both perspectives into one balanced recommendation. Exactly two sentences. No preamble.",
+      "wait_for": ["LeftBranch", "RightBranch"],
+      "next": { "type": "terminal" }
+    }
+  },
+  "vars_schema": {
+    "type": "object",
+    "required": ["prompt"],
+    "properties": {
+      "prompt": { "type": "string" }
+    }
+  }
+}
