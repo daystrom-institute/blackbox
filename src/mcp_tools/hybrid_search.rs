@@ -163,7 +163,7 @@ pub(crate) fn hybrid_search_typed(
     }
 
     let mut vector_status = HybridVectorStatus {
-        queues: embed_queue::status_response().routes,
+        queues: queue_status_for_hybrid(ctx, p.doc_type.as_deref()).routes,
         partitions: vectors::metrics(),
         searched_partitions: Vec::new(),
     };
@@ -463,6 +463,33 @@ fn diversify_by_chunk_kind(results: &mut [HybridResult], limit: usize) {
         if let Some(displace_idx) = displaceable {
             results.swap(displace_idx, promote_idx);
         }
+    }
+}
+
+fn queue_status_for_hybrid(
+    ctx: &ProviderContext<'_>,
+    doc_type: Option<&str>,
+) -> crate::embed::queue::EmbedStatusResponse {
+    let Some(state) = ctx.state() else {
+        return embed_queue::status_response();
+    };
+    let Some(buckets) = status_buckets_for_doc_type(doc_type) else {
+        return embed_queue::status_response();
+    };
+    embed_queue::status_response_for_buckets(state, &buckets).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "embedding coverage status failed; falling back to queue-local status");
+        embed_queue::status_response()
+    })
+}
+
+fn status_buckets_for_doc_type(doc_type: Option<&str>) -> Option<Vec<Bucket>> {
+    match doc_type?.trim() {
+        "knowledge" => Some(vec![Bucket::Knowledge]),
+        "thread" => Some(vec![Bucket::Threads]),
+        "note" => Some(vec![Bucket::Notes]),
+        "commit" => Some(vec![Bucket::GitMessage]),
+        "project_file" => Some(vec![Bucket::Code, Bucket::Docs]),
+        _ => None,
     }
 }
 

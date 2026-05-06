@@ -167,6 +167,10 @@ pub(crate) fn iter_active(
     global().iter_active(route, since)
 }
 
+pub(crate) fn active_entity_hashes(route: &str) -> Result<Vec<(String, String)>> {
+    global().active_entity_hashes(route)
+}
+
 pub(crate) fn cluster_neighbors_within_route(
     route: &str,
     similarity_threshold: f32,
@@ -300,6 +304,14 @@ impl VectorStore {
         };
         let entries = partition.read().active_entries_since(since);
         Ok(entries.into_iter())
+    }
+
+    pub(crate) fn active_entity_hashes(&self, route: &str) -> Result<Vec<(String, String)>> {
+        let Some(partition) = self.partitions.read().get(route).cloned() else {
+            return Ok(Vec::new());
+        };
+        let hashes = partition.read().active_entity_hashes();
+        Ok(hashes)
     }
 
     pub(crate) fn cluster_neighbors_within_route(
@@ -569,6 +581,13 @@ impl Partition {
                 vector: entry.vector.clone(),
                 upserted_at: entry.upserted_at.clone(),
             })
+            .collect()
+    }
+
+    fn active_entity_hashes(&self) -> Vec<(String, String)> {
+        self.slab
+            .active_entries()
+            .map(|entry| (entry.entity_id.clone(), entry.content_hash.clone()))
             .collect()
     }
 

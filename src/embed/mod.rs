@@ -4,7 +4,7 @@ pub mod ollama;
 pub mod queue;
 pub mod voyage;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -275,6 +275,25 @@ impl EmbeddingRouter {
             _ => None,
         }
     }
+
+    pub(crate) fn queue_and_vector_route(
+        &self,
+        bucket: Bucket,
+        project_id: Option<&str>,
+    ) -> Result<(String, String)> {
+        let route = self.route(bucket, project_id)?;
+        let default = self.route(bucket, None)?;
+        let queue_route = if project_id.is_some()
+            && (route.provider_id != default.provider_id
+                || route.model != default.model
+                || route.dimensions != default.dimensions)
+        {
+            format!("{}:{}", bucket.as_str(), project_id.unwrap_or_default())
+        } else {
+            bucket.as_str().to_string()
+        };
+        Ok((queue_route, route.vector_route_id()))
+    }
 }
 
 pub fn route_for(bucket: Bucket, project_id: Option<&str>) -> Result<Box<dyn EmbeddingProvider>> {
@@ -487,6 +506,230 @@ fn count_reembed_entities(state: &Arc<SharedState>, buckets: &[Bucket]) -> Resul
         Vec::new()
     };
     Ok(knowledge_count + note_count + agent_count + count_reembed_index_docs(buckets, &docs))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RouteCoverage {
+    pub source_count: u64,
+    pub indexed_count: u64,
+}
+
+pub(crate) fn route_coverage(
+    state: &SharedState,
+    buckets: &[Bucket],
+) -> Result<BTreeMap<String, RouteCoverage>> {
+    let router = EmbeddingRouter::load_default()?;
+    let mut coverage = BTreeMap::new();
+    let mut active_by_route = BTreeMap::new();
+    if buckets.contains(&Bucket::Knowledge) {
+        for entry in state.kb.read().all_entries() {
+            record_coverage(
+                &router,
+                &mut coverage,
+                &mut active_by_route,
+                Bucket::Knowledge,
+                None,
+                &crate::index::knowledge_entity_id(&entry.id),
+                &crate::index::knowledge_chunk_hash(entry),
+            )?;
+        }
+    }
+    if buckets.contains(&Bucket::Notes) {
+        for note in state.notes.read().all() {
+            record_coverage(
+                &router,
+                &mut coverage,
+                &mut active_by_route,
+                Bucket::Notes,
+                None,
+                &EntityRef::Note {
+                    note_id: note.id.clone(),
+                }
+                .to_string(),
+                &crate::embed_queue::note_chunk_hash(note),
+            )?;
+        }
+    }
+    if buckets.contains(&Bucket::Threads) {
+        for thread in state.threads.read().all() {
+            record_coverage(
+                &router,
+                &mut coverage,
+                &mut active_by_route,
+                Bucket::Threads,
+                None,
+                &EntityRef::Thread {
+                    thread_id: thread.id.clone(),
+                }
+                .to_string(),
+                &crate::embed_queue::thread_chunk_hash(thread),
+            )?;
+        }
+    }
+    if buckets.contains(&Bucket::AgentManifest) {
+        record_agent_manifest_coverage(state, &router, &mut coverage, &mut active_by_route)?;
+    }
+    let doc_types = reembed_index_doc_types(buckets);
+    if !doc_types.is_empty() {
+        let docs = state
+            .idx
+            .read()
+            .embedding_source_docs_for_doc_types(&doc_types, None)?;
+        for doc in docs {
+            record_index_doc_coverage(&router, &mut coverage, &mut active_by_route, buckets, &doc)?;
+        }
+    }
+    Ok(coverage)
+}
+
+fn record_agent_manifest_coverage(
+    state: &SharedState,
+    router: &EmbeddingRouter,
+    coverage: &mut BTreeMap<String, RouteCoverage>,
+    active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
+) -> Result<()> {
+    let catalog = state.artifacts.read();
+    let entries = catalog.list(&crate::artifacts::ArtifactListParams {
+        kind: Some(crate::artifacts::ArtifactKind::Agent),
+        name: None,
+        include_superseded: true,
+    })?;
+    for entry in entries {
+        let Some(value) =
+            catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
+        else {
+            continue;
+        };
+        let manifest_value = value.get("manifest").unwrap_or(&value);
+        let Ok(manifest) = serde_json::from_value::<
+            crate::orchestration::agents::types::AgentManifest,
+        >(manifest_value.clone()) else {
+            continue;
+        };
+        let Ok(version) = entry.version.parse::<u32>() else {
+            continue;
+        };
+        let agent = crate::orchestration::agents::types::AgentRef {
+            name: entry.name,
+            version,
+        };
+        for component in [
+            crate::embed_queue::AgentManifestComponent::Primary,
+            crate::embed_queue::AgentManifestComponent::WhenToUse,
+            crate::embed_queue::AgentManifestComponent::AntiPatterns,
+        ] {
+            let Some(chunk_hash) = crate::embed_queue::agent_component_hash(&manifest, component)
+            else {
+                continue;
+            };
+            record_coverage(
+                router,
+                coverage,
+                active_by_route,
+                Bucket::AgentManifest,
+                None,
+                &crate::embed_queue::agent_component_entity_id(&agent, component),
+                &chunk_hash,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn record_index_doc_coverage(
+    router: &EmbeddingRouter,
+    coverage: &mut BTreeMap<String, RouteCoverage>,
+    active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
+    buckets: &[Bucket],
+    doc: &EmbeddingSourceDoc,
+) -> Result<()> {
+    let Some(bucket) = reembed_index_doc_bucket(doc) else {
+        return Ok(());
+    };
+    if !buckets.contains(&bucket) {
+        return Ok(());
+    }
+    match bucket {
+        Bucket::Code | Bucket::Docs => {
+            let Some(chunk) = chunk_from_embedding_doc(doc) else {
+                return Ok(());
+            };
+            record_coverage(
+                router,
+                coverage,
+                active_by_route,
+                bucket,
+                Some(&chunk.project_id),
+                &crate::embed_queue::project_file_entity_id(&chunk),
+                &chunk.chunk_hash,
+            )
+        }
+        Bucket::Transcripts => {
+            let chunk_hash = doc
+                .chunk_hash
+                .clone()
+                .unwrap_or_else(|| crate::embed_queue::content_hash(&doc.content));
+            record_coverage(
+                router,
+                coverage,
+                active_by_route,
+                Bucket::Transcripts,
+                None,
+                &EntityRef::Transcript {
+                    provider: doc.account.clone(),
+                    session_id: doc.session_id.clone(),
+                    line_offset: doc.byte_offset,
+                    event_idx: 0,
+                }
+                .to_string(),
+                &chunk_hash,
+            )
+        }
+        Bucket::GitMessage => {
+            let (Some(entity_id), Some(chunk_hash)) = (&doc.entity_id, &doc.chunk_hash) else {
+                return Ok(());
+            };
+            record_coverage(
+                router,
+                coverage,
+                active_by_route,
+                Bucket::GitMessage,
+                None,
+                entity_id,
+                chunk_hash,
+            )
+        }
+        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => Ok(()),
+    }
+}
+
+fn record_coverage(
+    router: &EmbeddingRouter,
+    coverage: &mut BTreeMap<String, RouteCoverage>,
+    active_by_route: &mut BTreeMap<String, HashSet<(String, String)>>,
+    bucket: Bucket,
+    project_id: Option<&str>,
+    entity_id: &str,
+    chunk_hash: &str,
+) -> Result<()> {
+    let (queue_route, vector_route) = router.queue_and_vector_route(bucket, project_id)?;
+    let entry = coverage.entry(queue_route).or_default();
+    entry.source_count = entry.source_count.saturating_add(1);
+    if !active_by_route.contains_key(&vector_route) {
+        active_by_route.insert(
+            vector_route.clone(),
+            crate::vectors::active_entity_hashes(&vector_route)?
+                .into_iter()
+                .collect(),
+        );
+    }
+    if active_by_route
+        .get(&vector_route)
+        .is_some_and(|active| active.contains(&(entity_id.to_string(), chunk_hash.to_string())))
+    {
+        entry.indexed_count = entry.indexed_count.saturating_add(1);
+    }
+    Ok(())
 }
 
 fn enqueue_reembed_routes(

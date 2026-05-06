@@ -61,8 +61,40 @@ pub(crate) fn status_response() -> EmbedStatusResponse {
         })
 }
 
-pub(crate) fn status_json() -> Result<String> {
-    Ok(serde_json::to_string_pretty(&status_response())?)
+pub(crate) fn status_response_for_buckets(
+    state: &SharedState,
+    buckets: &[Bucket],
+) -> Result<EmbedStatusResponse> {
+    let mut response = status_response();
+    let coverage = crate::embed::route_coverage(state, buckets)?;
+    for (route, counts) in coverage {
+        let status = response.routes.entry(route).or_default();
+        status.session_indexed_count = Some(status.indexed_count);
+        status.indexed_count = counts.indexed_count;
+        status.source_count = Some(counts.source_count);
+        status.coverage_ratio = if counts.source_count == 0 {
+            None
+        } else {
+            Some(counts.indexed_count as f32 / counts.source_count as f32)
+        };
+    }
+    Ok(response)
+}
+
+pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
+    const STATUS_COVERAGE_BUCKETS: &[Bucket] = &[
+        Bucket::Knowledge,
+        Bucket::Code,
+        Bucket::Docs,
+        Bucket::GitMessage,
+        Bucket::Notes,
+        Bucket::Threads,
+        Bucket::AgentManifest,
+    ];
+    Ok(serde_json::to_string_pretty(&status_response_for_buckets(
+        state,
+        STATUS_COVERAGE_BUCKETS,
+    )?)?)
 }
 
 pub(crate) fn enqueue_knowledge(entry: &KnowledgeEntry, entity_id: &str, chunk_hash: &str) {
@@ -346,7 +378,7 @@ pub(crate) fn content_hash(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn note_chunk_hash(note: &Note) -> String {
+pub(crate) fn note_chunk_hash(note: &Note) -> String {
     let mut hasher = Sha256::new();
     hasher.update(note.id.as_bytes());
     hasher.update([0]);
@@ -375,7 +407,7 @@ fn note_text(note: &Note) -> String {
     fields.join("\n")
 }
 
-fn thread_chunk_hash(thread: &Thread) -> String {
+pub(crate) fn thread_chunk_hash(thread: &Thread) -> String {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, "thread-v1");
     hash_field(&mut hasher, &thread.id);

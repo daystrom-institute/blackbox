@@ -33,7 +33,9 @@ pub struct RouteStatus {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub dim: Option<usize>,
+    pub source_count: Option<u64>,
     pub indexed_count: u64,
+    pub session_indexed_count: Option<u64>,
     pub queue_depth: u64,
     pub retried_count: u64,
     pub last_error: Option<String>,
@@ -47,7 +49,9 @@ impl Default for RouteStatus {
             provider: None,
             model: None,
             dim: None,
+            source_count: None,
             indexed_count: 0,
+            session_indexed_count: None,
             queue_depth: 0,
             retried_count: 0,
             last_error: None,
@@ -229,24 +233,11 @@ impl EmbedQueueHandle {
                 vector_route: route,
             });
         };
-        let route = router.route(request.bucket, request.project_id.as_deref())?;
-        let default = router.route(request.bucket, None)?;
-        let queue_route = if request.project_id.is_some()
-            && (route.provider_id != default.provider_id
-                || route.model != default.model
-                || route.dimensions != default.dimensions)
-        {
-            format!(
-                "{}:{}",
-                request.bucket.as_str(),
-                request.project_id.as_deref().unwrap_or_default()
-            )
-        } else {
-            request.bucket.as_str().to_string()
-        };
+        let (queue_route, vector_route) =
+            router.queue_and_vector_route(request.bucket, request.project_id.as_deref())?;
         Ok(ResolvedRoute {
             queue_route,
-            vector_route: route.vector_route_id(),
+            vector_route,
         })
     }
 
