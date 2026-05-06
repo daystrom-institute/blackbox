@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::edge_index::{Edge, EdgeIndex};
-use crate::entity_loader;
 use crate::entity_ref::EntityRef;
-use crate::providers::{self, EntityView, Neighborhood, ProviderContext};
+use crate::entity_loader;
+use crate::providers::{self, EntityView, Neighborhood, NextHop, ProviderContext};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InspectEntityParams {
@@ -62,6 +62,20 @@ struct RenderedEdge {
     target: String,
     target_label: Option<String>,
     direction: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RenderedNextHop {
+    edge_family: String,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RenderedCoverage {
+    family: String,
+    count: usize,
+    expected: String,
+    status: String,
 }
 
 pub fn bad_input(entity_ref: &str, message: impl AsRef<str>) -> String {
@@ -131,7 +145,7 @@ pub fn inspect_entity(
     );
     let rendered_forward = render_edges(ctx, &entity.neighborhood.forward, "out");
     let rendered_reverse = render_edges(ctx, &entity.neighborhood.reverse, "in");
-    let recommended = provider.recommended_next_hops(&entity, &full_neighborhood);
+    let recommended = render_next_hops(provider.recommended_next_hops(&entity, &full_neighborhood));
     let coverage = provider
         .expected_edge_families(r)
         .into_iter()
@@ -142,16 +156,25 @@ pub fn inspect_entity(
                 .chain(full_neighborhood.reverse.iter())
                 .filter(|edge| edge.kind == expectation.family_name)
                 .count();
-            json!({
-                "family": expectation.family_name,
-                "count": count,
-                "expected": if expectation.required { "required" } else { "optional" },
-                "status": if count > 0 { "present" } else { "0 (expected)" },
-            })
+            RenderedCoverage {
+                family: expectation.family_name,
+                count,
+                expected: if expectation.required { "required" } else { "optional" }.into(),
+                status: if count > 0 { "present" } else { "0 (expected)" }.into(),
+            }
         })
         .collect::<Vec<_>>();
     let properties = render_properties(&entity, property_mode);
-    let text = render_text(&entity, &properties, &rendered_forward, &rendered_reverse);
+    let text = render_text(
+        ctx,
+        r,
+        &entity,
+        &properties,
+        &rendered_forward,
+        &rendered_reverse,
+        &recommended,
+        &coverage,
+    );
     Ok(serde_json::to_string_pretty(&json!({
         "status": "ok",
         "text": text,
@@ -162,10 +185,7 @@ pub fn inspect_entity(
             "out": rendered_forward,
             "in": rendered_reverse,
         },
-        "recommended_next_hops": recommended
-            .into_iter()
-            .map(|hop| json!({"edge_family": hop.edge_family_name, "count": hop.count}))
-            .collect::<Vec<_>>(),
+        "recommended_next_hops": recommended,
         "edge_family_coverage": coverage,
     }))?)
 }
@@ -256,6 +276,15 @@ pub(crate) fn compact_label(
     entity_loader::compact_label(ctx, r, loaded)
 }
 
+fn render_next_hops(hops: Vec<NextHop>) -> Vec<RenderedNextHop> {
+    hops.into_iter()
+        .map(|hop| RenderedNextHop {
+            edge_family: hop.edge_family_name,
+            count: hop.count,
+        })
+        .collect()
+}
+
 fn render_properties(entity: &EntityView, property_mode: PropertyMode) -> BTreeMap<String, String> {
     let summary_keys = ["name", "title", "status", "kind", "severity", "id"];
     entity
@@ -280,20 +309,73 @@ fn render_properties(entity: &EntityView, property_mode: PropertyMode) -> BTreeM
 }
 
 fn render_text(
+    ctx: &ProviderContext<'_>,
+    r: &EntityRef,
     entity: &EntityView,
     properties: &BTreeMap<String, String>,
     forward: &[RenderedEdge],
     reverse: &[RenderedEdge],
+    recommended: &[RenderedNextHop],
+    coverage: &[RenderedCoverage],
 ) -> String {
-    let mut text = format!("## {}\n\n", entity.ref_string);
+    let header =
+        compact_label(ctx, r, Some(&entity.properties)).unwrap_or_else(|| entity.ref_string.clone());
+    let mut text = format!("## {header}\n\n");
+    text.push_str(&format!(
+        "`{}` ({})\n\n",
+        entity.ref_string,
+        entity.entity_type.as_str()
+    ));
     text.push_str("### Properties\n");
     for (key, value) in properties {
         text.push_str(&format!("- `{key}`: {value}\n"));
     }
     text.push_str("\n### Edges\n");
-    text.push_str(&format!("- out: {}\n", forward.len()));
-    text.push_str(&format!("- in: {}\n", reverse.len()));
+    if forward.is_empty() && reverse.is_empty() {
+        text.push_str("  (no edges)\n");
+    } else {
+        for edge in forward {
+            text.push_str(&format!(
+                "  -->[{}] {}\n",
+                edge.kind,
+                labeled_ref(&edge.target, edge.target_label.as_deref())
+            ));
+        }
+        for edge in reverse {
+            text.push_str(&format!(
+                "  <--[{}] {}\n",
+                edge.kind,
+                labeled_ref(&edge.source, edge.source_label.as_deref())
+            ));
+        }
+    }
+    text.push_str("\n### Recommended next hops\n");
+    if recommended.is_empty() {
+        text.push_str("  (none)\n");
+    } else {
+        for hop in recommended {
+            text.push_str(&format!("  {} ({})\n", hop.edge_family, hop.count));
+        }
+    }
+    text.push_str("\n### Edge family coverage\n");
+    if coverage.is_empty() {
+        text.push_str("  (none)\n");
+    } else {
+        for row in coverage {
+            text.push_str(&format!(
+                "  {}: count={} expected={} status={}\n",
+                row.family, row.count, row.expected, row.status
+            ));
+        }
+    }
     text
+}
+
+fn labeled_ref(entity_ref: &str, label: Option<&str>) -> String {
+    match label {
+        Some(label) if label != entity_ref => format!("{entity_ref} ({label})"),
+        _ => entity_ref.to_string(),
+    }
 }
 
 pub fn entity_type_count(refs: &[EntityRef]) -> BTreeMap<String, usize> {
