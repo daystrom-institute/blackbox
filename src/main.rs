@@ -8673,6 +8673,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_install_wires_m5_auto_edge_artifacts_and_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let packet_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/auto-edge/vote-aggregate.json"
+        ))
+        .unwrap();
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/auto-edge-arc.json"
+        ))
+        .unwrap();
+        let brofiles: [(&str, Value); 6] = [
+            (
+                "describe-prose-signal",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/describe-prose-signal.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "describe-symbol-fit",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/describe-symbol-fit.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "describe-narrative-cohesion",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/describe-narrative-cohesion.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "reference-citation-precision",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/reference-citation-precision.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "reference-target-existence",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/reference-target-existence.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "reference-context-fit",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/reference-context-fit.json"
+                ))
+                .unwrap(),
+            ),
+        ];
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/auto-edge/vote-aggregate.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            packet_value,
+        )
+        .await
+        .unwrap();
+        for (name, value) in brofiles {
+            install_artifact_value(
+                &server.state,
+                ArtifactInstallParams {
+                    kind: artifacts::ArtifactKind::Brofile,
+                    source: format!("examples/agentic-corpus/brofiles/{name}.json"),
+                    name: None,
+                    version: None,
+                    supersedes: None,
+                },
+                value,
+            )
+            .await
+            .unwrap();
+            assert!(orchestration::brofile::resolve_brofile(
+                name,
+                &server.state.store_dir,
+                None
+            )
+            .is_some());
+        }
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/auto-edge-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("auto-edge-arc"));
+
+        let packet_store = server.state.packets.read();
+        let packet = packet_store
+            .load("domain:auto-edge/vote-aggregate")
+            .unwrap();
+        for cases in [
+            serde_json::from_str::<Value>(include_str!("../eval/audit/auto-edge/describes.json"))
+                .unwrap(),
+            serde_json::from_str::<Value>(include_str!(
+                "../eval/audit/auto-edge/references.json"
+            ))
+            .unwrap(),
+        ] {
+            let rows = cases.as_array().unwrap();
+            let mut matched = 0usize;
+            for case in rows {
+                let prediction = packets::apply_with(&packet, &case["entity"], &*packet_store)
+                    .unwrap_or_else(|| panic!("case {} produced no verdict", case["id"]));
+                if prediction.classification == case["expected"].as_str().unwrap() {
+                    matched += 1;
+                }
+            }
+            assert!(
+                matched >= 12,
+                "auto-edge audit fidelity {matched}/{} below gate",
+                rows.len()
+            );
+            assert_eq!(matched, rows.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn write_semantic_edge_projects_describes_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let edges_dir = tmp.path().join("edges");
+        let source = "project_file:proj1234:relhash:chunkhash:0";
+        let target = "symbol:proj1234:EntityRef:defnhash";
+        let ctx = workflow::context::ArcContext::new(workflow::context::ArcMeta {
+            arc_id: "arc-test".into(),
+            workflow_name: "auto-edge-arc".into(),
+            workflow_version: 1,
+            project_dir: Some(tmp.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        let hook = workflow::ops::HookOp {
+            op: workflow::ops::OpKind::WriteSemanticEdge,
+            args: json!({
+                "source": source,
+                "target": target,
+                "kind": "DESCRIBES",
+                "edges_dir": edges_dir,
+                "note": "synthetic doc-section describes EntityRef"
+            }),
+            when: None,
+            on_failure: workflow::ops::OnFailure::Halt,
+            into_var: Some("semantic_edge".into()),
+        };
+        workflow::ops::execute_op(&hook, &ctx, None).await.unwrap();
+        let edge_index = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+            index: &server.state.idx.read(),
+            knowledge: &server.state.kb.read(),
+            threads: &server.state.threads.read(),
+            notes: &server.state.notes.read(),
+            task_store: &server.state.task_store.read(),
+            edges_dir,
+        });
+        let source_ref = entity_ref::EntityRef::parse(source).unwrap();
+        let target_ref = entity_ref::EntityRef::parse(target).unwrap();
+        assert!(edge_index
+            .forward_edges(&source_ref)
+            .iter()
+            .any(|edge| edge.kind == "DESCRIBES" && edge.target == target_ref));
+    }
+
+    #[tokio::test]
     async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);

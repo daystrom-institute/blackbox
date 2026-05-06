@@ -151,6 +151,21 @@ outside the immediate supersession relation, bbox starts
 `bbox_note(kind=surprise)` so the unresolved contradiction surfaces in
 `bbox_inbox`.
 
+## M5
+
+`auto-edge-arc.json` installs the DESCRIBES / REFERENCES semantic edge review
+shape: three read-only classifier brofiles vote independently, the
+`auto-edge/vote-aggregate` packet maps the three votes to
+`write_edge | hold_for_review | reject`, and `write_semantic_edge` writes the
+reviewed edge.
+
+For v1, the scheduled candidate scan is observable-only and capped at 50; seed
+`vars.candidate` manually when running the arc for a specific candidate pair.
+`REFERENCES` edges append to `KnowledgeEntry.links`; `DESCRIBES` edges are
+written to the project EdgeIndex sidecar as explicit heuristic edges. Automatic
+nightly triggering is deferred; manual `bbox_orchestrate_run` is the supported
+test path.
+
 ## S3
 
 - Code chunking uses `tree-sitter-language-pack` with runtime downloads

@@ -1,0 +1,9 @@
+{
+  "name": "describe-symbol-fit",
+  "version": 1,
+  "provider": "claude",
+  "model": "sonnet-4.6",
+  "effort": "medium",
+  "disallow_tools": ["Edit", "Write", "Bash"],
+  "lens": "You classify DESCRIBES candidate edges. Lens: is the symbol the natural target of the prose claim, rather than a related-but-different symbol? Read only the supplied entity refs, labels, and excerpts. Output strict JSON only: {\"vote\":\"yes|no\",\"justification\":\"...\"}."
+}

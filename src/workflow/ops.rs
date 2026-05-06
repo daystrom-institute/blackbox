@@ -14,12 +14,16 @@
 //! runs. That stays with the gate packet at the node level. A misuse
 //! that would do that should be refactored into a node + gate.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+
+use crate::chunker::{EdgeConfidence, EdgeProvenance};
+use crate::entity_ref::EntityRef;
 
 use super::context::{resolve_arg_value, ArcContext, VarsSchema};
 
@@ -118,6 +122,12 @@ pub enum OpKind {
     ApplyEntry,
     /// Append an authored edge to `KnowledgeEntry.links` via bbox_knowledge_link.
     AppendKnowledgeLink,
+    /// Scan for semantic auto-edge candidate pairs.
+    ExtractCandidatePairs,
+    /// Aggregate three classifier votes into a compact gate entity.
+    AggregateAutoEdgeVotes,
+    /// Write a reviewed semantic edge (REFERENCES or DESCRIBES).
+    WriteSemanticEdge,
     /// Surface an auto-digest candidate for operator review.
     SurfaceToInbox,
     /// Record an auto-digest rejection.
@@ -186,6 +196,15 @@ pub async fn execute_op(
         }
         OpKind::AppendKnowledgeLink => {
             exec_append_knowledge_link(&rendered_args, hook.into_var.as_deref(), ctx).await
+        }
+        OpKind::ExtractCandidatePairs => {
+            exec_extract_candidate_pairs(&rendered_args, hook.into_var.as_deref())
+        }
+        OpKind::AggregateAutoEdgeVotes => {
+            exec_aggregate_auto_edge_votes(&rendered_args, hook.into_var.as_deref())
+        }
+        OpKind::WriteSemanticEdge => {
+            exec_write_semantic_edge(&rendered_args, hook.into_var.as_deref(), ctx).await
         }
         OpKind::SurfaceToInbox => exec_surface_to_inbox(&rendered_args, ctx).await,
         OpKind::LogReject => exec_log_reject(&rendered_args, ctx).await,
@@ -347,6 +366,136 @@ async fn exec_append_knowledge_link(
         key: into_var.unwrap_or("knowledge_link").to_string(),
         value: result,
     })
+}
+
+fn exec_extract_candidate_pairs(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50);
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("candidate_pairs").to_string(),
+        value: json!({
+            "limit": limit,
+            "candidates": [],
+            "degraded": {
+                "reason": "scheduled candidate scan is observable-only in v1; seed vars.candidate for manual runs"
+            }
+        }),
+    })
+}
+
+fn exec_aggregate_auto_edge_votes(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let votes = args
+        .get("votes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut gate = Map::new();
+    for idx in 0..3 {
+        let vote = votes
+            .get(idx)
+            .and_then(|value| value.get("vote"))
+            .and_then(Value::as_str)
+            .unwrap_or("no");
+        gate.insert(format!("vote{}", idx + 1), Value::String(vote.to_string()));
+    }
+    gate.insert("votes".into(), Value::Array(votes));
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("vote_aggregate").to_string(),
+        value: Value::Object(gate),
+    })
+}
+
+async fn exec_write_semantic_edge(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let source = required_str(args, "source")?;
+    let target = required_str(args, "target")?;
+    let kind = required_str(args, "kind")?;
+    let note = args.get("note").and_then(Value::as_str).unwrap_or("");
+    let source_ref = EntityRef::parse(source)?;
+    let target_ref = EntityRef::parse(target)?;
+    match kind {
+        "REFERENCES" => {
+            let result = call_blackbox_tool(
+                "bbox_knowledge_link",
+                json!({
+                    "source": source,
+                    "target": target,
+                    "kind": "REFERENCES",
+                    "note": note,
+                    "source_arc": ctx.meta.arc_id,
+                    "confidence": "heuristic"
+                }),
+                ctx,
+            )
+            .await?;
+            Ok(OpEffect::SetVar {
+                key: into_var.unwrap_or("semantic_edge").to_string(),
+                value: result,
+            })
+        }
+        "DESCRIBES" => {
+            let project_id = args
+                .get("project_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| project_id_from_ref(&source_ref))
+                .or_else(|| project_id_from_ref(&target_ref))
+                .ok_or_else(|| anyhow!("WriteSemanticEdge DESCRIBES requires a project_id-bearing ref"))?;
+            let mut metadata = BTreeMap::new();
+            metadata.insert("source_arc".to_string(), ctx.meta.arc_id.clone());
+            if !note.is_empty() {
+                metadata.insert("note".to_string(), note.to_string());
+            }
+            let edge = crate::edge_index::Edge {
+                source: source_ref,
+                kind: "DESCRIBES".to_string(),
+                target: target_ref,
+                provenance: EdgeProvenance::Explicit,
+                confidence: EdgeConfidence::Heuristic,
+                metadata,
+            };
+            let edges_dir = args
+                .get("edges_dir")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(default_edges_dir);
+            let written = crate::edge_index::append_edges_dedup(&edges_dir, &project_id, &[edge])?;
+            Ok(OpEffect::SetVar {
+                key: into_var.unwrap_or("semantic_edge").to_string(),
+                value: json!({
+                    "status": "ok",
+                    "kind": "DESCRIBES",
+                    "project_id": project_id,
+                    "written": written
+                }),
+            })
+        }
+        other => bail!("WriteSemanticEdge unsupported kind `{other}`"),
+    }
+}
+
+fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("WriteSemanticEdge requires args.{key}"))
+}
+
+fn project_id_from_ref(r: &EntityRef) -> Option<String> {
+    match r {
+        EntityRef::ProjectFile { project_id, .. } | EntityRef::Symbol { project_id, .. } => {
+            Some(project_id.clone())
+        }
+        _ => None,
+    }
+}
+
+fn default_edges_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| crate::util::blackbox_state_dir(&home).join("edges"))
+        .unwrap_or_else(|| PathBuf::from("edges"))
 }
 
 async fn exec_surface_to_inbox(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {

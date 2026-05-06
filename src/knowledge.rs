@@ -451,6 +451,8 @@ pub enum KnowledgeEdgeKind {
     DerivedFrom,
     #[serde(alias = "SUPERSEDES", alias = "Supersedes")]
     Supersedes,
+    #[serde(alias = "REFERENCES", alias = "References")]
+    References,
 }
 
 impl KnowledgeEdgeKind {
@@ -463,8 +465,9 @@ impl KnowledgeEdgeKind {
             "DependsOn" | "depends_on" | "DEPENDS_ON" => Ok(Self::DependsOn),
             "DerivedFrom" | "derived_from" | "DERIVED_FROM" => Ok(Self::DerivedFrom),
             "SUPERSEDES" | "Supersedes" | "supersedes" => Ok(Self::Supersedes),
+            "REFERENCES" | "References" | "references" => Ok(Self::References),
             other => anyhow::bail!(
-                "invalid knowledge edge kind '{other}' (expected Contradicts, RelatesTo, TensionWith, Supports, DependsOn, DerivedFrom, SUPERSEDES)"
+                "invalid knowledge edge kind '{other}' (expected Contradicts, RelatesTo, TensionWith, Supports, DependsOn, DerivedFrom, SUPERSEDES, REFERENCES)"
             ),
         }
     }
@@ -478,6 +481,7 @@ impl KnowledgeEdgeKind {
             Self::DependsOn => "DependsOn",
             Self::DerivedFrom => "DERIVED_FROM",
             Self::Supersedes => "SUPERSEDES",
+            Self::References => "REFERENCES",
         }
     }
 }
