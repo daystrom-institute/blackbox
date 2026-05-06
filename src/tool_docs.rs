@@ -11,6 +11,8 @@
 //!
 //! Adding or changing a tool = one edit here. No hand-curated drift.
 
+use std::borrow::Cow;
+
 use anyhow::Result;
 
 use crate::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
@@ -181,14 +183,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_register",
         category: ToolCategory::Projects,
-        summary: "Register a project directory for agentic-corpus indexing.",
+        summary: "Register a project directory for agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. Triggers the project-bootstrap-arc which walks the project, chunks files, writes to the index, and emits structural edges. project_id is derived from the canonicalized realpath and is per-machine; not portable across hosts. repo_id is null for non-git projects; for git projects it derives from the first-commit SHA (with remote-URL fallback for shallow clones), so it survives clones. Use bbox_project_list to inspect registered projects.",
         when_to_use: "Use before S2+ needs a repo root. Symlink aliases collapse to one `project_id`; git repos also get `repo_id`.",
         example: None,
     },
     ToolDoc {
         name: "bbox_project_list",
         category: ToolCategory::Projects,
-        summary: "List registered project roots.",
+        summary: "List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered.",
         when_to_use: "Use to inspect registered roots or confirm symlink aliases collapsed.",
         example: None,
     },
@@ -899,7 +901,11 @@ pub fn render_markdown() -> String {
             out.push_str(cat.intro());
             out.push_str("\n\n");
             for doc in TOOL_DOCS.iter().filter(|d| d.category == cat) {
-                out.push_str(&format!("- **`{}`** — {}\n", doc.name, doc.summary));
+                out.push_str(&format!(
+                    "- **`{}`** — {}\n",
+                    doc.name,
+                    hot_summary(doc.summary)
+                ));
                 out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
                 if let Some(ex) = doc.example {
                     out.push_str(&format!("  _Example:_ `{ex}`\n"));
@@ -914,6 +920,21 @@ pub fn render_markdown() -> String {
 
     out.push_str(WORKFLOW_NOTES);
     out
+}
+
+fn hot_summary(summary: &'static str) -> Cow<'static, str> {
+    const MAX_SUMMARY_BYTES: usize = 220;
+    if summary.len() <= MAX_SUMMARY_BYTES {
+        return Cow::Borrowed(summary);
+    }
+    let end = summary[..MAX_SUMMARY_BYTES]
+        .rfind(". ")
+        .map(|idx| idx + 1)
+        .unwrap_or(MAX_SUMMARY_BYTES);
+    Cow::Owned(format!(
+        "{} See the MCP tool description for the full contract.",
+        summary[..end].trim()
+    ))
 }
 
 // ── Sync into knowledge store ────────────────────────────────────────
