@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -75,6 +75,8 @@ pub struct ArtifactMetadata {
     pub superseded_by: Option<String>,
     #[serde(default = "default_active")]
     pub active: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub install_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,8 +159,10 @@ impl ArtifactCatalog {
             supersedes_chain: chain,
             superseded_by: None,
             active: true,
+            install_warnings: Vec::new(),
         };
         self.save_metadata(&metadata)?;
+        self.save_version_snapshot(&metadata, value)?;
         Ok(metadata)
     }
 
@@ -192,10 +196,7 @@ impl ArtifactCatalog {
                         continue;
                     }
                 }
-                if !p.include_superseded
-                    && meta.kind == ArtifactKind::Agent
-                    && !meta.active
-                {
+                if !p.include_superseded && meta.kind == ArtifactKind::Agent && !meta.active {
                     continue;
                 }
                 let artifact_path = self.artifact_path(meta.kind, &meta.name)?;
@@ -204,18 +205,63 @@ impl ArtifactCatalog {
                 } else {
                     None
                 };
+                let current_meta = meta.clone();
                 out.push(ArtifactListEntry {
-                    kind: meta.kind,
-                    name: meta.name,
-                    version: meta.version,
-                    source: meta.source,
-                    installed_at: meta.installed_at,
-                    active: meta.active,
-                    supersedes_chain: meta.supersedes_chain,
+                    kind: current_meta.kind,
+                    name: current_meta.name,
+                    version: current_meta.version,
+                    source: current_meta.source,
+                    installed_at: current_meta.installed_at,
+                    active: current_meta.active,
+                    supersedes_chain: current_meta.supersedes_chain,
                     path: artifact_path.to_string_lossy().into_owned(),
-                    superseded_by: meta.superseded_by,
+                    superseded_by: current_meta.superseded_by,
                     description,
                 });
+                if p.include_superseded && meta.kind == ArtifactKind::Agent {
+                    let version_dir = self.version_dir_path(meta.kind, &meta.name)?;
+                    if version_dir.exists() {
+                        for version_entry in WalkDir::new(&version_dir)
+                            .max_depth(1)
+                            .into_iter()
+                            .filter_map(|e| e.ok())
+                        {
+                            let version_path = version_entry.path();
+                            let Some(file_name) = version_path.file_name().and_then(|s| s.to_str())
+                            else {
+                                continue;
+                            };
+                            let Some(version) = file_name
+                                .strip_prefix('v')
+                                .and_then(|s| s.strip_suffix(".metadata.json"))
+                            else {
+                                continue;
+                            };
+                            if version == meta.version {
+                                continue;
+                            }
+                            let raw = fs::read_to_string(version_path)
+                                .with_context(|| format!("reading {}", version_path.display()))?;
+                            let version_meta: ArtifactMetadata = serde_json::from_str(&raw)
+                                .with_context(|| format!("parsing {}", version_path.display()))?;
+                            let artifact_path =
+                                self.version_artifact_path(meta.kind, &meta.name, version)?;
+                            let description = extract_agent_description(&artifact_path);
+                            out.push(ArtifactListEntry {
+                                kind: version_meta.kind,
+                                name: version_meta.name,
+                                version: version_meta.version,
+                                source: version_meta.source,
+                                installed_at: version_meta.installed_at,
+                                active: version_meta.active,
+                                supersedes_chain: version_meta.supersedes_chain,
+                                path: artifact_path.to_string_lossy().into_owned(),
+                                superseded_by: version_meta.superseded_by,
+                                description,
+                            });
+                        }
+                    }
+                }
             }
         }
         out.sort_by(|a, b| {
@@ -251,35 +297,79 @@ impl ArtifactCatalog {
         meta.active = false;
         meta.superseded_by = Some(superseded_by.to_string());
         self.save_metadata(&meta)?;
+        self.save_version_metadata(&meta)?;
         Ok(meta)
     }
 
-    pub fn load_artifact_value(
-        &self,
-        kind: ArtifactKind,
-        name: &str,
-    ) -> Result<Option<Value>> {
+    pub fn load_artifact_value(&self, kind: ArtifactKind, name: &str) -> Result<Option<Value>> {
         let path = self.artifact_path(kind, name)?;
         if !path.exists() {
             return Ok(None);
         }
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let value: Value =
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         Ok(Some(value))
     }
 
-    pub fn metadata_for(
+    pub fn load_artifact_value_version(
         &self,
         kind: ArtifactKind,
         name: &str,
-    ) -> Result<Option<ArtifactMetadata>> {
+        version: &str,
+    ) -> Result<Option<Value>> {
+        validate_artifact_name(name)?;
+        validate_version_component(version)?;
+        let path = self.version_artifact_path(kind, name, version)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let value: Value =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Some(value))
+    }
+
+    pub fn metadata_for(&self, kind: ArtifactKind, name: &str) -> Result<Option<ArtifactMetadata>> {
         let path = self.metadata_path(kind, name)?;
         if !path.exists() {
             return Ok(None);
         }
         Ok(Some(self.load_metadata(kind, name)?))
+    }
+
+    pub fn metadata_for_version(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<ArtifactMetadata>> {
+        validate_artifact_name(name)?;
+        validate_version_component(version)?;
+        let path = self.version_metadata_path(kind, name, version)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("parsing {}", path.display()))
+            .map(Some)
+    }
+
+    pub fn update_install_warnings(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+        warnings: Vec<String>,
+    ) -> Result<ArtifactMetadata> {
+        let mut meta = self.load_metadata(kind, name)?;
+        meta.install_warnings = warnings;
+        self.save_metadata(&meta)?;
+        self.save_version_metadata(&meta)?;
+        Ok(meta)
     }
 
     fn load_metadata(&self, kind: ArtifactKind, name: &str) -> Result<ArtifactMetadata> {
@@ -297,6 +387,17 @@ impl ArtifactCatalog {
         atomic_write_json(&path, meta)
     }
 
+    fn save_version_snapshot(&self, meta: &ArtifactMetadata, value: &Value) -> Result<()> {
+        let artifact_path = self.version_artifact_path(meta.kind, &meta.name, &meta.version)?;
+        atomic_write_json(&artifact_path, value)?;
+        self.save_version_metadata(meta)
+    }
+
+    fn save_version_metadata(&self, meta: &ArtifactMetadata) -> Result<()> {
+        let path = self.version_metadata_path(meta.kind, &meta.name, &meta.version)?;
+        atomic_write_json(&path, meta)
+    }
+
     fn artifact_path(&self, kind: ArtifactKind, name: &str) -> Result<PathBuf> {
         Ok(self.root.join(kind.as_str()).join(name_path(name, "json")?))
     }
@@ -307,6 +408,36 @@ impl ArtifactCatalog {
             .join(kind.as_str())
             .join(name_dir_path(name)?)
             .join("metadata.json"))
+    }
+
+    fn version_artifact_path(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .version_dir_path(kind, name)?
+            .join(format!("v{version}.json")))
+    }
+
+    fn version_metadata_path(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .version_dir_path(kind, name)?
+            .join(format!("v{version}.metadata.json")))
+    }
+
+    fn version_dir_path(&self, kind: ArtifactKind, name: &str) -> Result<PathBuf> {
+        Ok(self
+            .root
+            .join(kind.as_str())
+            .join(name_dir_path(name)?)
+            .join(".versions"))
     }
 }
 
@@ -387,6 +518,18 @@ fn validate_artifact_name(name: &str) -> Result<()> {
         })
     {
         bail!("invalid artifact name `{name}`");
+    }
+    Ok(())
+}
+
+fn validate_version_component(version: &str) -> Result<()> {
+    if version.trim().is_empty()
+        || version.contains('/')
+        || version.contains('\\')
+        || version == "."
+        || version == ".."
+    {
+        bail!("invalid artifact version `{version}`");
     }
     Ok(())
 }
@@ -649,7 +792,10 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "code-reviewer-v2");
-        assert_eq!(rows[0].description.as_deref(), Some("Reviews code for bugs and style"));
+        assert_eq!(
+            rows[0].description.as_deref(),
+            Some("Reviews code for bugs and style")
+        );
 
         let all_rows = catalog
             .list(&ArtifactListParams {
@@ -660,7 +806,10 @@ mod tests {
             .unwrap();
         assert_eq!(all_rows.len(), 2);
         let old = all_rows.iter().find(|r| r.name == "code-reviewer").unwrap();
-        let new = all_rows.iter().find(|r| r.name == "code-reviewer-v2").unwrap();
+        let new = all_rows
+            .iter()
+            .find(|r| r.name == "code-reviewer-v2")
+            .unwrap();
         assert!(!old.active);
         assert_eq!(old.superseded_by.as_deref(), Some("code-reviewer-v2"));
         assert!(new.active);
@@ -693,7 +842,11 @@ mod tests {
     #[test]
     fn discovers_project_agent_artifacts() {
         let dir = tempfile::tempdir().unwrap();
-        let artifact = dir.path().join(".bbox").join("agents").join("reviewer.json");
+        let artifact = dir
+            .path()
+            .join(".bbox")
+            .join("agents")
+            .join("reviewer.json");
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, "{}").unwrap();
 
@@ -772,13 +925,17 @@ mod tests {
         assert_eq!(meta.version, "2");
         assert!(meta.active);
 
-        assert!(catalog
-            .load_artifact_value(ArtifactKind::Agent, "nonexistent")
-            .unwrap()
-            .is_none());
-        assert!(catalog
-            .metadata_for(ArtifactKind::Agent, "nonexistent")
-            .unwrap()
-            .is_none());
+        assert!(
+            catalog
+                .load_artifact_value(ArtifactKind::Agent, "nonexistent")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            catalog
+                .metadata_for(ArtifactKind::Agent, "nonexistent")
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -1,3 +1,6 @@
+#[cfg(test)]
+#[path = "../eval/agents/check.rs"]
+mod agent_eval_check;
 mod artifacts;
 mod chunker;
 mod council;
@@ -41,7 +44,7 @@ mod workflow;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
@@ -296,6 +299,8 @@ struct BlackboxServer {
     state: Arc<SharedState>,
     tool_router: ToolRouter<Self>,
 }
+
+static AGENT_QUERY_EMBED_CACHE: OnceLock<RwLock<BTreeMap<String, Vec<f32>>>> = OnceLock::new();
 
 impl BlackboxServer {
     const MCP_RESPONSE_CAP_BYTES: usize = 80 * 1024;
@@ -1924,6 +1929,10 @@ struct AgentDispatchParams {
     bro: Option<String>,
     #[serde(default)]
     ambient: Option<serde_json::Value>,
+    #[serde(default)]
+    caller_provider: Option<String>,
+    #[serde(default)]
+    caller_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -3032,6 +3041,17 @@ impl BlackboxServer {
                 )
             });
 
+        #[derive(Default)]
+        struct AgentDashboardMetrics {
+            dispatch_count: u64,
+            success_count: u64,
+            failure_count: u64,
+            elapsed_ms_total: u64,
+            elapsed_count: u64,
+            cost_usd_total: f64,
+        }
+
+        let mut agent_metrics: BTreeMap<String, AgentDashboardMetrics> = BTreeMap::new();
         let mut with_ts: Vec<(u64, Value)> = store
             .all_tasks()
             .iter()
@@ -3058,6 +3078,24 @@ impl BlackboxServer {
                 let inner = t.inner.lock();
                 let bro_name =
                     orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
+                if let Some(label) = inner.agent_label.as_ref() {
+                    let metrics = agent_metrics.entry(label.clone()).or_default();
+                    metrics.dispatch_count += 1;
+                    match inner.status {
+                        orch::TaskStatus::Completed => metrics.success_count += 1,
+                        orch::TaskStatus::Failed | orch::TaskStatus::Cancelled => {
+                            metrics.failure_count += 1;
+                        }
+                        orch::TaskStatus::Running => {}
+                    }
+                    if let Some(done) = inner.completed_at {
+                        metrics.elapsed_ms_total += done.saturating_sub(inner.started_at);
+                        metrics.elapsed_count += 1;
+                    }
+                    if let Some(cost) = inner.cost_usd {
+                        metrics.cost_usd_total += cost;
+                    }
+                }
                 let mut entry = json!({
                     "taskId": inner.id,
                     "provider": inner.provider,
@@ -3080,8 +3118,28 @@ impl BlackboxServer {
             .collect();
         with_ts.sort_by(|a, b| b.0.cmp(&a.0));
         let entries: Vec<Value> = with_ts.into_iter().take(limit).map(|(_, e)| e).collect();
+        let agents: BTreeMap<String, Value> = agent_metrics
+            .into_iter()
+            .map(|(label, metrics)| {
+                let avg_elapsed_ms = if metrics.elapsed_count == 0 {
+                    None
+                } else {
+                    Some(metrics.elapsed_ms_total / metrics.elapsed_count)
+                };
+                (
+                    label,
+                    json!({
+                        "dispatch_count": metrics.dispatch_count,
+                        "success_count": metrics.success_count,
+                        "failure_count": metrics.failure_count,
+                        "avg_elapsed_ms": avg_elapsed_ms,
+                        "cost_usd_total": (metrics.cost_usd_total * 10000.0).round() / 10000.0,
+                    }),
+                )
+            })
+            .collect();
 
-        Self::ok_json(&json!({"count": entries.len(), "tasks": entries}))
+        Self::ok_json(&json!({"count": entries.len(), "tasks": entries, "agents": agents}))
     }
 
     #[tool(
@@ -4730,8 +4788,14 @@ Constraints:\n\
     }
 
     fn embed_agent_query(query: &str) -> anyhow::Result<Vec<f32>> {
-        let provider = embed::EmbeddingRouter::load_default()?
-            .route_for(embed::Bucket::AgentManifest, None)?;
+        let router = embed::EmbeddingRouter::load_default()?;
+        let route = router.route(embed::Bucket::AgentManifest, None)?;
+        let cache_key = format!("{}:{}:{}", route.provider_id, route.model, query);
+        let cache = AGENT_QUERY_EMBED_CACHE.get_or_init(|| RwLock::new(BTreeMap::new()));
+        if let Some(vector) = cache.read().get(&cache_key).cloned() {
+            return Ok(vector);
+        }
+        let provider = router.route_for(embed::Bucket::AgentManifest, None)?;
         let texts = vec![query.to_string()];
         let vectors = match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -4742,10 +4806,18 @@ Constraints:\n\
                 runtime.block_on(provider.embed_batch(&texts))
             }
         }?;
-        vectors
+        let vector = vectors
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("embedding provider returned no query vector"))
+            .ok_or_else(|| anyhow::anyhow!("embedding provider returned no query vector"))?;
+        let mut guard = cache.write();
+        if guard.len() >= 256 {
+            if let Some(first) = guard.keys().next().cloned() {
+                guard.remove(&first);
+            }
+        }
+        guard.insert(cache_key, vector.clone());
+        Ok(vector)
     }
 
     fn extract_inline_filters(inline: &serde_json::Value) -> (Vec<String>, Vec<String>) {
@@ -4801,9 +4873,19 @@ Constraints:\n\
         };
 
         let mut warnings: Vec<String> = Vec::new();
+        let mut degraded = serde_json::Map::new();
 
         let (brofile_kind, brofile_name, brofile_provider, brofile_body, base_allow, base_disallow) =
             if let Some(ref br) = manifest.brofile_ref {
+                if let Ok(Some(meta)) = catalog.metadata_for(artifacts::ArtifactKind::Brofile, br) {
+                    if !meta.active {
+                        degraded.insert("manifest_stale".into(), serde_json::Value::Bool(true));
+                        warnings.push(format!(
+                            "brofile_ref '{br}' is superseded by {}; reinstall or upgrade the agent manifest",
+                            meta.superseded_by.unwrap_or_else(|| "unknown".into())
+                        ));
+                    }
+                }
                 let resolved =
                     orchestration::brofile::resolve_brofile(br, &self.state.store_dir, None);
                 match resolved {
@@ -4857,6 +4939,13 @@ Constraints:\n\
             Some(_) => "embedded",
             None => "pending",
         };
+        let install_warnings = rec
+            .metadata
+            .install_warnings
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>();
 
         let mut result = serde_json::Map::from_iter([
             ("name".into(), serde_json::Value::String(rec.name)),
@@ -4876,7 +4965,7 @@ Constraints:\n\
             ),
             (
                 "install_warnings".into(),
-                serde_json::Value::Array(Vec::new()),
+                serde_json::Value::Array(install_warnings),
             ),
         ]);
         if !brofile_name.is_empty() {
@@ -4904,6 +4993,9 @@ Constraints:\n\
                         .collect(),
                 ),
             );
+        }
+        if !degraded.is_empty() {
+            result.insert("degraded".into(), serde_json::Value::Object(degraded));
         }
         result.insert(
             "manifest".into(),
@@ -5081,8 +5173,8 @@ Constraints:\n\
                     .as_ref()
                     .and_then(|v| serde_json::to_string(v).ok()),
                 bro_label_prefix: Some(bro_label),
-                caller_provider: None,
-                caller_session_id: None,
+                caller_provider: p.caller_provider.clone(),
+                caller_session_id: p.caller_session_id.clone(),
             };
             match adapter.dispatch(&manifest, p.args, ctx).await {
                 Ok(result) => {
@@ -7738,6 +7830,7 @@ async fn install_artifact_value(
     let mut installed_agent: Option<(
         orchestration::agents::types::AgentRef,
         orchestration::agents::types::AgentManifest,
+        Vec<String>,
     )> = None;
     match p.kind {
         artifacts::ArtifactKind::Workflow => {
@@ -7814,10 +7907,11 @@ async fn install_artifact_value(
             let agent_ref = orchestration::agents::types::AgentRef { name, version };
             manifest.embedding = Some(embed_queue::agent_manifest_embedding(&agent_ref, &manifest));
             value["manifest"]["embedding"] = serde_json::to_value(&manifest.embedding)?;
-            installed_agent = Some((agent_ref, manifest));
+            let install_warnings = agent_install_warnings(state, &manifest);
+            installed_agent = Some((agent_ref, manifest, install_warnings));
         }
     }
-    let meta = state
+    let mut meta = state
         .artifacts
         .write()
         .install_value(p.kind, p.source, &value, p.name, p.version, p.supersedes)
@@ -7827,11 +7921,59 @@ async fn install_artifact_value(
             }
             Ok(meta)
         })?;
-    if let Some((agent_ref, manifest)) = installed_agent {
+    if let Some((agent_ref, manifest, install_warnings)) = installed_agent {
+        if !install_warnings.is_empty() {
+            meta = state.artifacts.write().update_install_warnings(
+                artifacts::ArtifactKind::Agent,
+                &agent_ref.name,
+                install_warnings,
+            )?;
+        }
         embed_queue::enqueue_agent_manifest(&agent_ref, &manifest);
         persist_agent_provenance_edges(state, &agent_ref, &manifest)?;
     }
     Ok(meta)
+}
+
+fn agent_install_warnings(
+    state: &Arc<SharedState>,
+    manifest: &orchestration::agents::types::AgentManifest,
+) -> Vec<String> {
+    let Some(overlay) = manifest.filter_overlay.as_ref() else {
+        return Vec::new();
+    };
+    let (base_allow, base_disallow) = if let Some(brofile_ref) = manifest.brofile_ref.as_ref() {
+        let Some(brofile) =
+            orchestration::brofile::resolve_brofile(brofile_ref, &state.store_dir, None)
+        else {
+            return Vec::new();
+        };
+        match brofile.filters {
+            Some(filters) => (filters.allow, filters.disallow),
+            None => (Vec::new(), Vec::new()),
+        }
+    } else if let Some(inline) = manifest.brofile_inline.as_ref() {
+        BlackboxServer::extract_inline_filters(inline)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let mut warnings = Vec::new();
+    for allowed in &overlay.allow {
+        if base_disallow.contains(allowed) {
+            warnings.push(format!(
+                "filter_overlay.allow `{allowed}` is also disallowed by the base brofile; deny-wins merge keeps it disallowed"
+            ));
+        }
+    }
+    for disallowed in &overlay.disallow {
+        if base_allow.contains(disallowed) {
+            warnings.push(format!(
+                "filter_overlay.disallow `{disallowed}` overrides a base brofile allow entry"
+            ));
+        }
+    }
+    warnings
 }
 
 fn artifact_version_string(value: &serde_json::Value) -> Option<String> {
@@ -11847,6 +11989,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn agent_install_records_filter_conflict_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "kind": "agent",
+                "name": "warning-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent where overlay conflicts are recorded.",
+                    "when_to_use": ["when testing filter warnings"],
+                    "brofile_inline": {
+                        "provider": "claude",
+                        "filters": {
+                            "allow": ["Read"],
+                            "disallow": ["Bash"]
+                        }
+                    },
+                    "filter_overlay": {
+                        "allow": ["Bash"],
+                        "disallow": ["Read"]
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "warning-agent".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let warnings = body["install_warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("Bash"))),
+            "allow/disallow conflict warning missing: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("Read"))),
+            "disallow/allow conflict warning missing: {warnings:?}"
+        );
+    }
+
     #[test]
     fn bro_agent_describe_brofile_ref_resolved() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11915,6 +12115,88 @@ mod tests {
                 .iter()
                 .any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
             "brofile disallow in merged: {disallow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bro_agent_describe_flags_stale_brofile_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "name": "review-persona",
+                "version": 1,
+                "provider": "claude",
+                "lens": "Review code."
+            }),
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "kind": "agent",
+                "name": "stale-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with a brofile ref that will become stale.",
+                    "when_to_use": ["when testing stale refs"],
+                    "brofile_ref": "review-persona"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "name": "review-persona-v2",
+                "version": 2,
+                "supersedes": "review-persona",
+                "provider": "claude",
+                "lens": "Review code better."
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "stale-agent".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["degraded"]["manifest_stale"].as_bool(), Some(true));
+        assert!(
+            body["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|text| text.contains("review-persona-v2"))),
+            "expected stale warning: {body}"
         );
     }
 
@@ -12415,6 +12697,8 @@ mod tests {
             project_dir: None,
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -12468,6 +12752,8 @@ mod tests {
             project_dir: None,
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -12508,6 +12794,8 @@ mod tests {
             project_dir: None,
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -12550,7 +12838,7 @@ mod tests {
                 &self,
                 _manifest: &orchestration::agents::types::AgentManifest,
                 _args: serde_json::Value,
-                _ctx: orchestration::agents::adapter::DispatchContext,
+                ctx: orchestration::agents::adapter::DispatchContext,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<
@@ -12562,10 +12850,12 @@ mod tests {
                         + '_,
                 >,
             > {
-                Box::pin(async {
+                let caller_provider = ctx.caller_provider.clone().unwrap_or_default();
+                let caller_session_id = ctx.caller_session_id.clone().unwrap_or_default();
+                Box::pin(async move {
                     Ok(orchestration::agents::adapter::AgentDispatchResult {
                         session: orchestration::agents::types::AgentSession {
-                            session_id: "test-session-123".into(),
+                            session_id: format!("{caller_provider}/{caller_session_id}"),
                             provider: "test".into(),
                             project_dir: None,
                             agent: orchestration::agents::types::AgentRef {
@@ -12594,11 +12884,13 @@ mod tests {
                 project_dir: None,
                 bro: None,
                 ambient: None,
+                caller_provider: Some("claude".into()),
+                caller_session_id: Some("caller-session-789".into()),
             }))
             .await;
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(body["session"]["session_id"], "test-session-123");
+        assert_eq!(body["session"]["session_id"], "claude/caller-session-789");
         assert_eq!(body["task_id"], "test-task-456");
     }
 
@@ -12676,6 +12968,8 @@ mod tests {
                 project_dir: Some("/tmp/test".into()),
                 bro: None,
                 ambient: None,
+                caller_provider: None,
+                caller_session_id: None,
             }))
             .await;
         assert!(
@@ -12776,6 +13070,8 @@ mod tests {
             project_dir: None,
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -12811,6 +13107,8 @@ mod tests {
             project_dir: None,
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -12858,6 +13156,8 @@ mod tests {
             project_dir: None,
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -12904,6 +13204,8 @@ mod tests {
             project_dir: None,
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -12953,6 +13255,8 @@ mod tests {
             project_dir: None,
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -13008,6 +13312,8 @@ mod tests {
             project_dir: None,
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -13132,6 +13438,8 @@ mod tests {
             project_dir: Some(tmp.path().to_str().unwrap().to_string()),
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -13186,6 +13494,8 @@ mod tests {
             project_dir: Some(tmp.path().to_str().unwrap().to_string()),
             bro: Some("some-bro".into()),
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -13236,6 +13546,8 @@ mod tests {
             project_dir: Some(tmp.path().to_str().unwrap().to_string()),
             bro: None,
             ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
         })));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -13262,5 +13574,9 @@ mod tests {
             Some("agent:dash-agent@v1"),
             "dashboard entry should carry broLabel: {entry}"
         );
+        let agent_metrics = &dash_body["agents"]["agent:dash-agent@v1"];
+        assert_eq!(agent_metrics["dispatch_count"].as_u64(), Some(1));
+        assert_eq!(agent_metrics["success_count"].as_u64(), Some(0));
+        assert_eq!(agent_metrics["failure_count"].as_u64(), Some(0));
     }
 }

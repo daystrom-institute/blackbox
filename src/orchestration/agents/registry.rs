@@ -89,6 +89,7 @@ pub struct ArtifactRecordMeta {
     pub supersedes: Option<String>,
     pub supersedes_chain: Vec<String>,
     pub superseded_by: Option<String>,
+    pub install_warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,15 +97,6 @@ pub struct ArtifactRecordMeta {
 // ---------------------------------------------------------------------------
 
 /// Read-only projection over `ArtifactCatalog` for agent artifacts.
-///
-/// **Multi-version limitation:** `ArtifactCatalog` stores one artifact blob
-/// and one metadata file per `(kind, name)` pair. Installing a new version
-/// overwrites the previous blob on disk, so pinned refs like `name@v1`
-/// cannot retrieve the old version after v2 overwrites it. The registry
-/// correctly parses pinned refs and queries by version string, but the
-/// catalog will only ever have the latest version's data. Historical
-/// multi-version support requires a catalog redesign (out of scope for
-/// the current agent-system phase).
 pub struct AgentRegistry<'a> {
     catalog: &'a ArtifactCatalog,
 }
@@ -172,27 +164,50 @@ impl<'a> AgentRegistry<'a> {
 
     pub fn get(&self, name_or_ref: &str) -> Result<Option<AgentRecord>> {
         let (name, version_pin) = parse_name_or_ref(name_or_ref)?;
+        if let Some(version) = version_pin {
+            let Some(meta) =
+                self.catalog
+                    .metadata_for_version(ArtifactKind::Agent, &name, &version)?
+            else {
+                return Ok(None);
+            };
+            let (manifest, manifest_parse_error) =
+                self.load_manifest_degraded_version(&name, &version);
+            return Ok(Some(AgentRecord {
+                name: meta.name,
+                version: meta.version,
+                active: meta.active,
+                installed_at: meta.installed_at,
+                source: meta.source,
+                metadata: ArtifactRecordMeta {
+                    supersedes: meta.supersedes,
+                    supersedes_chain: meta.supersedes_chain,
+                    superseded_by: meta.superseded_by,
+                    install_warnings: meta.install_warnings,
+                },
+                manifest,
+                manifest_parse_error,
+            }));
+        }
         let params = ArtifactListParams {
             kind: Some(ArtifactKind::Agent),
             name: Some(name.clone()),
-            include_superseded: version_pin.is_some(),
+            include_superseded: false,
         };
         let entries = self.catalog.list(&params)?;
-        let entry = match version_pin {
-            Some(v) => entries.into_iter().find(|e| e.version == v),
-            None => entries.into_iter().find(|e| e.active),
-        };
+        let entry = entries.into_iter().find(|e| e.active);
         let entry = match entry {
             Some(e) => e,
             None => return Ok(None),
         };
         let (manifest, manifest_parse_error) = self.load_manifest_degraded(&entry.name);
-        let supersedes = self
+        let metadata = self
             .catalog
             .metadata_for(ArtifactKind::Agent, &entry.name)
             .ok()
-            .flatten()
-            .and_then(|m| m.supersedes);
+            .flatten();
+        let supersedes = metadata.as_ref().and_then(|m| m.supersedes.clone());
+        let install_warnings = metadata.map(|m| m.install_warnings).unwrap_or_default();
         Ok(Some(AgentRecord {
             name: entry.name,
             version: entry.version,
@@ -203,6 +218,7 @@ impl<'a> AgentRegistry<'a> {
                 supersedes,
                 supersedes_chain: entry.supersedes_chain,
                 superseded_by: entry.superseded_by,
+                install_warnings,
             },
             manifest,
             manifest_parse_error,
@@ -214,11 +230,23 @@ impl<'a> AgentRegistry<'a> {
             Ok(Some(v)) => v,
             _ => return (None, None),
         };
-        let manifest_value = value.get("manifest").unwrap_or(&value);
-        match serde_json::from_value(manifest_value.clone()) {
-            Ok(m) => (Some(m), None),
-            Err(e) => (None, Some(e.to_string())),
-        }
+        load_manifest_degraded_value(value)
+    }
+
+    fn load_manifest_degraded_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> (Option<AgentManifest>, Option<String>) {
+        let value =
+            match self
+                .catalog
+                .load_artifact_value_version(ArtifactKind::Agent, name, version)
+            {
+                Ok(Some(v)) => v,
+                _ => return (None, None),
+            };
+        load_manifest_degraded_value(value)
     }
 
     pub fn search(
@@ -230,7 +258,19 @@ impl<'a> AgentRegistry<'a> {
     ) -> Result<Vec<AgentSearchResult>> {
         self.search_inner(query, limit, filter, exclude_anti_pattern_matches, None)
     }
+}
 
+fn load_manifest_degraded_value(
+    value: serde_json::Value,
+) -> (Option<AgentManifest>, Option<String>) {
+    let manifest_value = value.get("manifest").unwrap_or(&value);
+    match serde_json::from_value(manifest_value.clone()) {
+        Ok(m) => (Some(m), None),
+        Err(e) => (None, Some(e.to_string())),
+    }
+}
+
+impl<'a> AgentRegistry<'a> {
     pub fn search_with_vectors(
         &self,
         query: &str,
@@ -705,6 +745,84 @@ mod tests {
         let record = registry.get("reviewer@v2").unwrap().unwrap();
         assert_eq!(record.version, "2");
         assert!(record.active);
+    }
+
+    #[test]
+    fn get_by_pinned_version_reads_historical_snapshot_after_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "reviewer-v1.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "reviewer",
+                    "version": 1,
+                    "manifest": {
+                        "description": "First review agent.",
+                        "when_to_use": ["before the upgrade"],
+                        "brofile_inline": {"provider": "claude"}
+                    }
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "reviewer-v2.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "reviewer",
+                    "version": 2,
+                    "supersedes": "reviewer",
+                    "manifest": {
+                        "description": "Second review agent.",
+                        "when_to_use": ["after the upgrade"],
+                        "brofile_inline": {"provider": "claude"}
+                    }
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let registry = AgentRegistry::new(&catalog);
+        let current = registry.get("reviewer").unwrap().unwrap();
+        assert_eq!(current.version, "2");
+        assert_eq!(
+            current.manifest.as_ref().unwrap().description,
+            "Second review agent."
+        );
+
+        let pinned = registry.get("agent:reviewer@v1").unwrap().unwrap();
+        assert_eq!(pinned.version, "1");
+        assert!(!pinned.active);
+        assert_eq!(
+            pinned.manifest.as_ref().unwrap().description,
+            "First review agent."
+        );
+        assert_eq!(pinned.metadata.superseded_by.as_deref(), Some("reviewer"));
+
+        let history = registry
+            .list(&ListFilter {
+                include_superseded: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let versions = history
+            .iter()
+            .filter(|row| row.name == "reviewer")
+            .map(|row| (row.version.as_str(), row.active))
+            .collect::<Vec<_>>();
+        assert!(
+            versions.contains(&("1", false)) && versions.contains(&("2", true)),
+            "include_superseded should surface same-name history: {versions:?}"
+        );
     }
 
     #[test]

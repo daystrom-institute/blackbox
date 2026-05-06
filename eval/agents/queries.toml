@@ -1,0 +1,24 @@
+[discovery.find_review_agent]
+query = "review a code diff for bugs and security"
+expected_agents = ["code-reviewer"]
+forbidden_agents = ["badgey"]
+
+[discovery.find_narrator_agent]
+query = "summarize what changed in this patch before review"
+expected_agents = ["diff-narrator"]
+forbidden_agents = []
+
+[discovery.find_distillation_agent]
+query = "propose reusable agents from recurring transcript workflows"
+expected_agents = ["badgey"]
+forbidden_agents = ["diff-narrator"]
+
+[cuing.chain_review]
+agent = "code-reviewer"
+prompt = "review this diff after a narrator summarizes it"
+expect_dispatch = true
+
+[cuing.anti_pattern_typo]
+agent = "code-reviewer"
+prompt = "review this one-line typo fix"
+expect_dispatch = false

@@ -1,0 +1,24 @@
+{
+  "suite": "agent-discovery",
+  "version": 1,
+  "queries": [
+    {
+      "id": "find-review-agent",
+      "query": "review a code diff for bugs and security",
+      "expected_agents": ["code-reviewer"],
+      "forbidden_agents": ["badgey"]
+    },
+    {
+      "id": "find-narrator-agent",
+      "query": "summarize what changed in this patch before review",
+      "expected_agents": ["diff-narrator"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-distillation-agent",
+      "query": "propose reusable agents from recurring transcript workflows",
+      "expected_agents": ["badgey"],
+      "forbidden_agents": ["diff-narrator"]
+    }
+  ]
+}

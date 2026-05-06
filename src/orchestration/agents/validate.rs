@@ -142,7 +142,32 @@ pub fn validate_agent_install<B: Fn(&str) -> bool, A: Fn(&str) -> bool>(
     }
 
     lint_manifest(&manifest, ctx)?;
+    validate_agent_artifact_schema(value)?;
 
+    Ok(())
+}
+
+fn validate_agent_artifact_schema(value: &serde_json::Value) -> Result<(), ValidationError> {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../schema/agent.schema.json")).map_err(|e| {
+            ValidationError {
+                step: "schema",
+                message: format!("shipped agent.schema.json is invalid JSON: {e}"),
+            }
+        })?;
+    let compiled = jsonschema::JSONSchema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .compile(&schema)
+        .map_err(|e| ValidationError {
+            step: "schema",
+            message: format!("shipped agent.schema.json failed to compile: {e}"),
+        })?;
+    if let Err(errors) = compiled.validate(value) {
+        return Err(ValidationError {
+            step: "schema",
+            message: errors.map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+        });
+    }
     Ok(())
 }
 
@@ -405,6 +430,7 @@ fn validate_json_schema_ish(
     value: &serde_json::Value,
     field_name: &'static str,
 ) -> Result<(), ValidationError> {
+    reject_remote_schema_refs(value, field_name)?;
     match value {
         serde_json::Value::Bool(_) => Ok(()),
         serde_json::Value::Object(map) => {
@@ -432,6 +458,37 @@ fn validate_json_schema_ish(
             step: "lint_schema",
             message: format!("{field_name}: must be a JSON object or boolean, got {value}"),
         }),
+    }
+}
+
+fn reject_remote_schema_refs(
+    value: &serde_json::Value,
+    field_name: &'static str,
+) -> Result<(), ValidationError> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(reference)) = map.get("$ref") {
+                if reference.starts_with("http://") || reference.starts_with("https://") {
+                    return Err(ValidationError {
+                        step: "lint_schema",
+                        message: format!(
+                            "{field_name}: remote `$ref` values are not allowed during agent install: {reference}"
+                        ),
+                    });
+                }
+            }
+            for child in map.values() {
+                reject_remote_schema_refs(child, field_name)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                reject_remote_schema_refs(child, field_name)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -563,6 +620,56 @@ mod tests {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx(&registry);
         validate_agent_install(&minimal_valid_agent(), &ctx).unwrap();
+    }
+
+    #[test]
+    fn shipped_agent_schema_validates_reference_agents() {
+        let schema_raw = include_str!("../../../schema/agent.schema.json");
+        let schema: serde_json::Value =
+            serde_json::from_str(schema_raw).expect("agent schema must be valid JSON");
+        let compiled = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .compile(&schema)
+            .expect("agent schema must compile as draft 2020-12");
+        for (name, raw) in [
+            (
+                "code-reviewer",
+                include_str!("../../../examples/agents/code-reviewer.json"),
+            ),
+            (
+                "diff-narrator",
+                include_str!("../../../examples/agents/diff-narrator.json"),
+            ),
+            (
+                "badgey",
+                include_str!("../../../examples/agents/badgey.json"),
+            ),
+        ] {
+            let value: serde_json::Value =
+                serde_json::from_str(raw).expect("reference agent must be valid JSON");
+            assert!(
+                compiled.is_valid(&value),
+                "{name} rejected by schema: {:?}",
+                compiled
+                    .validate(&value)
+                    .err()
+                    .map(|errs| errs.map(|e| e.to_string()).collect::<Vec<_>>())
+            );
+        }
+    }
+
+    #[test]
+    fn install_validation_enforces_shipped_agent_schema() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["unexpected"] = serde_json::json!("nope");
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "schema");
+        assert!(
+            err.message.contains("unexpected"),
+            "schema error should name the extra property: {err}"
+        );
     }
 
     #[test]
@@ -736,6 +843,24 @@ mod tests {
         });
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_schema");
+    }
+
+    #[test]
+    fn rejects_remote_schema_refs() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["inputs"] = serde_json::json!({
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "payload": {"$ref": "https://example.com/schema.json"}
+                }
+            }
+        });
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "lint_schema");
+        assert!(err.message.contains("remote `$ref`"));
     }
 
     #[test]

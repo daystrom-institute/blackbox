@@ -19,6 +19,8 @@ pub struct WalRecord {
     pub model: String,
     pub dims: usize,
     pub vector: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upserted_at: Option<String>,
     pub deleted_at: Option<String>,
     pub route: String,
 }
@@ -31,6 +33,7 @@ impl WalRecord {
             model: route.to_string(),
             dims: vector.len(),
             vector,
+            upserted_at: Some(chrono::Utc::now().to_rfc3339()),
             deleted_at: None,
             route: route.to_string(),
         }
@@ -43,6 +46,7 @@ impl WalRecord {
             model: route.to_string(),
             dims: 0,
             vector: Vec::new(),
+            upserted_at: None,
             deleted_at: Some(chrono::Utc::now().to_rfc3339()),
             route: route.to_string(),
         }

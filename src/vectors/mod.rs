@@ -7,7 +7,6 @@ pub mod wal;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -152,6 +151,20 @@ pub fn search(route: &str, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
     global().search(route, query, k)
 }
 
+pub(crate) fn iter_active(
+    route: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<impl Iterator<Item = VectorEntry>> {
+    global().iter_active(route, since)
+}
+
+pub(crate) fn cluster_neighbors_within_route(
+    route: &str,
+    similarity_threshold: f32,
+) -> Result<Vec<VectorCluster>> {
+    global().cluster_neighbors_within_route(route, similarity_threshold)
+}
+
 pub fn rebuild(route: &str) -> Result<()> {
     global().rebuild(route)
 }
@@ -268,6 +281,27 @@ impl VectorStore {
         Ok(hits)
     }
 
+    pub(crate) fn iter_active(
+        &self,
+        route: &str,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<impl Iterator<Item = VectorEntry>> {
+        let Some(partition) = self.partitions.read().get(route).cloned() else {
+            return Ok(Vec::new().into_iter());
+        };
+        let entries = partition.read().active_entries_since(since);
+        Ok(entries.into_iter())
+    }
+
+    pub(crate) fn cluster_neighbors_within_route(
+        &self,
+        route: &str,
+        similarity_threshold: f32,
+    ) -> Result<Vec<VectorCluster>> {
+        let entries = self.iter_active(route, None)?.collect::<Vec<_>>();
+        Ok(cluster_entries(entries, similarity_threshold))
+    }
+
     pub fn rebuild(&self, route: &str) -> Result<()> {
         let partition = self.partition(route)?;
         let result = partition.write().rebuild_from_wal();
@@ -341,6 +375,20 @@ pub struct VectorUpsert {
     pub entity_id: String,
     pub content_hash: String,
     pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorEntry {
+    pub entity_id: String,
+    pub content_hash: String,
+    pub vector: Vec<f32>,
+    pub upserted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorCluster {
+    pub id: String,
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -491,6 +539,30 @@ impl Partition {
         self.slab.contains_active(entity_id, content_hash)
     }
 
+    fn active_entries_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Vec<VectorEntry> {
+        self.slab
+            .active_entries()
+            .filter(|entry| match since {
+                Some(cutoff) => entry
+                    .upserted_at
+                    .as_deref()
+                    .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                    .map(|ts| ts.with_timezone(&chrono::Utc) > cutoff)
+                    .unwrap_or(false),
+                None => true,
+            })
+            .map(|entry| VectorEntry {
+                entity_id: entry.entity_id.clone(),
+                content_hash: entry.content_hash.clone(),
+                vector: entry.vector.clone(),
+                upserted_at: entry.upserted_at.clone(),
+            })
+            .collect()
+    }
+
     fn rebuild_from_wal(&mut self) -> Result<()> {
         let records = wal::read_all(&self.wal_path())?;
         self.slab = VectorSlab::default();
@@ -498,10 +570,11 @@ impl Partition {
             if record.deleted_at.is_some() {
                 self.slab.delete(&record.entity_id);
             } else {
-                self.slab.upsert(
+                self.slab.upsert_at(
                     &record.entity_id,
                     &record.content_hash,
                     record.vector.clone(),
+                    record.upserted_at.clone(),
                 )?;
             }
         }
@@ -644,6 +717,62 @@ impl Partition {
 // per-flush writes. Cold-start always rebuilds via WAL, so the derived
 // raw-f32 dump had no consumer. Kept the bulk-write helper notes in git
 // history (commit d8cd57d) in case a future snapshot path needs them.
+
+fn cluster_entries(entries: Vec<VectorEntry>, similarity_threshold: f32) -> Vec<VectorCluster> {
+    if entries.len() < 2 {
+        return Vec::new();
+    }
+    let threshold = similarity_threshold.clamp(0.0, 1.0);
+    let mut parent: Vec<usize> = (0..entries.len()).collect();
+    for left in 0..entries.len() {
+        for right in (left + 1)..entries.len() {
+            if entries[left].vector.len() != entries[right].vector.len() {
+                continue;
+            }
+            let similarity =
+                1.0 - distance::cosine_distance(&entries[left].vector, &entries[right].vector);
+            if similarity >= threshold {
+                union(&mut parent, left, right);
+            }
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for idx in 0..entries.len() {
+        let root = find(&mut parent, idx);
+        groups
+            .entry(root)
+            .or_default()
+            .push(entries[idx].entity_id.clone());
+    }
+    let mut clusters = Vec::new();
+    for (idx, mut members) in groups
+        .into_values()
+        .filter(|members| members.len() > 1)
+        .enumerate()
+    {
+        members.sort();
+        clusters.push(VectorCluster {
+            id: format!("cluster:{idx}"),
+            members,
+        });
+    }
+    clusters
+}
+
+fn find(parent: &mut [usize], idx: usize) -> usize {
+    if parent[idx] != idx {
+        parent[idx] = find(parent, parent[idx]);
+    }
+    parent[idx]
+}
+
+fn union(parent: &mut [usize], left: usize, right: usize) {
+    let left_root = find(parent, left);
+    let right_root = find(parent, right);
+    if left_root != right_root {
+        parent[right_root] = left_root;
+    }
+}
 
 #[cfg(test)]
 mod tests {
