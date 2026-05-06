@@ -3,12 +3,14 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use parking_lot::RwLock;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::chunker::Chunk;
 use crate::embed::queue::{EmbedQueueHandle, EmbedRequest, EmbedStatusResponse};
 use crate::embed::{queue, Bucket};
 use crate::entity_ref::EntityRef;
 use crate::knowledge::KnowledgeEntry;
+use crate::notes::Note;
 use crate::notes::NoteParams;
 use crate::routing::RoutingVerdict;
 use crate::SharedState;
@@ -104,6 +106,43 @@ pub(crate) fn enqueue_git_message(entity_id: &str, chunk_hash: &str, message: &s
     });
 }
 
+pub(crate) fn enqueue_note(note: &Note) {
+    let entity_id = EntityRef::Note {
+        note_id: note.id.clone(),
+    }
+    .to_string();
+    enqueue(EmbedRequest {
+        bucket: Bucket::Notes,
+        project_id: None,
+        entity_id,
+        chunk_hash: note_chunk_hash(note),
+        text: note_text(note),
+    });
+}
+
+pub(crate) fn enqueue_transcript(
+    provider: &str,
+    session_id: &str,
+    byte_offset: u64,
+    content: &str,
+    chunk_hash: &str,
+) {
+    let entity_id = EntityRef::Transcript {
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+        line_offset: byte_offset,
+        event_idx: 0,
+    }
+    .to_string();
+    enqueue(EmbedRequest {
+        bucket: Bucket::Transcripts,
+        project_id: None,
+        entity_id,
+        chunk_hash: chunk_hash.to_string(),
+        text: content.to_string(),
+    });
+}
+
 pub(crate) fn project_file_entity_id(chunk: &Chunk) -> String {
     EntityRef::ProjectFile {
         project_id: chunk.project_id.clone(),
@@ -112,6 +151,41 @@ pub(crate) fn project_file_entity_id(chunk: &Chunk) -> String {
         occurrence_idx: chunk.occurrence_idx,
     }
     .to_string()
+}
+
+pub(crate) fn content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn note_chunk_hash(note: &Note) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(note.id.as_bytes());
+    hasher.update([0]);
+    hasher.update(note.kind.as_ref().as_bytes());
+    hasher.update([0]);
+    hasher.update(note.body.as_bytes());
+    hasher.update([0]);
+    hasher.update(note.updated_at.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn note_text(note: &Note) -> String {
+    let mut fields = vec![format!("kind: {}", note.kind.as_ref()), note.body.clone()];
+    if let Some(project) = &note.project {
+        fields.push(format!("project: {project}"));
+    }
+    if let Some(task_id) = &note.task_id {
+        fields.push(format!("task: {task_id}"));
+    }
+    if let Some(thread_id) = &note.thread_id {
+        fields.push(format!("thread: {thread_id}"));
+    }
+    if let Some(bro) = &note.bro {
+        fields.push(format!("bro: {bro}"));
+    }
+    fields.join("\n")
 }
 
 fn enqueue(request: queue::EmbedRequest) {

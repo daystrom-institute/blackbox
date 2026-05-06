@@ -5,7 +5,8 @@ pub mod queue;
 pub mod voyage;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -13,6 +14,11 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+
+use crate::chunker::Chunk;
+use crate::entity_ref::EntityRef;
+use crate::index::EmbeddingSourceDoc;
+use crate::SharedState;
 
 pub const VOYAGE_PROVIDER_ID: &str = "voyage";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";
@@ -298,19 +304,213 @@ pub struct ReembedParams {
     pub route: String,
 }
 
-pub fn reembed_stub(p: &ReembedParams) -> Result<String> {
-    if p.route.trim().is_empty() {
-        bail!("route is required");
-    }
-    tracing::info!(
-        route = %p.route,
-        "rebuild requested for embedding route; not yet implemented (lands in E3)"
-    );
+pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<String> {
+    let buckets = buckets_for_reembed_route(&p.route)?;
+    let count = count_reembed_entities(&state, &buckets)?;
+    let route = p.route.trim().to_string();
+    tokio::spawn(async move {
+        match enqueue_reembed_routes(&state, &buckets) {
+            Ok(enqueued) => {
+                tracing::info!(route = %route, enqueued, "embedding rebuild queue refill completed");
+            }
+            Err(err) => {
+                tracing::warn!(route = %route, error = %err, "embedding rebuild queue refill failed");
+            }
+        }
+    });
     Ok(serde_json::to_string_pretty(&json!({
         "status": "ok",
         "route": p.route,
-        "message": format!("rebuild requested for route {}; not yet implemented (lands in E3)", p.route),
+        "message": format!("rebuild started: {count} entities enqueued"),
     }))?)
+}
+
+fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
+    let route = route.trim();
+    if route.is_empty() {
+        bail!("route is required");
+    }
+    if route == "all" {
+        return Ok(Bucket::ALL.to_vec());
+    }
+    Bucket::ALL
+        .iter()
+        .copied()
+        .find(|bucket| bucket.as_str() == route)
+        .map(|bucket| vec![bucket])
+        .with_context(|| {
+            format!(
+                "unknown embedding route `{route}`; expected one of: all, {}",
+                Bucket::ALL
+                    .iter()
+                    .map(|bucket| bucket.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn count_reembed_entities(state: &Arc<SharedState>, buckets: &[Bucket]) -> Result<usize> {
+    let knowledge_count = if buckets.contains(&Bucket::Knowledge) {
+        state.kb.read().all_entries().len()
+    } else {
+        0
+    };
+    let note_count = if buckets.contains(&Bucket::Notes) {
+        state.notes.read().all().len()
+    } else {
+        0
+    };
+    let docs = if buckets.iter().any(|bucket| {
+        matches!(
+            bucket,
+            Bucket::Code | Bucket::Docs | Bucket::Transcripts | Bucket::GitMessage
+        )
+    }) {
+        state.idx.read().embedding_source_docs()?
+    } else {
+        Vec::new()
+    };
+    Ok(knowledge_count + note_count + count_reembed_index_docs(buckets, &docs))
+}
+
+fn enqueue_reembed_routes(state: &Arc<SharedState>, buckets: &[Bucket]) -> Result<usize> {
+    let mut enqueued = 0usize;
+    if buckets.contains(&Bucket::Knowledge) {
+        for entry in state.kb.read().all_entries() {
+            let entity_id = crate::index::knowledge_entity_id(&entry.id);
+            let chunk_hash = crate::index::knowledge_chunk_hash(entry);
+            crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash);
+            enqueued += 1;
+        }
+    }
+    if buckets.contains(&Bucket::Notes) {
+        for note in state.notes.read().all() {
+            crate::embed_queue::enqueue_note(note);
+            enqueued += 1;
+        }
+    }
+    if buckets.iter().any(|bucket| {
+        matches!(
+            bucket,
+            Bucket::Code | Bucket::Docs | Bucket::Transcripts | Bucket::GitMessage
+        )
+    }) {
+        let docs = state.idx.read().embedding_source_docs()?;
+        enqueued += enqueue_reembed_index_docs(buckets, &docs);
+    }
+    Ok(enqueued)
+}
+
+fn count_reembed_index_docs(buckets: &[Bucket], docs: &[EmbeddingSourceDoc]) -> usize {
+    docs.iter()
+        .filter(|doc| reembed_index_doc_bucket(doc).is_some_and(|bucket| buckets.contains(&bucket)))
+        .count()
+}
+
+fn enqueue_reembed_index_docs(buckets: &[Bucket], docs: &[EmbeddingSourceDoc]) -> usize {
+    let mut enqueued = 0usize;
+    for doc in docs {
+        let Some(bucket) = reembed_index_doc_bucket(doc) else {
+            continue;
+        };
+        if !buckets.contains(&bucket) {
+            continue;
+        }
+        match bucket {
+            Bucket::Code | Bucket::Docs => {
+                let Some(chunk) = chunk_from_embedding_doc(doc) else {
+                    continue;
+                };
+                let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+                crate::embed_queue::enqueue_project_file(&chunk, &entity_id);
+                enqueued += 1;
+            }
+            Bucket::Transcripts => {
+                let chunk_hash = doc
+                    .chunk_hash
+                    .clone()
+                    .unwrap_or_else(|| crate::embed_queue::content_hash(&doc.content));
+                crate::embed_queue::enqueue_transcript(
+                    &doc.account,
+                    &doc.session_id,
+                    doc.byte_offset,
+                    &doc.content,
+                    &chunk_hash,
+                );
+                enqueued += 1;
+            }
+            Bucket::GitMessage => {
+                let (Some(entity_id), Some(chunk_hash)) = (&doc.entity_id, &doc.chunk_hash) else {
+                    continue;
+                };
+                crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content);
+                enqueued += 1;
+            }
+            Bucket::Knowledge | Bucket::Notes => {}
+        }
+    }
+    enqueued
+}
+
+fn reembed_index_doc_bucket(doc: &EmbeddingSourceDoc) -> Option<Bucket> {
+    match doc.doc_type.as_str() {
+        "transcript" if !doc.session_id.is_empty() && !doc.content.is_empty() => {
+            Some(Bucket::Transcripts)
+        }
+        "commit" if doc.chunk_kind == "git_message" && !doc.content.is_empty() => {
+            Some(Bucket::GitMessage)
+        }
+        "project_file" => {
+            let path = Path::new(&doc.file_path);
+            if crate::chunker::code::language_for_path(path).is_some() {
+                Some(Bucket::Code)
+            } else if is_docs_path(path) {
+                Some(Bucket::Docs)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_docs_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("md" | "mdx" | "rst" | "txt")
+    )
+}
+
+fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
+    let entity = doc
+        .entity_id
+        .as_deref()
+        .and_then(|id| EntityRef::parse(id).ok())?;
+    let EntityRef::ProjectFile {
+        project_id,
+        rel_path_hash,
+        chunk_hash,
+        occurrence_idx,
+    } = entity
+    else {
+        return None;
+    };
+    let byte_end = doc.byte_offset.saturating_add(doc.content.len() as u64);
+    Some(Chunk {
+        project_id,
+        file_path: PathBuf::from(&doc.file_path),
+        rel_path_hash,
+        chunk_kind: doc.chunk_kind.clone(),
+        chunk_hash,
+        occurrence_idx,
+        language: doc.language.clone(),
+        symbol: doc.symbol.clone(),
+        symbol_exact: doc.symbol_exact.clone(),
+        content: doc.content.clone(),
+        byte_start: doc.byte_offset,
+        byte_end,
+    })
 }
 
 #[cfg(test)]
@@ -359,13 +559,19 @@ code = "ollama"
     }
 
     #[test]
-    fn reembed_stub_returns_ok() {
-        let rendered = reembed_stub(&ReembedParams {
-            route: "knowledge".into(),
-        })
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(value["status"], "ok");
-        assert_eq!(value["route"], "knowledge");
+    fn reembed_route_validation_accepts_all_and_rejects_unknown() {
+        assert_eq!(buckets_for_reembed_route("all").unwrap(), Bucket::ALL);
+        assert_eq!(
+            buckets_for_reembed_route("knowledge").unwrap(),
+            vec![Bucket::Knowledge]
+        );
+        let err = buckets_for_reembed_route("missing").unwrap_err();
+        assert!(err.to_string().contains("unknown embedding route"));
+    }
+
+    #[test]
+    fn reembed_empty_index_doc_enumeration_counts_zero() {
+        assert_eq!(count_reembed_index_docs(&[Bucket::Code], &[]), 0);
+        assert_eq!(count_reembed_index_docs(&Bucket::ALL, &[]), 0);
     }
 }

@@ -849,7 +849,8 @@ impl BlackboxServer {
         description = "Request an embedding rebuild for a configured route."
     )]
     fn bbox_reembed(&self, Parameters(p): Parameters<ReembedParams>) -> CallToolResult {
-        Self::run("bbox_reembed", || embed::reembed_stub(&p))
+        let state = self.state.clone();
+        Self::run("bbox_reembed", || embed::reembed_start(&p, state))
     }
 
     #[tool(

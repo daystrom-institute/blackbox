@@ -109,6 +109,23 @@ impl EdgeProjectionDoc {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EmbeddingSourceDoc {
+    pub doc_type: String,
+    pub account: String,
+    pub session_id: String,
+    pub project: String,
+    pub file_path: String,
+    pub byte_offset: u64,
+    pub chunk_kind: String,
+    pub language: Option<String>,
+    pub symbol: Option<String>,
+    pub symbol_exact: Option<String>,
+    pub chunk_hash: Option<String>,
+    pub entity_id: Option<String>,
+    pub content: String,
+}
+
 impl TranscriptIndex {
     pub fn open_or_create(
         index_path: &Path,
@@ -232,6 +249,38 @@ impl TranscriptIndex {
                 byte_offset: first_u64(&doc, self.fields.byte_offset),
                 file_path: first_text(&doc, self.fields.file_path),
                 entity_id: optional_text(&doc, self.fields.entity_id),
+            });
+        }
+        Ok(docs)
+    }
+
+    pub(crate) fn embedding_source_docs(&self) -> Result<Vec<EmbeddingSourceDoc>> {
+        let searcher = self.reader.searcher();
+        let limit = searcher.num_docs() as usize;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let top_docs = searcher.search(
+            &tantivy::query::AllQuery,
+            &tantivy::collector::TopDocs::with_limit(limit),
+        )?;
+        let mut docs = Vec::with_capacity(top_docs.len());
+        for (_score, addr) in top_docs {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            docs.push(EmbeddingSourceDoc {
+                doc_type: first_text(&doc, self.fields.doc_type),
+                account: first_text(&doc, self.fields.account),
+                session_id: first_text(&doc, self.fields.session_id),
+                project: first_text(&doc, self.fields.project),
+                file_path: first_text(&doc, self.fields.file_path),
+                byte_offset: first_u64(&doc, self.fields.byte_offset),
+                chunk_kind: first_text(&doc, self.fields.chunk_kind),
+                language: optional_text(&doc, self.fields.language),
+                symbol: optional_text(&doc, self.fields.symbol),
+                symbol_exact: optional_text(&doc, self.fields.symbol_exact),
+                chunk_hash: optional_text(&doc, self.fields.chunk_hash),
+                entity_id: optional_text(&doc, self.fields.entity_id),
+                content: first_text(&doc, self.fields.content),
             });
         }
         Ok(docs)
