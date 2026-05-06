@@ -30,6 +30,7 @@ pub struct Edge {
 pub struct EdgeIndex {
     forward: HashMap<EntityRef, Vec<Edge>>,
     reverse: HashMap<EntityRef, Vec<Edge>>,
+    commit_anchor_index: HashMap<String, Vec<Edge>>,
 }
 
 pub struct EdgeStoreRefs<'a> {
@@ -109,9 +110,24 @@ impl EdgeIndex {
         self.forward.values().flat_map(|edges| edges.iter())
     }
 
+    pub(crate) fn edges_with_anchor_commit(&self, commit_sha: &str) -> Vec<&Edge> {
+        self.commit_anchor_index
+            .get(commit_sha)
+            .map(|edges| edges.iter().collect())
+            .unwrap_or_default()
+    }
+
     fn insert(&mut self, edge: Edge, seen: &mut HashSet<Edge>) {
         if !seen.insert(edge.clone()) {
             return;
+        }
+        if edge.kind == "EDITED_FILE" {
+            if let Some(commit_sha) = edge.metadata.get("anchor.commit_sha_at_edit") {
+                self.commit_anchor_index
+                    .entry(commit_sha.clone())
+                    .or_default()
+                    .push(edge.clone());
+            }
         }
         self.reverse
             .entry(edge.target.clone())

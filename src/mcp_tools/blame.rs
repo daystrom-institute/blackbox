@@ -176,17 +176,7 @@ fn matching_anchors<'a>(
 ) -> Vec<&'a Edge> {
     let mut exact = Vec::new();
     let mut same_commit = Vec::new();
-    for edge in edge_index.all_edges() {
-        if edge.kind != "EDITED_FILE" {
-            continue;
-        }
-        if edge
-            .metadata
-            .get("anchor.commit_sha_at_edit")
-            .is_none_or(|sha| sha != commit_sha)
-        {
-            continue;
-        }
+    for edge in edge_index.edges_with_anchor_commit(commit_sha) {
         if edge
             .metadata
             .get("anchor.file_path")
@@ -377,6 +367,34 @@ mod tests {
 
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0].target, same_file.target);
+    }
+
+    #[test]
+    fn matching_anchors_uses_commit_anchor_index() {
+        let mut edges = (0..10_000)
+            .map(|idx| {
+                let mut edge = edit_edge_at(&format!("src/{idx}.rs"), idx);
+                edge.metadata
+                    .insert("anchor.commit_sha_at_edit".into(), format!("commit-{idx}"));
+                edge
+            })
+            .collect::<Vec<_>>();
+        let mut target = edit_edge_at("src/main.rs", 10_001);
+        target
+            .metadata
+            .insert("anchor.commit_sha_at_edit".into(), "needle".into());
+        edges.push(target);
+        let index = EdgeIndex::from_edges_for_tests(edges);
+        let started = std::time::Instant::now();
+
+        let anchors = matching_anchors(&index, "needle", "src/main.rs");
+
+        assert_eq!(anchors.len(), 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1),
+            "commit anchor lookup should be O(k), elapsed {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
