@@ -60,6 +60,15 @@ pub struct VoyageProvider {
     api_key: Option<String>,
 }
 
+impl std::fmt::Debug for VoyageProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoyageProvider")
+            .field("config", &self.config)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 impl VoyageProvider {
     pub fn from_config(config: VoyageConfig) -> Result<Self> {
         let api_key = std::env::var(&config.api_key_env)
@@ -196,5 +205,14 @@ mod tests {
         assert_eq!(provider.dimensions(), VOYAGE_DIMENSIONS);
         let vectors = provider.embed_batch(&["hello".into()]).await.unwrap();
         assert_eq!(vectors[0].len(), VOYAGE_DIMENSIONS);
+    }
+
+    #[test]
+    fn debug_redacts_api_key() {
+        let provider = VoyageProvider::for_test("http://127.0.0.1:9/v1/embeddings".into())
+            .unwrap();
+        let rendered = format!("{provider:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("test-key"));
     }
 }

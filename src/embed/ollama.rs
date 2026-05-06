@@ -41,6 +41,14 @@ pub struct OllamaProvider {
     config: OllamaConfig,
 }
 
+impl std::fmt::Debug for OllamaProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OllamaProvider")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl OllamaProvider {
     pub fn from_config(config: OllamaConfig) -> Result<Self> {
         Ok(Self {
@@ -151,5 +159,14 @@ mod tests {
         assert_eq!(provider.dimensions(), OLLAMA_DIMENSIONS);
         let vectors = provider.embed_batch(&["hello".into()]).await.unwrap();
         assert_eq!(vectors[0].len(), OLLAMA_DIMENSIONS);
+    }
+
+    #[test]
+    fn debug_omits_client_internals() {
+        let provider = OllamaProvider::from_config(OllamaConfig::default()).unwrap();
+        let rendered = format!("{provider:?}");
+        assert!(rendered.contains("OllamaProvider"));
+        assert!(rendered.contains("config"));
+        assert!(!rendered.contains("client"));
     }
 }
