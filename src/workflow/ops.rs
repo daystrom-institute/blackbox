@@ -95,12 +95,20 @@ pub enum OpKind {
     /// for compaction-policy gates.
     ReadVectorStatus,
     /// Marker hook for pausing search traffic before a vector rebuild.
-    /// Search is in-process and rebuild reads WAL, so v1 is observable no-op.
+    ///
+    /// V1 is intentionally observable-only: vector reads serve from the
+    /// in-memory partition snapshot while `vectors::rebuild(route)` rebuilds
+    /// from WAL under the partition lock. If search becomes more concurrent or
+    /// moves out of process, this hook is where real quiescence belongs.
     QuiesceSearch,
     /// Rebuild one vector partition's HNSW from WAL.
     RebuildHnsw,
-    /// Marker hook for the atomic swap step. Vector rebuild already writes
-    /// derived files from the rebuilt in-memory partition, so v1 is no-op.
+    /// Marker hook for the atomic swap step.
+    ///
+    /// V1 is intentionally observable-only: `vectors::rebuild(route)` already
+    /// swaps the rebuilt in-memory partition and rewrites derived files from
+    /// WAL, so there is no separate file-system rename step for the workflow to
+    /// perform yet.
     SwapAtomic,
     /// Load a transcript session through bbox_messages for auto-digest arcs.
     ReadSession,

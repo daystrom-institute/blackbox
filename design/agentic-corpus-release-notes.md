@@ -87,6 +87,14 @@ falling through to `skip`. The shipped cron spec is an example inlet; cron
 installation remains through the existing cron admin/MCP surface, while the
 workflow and packets install through the artifact catalog.
 
+`QuiesceSearch` and `SwapAtomic` are v1 marker hooks. Reads continue serving
+from the current in-memory partition snapshot while the rebuild path reconstructs
+from WAL under the partition lock, then the rebuilt partition state is made
+visible by `vectors::rebuild(route)`. If vector search moves out of process or
+serves concurrently across multiple mutable snapshots, `QuiesceSearch` must grow
+a real traffic-drain implementation and `SwapAtomic` should own the explicit
+publish/rename step.
+
 ## M3
 
 `auto-digest-arc.json` is the first agentic-corpus workflow that dispatches an
