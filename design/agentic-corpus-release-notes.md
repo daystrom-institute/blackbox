@@ -54,9 +54,20 @@ be changed with `BBOX_GIT_NOTES_NAMESPACE`, for example `bbox-dev` or
 tool-call anchors. `bbox_provenance_import` reads those notes and replays the
 tool-call edges into the local EdgeIndex sidecar after a clone or fetch.
 
+Exports are append-only: each export appends another JSON document to the
+commit's provenance note, separated by `--bbox-note-separator--`, so
+collaborating machines do not silently overwrite each other's provenance.
+Import parses every document in the note and deduplicates replayed edges before
+writing the local sidecar.
+
 Operators who share notes across divergent branches should configure the repo
 with `git config notes.mergeStrategy union`. The daemon documents this merge
 strategy but does not write project git config automatically.
+
+Manual cross-machine flow:
+`bbox_provenance_export` → `git push origin 'refs/notes/bbox/*'` → remote
+machine runs `git fetch origin 'refs/notes/bbox/*:refs/notes/bbox/*'` →
+`bbox_provenance_import`.
 
 ## M2
 

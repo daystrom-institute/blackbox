@@ -175,6 +175,11 @@ pub(crate) fn notes_namespace() -> String {
 
 pub(crate) const NOTE_DOCUMENT_SEPARATOR: &str = "--bbox-note-separator--";
 
+/// Build a bbox-owned git notes ref for an open-ended note kind.
+///
+/// Kind `provenance` is used today. `knowledge` is reserved for v2
+/// cross-machine knowledge serialization, and future kinds should remain under
+/// this namespace instead of adding parallel `refs/notes/bbox-*` roots.
 pub(crate) fn notes_ref(kind: &str) -> String {
     format!("refs/notes/{}/{}", notes_namespace(), kind)
 }
