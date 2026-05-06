@@ -2,6 +2,7 @@ mod artifacts;
 mod chunker;
 mod council;
 mod crons;
+mod edge_index;
 pub mod entity_ref;
 #[cfg(test)]
 #[path = "../eval/check.rs"]
@@ -77,6 +78,8 @@ struct SharedState {
     projects: RwLock<ProjectRegistry>,
     packets: RwLock<Packets>,
     artifacts: RwLock<artifacts::ArtifactCatalog>,
+    #[allow(dead_code)]
+    edge_index: RwLock<edge_index::EdgeIndex>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
     store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
@@ -7379,6 +7382,15 @@ async fn main() -> anyhow::Result<()> {
     let bind_host = std::env::var("BBOX_BIND").unwrap_or_else(|_| "127.0.0.1".into());
     let bind_is_loopback = is_loopback_bind(&bind_host);
 
+    let edge_index = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+        index: &idx,
+        knowledge: &kb,
+        threads: &th,
+        notes: &notes_store,
+        task_store: &task_store,
+        edges_dir: edge_index::edges_dir_from_bro_store(&store_dir),
+    });
+
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
         kb: RwLock::new(kb),
@@ -7388,6 +7400,7 @@ async fn main() -> anyhow::Result<()> {
         projects: RwLock::new(projects_store),
         packets: RwLock::new(packets_store),
         artifacts: RwLock::new(artifacts_store),
+        edge_index: RwLock::new(edge_index),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx: tail_tx.clone(),
         store_dir: store_dir.clone(),
@@ -7735,6 +7748,7 @@ mod tests {
             projects: RwLock::new(projects),
             packets: RwLock::new(packets),
             artifacts: RwLock::new(artifacts),
+            edge_index: RwLock::new(edge_index::EdgeIndex::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,
             store_dir: tmp.path().join("bro"),

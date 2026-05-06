@@ -52,12 +52,13 @@ pub(super) fn index_registered_projects_standalone(
     meta: &mut HashMap<String, FileMeta>,
 ) -> Result<ProjectIndexStats> {
     let mut stats = ProjectIndexStats::default();
+    let edges_dir = crate::edge_index::edges_dir_from_projects_path(&config.projects_path);
     for project in ProjectRegistry::load_records(&config.projects_path)? {
         let root = PathBuf::from(&project.canonical_path);
         if !root.exists() {
             continue;
         }
-        index_project(&project, &root, f, writer, meta, &mut stats)?;
+        index_project(&project, &root, f, writer, meta, &mut stats, &edges_dir)?;
     }
     Ok(stats)
 }
@@ -118,11 +119,13 @@ fn index_project(
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
     stats: &mut ProjectIndexStats,
+    edges_dir: &Path,
 ) -> Result<()> {
     let registry = chunker::default_registry();
     let commit_sha = crate::git::current_head(root);
     let mut files = Vec::new();
     let mut pending = Vec::new();
+    let mut project_edges = Vec::new();
     scan_project_files(root, &mut files)?;
     for (path_str, mtime, size) in files {
         if let Some(prev) = meta.get(path_str.as_str()) {
@@ -161,6 +164,7 @@ fn index_project(
         let bounded_chunks = bound_chunks(&chunks);
         let edges = derive_edges(&bounded_chunks, edges);
         stats.emitted_edges += edges.len() as u64;
+        project_edges.extend(edges);
         pending.push(PendingProjectFile {
             path_str,
             absolute_path: path,
@@ -174,6 +178,7 @@ fn index_project(
     for file in pending {
         let code_edges = derive_code_edges(&file.chunks, &symbol_table, stats);
         stats.emitted_edges += code_edges.len() as u64;
+        project_edges.extend(code_edges);
         for chunk in file.chunks {
             let doc = build_project_file_doc(
                 &chunk,
@@ -194,6 +199,7 @@ fn index_project(
         );
         stats.indexed_files += 1;
     }
+    crate::edge_index::append_project_edges(edges_dir, &project.project_id, &project_edges)?;
     Ok(())
 }
 

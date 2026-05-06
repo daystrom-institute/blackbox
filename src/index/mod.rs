@@ -6,7 +6,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tantivy::schema::*;
-use tantivy::{Index, IndexReader, ReloadPolicy};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument};
 
 pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-f3";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
@@ -79,6 +79,28 @@ pub struct TranscriptIndex {
     pub(super) stats_cache: Mutex<Option<(Instant, String)>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EdgeProjectionDoc {
+    pub doc_type: String,
+    pub account: String,
+    pub session_id: String,
+    pub byte_offset: u64,
+    pub file_path: String,
+    pub entity_id: Option<String>,
+}
+
+impl EdgeProjectionDoc {
+    pub fn project_file_occurrence_idx(&self) -> Option<u32> {
+        let entity = self.entity_id.as_deref()?;
+        match crate::entity_ref::EntityRef::parse(entity).ok()? {
+            crate::entity_ref::EntityRef::ProjectFile { occurrence_idx, .. } => {
+                Some(occurrence_idx)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl TranscriptIndex {
     pub fn open_or_create(
         index_path: &Path,
@@ -147,6 +169,52 @@ impl TranscriptIndex {
         let searcher = self.reader.searcher();
         searcher.num_docs() == 0
     }
+
+    pub(crate) fn edge_projection_docs(&self) -> Result<Vec<EdgeProjectionDoc>> {
+        let searcher = self.reader.searcher();
+        let limit = searcher.num_docs() as usize;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let top_docs = searcher.search(
+            &tantivy::query::AllQuery,
+            &tantivy::collector::TopDocs::with_limit(limit),
+        )?;
+        let mut docs = Vec::with_capacity(top_docs.len());
+        for (_score, addr) in top_docs {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            docs.push(EdgeProjectionDoc {
+                doc_type: first_text(&doc, self.fields.doc_type),
+                account: first_text(&doc, self.fields.account),
+                session_id: first_text(&doc, self.fields.session_id),
+                byte_offset: first_u64(&doc, self.fields.byte_offset),
+                file_path: first_text(&doc, self.fields.file_path),
+                entity_id: optional_text(&doc, self.fields.entity_id),
+            });
+        }
+        Ok(docs)
+    }
+}
+
+fn first_text(doc: &TantivyDocument, field: Field) -> String {
+    optional_text(doc, field).unwrap_or_default()
+}
+
+fn optional_text(doc: &TantivyDocument, field: Field) -> Option<String> {
+    doc.get_all(field).next().and_then(|value| match value {
+        tantivy::schema::OwnedValue::Str(text) => Some(text.clone()),
+        _ => None,
+    })
+}
+
+fn first_u64(doc: &TantivyDocument, field: Field) -> u64 {
+    doc.get_all(field)
+        .next()
+        .and_then(|value| match value {
+            tantivy::schema::OwnedValue::U64(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn build_schema() -> (Schema, FieldHandles) {
