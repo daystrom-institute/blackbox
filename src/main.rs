@@ -3,6 +3,7 @@ mod chunker;
 mod council;
 mod crons;
 mod edge_index;
+mod embed;
 mod embed_queue;
 mod entity_loader;
 pub mod entity_ref;
@@ -678,6 +679,7 @@ use index::{
     CiteParams, ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
     SessionsListParams, TopicsParams,
 };
+use embed::ReembedParams;
 use knowledge::{
     AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeListParams, LearnParams,
     RememberParams, RenderParams, ResponseFormat, ReviewParams,
@@ -749,6 +751,14 @@ impl BlackboxServer {
     )]
     fn bbox_reindex(&self, Parameters(p): Parameters<ReindexParams>) -> CallToolResult {
         Self::run("bbox_reindex", || self.state.idx.write().reindex(&p))
+    }
+
+    #[tool(
+        name = "bbox_reembed",
+        description = "Request an embedding rebuild for a configured route. E1 records the request and returns ok; the queue and vector-store rebuild implementation lands in E3."
+    )]
+    fn bbox_reembed(&self, Parameters(p): Parameters<ReembedParams>) -> CallToolResult {
+        Self::run("bbox_reembed", || embed::reembed_stub(&p))
     }
 
     #[tool(

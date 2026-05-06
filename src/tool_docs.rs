@@ -164,6 +164,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: None,
     },
     ToolDoc {
+        name: "bbox_reembed",
+        category: ToolCategory::Transcripts,
+        summary: "Request an embedding rebuild for a configured route. E1 records the request and returns ok; the queue and vector-store rebuild implementation lands in E3.",
+        when_to_use: "Use after changing `~/.config/blackbox/embed.toml` routes or provider dimensions. In E1 this is a stub that records intent; E3 performs the rebuild.",
+        example: Some(r#"bbox_reembed(route="knowledge")"#),
+    },
+    ToolDoc {
         name: "bbox_topics",
         category: ToolCategory::Transcripts,
         summary: "Top terms in a session by frequency.",
@@ -962,7 +969,7 @@ pub fn render_markdown() -> String {
 }
 
 fn hot_summary(summary: &'static str) -> Cow<'static, str> {
-    const MAX_SUMMARY_BYTES: usize = 24;
+    const MAX_SUMMARY_BYTES: usize = 20;
     if summary.len() <= MAX_SUMMARY_BYTES {
         return Cow::Borrowed(summary);
     }
