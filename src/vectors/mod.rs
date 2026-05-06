@@ -199,6 +199,7 @@ pub struct PartitionMetrics {
     pub dims: usize,
     pub wal_records: usize,
     pub active_count: usize,
+    pub hnsw_rebuilds: usize,
     pub hnsw: Option<HnswMetricsSerde>,
 }
 
@@ -234,6 +235,7 @@ struct Partition {
     slab: VectorSlab,
     hnsw: Option<HnswIndex>,
     wal_records: usize,
+    hnsw_rebuilds: usize,
 }
 
 impl Partition {
@@ -246,6 +248,7 @@ impl Partition {
             slab: VectorSlab::default(),
             hnsw: None,
             wal_records: 0,
+            hnsw_rebuilds: 0,
         };
         partition.rebuild_from_wal()?;
         Ok(partition)
@@ -253,12 +256,17 @@ impl Partition {
 
     fn upsert(&mut self, entity_id: &str, content_hash: &str, vector: Vec<f32>) -> Result<()> {
         let record = WalRecord::upsert(&self.route, entity_id, content_hash, vector.clone());
-        if !self.slab.upsert(entity_id, content_hash, vector)? {
+        if !self.slab.upsert(entity_id, content_hash, vector.clone())? {
             return Ok(());
         }
         wal::append(&self.wal_path(), &record)?;
         self.wal_records += 1;
-        self.rebuild_hnsw()?;
+        match self.hnsw.as_mut() {
+            Some(hnsw) => hnsw
+                .push(entity_id.to_string(), vector)
+                .map_err(anyhow::Error::msg)?,
+            None => self.rebuild_hnsw()?,
+        }
         self.write_derived_files()
     }
 
@@ -267,7 +275,9 @@ impl Partition {
         wal::append(&self.wal_path(), &record)?;
         self.wal_records += 1;
         self.slab.delete(entity_id);
-        self.rebuild_hnsw()?;
+        if let Some(hnsw) = self.hnsw.as_mut() {
+            hnsw.delete(entity_id);
+        }
         self.write_derived_files()
     }
 
@@ -312,6 +322,7 @@ impl Partition {
         } else {
             Some(HnswIndex::build(items, HnswOptions::default()).map_err(anyhow::Error::msg)?)
         };
+        self.hnsw_rebuilds += 1;
         Ok(())
     }
 
@@ -321,6 +332,7 @@ impl Partition {
             dims: self.slab.dims(),
             wal_records: self.wal_records,
             active_count: self.slab.active_count(),
+            hnsw_rebuilds: self.hnsw_rebuilds,
             hnsw: self.hnsw.as_ref().map(|hnsw| hnsw.metrics().into()),
         }
     }
@@ -448,6 +460,59 @@ mod tests {
             .expect("ollama WAL should read");
         assert!(voyage_records.last().unwrap().deleted_at.is_some());
         assert!(ollama_records.last().unwrap().deleted_at.is_some());
+    }
+
+    #[test]
+    fn upsert_uses_incremental_hnsw_insertion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        let start_rebuilds = store
+            .metrics()
+            .get("voyage-1024")
+            .map(|metrics| metrics.hnsw_rebuilds)
+            .unwrap_or_default();
+
+        for idx in 0..100 {
+            let theta = idx as f32 * 0.01;
+            store
+                .upsert(
+                    "voyage-1024",
+                    &format!("id-{idx}"),
+                    &format!("hash-{idx}"),
+                    vec![theta.cos(), theta.sin(), 0.0, 0.0],
+                )
+                .unwrap();
+        }
+
+        let metrics = store.metrics();
+        let partition = &metrics["voyage-1024"];
+        assert_eq!(partition.active_count, 100);
+        assert_eq!(partition.hnsw.as_ref().unwrap().total_nodes, 100);
+        assert!(partition.hnsw_rebuilds <= start_rebuilds + 2);
+    }
+
+    #[test]
+    fn incrementally_inserted_hnsw_search_returns_nearest_hits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        for idx in 0..100 {
+            let theta = idx as f32 * 0.01;
+            store
+                .upsert(
+                    "voyage-1024",
+                    &format!("id-{idx}"),
+                    &format!("hash-{idx}"),
+                    vec![theta.cos(), theta.sin(), 0.0, 0.0],
+                )
+                .unwrap();
+        }
+
+        let hits = store
+            .search("voyage-1024", &[1.0, 0.0, 0.0, 0.0], 5)
+            .unwrap();
+
+        assert_eq!(hits[0].id, "id-0");
+        assert_eq!(hits.len(), 5);
     }
 
     #[test]

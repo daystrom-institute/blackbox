@@ -104,9 +104,6 @@ impl HnswIndex {
         if self.entry_point.is_none() || k == 0 || query.len() != self.vectors.dimensions {
             return Vec::new();
         }
-        // Keep v1 recall exact while the HNSW graph remains rebuildable
-        // derived state. H1 can switch this to graph-first plus exact rerank
-        // once hybrid-search latency pressure appears.
         let mut exact = self
             .ids
             .iter()
@@ -139,10 +136,11 @@ impl HnswIndex {
         }
     }
 
-    fn push(&mut self, id: String, vector: Vec<f32>) -> Result<(), String> {
+    pub fn push(&mut self, id: String, vector: Vec<f32>) -> Result<(), String> {
         if vector.len() != self.vectors.dimensions {
             return Err("dimension mismatch".to_string());
         }
+        self.delete(&id);
         let ordinal = self.ids.len();
         self.vectors.data.extend(vector);
         self.ids.push(id);
@@ -151,6 +149,39 @@ impl HnswIndex {
         self.graph.push(vec![Vec::new(); self.options.max_layers]);
         self.insert_internal(ordinal);
         Ok(())
+    }
+
+    pub fn delete(&mut self, id: &str) -> bool {
+        let mut deleted_entry_point = false;
+        let mut deleted = false;
+        for (ordinal, existing) in self.ids.iter().enumerate() {
+            if self.active[ordinal] && existing == id {
+                self.active[ordinal] = false;
+                deleted = true;
+                deleted_entry_point |= self.entry_point == Some(ordinal);
+            }
+        }
+        if deleted_entry_point {
+            self.repair_entry_point();
+        }
+        deleted
+    }
+
+    fn repair_entry_point(&mut self) {
+        let Some((ordinal, level)) = self
+            .active
+            .iter()
+            .enumerate()
+            .filter(|(_, active)| **active)
+            .map(|(ordinal, _)| (ordinal, self.levels[ordinal]))
+            .max_by_key(|(ordinal, level)| (*level, std::cmp::Reverse(*ordinal)))
+        else {
+            self.entry_point = None;
+            self.max_level = -1;
+            return;
+        };
+        self.entry_point = Some(ordinal);
+        self.max_level = level as isize;
     }
 
     fn insert_internal(&mut self, ordinal: usize) {
@@ -195,6 +226,9 @@ impl HnswIndex {
         loop {
             let mut changed = false;
             for neighbor in self.graph[best][layer].iter().copied() {
+                if !self.active[neighbor] {
+                    continue;
+                }
                 let dist = self.distance_to_ordinal(query, neighbor);
                 if dist < best_dist {
                     best = neighbor;
@@ -231,6 +265,9 @@ impl HnswIndex {
                     break;
                 }
                 for neighbor in self.graph[current][layer].iter().copied() {
+                    if !self.active[neighbor] {
+                        continue;
+                    }
                     if !visited.mark(neighbor) {
                         continue;
                     }
