@@ -598,21 +598,7 @@ impl BlackboxServer {
     }
 
     fn rebuild_edge_index_from_stores(&self) {
-        let edges_dir = edge_index::edges_dir_from_bro_store(&self.state.store_dir);
-        let idx = self.state.idx.read();
-        let kb = self.state.kb.read();
-        let threads = self.state.threads.read();
-        let notes = self.state.notes.read();
-        let task_store = self.state.task_store.read();
-        let rebuilt = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
-            index: &idx,
-            knowledge: &kb,
-            threads: &threads,
-            notes: &notes,
-            task_store: &task_store,
-            edges_dir,
-        });
-        *self.state.edge_index.write() = rebuilt;
+        rebuild_edge_index_from_shared(&self.state);
     }
 
     /// Resolve a workflow by registry id (set via `bro_workflow_install`
@@ -1036,12 +1022,17 @@ impl BlackboxServer {
                 std::slice::from_ref(&record),
                 &edges_dir,
             )?;
-            self.rebuild_edge_index_from_stores();
             trigger_project_bootstrap_arc(self.state.clone(), record.clone());
             self.state
                 .idx
                 .write()
                 .reindex(&ReindexParams { full: Some(false) })?;
+            // Rebuild EdgeIndex AFTER reindex so freshly-derived edges from the
+            // new project's chunks (IN_FILE, CONTAINS_SYMBOL, NEXT_CHUNK, etc.)
+            // are projected into the in-memory index. Doing this before reindex
+            // (the prior order) left the new project's edges invisible until
+            // the next unrelated rebuild trigger.
+            self.rebuild_edge_index_from_stores();
             Ok(serde_json::to_string_pretty(&record)?)
         })
     }
@@ -6709,6 +6700,57 @@ fn deactivate_artifact(
     Ok(())
 }
 
+fn rebuild_edge_index_from_shared(state: &SharedState) {
+    let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let idx = state.idx.read();
+    let kb = state.kb.read();
+    let threads = state.threads.read();
+    let notes = state.notes.read();
+    let task_store = state.task_store.read();
+    let rebuilt = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+        index: &idx,
+        knowledge: &kb,
+        threads: &threads,
+        notes: &notes,
+        task_store: &task_store,
+        edges_dir,
+    });
+    *state.edge_index.write() = rebuilt;
+}
+
+/// Watcher thread that rebuilds the EdgeIndex when the underlying tantivy
+/// corpus has grown. The auto-reindex thread writes new docs + edge sidecars
+/// every interval, but it can't trigger a rebuild itself (it spawns before
+/// SharedState exists). This watcher polls `idx.num_docs()` and triggers a
+/// rebuild whenever the count advances, which folds in the new project_file
+/// edges (IN_FILE / CONTAINS_SYMBOL / NEXT_CHUNK / etc.) so the agentic
+/// graph surface stays current without manual intervention.
+fn spawn_edge_index_rebuild_watcher(state: Arc<SharedState>, interval: std::time::Duration) {
+    std::thread::Builder::new()
+        .name("blackbox-edge-rebuild".into())
+        .spawn(move || {
+            // Initial settle so the boot-time rebuild already ran.
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            let mut last_seen: u64 = state.idx.read().num_docs();
+            loop {
+                std::thread::sleep(interval);
+                let current = state.idx.read().num_docs();
+                if current > last_seen {
+                    let started = std::time::Instant::now();
+                    rebuild_edge_index_from_shared(&state);
+                    tracing::info!(
+                        prev_docs = last_seen,
+                        new_docs = current,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "edge-index watcher: corpus grew, EdgeIndex rebuilt"
+                    );
+                    last_seen = current;
+                }
+            }
+        })
+        .expect("failed to spawn edge index rebuild watcher");
+}
+
 fn trigger_project_bootstrap_arc(state: Arc<SharedState>, record: ProjectRecord) {
     let Some(spec) = state
         .workflow_registry
@@ -7759,6 +7801,11 @@ async fn main() -> anyhow::Result<()> {
     embed_queue::install_contradiction_threshold(tier0_cosine_threshold_from_env());
     embed_queue::install_contradiction_state(shared.clone());
     embed_queue::install(embed::queue::EmbedQueueHandle::start_default());
+
+    // Watch the tantivy corpus and rebuild the EdgeIndex whenever new docs
+    // land via the auto-reindex thread (60s poll interval is sufficient
+    // since the reindex tick is 120s by default).
+    spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
 
     // Restore webhook + workflow registries from disk so installs
     // survive daemon restart. Re-run install_check at restore time —

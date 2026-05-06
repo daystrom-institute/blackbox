@@ -220,6 +220,12 @@ impl TranscriptIndex {
         searcher.num_docs() == 0
     }
 
+    /// Current document count from a fresh searcher snapshot. Used by the
+    /// edge-index rebuild watcher to detect when the corpus has grown.
+    pub fn num_docs(&self) -> u64 {
+        self.reader.searcher().num_docs()
+    }
+
     pub(crate) fn edge_projection_docs(&self) -> Result<Vec<EdgeProjectionDoc>> {
         let searcher = self.reader.searcher();
         let limit = searcher.num_docs() as usize;
