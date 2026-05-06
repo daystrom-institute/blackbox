@@ -124,6 +124,11 @@ The v1 trigger does not reliably populate `source_query`. Until the
 of `source_session`, `source_query`, or `source_files` is present. Candidates
 with all three absent are rejected.
 
+The M2 compaction gate test verified that workflow gate entities include
+flattened `vars`, so the auto-digest quality and bro-trust packets now
+standardize on `vars.candidate.*` fields rather than dual flat-or-vars
+predicates.
+
 ## M4
 
 `KnowledgeEntry.links` is now the durable authored-edge surface for reviewed

@@ -8543,7 +8543,12 @@ mod tests {
             .unwrap();
         let mut matched = 0usize;
         for case in cases {
-            let prediction = packets::apply_with(&packet, &case["proposal"], &*packet_store)
+            let entity = serde_json::json!({
+                "vars": {
+                    "candidate": case["proposal"].clone()
+                }
+            });
+            let prediction = packets::apply_with(&packet, &entity, &*packet_store)
                 .unwrap_or_else(|| panic!("case {} produced no verdict", case["id"]));
             if prediction.classification == case["expected_verdict"].as_str().unwrap() {
                 matched += 1;

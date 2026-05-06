@@ -9,11 +9,9 @@
       "id": "hold_rendered_entries",
       "classification": "hold_for_review",
       "antecedent": {
-        "op": "Any",
-        "args": [
-          { "op": "Eq", "field": "rendered", "value": true },
-          { "op": "Eq", "field": "vars.candidate.rendered", "value": true }
-        ]
+        "op": "Eq",
+        "field": "vars.candidate.rendered",
+        "value": true
       },
       "consequent": "hold_for_review"
     },
@@ -24,49 +22,24 @@
         "op": "All",
         "args": [
           {
-            "op": "All",
+            "op": "Any",
             "args": [
-              {
-                "op": "Any",
-                "args": [
-                  { "op": "IsNull", "field": "source_session" },
-                  { "op": "IsMissing", "field": "source_session" }
-                ]
-              },
-              {
-                "op": "Any",
-                "args": [
-                  { "op": "IsNull", "field": "vars.candidate.source_session" },
-                  { "op": "IsMissing", "field": "vars.candidate.source_session" }
-                ]
-              }
+              { "op": "IsNull", "field": "vars.candidate.source_session" },
+              { "op": "IsMissing", "field": "vars.candidate.source_session" }
             ]
           },
           {
-            "op": "All",
+            "op": "Any",
             "args": [
-              {
-                "op": "Any",
-                "args": [
-                  { "op": "IsNull", "field": "source_query" },
-                  { "op": "IsMissing", "field": "source_query" }
-                ]
-              },
-              {
-                "op": "Any",
-                "args": [
-                  { "op": "IsNull", "field": "vars.candidate.source_query" },
-                  { "op": "IsMissing", "field": "vars.candidate.source_query" }
-                ]
-              }
+              { "op": "IsNull", "field": "vars.candidate.source_query" },
+              { "op": "IsMissing", "field": "vars.candidate.source_query" }
             ]
           },
           {
-            "op": "All",
-            "args": [
-              { "op": "CountCmp", "path": "source_files[*]", "compare": "eq", "value": 0 },
-              { "op": "CountCmp", "path": "vars.candidate.source_files[*]", "compare": "eq", "value": 0 }
-            ]
+            "op": "CountCmp",
+            "path": "vars.candidate.source_files[*]",
+            "compare": "eq",
+            "value": 0
           }
         ]
       },
@@ -89,11 +62,9 @@
       "id": "auto_apply_nonrendered_under_daily_cap",
       "classification": "auto_apply",
       "antecedent": {
-        "op": "Any",
-        "args": [
-          { "op": "Lt", "field": "daily_count", "value": 50 },
-          { "op": "Lt", "field": "vars.candidate.daily_count", "value": 50 }
-        ]
+        "op": "Lt",
+        "field": "vars.candidate.daily_count",
+        "value": 50
       },
       "consequent": "auto_apply"
     },

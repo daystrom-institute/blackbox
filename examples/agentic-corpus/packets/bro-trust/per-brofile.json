@@ -9,11 +9,9 @@
       "id": "trusted_digest_extractor",
       "classification": "trusted",
       "antecedent": {
-        "op": "Any",
-        "args": [
-          { "op": "Eq", "field": "brofile", "value": "digest-extractor" },
-          { "op": "Eq", "field": "vars.candidate.brofile", "value": "digest-extractor" }
-        ]
+        "op": "Eq",
+        "field": "vars.candidate.brofile",
+        "value": "digest-extractor"
       },
       "consequent": "trusted"
     },
@@ -21,11 +19,9 @@
       "id": "quarantine_known_bad",
       "classification": "quarantine",
       "antecedent": {
-        "op": "Any",
-        "args": [
-          { "op": "Eq", "field": "brofile", "value": "quarantined-brofile" },
-          { "op": "Eq", "field": "vars.candidate.brofile", "value": "quarantined-brofile" }
-        ]
+        "op": "Eq",
+        "field": "vars.candidate.brofile",
+        "value": "quarantined-brofile"
       },
       "consequent": "quarantine"
     },
