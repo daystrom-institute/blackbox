@@ -15,6 +15,8 @@ const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
+type ProviderSpec = (String, Arc<dyn EmbeddingProvider>, Option<u32>, String);
+
 #[derive(Debug, Clone)]
 pub struct EmbedRequest {
     pub bucket: Bucket,
@@ -92,8 +94,7 @@ impl EmbedQueueHandle {
     }
 
     fn from_router(router: EmbeddingRouter, debounce: Duration, retry_backoff: Duration) -> Self {
-        let mut providers: Vec<(String, Arc<dyn EmbeddingProvider>, Option<u32>, String)> =
-            Vec::new();
+        let mut providers: Vec<ProviderSpec> = Vec::new();
         for bucket in Bucket::ALL {
             let route = bucket.as_str().to_string();
             match router.route_for(bucket, None) {
@@ -320,7 +321,7 @@ impl EmbedQueueHandle {
     }
 
     fn from_providers(
-        providers: Vec<(String, Arc<dyn EmbeddingProvider>, Option<u32>, String)>,
+        providers: Vec<ProviderSpec>,
         debounce: Duration,
         retry_backoff: Duration,
         router: Option<EmbeddingRouter>,

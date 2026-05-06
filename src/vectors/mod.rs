@@ -1,3 +1,5 @@
+#![allow(dead_code)] // E3 lands vector API; H1 wires search callers.
+
 pub mod distance;
 pub mod hnsw;
 pub mod slab;
