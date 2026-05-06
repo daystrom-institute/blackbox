@@ -43,38 +43,38 @@ pub struct HybridSearchParams {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HybridSearchResponse {
-    text: String,
-    results: Vec<HybridResult>,
-    vector_status: HybridVectorStatus,
-    degraded: HybridDegraded,
+pub(crate) struct HybridSearchResponse {
+    pub(crate) text: String,
+    pub(crate) results: Vec<HybridResult>,
+    pub(crate) vector_status: HybridVectorStatus,
+    pub(crate) degraded: HybridDegraded,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HybridResult {
-    rank: usize,
-    entity_id: String,
-    score: f32,
-    base_score: f32,
-    label: String,
-    doc_type: Option<String>,
-    chunk_kind: Option<String>,
-    role: Option<String>,
-    sources: BTreeMap<String, f32>,
-    excerpt: Option<String>,
+pub(crate) struct HybridResult {
+    pub(crate) rank: usize,
+    pub(crate) entity_id: String,
+    pub(crate) score: f32,
+    pub(crate) base_score: f32,
+    pub(crate) label: String,
+    pub(crate) doc_type: Option<String>,
+    pub(crate) chunk_kind: Option<String>,
+    pub(crate) role: Option<String>,
+    pub(crate) sources: BTreeMap<String, f32>,
+    pub(crate) excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-struct HybridVectorStatus {
-    queues: BTreeMap<String, crate::embed::queue::RouteStatus>,
-    partitions: BTreeMap<String, PartitionMetrics>,
-    searched_partitions: Vec<String>,
+pub(crate) struct HybridVectorStatus {
+    pub(crate) queues: BTreeMap<String, crate::embed::queue::RouteStatus>,
+    pub(crate) partitions: BTreeMap<String, PartitionMetrics>,
+    pub(crate) searched_partitions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-struct HybridDegraded {
-    vector_errors: BTreeMap<String, String>,
-    skipped_partitions: BTreeMap<String, String>,
+pub(crate) struct HybridDegraded {
+    pub(crate) vector_errors: BTreeMap<String, String>,
+    pub(crate) skipped_partitions: BTreeMap<String, String>,
 }
 
 pub fn hybrid_search(
@@ -83,6 +83,17 @@ pub fn hybrid_search(
     ctx: &ProviderContext<'_>,
     p: &HybridSearchParams,
 ) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&hybrid_search_typed(
+        index, knowledge, ctx, p,
+    )?)?)
+}
+
+pub(crate) fn hybrid_search_typed(
+    index: &TranscriptIndex,
+    knowledge: &Knowledge,
+    ctx: &ProviderContext<'_>,
+    p: &HybridSearchParams,
+) -> Result<HybridSearchResponse> {
     let query = p.query.trim();
     if query.is_empty() {
         anyhow::bail!("query is required");
@@ -180,12 +191,12 @@ pub fn hybrid_search(
     }
 
     let text = render_text(query, &results, &vector_status, &degraded);
-    Ok(serde_json::to_string_pretty(&HybridSearchResponse {
+    Ok(HybridSearchResponse {
         text,
         results,
         vector_status,
         degraded,
-    })?)
+    })
 }
 
 fn vector_ranked_lists(

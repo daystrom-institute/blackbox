@@ -3,14 +3,15 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::edge_index::{Edge, EdgeIndex};
 use crate::entity_loader;
 use crate::entity_ref::EntityRef;
 use crate::index::TranscriptIndex;
 use crate::knowledge::Knowledge;
-use crate::mcp_tools::hybrid_search::{self, HybridSearchParams};
+use crate::mcp_tools::hybrid_search::{
+    self, HybridDegraded, HybridResult, HybridSearchParams, HybridVectorStatus,
+};
 use crate::providers::{self, Neighborhood, ProviderContext};
 
 const DEFAULT_LIMIT: u64 = 8;
@@ -37,8 +38,8 @@ struct DiscoverSeedResponse {
     status: &'static str,
     text: String,
     seeds: Vec<SeedEntity>,
-    vector_status: Value,
-    degraded: Value,
+    vector_status: HybridVectorStatus,
+    degraded: HybridDegraded,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,7 +67,7 @@ pub fn discover_seed_entities(
     p: &DiscoverSeedParams,
 ) -> Result<String> {
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let hybrid = hybrid_search::hybrid_search(
+    let hybrid = hybrid_search::hybrid_search_typed(
         index,
         knowledge,
         ctx,
@@ -79,55 +80,44 @@ pub fn discover_seed_entities(
             query_vector: p.query_vector.clone(),
         },
     )?;
-    let hybrid: Value = serde_json::from_str(&hybrid)?;
     let seeds = hybrid
-        .get("results")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+        .results
+        .iter()
         .filter_map(|result| seed_from_hybrid_result(ctx, edge_index, result))
         .collect::<Vec<_>>();
-    let vector_status = hybrid.get("vector_status").cloned().unwrap_or(Value::Null);
-    let degraded = hybrid.get("degraded").cloned().unwrap_or(Value::Null);
     let text = render_text(&p.query, &seeds);
     Ok(serde_json::to_string_pretty(&DiscoverSeedResponse {
         status: "ok",
         text,
         seeds,
-        vector_status,
-        degraded,
+        vector_status: hybrid.vector_status,
+        degraded: hybrid.degraded,
     })?)
 }
 
 fn seed_from_hybrid_result(
     ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
-    result: &Value,
+    result: &HybridResult,
 ) -> Option<SeedEntity> {
-    let entity_ref = result.get("entity_id")?.as_str()?;
+    let entity_ref = result.entity_id.as_str();
     let parsed = EntityRef::parse(entity_ref).ok()?;
-    let label = result
-        .get("label")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| entity_loader::compact_label(ctx, &parsed, None))
-        .unwrap_or_else(|| entity_ref.to_string());
-    let score = result.get("score").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-    let match_source = result
-        .get("sources")
-        .and_then(Value::as_object)
-        .map(match_source)
-        .unwrap_or_else(|| "hybrid".into());
+    let label = if result.label.trim().is_empty() {
+        entity_loader::compact_label(ctx, &parsed, None).unwrap_or_else(|| entity_ref.to_string())
+    } else {
+        result.label.clone()
+    };
+    let match_source = match_source(&result.sources);
     Some(SeedEntity {
         entity_ref: entity_ref.to_string(),
         label,
-        score,
+        score: result.score,
         match_source,
         notable_edges: notable_edges(ctx, edge_index, &parsed),
     })
 }
 
-fn match_source(sources: &serde_json::Map<String, Value>) -> String {
+fn match_source(sources: &std::collections::BTreeMap<String, f32>) -> String {
     let has_bm25 = sources.contains_key("bm25");
     let has_vector = sources.keys().any(|key| key.starts_with("vector:"));
     match (has_bm25, has_vector) {
@@ -304,12 +294,18 @@ mod tests {
 
     #[test]
     fn empty_edge_index_keeps_seed_without_edges() {
-        let result = serde_json::json!({
-            "entity_id": "knowledge:a",
-            "label": "A",
-            "score": 0.5,
-            "sources": {"bm25": 0.1},
-        });
+        let result = HybridResult {
+            rank: 1,
+            entity_id: "knowledge:a".into(),
+            score: 0.5,
+            base_score: 0.5,
+            label: "A".into(),
+            doc_type: Some("knowledge".into()),
+            chunk_kind: None,
+            role: None,
+            sources: std::collections::BTreeMap::from([("bm25".into(), 0.1)]),
+            excerpt: None,
+        };
         let ctx = ProviderContext::empty_for_tests();
         let seed = seed_from_hybrid_result(&ctx, &EdgeIndex::default(), &result).unwrap();
         assert!(seed.notable_edges.is_empty());
