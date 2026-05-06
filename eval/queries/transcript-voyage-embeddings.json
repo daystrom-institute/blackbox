@@ -1,6 +1,7 @@
 {
   "id": "transcript-voyage-embeddings",
   "query_class": "transcript_provenance",
+  "pass_strictness": "first",
   "query": "where did we discuss Voyage embeddings for agentic corpus?",
   "target_locators": [
     {

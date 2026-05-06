@@ -1,6 +1,7 @@
 {
   "id": "decision-render-pipeline-unidirectional",
   "query_class": "stale_decision_lookup",
+  "pass_strictness": "all",
   "query": "is bbox_absorb still the source of truth for rendered memory files?",
   "target_locators": [
     {

@@ -1,6 +1,7 @@
 {
   "id": "decision-rule-packet-primitive",
   "query_class": "stale_decision_lookup",
+  "pass_strictness": "all",
   "query": "what was decided about adding rule-packets to blackbox?",
   "target_locators": [
     {

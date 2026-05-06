@@ -1,6 +1,7 @@
 {
   "id": "cross-modal-notes-side-channel",
   "query_class": "cross_modal_code_prose",
+  "pass_strictness": "all",
   "query": "connect side-channel note guidance to the Notes implementation.",
   "target_locators": [
     {

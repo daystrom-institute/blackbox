@@ -136,6 +136,8 @@ pub struct EvalQueryManifest {
     pub target_locators: Vec<TargetLocator>,
     #[serde(default)]
     pub expected_entity_refs: Vec<String>,
+    #[serde(default)]
+    pub pass_strictness: PassStrictness,
     pub required_evidence: RequiredEvidence,
     pub forbidden_stale_answers: Vec<String>,
     pub pass_classifier: String,
@@ -149,6 +151,20 @@ pub enum QueryClass {
     StaleDecisionLookup,
     TranscriptProvenance,
     CrossModalCodeProse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PassStrictness {
+    Any,
+    All,
+    First,
+}
+
+impl Default for PassStrictness {
+    fn default() -> Self {
+        Self::Any
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,7 +276,7 @@ fn default_stub_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>
 }
 
 fn expected_ref_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>) {
-    let expected = match expected_refs_for_checker(name) {
+    let (expected, strictness) = match expected_refs_for_checker(name) {
         Ok(expected) => expected,
         Err(err) => return (false, vec![err]),
     };
@@ -270,14 +286,25 @@ fn expected_ref_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>
             vec![format!("{name} has no expected_entity_refs materialized")],
         );
     }
-    let matched = expected.iter().any(|expected| collected.contains(expected));
+    let matched = match strictness {
+        PassStrictness::Any => expected.iter().any(|expected| collected.contains(expected)),
+        PassStrictness::All => expected.iter().all(|expected| collected.contains(expected)),
+        PassStrictness::First => expected
+            .first()
+            .is_some_and(|expected| collected.contains(expected)),
+    };
     if matched {
-        (true, vec![format!("{name} matched an expected entity ref")])
+        (
+            true,
+            vec![format!(
+                "{name} matched expected entity refs with {strictness:?} strictness"
+            )],
+        )
     } else {
         (
             false,
             vec![format!(
-                "{name} expected one of [{}], collected [{}]",
+                "{name} expected {strictness:?} match for [{}], collected [{}]",
                 expected
                     .iter()
                     .map(EntityRef::to_string)
@@ -293,7 +320,7 @@ fn expected_ref_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>
     }
 }
 
-fn expected_refs_for_checker(name: &str) -> Result<Vec<EntityRef>, String> {
+fn expected_refs_for_checker(name: &str) -> Result<(Vec<EntityRef>, PassStrictness), String> {
     let manifests = load_manifests().map_err(|err| err.to_string())?;
     let Some(manifest) = manifests
         .into_iter()
@@ -301,16 +328,18 @@ fn expected_refs_for_checker(name: &str) -> Result<Vec<EntityRef>, String> {
     else {
         return Err(format!("unknown checker {name}"));
     };
-    manifest
+    let expected = manifest
         .expected_entity_refs
         .iter()
         .map(|raw| EntityRef::parse(raw).map_err(|err| err.to_string()))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((expected, manifest.pass_strictness))
 }
 
 macro_rules! stub_checker {
     ($name:ident) => {
         pub fn $name(collected: &[EntityRef]) -> (bool, Vec<String>) {
+            // H3 replaces this shared oracle with per-class harness logic.
             default_stub_check(stringify!($name), collected)
         }
     };
@@ -458,6 +487,38 @@ mod tests {
     }
 
     #[test]
+    fn strictness_controls_expected_ref_matching() {
+        let manifests = load_manifests().expect("all eval manifests parse");
+
+        let cross_modal = manifests
+            .iter()
+            .find(|manifest| manifest.query_class == QueryClass::CrossModalCodeProse)
+            .expect("cross-modal manifest exists");
+        assert_eq!(cross_modal.pass_strictness, PassStrictness::All);
+        let cross_modal_refs = parsed_expected(cross_modal);
+        let checker = checker_by_name(&cross_modal.pass_classifier).unwrap();
+        let (passed, _messages) = checker(&cross_modal_refs[..1]);
+        assert!(
+            !passed,
+            "cross-modal checks require all expected refs, not just one"
+        );
+        let (passed, _messages) = checker(&cross_modal_refs);
+        assert!(passed);
+
+        let transcript = manifests
+            .iter()
+            .find(|manifest| manifest.query_class == QueryClass::TranscriptProvenance)
+            .expect("transcript manifest exists");
+        assert_eq!(transcript.pass_strictness, PassStrictness::First);
+
+        let exact = manifests
+            .iter()
+            .find(|manifest| manifest.query_class == QueryClass::ExactSymbol)
+            .expect("exact-symbol manifest exists");
+        assert_eq!(exact.pass_strictness, PassStrictness::Any);
+    }
+
+    #[test]
     fn load_manifest_rejects_invalid_entity_type_hint() {
         let mut value: serde_json::Value = serde_json::from_str(MANIFEST_SOURCES[0].1).unwrap();
         value["target_locators"][0]["entity_type_hint"] = "smbol".into();
@@ -480,6 +541,14 @@ mod tests {
 
         assert!(err.contains(&"x".repeat(80)));
         assert!(!err.contains(&"x".repeat(120)));
+    }
+
+    fn parsed_expected(manifest: &EvalQueryManifest) -> Vec<EntityRef> {
+        manifest
+            .expected_entity_refs
+            .iter()
+            .map(|raw| EntityRef::parse(raw).unwrap())
+            .collect()
     }
 
     fn expected_ref_resolves(manifest: &EvalQueryManifest, entity_ref: &EntityRef) -> bool {

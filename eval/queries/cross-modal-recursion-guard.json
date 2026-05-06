@@ -1,6 +1,7 @@
 {
   "id": "cross-modal-recursion-guard",
   "query_class": "cross_modal_code_prose",
+  "pass_strictness": "all",
   "query": "show the docs and implementation for the mechanical recursion guard.",
   "target_locators": [
     {

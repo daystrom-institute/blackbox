@@ -1,6 +1,7 @@
 {
   "id": "decision-bro-account-env",
   "query_class": "stale_decision_lookup",
+  "pass_strictness": "all",
   "query": "how should brofile account names affect provider environment?",
   "target_locators": [
     {

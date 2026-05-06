@@ -1,6 +1,7 @@
 {
   "id": "transcript-mechanical-recursion-guard",
   "query_class": "transcript_provenance",
+  "pass_strictness": "first",
   "query": "where was the mechanical bro recursion guard discussed?",
   "target_locators": [
     {

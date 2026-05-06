@@ -1,6 +1,7 @@
 {
   "id": "cross-modal-workflow-engine",
   "query_class": "cross_modal_code_prose",
+  "pass_strictness": "all",
   "query": "connect the workflow runbook to the workflow engine implementation.",
   "target_locators": [
     {

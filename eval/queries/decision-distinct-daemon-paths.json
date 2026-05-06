@@ -1,6 +1,7 @@
 {
   "id": "decision-distinct-daemon-paths",
   "query_class": "stale_decision_lookup",
+  "pass_strictness": "all",
   "query": "what was decided about prod and dev blackbox daemon install paths?",
   "target_locators": [
     {

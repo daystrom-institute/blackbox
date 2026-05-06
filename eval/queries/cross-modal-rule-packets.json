@@ -1,6 +1,7 @@
 {
   "id": "cross-modal-rule-packets",
   "query_class": "cross_modal_code_prose",
+  "pass_strictness": "all",
   "query": "show where rule-packets are documented and implemented.",
   "target_locators": [
     {

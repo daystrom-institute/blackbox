@@ -1,6 +1,7 @@
 {
   "id": "transcript-postgres-snake-case",
   "query_class": "transcript_provenance",
+  "pass_strictness": "first",
   "query": "where did the Postgres snake_case column convention come from?",
   "target_locators": [
     {

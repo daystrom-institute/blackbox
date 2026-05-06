@@ -1,6 +1,7 @@
 {
   "id": "transcript-rule-packet-validation",
   "query_class": "transcript_provenance",
+  "pass_strictness": "first",
   "query": "where did rule-packet validation get discussed?",
   "target_locators": [
     {

@@ -1,6 +1,7 @@
 {
   "id": "decision-deep-docs-system-memory",
   "query_class": "stale_decision_lookup",
+  "pass_strictness": "all",
   "query": "where should deep blackbox tool documentation live?",
   "target_locators": [
     {

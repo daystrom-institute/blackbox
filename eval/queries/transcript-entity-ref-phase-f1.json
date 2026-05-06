@@ -1,6 +1,7 @@
 {
   "id": "transcript-entity-ref-phase-f1",
   "query_class": "transcript_provenance",
+  "pass_strictness": "first",
   "query": "where was Phase F1 entity-ref parser implemented?",
   "target_locators": [
     {

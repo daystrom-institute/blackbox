@@ -1,6 +1,7 @@
 {
   "id": "decision-rule-packet-validation",
   "query_class": "stale_decision_lookup",
+  "pass_strictness": "all",
   "query": "what validated the rule-packet gap-to-primitive loop?",
   "target_locators": [
     {

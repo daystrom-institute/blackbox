@@ -1,6 +1,7 @@
 {
   "id": "cross-modal-knowledge-store",
   "query_class": "cross_modal_code_prose",
+  "pass_strictness": "all",
   "query": "show the code and design context for KnowledgeStore indexing.",
   "target_locators": [
     {

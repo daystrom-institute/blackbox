@@ -1,6 +1,7 @@
 {
   "id": "cross-modal-entity-ref-parser",
   "query_class": "cross_modal_code_prose",
+  "pass_strictness": "all",
   "query": "show the entity-ref grammar and the parser that implements it.",
   "target_locators": [
     {

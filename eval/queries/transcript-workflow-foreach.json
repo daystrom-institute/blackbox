@@ -1,6 +1,7 @@
 {
   "id": "transcript-workflow-foreach",
   "query_class": "transcript_provenance",
+  "pass_strictness": "first",
   "query": "where did we track the workflow foreach follow-up?",
   "target_locators": [
     {
