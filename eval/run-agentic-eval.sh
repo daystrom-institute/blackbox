@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Agentic corpus evaluation harness.
 # Usage: eval/run-agentic-eval.sh [all|failed] [trials] [parallel]
+# By default, the harness runs LLM commands in an isolated git worktree to
+# contain accidental file modifications from eval agents. Set
+# EVAL_USE_WORKTREE=0 to run directly in the current checkout. The default LLM
+# command is `codex exec --dangerously-bypass-approvals-and-sandbox`; set
+# EVAL_LLM_CMD to use another provider/command.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,8 +20,26 @@ TRIALS="${2:-1}"
 PARALLEL="${3:-1}"
 STRATEGIES="${EVAL_STRATEGIES:-search-only,static-hybrid,agentic}"
 LIMIT="${EVAL_LIMIT:-0}"
+EVAL_USE_WORKTREE="${EVAL_USE_WORKTREE:-1}"
+LLM_WORKDIR="$REPO_ROOT"
+EVAL_WORKTREE_DIR=""
 
 mkdir -p "$RUN_DIR"
+
+setup_eval_worktree() {
+    if [[ "$EVAL_USE_WORKTREE" != "1" ]]; then
+        return 0
+    fi
+    EVAL_WORKTREE_DIR="${EVAL_WORKTREE_PATH:-/tmp/agentic-eval-worktree-${TIMESTAMP}-$$}"
+    git -C "$REPO_ROOT" worktree add --detach "$EVAL_WORKTREE_DIR" HEAD >/dev/null
+    LLM_WORKDIR="$EVAL_WORKTREE_DIR"
+}
+
+cleanup_eval_worktree() {
+    if [[ -n "$EVAL_WORKTREE_DIR" && -d "$EVAL_WORKTREE_DIR" ]]; then
+        git -C "$REPO_ROOT" worktree remove --force "$EVAL_WORKTREE_DIR" >/dev/null 2>&1 || true
+    fi
+}
 
 check_dev_daemon() {
     if [[ "${EVAL_SKIP_DEV_CHECK:-0}" == "1" ]]; then
@@ -107,11 +130,14 @@ PY
     local prompt_text
     prompt_text="$(<"$prompt_file")"
     if [[ -n "${EVAL_LLM_CMD:-}" ]]; then
-        BLACKBOX_MCP_URL="$MCP_URL" BLACKBOX_MCP_NAME="blackbox-dev" \
-            bash -lc "$EVAL_LLM_CMD" <"$prompt_file" >"$raw_file"
+        (
+            cd "$LLM_WORKDIR"
+            BLACKBOX_MCP_URL="$MCP_URL" BLACKBOX_MCP_NAME="blackbox-dev" \
+                bash -lc "$EVAL_LLM_CMD" <"$prompt_file" >"$raw_file"
+        )
     else
         BLACKBOX_MCP_URL="$MCP_URL" BLACKBOX_MCP_NAME="blackbox-dev" \
-            codex exec --dangerously-bypass-approvals-and-sandbox -C "$REPO_ROOT" "$prompt_text" >"$raw_file"
+            codex exec --dangerously-bypass-approvals-and-sandbox -C "$LLM_WORKDIR" "$prompt_text" >"$raw_file"
     fi
     [[ -s "$raw_file" ]]
 }
@@ -268,6 +294,8 @@ PY
 
 main() {
     check_dev_daemon
+    setup_eval_worktree
+    trap cleanup_eval_worktree EXIT
     mapfile -t manifests < <(manifest_list)
     IFS=',' read -r -a strategies <<<"$STRATEGIES"
     if [[ "${#manifests[@]}" -eq 0 ]]; then
