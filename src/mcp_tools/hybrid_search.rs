@@ -112,12 +112,24 @@ pub(crate) fn hybrid_search_typed(
         .limit
         .unwrap_or(DEFAULT_LIMIT as u64)
         .min(MAX_LIMIT as u64) as usize;
-    // Widened to limit*8 (was limit*4) so per-file collapse has enough
-    // depth to surface `limit` distinct files even when the top-N is
-    // dominated by multiple chunks of the same hot file.
+    // Widened to limit*8 so per-file collapse has enough depth to surface
+    // `limit` distinct files even when the top-N is dominated by multiple
+    // chunks of the same hot file.
     let fetch = DEFAULT_FETCH.max(limit * 8);
+    // BM25 fetches deeper (limit*32) specifically to feed the file-level
+    // aggregation pass. A high-mention file with chunks spread across many
+    // sections (e.g. STATUS.md with 21 mentions across ~30 chunks) can
+    // have every chunk individually rank below the chunk-level fetch
+    // window, missing top-N entirely. Aggregating over a larger sample
+    // lets the file's total query-term density surface even when no
+    // single chunk is competitive.
+    let bm25_fetch = (limit * 32).max(fetch);
     let (bm25_weight, vector_weight) = fusion_weights(p.vector_weight);
-    let bm25_hits = index.hybrid_bm25_hits(query, fetch, p.doc_type.as_deref())?;
+    let bm25_hits_full = index.hybrid_bm25_hits(query, bm25_fetch, p.doc_type.as_deref())?;
+    // Truncate the chunk-level list to `fetch` so it doesn't dilute RRF with
+    // tail chunks that rank too low to matter. The full set still feeds
+    // file-level aggregation below.
+    let bm25_hits: Vec<_> = bm25_hits_full.iter().take(fetch).cloned().collect();
     let mut features = features_from_bm25(&bm25_hits);
 
     let mut lists = vec![RankedList {
@@ -133,6 +145,21 @@ pub(crate) fn hybrid_search_typed(
             })
             .collect(),
     }];
+    // File-level BM25 aggregation: sum chunk scores per (project_id,
+    // rel_path_hash) over the FULL bm25 fetch (not the truncated chunk
+    // list) and contribute the file-level ranking as a separate signal
+    // into RRF. Lifts files with many sparse mentions across many chunks
+    // (STATUS.md, ARCS.md, etc.) — without aggregation each chunk gets
+    // a low individual score and the file falls off the top-N even when
+    // its total query-term density is the highest in the corpus.
+    let bm25_file_hits = aggregate_bm25_by_file(&bm25_hits_full);
+    if !bm25_file_hits.is_empty() {
+        lists.push(RankedList {
+            source: "bm25_file".into(),
+            weight: bm25_weight,
+            hits: bm25_file_hits,
+        });
+    }
 
     let mut vector_status = HybridVectorStatus {
         queues: embed_queue::status_response().routes,
@@ -244,6 +271,67 @@ pub(crate) fn hybrid_search_typed(
         vector_status,
         degraded,
     })
+}
+
+/// Aggregates per-chunk BM25 scores up to per-file scores and returns a
+/// ranked list keyed on the highest-scoring chunk per file. Chunks of
+/// non-project_file entities (commits, transcripts, knowledge) pass through
+/// individually so they're not double-counted in the file aggregation.
+fn aggregate_bm25_by_file(
+    chunks: &[crate::index::HybridBm25Hit],
+) -> Vec<RankedHit> {
+    use std::collections::HashMap;
+    // Group project_file chunks by (project_id, rel_path_hash). Track
+    // sum-of-scores AND count, then rank by `sum * sqrt(count)` so a file
+    // with many matching chunks (high topical coverage even when each
+    // chunk's individual TF-IDF is mediocre, e.g. STATUS.md sprawled
+    // across many sections) ranks above a file with fewer but slightly
+    // denser chunks. Score sum alone underweights breadth; sqrt(count)
+    // alone overweights it. The geometric blend lifts coverage cleanly.
+    let mut by_file: HashMap<String, (f32, usize, &crate::index::HybridBm25Hit)> =
+        HashMap::new();
+    let mut non_file_hits: Vec<&crate::index::HybridBm25Hit> = Vec::new();
+    for hit in chunks {
+        let Some(key) = file_dedup_key(&hit.entity_id) else {
+            non_file_hits.push(hit);
+            continue;
+        };
+        by_file
+            .entry(key)
+            .and_modify(|(score, count, repr)| {
+                *score += hit.score;
+                *count += 1;
+                if hit.score > repr.score {
+                    *repr = hit;
+                }
+            })
+            .or_insert((hit.score, 1, hit));
+    }
+    if by_file.len() <= 1 {
+        // Aggregation only contributes signal when multiple files appear in
+        // the chunk-level results. With one or zero, there's nothing to
+        // re-rank — return empty so the existing chunk-level RRF pass owns
+        // the ranking.
+        return Vec::new();
+    }
+    let mut aggregated: Vec<(String, f32, &crate::index::HybridBm25Hit)> = by_file
+        .into_iter()
+        .map(|(_, (score, count, repr))| {
+            let combined = score * (count as f32).sqrt();
+            (repr.entity_id.clone(), combined, repr)
+        })
+        .collect();
+    aggregated.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    aggregated
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (entity_id, score, _repr))| RankedHit {
+            entity_id,
+            rank: idx + 1,
+            score,
+            source: "bm25_file".into(),
+        })
+        .collect()
 }
 
 /// Resolves the caller's `project` parameter to a canonical project_id
