@@ -451,6 +451,68 @@ mod tests {
     }
 
     #[test]
+    fn supersedes_chain_accumulates_across_three_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        let first = serde_json::json!({
+            "name": "chain-v1",
+            "version": 1,
+            "actors": {},
+            "start": "Done",
+            "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+        });
+        let second = serde_json::json!({
+            "name": "chain-v2",
+            "version": 2,
+            "supersedes": "chain-v1",
+            "actors": {},
+            "start": "Done",
+            "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+        });
+        let third = serde_json::json!({
+            "name": "chain-v3",
+            "version": 3,
+            "supersedes": "chain-v2",
+            "actors": {},
+            "start": "Done",
+            "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+        });
+
+        catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "first.json".into(),
+                &first,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "second.json".into(),
+                &second,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let meta = catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "third.json".into(),
+                &third,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(meta.supersedes_chain, vec!["chain-v1", "chain-v2"]);
+    }
+
+    #[test]
     fn discovers_project_bbox_artifacts_without_installing() {
         let dir = tempfile::tempdir().unwrap();
         let artifact = dir
