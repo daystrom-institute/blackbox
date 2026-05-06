@@ -755,10 +755,18 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_reembed",
-        description = "Request an embedding rebuild for a configured route. E1 records the request and returns ok; the queue and vector-store rebuild implementation lands in E3."
+        description = "Request an embedding rebuild for a configured route."
     )]
     fn bbox_reembed(&self, Parameters(p): Parameters<ReembedParams>) -> CallToolResult {
         Self::run("bbox_reembed", || embed::reembed_stub(&p))
+    }
+
+    #[tool(
+        name = "bbox_embed_status",
+        description = "Return per-route embedding queue health."
+    )]
+    fn bbox_embed_status(&self) -> CallToolResult {
+        Self::run("bbox_embed_status", embed_queue::status_json)
     }
 
     #[tool(
@@ -7566,6 +7574,7 @@ async fn main() -> anyhow::Result<()> {
         councils: Arc::new(council::CouncilRegistry::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
     });
+    embed_queue::install(embed::queue::EmbedQueueHandle::start_default());
 
     // Restore webhook + workflow registries from disk so installs
     // survive daemon restart. Re-run install_check at restore time —

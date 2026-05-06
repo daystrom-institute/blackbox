@@ -166,9 +166,16 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_reembed",
         category: ToolCategory::Transcripts,
-        summary: "Request an embedding rebuild for a configured route. E1 records the request and returns ok; the queue and vector-store rebuild implementation lands in E3.",
-        when_to_use: "Use after changing `~/.config/blackbox/embed.toml` routes or provider dimensions. In E1 this is a stub that records intent; E3 performs the rebuild.",
-        example: Some(r#"bbox_reembed(route="knowledge")"#),
+        summary: "Request an embedding rebuild for a configured route.",
+        when_to_use: "Use after changing embedding routes or provider dimensions. E3 performs the rebuild.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_embed_status",
+        category: ToolCategory::Transcripts,
+        summary: "Return per-route embedding queue health.",
+        when_to_use: "Use when vector search degrades. Reports availability, queue depth, success count, and sanitized error",
+        example: None,
     },
     ToolDoc {
         name: "bbox_topics",

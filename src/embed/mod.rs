@@ -1,6 +1,7 @@
 #![allow(dead_code)] // E1 lands provider/routing surface; E2/E3 wire live consumers.
 
 pub mod ollama;
+pub mod queue;
 pub mod voyage;
 
 use std::collections::BTreeMap;
@@ -35,6 +36,15 @@ pub enum Bucket {
 }
 
 impl Bucket {
+    pub const ALL: [Bucket; 6] = [
+        Bucket::Knowledge,
+        Bucket::Code,
+        Bucket::Docs,
+        Bucket::Transcripts,
+        Bucket::GitMessage,
+        Bucket::Notes,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Knowledge => "knowledge",
@@ -192,6 +202,14 @@ impl EmbeddingRouter {
             .and_then(|routes| routes.get(bucket))
             .or_else(|| self.config.routes.global(bucket))
             .unwrap_or(VOYAGE_PROVIDER_ID)
+    }
+
+    pub fn rate_limit_per_min(&self, provider_id: &str) -> Option<u32> {
+        match provider_id {
+            VOYAGE_PROVIDER_ID => Some(self.config.providers.voyage.rate_limit_per_min),
+            OLLAMA_PROVIDER_ID => None,
+            _ => None,
+        }
     }
 }
 

@@ -1,0 +1,579 @@
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
+use parking_lot::{Mutex, RwLock};
+use rmcp::schemars;
+use serde::Serialize;
+use tokio::sync::mpsc;
+
+use super::{Bucket, EmbeddingProvider, EmbeddingRouter};
+
+const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
+const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+pub struct EmbedRequest {
+    pub bucket: Bucket,
+    pub project_id: Option<String>,
+    pub entity_id: String,
+    pub chunk_hash: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct RouteStatus {
+    pub available: bool,
+    pub indexed_count: u64,
+    pub queue_depth: u64,
+    pub last_error: Option<String>,
+    pub coverage_ratio: Option<f32>,
+}
+
+impl Default for RouteStatus {
+    fn default() -> Self {
+        Self {
+            available: true,
+            indexed_count: 0,
+            queue_depth: 0,
+            last_error: None,
+            coverage_ratio: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct EmbedStatusResponse {
+    pub routes: BTreeMap<String, RouteStatus>,
+}
+
+#[derive(Clone)]
+pub struct EmbedQueueHandle {
+    inner: Arc<EmbedQueueInner>,
+}
+
+struct EmbedQueueInner {
+    senders: RwLock<BTreeMap<String, mpsc::UnboundedSender<WorkerCommand>>>,
+    statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
+    seen_hashes: Mutex<HashSet<String>>,
+    router: Option<EmbeddingRouter>,
+    debounce: Duration,
+    retry_backoff: Duration,
+}
+
+enum WorkerCommand {
+    Enqueue(EmbedRequest),
+    Shutdown,
+}
+
+struct WorkerSpec {
+    route: String,
+    provider: Arc<dyn EmbeddingProvider>,
+    rate_limit_per_min: Option<u32>,
+    debounce: Duration,
+    retry_backoff: Duration,
+    statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
+}
+
+impl EmbedQueueHandle {
+    pub fn start_default() -> Self {
+        match EmbeddingRouter::load_default() {
+            Ok(router) => Self::from_router(router, DEFAULT_DEBOUNCE, DEFAULT_RETRY_BACKOFF),
+            Err(err) => {
+                tracing::warn!(error = %err, "embedding router config failed; embedding queue disabled");
+                Self::disabled_with_error(err)
+            }
+        }
+    }
+
+    fn from_router(router: EmbeddingRouter, debounce: Duration, retry_backoff: Duration) -> Self {
+        let mut providers = Vec::new();
+        for bucket in Bucket::ALL {
+            let route = bucket.as_str().to_string();
+            match router.route_for(bucket, None) {
+                Ok(provider) => {
+                    let provider: Arc<dyn EmbeddingProvider> = provider.into();
+                    let rate_limit_per_min = router.rate_limit_per_min(provider.id());
+                    providers.push((route, provider, rate_limit_per_min));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        route = %route,
+                        error = %err,
+                        "embedding route disabled because provider could not be constructed"
+                    );
+                    providers.push((route, Arc::new(FailingProvider::new(err)), None));
+                }
+            }
+        }
+        Self::from_providers(providers, debounce, retry_backoff, Some(router))
+    }
+
+    pub fn enqueue(&self, request: EmbedRequest) -> bool {
+        let route = match self.resolve_route(&request) {
+            Ok(route) => route,
+            Err(err) => {
+                let fallback = request.bucket.as_str().to_string();
+                mark_error(&self.inner.statuses, &fallback, &sanitize_error(&err));
+                return false;
+            }
+        };
+        let seen_key = format!("{route}:{}", request.chunk_hash);
+        if !self.inner.seen_hashes.lock().insert(seen_key) {
+            tracing::debug!(
+                route = %route,
+                entity_id = %request.entity_id,
+                chunk_hash = %request.chunk_hash,
+                "embedding enqueue skipped unchanged content hash"
+            );
+            return false;
+        }
+        increment_depth(&self.inner.statuses, &route, 1);
+        let sender = self.ensure_sender(&route, &request);
+        match sender {
+            Some(sender) => {
+                let sent = sender.send(WorkerCommand::Enqueue(request)).is_ok();
+                if !sent {
+                    increment_depth(&self.inner.statuses, &route, -1);
+                    mark_error(&self.inner.statuses, &route, "embedding route worker stopped");
+                }
+                sent
+            }
+            None => {
+                increment_depth(&self.inner.statuses, &route, -1);
+                mark_error(&self.inner.statuses, &route, "embedding route is not configured");
+                false
+            }
+        }
+    }
+
+    pub fn tombstone(&self, entity_id: &str) {
+        tracing::debug!(
+            entity_id,
+            "embedding tombstone accepted; vector-store delete lands in E3"
+        );
+    }
+
+    pub fn status(&self) -> EmbedStatusResponse {
+        EmbedStatusResponse {
+            routes: self.inner.statuses.read().clone(),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        for sender in self.inner.senders.read().values() {
+            let _ = sender.send(WorkerCommand::Shutdown);
+        }
+    }
+
+    fn resolve_route(&self, request: &EmbedRequest) -> Result<String> {
+        let Some(router) = &self.inner.router else {
+            return Ok(request.bucket.as_str().to_string());
+        };
+        let route = router.route(request.bucket, request.project_id.as_deref())?;
+        let default = router.route(request.bucket, None)?;
+        if request.project_id.is_some()
+            && (route.provider_id != default.provider_id
+                || route.model != default.model
+                || route.dimensions != default.dimensions)
+        {
+            Ok(format!(
+                "{}:{}",
+                request.bucket.as_str(),
+                request.project_id.as_deref().unwrap_or_default()
+            ))
+        } else {
+            Ok(request.bucket.as_str().to_string())
+        }
+    }
+
+    fn ensure_sender(
+        &self,
+        route: &str,
+        request: &EmbedRequest,
+    ) -> Option<mpsc::UnboundedSender<WorkerCommand>> {
+        if let Some(sender) = self.inner.senders.read().get(route).cloned() {
+            return Some(sender);
+        }
+        let router = self.inner.router.as_ref()?;
+        let provider = match router.route_for(request.bucket, request.project_id.as_deref()) {
+            Ok(provider) => provider,
+            Err(err) => {
+                mark_error(&self.inner.statuses, route, &sanitize_error(&err));
+                return None;
+            }
+        };
+        let provider: Arc<dyn EmbeddingProvider> = provider.into();
+        let rate_limit_per_min = router.rate_limit_per_min(provider.id());
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner
+            .statuses
+            .write()
+            .entry(route.to_string())
+            .or_default();
+        let spec = WorkerSpec {
+            route: route.to_string(),
+            provider,
+            rate_limit_per_min,
+            debounce: self.inner.debounce,
+            retry_backoff: self.inner.retry_backoff,
+            statuses: self.inner.statuses.clone(),
+        };
+        tokio::spawn(worker_loop(spec, rx));
+        self.inner
+            .senders
+            .write()
+            .insert(route.to_string(), tx.clone());
+        Some(tx)
+    }
+
+    fn disabled_with_error(err: anyhow::Error) -> Self {
+        let mut statuses = BTreeMap::new();
+        let message = sanitize_error(&err);
+        for bucket in Bucket::ALL {
+            statuses.insert(
+                bucket.as_str().to_string(),
+                RouteStatus {
+                    available: false,
+                    last_error: Some(message.clone()),
+                    ..RouteStatus::default()
+                },
+            );
+        }
+        Self {
+            inner: Arc::new(EmbedQueueInner {
+                senders: RwLock::new(BTreeMap::new()),
+                statuses: Arc::new(RwLock::new(statuses)),
+                seen_hashes: Mutex::new(HashSet::new()),
+                router: None,
+                debounce: DEFAULT_DEBOUNCE,
+                retry_backoff: DEFAULT_RETRY_BACKOFF,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_providers_for_test(
+        providers: Vec<(&str, Arc<dyn EmbeddingProvider>)>,
+        debounce: Duration,
+        retry_backoff: Duration,
+    ) -> Self {
+        Self::from_providers(
+            providers
+                .into_iter()
+                .map(|(route, provider)| (route.to_string(), provider, None))
+                .collect(),
+            debounce,
+            retry_backoff,
+            None,
+        )
+    }
+
+    fn from_providers(
+        providers: Vec<(String, Arc<dyn EmbeddingProvider>, Option<u32>)>,
+        debounce: Duration,
+        retry_backoff: Duration,
+        router: Option<EmbeddingRouter>,
+    ) -> Self {
+        let statuses = Arc::new(RwLock::new(BTreeMap::new()));
+        let mut senders = BTreeMap::new();
+        for (route, provider, rate_limit_per_min) in providers {
+            statuses
+                .write()
+                .entry(route.clone())
+                .or_insert_with(RouteStatus::default);
+            let (tx, rx) = mpsc::unbounded_channel();
+            let spec = WorkerSpec {
+                route: route.clone(),
+                provider,
+                rate_limit_per_min,
+                debounce,
+                retry_backoff,
+                statuses: statuses.clone(),
+            };
+            tokio::spawn(worker_loop(spec, rx));
+            senders.insert(route, tx);
+        }
+        Self {
+            inner: Arc::new(EmbedQueueInner {
+                senders: RwLock::new(senders),
+                statuses,
+                seen_hashes: Mutex::new(HashSet::new()),
+                router,
+                debounce,
+                retry_backoff,
+            }),
+        }
+    }
+}
+
+async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCommand>) {
+    let mut pending = VecDeque::new();
+    let mut retry_batch = Vec::new();
+    let mut backoff = spec.retry_backoff;
+    loop {
+        let batch = if retry_batch.is_empty() {
+            match collect_quiescent_batch(&mut rx, &mut pending, spec.debounce).await {
+                Some(batch) => batch,
+                None => return,
+            }
+        } else {
+            retry_batch.clone()
+        };
+        apply_rate_limit(spec.rate_limit_per_min).await;
+        let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
+        match spec.provider.embed_batch(&texts).await {
+            Ok(vectors) => {
+                tracing::debug!(
+                    route = %spec.route,
+                    vectors = vectors.len(),
+                    dimensions = spec.provider.dimensions(),
+                    model = spec.provider.model_name(),
+                    "embedding vectors computed and discarded until E3 storage lands"
+                );
+                mark_success(&spec.statuses, &spec.route, batch.len() as u64);
+                retry_batch.clear();
+                backoff = spec.retry_backoff;
+            }
+            Err(err) => {
+                let sanitized = sanitize_error(&err);
+                tracing::warn!(
+                    route = %spec.route,
+                    error = %sanitized,
+                    "embedding batch failed; route will retry without affecting search"
+                );
+                mark_error(&spec.statuses, &spec.route, &sanitized);
+                retry_batch = batch;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+            }
+        }
+    }
+}
+
+async fn collect_quiescent_batch(
+    rx: &mut mpsc::UnboundedReceiver<WorkerCommand>,
+    pending: &mut VecDeque<EmbedRequest>,
+    debounce: Duration,
+) -> Option<Vec<EmbedRequest>> {
+    while pending.is_empty() {
+        match rx.recv().await? {
+            WorkerCommand::Enqueue(request) => pending.push_back(request),
+            WorkerCommand::Shutdown => return None,
+        }
+    }
+    loop {
+        match tokio::time::timeout(debounce, rx.recv()).await {
+            Ok(Some(WorkerCommand::Enqueue(request))) => pending.push_back(request),
+            Ok(Some(WorkerCommand::Shutdown)) | Ok(None) => return None,
+            Err(_) => break,
+        }
+    }
+    Some(pending.drain(..).collect())
+}
+
+async fn apply_rate_limit(rate_limit_per_min: Option<u32>) {
+    let Some(rate_limit) = rate_limit_per_min else {
+        return;
+    };
+    if rate_limit == 0 {
+        return;
+    }
+    let delay_ms = 60_000_u64 / u64::from(rate_limit);
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
+
+fn increment_depth(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, delta: i64) {
+    let mut statuses = statuses.write();
+    let status = statuses.entry(route.to_string()).or_default();
+    if delta.is_negative() {
+        status.queue_depth = status.queue_depth.saturating_sub(delta.unsigned_abs());
+    } else {
+        status.queue_depth = status.queue_depth.saturating_add(delta as u64);
+    }
+}
+
+fn mark_success(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, count: u64) {
+    let mut statuses = statuses.write();
+    let status = statuses.entry(route.to_string()).or_default();
+    status.available = true;
+    status.indexed_count = status.indexed_count.saturating_add(count);
+    status.queue_depth = status.queue_depth.saturating_sub(count);
+    status.last_error = None;
+}
+
+fn mark_error(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, message: &str) {
+    let mut statuses = statuses.write();
+    let status = statuses.entry(route.to_string()).or_default();
+    status.available = false;
+    status.last_error = Some(message.to_string());
+}
+
+fn sanitize_error(err: &anyhow::Error) -> String {
+    let mut message = err.to_string();
+    if let Some((first, _)) = message.split_once('\n') {
+        message = first.to_string();
+    }
+    if message.len() > 200 {
+        message.truncate(197);
+        message.push_str("...");
+    }
+    message
+}
+
+struct FailingProvider {
+    error: String,
+}
+
+impl FailingProvider {
+    fn new(err: anyhow::Error) -> Self {
+        Self {
+            error: sanitize_error(&err),
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for FailingProvider {
+    async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Err(anyhow!(self.error.clone()))
+    }
+
+    fn dimensions(&self) -> usize {
+        0
+    }
+
+    fn model_name(&self) -> &str {
+        "unavailable"
+    }
+
+    fn id(&self) -> &str {
+        "unavailable"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct MockProvider {
+        calls: AtomicUsize,
+        fail: bool,
+    }
+
+    impl MockProvider {
+        fn ok() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for MockProvider {
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(anyhow!("provider unavailable: token redacted"));
+            }
+            Ok(texts.iter().map(|_| vec![0.0_f32; 4]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+
+        fn id(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn debounce_batches_and_dedups_by_content_hash() {
+        let provider = Arc::new(MockProvider::ok());
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("knowledge", provider.clone())],
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        );
+        assert!(queue.enqueue(request(Bucket::Knowledge, "a", "h1")));
+        assert!(!queue.enqueue(request(Bucket::Knowledge, "b", "h1")));
+        assert!(queue.enqueue(request(Bucket::Knowledge, "c", "h2")));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let status = queue.status().routes["knowledge"].clone();
+        assert!(status.available);
+        assert_eq!(status.indexed_count, 2);
+        assert_eq!(status.queue_depth, 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        queue.shutdown();
+    }
+
+    #[tokio::test]
+    async fn provider_outage_keeps_route_backed_up_without_panic() {
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("code", Arc::new(MockProvider::failing()))],
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        );
+        assert!(queue.enqueue(request(Bucket::Code, "a", "h1")));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let status = queue.status().routes["code"].clone();
+        assert!(!status.available);
+        assert_eq!(status.queue_depth, 1);
+        assert!(status.last_error.unwrap().contains("provider unavailable"));
+        queue.shutdown();
+    }
+
+    #[tokio::test]
+    async fn per_project_override_gets_distinct_route_key() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+            [embed.routes]
+            code = "voyage"
+
+            [embed.routes.per_project.proj1234]
+            code = "ollama"
+            "#,
+        )
+        .unwrap();
+        let queue = EmbedQueueHandle::from_router(
+            router,
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        );
+        let mut req = request(Bucket::Code, "a", "h1");
+        assert_eq!(queue.resolve_route(&req).unwrap(), "code");
+        req.project_id = Some("proj1234".into());
+        assert_eq!(queue.resolve_route(&req).unwrap(), "code:proj1234");
+        queue.shutdown();
+    }
+
+    fn request(bucket: Bucket, entity_id: &str, chunk_hash: &str) -> EmbedRequest {
+        EmbedRequest {
+            bucket,
+            project_id: None,
+            entity_id: entity_id.into(),
+            chunk_hash: chunk_hash.into(),
+            text: "hello".into(),
+        }
+    }
+}

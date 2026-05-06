@@ -101,13 +101,7 @@ pub(crate) fn build_project_file_doc(
     commit_sha: Option<&str>,
     f: FieldHandles,
 ) -> TantivyDocument {
-    let entity_id = EntityRef::ProjectFile {
-        project_id: chunk.project_id.clone(),
-        rel_path_hash: chunk.rel_path_hash.clone(),
-        chunk_hash: chunk.chunk_hash.clone(),
-        occurrence_idx: chunk.occurrence_idx,
-    }
-    .to_string();
+    let entity_id = crate::embed_queue::project_file_entity_id(chunk);
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "project_file");
     doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
@@ -217,6 +211,8 @@ fn index_project(
                 commit_sha.as_deref(),
                 ctx.f,
             );
+            let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+            crate::embed_queue::enqueue_project_file(&chunk, &entity_id);
             ctx.writer.add_document(doc)?;
             ctx.stats.indexed_docs += 1;
         }
