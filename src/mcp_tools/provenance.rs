@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::Result;
@@ -30,12 +30,12 @@ struct GitProvenanceNote {
 struct ProducedBy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    brofile: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    arc_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    session_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    brofiles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    arc_thread_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trigger: Option<serde_json::Value>,
 }
@@ -144,10 +144,7 @@ fn project_map<'a>(
 }
 
 fn note_from_edges(commit: &str, edges: &[&Edge], edge_index: &EdgeIndex) -> GitProvenanceNote {
-    let produced_by = edges
-        .first()
-        .map(|edge| produced_by_from_edge(edge, edge_index))
-        .unwrap_or_default();
+    let produced_by = produced_by_from_edges(edges, edge_index);
     GitProvenanceNote {
         commit: commit.to_string(),
         produced_by,
@@ -156,33 +153,48 @@ fn note_from_edges(commit: &str, edges: &[&Edge], edge_index: &EdgeIndex) -> Git
     }
 }
 
-fn produced_by_from_edge(edge: &Edge, edge_index: &EdgeIndex) -> ProducedBy {
-    let mut produced_by = ProducedBy::default();
-    let EntityRef::Transcript {
-        provider,
-        session_id,
-        ..
-    } = &edge.source
-    else {
-        return produced_by;
-    };
-    produced_by.provider = Some(provider.clone());
-    produced_by.session_id = Some(session_id.clone());
-    let session_ref = EntityRef::Session {
-        provider: provider.clone(),
-        session_id: session_id.clone(),
-    };
-    produced_by.brofile = edge_index
-        .forward_edges(&session_ref)
-        .iter()
-        .find(|edge| edge.kind == "SESSION_USED_BROFILE")
-        .map(|edge| edge.target.to_string());
-    produced_by.arc_thread_id = edge_index
-        .reverse_edges(&session_ref)
-        .iter()
-        .find(|edge| edge.kind == "THREAD_HAS_SESSION")
-        .map(|edge| edge.source.to_string());
-    produced_by
+fn produced_by_from_edges(edges: &[&Edge], edge_index: &EdgeIndex) -> ProducedBy {
+    let mut providers = BTreeSet::new();
+    let mut session_ids = BTreeSet::new();
+    let mut brofiles = BTreeSet::new();
+    let mut arc_thread_ids = BTreeSet::new();
+    for edge in edges {
+        let EntityRef::Transcript {
+            provider,
+            session_id,
+            ..
+        } = &edge.source
+        else {
+            continue;
+        };
+        providers.insert(provider.clone());
+        session_ids.insert(session_id.clone());
+        let session_ref = EntityRef::Session {
+            provider: provider.clone(),
+            session_id: session_id.clone(),
+        };
+        brofiles.extend(
+            edge_index
+                .forward_edges(&session_ref)
+                .iter()
+                .filter(|edge| edge.kind == "SESSION_USED_BROFILE")
+                .map(|edge| edge.target.to_string()),
+        );
+        arc_thread_ids.extend(
+            edge_index
+                .reverse_edges(&session_ref)
+                .iter()
+                .filter(|edge| edge.kind == "THREAD_HAS_SESSION")
+                .map(|edge| edge.source.to_string()),
+        );
+    }
+    ProducedBy {
+        provider: providers.into_iter().next(),
+        session_ids: session_ids.into_iter().collect(),
+        brofiles: brofiles.into_iter().collect(),
+        arc_thread_ids: arc_thread_ids.into_iter().collect(),
+        trigger: None,
+    }
 }
 
 fn tool_call_from_edge(edge: &Edge) -> NoteToolCall {
@@ -294,9 +306,9 @@ mod tests {
             commit: "abc123".into(),
             produced_by: ProducedBy {
                 provider: Some("claude".into()),
-                session_id: Some("sess".into()),
-                brofile: Some("brofile:keystone".into()),
-                arc_thread_id: None,
+                session_ids: vec!["sess".into()],
+                brofiles: vec!["brofile:keystone".into()],
+                arc_thread_ids: Vec::new(),
                 trigger: None,
             },
             tool_calls: vec![NoteToolCall {
@@ -314,5 +326,46 @@ mod tests {
         let parsed: GitProvenanceNote = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(parsed, note);
+    }
+
+    #[test]
+    fn note_from_edges_aggregates_distinct_sessions() {
+        let target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "path".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let edge_a = Edge {
+            source: EntityRef::Transcript {
+                provider: "claude".into(),
+                session_id: "sess-a".into(),
+                line_offset: 10,
+                event_idx: 0,
+            },
+            kind: "EDITED_FILE".into(),
+            target: target.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata: BTreeMap::new(),
+        };
+        let edge_b = Edge {
+            source: EntityRef::Transcript {
+                provider: "claude".into(),
+                session_id: "sess-b".into(),
+                line_offset: 11,
+                event_idx: 0,
+            },
+            kind: "READ_FILE".into(),
+            target,
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata: BTreeMap::new(),
+        };
+        let edge_index = EdgeIndex::from_edges_for_tests(vec![edge_a.clone(), edge_b.clone()]);
+
+        let note = note_from_edges("abc123", &[&edge_a, &edge_b], &edge_index);
+
+        assert_eq!(note.produced_by.session_ids, vec!["sess-a", "sess-b"]);
     }
 }
