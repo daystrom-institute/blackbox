@@ -363,8 +363,8 @@ fn derive_code_edges(
                 symbol.clone(),
                 EdgeConfidence::Exact,
             ));
-            edges.extend(derive_has_field_edges(chunk, &symbol));
-            edges.extend(derive_impl_trait_edges(chunk, &symbol));
+            edges.extend(derive_has_field_edges(chunk, &symbol, symbols));
+            edges.extend(derive_impl_trait_edges(chunk, &symbol, symbols));
             for callee in call_names(&chunk.content) {
                 if let Some(target) = symbols.get(&callee) {
                     edges.push(edge(
@@ -388,14 +388,6 @@ fn derive_code_edges(
                 }
             }
         }
-        for import in import_names(&chunk.content) {
-            edges.push(edge(
-                file_ref.clone(),
-                "IMPORTS",
-                external_symbol_ref(chunk, &import),
-                EdgeConfidence::Heuristic,
-            ));
-        }
     }
     edges
 }
@@ -418,15 +410,25 @@ fn symbol_ref(chunk: &Chunk, qualified_name: &str) -> EntityRef {
     }
 }
 
-fn external_symbol_ref(chunk: &Chunk, qualified_name: &str) -> EntityRef {
-    EntityRef::Symbol {
-        project_id: chunk.project_id.clone(),
-        qualified_name: qualified_name.to_string(),
-        defn_hash: full_hash(qualified_name.as_bytes()),
-    }
+fn resolve_symbol<'a>(
+    symbols: &'a HashMap<String, EntityRef>,
+    name: &str,
+) -> Option<&'a EntityRef> {
+    symbols.get(name).or_else(|| {
+        name.rsplit_once("::")
+            .and_then(|(_, bare)| symbols.get(bare))
+            .or_else(|| {
+                name.rsplit_once('.')
+                    .and_then(|(_, bare)| symbols.get(bare))
+            })
+    })
 }
 
-fn derive_has_field_edges(chunk: &Chunk, source: &EntityRef) -> Vec<Edge> {
+fn derive_has_field_edges(
+    chunk: &Chunk,
+    source: &EntityRef,
+    symbols: &HashMap<String, EntityRef>,
+) -> Vec<Edge> {
     let Some(struct_name) = &chunk.symbol else {
         return Vec::new();
     };
@@ -435,18 +437,23 @@ fn derive_has_field_edges(chunk: &Chunk, source: &EntityRef) -> Vec<Edge> {
     }
     field_names(&chunk.content)
         .into_iter()
-        .map(|field| {
-            edge(
+        .filter_map(|field| {
+            let target = resolve_symbol(symbols, &format!("{struct_name}::{field}"))?;
+            Some(edge(
                 source.clone(),
                 "HAS_FIELD",
-                external_symbol_ref(chunk, &format!("{struct_name}::{field}")),
+                target.clone(),
                 EdgeConfidence::Heuristic,
-            )
+            ))
         })
         .collect()
 }
 
-fn derive_impl_trait_edges(chunk: &Chunk, source: &EntityRef) -> Vec<Edge> {
+fn derive_impl_trait_edges(
+    chunk: &Chunk,
+    source: &EntityRef,
+    symbols: &HashMap<String, EntityRef>,
+) -> Vec<Edge> {
     let header = chunk.content.split('{').next().unwrap_or_default().trim();
     let Some(rest) = header.strip_prefix("impl ") else {
         return Vec::new();
@@ -454,10 +461,13 @@ fn derive_impl_trait_edges(chunk: &Chunk, source: &EntityRef) -> Vec<Edge> {
     let Some((trait_name, _target)) = rest.split_once(" for ") else {
         return Vec::new();
     };
+    let Some(target) = resolve_symbol(symbols, trait_name.trim()) else {
+        return Vec::new();
+    };
     vec![edge(
         source.clone(),
         "IMPLEMENTS_TRAIT",
-        external_symbol_ref(chunk, trait_name.trim()),
+        target.clone(),
         EdgeConfidence::Heuristic,
     )]
 }
@@ -477,22 +487,6 @@ fn type_names(content: &str) -> Vec<String> {
     type_pattern
         .captures_iter(content)
         .filter_map(|capture| capture.get(1).map(|name| name.as_str().to_string()))
-        .collect()
-}
-
-fn import_names(content: &str) -> Vec<String> {
-    content
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_prefix("use ")
-                .or_else(|| trimmed.strip_prefix("import "))
-                .or_else(|| trimmed.strip_prefix("using "))
-                .or_else(|| trimmed.strip_prefix("from "))
-                .map(|rest| rest.trim_end_matches(';').trim().to_string())
-        })
-        .filter(|name| !name.is_empty())
         .collect()
 }
 
@@ -658,6 +652,67 @@ mod tests {
         assert!(edges.iter().any(|edge| edge.kind == "CALLS"));
         assert!(stats.call_edges >= 1);
         assert_eq!(stats.resolved_call_edges, stats.call_edges);
+    }
+
+    #[test]
+    fn tier_a_edges_skip_external_symbol_targets() {
+        let project = ProjectRecord {
+            project_id: "proj1234".into(),
+            repo_id: Some("repo1234".into()),
+            canonical_path: "/tmp/repo".into(),
+            registered_at: "2026-05-05T17:30:00Z".into(),
+            is_git_repo: true,
+        };
+        let chunks = finalize_chunks(
+            &project,
+            Path::new("src/lib.rs"),
+            vec![
+                crate::chunker::placeholder_chunk(
+                    Path::new("src/lib.rs"),
+                    "code_block",
+                    Some("rust"),
+                    "trait LocalTrait {}",
+                    0,
+                    19,
+                    0,
+                ),
+                crate::chunker::placeholder_chunk(
+                    Path::new("src/lib.rs"),
+                    "code_block",
+                    Some("rust"),
+                    "impl LocalTrait for Thing {}\nuse std::fmt::Display;",
+                    20,
+                    72,
+                    1,
+                ),
+            ],
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut chunk)| {
+            if idx == 0 {
+                chunk.symbol = Some("LocalTrait".into());
+                chunk.symbol_exact = Some("LocalTrait".into());
+            } else {
+                chunk.symbol = Some("Thing::impl".into());
+                chunk.symbol_exact = Some("impl".into());
+            }
+            chunk
+        })
+        .collect::<Vec<_>>();
+        let pending = vec![PendingProjectFile {
+            path_str: "/tmp/repo/src/lib.rs".into(),
+            absolute_path: PathBuf::from("/tmp/repo/src/lib.rs"),
+            mtime: 1,
+            size: 72,
+            chunks,
+        }];
+        let symbols = build_symbol_table(&pending);
+        let mut stats = ProjectIndexStats::default();
+        let edges = derive_code_edges(&pending[0].chunks, &symbols, &mut stats);
+
+        assert!(edges.iter().any(|edge| edge.kind == "IMPLEMENTS_TRAIT"));
+        assert!(!edges.iter().any(|edge| edge.kind == "IMPORTS"));
     }
 
     #[test]
