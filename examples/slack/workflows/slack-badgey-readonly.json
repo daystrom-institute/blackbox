@@ -6,6 +6,7 @@
     "user": { "kind": "string" },
     "thread_ts": { "kind": "string" },
     "text": { "kind": "string" },
+    "command_text": { "kind": "string" },
     "response_url": { "kind": "string" },
     "team_id": { "kind": "string" },
     "bbox_user": { "kind": "string" }

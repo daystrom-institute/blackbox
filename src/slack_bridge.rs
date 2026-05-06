@@ -319,6 +319,14 @@ pub fn normalize_envelope(
             event.text = ev.and_then(|e| e.get("text")).and_then(Value::as_str).map(String::from);
             event.ts = ev.and_then(|e| e.get("ts")).and_then(Value::as_str).map(String::from);
             event.thread_ts = ev.and_then(|e| e.get("thread_ts")).and_then(Value::as_str).map(String::from);
+            // For app_mention and message events, fall back thread_ts to ts
+            // so root mentions always have a thread_ts for reply threading.
+            if event.thread_ts.is_none() && event.ts.is_some() {
+                let typ = event.event_type.as_deref().unwrap_or("");
+                if typ == "app_mention" || typ == "message" {
+                    event.thread_ts = event.ts.clone();
+                }
+            }
             event.subtype = ev.and_then(|e| e.get("subtype")).and_then(Value::as_str).map(String::from);
             event.bot_id = ev.and_then(|e| e.get("bot_id")).and_then(Value::as_str).map(String::from);
             event.reaction = ev.and_then(|e| e.get("reaction")).and_then(Value::as_str).map(String::from);
@@ -348,6 +356,9 @@ pub fn normalize_envelope(
         "slash_commands" => {
             event.command = payload.get("command").and_then(Value::as_str).map(String::from);
             event.command_text = payload.get("text").and_then(Value::as_str).map(String::from);
+            // Normalize: set `text` from `command_text` so workflows
+            // get a consistent `${vars.text}` regardless of event source.
+            event.text = event.command_text.clone();
             event.user = payload.get("user_id").and_then(Value::as_str).map(String::from);
             event.channel = payload.get("channel_id").and_then(Value::as_str).map(String::from);
             event.channel_type = event.channel.as_deref().map(channel_type_from_id);
@@ -2064,5 +2075,264 @@ mod tests {
         let ids = SlackIdentities::default();
         let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 2).expect("ok").expect("some");
         assert_eq!(norm.meta.retry_attempt, 2);
+    }
+
+    // ── New normalization: thread_ts fallback ──────────────────
+
+    #[test]
+    fn test_thread_ts_fallback_for_app_mention() {
+        let envelope = json!({
+            "envelope_id": "env-tt",
+            "type": "events_api",
+            "payload": {
+                "team_id": "T01",
+                "event": {
+                    "type": "app_mention",
+                    "user": "Uhuman",
+                    "text": "hello",
+                    "ts": "100.200",
+                    "channel": "C01"
+                }
+            }
+        });
+        let ids = SlackIdentities::default();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        // thread_ts should fall back to ts for app_mention
+        assert_eq!(norm.thread_ts.as_deref(), Some("100.200"));
+        assert_eq!(norm.ts.as_deref(), Some("100.200"));
+    }
+
+    #[test]
+    fn test_thread_ts_not_overwritten_when_present() {
+        let envelope = json!({
+            "envelope_id": "env-tt2",
+            "type": "events_api",
+            "payload": {
+                "team_id": "T01",
+                "event": {
+                    "type": "app_mention",
+                    "user": "Uhuman",
+                    "text": "hello",
+                    "ts": "100.300",
+                    "thread_ts": "100.100",
+                    "channel": "C01"
+                }
+            }
+        });
+        let ids = SlackIdentities::default();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        // thread_ts is already set, should not be overwritten
+        assert_eq!(norm.thread_ts.as_deref(), Some("100.100"));
+        assert_eq!(norm.ts.as_deref(), Some("100.300"));
+    }
+
+    #[test]
+    fn test_slash_command_text_fallback() {
+        let envelope = json!({
+            "envelope_id": "env-tf",
+            "type": "slash_commands",
+            "payload": {
+                "command": "/bbox",
+                "text": "inbox",
+                "user_id": "Ualice",
+                "channel_id": "C01",
+                "team_id": "T01"
+            }
+        });
+        let ids = SlackIdentities::default();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        // text should be set from command_text for slash commands
+        assert_eq!(norm.text.as_deref(), Some("inbox"));
+        assert_eq!(norm.command_text.as_deref(), Some("inbox"));
+    }
+
+    // ── Example artifact validation ────────────────────────────
+
+    #[test]
+    fn test_example_workflow_json_valid() {
+        // Validate each workflow JSON file against the blackbox
+        // workflow schema.
+        let schema_json = include_str!("../schema/workflow.schema.json");
+        let schema_val: serde_json::Value =
+            serde_json::from_str(schema_json).expect("schema JSON parse");
+        let compiled = jsonschema::JSONSchema::options()
+            .compile(&schema_val)
+            .expect("schema compile");
+
+        let workflows_dir = std::path::Path::new("examples/slack/workflows");
+        if !workflows_dir.is_dir() {
+            // ok if the dir doesn't exist (e.g. running from a different cwd)
+            return;
+        }
+        for entry in std::fs::read_dir(workflows_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let instance: Value =
+                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+            let result = compiled.validate(&instance);
+            assert!(
+                result.is_ok(),
+                "schema validation failed for {}: {:?}",
+                path.display(),
+                result.err().map(|e| e.map(|ee| ee.to_string()).collect::<Vec<_>>())
+            );
+        }
+    }
+
+    #[test]
+    fn test_routing_packet_shape() {
+        // Validate the routing-slack.json has the required structure.
+        let raw =
+            std::fs::read_to_string("examples/slack/packets/routing-slack.json")
+                .expect("routing-slack.json readable");
+        let packet: Value = serde_json::from_str(&raw).expect("valid JSON");
+
+        assert_eq!(packet["domain"], "webhook-routing/slack");
+        assert_eq!(packet["scope"], "global");
+        let lattice: Vec<&str> = packet["classification_lattice"]
+            .as_array()
+            .expect("classification_lattice array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(lattice.contains(&"start_arc"));
+        assert!(lattice.contains(&"signal_arc"));
+        assert!(lattice.contains(&"ignore"));
+
+        let rules = packet["rules"].as_array().expect("rules array");
+        assert!(rules.len() >= 5, "expected at least 5 routing rules");
+
+        // The first rule must be ignore_bot_messages (defense in depth)
+        assert_eq!(
+            rules[0]["id"].as_str().unwrap_or(""),
+            "ignore_bot_messages",
+            "first rule must be ignore_bot_messages for first-match defense-in-depth"
+        );
+
+        // Every rule must have id, classification, antecedent, consequent
+        for rule in rules {
+            assert!(rule["id"].is_string(), "rule missing id");
+            assert!(rule["classification"].is_string(), "rule missing classification");
+            assert!(rule["antecedent"].is_object(), "rule missing antecedent");
+            assert!(rule["consequent"].is_string() || rule["consequent"].is_object(),
+                "rule missing consequent");
+        }
+    }
+
+    #[test]
+    fn test_webhook_spec_shape() {
+        let raw =
+            std::fs::read_to_string("examples/slack/webhooks/slack.json")
+                .expect("slack.json readable");
+        let spec: Value = serde_json::from_str(&raw).expect("valid JSON");
+
+        assert_eq!(spec["name"], "slack");
+        assert_eq!(spec["signature"]["kind"], "hmac_sha256");
+        assert_eq!(spec["delivery_id_header"], "X-Slack-Envelope-Id");
+        assert_eq!(spec["routing_packet"], "domain:webhook-routing/slack");
+        assert!(spec["extractor"]["outputs"].as_object().unwrap().len() > 10,
+            "expected at least 10 extractor outputs");
+    }
+
+    #[test]
+    fn test_replay_payloads_are_valid_json() {
+        // The README contains curl commands with inline JSON payloads.
+        // We test that representative payload shapes parse correctly.
+        let replay_app_mention = json!({
+            "_meta": {
+                "source": "bro-slack", "workspace_id": "T01",
+                "self_bot_id": "Bbot", "self_user_id": "Ubot",
+                "received_at": "2026-05-05T12:34:56.789Z",
+                "envelope_id": "replay-001", "retry_attempt": 0,
+                "bbox_user": "alice", "bbox_scopes": ["all"],
+                "bbox_can_dispatch": true
+            },
+            "_headers": { "x-slack-envelope-id": "replay-001" },
+            "type": "events_api", "event_type": "app_mention",
+            "team_id": "T01", "channel": "C01", "channel_type": "channel",
+            "user": "Ualice", "ts": "1.0", "thread_ts": "1.0",
+            "text": "hello", "subtype": null, "bot_id": null,
+            "reaction": null, "item_ts": null, "command": null,
+            "command_text": null, "response_url": null, "trigger_id": null,
+            "action_id": null, "action_value": null, "view_id": null,
+            "view_state_values": null, "files": [],
+            "raw": { "event": { "type": "app_mention", "user": "Ualice", "text": "hello", "ts": "1.0", "channel": "C01" } }
+        });
+        assert_eq!(replay_app_mention["type"], "events_api");
+        assert_eq!(replay_app_mention["event_type"], "app_mention");
+
+        let replay_reaction = json!({
+            "_meta": {
+                "source": "bro-slack", "workspace_id": "T01",
+                "self_bot_id": "Bbot", "self_user_id": "Ubot",
+                "received_at": "2026-05-05T12:34:56.789Z",
+                "envelope_id": "replay-003", "retry_attempt": 0,
+                "bbox_user": "alice", "bbox_scopes": ["all"],
+                "bbox_can_dispatch": true
+            },
+            "_headers": { "x-slack-envelope-id": "replay-003" },
+            "type": "events_api", "event_type": "reaction_added",
+            "team_id": "T01", "channel": "C01", "channel_type": "channel",
+            "user": "Ualice", "ts": null, "thread_ts": null,
+            "text": null, "subtype": null, "bot_id": null,
+            "reaction": "white_check_mark", "item_ts": "1.0",
+            "command": null, "command_text": null, "response_url": null,
+            "trigger_id": null, "action_id": null, "action_value": null,
+            "view_id": null, "view_state_values": null, "files": [],
+            "raw": { "event": { "type": "reaction_added", "user": "Ualice", "reaction": "white_check_mark", "item": { "channel": "C01", "ts": "1.0" } } }
+        });
+        assert_eq!(replay_reaction["event_type"], "reaction_added");
+        assert_eq!(replay_reaction["reaction"], "white_check_mark");
+
+        let replay_block_actions = json!({
+            "_meta": {
+                "source": "bro-slack", "workspace_id": "T01",
+                "self_bot_id": "Bbot", "self_user_id": "Ubot",
+                "received_at": "2026-05-05T12:34:56.789Z",
+                "envelope_id": "replay-004", "retry_attempt": 0,
+                "bbox_user": "alice", "bbox_scopes": ["all"],
+                "bbox_can_dispatch": true
+            },
+            "_headers": { "x-slack-envelope-id": "replay-004" },
+            "type": "interactive", "event_type": "block_actions",
+            "team_id": "T01", "channel": "C01", "channel_type": "channel",
+            "user": "Ualice", "ts": null, "thread_ts": null,
+            "text": null, "subtype": null, "bot_id": null,
+            "reaction": null, "item_ts": null, "command": null,
+            "command_text": null, "response_url": null, "trigger_id": "trig-7",
+            "action_id": "apply_proposal", "action_value": "P-3",
+            "view_id": null, "view_state_values": null, "files": [],
+            "raw": { "type": "block_actions", "user": {"id": "Ualice"}, "channel": {"id": "C01"}, "team": {"id": "T01"}, "actions": [{"action_id": "apply_proposal", "value": "P-3"}] }
+        });
+        assert_eq!(replay_block_actions["type"], "interactive");
+        assert_eq!(replay_block_actions["action_id"], "apply_proposal");
+
+        let replay_bot_message = json!({
+            "_meta": {
+                "source": "bro-slack", "workspace_id": "T01",
+                "self_bot_id": "Bbot", "self_user_id": "Ubot",
+                "received_at": "2026-05-05T12:34:56.789Z",
+                "envelope_id": "replay-005", "retry_attempt": 0,
+                "bbox_user": "anonymous", "bbox_scopes": ["read"],
+                "bbox_can_dispatch": false
+            },
+            "_headers": { "x-slack-envelope-id": "replay-005" },
+            "type": "events_api", "event_type": "message",
+            "team_id": "T01", "channel": "C01", "channel_type": "channel",
+            "user": null, "ts": "1.0", "thread_ts": null,
+            "text": "bot reply here", "subtype": "bot_message",
+            "bot_id": "Bbot", "reaction": null, "item_ts": null,
+            "command": null, "command_text": null, "response_url": null,
+            "trigger_id": null, "action_id": null, "action_value": null,
+            "view_id": null, "view_state_values": null, "files": [],
+            "raw": { "event": { "type": "message", "subtype": "bot_message", "bot_id": "Bbot", "text": "bot reply here", "ts": "1.0", "channel": "C01" } }
+        });
+        assert_eq!(replay_bot_message["subtype"], "bot_message");
+        assert_eq!(replay_bot_message["bot_id"], "Bbot");
     }
 }

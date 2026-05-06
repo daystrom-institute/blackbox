@@ -4,6 +4,18 @@
   "classification_lattice": ["start_arc", "signal_arc", "ignore", "dead_letter"],
   "rules": [
     {
+      "id": "ignore_bot_messages",
+      "classification": "ignore",
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "subtype", "value": "bot_message" },
+          { "op": "IsNonNull", "field": "bot_id" }
+        ]
+      },
+      "consequent": "ignore"
+    },
+    {
       "id": "start_badgey_on_app_mention",
       "classification": "start_arc",
       "antecedent": {
@@ -79,18 +91,6 @@
         ]
       },
       "consequent": "{\"route\":\"signal_arc\",\"signal\":\"proposal-applied\",\"correlate\":{\"proposal_id\":\"${entity.action_value}\"}}"
-    },
-    {
-      "id": "ignore_bot_messages",
-      "classification": "ignore",
-      "antecedent": {
-        "op": "Any",
-        "args": [
-          { "op": "Eq", "field": "subtype", "value": "bot_message" },
-          { "op": "IsNonNull", "field": "bot_id" }
-        ]
-      },
-      "consequent": "ignore"
     }
   ]
 }

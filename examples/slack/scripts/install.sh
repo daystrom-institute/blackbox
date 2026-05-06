@@ -73,16 +73,6 @@ body=$(jq -nc --slurpfile spec "${ROOT}/webhooks/slack.json" \
     '{spec:$spec[0]}')
 post_admin /admin/webhook/install "${body}" >/dev/null
 
-# ── 5. Verify ──────────────────────────────────────────────────
-log "verify: compiled packets"
-curl -sfS "${BBOX}/admin/packet/list" | jq -r '.[] | select(.id | startswith("packet-")) | "  [\(.id)] \(.domain) (\(.rules | length) rules)"' 2>/dev/null || true
-
-log "verify: installed workflows"
-curl -sfS "${BBOX}/admin/workflow/list" | jq -r '.[] | "  \(.id) v\(.version)"' 2>/dev/null || true
-
-log "verify: installed webhooks"
-curl -sfS "${BBOX}/admin/webhook/list" | jq -r '.[] | "  \(.name) (routing: \(.routing_packet))"' 2>/dev/null || true
-
 log ""
 log "install complete"
 log "  daemon:     ${BBOX}"
