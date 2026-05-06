@@ -4,7 +4,8 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
+    truncate_label,
 };
 use crate::entity_ref::{EntityRef, EntityType};
 
@@ -35,7 +36,7 @@ impl InspectableEntityProvider for CommitProvider {
                 .ok_or_else(|| anyhow::anyhow!("commit entity {r} not found"))?;
             properties.extend(indexed);
         }
-        Ok(base_view(r, properties))
+        Ok(empty_neighborhood_view(r, properties))
     }
 
     fn schema(&self) -> EntitySchemaView {
