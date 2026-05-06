@@ -83,6 +83,10 @@ pub fn bundle_evidence(
     let mut intra_bundle_edges = intra_bundle_edges(edge_index, &refs);
     let intra_bundle_edges_truncated = intra_bundle_edges.len() > INTRA_BUNDLE_EDGE_CAP;
     intra_bundle_edges.truncate(INTRA_BUNDLE_EDGE_CAP);
+    let mut intra_bundle_convergences = intra_bundle_convergences(edge_index, &refs);
+    let intra_bundle_convergences_truncated =
+        intra_bundle_convergences.len() > INTRA_BUNDLE_EDGE_CAP;
+    intra_bundle_convergences.truncate(INTRA_BUNDLE_EDGE_CAP);
     let text = render_text(
         ctx,
         &p.question,
@@ -106,12 +110,14 @@ pub fn bundle_evidence(
             "steps": path.steps,
         })).collect::<Vec<_>>(),
         "intra_bundle_edges": intra_bundle_edges,
+        "intra_bundle_convergences": intra_bundle_convergences,
         "degraded": {
             "stale_path_ids": stale_path_ids,
             "unresolved_entity_refs": unresolved_entity_refs,
             "omitted_entity_refs": omitted_entity_refs,
             "omitted_path_ids": omitted_path_ids,
             "intra_bundle_edges_truncated": intra_bundle_edges_truncated,
+            "intra_bundle_convergences_truncated": intra_bundle_convergences_truncated,
         }
     }))?)
 }
@@ -131,6 +137,91 @@ fn intra_bundle_edges(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<serde_j
         }
     }
     edges
+}
+
+/// Surfaces 2-hop convergences: pairs of bundled entities (A, B) that share
+/// a common neighbor C via outgoing or incoming edges. Examples:
+/// - two project_files both EDITED_BY_SESSION the same session ("touched in
+///   the same conversation")
+/// - two project_files both COMMIT_TOUCHED_FILE the same commit ("changed
+///   together")
+/// - a knowledge entry and a session it was KNOWLEDGE_FROM_SESSION'd from
+/// Direct edges (1-hop) already surface in `intra_bundle_edges`; this fills
+/// in the structurally more common case where bundled chunks aren't
+/// directly connected but share an originating event.
+fn intra_bundle_convergences(
+    edge_index: &EdgeIndex,
+    refs: &[EntityRef],
+) -> Vec<serde_json::Value> {
+    use std::collections::HashMap;
+    // For each ref, gather the set of (neighbor_ref, edge_kind, direction)
+    // tuples reachable in one hop. Direction lets us distinguish the source
+    // and report it back to the user.
+    type Neighbor = (EntityRef, String, &'static str);
+    let mut neighbors_by_ref: HashMap<usize, Vec<Neighbor>> = HashMap::new();
+    for (idx, r) in refs.iter().enumerate() {
+        let mut neighbors = Vec::new();
+        for edge in edge_index.forward_edges(r) {
+            neighbors.push((edge.target.clone(), edge.kind.clone(), "out"));
+        }
+        for edge in edge_index.reverse_edges(r) {
+            neighbors.push((edge.source.clone(), edge.kind.clone(), "in"));
+        }
+        neighbors_by_ref.insert(idx, neighbors);
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::<(EntityRef, EntityRef, EntityRef)>::new();
+    for i in 0..refs.len() {
+        for j in (i + 1)..refs.len() {
+            let a_neighbors = match neighbors_by_ref.get(&i) {
+                Some(n) => n,
+                None => continue,
+            };
+            let b_neighbors = match neighbors_by_ref.get(&j) {
+                Some(n) => n,
+                None => continue,
+            };
+            // Index B's neighbors by ref for O(1) intersection lookup.
+            let b_index: HashMap<&EntityRef, Vec<&Neighbor>> = b_neighbors
+                .iter()
+                .fold(HashMap::new(), |mut acc, n| {
+                    acc.entry(&n.0).or_default().push(n);
+                    acc
+                });
+            for an in a_neighbors {
+                let Some(b_matches) = b_index.get(&an.0) else {
+                    continue;
+                };
+                // Skip self-references — a chunk's own IN_FILE proxy
+                // isn't a meaningful convergence between siblings.
+                if an.0 == refs[i] || an.0 == refs[j] {
+                    continue;
+                }
+                for bn in b_matches {
+                    let key = (refs[i].clone(), refs[j].clone(), an.0.clone());
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    out.push(json!({
+                        "a": refs[i].to_string(),
+                        "b": refs[j].to_string(),
+                        "via": an.0.to_string(),
+                        "via_label": render_node_short(&an.0),
+                        "a_edge_kind": an.1,
+                        "a_direction": an.2,
+                        "b_edge_kind": bn.1,
+                        "b_direction": bn.2,
+                    }));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn render_node_short(r: &EntityRef) -> String {
+    // Compact labeling — the bundle viewer can call inspect for details.
+    r.to_string()
 }
 
 fn render_text(
