@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde::Serialize;
 use serde_json::json;
@@ -47,11 +47,9 @@ pub fn describe_schema(
         "text": text,
         "vertex_types": vertex_types,
         "edge_families": edge_families,
+        "agents": agents,
+        "agents_by_dispatch_adapter": agents_by_adapter,
     });
-    if !agents.is_empty() {
-        response["agents"] = json!(agents);
-        response["agents_by_dispatch_adapter"] = json!(agents_by_adapter);
-    }
     Ok(serde_json::to_string_pretty(&response)?)
 }
 
@@ -103,8 +101,8 @@ fn render_text(
     text
 }
 
-fn group_agents_by_adapter(agents: &[AgentSchemaEntry]) -> HashMap<String, Vec<&str>> {
-    let mut groups: HashMap<String, Vec<&str>> = HashMap::new();
+fn group_agents_by_adapter(agents: &[AgentSchemaEntry]) -> BTreeMap<String, Vec<&str>> {
+    let mut groups: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for agent in agents {
         let key = agent
             .dispatch_adapter
@@ -285,13 +283,15 @@ mod tests {
     fn schema_no_agents_section_when_empty() {
         let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert!(
-            value.get("agents").is_none(),
-            "agents should be absent when empty"
+        assert_eq!(
+            value["agents"].as_array().unwrap().len(),
+            0,
+            "agents should be empty array"
         );
-        assert!(
-            value.get("agents_by_dispatch_adapter").is_none(),
-            "agents_by_dispatch_adapter should be absent when empty"
+        assert_eq!(
+            value["agents_by_dispatch_adapter"].as_object().unwrap().len(),
+            0,
+            "agents_by_dispatch_adapter should be empty object"
         );
         let text = value["text"].as_str().unwrap();
         assert!(
