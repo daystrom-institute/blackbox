@@ -11,7 +11,7 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g3-commit-subject-tokens";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g5-symbol-tokenized";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -456,7 +456,13 @@ pub(crate) fn build_schema() -> (Schema, FieldHandles) {
         doc_type: builder.add_text_field("doc_type", STRING | STORED),
         chunk_kind: builder.add_text_field("chunk_kind", STRING | STORED),
         language: builder.add_text_field("language", STRING | STORED),
-        symbol: builder.add_text_field("symbol", TEXT | STORED),
+        // Use code_tokenizer on `symbol` so qualified names like
+        // `Substrate.TriadClosure::handle_call` index as the union of their
+        // camel-case and snake-case parts. Without this, a query for
+        // `triad_closure` couldn't match a chunk whose elixir defmodule is
+        // `Substrate.TriadClosure` (the default tokenizer keeps CamelCase
+        // as one token, so the snake_case query never aligns).
+        symbol: builder.add_text_field("symbol", code_options.clone()),
         symbol_exact: builder.add_text_field("symbol_exact", STRING | STORED),
         code_content: builder.add_text_field("code_content", code_options),
         chunk_hash: builder.add_text_field("chunk_hash", STRING | STORED),

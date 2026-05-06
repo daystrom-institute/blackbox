@@ -8,7 +8,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{IndexWriter, TantivyDocument, Term};
@@ -352,6 +352,21 @@ impl TranscriptIndex {
         let text_query = qp.parse_query(&query_str)?;
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
             vec![(Occur::Must, text_query.box_clone())];
+        // Symbol-defining-file boost: when the user issues a single-token
+        // query that looks like a code symbol (snake_case, CamelCase, dotted
+        // path, or just one word), add an additional SHOULD clause that
+        // matches the symbol_exact field with a heavy boost. Effect: a
+        // query for `triad_closure` lifts the chunk where
+        // `symbol_exact == triad_closure` (the defining .ex chunk) above
+        // arbitrary doc paragraphs that mention the same string in body.
+        if let Some(token) = single_symbol_token(query) {
+            let term = Term::from_field_text(self.fields.symbol_exact, &token);
+            let exact = TermQuery::new(term, IndexRecordOption::Basic);
+            clauses.push((
+                Occur::Should,
+                Box::new(BoostQuery::new(Box::new(exact), 6.0)),
+            ));
+        }
         if let Some(doc_type) = doc_type.filter(|value| !value.trim().is_empty()) {
             clauses.push((
                 Occur::Must,
@@ -1515,6 +1530,33 @@ impl TranscriptIndex {
             })
             .unwrap_or_default()
     }
+}
+
+/// Returns the query string when it looks like a single code symbol — one
+/// token of identifier-shaped characters (letters/digits/underscore/hyphen
+/// /dot/colon), no spaces, no quotes, no boolean operators. Used by the
+/// BM25 query builder to opt into a symbol_exact boost when the agent
+/// asks about a specific identifier rather than a topical phrase.
+fn single_symbol_token(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    if trimmed.chars().any(|c| {
+        !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.' && c != ':'
+    }) {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("AND")
+        || trimmed.eq_ignore_ascii_case("OR")
+        || trimmed.eq_ignore_ascii_case("NOT")
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 fn count_tool_call_edges(edges_dir: &Path) -> u64 {

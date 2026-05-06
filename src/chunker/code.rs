@@ -278,6 +278,11 @@ fn walk_children(
 
 fn symbol_name(node: Node<'_>, source: &str, language: &str) -> Option<(String, String)> {
     let kind = node.kind();
+    // Elixir uses `call` for defmodule/def/defp/defmacro — every other call
+    // is also `call`, so we filter by inspecting the head identifier.
+    if language == "elixir" && kind == "call" {
+        return elixir_call_symbol(node, source);
+    }
     if language == "rust" && kind == "impl_item" {
         let display = impl_header(node, source)?;
         let bare = display
@@ -323,6 +328,49 @@ fn is_symbol_node(kind: &str) -> bool {
             | "type_declaration"
             | "type_spec"
     )
+}
+
+/// Extract a symbol name from an elixir `call` node when the call head is
+/// a definition keyword (defmodule, def, defp, defmacro, defmacrop,
+/// defguard, defguardp, defstruct, defprotocol, defimpl, defexception).
+/// Other `call` nodes (regular function invocations) return None so we
+/// don't pollute the symbol table with every `Foo.bar(x)` call site.
+fn elixir_call_symbol(node: Node<'_>, source: &str) -> Option<(String, String)> {
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor);
+    let head = children.next()?;
+    let head_text = node_text(head, source)?;
+    let is_def = matches!(
+        head_text.as_str(),
+        "defmodule"
+            | "def"
+            | "defp"
+            | "defmacro"
+            | "defmacrop"
+            | "defguard"
+            | "defguardp"
+            | "defstruct"
+            | "defprotocol"
+            | "defimpl"
+            | "defexception"
+    );
+    if !is_def {
+        return None;
+    }
+    // Next child is usually an `arguments` node; the first identifier within
+    // it is the symbol name. For `defmodule Witness.Authority do ...` the
+    // arg is `Witness.Authority` (alias). For `def start_link(opts) do` the
+    // arg is `start_link(opts)` (call); we want the first identifier.
+    let args = children.next()?;
+    let args_text = node_text(args, source)?;
+    let bare = args_text
+        .split(|c: char| !is_ident_char(c) && c != '.')
+        .find(|s| !s.is_empty())?
+        .to_string();
+    if bare.is_empty() {
+        return None;
+    }
+    Some((bare.clone(), bare))
 }
 
 fn fallback_name(kind: &str, node: Node<'_>, source: &str) -> Option<String> {
