@@ -10395,4 +10395,174 @@ mod tests {
             "system-generated entries must be exempt from the nag: {nag_system:?}"
         );
     }
+
+    fn seed_test_agent(
+        catalog: &artifacts::ArtifactCatalog,
+        file_name: &str,
+        name: &str,
+        version: u64,
+        cost_class: Option<&str>,
+    ) {
+        let mut manifest = serde_json::json!({
+            "description": format!("Test agent {name}."),
+            "when_to_use": ["when testing"],
+            "brofile_inline": {"provider": "claude"},
+        });
+        if let Some(cc) = cost_class {
+            manifest["cost_class"] = serde_json::json!(cc);
+        }
+        catalog
+            .install_value(
+                artifacts::ArtifactKind::Agent,
+                file_name.into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": name,
+                    "version": version,
+                    "manifest": manifest,
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    fn extract_text(result: &CallToolResult) -> String {
+        let wire = serde_json::to_value(result).unwrap();
+        wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn bro_agent_list_output_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            1,
+            Some("expensive"),
+        );
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "writer.json",
+            "writer",
+            2,
+            Some("cheap"),
+        );
+
+        let result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: None,
+            provenance_kind: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        let agents = body["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 2);
+
+        let reviewer = agents
+            .iter()
+            .find(|a| a["name"] == "reviewer")
+            .unwrap();
+        assert_eq!(reviewer["version"], "1");
+        assert_eq!(reviewer["active"], true);
+        assert_eq!(reviewer["cost_class"], "expensive");
+        assert_eq!(reviewer["embedding_pending"], true);
+
+        let writer = agents.iter().find(|a| a["name"] == "writer").unwrap();
+        assert_eq!(writer["version"], "2");
+        assert_eq!(writer["cost_class"], "cheap");
+    }
+
+    #[test]
+    fn bro_agent_list_invalid_cost_class_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: Some("notavalidclass".into()),
+            provenance_kind: None,
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("unknown cost_class"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_get_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            3,
+            None,
+        );
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "reviewer".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["name"], "reviewer");
+        assert_eq!(body["version"], "3");
+        assert_eq!(body["active"], true);
+        assert!(body["manifest"].is_object());
+    }
+
+    #[test]
+    fn bro_agent_get_missing_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "nonexistent".into(),
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("agent not found"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_get_pinned_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            5,
+            None,
+        );
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "reviewer@v5".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["version"], "5");
+    }
+
+    #[test]
+    fn bro_agent_get_invalid_ref_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "@v2".into(),
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("requires a name"), "got: {text}");
+    }
 }

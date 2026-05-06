@@ -54,10 +54,7 @@ pub fn validate_agent_install<F: Fn(&str) -> bool>(
         });
     }
 
-    let name = value
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = value.get("name").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() {
         return Err(ValidationError {
             step: "shape",
@@ -125,12 +122,11 @@ pub fn validate_agent_install<F: Fn(&str) -> bool>(
         });
     }
 
-    let manifest: AgentManifest = serde_json::from_value(manifest_value.clone()).map_err(|e| {
-        ValidationError {
+    let manifest: AgentManifest =
+        serde_json::from_value(manifest_value.clone()).map_err(|e| ValidationError {
             step: "manifest_deserialize",
             message: format!("failed to parse manifest: {e}"),
-        }
-    })?;
+        })?;
 
     validate_brofile_xor(&manifest)?;
 
@@ -264,7 +260,12 @@ fn lint_filter_overlay(overlay: &Option<AgentFilterOverlay>) -> Result<(), Valid
     let Some(ov) = overlay else {
         return Ok(());
     };
-    let all_patterns: Vec<&str> = ov.allow.iter().chain(ov.disallow.iter()).map(|s| s.as_str()).collect();
+    let all_patterns: Vec<&str> = ov
+        .allow
+        .iter()
+        .chain(ov.disallow.iter())
+        .map(|s| s.as_str())
+        .collect();
     for pat in &all_patterns {
         if pat.trim().is_empty() {
             return Err(ValidationError {
@@ -291,9 +292,7 @@ fn lint_filter_overlay(overlay: &Option<AgentFilterOverlay>) -> Result<(), Valid
         if disallow_set.contains(a) {
             return Err(ValidationError {
                 step: "lint_filter_overlay",
-                message: format!(
-                    "filter overlay has same pattern in allow and disallow: {a}"
-                ),
+                message: format!("filter overlay has same pattern in allow and disallow: {a}"),
             });
         }
     }
@@ -320,11 +319,11 @@ mod tests {
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
-                    Output = Result<
-                        super::super::adapter::AgentDispatchResult,
-                        super::super::adapter::AgentDispatchError,
-                    >,
-                > + Send,
+                        Output = Result<
+                            super::super::adapter::AgentDispatchResult,
+                            super::super::adapter::AgentDispatchError,
+                        >,
+                    > + Send,
             >,
         > {
             Box::pin(async {
@@ -354,7 +353,9 @@ mod tests {
         }
     }
 
-    fn make_ctx_brofile_missing(registry: &AgentAdapterRegistry) -> InstallCtx<'_, impl Fn(&str) -> bool> {
+    fn make_ctx_brofile_missing(
+        registry: &AgentAdapterRegistry,
+    ) -> InstallCtx<'_, impl Fn(&str) -> bool> {
         InstallCtx {
             adapter_registry: registry,
             brofile_exists: |_name: &str| false,

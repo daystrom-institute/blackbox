@@ -170,10 +170,7 @@ impl<'a> AgentRegistry<'a> {
     }
 
     fn load_manifest_degraded(&self, name: &str) -> (Option<AgentManifest>, Option<String>) {
-        let value = match self
-            .catalog
-            .load_artifact_value(ArtifactKind::Agent, name)
-        {
+        let value = match self.catalog.load_artifact_value(ArtifactKind::Agent, name) {
             Ok(Some(v)) => v,
             _ => return (None, None),
         };
