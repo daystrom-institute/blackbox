@@ -19,6 +19,8 @@ pub struct VoyageConfig {
     pub api_key_env: String,
     #[serde(default = "default_model")]
     pub model: String,
+    /// Batch-level enforcement lives in the E2 queue layer so retries
+    /// and per-route debounce share one throttle point.
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_min: u32,
     #[serde(default = "default_endpoint")]
