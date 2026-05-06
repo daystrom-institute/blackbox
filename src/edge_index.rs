@@ -237,6 +237,7 @@ impl EdgeIndex {
                             provider: doc.account.clone(),
                             session_id: doc.session_id.clone(),
                             line_offset: doc.byte_offset,
+                            // TODO(F3+): event_idx is hardcoded 0 because the current schema doesn't store per-line event index; multi-event lines collide on the source ref. Fix when transcript schema gains an event_idx field (likely alongside parser_version bump).
                             event_idx: 0,
                         },
                         "IN_SESSION",
