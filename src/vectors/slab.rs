@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -39,7 +39,12 @@ impl VectorSlab {
         self.entries.iter().filter(|entry| entry.active)
     }
 
-    pub fn upsert(&mut self, entity_id: &str, content_hash: &str, vector: Vec<f32>) -> Result<bool> {
+    pub fn upsert(
+        &mut self,
+        entity_id: &str,
+        content_hash: &str,
+        vector: Vec<f32>,
+    ) -> Result<bool> {
         if self.dims == 0 {
             self.dims = vector.len();
         }
@@ -50,11 +55,9 @@ impl VectorSlab {
                 self.dims
             );
         }
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.active && entry.entity_id == entity_id && entry.content_hash == content_hash)
-        {
+        if self.entries.iter().any(|entry| {
+            entry.active && entry.entity_id == entity_id && entry.content_hash == content_hash
+        }) {
             return Ok(false);
         }
         for entry in &mut self.entries {

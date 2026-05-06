@@ -1,6 +1,6 @@
 #![allow(dead_code)] // E1 client is constructed by routing; E2/E3 drive calls.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -109,10 +109,9 @@ impl VoyageProvider {
 #[async_trait]
 impl EmbeddingProvider for VoyageProvider {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let api_key = self
-            .api_key
-            .as_deref()
-            .context("VOYAGE_API_KEY or DAYSTROM_VOYAGE_API_KEY is required for voyage embeddings")?;
+        let api_key = self.api_key.as_deref().context(
+            "VOYAGE_API_KEY or DAYSTROM_VOYAGE_API_KEY is required for voyage embeddings",
+        )?;
         let response = self
             .client
             .post(&self.config.endpoint)
@@ -176,7 +175,7 @@ struct VoyageEmbedding {
 
 #[cfg(test)]
 mod tests {
-    use axum::{Json, Router, routing::post};
+    use axum::{routing::post, Json, Router};
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -195,9 +194,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/v1/embeddings", post(voyage_handler)))
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                Router::new().route("/v1/embeddings", post(voyage_handler)),
+            )
+            .await
+            .unwrap();
         });
         let provider = VoyageProvider::for_test(format!("http://{addr}/v1/embeddings")).unwrap();
         assert_eq!(provider.id(), super::super::VOYAGE_PROVIDER_ID);
@@ -209,8 +211,7 @@ mod tests {
 
     #[test]
     fn debug_redacts_api_key() {
-        let provider = VoyageProvider::for_test("http://127.0.0.1:9/v1/embeddings".into())
-            .unwrap();
+        let provider = VoyageProvider::for_test("http://127.0.0.1:9/v1/embeddings".into()).unwrap();
         let rendered = format!("{provider:?}");
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("test-key"));

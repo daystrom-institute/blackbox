@@ -66,6 +66,9 @@ mod tests {
             .collect::<Vec<_>>();
         let simd = cosine_distance(&left, &right);
         let scalar = scalar_cosine_distance(&left, &right);
-        assert!((simd - scalar).abs() <= 1.0e-6, "simd={simd} scalar={scalar}");
+        assert!(
+            (simd - scalar).abs() <= 1.0e-6,
+            "simd={simd} scalar={scalar}"
+        );
     }
 }

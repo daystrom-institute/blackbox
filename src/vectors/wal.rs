@@ -53,7 +53,8 @@ pub fn append(path: &Path, record: &WalRecord) -> Result<()> {
         .open(path)
         .with_context(|| format!("opening vector WAL {}", path.display()))?;
     serde_json::to_writer(&mut file, record).context("serializing vector WAL record")?;
-    file.write_all(b"\n").context("writing vector WAL newline")?;
+    file.write_all(b"\n")
+        .context("writing vector WAL newline")?;
     file.sync_data().context("fsync vector WAL")?;
     Ok(())
 }
@@ -62,7 +63,8 @@ pub fn read_all(path: &Path) -> Result<Vec<WalRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let file = fs::File::open(path).with_context(|| format!("opening vector WAL {}", path.display()))?;
+    let file =
+        fs::File::open(path).with_context(|| format!("opening vector WAL {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut records = Vec::new();
     for (idx, line) in reader.lines().enumerate() {

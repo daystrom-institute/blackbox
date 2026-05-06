@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use rmcp::schemars;
@@ -106,7 +106,12 @@ impl EmbedQueueHandle {
                                 error = %err,
                                 "embedding route disabled because route metadata failed"
                             );
-                            providers.push((route, Arc::new(FailingProvider::new(err)), None, String::new()));
+                            providers.push((
+                                route,
+                                Arc::new(FailingProvider::new(err)),
+                                None,
+                                String::new(),
+                            ));
                             continue;
                         }
                     };
@@ -121,7 +126,12 @@ impl EmbedQueueHandle {
                         error = %err,
                         "embedding route disabled because provider could not be constructed"
                     );
-                    providers.push((route, Arc::new(FailingProvider::new(err)), None, String::new()));
+                    providers.push((
+                        route,
+                        Arc::new(FailingProvider::new(err)),
+                        None,
+                        String::new(),
+                    ));
                 }
             }
         }
@@ -154,13 +164,21 @@ impl EmbedQueueHandle {
                 let sent = sender.send(WorkerCommand::Enqueue(request)).is_ok();
                 if !sent {
                     increment_depth(&self.inner.statuses, &route, -1);
-                    mark_error(&self.inner.statuses, &route, "embedding route worker stopped");
+                    mark_error(
+                        &self.inner.statuses,
+                        &route,
+                        "embedding route worker stopped",
+                    );
                 }
                 sent
             }
             None => {
                 increment_depth(&self.inner.statuses, &route, -1);
-                mark_error(&self.inner.statuses, &route, "embedding route is not configured");
+                mark_error(
+                    &self.inner.statuses,
+                    &route,
+                    "embedding route is not configured",
+                );
                 false
             }
         }
@@ -174,10 +192,7 @@ impl EmbedQueueHandle {
                 "embedding tombstone failed; vector WAL can be reconstructed by reindex"
             );
         }
-        tracing::debug!(
-            entity_id,
-            "embedding tombstone accepted"
-        );
+        tracing::debug!(entity_id, "embedding tombstone accepted");
     }
 
     pub fn status(&self) -> EmbedStatusResponse {
@@ -363,18 +378,18 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
             Ok(vectors) => {
                 if spec.persist_vectors {
                     if let Err(err) = persist_vectors(&spec, &batch, vectors) {
-                    let sanitized = sanitize_error(&err);
-                    tracing::warn!(
-                        route = %spec.route,
-                        vector_route = %spec.vector_route,
-                        error = %sanitized,
-                        "embedding vector persistence failed; route will retry"
-                    );
-                    mark_error(&spec.statuses, &spec.route, &sanitized);
-                    retry_batch = batch;
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
-                    continue;
+                        let sanitized = sanitize_error(&err);
+                        tracing::warn!(
+                            route = %spec.route,
+                            vector_route = %spec.vector_route,
+                            error = %sanitized,
+                            "embedding vector persistence failed; route will retry"
+                        );
+                        mark_error(&spec.statuses, &spec.route, &sanitized);
+                        retry_batch = batch;
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+                        continue;
                     }
                 }
                 tracing::debug!(
@@ -439,7 +454,11 @@ async fn apply_rate_limit(rate_limit_per_min: Option<u32>) {
     }
 }
 
-fn persist_vectors(spec: &WorkerSpec, batch: &[EmbedRequest], vectors: Vec<Vec<f32>>) -> Result<()> {
+fn persist_vectors(
+    spec: &WorkerSpec,
+    batch: &[EmbedRequest],
+    vectors: Vec<Vec<f32>>,
+) -> Result<()> {
     if vectors.len() != batch.len() {
         return Err(anyhow!(
             "provider returned {} vectors for {} requests",

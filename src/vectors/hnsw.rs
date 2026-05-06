@@ -168,8 +168,12 @@ impl HnswIndex {
             }
         }
         for layer in (0..=level.min(self.max_level.max(0) as usize)).rev() {
-            let candidates =
-                self.search_layer(self.vectors.get(ordinal), &[ep], self.options.ef_construction, layer);
+            let candidates = self.search_layer(
+                self.vectors.get(ordinal),
+                &[ep],
+                self.options.ef_construction,
+                layer,
+            );
             let selected = self.select_neighbors(&candidates, self.max_neighbors(layer));
             self.graph[ordinal][layer] = selected.clone();
             for neighbor in selected {

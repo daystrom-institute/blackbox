@@ -29,8 +29,7 @@ pub fn global() -> Arc<VectorStore> {
     GLOBAL_STORE
         .get_or_init(|| {
             Arc::new(
-                VectorStore::open(default_vectors_dir())
-                    .expect("default vector store should open"),
+                VectorStore::open(default_vectors_dir()).expect("default vector store should open"),
             )
         })
         .clone()
@@ -112,12 +111,7 @@ impl VectorStore {
     }
 
     pub fn delete_entity_all_routes(&self, entity_id: &str) -> Result<()> {
-        let partitions = self
-            .partitions
-            .read()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let partitions = self.partitions.read().values().cloned().collect::<Vec<_>>();
         for partition in partitions {
             partition.write().delete(entity_id)?;
         }
@@ -272,8 +266,11 @@ impl Partition {
             if record.deleted_at.is_some() {
                 self.slab.delete(&record.entity_id);
             } else {
-                self.slab
-                    .upsert(&record.entity_id, &record.content_hash, record.vector.clone())?;
+                self.slab.upsert(
+                    &record.entity_id,
+                    &record.content_hash,
+                    record.vector.clone(),
+                )?;
             }
         }
         self.wal_records = records.len();
@@ -343,7 +340,8 @@ impl Partition {
 }
 
 fn write_f32_file(path: &Path, values: &[f32]) -> Result<()> {
-    let mut file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut file =
+        fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     for value in values {
         file.write_all(&value.to_le_bytes())?;
     }
@@ -359,8 +357,12 @@ mod tests {
     fn wal_rebuild_restores_active_vectors() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VectorStore::open(tmp.path()).unwrap();
-        store.upsert("voyage-1024", "a", "h1", vec![1.0, 0.0, 0.0, 0.0]).unwrap();
-        store.upsert("voyage-1024", "b", "h2", vec![0.0, 1.0, 0.0, 0.0]).unwrap();
+        store
+            .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        store
+            .upsert("voyage-1024", "b", "h2", vec![0.0, 1.0, 0.0, 0.0])
+            .unwrap();
         store.delete("voyage-1024", "b").unwrap();
         drop(store);
 
@@ -378,8 +380,12 @@ mod tests {
     fn separate_routes_create_separate_partitions() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VectorStore::open(tmp.path()).unwrap();
-        store.upsert("voyage-1024", "a", "h1", vec![1.0, 0.0]).unwrap();
-        store.upsert("ollama-768", "b", "h2", vec![0.0, 1.0, 0.0]).unwrap();
+        store
+            .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0])
+            .unwrap();
+        store
+            .upsert("ollama-768", "b", "h2", vec![0.0, 1.0, 0.0])
+            .unwrap();
         assert_eq!(store.partition_count(), 2);
         assert_eq!(store.metrics()["voyage-1024"].dims, 2);
         assert_eq!(store.metrics()["ollama-768"].dims, 3);
@@ -389,7 +395,9 @@ mod tests {
     fn dimension_mismatch_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VectorStore::open(tmp.path()).unwrap();
-        store.upsert("voyage-1024", "a", "h1", vec![1.0, 0.0]).unwrap();
+        store
+            .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0])
+            .unwrap();
         assert!(store.upsert("voyage-1024", "b", "h2", vec![1.0]).is_err());
     }
 }

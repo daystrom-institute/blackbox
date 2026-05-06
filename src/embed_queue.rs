@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 
 use crate::chunker::Chunk;
 use crate::embed::queue::{EmbedQueueHandle, EmbedRequest, EmbedStatusResponse};
-use crate::embed::{Bucket, queue};
+use crate::embed::{queue, Bucket};
 use crate::entity_ref::EntityRef;
 use crate::knowledge::KnowledgeEntry;
 

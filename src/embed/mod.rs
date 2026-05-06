@@ -7,7 +7,7 @@ pub mod voyage;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -206,7 +206,10 @@ impl EmbeddingRouter {
                 self.config.providers.ollama.model.clone(),
                 ollama::OLLAMA_DIMENSIONS,
             ),
-            other => bail!("unknown embedding provider `{other}` for bucket {}", bucket.as_str()),
+            other => bail!(
+                "unknown embedding provider `{other}` for bucket {}",
+                bucket.as_str()
+            ),
         };
         Ok(Route {
             bucket,
@@ -230,7 +233,10 @@ impl EmbeddingRouter {
             OLLAMA_PROVIDER_ID => Ok(Box::new(ollama::OllamaProvider::from_config(
                 self.config.providers.ollama.clone(),
             )?)),
-            other => bail!("unknown embedding provider `{other}` for bucket {}", bucket.as_str()),
+            other => bail!(
+                "unknown embedding provider `{other}` for bucket {}",
+                bucket.as_str()
+            ),
         }
     }
 
@@ -332,7 +338,10 @@ code = "ollama"
         )
         .unwrap();
         assert_eq!(
-            router.route(Bucket::Code, Some("proj1234")).unwrap().provider_id,
+            router
+                .route(Bucket::Code, Some("proj1234"))
+                .unwrap()
+                .provider_id,
             OLLAMA_PROVIDER_ID
         );
         assert_eq!(

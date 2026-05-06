@@ -675,12 +675,12 @@ impl BlackboxServer {
 // ---------------------------------------------------------------------------
 
 use artifacts::{ArtifactInstallParams, ArtifactListParams, ArtifactSupersedeParams};
+use embed::ReembedParams;
 use inbox::InboxParams;
 use index::{
     CiteParams, ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
     SessionsListParams, TopicsParams,
 };
-use embed::ReembedParams;
 use knowledge::{
     AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeListParams, LearnParams,
     RememberParams, RenderParams, ResponseFormat, ReviewParams,
