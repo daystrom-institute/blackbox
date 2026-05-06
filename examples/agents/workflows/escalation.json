@@ -10,13 +10,14 @@
   "start": "CheapAttempt",
   "vars_schema": {
     "prompt": { "kind": "string", "required": true },
-    "cheap_dispatch": { "kind": "any" },
-    "expensive_dispatch": { "kind": "any" }
+    "cheap_handle": { "kind": "any" },
+    "cheap_output": { "kind": "any" },
+    "expensive_handle": { "kind": "any" }
   },
   "nodes": {
     "CheapAttempt": {
       "actor": "placeholder",
-      "prompt": "Attempt the task cheaply: ${vars.prompt}",
+      "prompt": "Escalation: dispatching cheap agent, then evaluating output quality.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -29,7 +30,21 @@
             },
             "timeout_secs": 60
           },
-          "into_var": "cheap_dispatch",
+          "into_var": "cheap_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.cheap_handle.taskId}",
+              "timeout_seconds": 60
+            },
+            "timeout_secs": 70
+          },
+          "into_var": "cheap_output",
           "on_failure": "halt"
         }
       ],
@@ -45,7 +60,7 @@
     },
     "Escalate": {
       "actor": "placeholder",
-      "prompt": "Escalating to expensive agent with context from cheap attempt.",
+      "prompt": "Escalating to expensive agent. Cheap agent output was unsuitable.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -56,12 +71,12 @@
               "agent": "expensive-agent",
               "args": {
                 "prompt": "${vars.prompt}",
-                "context": "Cheap agent result: ${vars.cheap_dispatch}"
+                "context": "Cheap agent result: ${vars.cheap_output.result}"
               }
             },
             "timeout_secs": 120
           },
-          "into_var": "expensive_dispatch",
+          "into_var": "expensive_handle",
           "on_failure": "halt"
         }
       ],
@@ -69,7 +84,7 @@
     },
     "Done": {
       "actor": "placeholder",
-      "prompt": "Cheap agent was sufficient. Result: ${vars.cheap_dispatch}",
+      "prompt": "Cheap agent output was sufficient. Result: ${vars.cheap_output.result}",
       "next": { "type": "terminal" }
     }
   }

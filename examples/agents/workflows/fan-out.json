@@ -10,13 +10,15 @@
   "start": "FanOut",
   "vars_schema": {
     "prompt": { "kind": "string", "required": true },
-    "left_dispatch": { "kind": "any" },
-    "right_dispatch": { "kind": "any" }
+    "left_handle": { "kind": "any" },
+    "right_handle": { "kind": "any" },
+    "left_output": { "kind": "any" },
+    "right_output": { "kind": "any" }
   },
   "nodes": {
     "FanOut": {
       "actor": "placeholder",
-      "prompt": "Fan-out dispatched. Waiting for branch outputs.",
+      "prompt": "Fan-out: dispatching left and right agents in parallel.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -29,7 +31,7 @@
             },
             "timeout_secs": 120
           },
-          "into_var": "left_dispatch",
+          "into_var": "left_handle",
           "on_failure": "warn"
         },
         {
@@ -43,15 +45,62 @@
             },
             "timeout_secs": 120
           },
-          "into_var": "right_dispatch",
+          "into_var": "right_handle",
           "on_failure": "warn"
         }
       ],
-      "next": { "type": "goto", "to": "Aggregate" }
+      "next": {
+        "type": "fork",
+        "branches": ["WaitLeft", "WaitRight"],
+        "continue_to": "Aggregate"
+      }
+    },
+    "WaitLeft": {
+      "actor": "placeholder",
+      "prompt": "Waiting for left agent to complete.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.left_handle.taskId}",
+              "timeout_seconds": 120
+            },
+            "timeout_secs": 130
+          },
+          "into_var": "left_output",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "WaitRight": {
+      "actor": "placeholder",
+      "prompt": "Waiting for right agent to complete.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.right_handle.taskId}",
+              "timeout_seconds": 120
+            },
+            "timeout_secs": 130
+          },
+          "into_var": "right_output",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
     },
     "Aggregate": {
       "actor": "placeholder",
-      "prompt": "Fan-out results:\n\nLeft: ${vars.left_dispatch}\n\nRight: ${vars.right_dispatch}\n\nSynthesize both into a balanced recommendation.",
+      "wait_for": ["WaitLeft", "WaitRight"],
+      "prompt": "Fan-out aggregation. Synthesize both agent outputs into a balanced recommendation.\n\nLeft agent output:\n${vars.left_output.result}\n\nRight agent output:\n${vars.right_output.result}",
       "next": { "type": "terminal" }
     }
   }

@@ -4947,7 +4947,7 @@ Constraints:\n\
         Parameters(p): Parameters<AgentDispatchParams>,
     ) -> CallToolResult {
         use orchestration::agents::adapter::{
-            AgentAdapterRegistry, AgentDispatchAdapter, DispatchContext,
+            AgentAdapterRegistry, DispatchContext,
         };
         use orchestration::agents::registry::AgentRegistry;
         use orchestration::agents::types::{AgentRef, AgentSession, MergedFilters};

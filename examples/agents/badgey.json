@@ -2,6 +2,7 @@
   "kind": "agent",
   "name": "badgey",
   "version": 1,
+  "_contract": "dispatch_adapter 'badgey' owns lifecycle; the inline brofile below serves as identity/documentation/fallback-persona and is NOT used for direct dispatch when the adapter is registered.",
   "manifest": {
     "description": "Consultant-flavored agent that proposes knowledge entries, brofile lenses, rule packets, workflow arcs, and agent manifests distilled from recurring patterns in the transcript corpus.",
     "when_to_use": [
@@ -15,6 +16,7 @@
       "badgey is long-running and asynchronous by design"
     ],
     "brofile_inline": {
+      "_note": "documentation persona — adapter dispatch (badgey) takes precedence when registered",
       "provider": "claude",
       "model": "sonnet-4.6",
       "effort": "medium",

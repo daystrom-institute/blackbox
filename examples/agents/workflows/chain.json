@@ -7,17 +7,17 @@
       "brofile": "probe-haiku"
     }
   },
-  "start": "DispatchFirst",
+  "start": "RunFirst",
   "vars_schema": {
     "input": { "kind": "string", "required": true },
-    "first_dispatch": { "kind": "any" },
-    "first_result": { "kind": "any" },
-    "second_dispatch": { "kind": "any" }
+    "first_handle": { "kind": "any" },
+    "first_output": { "kind": "any" },
+    "second_handle": { "kind": "any" }
   },
   "nodes": {
-    "DispatchFirst": {
+    "RunFirst": {
       "actor": "placeholder",
-      "prompt": "Chain step 1 dispatched.",
+      "prompt": "Chain: dispatching first agent, then waiting for completion.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -30,21 +30,29 @@
             },
             "timeout_secs": 120
           },
-          "into_var": "first_dispatch",
+          "into_var": "first_handle",
           "on_failure": "halt"
         },
         {
-          "op": "parse_json",
-          "args": { "source": "${vars.first_dispatch}" },
-          "into_var": "first_result",
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.first_handle.taskId}",
+              "timeout_seconds": 120
+            },
+            "timeout_secs": 130
+          },
+          "into_var": "first_output",
           "on_failure": "halt"
         }
       ],
-      "next": { "type": "goto", "to": "DispatchSecond" }
+      "next": { "type": "goto", "to": "RunSecond" }
     },
-    "DispatchSecond": {
+    "RunSecond": {
       "actor": "placeholder",
-      "prompt": "Chain step 2 dispatched.",
+      "prompt": "Chain: dispatching second agent with first agent's output.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -53,11 +61,11 @@
             "tool": "bro_agent_dispatch",
             "arguments": {
               "agent": "second-agent",
-              "args": { "input": "${vars.first_result.output}" }
+              "args": { "input": "${vars.first_output.result}" }
             },
             "timeout_secs": 120
           },
-          "into_var": "second_dispatch",
+          "into_var": "second_handle",
           "on_failure": "halt"
         }
       ],

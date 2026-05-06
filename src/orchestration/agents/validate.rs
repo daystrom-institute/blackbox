@@ -969,4 +969,234 @@ mod tests {
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_dispatch_adapter");
     }
+
+    #[test]
+    fn reference_agents_install_via_artifact_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = crate::artifacts::ArtifactCatalog::open(tmp.path()).unwrap();
+
+        let persona_src = include_str!("../../../examples/agents/code-reviewer-persona.json");
+        let persona_v: serde_json::Value =
+            serde_json::from_str(persona_src).expect("persona parses");
+        catalog
+            .install_value(
+                crate::artifacts::ArtifactKind::Brofile,
+                "code-reviewer-persona.json".into(),
+                &persona_v,
+                Some("code-reviewer-persona".into()),
+                None,
+                None,
+            )
+            .expect("brofile install");
+
+        let mut registry = AgentAdapterRegistry::new();
+        struct TestBadgeyAdapter;
+        impl super::super::adapter::AgentDispatchAdapter for TestBadgeyAdapter {
+            fn name(&self) -> &'static str {
+                "badgey"
+            }
+            fn dispatch(
+                &self,
+                _manifest: &AgentManifest,
+                _args: serde_json::Value,
+                _ctx: super::super::adapter::DispatchContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                super::super::adapter::AgentDispatchResult,
+                                super::super::adapter::AgentDispatchError,
+                            >,
+                        > + Send,
+                >,
+            > {
+                Box::pin(async { Err(super::super::adapter::AgentDispatchError::AdapterFailed { message: "stub".into() }) })
+            }
+        }
+        registry.register(Arc::new(TestBadgeyAdapter));
+
+        let agents: &[&str] = &[
+            include_str!("../../../examples/agents/code-reviewer.json"),
+            include_str!("../../../examples/agents/diff-narrator.json"),
+            include_str!("../../../examples/agents/badgey.json"),
+        ];
+        for src in agents {
+            let v: serde_json::Value = serde_json::from_str(src)
+                .expect("agent JSON parses");
+            let ctx = InstallCtx {
+                adapter_registry: &registry,
+                brofile_exists: |name: &str| -> bool {
+                    catalog.metadata_for(crate::artifacts::ArtifactKind::Brofile, name)
+                        .ok().flatten().is_some_and(|m| m.active)
+                },
+            };
+            let agent_name = v["name"].as_str().unwrap_or("unknown");
+            validate_agent_install(&v, &ctx)
+                .unwrap_or_else(|e| panic!("{agent_name} validation failed: {e}"));
+            catalog
+                .install_value(
+                    crate::artifacts::ArtifactKind::Agent,
+                    format!("{agent_name}.json"),
+                    &v,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{agent_name} artifact install failed: {e}"));
+        }
+
+        let rows = catalog
+            .list(&crate::artifacts::ArtifactListParams {
+                kind: Some(crate::artifacts::ArtifactKind::Agent),
+                name: None,
+                include_superseded: false,
+            })
+            .unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"code-reviewer"), "code-reviewer not in catalog");
+        assert!(names.contains(&"diff-narrator"), "diff-narrator not in catalog");
+        assert!(names.contains(&"badgey"), "badgey not in catalog");
+    }
+
+    #[test]
+    fn badgey_adapter_contract_inline_brofile_is_documentation() {
+        let mut registry = AgentAdapterRegistry::new();
+        struct TestBadgeyAdapter;
+        impl super::super::adapter::AgentDispatchAdapter for TestBadgeyAdapter {
+            fn name(&self) -> &'static str {
+                "badgey"
+            }
+            fn dispatch(
+                &self,
+                _manifest: &AgentManifest,
+                _args: serde_json::Value,
+                _ctx: super::super::adapter::DispatchContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                super::super::adapter::AgentDispatchResult,
+                                super::super::adapter::AgentDispatchError,
+                            >,
+                        > + Send,
+                >,
+            > {
+                Box::pin(async { Err(super::super::adapter::AgentDispatchError::AdapterFailed { message: "stub".into() }) })
+            }
+        }
+        registry.register(Arc::new(TestBadgeyAdapter));
+
+        let src = include_str!("../../../examples/agents/badgey.json");
+        let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
+        let ctx = make_ctx(&registry);
+        validate_agent_install(&v, &ctx)
+            .expect("badgey with registered adapter should validate");
+
+        let manifest = serde_json::from_value::<AgentManifest>(
+            v["manifest"].clone(),
+        )
+        .expect("manifest deserializes");
+        assert!(
+            manifest.brofile_inline.is_some(),
+            "badgey declares inline brofile for documentation/identity"
+        );
+        assert_eq!(
+            manifest.dispatch_adapter.as_deref(),
+            Some("badgey"),
+            "dispatch_adapter: badgey owns lifecycle; inline brofile serves as documentation"
+        );
+    }
+
+    #[test]
+    fn reference_agents_dispatch_via_noop_adapter_returns_expected_handles() {
+        let mut registry = AgentAdapterRegistry::new();
+        struct DispatchingNoopAdapter;
+        impl super::super::adapter::AgentDispatchAdapter for DispatchingNoopAdapter {
+            fn name(&self) -> &'static str {
+                "noop-dispatch"
+            }
+            fn dispatch(
+                &self,
+                manifest: &AgentManifest,
+                args: serde_json::Value,
+                ctx: super::super::adapter::DispatchContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                super::super::adapter::AgentDispatchResult,
+                                super::super::adapter::AgentDispatchError,
+                            >,
+                        > + Send,
+                >,
+            > {
+                let name = manifest.description.clone();
+                let args_string = args.to_string();
+                Box::pin(async move {
+                    Ok(super::super::adapter::AgentDispatchResult {
+                        session: super::super::types::AgentSession {
+                            session_id: format!("stub-session-{}", name),
+                            provider: "stub".into(),
+                            project_dir: ctx.project_dir,
+                            agent: super::super::types::AgentRef {
+                                name: name.clone(),
+                                version: 1,
+                            },
+                            task_id: Some(format!("stub-task-{}", name)),
+                        },
+                        resolved_brofile: None,
+                        merged_filters: Default::default(),
+                        degraded: if args_string.len() > 1000 {
+                            Some(super::super::adapter::DispatchDegraded {
+                                reasons: vec!["args_too_large_for_stub".into()],
+                            })
+                        } else {
+                            None
+                        },
+                    })
+                })
+            }
+        }
+        registry.register(Arc::new(DispatchingNoopAdapter));
+
+        for (agent_name, agent_src) in [
+            ("code-reviewer", include_str!("../../../examples/agents/code-reviewer.json")),
+            ("diff-narrator", include_str!("../../../examples/agents/diff-narrator.json")),
+        ] {
+            let v: serde_json::Value =
+                serde_json::from_str(agent_src).expect("agent parses");
+            let manifest = serde_json::from_value::<AgentManifest>(
+                v["manifest"].clone(),
+            )
+            .expect("manifest deserializes");
+
+            let test_args = serde_json::json!({"diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new"});
+            let ctx = super::super::adapter::DispatchContext {
+                project_dir: Some("/tmp/test-project".into()),
+                ambient: None,
+                bro_label_prefix: None,
+                caller_provider: None,
+                caller_session_id: None,
+            };
+            let adapter = registry.get("noop-dispatch")
+                .expect("adapter registered");
+            let result = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(adapter.dispatch(&manifest, test_args, ctx))
+                .unwrap_or_else(|e| panic!("{agent_name}: dispatch failed: {e}"));
+
+            assert!(
+                !result.session.session_id.is_empty(),
+                "{agent_name}: session_id should be non-empty"
+            );
+            assert!(
+                result.session.task_id.is_some(),
+                "{agent_name}: task_id should be Some"
+            );
+            assert!(
+                result.degraded.is_none(),
+                "{agent_name}: should not be degraded for small args"
+            );
+        }
+    }
 }

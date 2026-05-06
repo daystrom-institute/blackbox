@@ -35,7 +35,7 @@
         },
         "required": ["diff"]
       },
-      "prompt_template": "Review the following diff:\n\n{{diff}}\n\nRelevant context:\n{{#each context_refs}}- {{this}}\n{{/each}}"
+      "prompt_template": "Review the following diff:\n\n{{diff}}\n\nRelevant context refs: {{context_refs}}"
     },
     "outputs": {
       "schema": {
