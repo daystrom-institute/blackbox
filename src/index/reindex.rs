@@ -10,6 +10,7 @@ use tantivy::{Index, IndexWriter, TantivyDocument};
 use walkdir::WalkDir;
 
 use super::helpers::*;
+use super::knowledge_docs;
 use super::project_files;
 use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::entity_ref;
@@ -120,6 +121,9 @@ pub(super) fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64
 
 pub(super) fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
     let mut files = scan_source_files(config);
+    if config.knowledge_path.exists() {
+        scan_single_file(&config.knowledge_path, &mut files);
+    }
     match project_files::scan_registered_project_files(config) {
         Ok(mut project_files) => files.append(&mut project_files),
         Err(err) => tracing::warn!(error = %err, "failed to scan registered project files"),
@@ -253,6 +257,17 @@ fn try_background_reindex(
             resolved_call_edges = project_stats.resolved_call_edges,
             "auto-reindex: accumulated project-file edges"
         );
+    }
+
+    let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
+        &config.knowledge_path,
+        fields,
+        &mut writer,
+        &mut meta,
+    )?;
+    if knowledge_docs > 0 {
+        indexed_files += 1;
+        indexed_docs += knowledge_docs;
     }
 
     // 4b. Purge documents for deleted source files

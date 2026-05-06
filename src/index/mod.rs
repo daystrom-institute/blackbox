@@ -63,6 +63,7 @@ pub struct ReindexConfig {
     pub codex_root: Option<PathBuf>,
     pub meta_path: PathBuf,
     pub projects_path: PathBuf,
+    pub knowledge_path: PathBuf,
 }
 
 pub struct TranscriptIndex {
@@ -108,6 +109,7 @@ impl TranscriptIndex {
         roots: Vec<(String, PathBuf)>,
         codex_root: Option<PathBuf>,
         projects_path: PathBuf,
+        knowledge_path: PathBuf,
     ) -> Result<Self> {
         reset_index_on_schema_mismatch(index_path)?;
         let meta_path = index_path.join("_meta.json");
@@ -140,6 +142,7 @@ impl TranscriptIndex {
             codex_root,
             meta_path,
             projects_path,
+            knowledge_path,
         };
 
         Ok(Self {
@@ -165,6 +168,28 @@ impl TranscriptIndex {
     /// Get the reindex config for the background thread.
     pub fn reindex_config(&self) -> ReindexConfig {
         self.config.clone()
+    }
+
+    pub(crate) fn index_knowledge_entry(
+        &mut self,
+        entry: &crate::knowledge::KnowledgeEntry,
+    ) -> Result<()> {
+        knowledge_docs::upsert_knowledge_entry(
+            &self.index,
+            self.fields,
+            &self.config.knowledge_path,
+            entry,
+        )?;
+        self.reader.reload()?;
+        *self.stats_cache.lock() = None;
+        Ok(())
+    }
+
+    pub(crate) fn delete_knowledge_entry(&mut self, entry_id: &str) -> Result<()> {
+        knowledge_docs::delete_knowledge_entry(&self.index, self.fields, entry_id)?;
+        self.reader.reload()?;
+        *self.stats_cache.lock() = None;
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -307,6 +332,7 @@ mod tests {
             Vec::new(),
             None,
             dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
         )
         .unwrap();
 
@@ -327,6 +353,7 @@ mod tests {
             Vec::new(),
             None,
             dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
         )
         .unwrap();
 
@@ -344,6 +371,7 @@ mod tests {
             Vec::new(),
             None,
             dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
         )
         .unwrap();
         let project = crate::projects::ProjectRecord {
@@ -393,15 +421,92 @@ mod tests {
             .unwrap();
         assert!(result.contains("/tmp/repo/src/lib.rs"), "{result}");
     }
+
+    #[test]
+    fn delete_knowledge_entry_removes_tantivy_doc() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        let knowledge_path = dir.path().join("knowledge.json");
+        let mut index = TranscriptIndex::open_or_create(
+            &index_path,
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            knowledge_path.clone(),
+        )
+        .unwrap();
+        let entry = crate::knowledge::KnowledgeEntry {
+            id: "abc12345".into(),
+            title: "Delete fixture".into(),
+            content: "tombstone searchable knowledge phrase".into(),
+            cluster: None,
+            variants: Default::default(),
+            category: crate::knowledge::Category::Memory,
+            scope: crate::knowledge::Scope::Global,
+            project: None,
+            providers: Vec::new(),
+            priority: crate::knowledge::Priority::Standard,
+            weight: 100,
+            status: crate::knowledge::Status::Active,
+            approval: crate::knowledge::Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-05-05T17:30:00Z".into(),
+            updated_at: "2026-05-05T17:30:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+
+        index.index_knowledge_entry(&entry).unwrap();
+        let hits = index
+            .search(&SearchParams {
+                query: "tombstone searchable".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(5),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(hits.contains("tombstone"), "{hits}");
+        assert!(hits.contains("searchable"), "{hits}");
+
+        index.delete_knowledge_entry("abc12345").unwrap();
+        let hits = index
+            .search(&SearchParams {
+                query: "tombstone searchable".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(5),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(
+            hits == "No results found." || hits == "Index is empty. Run blackbox_reindex first.",
+            "{hits}"
+        );
+    }
 }
 
 mod code_tokenizer;
 mod helpers;
+mod knowledge_docs;
 mod project_files;
 mod reindex;
 mod search;
 
 pub use helpers::find_session_file;
+pub(crate) use knowledge_docs::{knowledge_chunk_hash, knowledge_entity_id};
 pub use reindex::spawn_reindex_thread;
 pub use search::{
     CiteParams, ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,

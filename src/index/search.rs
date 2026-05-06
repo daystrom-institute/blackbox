@@ -14,6 +14,7 @@ use tantivy::{IndexWriter, TantivyDocument, Term};
 use walkdir::WalkDir;
 
 use super::helpers::*;
+use super::knowledge_docs;
 use super::project_files;
 use super::reindex::*;
 use super::{FileMeta, TranscriptIndex};
@@ -1321,6 +1322,17 @@ impl TranscriptIndex {
         indexed_docs += project_stats.indexed_docs;
         skipped += project_stats.skipped;
 
+        let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
+            &self.config.knowledge_path,
+            f,
+            &mut writer,
+            &mut meta,
+        )?;
+        if knowledge_docs > 0 {
+            indexed_files += 1;
+            indexed_docs += knowledge_docs;
+        }
+
         // Purge documents for deleted source files
         let current_files = scan_all_source_files(&self.config);
         let current_paths: std::collections::HashSet<String> =
@@ -1385,6 +1397,7 @@ mod agentic_project_file_tests {
             Vec::new(),
             None,
             projects_path,
+            dir.path().join("knowledge.json"),
         )
         .unwrap();
         let msg = index.build_index(false).unwrap();
@@ -1436,5 +1449,53 @@ mod agentic_project_file_tests {
 
         let rerun = index.build_index(false).unwrap();
         assert!(rerun.contains("skipped"));
+    }
+
+    #[test]
+    fn knowledge_entries_are_searchable_after_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let knowledge_path = dir.path().join("knowledge.json");
+        let mut knowledge = crate::knowledge::Knowledge::open(&knowledge_path).unwrap();
+        knowledge
+            .remember(
+                &crate::knowledge::RememberParams {
+                    content: "durable zebra phrase for knowledge indexing".into(),
+                    category: None,
+                    title: Some("Knowledge indexing fixture".into()),
+                    scope: None,
+                    project: None,
+                    decay: None,
+                    review_at: None,
+                    expires_at: None,
+                },
+                false,
+            )
+            .unwrap();
+
+        let mut index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            knowledge_path,
+        )
+        .unwrap();
+        index.build_index(false).unwrap();
+
+        let hits = index
+            .search(&SearchParams {
+                query: "durable zebra phrase".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(5),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(hits.contains("durable"), "{hits}");
+        assert!(hits.contains("zebra"), "{hits}");
+        assert!(hits.contains("phrase"), "{hits}");
     }
 }

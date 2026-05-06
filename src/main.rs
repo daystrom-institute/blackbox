@@ -3,6 +3,7 @@ mod chunker;
 mod council;
 mod crons;
 mod edge_index;
+mod embed_queue;
 pub mod entity_ref;
 #[cfg(test)]
 #[path = "../eval/check.rs"]
@@ -290,6 +291,23 @@ impl BlackboxServer {
             state,
             tool_router: Self::bbox_tools() + Self::bro_tools(),
         }
+    }
+
+    fn sync_knowledge_entry_to_index(&self, entry_id: &str) -> anyhow::Result<()> {
+        let Some(entry) = self.state.kb.read().entry(entry_id).cloned() else {
+            return Ok(());
+        };
+        let entity_id = crate::index::knowledge_entity_id(entry_id);
+        let chunk_hash = crate::index::knowledge_chunk_hash(&entry);
+        self.state.idx.write().index_knowledge_entry(&entry)?;
+        embed_queue::enqueue_knowledge(&entry, &entity_id, &chunk_hash);
+        Ok(())
+    }
+
+    fn tombstone_knowledge_entry_in_index(&self, entry_id: &str) -> anyhow::Result<()> {
+        self.state.idx.write().delete_knowledge_entry(entry_id)?;
+        embed_queue::tombstone_knowledge(&crate::index::knowledge_entity_id(entry_id));
+        Ok(())
     }
 
     fn ambient_pin_block(
@@ -833,6 +851,7 @@ impl BlackboxServer {
         match (|| {
             let warning = self.arc_bound_warning(p.id.as_deref(), &p.content);
             let result = self.state.kb.write().learn_result(&p, false)?;
+            self.sync_knowledge_entry_to_index(&result.id)?;
             Ok::<_, anyhow::Error>((result, warning))
         })() {
             Ok((result, warning)) => {
@@ -882,7 +901,9 @@ impl BlackboxServer {
     )]
     fn bbox_remember(&self, Parameters(p): Parameters<RememberParams>) -> CallToolResult {
         Self::run("bbox_remember", || {
-            self.state.kb.write().remember(&p, false)
+            let result = self.state.kb.write().remember_result(&p, false)?;
+            self.sync_knowledge_entry_to_index(&result.id)?;
+            Ok(result.message)
         })
     }
 
@@ -891,7 +912,14 @@ impl BlackboxServer {
         description = "Record a durable commitment with required rationale; supports supersession."
     )]
     fn bbox_decide(&self, Parameters(p): Parameters<DecideParams>) -> CallToolResult {
-        Self::run("bbox_decide", || self.state.kb.write().decide(&p, false))
+        Self::run("bbox_decide", || {
+            let result = self.state.kb.write().decide_result(&p, false)?;
+            self.sync_knowledge_entry_to_index(&result.id)?;
+            if let Some(old_id) = result.superseded.as_deref() {
+                self.tombstone_knowledge_entry_in_index(old_id)?;
+            }
+            Ok(result.message)
+        })
     }
 
     #[tool(
@@ -969,7 +997,11 @@ impl BlackboxServer {
 
     #[tool(name = "bbox_forget", description = "Retire or supersede an entry.")]
     fn bbox_forget(&self, Parameters(p): Parameters<ForgetParams>) -> CallToolResult {
-        Self::run("bbox_forget", || self.state.kb.write().forget(&p))
+        Self::run("bbox_forget", || {
+            let message = self.state.kb.write().forget(&p)?;
+            self.tombstone_knowledge_entry_in_index(&p.id)?;
+            Ok(message)
+        })
     }
 
     #[tool(
@@ -7274,12 +7306,17 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Index path: {}", index_path.display());
 
     let projects_path = util::blackbox_projects_path(&home);
-    let idx =
-        TranscriptIndex::open_or_create(&index_path, roots, codex_root, projects_path.clone())?;
+    let kb_path = util::blackbox_knowledge_path(&home);
+    let idx = TranscriptIndex::open_or_create(
+        &index_path,
+        roots,
+        codex_root,
+        projects_path.clone(),
+        kb_path.clone(),
+    )?;
     let projects_store = ProjectRegistry::open(&projects_path)?;
     tracing::info!("Project registry: {}", projects_path.display());
 
-    let kb_path = util::blackbox_knowledge_path(&home);
     let mut kb = Knowledge::open(&kb_path)?;
     tracing::info!("Knowledge store: {}", kb_path.display());
 
@@ -7729,6 +7766,7 @@ mod tests {
             Vec::new(),
             None,
             tmp.path().join("projects.json"),
+            tmp.path().join("knowledge.json"),
         )
         .unwrap();
         let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();

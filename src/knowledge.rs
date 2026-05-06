@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::query::{parse_query, QueryAtom, QueryNode};
+use crate::query::{QueryAtom, QueryNode, parse_query};
 
 // ── MCP parameter structs ─────────────────────────────────────────
 //
@@ -318,6 +318,13 @@ pub struct LearnWriteResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct KnowledgeWriteResult {
+    pub id: String,
+    pub message: String,
+    pub superseded: Option<String>,
 }
 
 impl Priority {
@@ -648,6 +655,10 @@ impl Knowledge {
         &self.store.entries
     }
 
+    pub fn entry(&self, id: &str) -> Option<&KnowledgeEntry> {
+        self.store.entries.iter().find(|entry| entry.id == id)
+    }
+
     /// Insert-or-replace a code-generated entry by its stable ID.
     /// Bypasses the normal `learn` flow (no ID generation, no approval
     /// defaulting). Used by `tool_docs::sync_into_knowledge` to keep
@@ -864,7 +875,11 @@ impl Knowledge {
     }
 
     /// Remember — store for on-demand recall only, never rendered into markdown.
-    pub fn remember(&mut self, p: &RememberParams, from_agent: bool) -> Result<String> {
+    pub fn remember_result(
+        &mut self,
+        p: &RememberParams,
+        from_agent: bool,
+    ) -> Result<KnowledgeWriteResult> {
         // None → Memory (schema default). Some(invalid) → error rather than
         // silently landing the entry in the wrong bucket.
         let category = match p.category.as_deref() {
@@ -915,15 +930,26 @@ impl Knowledge {
         });
 
         self.save()?;
-        Ok(format!(
-            "Remembered entry {id} (indexed only, not rendered)"
-        ))
+        Ok(KnowledgeWriteResult {
+            id: id.clone(),
+            message: format!("Remembered entry {id} (indexed only, not rendered)"),
+            superseded: None,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn remember(&mut self, p: &RememberParams, from_agent: bool) -> Result<String> {
+        Ok(self.remember_result(p, from_agent)?.message)
     }
 
     /// Decide — a durable commitment with rationale. When `supersedes`
     /// is set, marks the prior entry as superseded and records a link
     /// from the old to the new (via the existing `supersedes` field).
-    pub fn decide(&mut self, p: &DecideParams, from_agent: bool) -> Result<String> {
+    pub fn decide_result(
+        &mut self,
+        p: &DecideParams,
+        from_agent: bool,
+    ) -> Result<KnowledgeWriteResult> {
         if p.content.trim().is_empty() {
             anyhow::bail!("'content' is required");
         }
@@ -993,11 +1019,21 @@ impl Knowledge {
         }
 
         self.save()?;
-        if let Some(old_id) = p.supersedes.as_deref() {
-            Ok(format!("Decided entry {id} (supersedes {old_id})"))
+        let message = if let Some(old_id) = p.supersedes.as_deref() {
+            format!("Decided entry {id} (supersedes {old_id})")
         } else {
-            Ok(format!("Decided entry {id}"))
-        }
+            format!("Decided entry {id}")
+        };
+        Ok(KnowledgeWriteResult {
+            id,
+            message,
+            superseded: p.supersedes.clone(),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn decide(&mut self, p: &DecideParams, from_agent: bool) -> Result<String> {
+        Ok(self.decide_result(p, from_agent)?.message)
     }
 
     pub fn forget(&mut self, p: &ForgetParams) -> Result<String> {
@@ -2389,11 +2425,12 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             report.contains("Global absorb is no-op"),
             "report: {report}"
         );
-        assert!(kb
-            .store
-            .entries
-            .iter()
-            .all(|e| e.approval != Approval::Imported));
+        assert!(
+            kb.store
+                .entries
+                .iter()
+                .all(|e| e.approval != Approval::Imported)
+        );
     }
 
     #[test]
