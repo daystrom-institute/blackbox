@@ -21,6 +21,18 @@
   copied under `$BLACKBOX_STATE_DIR/artifacts/<kind>/<name>.json` with
   `<kind>/<name>/metadata.json` tracking install source and supersession state.
 
+## H3
+
+The shipped `nightly-eval-arc.json` records that the eval shell harness ran but
+does not route the actual scoreboard through the `eval/drift-policy` gate. The
+`Decide` node's gate runs against the workflow's policy entity, not against
+`RunSuite`'s shell output. The shell harness itself is the real runner; the
+workflow is documentation and audit trail.
+
+When workflow hook ops grow shell-output capture, such as `op: shell`
+populating a var with stdout, exit code, or parsed JSON, the `Decide` gate can
+route on actual drift verdict.
+
 ## S3
 
 - Code chunking uses `tree-sitter-language-pack` with runtime downloads
