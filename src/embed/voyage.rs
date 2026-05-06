@@ -112,7 +112,7 @@ impl EmbeddingProvider for VoyageProvider {
         let api_key = self.api_key.as_deref().context(
             "VOYAGE_API_KEY or DAYSTROM_VOYAGE_API_KEY is required for voyage embeddings",
         )?;
-        let response = self
+        let raw = self
             .client
             .post(&self.config.endpoint)
             .bearer_auth(api_key)
@@ -122,9 +122,17 @@ impl EmbeddingProvider for VoyageProvider {
             })
             .send()
             .await
-            .context("sending voyage embedding request")?
-            .error_for_status()
-            .context("voyage embedding request failed")?
+            .context("sending voyage embedding request")?;
+        let status = raw.status();
+        if !status.is_success() {
+            let body = raw.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(512).collect();
+            bail!(
+                "voyage embedding request failed: HTTP {status} batch_size={} body={snippet}",
+                texts.len()
+            );
+        }
+        let response = raw
             .json::<VoyageResponse>()
             .await
             .context("decoding voyage embedding response")?;

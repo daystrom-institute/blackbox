@@ -24,8 +24,13 @@ pub(crate) struct GitBlameLine {
 }
 
 pub(crate) fn git_root_for_path(path: &Path) -> Option<PathBuf> {
+    let cwd = if path.is_file() {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
     let output = git_output(
-        path,
+        cwd,
         &["rev-parse", "--show-toplevel"],
         "deriving repository root",
     )?;

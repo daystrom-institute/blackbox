@@ -515,6 +515,12 @@ async fn schedule_retry_or_drop(
     }
 }
 
+// Voyage API caps: 128 docs/request and ~120k tokens/request. Cap batches at
+// 64 docs and ~80 KB of input bytes — keeps us comfortably under both limits
+// even when chunks approach MAX_CHUNK_BYTES.
+const MAX_BATCH_DOCS: usize = 64;
+const MAX_BATCH_BYTES: usize = 80 * 1024;
+
 async fn collect_quiescent_batch(
     rx: &mut mpsc::UnboundedReceiver<WorkerCommand>,
     pending: &mut VecDeque<EmbedRequest>,
@@ -533,7 +539,21 @@ async fn collect_quiescent_batch(
             Err(_) => break,
         }
     }
-    Some(pending.drain(..).collect())
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(req) = pending.pop_front() {
+        let req_bytes = req.text.len();
+        if !batch.is_empty() && (batch.len() >= MAX_BATCH_DOCS || bytes + req_bytes > MAX_BATCH_BYTES) {
+            pending.push_front(req);
+            break;
+        }
+        bytes += req_bytes;
+        batch.push(req);
+        if batch.len() >= MAX_BATCH_DOCS {
+            break;
+        }
+    }
+    Some(batch)
 }
 
 fn persist_vectors(
