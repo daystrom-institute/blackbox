@@ -533,15 +533,18 @@ fn persist_vectors(
             batch.len()
         ));
     }
-    for (request, vector) in batch.iter().zip(vectors) {
-        crate::vectors::upsert(
-            &spec.vector_route,
-            &request.entity_id,
-            &request.chunk_hash,
-            vector,
-        )?;
-    }
-    Ok(())
+    crate::vectors::upsert_batch(
+        &spec.vector_route,
+        batch
+            .iter()
+            .zip(vectors)
+            .map(|(request, vector)| crate::vectors::VectorUpsert {
+                entity_id: request.entity_id.clone(),
+                content_hash: request.chunk_hash.clone(),
+                vector,
+            })
+            .collect(),
+    )
 }
 
 struct TokenBucket {

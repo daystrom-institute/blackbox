@@ -41,6 +41,10 @@ pub fn upsert(route: &str, entity_id: &str, content_hash: &str, vector: Vec<f32>
     global().upsert(route, entity_id, content_hash, vector)
 }
 
+pub fn upsert_batch(route: &str, records: Vec<VectorUpsert>) -> Result<()> {
+    global().upsert_batch(route, records)
+}
+
 pub fn delete(route: &str, entity_id: &str) -> Result<()> {
     global().delete(route, entity_id)
 }
@@ -100,11 +104,24 @@ impl VectorStore {
         vector: Vec<f32>,
     ) -> Result<()> {
         let partition = self.partition(route)?;
-        let result = partition
-            .write()
+        let mut partition = partition.write();
+        partition
             .upsert(entity_id, content_hash, vector)
-            .with_context(|| format!("upserting vector entity {entity_id} into {route}"));
-        result
+            .with_context(|| format!("upserting vector entity {entity_id} into {route}"))?;
+        partition
+            .flush_derived_files()
+            .with_context(|| format!("flushing vector partition {route}"))
+    }
+
+    pub fn upsert_batch(&self, route: &str, records: Vec<VectorUpsert>) -> Result<()> {
+        let partition = self.partition(route)?;
+        let mut partition = partition.write();
+        for record in records {
+            partition.upsert(&record.entity_id, &record.content_hash, record.vector)?;
+        }
+        partition
+            .flush_derived_files()
+            .with_context(|| format!("flushing vector partition {route}"))
     }
 
     pub fn delete(&self, route: &str, entity_id: &str) -> Result<()> {
@@ -203,6 +220,13 @@ pub struct PartitionMetrics {
     pub hnsw: Option<HnswMetricsSerde>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VectorUpsert {
+    pub entity_id: String,
+    pub content_hash: String,
+    pub vector: Vec<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HnswMetricsSerde {
     pub total_nodes: usize,
@@ -267,7 +291,7 @@ impl Partition {
                 .map_err(anyhow::Error::msg)?,
             None => self.rebuild_hnsw()?,
         }
-        self.write_derived_files()
+        Ok(())
     }
 
     fn delete(&mut self, entity_id: &str) -> Result<()> {
@@ -278,7 +302,7 @@ impl Partition {
         if let Some(hnsw) = self.hnsw.as_mut() {
             hnsw.delete(entity_id);
         }
-        self.write_derived_files()
+        self.flush_derived_files()
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<SearchHit> {
@@ -308,7 +332,7 @@ impl Partition {
         }
         self.wal_records = records.len();
         self.rebuild_hnsw()?;
-        self.write_derived_files()
+        self.flush_derived_files()
     }
 
     fn rebuild_hnsw(&mut self) -> Result<()> {
@@ -337,7 +361,7 @@ impl Partition {
         }
     }
 
-    fn write_derived_files(&self) -> Result<()> {
+    fn flush_derived_files(&self) -> Result<()> {
         fs::create_dir_all(&self.path)?;
         fs::write(
             self.path.join("meta.json"),
