@@ -31,7 +31,7 @@ impl InspectableEntityProvider for ThreadProvider {
             let threads = state.threads.read();
             let thread = threads
                 .all()
-                .into_iter()
+                .iter()
                 .find(|thread| thread.id == *thread_id)
                 .ok_or_else(|| anyhow::anyhow!("thread entity {thread_id} not found"))?;
             properties.insert("topic".into(), thread.topic.clone());
@@ -96,7 +96,7 @@ impl InspectableEntityProvider for ThreadProvider {
                 .threads
                 .read()
                 .all()
-                .into_iter()
+                .iter()
                 .find(|thread| thread.id == *thread_id)
             {
                 if let Some(name) = &thread.name {

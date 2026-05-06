@@ -31,7 +31,7 @@ impl InspectableEntityProvider for NoteProvider {
             let notes = state.notes.read();
             let note = notes
                 .all()
-                .into_iter()
+                .iter()
                 .find(|note| note.id == *note_id)
                 .ok_or_else(|| anyhow::anyhow!("note entity {note_id} not found"))?;
             properties.insert("kind".into(), format!("{:?}", note.kind));
@@ -97,7 +97,7 @@ impl InspectableEntityProvider for NoteProvider {
                 .notes
                 .read()
                 .all()
-                .into_iter()
+                .iter()
                 .find(|note| note.id == *note_id)
             {
                 return Some(truncate_label(format!("{:?}: {}", note.kind, note.body)));
