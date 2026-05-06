@@ -686,6 +686,7 @@ use knowledge::{
     AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeListParams, LearnParams,
     RememberParams, RenderParams, ResponseFormat, ReviewParams,
 };
+use mcp_tools::blame::BlameParams;
 use mcp_tools::bundle_evidence::BundleEvidenceParams;
 use mcp_tools::discover_seed::DiscoverSeedParams;
 use mcp_tools::find_paths::FindPathsParams;
@@ -916,6 +917,23 @@ impl BlackboxServer {
                 &provider_ctx,
                 &self.state.edge_index.read(),
                 &mut self.state.path_cache.write(),
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_blame",
+        description = "Trace a code line to the commit and bbox conversation that produced it."
+    )]
+    fn bbox_blame(&self, Parameters(p): Parameters<BlameParams>) -> CallToolResult {
+        Self::run("bbox_blame", || {
+            let provider_ctx = ProviderContext::new(&self.state);
+            let projects = self.state.projects.read().list();
+            mcp_tools::blame::blame(
+                &p,
+                &provider_ctx,
+                &self.state.edge_index.read(),
+                &projects,
             )
         })
     }

@@ -245,6 +245,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"])"#,
         ),
     },
+    ToolDoc {
+        name: "bbox_blame",
+        category: ToolCategory::Graph,
+        summary: "Trace a code line to the commit and bbox conversation that produced it.",
+        when_to_use: "Use for WHY-this-line-exists questions.",
+        example: None,
+    },
     // ── Projects ─────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_project_register",

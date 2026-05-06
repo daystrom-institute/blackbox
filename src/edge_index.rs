@@ -105,6 +105,10 @@ impl EdgeIndex {
         refs
     }
 
+    pub(crate) fn all_edges(&self) -> impl Iterator<Item = &Edge> {
+        self.forward.values().flat_map(|edges| edges.iter())
+    }
+
     fn insert(&mut self, edge: Edge, seen: &mut HashSet<Edge>) {
         if !seen.insert(edge.clone()) {
             return;

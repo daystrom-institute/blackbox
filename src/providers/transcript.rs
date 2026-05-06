@@ -51,7 +51,7 @@ impl InspectableEntityProvider for TranscriptProvider {
         schema(
             self.entity_type(),
             &["provider", "session_id", "line_offset", "event_idx", "role"],
-            &["IN_SESSION", "EDITED_FILE", "READ_FILE"],
+            &["IN_SESSION", "EDITED_FILE", "READ_FILE", "RAN_BASH"],
             &["provider", "session_id", "role"],
         )
     }
@@ -61,6 +61,7 @@ impl InspectableEntityProvider for TranscriptProvider {
             expected("IN_SESSION", true),
             expected("EDITED_FILE", false),
             expected("READ_FILE", false),
+            expected("RAN_BASH", false),
         ]
     }
 
@@ -71,7 +72,7 @@ impl InspectableEntityProvider for TranscriptProvider {
     ) -> Vec<NextHop> {
         next_hops(
             full_neighborhood,
-            &["IN_SESSION", "EDITED_FILE", "READ_FILE"],
+            &["IN_SESSION", "EDITED_FILE", "READ_FILE", "RAN_BASH"],
         )
     }
 

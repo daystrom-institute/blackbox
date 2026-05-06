@@ -338,6 +338,9 @@ impl TranscriptIndex {
             let preview = content.chars().take(300).collect::<String>();
             properties.insert("content_preview".into(), preview);
         }
+        if let Some(offset) = optional_u64(doc, self.fields.byte_offset) {
+            properties.insert("byte_offset".into(), offset.to_string());
+        }
         properties
     }
 }

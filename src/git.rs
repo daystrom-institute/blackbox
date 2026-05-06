@@ -13,6 +13,15 @@ pub(crate) struct GitCommit {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitBlameLine {
+    pub commit_sha: String,
+    pub author: String,
+    pub author_time: Option<String>,
+    pub root: PathBuf,
+    pub rel_path: String,
+}
+
 pub(crate) fn git_root_for_path(path: &Path) -> Option<PathBuf> {
     let output = git_output(
         path,
@@ -157,6 +166,69 @@ pub(crate) fn changed_files_for_commit(root: &Path, sha: &str) -> Result<Vec<Str
         .collect())
 }
 
+pub(crate) fn blame_for_line(file: &Path, line: u64) -> Result<Option<GitBlameLine>> {
+    if line == 0 {
+        anyhow::bail!("line must be 1-based");
+    }
+    let file = fs::canonicalize(file)
+        .with_context(|| format!("canonicalizing blame path {}", file.display()))?;
+    let Some(root) = git_root_for_path(&file) else {
+        return Ok(None);
+    };
+    let rel_path = file
+        .strip_prefix(&root)
+        .unwrap_or(&file)
+        .to_string_lossy()
+        .to_string();
+    let line_spec = format!("{line},{line}");
+    let output = git_output(
+        &root,
+        &["blame", "--porcelain", "-L", &line_spec, "--", &rel_path],
+        "running git blame",
+    )
+    .with_context(|| format!("failed to execute git blame in {}", root.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    parse_blame_porcelain(&output.stdout, root, rel_path)
+}
+
+pub(crate) fn parse_blame_porcelain(
+    stdout: &[u8],
+    root: PathBuf,
+    rel_path: String,
+) -> Result<Option<GitBlameLine>> {
+    let raw = String::from_utf8(stdout.to_vec())?;
+    let mut lines = raw.lines();
+    let Some(header) = lines.next() else {
+        return Ok(None);
+    };
+    let commit_sha = header.split_whitespace().next().unwrap_or("").to_string();
+    if commit_sha.is_empty() {
+        return Ok(None);
+    }
+    let mut author = String::new();
+    let mut author_time = None;
+    for line in lines {
+        if let Some(value) = line.strip_prefix("author ") {
+            author = value.to_string();
+        } else if let Some(value) = line.strip_prefix("author-time ") {
+            author_time = value
+                .parse::<i64>()
+                .ok()
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                .map(|dt| dt.to_rfc3339());
+        }
+    }
+    Ok(Some(GitBlameLine {
+        commit_sha,
+        author,
+        author_time,
+        root,
+        rel_path,
+    }))
+}
+
 pub(crate) fn head_fingerprint(root: &Path) -> Option<u64> {
     // HACK: project-file reindex metadata only has `(mtime, size)`, so git
     // history uses `mtime = 0` plus `size = HEAD fingerprint` as a synthetic
@@ -255,6 +327,19 @@ mod tests {
         assert_eq!(commits[0].author_name, "Alice");
         assert_eq!(commits[0].author_email, "a@example.test");
         assert_eq!(commits[0].message, "subject\n\nbody");
+    }
+
+    #[test]
+    fn parse_blame_porcelain_extracts_commit_author_and_time() {
+        let raw = b"abc123 1 1 1\nauthor Ada Lovelace\nauthor-mail <ada@example.test>\nauthor-time 1700000000\n\tlet x = 1;\n";
+        let blame = parse_blame_porcelain(raw, PathBuf::from("/repo"), "src/main.rs".into())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(blame.commit_sha, "abc123");
+        assert_eq!(blame.author, "Ada Lovelace");
+        assert_eq!(blame.rel_path, "src/main.rs");
+        assert_eq!(blame.author_time.as_deref(), Some("2023-11-14T22:13:20+00:00"));
     }
 
     #[test]

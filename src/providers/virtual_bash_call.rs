@@ -40,13 +40,14 @@ impl InspectableEntityProvider for BashCallProvider {
         schema(
             self.entity_type(),
             &["session", "turn", "virtual"],
-            &["BASH_CALL_IN_SESSION", "BASH_CALL_PRODUCED_OUTPUT"],
+            &["RAN_BASH", "BASH_CALL_IN_SESSION", "BASH_CALL_PRODUCED_OUTPUT"],
             &["session"],
         )
     }
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
         vec![
+            expected("RAN_BASH", false),
             expected("BASH_CALL_IN_SESSION", false),
             expected("BASH_CALL_PRODUCED_OUTPUT", false),
         ]
@@ -59,7 +60,7 @@ impl InspectableEntityProvider for BashCallProvider {
     ) -> Vec<NextHop> {
         next_hops(
             full_neighborhood,
-            &["BASH_CALL_IN_SESSION", "BASH_CALL_PRODUCED_OUTPUT"],
+            &["RAN_BASH", "BASH_CALL_IN_SESSION", "BASH_CALL_PRODUCED_OUTPUT"],
         )
     }
 
