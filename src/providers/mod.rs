@@ -1,5 +1,6 @@
 #![allow(dead_code)] // D1 lands the provider surface; D2 wires public consumers.
 
+pub mod agent;
 pub mod brofile;
 pub mod commit;
 pub mod knowledge;
@@ -128,6 +129,7 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(commit::CommitProvider),
             Box::new(virtual_task::TaskProvider),
             Box::new(virtual_bash_call::BashCallProvider),
+            Box::new(agent::AgentProvider),
         ]
     })
 }
@@ -231,6 +233,7 @@ mod tests {
             "commit:repo1234:abcdef1234567890",
             "task:task-12345678",
             "bash_call:session123:7",
+            "agent:code-reviewer@v3",
         ]
     }
 

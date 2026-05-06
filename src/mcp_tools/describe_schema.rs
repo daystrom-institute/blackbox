@@ -157,7 +157,7 @@ mod tests {
         let rendered = describe_schema(&BTreeMap::new()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let vertex_types = value["vertex_types"].as_array().unwrap();
-        assert_eq!(vertex_types.len(), 12);
+        assert_eq!(vertex_types.len(), 13);
         assert!(vertex_types
             .iter()
             .any(|value| value["entity_type"] == "knowledge"));

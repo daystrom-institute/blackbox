@@ -25,10 +25,11 @@ pub enum EntityType {
     Commit,
     Task,
     BashCall,
+    Agent,
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 12] = [
+    pub const ALL: [EntityType; 13] = [
         EntityType::Knowledge,
         EntityType::Transcript,
         EntityType::ProjectFile,
@@ -41,6 +42,7 @@ impl EntityType {
         EntityType::Commit,
         EntityType::Task,
         EntityType::BashCall,
+        EntityType::Agent,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -57,6 +59,7 @@ impl EntityType {
             EntityType::Commit => "commit",
             EntityType::Task => "task",
             EntityType::BashCall => "bash_call",
+            EntityType::Agent => "agent",
         }
     }
 
@@ -78,6 +81,7 @@ impl EntityType {
             EntityType::Commit => "commit:<repo_id>:<sha>",
             EntityType::Task => "task:<task_id>",
             EntityType::BashCall => "bash_call:<session>:<turn>",
+            EntityType::Agent => "agent:<name>@v<version>",
         }
     }
 
@@ -153,6 +157,10 @@ pub enum EntityRef {
         session: String,
         turn: u32,
     },
+    Agent {
+        name: String,
+        version: u32,
+    },
 }
 
 impl EntityRef {
@@ -203,6 +211,7 @@ impl EntityRef {
                 EntityRef::Task { task_id }
             }),
             EntityType::BashCall => parse_bash_call(input, rest),
+            EntityType::Agent => parse_agent(input, rest),
         }
     }
 
@@ -252,6 +261,7 @@ impl EntityRef {
             EntityRef::Commit { repo_id, sha } => Ok(format!("commit:{repo_id}:{sha}")),
             EntityRef::Task { task_id } => Ok(format!("task:{task_id}")),
             EntityRef::BashCall { session, turn } => Ok(format!("bash_call:{session}:{turn}")),
+            EntityRef::Agent { name, version } => Ok(format!("agent:{name}@v{version}")),
         }
     }
 
@@ -269,6 +279,7 @@ impl EntityRef {
             EntityRef::Commit { .. } => EntityType::Commit,
             EntityRef::Task { .. } => EntityType::Task,
             EntityRef::BashCall { .. } => EntityType::BashCall,
+            EntityRef::Agent { .. } => EntityType::Agent,
         }
     }
 
@@ -493,6 +504,19 @@ fn parse_bash_call(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseE
     Ok(EntityRef::BashCall {
         session: non_empty(input, session, EntityType::BashCall, "session")?.to_string(),
         turn: parse_u32(input, turn, EntityType::BashCall, "turn")?,
+    })
+}
+
+fn parse_agent(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
+    require_no_colon(input, rest, EntityType::Agent)?;
+    let value = non_empty(input, rest, EntityType::Agent, "name@version")?;
+    let (name, version_str) = value
+        .rsplit_once("@v")
+        .ok_or_else(|| shape_error(input, EntityType::Agent))?;
+    let name = non_empty(input, name, EntityType::Agent, "name")?;
+    Ok(EntityRef::Agent {
+        name: name.to_string(),
+        version: parse_u32(input, version_str, EntityType::Agent, "version")?,
     })
 }
 
@@ -800,6 +824,45 @@ mod tests {
         .is_virtual());
     }
 
+    #[test]
+    fn agent_ref_round_trips() {
+        let agent = EntityRef::Agent {
+            name: "code-reviewer".to_string(),
+            version: 3,
+        };
+        let rendered = agent.render();
+        assert_eq!(rendered, "agent:code-reviewer@v3");
+        let parsed = EntityRef::parse(&rendered).unwrap();
+        assert_eq!(parsed, agent);
+        assert_eq!(parsed.entity_type(), EntityType::Agent);
+        assert!(!parsed.is_virtual());
+    }
+
+    #[test]
+    fn agent_ref_rejects_missing_version() {
+        let err = EntityRef::parse("agent:reviewer").unwrap_err();
+        assert!(err.message.contains("agent"));
+        assert!(err.suggested_fix.is_some());
+    }
+
+    #[test]
+    fn agent_ref_rejects_non_numeric_version() {
+        let err = EntityRef::parse("agent:reviewer@vabc").unwrap_err();
+        assert!(err.message.contains("version"));
+    }
+
+    #[test]
+    fn agent_ref_rejects_colon_in_name() {
+        let err = EntityRef::parse("agent:reviewer:extra@v1").unwrap_err();
+        assert!(err.message.contains("agent"));
+    }
+
+    #[test]
+    fn agent_ref_rejects_empty_name() {
+        let err = EntityRef::parse("agent:@v1").unwrap_err();
+        assert!(err.message.contains("name"));
+    }
+
     #[derive(Clone)]
     struct Lcg(u64);
 
@@ -902,6 +965,10 @@ mod tests {
             11 => EntityRef::BashCall {
                 session: format!("{}:{}", rng.token("sess-"), rng.token("tool-")),
                 turn: rng.next() as u32,
+            },
+            12 => EntityRef::Agent {
+                name: rng.token("agent-"),
+                version: 1 + (rng.next() as u32) % 10,
             },
             _ => unreachable!(),
         }
