@@ -86,7 +86,7 @@ pub(crate) fn commit_log(root: &Path, since_exclusive: Option<&str>) -> Result<V
         "log".to_string(),
         "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%B%x1e".to_string(),
     ];
-    if let Some(since) = since_exclusive {
+    if let Some(since) = since_exclusive.filter(|since| is_ancestor_of_head(root, since)) {
         args.push(format!("{since}..HEAD"));
     }
     let output = git_output_strings(root, &args, "reading commit history")
@@ -95,6 +95,43 @@ pub(crate) fn commit_log(root: &Path, since_exclusive: Option<&str>) -> Result<V
         return Ok(Vec::new());
     }
     parse_commit_log(&output.stdout)
+}
+
+fn is_ancestor_of_head(root: &Path, since: &str) -> bool {
+    let rev_args = vec!["rev-parse".to_string(), format!("{since}^{{commit}}")];
+    let Some(rev) = git_output_strings(root, &rev_args, "checking commit existence") else {
+        return false;
+    };
+    if !rev.status.success() {
+        tracing::warn!(
+            path = %root.display(),
+            since,
+            "last ingested git commit is not resolvable; forcing full git ingestion"
+        );
+        return false;
+    }
+
+    let merge_base_args = vec![
+        "merge-base".to_string(),
+        "--is-ancestor".to_string(),
+        since.to_string(),
+        "HEAD".to_string(),
+    ];
+    let Some(merge_base) =
+        git_output_strings(root, &merge_base_args, "checking git ancestry")
+    else {
+        return false;
+    };
+    if merge_base.status.success() {
+        true
+    } else {
+        tracing::warn!(
+            path = %root.display(),
+            since,
+            "last ingested git commit is not an ancestor of HEAD; forcing full git ingestion"
+        );
+        false
+    }
 }
 
 pub(crate) fn changed_files_for_commit(root: &Path, sha: &str) -> Result<Vec<String>> {
@@ -202,6 +239,7 @@ fn git_output_strings(path: &Path, args: &[String], action: &'static str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn parse_commit_log_handles_messages_and_parents() {
@@ -213,5 +251,41 @@ mod tests {
         assert_eq!(commits[0].author_name, "Alice");
         assert_eq!(commits[0].author_email, "a@example.test");
         assert_eq!(commits[0].message, "subject\n\nbody");
+    }
+
+    #[test]
+    fn commit_log_falls_back_to_full_when_since_is_not_ancestor() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init"]);
+        run_git(repo.path(), &["config", "user.name", "Test User"]);
+        run_git(repo.path(), &["config", "user.email", "test@example.test"]);
+        std::fs::write(repo.path().join("README.md"), "one\n").unwrap();
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-m", "old root"]);
+        let old_head = current_head(repo.path()).unwrap();
+
+        run_git(repo.path(), &["checkout", "--orphan", "rewritten"]);
+        std::fs::write(repo.path().join("README.md"), "two\n").unwrap();
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-m", "new root"]);
+
+        let commits = commit_log(repo.path(), Some(&old_head)).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].message, "new root");
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
