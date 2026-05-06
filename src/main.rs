@@ -8109,13 +8109,37 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            tokio::signal::ctrl_c().await.ok();
+            // Wait for either Ctrl-C (interactive) or SIGTERM (systemd
+            // stop). Without the SIGTERM branch, `systemctl stop` skips
+            // the per-partition force-flush below and the next start
+            // pays a full WAL replay to rebuild derived files.
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.ok();
+            }
             ct.cancel();
         })
         .await?;
 
     // Persist tasks on shutdown
     shared.task_store.read().persist(&store_dir);
+    // Force-flush every vector partition's derived files so the next
+    // start can avoid a full WAL replay. The throttled per-batch upsert
+    // path may have left up to FLUSH_MIN_RECORDS new records unwritten;
+    // this catches them.
+    if let Err(err) = vectors::global().flush_all() {
+        tracing::warn!(error = %err, "vector partition force-flush on shutdown failed");
+    }
     tracing::info!("blackboxd shut down");
     Ok(())
 }
