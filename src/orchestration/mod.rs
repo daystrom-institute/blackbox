@@ -580,6 +580,7 @@ pub fn spawn_task(
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    bro_label: Option<String>,
 ) -> Arc<Task> {
     let id = task_id;
 
@@ -640,8 +641,7 @@ pub fn spawn_task(
                     started_at: now_ms(),
                     completed_at: Some(now_ms()),
                     exit_code: None,
-                    cwd,
-                    bro_label: None,
+                    bro_label: bro_label.clone(),
                     recoverable: false,
                 }),
                 notify: Arc::new(Notify::new()),
@@ -671,7 +671,7 @@ pub fn spawn_task(
             completed_at: None,
             exit_code: None,
             cwd: cwd.clone(),
-            bro_label: None,
+            bro_label,
             recoverable: false,
         }),
         notify: Arc::new(Notify::new()),
@@ -1183,6 +1183,9 @@ pub fn task_result_json(task: &Task) -> Value {
         if let Some(turns) = inner.num_turns {
             obj["numTurns"] = Value::from(turns);
         }
+    }
+    if let Some(ref label) = inner.bro_label {
+        obj["broLabel"] = Value::String(label.clone());
     }
     if inner.status == TaskStatus::Failed {
         if let Some(code) = inner.exit_code {

@@ -592,6 +592,7 @@ impl BlackboxServer {
             store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            None,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         if let Some(lease) = resume_lease {
@@ -2393,6 +2394,7 @@ impl BlackboxServer {
             store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            None,
         );
 
         // Register Gemini policy-file cleanup once the task terminates.
@@ -2518,6 +2520,7 @@ impl BlackboxServer {
             store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            None,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task.clone(), resume_lease);
@@ -2882,6 +2885,7 @@ impl BlackboxServer {
                         store_dir.clone(),
                         self.state.task_store.clone(),
                         self.state.tail_tx.clone(),
+                        None,
                     );
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     release_resume_lease_when_done(t.clone(), resume_lease);
@@ -2925,6 +2929,7 @@ impl BlackboxServer {
                     store_dir.clone(),
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
+                    None,
                 );
                 cleanup_policy_file_when_done(t.clone(), df.policy_file);
                 updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
@@ -4950,9 +4955,10 @@ Constraints:\n\
             };
             match adapter.dispatch(&manifest, p.args, ctx).await {
                 Ok(result) => {
+                    let task_id = result.session.task_id.clone();
                     return Self::ok_json(&serde_json::json!({
                         "session": result.session,
-                        "task_id": result.session.task_id,
+                        "task_id": task_id,
                         "resolved_brofile": result.resolved_brofile,
                         "merged_filters": result.merged_filters,
                         "degraded": result.degraded,
@@ -4963,7 +4969,7 @@ Constraints:\n\
         }
 
         // Direct path
-        let (provider, brofile_name, base_allow, base_disallow, exec_opts, env_overrides) =
+        let (provider, lens, brofile_name, base_allow, base_disallow, exec_opts, env_overrides) =
             if let Some(ref br) = manifest.brofile_ref {
                 let bf = match orchestration::brofile::resolve_brofile(
                     br,
@@ -4996,16 +5002,20 @@ Constraints:\n\
                 } else {
                     None
                 };
-                (bf.provider, Some(br.clone()), ba, bd, opts, env)
+                (bf.provider, bf.lens, Some(br.clone()), ba, bd, opts, env)
             } else if let Some(ref inline) = manifest.brofile_inline {
                 let prov_str = inline
                     .get("provider")
                     .and_then(|v| v.as_str())
                     .unwrap_or("claude");
-                let provider = prov_str
-                    .parse::<orchestration::providers::Provider>()
-                    .map_err(|_| format!("unknown provider in inline brofile: {prov_str}"))
-                    .unwrap_or(orchestration::providers::Provider::Claude);
+                let provider = match prov_str.parse::<orchestration::providers::Provider>() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return Self::err_text(&format!(
+                            "error.bad_input(code=unknown_provider): unknown provider in inline brofile: {prov_str}"
+                        ));
+                    }
+                };
                 let (ba, bd) = Self::extract_inline_filters(inline);
                 let env = orchestration::brofile::resolve_provider_env(
                     provider,
@@ -5021,7 +5031,8 @@ Constraints:\n\
                 } else {
                     None
                 };
-                (provider, None, ba, bd, opts, env)
+                let lens = inline.get("lens").and_then(|v| v.as_str()).map(String::from);
+                (provider, lens, None, ba, bd, opts, env)
             } else {
                 return Self::err_text("manifest has neither brofile_ref nor brofile_inline");
             };
@@ -5031,6 +5042,36 @@ Constraints:\n\
             &base_disallow,
             manifest.filter_overlay.as_ref(),
         );
+
+        // Args validation against schema
+        if let Some(ref inputs) = manifest.inputs {
+            if let Some(ref schema) = inputs.schema {
+                if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+                    if let Some(obj) = p.args.as_object() {
+                        for field in required {
+                            if let Some(name) = field.as_str() {
+                                if !obj.contains_key(name) {
+                                    return Self::err_text(&format!(
+                                        "error.bad_input(code=missing_required_field): args missing required field '{name}'"
+                                    ));
+                                }
+                            }
+                        }
+                    } else if !required.is_empty() {
+                        return Self::err_text(
+                            "error.bad_input(code=invalid_args): args must be an object when schema has required fields",
+                        );
+                    }
+                }
+                if let Some(types) = schema.get("type").and_then(|t| t.as_str()) {
+                    if types == "object" && !p.args.is_object() && !p.args.is_null() {
+                        return Self::err_text(
+                            "error.bad_input(code=invalid_args): args must be an object per schema",
+                        );
+                    }
+                }
+            }
+        }
 
         let prompt = match &manifest.inputs {
             Some(spec) => match &spec.prompt_template {
@@ -5053,7 +5094,11 @@ Constraints:\n\
         };
 
         let task_id = uuid::Uuid::new_v4().to_string();
-        let session_id = uuid::Uuid::new_v4().to_string();
+        let session_id = if matches!(provider, Provider::Claude) {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            "pending".to_string()
+        };
         let cwd = p.project_dir.clone();
 
         let ambient_ctx = orch::AmbientContext {
@@ -5074,7 +5119,10 @@ Constraints:\n\
             allow_recursion: false,
             provider: Some(provider),
         };
-        let final_prompt = orch::apply_ambient(&prompt, &ambient_ctx);
+        let final_prompt = orch::apply_brofile_lens(
+            &orch::apply_ambient(&prompt, &ambient_ctx),
+            lens.as_deref(),
+        );
 
         let mut args = provider.build_exec_args(
             &final_prompt,
@@ -5106,6 +5154,7 @@ Constraints:\n\
             self.state.store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            Some(bro_label.clone()),
         );
 
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
@@ -5827,6 +5876,7 @@ Next step: <one concrete steering suggestion>\n",
                     store_dir.clone(),
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
+                    None,
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
                 release_resume_lease_when_done(task.clone(), resume_lease);
@@ -5884,6 +5934,7 @@ Next step: <one concrete steering suggestion>\n",
                     store_dir.clone(),
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
+                    None,
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
                 task
@@ -12090,5 +12141,133 @@ mod tests {
         let args = serde_json::json!({"diff": "abc123", "focus": "security"});
         let result = BlackboxServer::expand_template(tmpl, &args);
         assert_eq!(result, "Review abc123 for security issues.");
+    }
+
+    #[test]
+    fn bro_agent_dispatch_invalid_inline_provider_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "bad-prov.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "bad-provider-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with bad provider.",
+                    "brofile_inline": {"provider": "nonexistent_provider_xyz"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "bad-provider-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("unknown_provider") && text.contains("nonexistent_provider_xyz"),
+            "should report unknown provider: {text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_args_validation_missing_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "schema-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "schema-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with input schema.",
+                    "brofile_inline": {"provider": "claude"},
+                    "inputs": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["diff", "focus"],
+                        },
+                        "prompt_template": "Review {{diff}} for {{focus}} issues."
+                    },
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "schema-agent".into(),
+            args: serde_json::json!({"diff": "abc123"}),
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("missing_required_field") && text.contains("focus"),
+            "should report missing required field: {text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_bro_label_stamped_on_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "labeled.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "labeled-agent",
+                "version": 3,
+                "manifest": {
+                    "description": "Agent whose bro_label should be stamped.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "labeled-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            bro: None,
+            ambient: None,
+        })));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = body["task_id"].as_str().unwrap();
+        let task = server.state.task_store.read().get(task_id).unwrap();
+        let label = task.inner.lock().bro_label.clone();
+        assert_eq!(
+            label.as_deref(),
+            Some("agent:labeled-agent@v3"),
+            "bro_label should be stamped: {label:?}"
+        );
     }
 }
