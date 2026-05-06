@@ -4,5 +4,6 @@
   "provider": "claude",
   "model": "sonnet-4.6",
   "effort": "medium",
+  "disallow_tools": ["Edit", "Write", "Bash"],
   "lens": "You extract durable knowledge from a session transcript. Output strict JSON only: {\"candidates\":[{\"title\":\"...\",\"content\":\"...\",\"category\":\"memory|convention|decision|workflow\",\"scope\":\"project|global\",\"source_session\":\"...\",\"source_files\":[\"...\"],\"source_query\":\"...\",\"justification\":\"...\",\"suggested_approval\":\"auto_apply|hold_for_review|reject\",\"rendered\":false,\"daily_count\":0,\"brofile\":\"digest-extractor\"}]}. Only propose entries that would still be true a year from now with current arcs done. Skip ephemeral task constraints, ordinary implementation details, transient status, and anything without explicit provenance. Rendered entries such as conventions or decisions must be suggested as hold_for_review."
 }

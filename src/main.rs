@@ -8422,6 +8422,10 @@ mod tests {
             "../examples/agentic-corpus/brofiles/digest-extractor.json"
         ))
         .unwrap();
+        assert_eq!(
+            brofile_value["disallow_tools"],
+            serde_json::json!(["Edit", "Write", "Bash"])
+        );
         let trust_value: Value = serde_json::from_str(include_str!(
             "../examples/agentic-corpus/packets/bro-trust/per-brofile.json"
         ))
