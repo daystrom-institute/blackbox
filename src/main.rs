@@ -798,11 +798,14 @@ impl BlackboxServer {
         Parameters(p): Parameters<ArtifactSupersedeParams>,
     ) -> CallToolResult {
         Self::run("bbox_artifact_supersede", || {
+            let kind = p.kind;
+            let name = p.name.clone();
             let meta = self
                 .state
                 .artifacts
                 .write()
                 .supersede(p.kind, &p.name, &p.superseded_by)?;
+            deactivate_artifact(&self.state, kind, &name)?;
             Ok(serde_json::to_string_pretty(&meta)?)
         })
     }
@@ -6313,6 +6316,40 @@ async fn install_artifact_value(
         .artifacts
         .write()
         .install_value(p.kind, p.source, &value, p.name, p.version, p.supersedes)
+        .and_then(|meta| {
+            if let Some(prev) = meta.supersedes.as_deref() {
+                deactivate_artifact(state, meta.kind, prev)?;
+            }
+            Ok(meta)
+        })
+}
+
+fn deactivate_artifact(
+    state: &Arc<SharedState>,
+    kind: artifacts::ArtifactKind,
+    name: &str,
+) -> anyhow::Result<()> {
+    match kind {
+        artifacts::ArtifactKind::Workflow => {
+            state.workflow_registry.write().remove(name);
+            let path = state
+                .store_dir
+                .join("workflows")
+                .join(format!("{name}.json"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        artifacts::ArtifactKind::Packet => {
+            state.packets.read().remove_domain(name)?;
+        }
+        artifacts::ArtifactKind::Brofile => {
+            orchestration::brofile::delete_brofile(name, "global", &state.store_dir, None);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -6413,7 +6450,14 @@ async fn admin_artifact_supersede(
         .write()
         .supersede(req.kind, &req.name, &req.superseded_by)
     {
-        Ok(meta) => axum::Json(json!({"status": "superseded", "artifact": meta})).into_response(),
+        Ok(meta) => match deactivate_artifact(&state, req.kind, &req.name) {
+            Ok(()) => axum::Json(json!({"status": "superseded", "artifact": meta})).into_response(),
+            Err(e) => (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("artifact deactivate: {e:#}"),
+            )
+                .into_response(),
+        },
         Err(e) => (
             axum::http::StatusCode::BAD_REQUEST,
             format!("artifact supersede: {e:#}"),
@@ -7714,6 +7758,77 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn artifact_supersession_deactivates_workflow_registry_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_a = serde_json::json!({
+            "name": "workflow-a",
+            "version": 1,
+            "actors": {},
+            "start": "Done",
+            "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+        });
+        let workflow_a2 = serde_json::json!({
+            "name": "workflow-a2",
+            "version": 2,
+            "supersedes": "workflow-a",
+            "actors": {},
+            "start": "Done",
+            "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+        });
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "workflow-a.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_a,
+        )
+        .await
+        .unwrap();
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a"));
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "workflow-a2.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_a2,
+        )
+        .await
+        .unwrap();
+
+        assert!(!server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a"));
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a2"));
+        assert!(!server
+            .state
+            .store_dir
+            .join("workflows")
+            .join("workflow-a.json")
+            .exists());
     }
 
     #[test]

@@ -2194,6 +2194,24 @@ impl Packets {
         Ok(out)
     }
 
+    pub fn remove_domain(&self, domain: &str) -> Result<usize> {
+        let packets: Vec<Packet> = self
+            .list_all()?
+            .into_iter()
+            .filter(|packet| packet.domain == domain)
+            .collect();
+        let mut removed = 0usize;
+        for packet in packets {
+            let path = packet_path(&self.state_dir, &packet.scope, &packet.id);
+            if path.exists() {
+                fs::remove_file(&path)
+                    .with_context(|| format!("removing packet {}", path.display()))?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     // ── bbox_compile (create) ──────────────────────────────────────
 
     pub fn compile(&self, p: &CompileParams) -> Result<String> {
