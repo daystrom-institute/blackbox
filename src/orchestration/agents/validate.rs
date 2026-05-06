@@ -254,14 +254,32 @@ mod tests {
             _manifest: &AgentManifest,
             _args: serde_json::Value,
             _ctx: super::super::adapter::DispatchContext,
-        ) -> Result<super::super::adapter::AgentDispatchResult, super::super::adapter::AgentDispatchError>
-        {
-            Ok(super::super::adapter::AgentDispatchResult {
-                session_id: "noop".into(),
-                task_id: "noop".into(),
-                resolved_brofile: None,
-                merged_filters: Default::default(),
-                degraded: false,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                    Output = Result<
+                        super::super::adapter::AgentDispatchResult,
+                        super::super::adapter::AgentDispatchError,
+                    >,
+                > + Send,
+            >,
+        > {
+            Box::pin(async {
+                Ok(super::super::adapter::AgentDispatchResult {
+                    session: super::super::types::AgentSession {
+                        session_id: "noop".into(),
+                        provider: "test".into(),
+                        project_dir: None,
+                        agent: super::super::types::AgentRef {
+                            name: "noop".into(),
+                            version: 1,
+                        },
+                        task_id: None,
+                    },
+                    resolved_brofile: None,
+                    merged_filters: Default::default(),
+                    degraded: None,
+                })
             })
         }
     }

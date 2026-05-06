@@ -167,6 +167,10 @@ struct SharedState {
     /// state. Concurrent resumes on the same provider session race
     /// transcript writes and can fork/corrupt the session.
     resume_leases: Arc<orchestration::resume_lease::ResumeLeaseRegistry>,
+    /// Agent dispatch adapter registry. Initialized before artifact
+    /// catalog opens so AS-I1 validation can check dispatch_adapter
+    /// membership against the live registry.
+    agent_adapter_registry: Arc<RwLock<orchestration::agents::adapter::AgentAdapterRegistry>>,
 }
 
 const SIGNAL_LOG_CAP: usize = 200;
@@ -415,7 +419,7 @@ impl BlackboxServer {
             EntityRef::Agent { name, version } => {
                 let catalog = self.state.artifacts.read();
                 let meta = catalog
-                    .load_metadata_public(artifacts::ArtifactKind::Agent, name)
+                    .metadata_for(artifacts::ArtifactKind::Agent, name)
                     .ok()
                     .flatten();
                 let meta = match meta {
@@ -433,13 +437,14 @@ impl BlackboxServer {
                 properties.insert("name".into(), name.clone());
                 properties.insert("version".into(), version.to_string());
                 if let Some(v) = &artifact_value {
-                    if let Some(desc) = v.get("description").and_then(|d| d.as_str()) {
+                    let manifest = v.get("manifest").unwrap_or(v);
+                    if let Some(desc) = manifest.get("description").and_then(|d| d.as_str()) {
                         properties.insert("description".into(), desc.to_string());
                     }
-                    if let Some(bro) = v.get("brofile_ref").and_then(|b| b.as_str()) {
+                    if let Some(bro) = manifest.get("brofile_ref").and_then(|b| b.as_str()) {
                         properties.insert("brofile_ref".into(), bro.to_string());
                     }
-                    if let Some(wtu) = v.get("when_to_use").and_then(|w| w.as_array()) {
+                    if let Some(wtu) = manifest.get("when_to_use").and_then(|w| w.as_array()) {
                         properties.insert(
                             "when_to_use".into(),
                             wtu.iter()
@@ -6916,13 +6921,13 @@ async fn install_artifact_value(
                 anyhow::bail!("agent artifact must be a JSON object");
             }
             let adapter_registry =
-                orchestration::agents::adapter::AgentAdapterRegistry::new();
+                state.agent_adapter_registry.read();
             let catalog = state.artifacts.read();
             let ctx = orchestration::agents::validate::InstallCtx {
                 adapter_registry: &adapter_registry,
                 brofile_exists: |name: &str| -> bool {
                     catalog
-                        .load_metadata_public(artifacts::ArtifactKind::Brofile, name)
+                        .metadata_for(artifacts::ArtifactKind::Brofile, name)
                         .ok()
                         .flatten()
                         .is_some_and(|m| m.active)
@@ -7999,6 +8004,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Packets store: {}", packets_dir.join("packets").display());
 
     let artifacts_dir = util::blackbox_artifacts_dir(&home);
+    let agent_adapter_registry = Arc::new(RwLock::new(
+        orchestration::agents::adapter::AgentAdapterRegistry::new(),
+    ));
     let artifacts_store = artifacts::ArtifactCatalog::open(&artifacts_dir)?;
     tracing::info!("Artifact catalog: {}", artifacts_store.root().display());
 
@@ -8073,6 +8081,7 @@ async fn main() -> anyhow::Result<()> {
         arc_cancel_tokens: RwLock::new(HashMap::new()),
         councils: Arc::new(council::CouncilRegistry::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
+        agent_adapter_registry: agent_adapter_registry.clone(),
     });
     std::thread::Builder::new()
         .name("blackbox-vectors-warmup".into())
@@ -8522,6 +8531,9 @@ mod tests {
             arc_cancel_tokens: RwLock::new(HashMap::new()),
             councils: Arc::new(council::CouncilRegistry::new()),
             resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
+            agent_adapter_registry: Arc::new(RwLock::new(
+                orchestration::agents::adapter::AgentAdapterRegistry::new(),
+            )),
         });
         BlackboxServer::new(state)
     }

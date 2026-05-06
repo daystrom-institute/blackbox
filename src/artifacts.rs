@@ -270,7 +270,7 @@ impl ArtifactCatalog {
         Ok(Some(value))
     }
 
-    pub fn load_metadata_public(
+    pub fn metadata_for(
         &self,
         kind: ArtifactKind,
         name: &str,
@@ -765,7 +765,7 @@ mod tests {
         assert_eq!(value["brofile_ref"], "reviewer-persona");
 
         let meta = catalog
-            .load_metadata_public(ArtifactKind::Agent, "test-agent")
+            .metadata_for(ArtifactKind::Agent, "test-agent")
             .unwrap()
             .unwrap();
         assert_eq!(meta.name, "test-agent");
@@ -777,7 +777,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(catalog
-            .load_metadata_public(ArtifactKind::Agent, "nonexistent")
+            .metadata_for(ArtifactKind::Agent, "nonexistent")
             .unwrap()
             .is_none());
     }

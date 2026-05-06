@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use super::types::{AgentFilterOverlay, AgentManifest, MergedFilters};
+use super::types::{AgentFilterOverlay, AgentManifest, AgentSession, MergedFilters};
 
 // ---------------------------------------------------------------------------
 // DispatchContext
@@ -17,16 +19,24 @@ pub struct DispatchContext {
 }
 
 // ---------------------------------------------------------------------------
+// DispatchDegraded
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchDegraded {
+    pub reasons: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // AgentDispatchResult
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct AgentDispatchResult {
-    pub session_id: String,
-    pub task_id: String,
+    pub session: AgentSession,
     pub resolved_brofile: Option<String>,
     pub merged_filters: MergedFilters,
-    pub degraded: bool,
+    pub degraded: Option<DispatchDegraded>,
 }
 
 // ---------------------------------------------------------------------------
@@ -53,7 +63,7 @@ impl std::fmt::Display for AgentDispatchError {
 impl std::error::Error for AgentDispatchError {}
 
 // ---------------------------------------------------------------------------
-// AgentDispatchAdapter trait
+// AgentDispatchAdapter trait (boxed-future async boundary)
 // ---------------------------------------------------------------------------
 
 pub trait AgentDispatchAdapter: Send + Sync {
@@ -64,7 +74,7 @@ pub trait AgentDispatchAdapter: Send + Sync {
         manifest: &AgentManifest,
         args: serde_json::Value,
         ctx: DispatchContext,
-    ) -> Result<AgentDispatchResult, AgentDispatchError>;
+    ) -> Pin<Box<dyn Future<Output = Result<AgentDispatchResult, AgentDispatchError>> + Send + '_>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -96,8 +106,13 @@ impl AgentAdapterRegistry {
         }
     }
 
-    pub fn register(&mut self, adapter: Arc<dyn AgentDispatchAdapter>) {
-        self.adapters.insert(adapter.name(), adapter);
+    /// Register an adapter. Returns the previous adapter with the same
+    /// name, if any, so startup code can detect accidental duplicates.
+    pub fn register(
+        &mut self,
+        adapter: Arc<dyn AgentDispatchAdapter>,
+    ) -> Option<Arc<dyn AgentDispatchAdapter>> {
+        self.adapters.insert(adapter.name(), adapter)
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn AgentDispatchAdapter>> {
@@ -150,19 +165,30 @@ mod tests {
             _manifest: &AgentManifest,
             _args: serde_json::Value,
             _ctx: DispatchContext,
-        ) -> Result<AgentDispatchResult, AgentDispatchError> {
-            Ok(AgentDispatchResult {
-                session_id: "noop-session".into(),
-                task_id: "noop-task".into(),
-                resolved_brofile: None,
-                merged_filters: MergedFilters::default(),
-                degraded: false,
+        ) -> Pin<Box<dyn Future<Output = Result<AgentDispatchResult, AgentDispatchError>> + Send + '_>>
+        {
+            Box::pin(async {
+                Ok(AgentDispatchResult {
+                    session: AgentSession {
+                        session_id: "noop-session".into(),
+                        provider: "test".into(),
+                        project_dir: None,
+                        agent: super::super::types::AgentRef {
+                            name: "noop".into(),
+                            version: 1,
+                        },
+                        task_id: Some("noop-task".into()),
+                    },
+                    resolved_brofile: None,
+                    merged_filters: MergedFilters::default(),
+                    degraded: None,
+                })
             })
         }
     }
 
-    #[test]
-    fn noop_adapter_dispatches() {
+    #[tokio::test]
+    async fn noop_adapter_dispatches() {
         let adapter = NoopAdapter;
         let manifest = AgentManifest {
             description: "test".into(),
@@ -177,10 +203,11 @@ mod tests {
         };
         let result = adapter
             .dispatch(&manifest, serde_json::Value::Null, ctx)
+            .await
             .unwrap();
-        assert_eq!(result.session_id, "noop-session");
-        assert_eq!(result.task_id, "noop-task");
-        assert!(!result.degraded);
+        assert_eq!(result.session.session_id, "noop-session");
+        assert_eq!(result.session.task_id.as_deref(), Some("noop-task"));
+        assert!(result.degraded.is_none());
     }
 
     #[test]
@@ -201,10 +228,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_overwrite_replaces() {
+    fn register_returns_previous_on_duplicate() {
         let mut registry = AgentAdapterRegistry::new();
-        registry.register(Arc::new(NoopAdapter));
-        registry.register(Arc::new(NoopAdapter));
+        let old = registry.register(Arc::new(NoopAdapter));
+        assert!(old.is_none());
+        let prev = registry.register(Arc::new(NoopAdapter));
+        assert!(prev.is_some());
         assert_eq!(registry.list_registered().len(), 1);
     }
 
@@ -257,5 +286,13 @@ mod tests {
         let merged = MergedFilters::merge(&["a".into()], &["b".into()], None);
         assert_eq!(merged.allow, vec!["a".to_string()]);
         assert_eq!(merged.disallow, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn dispatch_degraded_structured() {
+        let d = DispatchDegraded {
+            reasons: vec!["embedding_pending".into()],
+        };
+        assert_eq!(d.reasons.len(), 1);
     }
 }
