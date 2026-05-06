@@ -13,14 +13,15 @@ mod inbox;
 mod index;
 mod knowledge;
 mod mcp_client;
+mod mcp_tools;
 mod notes;
 mod orchestration;
 mod packets;
 mod parser;
 mod pins;
 mod pollers;
-mod providers;
 mod projects;
+mod providers;
 mod query;
 mod render;
 mod routing;
@@ -309,6 +310,124 @@ impl BlackboxServer {
         self.state.idx.write().delete_knowledge_entry(entry_id)?;
         embed_queue::tombstone_knowledge(&crate::index::knowledge_entity_id(entry_id));
         Ok(())
+    }
+
+    fn inspect_extra_properties(
+        &self,
+        r: &crate::entity_ref::EntityRef,
+    ) -> anyhow::Result<Option<BTreeMap<String, String>>> {
+        use crate::entity_ref::EntityRef;
+        match r {
+            EntityRef::Knowledge { id } => Ok(self.state.kb.read().entry(id).map(|entry| {
+                let mut properties = BTreeMap::new();
+                properties.insert("id".into(), entry.id.clone());
+                properties.insert("title".into(), entry.title.clone());
+                properties.insert("content".into(), entry.content.clone());
+                properties.insert("category".into(), format!("{:?}", entry.category));
+                properties.insert("scope".into(), format!("{:?}", entry.scope));
+                properties.insert("status".into(), format!("{:?}", entry.status));
+                properties.insert("approval".into(), format!("{:?}", entry.approval));
+                if let Some(project) = &entry.project {
+                    properties.insert("project".into(), project.clone());
+                }
+                if let Some(supersedes) = &entry.supersedes {
+                    properties.insert("supersedes".into(), supersedes.clone());
+                }
+                properties
+            })),
+            EntityRef::Thread { thread_id } => Ok(self
+                .state
+                .threads
+                .read()
+                .all()
+                .iter()
+                .find(|thread| thread.id == *thread_id)
+                .map(|thread| {
+                    let mut properties = BTreeMap::new();
+                    properties.insert("thread_id".into(), thread.id.clone());
+                    properties.insert("topic".into(), thread.topic.clone());
+                    properties.insert("project".into(), thread.project.clone());
+                    properties.insert("status".into(), format!("{:?}", thread.status));
+                    if let Some(name) = &thread.name {
+                        properties.insert("name".into(), name.clone());
+                    }
+                    properties
+                })),
+            EntityRef::Note { note_id } => Ok(self
+                .state
+                .notes
+                .read()
+                .all()
+                .iter()
+                .find(|note| note.id == *note_id)
+                .map(|note| {
+                    let mut properties = BTreeMap::new();
+                    properties.insert("note_id".into(), note.id.clone());
+                    properties.insert("kind".into(), format!("{:?}", note.kind));
+                    properties.insert("body".into(), note.body.clone());
+                    properties.insert("created_at".into(), note.created_at.clone());
+                    if let Some(task_id) = &note.task_id {
+                        properties.insert("task_id".into(), task_id.clone());
+                    }
+                    if let Some(thread_id) = &note.thread_id {
+                        properties.insert("thread_id".into(), thread_id.clone());
+                    }
+                    properties
+                })),
+            EntityRef::Whiteboard { board_id } => {
+                Ok(self.state.whiteboards.get(board_id).map(|board| {
+                    let board = board.read();
+                    let mut properties = BTreeMap::new();
+                    properties.insert("board_id".into(), board.id.clone());
+                    properties.insert("topic".into(), board.topic.clone());
+                    properties.insert("project".into(), board.project.clone());
+                    properties.insert("phase".into(), format!("{:?}", board.phase));
+                    properties
+                }))
+            }
+            EntityRef::Brofile { name } => {
+                Ok(
+                    orch::brofile::list_brofiles("global", &self.state.store_dir, None)
+                        .into_iter()
+                        .find(|brofile| brofile.name == *name)
+                        .map(|brofile| {
+                            let mut properties = BTreeMap::new();
+                            properties.insert("name".into(), brofile.name);
+                            properties.insert("provider".into(), brofile.provider.as_str().into());
+                            if let Some(model) = brofile.model {
+                                properties.insert("model".into(), model);
+                            }
+                            if let Some(effort) = brofile.effort {
+                                properties.insert("effort".into(), effort);
+                            }
+                            properties
+                        }),
+                )
+            }
+            _ => self.state.idx.read().entity_properties(&r.to_string()),
+        }
+    }
+
+    fn inspect_entity_exists(
+        &self,
+        r: &crate::entity_ref::EntityRef,
+        extra_properties: Option<&BTreeMap<String, String>>,
+    ) -> bool {
+        if extra_properties.is_some() {
+            return true;
+        }
+        let edge_index = self.state.edge_index.read();
+        !edge_index.forward_edges(r).is_empty() || !edge_index.reverse_edges(r).is_empty()
+    }
+
+    fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts =
+            mcp_tools::inspect::entity_type_count(&self.state.edge_index.read().known_refs());
+        counts.insert("knowledge".into(), self.state.kb.read().all_entries().len());
+        counts.insert("thread".into(), self.state.threads.read().all().len());
+        counts.insert("note".into(), self.state.notes.read().all().len());
+        counts.insert("whiteboard".into(), self.state.whiteboards.list_ids().len());
+        counts
     }
 
     fn ambient_pin_block(
@@ -667,6 +786,7 @@ use knowledge::{
     AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeListParams, LearnParams,
     RememberParams, RenderParams, ResponseFormat, ReviewParams,
 };
+use mcp_tools::inspect::InspectEntityParams;
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
     apply_with as apply_packet_with, packet_matches_query, packet_summary,
@@ -757,6 +877,46 @@ impl BlackboxServer {
     )]
     fn bbox_stats(&self) -> CallToolResult {
         Self::run("bbox_stats", || self.state.idx.read().stats())
+    }
+
+    #[tool(
+        name = "bbox_inspect_entity",
+        description = "Inspect a vertex: returns properties AND targeted edges in one call. Prefer targeted inspection over broad exploration: 1) Set edge_types to the specific edges you want (e.g. 'SUPERSEDES,DERIVED_FROM'). 2) Set direction to 'out' or 'in' when you know which way to traverse. 3) Use 'both' only for initial orientation on an unfamiliar entity. 4) Set per_type_limit=0 for property-only inspection. property_mode controls detail: 'summary' (names/titles only), 'smart' (full text <=300 chars, truncated for longer - default), 'full' (no truncation)."
+    )]
+    fn bbox_inspect_entity(
+        &self,
+        Parameters(p): Parameters<InspectEntityParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_inspect_entity", || {
+            let entity_ref = match crate::entity_ref::EntityRef::parse(&p.entity_ref) {
+                Ok(entity_ref) => entity_ref,
+                Err(err) => {
+                    return Ok(mcp_tools::inspect::bad_input(
+                        &p.entity_ref,
+                        err.to_string(),
+                    ));
+                }
+            };
+            let extra_properties = self.inspect_extra_properties(&entity_ref)?;
+            let exists = self.inspect_entity_exists(&entity_ref, extra_properties.as_ref());
+            mcp_tools::inspect::inspect_entity(
+                &p,
+                &entity_ref,
+                &self.state.edge_index.read(),
+                extra_properties.unwrap_or_default(),
+                exists,
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_describe_schema",
+        description = "Catalog agentic-corpus entity types and edge families. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips."
+    )]
+    fn bbox_describe_schema(&self) -> CallToolResult {
+        Self::run("bbox_describe_schema", || {
+            mcp_tools::describe_schema::describe_schema(&self.describe_schema_counts())
+        })
     }
 
     #[tool(

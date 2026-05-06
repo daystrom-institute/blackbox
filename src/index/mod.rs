@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -5,9 +6,10 @@ use std::time::Instant;
 use anyhow::Result;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tantivy::query::TermQuery;
 use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
-use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
 pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g1";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
@@ -233,6 +235,44 @@ impl TranscriptIndex {
             });
         }
         Ok(docs)
+    }
+
+    pub(crate) fn entity_properties(
+        &self,
+        entity_id: &str,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        let searcher = self.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.entity_id, entity_id),
+            IndexRecordOption::Basic,
+        );
+        let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(1))?;
+        let Some((_score, addr)) = top_docs.into_iter().next() else {
+            return Ok(None);
+        };
+        let doc: TantivyDocument = searcher.doc(addr)?;
+        let mut properties = BTreeMap::new();
+        for (name, field) in [
+            ("doc_type", self.fields.doc_type),
+            ("chunk_kind", self.fields.chunk_kind),
+            ("language", self.fields.language),
+            ("symbol", self.fields.symbol),
+            ("symbol_exact", self.fields.symbol_exact),
+            ("file_path", self.fields.file_path),
+            ("repo_id", self.fields.repo_id),
+            ("commit_sha", self.fields.commit_sha),
+            ("commit_author_name", self.fields.commit_author_name),
+            ("commit_author_email", self.fields.commit_author_email),
+        ] {
+            if let Some(value) = optional_text(&doc, field).filter(|value| !value.is_empty()) {
+                properties.insert(name.to_string(), value);
+            }
+        }
+        if let Some(content) = optional_text(&doc, self.fields.content) {
+            let preview = content.chars().take(300).collect::<String>();
+            properties.insert("content_preview".into(), preview);
+        }
+        Ok(Some(properties))
     }
 }
 

@@ -96,6 +96,15 @@ impl EdgeIndex {
         self.forward.values().map(Vec::len).sum()
     }
 
+    pub fn known_refs(&self) -> Vec<EntityRef> {
+        let mut refs = HashSet::new();
+        refs.extend(self.forward.keys().cloned());
+        refs.extend(self.reverse.keys().cloned());
+        let mut refs = refs.into_iter().collect::<Vec<_>>();
+        refs.sort_by_key(|r| r.to_string());
+        refs
+    }
+
     fn insert(&mut self, edge: Edge, seen: &mut HashSet<Edge>) {
         if !seen.insert(edge.clone()) {
             return;

@@ -22,6 +22,7 @@ pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCategory {
     Transcripts,
+    Graph,
     Projects,
     Knowledge,
     Threads,
@@ -39,6 +40,7 @@ impl ToolCategory {
     fn heading(&self) -> &'static str {
         match self {
             Self::Transcripts => "Transcripts",
+            Self::Graph => "Agentic graph",
             Self::Projects => "Projects",
             Self::Knowledge => "Knowledge",
             Self::Threads => "Threads",
@@ -57,6 +59,9 @@ impl ToolCategory {
         match self {
             Self::Transcripts => {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
+            }
+            Self::Graph => {
+                "Inspect typed agentic-corpus entities and graph vocabulary. Use these tools after search returns entity refs, before path finding, or when you need to understand what edges and filters exist."
             }
             Self::Projects => {
                 "Register project roots for later file indexing."
@@ -178,6 +183,21 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Corpus statistics (doc count, index size, file counts).",
         when_to_use: "Sanity-check the index; diagnose 'did my new sessions get indexed?'.",
         example: None,
+    },
+    // ── Agentic graph ────────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_inspect_entity",
+        category: ToolCategory::Graph,
+        summary: "Inspect a vertex: returns properties AND targeted edges in one call. Prefer targeted inspection over broad exploration: 1) Set edge_types to the specific edges you want (e.g. 'SUPERSEDES,DERIVED_FROM'). 2) Set direction to 'out' or 'in' when you know which way to traverse. 3) Use 'both' only for initial orientation on an unfamiliar entity. 4) Set per_type_limit=0 for property-only inspection. property_mode controls detail: 'summary' (names/titles only), 'smart' (full text <=300 chars, truncated for longer - default), 'full' (no truncation).",
+        when_to_use: "Prefer targeted inspection over broad sweeps. Set `edge_types` to the specific edges you want, set `direction` to `out` or `in` when known, use `both` only for initial orientation, and set `per_type_limit=0` for property-only inspection. Do not answer lifecycle or history questions from one inspect call when the claim depends on a multi-hop chain.",
+        example: Some(r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", edge_types="SUPERSEDES,DERIVED_FROM", direction="both")"#),
+    },
+    ToolDoc {
+        name: "bbox_describe_schema",
+        category: ToolCategory::Graph,
+        summary: "Catalog agentic-corpus entity types and edge families. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips.",
+        when_to_use: "Use before `bbox_inspect_entity`, `bbox_find_paths`, or evidence bundling when you need the graph vocabulary or want to choose edge filters deliberately.",
+        example: Some("bbox_describe_schema()"),
     },
     // ── Projects ─────────────────────────────────────────────────────
     ToolDoc {
@@ -876,6 +896,7 @@ pub fn render_markdown() -> String {
 
     let categories = [
         ToolCategory::Transcripts,
+        ToolCategory::Graph,
         ToolCategory::Projects,
         ToolCategory::Knowledge,
         ToolCategory::Threads,
@@ -923,7 +944,7 @@ pub fn render_markdown() -> String {
 }
 
 fn hot_summary(summary: &'static str) -> Cow<'static, str> {
-    const MAX_SUMMARY_BYTES: usize = 220;
+    const MAX_SUMMARY_BYTES: usize = 70;
     if summary.len() <= MAX_SUMMARY_BYTES {
         return Cow::Borrowed(summary);
     }
@@ -931,10 +952,7 @@ fn hot_summary(summary: &'static str) -> Cow<'static, str> {
         .rfind(". ")
         .map(|idx| idx + 1)
         .unwrap_or(MAX_SUMMARY_BYTES);
-    Cow::Owned(format!(
-        "{} See the MCP tool description for the full contract.",
-        summary[..end].trim()
-    ))
+    Cow::Owned(format!("{} See MCP.", summary[..end].trim()))
 }
 
 // ── Sync into knowledge store ────────────────────────────────────────
