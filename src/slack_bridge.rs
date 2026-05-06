@@ -815,7 +815,7 @@ where
 // loopback endpoint (§13.1). Shared across the processing pipeline
 // via Arc; the health HTTP server reads a clone.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -1038,7 +1038,11 @@ where
 // Returns cleanly on normal shutdown; returns Err on connection loss
 // (caller should reconnect).
 
-async fn run_socket_loop(ws_url: &str, ctx: &BridgeContext<'_>) -> Result<Duration> {
+async fn run_socket_loop(
+    ws_url: &str,
+    ctx: &BridgeContext<'_>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<Duration> {
     let connected_at = Instant::now();
     let (ws_stream, _resp) = tokio_tungstenite::connect_async(ws_url)
         .await
@@ -1049,8 +1053,25 @@ async fn run_socket_loop(ws_url: &str, ctx: &BridgeContext<'_>) -> Result<Durati
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let mut in_flight = InFlightSet::new();
 
+    // Poll the shutdown flag every 500ms while waiting for messages.
+    // On shutdown, stop accepting new events and return cleanly.
+    const SHUTDOWN_POLL: Duration = Duration::from_millis(500);
+
     loop {
-        let msg = match ws_read.next().await {
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("shutdown signal received (idle); exiting");
+            return Ok(connected_at.elapsed());
+        }
+
+        let msg = tokio::select! {
+            m = ws_read.next() => m,
+            _ = tokio::time::sleep(SHUTDOWN_POLL) => {
+                // Re-check the flag at the top of the next iteration
+                continue;
+            }
+        };
+
+        let msg = match msg {
             Some(Ok(m)) => m,
             Some(Err(e)) => {
                 tracing::error!("WebSocket read error: {e:#}");
@@ -1172,6 +1193,32 @@ async fn main() -> Result<()> {
         None
     };
 
+    // ── Shutdown signal ────────────────────────────────────────
+    // SIGTERM (systemd) and Ctrl-C set this flag; run_socket_loop
+    // checks it between WS reads and exits cleanly. On shutdown,
+    // the sidecar stops accepting new events; any in-flight POST
+    // completes or times out within the POST retry budget (§5.1).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_sig = shutdown.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .expect("register SIGTERM handler");
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        shutdown_sig.store(true, Ordering::Relaxed);
+    });
+
     let daemon_client = reqwest::Client::new();
     let ctx = BridgeContext {
         daemon_client: &daemon_client,
@@ -1203,44 +1250,39 @@ async fn main() -> Result<()> {
             h.connected.store(true, Ordering::Relaxed);
         }
 
-        // Run the socket loop; break on clean shutdown or ctrl_c
-        let run_fut = run_socket_loop(&ws_url, &ctx);
+        let result = run_socket_loop(&ws_url, &ctx, shutdown.clone()).await;
 
-        tokio::select! {
-            result = run_fut => {
-                // Mark disconnected
+        // Mark disconnected
+        if let Some(h) = &health {
+            h.connected.store(false, Ordering::Relaxed);
+        }
+
+        // Check shutdown first — if the user signalled, exit cleanly.
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("shutdown complete");
+            return Ok(());
+        }
+
+        match result {
+            Ok(elapsed) => {
+                if elapsed >= Duration::from_secs(30) {
+                    reconnect_attempt = 0;
+                    tracing::info!("healthy connection ran for {:.0}s; backoff reset", elapsed.as_secs());
+                } else {
+                    tracing::warn!("connection lasted {:.0}s (< 30s healthy threshold); keeping backoff state", elapsed.as_secs());
+                }
                 if let Some(h) = &health {
-                    h.connected.store(false, Ordering::Relaxed);
+                    h.reconnects.fetch_add(1, Ordering::Relaxed);
                 }
-                match result {
-                    Ok(elapsed) => {
-                        // Server-initiated clean close. Only reset
-                        // backoff if the connection was healthy for
-                        // long enough to count as a proper run.
-                        if elapsed >= Duration::from_secs(30) {
-                            reconnect_attempt = 0;
-                            tracing::info!("healthy connection ran for {:.0}s; backoff reset", elapsed.as_secs());
-                        } else {
-                            tracing::warn!("connection lasted {:.0}s (< 30s healthy threshold); keeping backoff state", elapsed.as_secs());
-                        }
-                        if let Some(h) = &health {
-                            h.reconnects.fetch_add(1, Ordering::Relaxed);
-                        }
-                        backoff_sleep(&mut reconnect_attempt).await;
-                    }
-                    Err(e) => {
-                        if let Some(h) = &health {
-                            *h.last_disconnect_reason.lock() = Some(format!("{e:#}"));
-                            h.reconnects.fetch_add(1, Ordering::Relaxed);
-                        }
-                        tracing::error!("Socket Mode loop error: {e:#}");
-                        backoff_sleep(&mut reconnect_attempt).await;
-                    }
-                }
+                backoff_sleep(&mut reconnect_attempt).await;
             }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("SIGTERM received; shutting down");
-                return Ok(());
+            Err(e) => {
+                if let Some(h) = &health {
+                    *h.last_disconnect_reason.lock() = Some(format!("{e:#}"));
+                    h.reconnects.fetch_add(1, Ordering::Relaxed);
+                }
+                tracing::error!("Socket Mode loop error: {e:#}");
+                backoff_sleep(&mut reconnect_attempt).await;
             }
         }
     }
