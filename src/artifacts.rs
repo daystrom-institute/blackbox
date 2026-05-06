@@ -16,6 +16,7 @@ pub enum ArtifactKind {
     Workflow,
     Packet,
     Brofile,
+    Agent,
 }
 
 impl ArtifactKind {
@@ -24,6 +25,7 @@ impl ArtifactKind {
             Self::Workflow => "workflow",
             Self::Packet => "packet",
             Self::Brofile => "brofile",
+            Self::Agent => "agent",
         }
     }
 }
@@ -164,6 +166,7 @@ impl ArtifactCatalog {
                 ArtifactKind::Workflow,
                 ArtifactKind::Packet,
                 ArtifactKind::Brofile,
+                ArtifactKind::Agent,
             ],
         };
         for kind in kinds {
@@ -297,13 +300,14 @@ fn artifact_kind_from_dir(component: &str) -> Option<ArtifactKind> {
         "workflows" => Some(ArtifactKind::Workflow),
         "packets" => Some(ArtifactKind::Packet),
         "brofiles" => Some(ArtifactKind::Brofile),
+        "agents" => Some(ArtifactKind::Agent),
         _ => None,
     }
 }
 
 fn artifact_name(kind: ArtifactKind, value: &Value) -> Option<String> {
     match kind {
-        ArtifactKind::Workflow | ArtifactKind::Brofile => {
+        ArtifactKind::Workflow | ArtifactKind::Brofile | ArtifactKind::Agent => {
             value.get("name")?.as_str().map(str::to_string)
         }
         ArtifactKind::Packet => value.get("domain")?.as_str().map(str::to_string),
@@ -539,5 +543,126 @@ mod tests {
         let found = discover_project_artifacts(dir.path()).unwrap();
 
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn agent_install_list_and_supersede_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        let agent_v1 = serde_json::json!({
+            "name": "code-reviewer",
+            "version": 1,
+            "description": "Reviews code for bugs",
+            "brofile": "sonnet-standard"
+        });
+        let agent_v2 = serde_json::json!({
+            "name": "code-reviewer-v2",
+            "version": 2,
+            "supersedes": "code-reviewer",
+            "description": "Reviews code for bugs and style",
+            "brofile": "sonnet-standard"
+        });
+
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "agent-v1.json".into(),
+                &agent_v1,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "agent-v2.json".into(),
+                &agent_v2,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let rows = catalog
+            .list(&ArtifactListParams {
+                kind: Some(ArtifactKind::Agent),
+                name: None,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let old = rows.iter().find(|r| r.name == "code-reviewer").unwrap();
+        let new = rows.iter().find(|r| r.name == "code-reviewer-v2").unwrap();
+        assert!(!old.active);
+        assert_eq!(old.superseded_by.as_deref(), Some("code-reviewer-v2"));
+        assert!(new.active);
+        assert_eq!(new.supersedes_chain, vec!["code-reviewer"]);
+
+        let meta = catalog
+            .supersede(ArtifactKind::Agent, "code-reviewer-v2", "code-reviewer")
+            .unwrap();
+        assert!(!meta.active);
+        assert_eq!(meta.superseded_by.as_deref(), Some("code-reviewer"));
+    }
+
+    #[test]
+    fn agent_install_rejects_non_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        let result = catalog.install_value(
+            ArtifactKind::Agent,
+            "bad.json".into(),
+            &serde_json::json!("not an object"),
+            None,
+            None,
+            None,
+        );
+        // artifacts.rs doesn't validate object-ness; that happens in main.rs dispatch.
+        // But name extraction should still fail for a bare string.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn discovers_project_agent_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join(".bbox").join("agents").join("reviewer.json");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "{}").unwrap();
+
+        let found = discover_project_artifacts(dir.path()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, ArtifactKind::Agent);
+    }
+
+    #[test]
+    fn agent_list_filters_by_kind_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "agent.json".into(),
+                &serde_json::json!({"name": "my-agent", "version": 1}),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let agent_rows = catalog
+            .list(&ArtifactListParams {
+                kind: Some(ArtifactKind::Agent),
+                name: None,
+            })
+            .unwrap();
+        assert_eq!(agent_rows.len(), 1);
+
+        let workflow_rows = catalog
+            .list(&ArtifactListParams {
+                kind: Some(ArtifactKind::Workflow),
+                name: None,
+            })
+            .unwrap();
+        assert!(workflow_rows.is_empty());
     }
 }

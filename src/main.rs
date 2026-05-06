@@ -1066,7 +1066,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_artifact_install",
-        description = "Install a workflow, packet, or brofile artifact from a local JSON file path or http(s) URL into the versioned artifact catalog."
+        description = "Install a workflow, packet, brofile, or agent artifact from a local JSON file path or http(s) URL into the versioned artifact catalog."
     )]
     async fn bbox_artifact_install(
         &self,
@@ -1080,7 +1080,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_artifact_list",
-        description = "List installed workflow, packet, and brofile artifacts with version, source, active status, and supersession metadata."
+        description = "List installed workflow, packet, brofile, and agent artifacts with version, source, active status, and supersession metadata."
     )]
     fn bbox_artifact_list(&self, Parameters(p): Parameters<ArtifactListParams>) -> CallToolResult {
         Self::run("bbox_artifact_list", || {
@@ -6764,6 +6764,13 @@ async fn install_artifact_value(
             let brofile: orchestration::brofile::Brofile = serde_json::from_value(value.clone())?;
             orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None);
         }
+        artifacts::ArtifactKind::Agent => {
+            // Minimal validation: must be a JSON object with a name field.
+            // Manifest-specific semantic validation deferred to AS-I1.
+            if !value.is_object() {
+                anyhow::bail!("agent artifact must be a JSON object");
+            }
+        }
     }
     state
         .artifacts
@@ -6800,6 +6807,9 @@ fn deactivate_artifact(
         }
         artifacts::ArtifactKind::Brofile => {
             orchestration::brofile::delete_brofile(name, "global", &state.store_dir, None);
+        }
+        artifacts::ArtifactKind::Agent => {
+            // No separate registry to deactivate for agents (yet).
         }
     }
     Ok(())
@@ -9339,6 +9349,105 @@ mod tests {
             .join("workflows")
             .join("workflow-a.json")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn agent_artifact_install_list_supersede_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let agent_v1 = serde_json::json!({
+            "name": "test-reviewer",
+            "version": 1,
+            "description": "Reviews code",
+            "brofile": "sonnet-standard"
+        });
+        let agent_v2 = serde_json::json!({
+            "name": "test-reviewer-v2",
+            "version": 2,
+            "supersedes": "test-reviewer",
+            "description": "Reviews code with style checks",
+            "brofile": "sonnet-standard"
+        });
+
+        let meta1 = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "agent-v1.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            agent_v1,
+        )
+        .await
+        .unwrap();
+        assert!(meta1.active);
+
+        let meta2 = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "agent-v2.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            agent_v2,
+        )
+        .await
+        .unwrap();
+        assert!(meta2.active);
+        assert_eq!(meta2.supersedes_chain, vec!["test-reviewer"]);
+
+        let rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: Some(artifacts::ArtifactKind::Agent),
+                name: None,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let old = rows.iter().find(|r| r.name == "test-reviewer").unwrap();
+        assert!(!old.active);
+        assert_eq!(old.superseded_by.as_deref(), Some("test-reviewer-v2"));
+
+        let rows_all = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: None,
+                name: None,
+            })
+            .unwrap();
+        assert_eq!(rows_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn agent_artifact_rejects_non_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let result = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "bad.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!("not an object"),
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("JSON object"),
+            "expected 'JSON object' in error, got: {err}"
+        );
     }
 
     #[tokio::test]

@@ -429,8 +429,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_install",
         category: ToolCategory::Artifacts,
-        summary: "Install a workflow, packet, or brofile artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
-        when_to_use: "Use for producer-side artifacts shipped under examples/agentic-corpus or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, or brofile registry, then records version/source/supersession metadata in the catalog.",
+        summary: "Install a workflow, packet, brofile, or agent artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
+        when_to_use: "Use for producer-side artifacts shipped under examples/agentic-corpus or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, or brofile registry (agent artifacts receive basic JSON validation), then records version/source/supersession metadata in the catalog.",
         example: Some(
             r#"bbox_artifact_install(kind="workflow", source="examples/agentic-corpus/workflows/schema-migration-arc.json")"#,
         ),
@@ -438,7 +438,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_list",
         category: ToolCategory::Artifacts,
-        summary: "List installed workflow, packet, and brofile artifacts with version, source, active status, and supersession metadata.",
+        summary: "List installed workflow, packet, brofile, and agent artifacts with version, source, active status, and supersession metadata.",
         when_to_use: "Inventory check before installing or superseding producer machinery. Use kind/name filters to inspect a specific artifact family.",
         example: Some(r#"bbox_artifact_list(kind="packet")"#),
     },
@@ -446,7 +446,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_artifact_supersede",
         category: ToolCategory::Artifacts,
         summary: "Mark one installed artifact superseded by another artifact of the same kind.",
-        when_to_use: "Use when a customized workflow/packet/brofile replaces an installed version but you want the old version retained for audit.",
+        when_to_use: "Use when a customized workflow/packet/brofile/agent replaces an installed version but you want the old version retained for audit.",
         example: Some(
             r#"bbox_artifact_supersede(kind="workflow", name="auto-digest-arc", superseded_by="auto-digest-arc-v2")"#,
         ),
