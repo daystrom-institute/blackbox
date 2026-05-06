@@ -13,6 +13,9 @@ use crate::entity_ref::{self, EntityRef};
 use crate::git::GitCommit;
 use crate::projects::ProjectRecord;
 
+const MAX_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
+const TRUNCATED_COMMIT_MESSAGE_SUFFIX: &str = "\n\n[... message truncated]";
+
 #[derive(Debug, Default)]
 pub(super) struct GitIndexStats {
     pub indexed_commits: u64,
@@ -132,12 +135,13 @@ pub(crate) fn build_commit_doc(
     f: FieldHandles,
 ) -> TantivyDocument {
     let entity_id = commit_entity_id(repo_id, &commit.sha);
+    let message = indexable_commit_message(&commit.message);
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "commit");
     doc.add_text(f.chunk_kind, "git_message");
     doc.add_text(f.entity_id, &entity_id);
-    doc.add_text(f.content, &commit.message);
-    doc.add_text(f.chunk_hash, commit_message_hash(&commit.message));
+    doc.add_text(f.content, &message);
+    doc.add_text(f.chunk_hash, commit_message_hash(&message));
     doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
     doc.add_text(f.repo_id, repo_id);
     doc.add_text(f.commit_sha, &commit.sha);
@@ -210,6 +214,22 @@ fn commit_message_hash(message: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(message.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn indexable_commit_message(message: &str) -> String {
+    if message.len() <= MAX_COMMIT_MESSAGE_BYTES {
+        return message.to_string();
+    }
+    let content_limit = MAX_COMMIT_MESSAGE_BYTES - TRUNCATED_COMMIT_MESSAGE_SUFFIX.len();
+    let mut end = content_limit;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}{}",
+        &message[..end],
+        TRUNCATED_COMMIT_MESSAGE_SUFFIX
+    )
 }
 
 fn load_git_meta(path: &Path) -> Result<GitIngestMeta> {
@@ -312,6 +332,26 @@ mod tests {
         };
         let targets = current_chunk_targets(&[chunk]);
         assert!(targets.contains_key("src/main.rs"));
+    }
+
+    #[test]
+    fn commit_doc_truncates_oversized_messages_before_hashing() {
+        let (_schema, fields) = build_schema();
+        let commit = GitCommit {
+            sha: "a".repeat(40),
+            parent_shas: Vec::new(),
+            author_name: "A".into(),
+            author_email: "a@example.test".into(),
+            message: "x".repeat(20 * 1024),
+        };
+        let doc = build_commit_doc(&commit, "repo1234", &project(), fields);
+        let content = text(&doc, fields.content);
+        assert!(content.len() <= MAX_COMMIT_MESSAGE_BYTES);
+        assert!(content.ends_with(TRUNCATED_COMMIT_MESSAGE_SUFFIX));
+        assert_eq!(
+            text(&doc, fields.chunk_hash),
+            commit_message_hash(&content)
+        );
     }
 
     #[test]
