@@ -16,6 +16,8 @@ use crate::SharedState;
 static GLOBAL_QUEUE: OnceLock<RwLock<Option<EmbedQueueHandle>>> = OnceLock::new();
 static CONTRADICTION_STATE: OnceLock<RwLock<Option<std::sync::Arc<SharedState>>>> =
     OnceLock::new();
+static CONTRADICTION_THRESHOLD: OnceLock<RwLock<f32>> = OnceLock::new();
+const DEFAULT_TIER0_COSINE_THRESHOLD: f32 = 0.85;
 
 fn queue_slot() -> &'static RwLock<Option<EmbedQueueHandle>> {
     GLOBAL_QUEUE.get_or_init(|| RwLock::new(None))
@@ -27,6 +29,18 @@ pub(crate) fn install(handle: EmbedQueueHandle) {
 
 pub(crate) fn install_contradiction_state(state: std::sync::Arc<SharedState>) {
     *CONTRADICTION_STATE.get_or_init(|| RwLock::new(None)).write() = Some(state);
+}
+
+pub(crate) fn install_contradiction_threshold(threshold: f32) {
+    *CONTRADICTION_THRESHOLD
+        .get_or_init(|| RwLock::new(DEFAULT_TIER0_COSINE_THRESHOLD))
+        .write() = threshold.clamp(0.0, 1.0);
+}
+
+fn contradiction_threshold() -> f32 {
+    *CONTRADICTION_THRESHOLD
+        .get_or_init(|| RwLock::new(DEFAULT_TIER0_COSINE_THRESHOLD))
+        .read()
 }
 
 pub(crate) fn status_response() -> EmbedStatusResponse {
@@ -152,8 +166,10 @@ pub(crate) fn maybe_detect_knowledge_contradiction(
     let Some(source) = kb.entry(entry_a).cloned() else {
         return;
     };
+    let threshold = contradiction_threshold();
     let Some((entry_b, cosine)) = hits.into_iter().find_map(|hit| {
-        if hit.id == request.entity_id || hit.distance > 0.15 {
+        let cosine = 1.0 - hit.distance;
+        if hit.id == request.entity_id || cosine < threshold {
             return None;
         }
         let id = hit.id.strip_prefix("knowledge:")?;
@@ -161,7 +177,7 @@ pub(crate) fn maybe_detect_knowledge_contradiction(
         if supersession_related(&source, &target) {
             return None;
         }
-        Some((target, 1.0 - hit.distance))
+        Some((target, cosine))
     }) else {
         return;
     };

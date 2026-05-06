@@ -7736,6 +7736,7 @@ async fn main() -> anyhow::Result<()> {
     vectors::install_global(Arc::new(vectors::VectorStore::open(
         vectors::default_vectors_dir(),
     )?));
+    embed_queue::install_contradiction_threshold(tier0_cosine_threshold_from_env());
     embed_queue::install_contradiction_state(shared.clone());
     embed_queue::install(embed::queue::EmbedQueueHandle::start_default());
 
@@ -8042,6 +8043,31 @@ async fn main() -> anyhow::Result<()> {
     shared.task_store.read().persist(&store_dir);
     tracing::info!("blackboxd shut down");
     Ok(())
+}
+
+fn tier0_cosine_threshold_from_env() -> f32 {
+    const DEFAULT: f32 = 0.85;
+    match std::env::var("BBOX_TIER0_COSINE_THRESHOLD") {
+        Ok(raw) => match raw.parse::<f32>() {
+            Ok(value) if (0.0..=1.0).contains(&value) => value,
+            Ok(value) => {
+                tracing::warn!(
+                    value,
+                    "BBOX_TIER0_COSINE_THRESHOLD outside [0.0, 1.0]; using default"
+                );
+                DEFAULT
+            }
+            Err(err) => {
+                tracing::warn!(
+                    value = raw,
+                    error = %err,
+                    "invalid BBOX_TIER0_COSINE_THRESHOLD; using default"
+                );
+                DEFAULT
+            }
+        },
+        Err(_) => DEFAULT,
+    }
 }
 
 #[cfg(test)]
@@ -8860,6 +8886,7 @@ mod tests {
     async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
+        embed_queue::install_contradiction_threshold(0.85);
         embed_queue::install_contradiction_state(server.state.clone());
         let vector_store = Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
         let _guard = vectors::install_test_global(vector_store.clone());
@@ -8925,6 +8952,16 @@ mod tests {
                 && note.body.contains("knowledge:aaaabbbb")
                 && note.body.contains("knowledge:ccccdddd")
         }));
+
+        embed_queue::install_contradiction_threshold(1.0);
+        let note_count = server.state.notes.read().all().len();
+        embed_queue::maybe_detect_knowledge_contradiction(
+            &request,
+            "knowledge-test",
+            &[0.99, 0.01],
+        );
+        assert_eq!(server.state.notes.read().all().len(), note_count);
+        embed_queue::install_contradiction_threshold(0.85);
     }
 
     #[tokio::test]

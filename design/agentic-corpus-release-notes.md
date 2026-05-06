@@ -155,11 +155,12 @@ vars. The auto-digest quality and bro-trust packets now use single
 `vars.candidate.*` paths, matching `contradiction/review-synthesis`.
 
 Tier-0 contradiction detection runs in the knowledge embedding success path.
-When a new knowledge vector has cosine > 0.85 against another knowledge entry
-outside the immediate supersession relation, bbox starts
+When a new knowledge vector exceeds the cosine threshold against another
+knowledge entry outside the immediate supersession relation, bbox starts
 `contradiction-review-arc` if installed; otherwise it emits a
 `bbox_note(kind=surprise)` so the unresolved contradiction surfaces in
-`bbox_inbox`.
+`bbox_inbox`. The threshold defaults to `0.85` and can be tuned at daemon
+startup with `BBOX_TIER0_COSINE_THRESHOLD`.
 
 ## M5
 
