@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod brofile;
 pub mod http_fetch;
 pub mod mcp;

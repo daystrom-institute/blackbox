@@ -6765,7 +6765,8 @@ async fn install_artifact_value(
             orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None);
         }
         artifacts::ArtifactKind::Agent => {
-            // Minimal validation: must be a JSON object with a name field.
+            // Minimal validation: must be a JSON object. Name/version
+            // extraction happens in ArtifactCatalog::install_value.
             // Manifest-specific semantic validation deferred to AS-I1.
             if !value.is_object() {
                 anyhow::bail!("agent artifact must be a JSON object");
@@ -8441,6 +8442,7 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: None,
                 name: None,
+                include_superseded: false,
             })
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -8481,6 +8483,7 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: Some(artifacts::ArtifactKind::Workflow),
                 name: Some("project-bootstrap-arc".into()),
+                include_superseded: false,
             })
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -9407,10 +9410,24 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: Some(artifacts::ArtifactKind::Agent),
                 name: None,
+                include_superseded: false,
             })
             .unwrap();
-        assert_eq!(rows.len(), 2);
-        let old = rows.iter().find(|r| r.name == "test-reviewer").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "test-reviewer-v2");
+
+        let all_rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: Some(artifacts::ArtifactKind::Agent),
+                name: None,
+                include_superseded: true,
+            })
+            .unwrap();
+        assert_eq!(all_rows.len(), 2);
+        let old = all_rows.iter().find(|r| r.name == "test-reviewer").unwrap();
         assert!(!old.active);
         assert_eq!(old.superseded_by.as_deref(), Some("test-reviewer-v2"));
 
@@ -9421,6 +9438,7 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: None,
                 name: None,
+                include_superseded: true,
             })
             .unwrap();
         assert_eq!(rows_all.len(), 2);

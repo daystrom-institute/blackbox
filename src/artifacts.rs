@@ -49,6 +49,8 @@ pub struct ArtifactListParams {
     pub kind: Option<ArtifactKind>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub include_superseded: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -87,6 +89,8 @@ pub struct ArtifactListEntry {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,7 +192,18 @@ impl ArtifactCatalog {
                         continue;
                     }
                 }
+                if !p.include_superseded
+                    && meta.kind == ArtifactKind::Agent
+                    && !meta.active
+                {
+                    continue;
+                }
                 let artifact_path = self.artifact_path(meta.kind, &meta.name)?;
+                let description = if meta.kind == ArtifactKind::Agent {
+                    extract_agent_description(&artifact_path)
+                } else {
+                    None
+                };
                 out.push(ArtifactListEntry {
                     kind: meta.kind,
                     name: meta.name,
@@ -199,6 +214,7 @@ impl ArtifactCatalog {
                     supersedes_chain: meta.supersedes_chain,
                     path: artifact_path.to_string_lossy().into_owned(),
                     superseded_by: meta.superseded_by,
+                    description,
                 });
             }
         }
@@ -388,6 +404,17 @@ fn default_active() -> bool {
     true
 }
 
+fn extract_agent_description(artifact_path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(artifact_path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("description")
+        .or_else(|| value.get("manifest")?.get("description"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +464,7 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: Some(ArtifactKind::Workflow),
                 name: None,
+                include_superseded: false,
             })
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -588,11 +616,23 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: Some(ArtifactKind::Agent),
                 name: None,
+                include_superseded: false,
             })
             .unwrap();
-        assert_eq!(rows.len(), 2);
-        let old = rows.iter().find(|r| r.name == "code-reviewer").unwrap();
-        let new = rows.iter().find(|r| r.name == "code-reviewer-v2").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "code-reviewer-v2");
+        assert_eq!(rows[0].description.as_deref(), Some("Reviews code for bugs and style"));
+
+        let all_rows = catalog
+            .list(&ArtifactListParams {
+                kind: Some(ArtifactKind::Agent),
+                name: None,
+                include_superseded: true,
+            })
+            .unwrap();
+        assert_eq!(all_rows.len(), 2);
+        let old = all_rows.iter().find(|r| r.name == "code-reviewer").unwrap();
+        let new = all_rows.iter().find(|r| r.name == "code-reviewer-v2").unwrap();
         assert!(!old.active);
         assert_eq!(old.superseded_by.as_deref(), Some("code-reviewer-v2"));
         assert!(new.active);
@@ -606,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_install_rejects_non_object() {
+    fn agent_install_requires_name_field() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
         let result = catalog.install_value(
@@ -653,6 +693,7 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: Some(ArtifactKind::Agent),
                 name: None,
+                include_superseded: false,
             })
             .unwrap();
         assert_eq!(agent_rows.len(), 1);
@@ -661,6 +702,7 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: Some(ArtifactKind::Workflow),
                 name: None,
+                include_superseded: false,
             })
             .unwrap();
         assert!(workflow_rows.is_empty());
