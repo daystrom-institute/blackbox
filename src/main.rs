@@ -6912,12 +6912,24 @@ async fn install_artifact_value(
             orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None);
         }
         artifacts::ArtifactKind::Agent => {
-            // Minimal validation: must be a JSON object. Name/version
-            // extraction happens in ArtifactCatalog::install_value.
-            // Manifest-specific semantic validation deferred to AS-I1.
             if !value.is_object() {
                 anyhow::bail!("agent artifact must be a JSON object");
             }
+            let adapter_registry =
+                orchestration::agents::adapter::AgentAdapterRegistry::new();
+            let catalog = state.artifacts.read();
+            let ctx = orchestration::agents::validate::InstallCtx {
+                adapter_registry: &adapter_registry,
+                brofile_exists: |name: &str| -> bool {
+                    catalog
+                        .load_metadata_public(artifacts::ArtifactKind::Brofile, name)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.active)
+                },
+            };
+            orchestration::agents::validate::validate_agent_install(&value, &ctx)?;
+            drop(catalog);
         }
     }
     state

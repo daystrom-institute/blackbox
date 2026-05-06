@@ -4,6 +4,20 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// AgentArtifact — top-level wrapper for installed agent files
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentArtifact {
+    pub kind: String,
+    pub name: String,
+    pub version: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    pub manifest: AgentManifest,
+}
+
+// ---------------------------------------------------------------------------
 // AgentManifest
 // ---------------------------------------------------------------------------
 
@@ -93,7 +107,7 @@ pub enum EvidenceDensity {
 }
 
 // ---------------------------------------------------------------------------
-// AgentComposition
+// AgentComposition + CompositionShape
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +118,14 @@ pub struct AgentComposition {
     pub parallel_safe: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fan_out_aggregator: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositionShape {
+    Chain,
+    FanOut,
+    Escalation,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,11 +213,17 @@ impl AgentRef {
     pub fn parse(input: &str) -> Option<Self> {
         let input = input.trim();
         let rest = input.strip_prefix("agent:")?;
+        if rest.contains(':') {
+            return None;
+        }
         let (name, version_str) = rest.rsplit_once("@v")?;
         if name.is_empty() {
             return None;
         }
-        let version = version_str.parse().ok()?;
+        let version: u32 = version_str.parse().ok()?;
+        if version == 0 {
+            return None;
+        }
         Some(Self {
             name: name.to_string(),
             version,
@@ -233,21 +261,13 @@ pub struct AgentSession {
 }
 
 // ---------------------------------------------------------------------------
-// AgentLifecyclePolicy
+// BadgeyAgentArgs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentLifecyclePolicy {
-    Oneshot,
-    SessionCached,
-    Consultant,
-}
-
-impl Default for AgentLifecyclePolicy {
-    fn default() -> Self {
-        Self::Oneshot
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BadgeyAgentArgs {
+    pub prompt: String,
+    pub badgey_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +309,32 @@ impl Default for AgentManifest {
             embedding: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Validation helpers (§4.3 lints — focused, not the full validator)
+// ---------------------------------------------------------------------------
+
+pub fn validate_description_length(desc: &str) -> Result<(), String> {
+    let len = desc.len();
+    if len < 10 {
+        return Err(format!(
+            "description too short ({len} chars, minimum 10)"
+        ));
+    }
+    if len > 500 {
+        return Err(format!(
+            "description too long ({len} chars, maximum 500)"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_when_to_use_nonempty(items: &[String]) -> Result<(), String> {
+    if items.is_empty() {
+        return Err("when_to_use must be non-empty".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -391,6 +437,16 @@ mod tests {
     }
 
     #[test]
+    fn agent_ref_parse_rejects_colon_in_name() {
+        assert!(AgentRef::parse("agent:bad:name@v1").is_none());
+    }
+
+    #[test]
+    fn agent_ref_parse_rejects_version_zero() {
+        assert!(AgentRef::parse("agent:reviewer@v0").is_none());
+    }
+
+    #[test]
     fn agent_ref_from_str_works() {
         let r: AgentRef = "agent:foo@v1".parse().unwrap();
         assert_eq!(r.name, "foo");
@@ -452,11 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_policy_default_is_oneshot() {
-        assert_eq!(AgentLifecyclePolicy::default(), AgentLifecyclePolicy::Oneshot);
-    }
-
-    #[test]
     fn cost_class_display() {
         assert_eq!(AgentCostClass::Cheap.to_string(), "cheap");
         assert_eq!(AgentCostClass::Normal.to_string(), "normal");
@@ -468,5 +519,86 @@ mod tests {
         let json = serde_json::json!({});
         let result = serde_json::from_value::<AgentManifest>(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn badgey_agent_args_serde_round_trip() {
+        let args = BadgeyAgentArgs {
+            prompt: "Review this code".into(),
+            badgey_id: "badgey-01".into(),
+        };
+        let json = serde_json::to_string(&args).unwrap();
+        let parsed: BadgeyAgentArgs = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, args);
+    }
+
+    #[test]
+    fn composition_shape_serde_round_trip() {
+        for shape in &[CompositionShape::Chain, CompositionShape::FanOut, CompositionShape::Escalation] {
+            let json = serde_json::to_string(&shape).unwrap();
+            let parsed: CompositionShape = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, *shape);
+        }
+    }
+
+    #[test]
+    fn agent_artifact_serde_round_trip() {
+        let artifact = AgentArtifact {
+            kind: "agent".into(),
+            name: "code-reviewer".into(),
+            version: serde_json::json!(1),
+            supersedes: None,
+            manifest: AgentManifest {
+                description: "Reviews code for security.".into(),
+                when_to_use: vec!["after writing code".into()],
+                brofile_ref: Some("reviewer-persona".into()),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string_pretty(&artifact).unwrap();
+        let parsed: AgentArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, artifact);
+    }
+
+    #[test]
+    fn validate_description_length_accepts_valid() {
+        assert!(validate_description_length("This is a valid description.").is_ok());
+    }
+
+    #[test]
+    fn validate_description_length_rejects_too_short() {
+        let result = validate_description_length("short");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn validate_description_length_rejects_too_long() {
+        let long = "x".repeat(501);
+        let result = validate_description_length(&long);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too long"));
+    }
+
+    #[test]
+    fn validate_description_length_accepts_boundary_10() {
+        assert!(validate_description_length("1234567890").is_ok());
+    }
+
+    #[test]
+    fn validate_description_length_accepts_boundary_500() {
+        assert!(validate_description_length(&"x".repeat(500)).is_ok());
+    }
+
+    #[test]
+    fn validate_when_to_use_nonempty_rejects_empty() {
+        let result = validate_when_to_use_nonempty(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-empty"));
+    }
+
+    #[test]
+    fn validate_when_to_use_nonempty_accepts_nonempty() {
+        assert!(validate_when_to_use_nonempty(&["after writing code".into()]).is_ok());
     }
 }
