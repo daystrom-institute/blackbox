@@ -200,9 +200,18 @@ impl TranscriptIndex {
     pub(crate) fn edge_projection_docs(&self) -> Result<Vec<EdgeProjectionDoc>> {
         let searcher = self.reader.searcher();
         let limit = searcher.num_docs() as usize;
+        if limit > 100_000 {
+            tracing::warn!(
+                doc_count = limit,
+                "EdgeIndex projection is materializing all index docs at startup"
+            );
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
+        // NOTE: AllQuery + TopDocs::with_limit materializes every doc into memory at once.
+        // Acceptable at <50k doc scale (current corpus); refactor to streaming/segment
+        // iteration before this crosses ~100k.
         let top_docs = searcher.search(
             &tantivy::query::AllQuery,
             &tantivy::collector::TopDocs::with_limit(limit),
