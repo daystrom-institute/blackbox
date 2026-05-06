@@ -29,3 +29,9 @@
   supported parsers are statically compiled into the daemon where parser
   sources are present; direct tree-sitter grammar crates provide the same
   no-download parser subset as a fallback.
+
+## S4
+
+- EdgeIndex memory model: dedup uses full `Edge` structs as `HashSet` keys.
+  This is fine at current corpus scale, but needs rework if edge count crosses
+  roughly 5M; revisit when corpora actually exceed that scale.
