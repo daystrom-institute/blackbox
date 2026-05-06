@@ -714,8 +714,10 @@ impl BlackboxServer {
             .take(5)
             .collect::<Vec<_>>()
             .join(", ");
+        let budget_extensions = self.badgey_budget_extensions(thread_id);
+        let budget_remaining = 50_000 + (budget_extensions * 50_000);
         format!(
-            "[badgey-scope]\nbadgey_id: {id}\nthread_of_record: {thread_id}\nproject: {project}\ncurrent_time: {current_time}\nbrief: {brief}\nqueue: {queue_status}\nrecent_paths: {recent_paths}\nrecent_proposals: {recent_proposals}\nbudget_remaining: advisory\n[/badgey-scope]\n",
+            "[badgey-scope]\nbadgey_id: {id}\nthread_of_record: {thread_id}\nproject: {project}\ncurrent_time: {current_time}\nbrief: {brief}\nqueue: {queue_status}\nrecent_paths: {recent_paths}\nrecent_proposals: {recent_proposals}\nbudget_remaining: {budget_remaining}\n[/badgey-scope]\n",
             current_time = util::now_iso(),
             project = scope.project_id
         )
@@ -1001,34 +1003,104 @@ impl BlackboxServer {
                 return self.badgey_reject_proposal_internal(&id, &proposal_id);
             }
             Some(WrapperCommand::ExpandPath(path_id)) => {
-                return Ok(json!({
-                    "badgey_id": id,
-                    "path_id": path_id,
-                    "status": "not_found",
-                    "degraded": {"reason": "path cache replay is not populated for this instance"}
-                }));
+                let instance = self
+                    .state
+                    .badgey_registry
+                    .get(&id)
+                    .map_err(|e| e.to_string())?;
+                return match self.badgey_cached_path(&instance.thread_of_record_id, &path_id) {
+                    Some(orchestration::badgey::events::ThreadEvent::PathCached {
+                        id,
+                        nodes,
+                        edges,
+                        summary,
+                    }) => Ok(json!({
+                        "badgey_id": instance.id,
+                        "path_id": id,
+                        "status": "found",
+                        "nodes": nodes,
+                        "edges": edges,
+                        "summary": summary,
+                    })),
+                    _ => Ok(json!({
+                        "badgey_id": id,
+                        "path_id": path_id,
+                        "status": "not_found",
+                    })),
+                };
             }
             Some(WrapperCommand::BudgetExtend) => {
+                let instance = self
+                    .state
+                    .badgey_registry
+                    .get(&id)
+                    .map_err(|e| e.to_string())?;
+                self.badgey_action_result_note(
+                    &instance,
+                    &uuid::Uuid::new_v4().to_string(),
+                    "budget_extended",
+                    json!({"added_tokens": 50_000}),
+                )?;
                 return Ok(json!({
                     "badgey_id": id,
                     "status": "accepted",
-                    "degraded": {"reason": "budget tracking is advisory in this build"}
+                    "budget": self.badgey_observability(&instance)["budget"].clone(),
                 }));
             }
             Some(WrapperCommand::RevertBrofileTo(version)) => {
+                let instance = self
+                    .state
+                    .badgey_registry
+                    .get(&id)
+                    .map_err(|e| e.to_string())?;
+                let proposal = self
+                    .state
+                    .badgey_proposals
+                    .create(
+                        &id,
+                        orchestration::badgey::types::ProposalKind::Brofile,
+                        json!({
+                            "action": "revert_brofile",
+                            "name": "badgey-persona",
+                            "version": version,
+                            "source": format!("artifact:brofile:badgey-persona@{version}"),
+                        }),
+                        Some(format!("revert-brofile:{version}")),
+                    )
+                    .map_err(|e| format!("creating brofile revert proposal: {e}"))?;
+                self.badgey_write_event(
+                    &instance,
+                    orchestration::badgey::events::ThreadEvent::ProposalEmitted {
+                        proposal_id: proposal.id.clone(),
+                        kind: proposal.kind,
+                        draft_ref: format!("badgey-persona@{version}"),
+                        state: proposal.state,
+                    },
+                    None,
+                )?;
                 return Ok(json!({
                     "badgey_id": id,
                     "version": version,
-                    "status": "not_applied",
-                    "degraded": {"reason": "brofile revert proposals must be represented as artifacts"}
+                    "status": "proposal_created",
+                    "proposal_id": proposal.id,
                 }));
             }
             Some(WrapperCommand::TrustSubBro(label)) => {
+                let instance = self
+                    .state
+                    .badgey_registry
+                    .get(&id)
+                    .map_err(|e| e.to_string())?;
+                self.badgey_action_result_note(
+                    &instance,
+                    &uuid::Uuid::new_v4().to_string(),
+                    "subbro_trusted",
+                    json!({"label": label}),
+                )?;
                 return Ok(json!({
                     "badgey_id": id,
                     "sub_bro": label,
                     "status": "recorded",
-                    "degraded": {"reason": "sub-bro trust is advisory until scout state is durable"}
                 }));
             }
             None => {}
@@ -1243,6 +1315,104 @@ impl BlackboxServer {
             .filter(|event| matches!(event, orchestration::badgey::events::ThreadEvent::Turn { .. }))
             .count() as u64
             + 1
+    }
+
+    fn badgey_cached_path(
+        &self,
+        thread_id: &str,
+        path_id: &str,
+    ) -> Option<orchestration::badgey::events::ThreadEvent> {
+        self.state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id))
+            .filter_map(|note| {
+                serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body).ok()
+            })
+            .rev()
+            .find(|event| {
+                matches!(
+                    event,
+                    orchestration::badgey::events::ThreadEvent::PathCached { id, .. }
+                        if id == path_id
+                )
+            })
+    }
+
+    fn badgey_budget_extensions(&self, thread_id: &str) -> u64 {
+        self.state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id))
+            .filter_map(|note| serde_json::from_str::<Value>(&note.body).ok())
+            .filter(|body| body.get("event").and_then(Value::as_str) == Some("budget_extended"))
+            .count() as u64
+    }
+
+    fn badgey_observability(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+    ) -> Value {
+        let mut turns = 0u64;
+        let mut paths = 0u64;
+        let mut scouts = 0u64;
+        for note in self.state.notes.read().all() {
+            if note.thread_id.as_deref() != Some(instance.thread_of_record_id.as_str()) {
+                continue;
+            }
+            if let Ok(event) =
+                serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body)
+            {
+                match event {
+                    orchestration::badgey::events::ThreadEvent::Turn { .. } => turns += 1,
+                    orchestration::badgey::events::ThreadEvent::PathCached { .. } => paths += 1,
+                    orchestration::badgey::events::ThreadEvent::SubbroSpawned { .. } => scouts += 1,
+                    _ => {}
+                }
+            }
+        }
+        let proposals = self
+            .state
+            .badgey_proposals
+            .list_by_instance(&instance.id)
+            .unwrap_or_default();
+        let applied = proposals
+            .iter()
+            .filter(|proposal| proposal.state == orchestration::badgey::types::ProposalState::Applied)
+            .count() as u64;
+        let rejected = proposals
+            .iter()
+            .filter(|proposal| proposal.state == orchestration::badgey::types::ProposalState::Failed)
+            .count() as u64;
+        let total_decided = applied + rejected;
+        let accept_rate = if total_decided == 0 {
+            None
+        } else {
+            Some(applied as f64 / total_decided as f64)
+        };
+        let budget_extensions = self.badgey_budget_extensions(&instance.thread_of_record_id);
+        json!({
+            "turns": turns,
+            "cached_paths": paths,
+            "sub_bros": scouts,
+            "proposals_total": proposals.len(),
+            "proposals_applied": applied,
+            "proposals_rejected": rejected,
+            "accept_rate": accept_rate,
+            "budget": {
+                "base_tokens": 50_000,
+                "extension_count": budget_extensions,
+                "remaining": 50_000 + (budget_extensions * 50_000),
+            },
+            "learning_loop": {
+                "eligible": total_decided >= 5 && accept_rate.unwrap_or(0.0) >= 0.6,
+                "reason": "lens proposals remain user-gated; eligibility surfaces for Badgey to draft a brofile/lens proposal"
+            }
+        })
     }
 
     fn badgey_refs_consumed_from_result(&self, result: &Value) -> Vec<String> {
@@ -1810,7 +1980,54 @@ impl BlackboxServer {
                 )?;
                 Ok(json!({"task_id": task_id}))
             } else {
-                Err("artifact_promotion proposals are not supported in this apply path yet".to_string())
+                let kind = applying
+                    .draft
+                    .get("artifact_kind")
+                    .or_else(|| applying.draft.get("kind"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "artifact promotion draft missing artifact_kind".to_string())
+                    .and_then(|raw| match raw {
+                        "workflow" => Ok(artifacts::ArtifactKind::Workflow),
+                        "packet" => Ok(artifacts::ArtifactKind::Packet),
+                        "brofile" => Ok(artifacts::ArtifactKind::Brofile),
+                        "agent" => Ok(artifacts::ArtifactKind::Agent),
+                        other => Err(format!("unknown artifact promotion kind: {other}")),
+                    })?;
+                let source = applying
+                    .draft
+                    .get("source")
+                    .or_else(|| applying.draft.get("draft_path"))
+                    .or_else(|| applying.draft.get("path"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "artifact promotion draft missing source/draft_path".to_string())?;
+                let metadata = install_artifact_from_params(
+                    &self.state,
+                    ArtifactInstallParams {
+                        kind,
+                        source: source.to_string(),
+                        name: applying
+                            .draft
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        version: applying
+                            .draft
+                            .get("version")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        supersedes: applying
+                            .draft
+                            .get("supersedes")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                    },
+                )
+                .await
+                .map_err(|e| format!("promoting artifact proposal: {e:#}"))?;
+                Ok(json!({
+                    "artifact_ref": format!("{:?}:{}@{}", kind, metadata.name, metadata.version),
+                    "metadata": metadata,
+                }))
             }
         }
         .await;
@@ -2015,6 +2232,7 @@ impl BlackboxServer {
                 "instance": instance,
                 "queue": queue,
                 "proposals": proposals,
+                "observability": self.badgey_observability(&instance),
             }));
         }
         self.badgey_list_internal(false)
