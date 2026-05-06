@@ -33,6 +33,16 @@ When workflow hook ops grow shell-output capture, such as `op: shell`
 populating a var with stdout, exit code, or parsed JSON, the `Decide` gate can
 route on actual drift verdict.
 
+## P1
+
+Tool-call edges only emit when the touched file is under a registered project.
+Files edited in unregistered projects are recorded in transcripts but produce
+no `EDITED_FILE`, `READ_FILE`, or `RAN_BASH` edges. After registering a new
+project, no backfill happens; only future tool calls produce edges.
+
+Future improvement: a `bbox_project_register` post-step that walks transcripts
+and backfills tool-call edges for the newly registered project.
+
 ## S3
 
 - Code chunking uses `tree-sitter-language-pack` with runtime downloads
