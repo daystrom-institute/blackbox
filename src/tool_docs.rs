@@ -61,7 +61,7 @@ impl ToolCategory {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
             }
             Self::Graph => {
-                "Inspect agentic-corpus entities, graph vocabulary, paths, bundles, and retrieval."
+                "Inspect entities, graph vocabulary, paths, bundles, and retrieval."
             }
             Self::Projects => "Register project roots for later file indexing.",
             Self::Knowledge => {
@@ -123,14 +123,21 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_search",
         category: ToolCategory::Transcripts,
         summary: "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax.",
-        when_to_use: "Use when you know the topic but not the exact session. Default `smart` mode treats adjacent terms as broad recall, preserves quoted phrases, and understands `-term`; switch to `mode=fulltext` when you want raw boolean query syntax with conjunction semantics. Filter by account, project, or role as early as possible. Pass `exclude_self=true` to suppress the caller's own current session. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders and query-shaping guidance.",
+        when_to_use: "Use when you know the topic but not the exact session. Filter by account, project, or role early. Pass `exclude_self=true` for current-turn searches. See `sm-transcript-retrieval` for ladders.",
         example: Some(r#"bbox_search(query="redis locking", project="my-app", role="user")"#),
     },
     ToolDoc {
         name: "bbox_hybrid_search",
         category: ToolCategory::Graph,
-        summary: "Search typed agentic-corpus entities with BM25 plus vector RRF fusion; returns entity refs, scores, and vector_status.",
-        when_to_use: "Use for mixed corpus questions.",
+        summary: "Hybrid BM25+vector search over typed entities.",
+        when_to_use: "Use for mixed questions.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_discover_seed_entities",
+        category: ToolCategory::Graph,
+        summary: "Find seed entities with notable_edges; inspect before answering.",
+        when_to_use: "Use before inspect.",
         example: None,
     },
     ToolDoc {

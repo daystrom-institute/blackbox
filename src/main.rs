@@ -687,6 +687,7 @@ use knowledge::{
     RememberParams, RenderParams, ResponseFormat, ReviewParams,
 };
 use mcp_tools::bundle_evidence::BundleEvidenceParams;
+use mcp_tools::discover_seed::DiscoverSeedParams;
 use mcp_tools::find_paths::FindPathsParams;
 use mcp_tools::hybrid_search::HybridSearchParams;
 use mcp_tools::inspect::InspectEntityParams;
@@ -718,7 +719,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_hybrid_search",
-        description = "Search typed agentic-corpus entities with BM25 plus vector RRF fusion; returns entity refs, scores, and vector_status."
+        description = "Hybrid BM25+vector search over typed entities."
     )]
     fn bbox_hybrid_search(&self, Parameters(p): Parameters<HybridSearchParams>) -> CallToolResult {
         Self::run("bbox_hybrid_search", || {
@@ -731,6 +732,32 @@ impl BlackboxServer {
             mcp_tools::hybrid_search::hybrid_search(
                 &self.state.idx.read(),
                 &self.state.kb.read(),
+                &p,
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_discover_seed_entities",
+        description = "Find seed entities with notable_edges; inspect before answering."
+    )]
+    fn bbox_discover_seed_entities(
+        &self,
+        Parameters(p): Parameters<DiscoverSeedParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_discover_seed_entities", || {
+            let mut idx = self.state.idx.write();
+            if idx.is_empty() {
+                idx.build_index(false)
+                    .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
+            }
+            drop(idx);
+            let provider_ctx = ProviderContext::new(&self.state);
+            mcp_tools::discover_seed::discover_seed_entities(
+                &self.state.idx.read(),
+                &self.state.kb.read(),
+                &provider_ctx,
+                &self.state.edge_index.read(),
                 &p,
             )
         })
