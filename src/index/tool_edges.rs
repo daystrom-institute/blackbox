@@ -277,9 +277,15 @@ fn edit_byte_range(tool_call: &ToolCallInfo, bytes: &[u8]) -> Option<(u64, u64)>
 }
 
 fn line_offset_to_turn(line_offset: u64, event_idx: u32) -> u32 {
-    u32::try_from(line_offset)
-        .unwrap_or(u32::MAX - event_idx)
-        .saturating_add(event_idx)
+    // BashCall refs only have a u32 turn slot, while transcript locations are
+    // `(line_offset: u64, event_idx: u32)`. This truncates a SHA-256 tuple hash
+    // to 32 bits, so collisions are possible but rare at current per-session
+    // volumes; the source transcript ref remains in RAN_BASH edge metadata.
+    let mut hasher = Sha256::new();
+    hasher.update(line_offset.to_be_bytes());
+    hasher.update(event_idx.to_be_bytes());
+    let digest = hasher.finalize();
+    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -319,5 +325,18 @@ mod tests {
         };
 
         assert_eq!(read_byte_range(&tool_call, 100), Some((10, 30)));
+    }
+
+    #[test]
+    fn line_offset_to_turn_has_no_collisions_for_synthetic_session() {
+        let mut seen = std::collections::HashSet::new();
+        for idx in 0..10_000u32 {
+            let line_offset = u64::from(idx) * 137;
+            let event_idx = idx % 5;
+            assert!(
+                seen.insert(line_offset_to_turn(line_offset, event_idx)),
+                "unexpected turn collision at synthetic event {idx}"
+            );
+        }
     }
 }
