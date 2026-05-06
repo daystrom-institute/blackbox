@@ -71,11 +71,13 @@ enum WorkerCommand {
 
 struct WorkerSpec {
     route: String,
+    vector_route: String,
     provider: Arc<dyn EmbeddingProvider>,
     rate_limit_per_min: Option<u32>,
     debounce: Duration,
     retry_backoff: Duration,
     statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
+    persist_vectors: bool,
 }
 
 impl EmbedQueueHandle {
@@ -90,14 +92,28 @@ impl EmbedQueueHandle {
     }
 
     fn from_router(router: EmbeddingRouter, debounce: Duration, retry_backoff: Duration) -> Self {
-        let mut providers = Vec::new();
+        let mut providers: Vec<(String, Arc<dyn EmbeddingProvider>, Option<u32>, String)> =
+            Vec::new();
         for bucket in Bucket::ALL {
             let route = bucket.as_str().to_string();
             match router.route_for(bucket, None) {
                 Ok(provider) => {
+                    let route_meta = match router.route(bucket, None) {
+                        Ok(route_meta) => route_meta,
+                        Err(err) => {
+                            tracing::warn!(
+                                route = %route,
+                                error = %err,
+                                "embedding route disabled because route metadata failed"
+                            );
+                            providers.push((route, Arc::new(FailingProvider::new(err)), None, String::new()));
+                            continue;
+                        }
+                    };
+                    let vector_route = route_meta.vector_route_id();
                     let provider: Arc<dyn EmbeddingProvider> = provider.into();
                     let rate_limit_per_min = router.rate_limit_per_min(provider.id());
-                    providers.push((route, provider, rate_limit_per_min));
+                    providers.push((route, provider, rate_limit_per_min, vector_route));
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -105,7 +121,7 @@ impl EmbedQueueHandle {
                         error = %err,
                         "embedding route disabled because provider could not be constructed"
                     );
-                    providers.push((route, Arc::new(FailingProvider::new(err)), None));
+                    providers.push((route, Arc::new(FailingProvider::new(err)), None, String::new()));
                 }
             }
         }
@@ -151,9 +167,16 @@ impl EmbedQueueHandle {
     }
 
     pub fn tombstone(&self, entity_id: &str) {
+        if let Err(err) = crate::vectors::delete_entity_all_routes(entity_id) {
+            tracing::warn!(
+                entity_id,
+                error = %err,
+                "embedding tombstone failed; vector WAL can be reconstructed by reindex"
+            );
+        }
         tracing::debug!(
             entity_id,
-            "embedding tombstone accepted; vector-store delete lands in E3"
+            "embedding tombstone accepted"
         );
     }
 
@@ -206,6 +229,13 @@ impl EmbedQueueHandle {
                 return None;
             }
         };
+        let vector_route = match router.route(request.bucket, request.project_id.as_deref()) {
+            Ok(route) => route.vector_route_id(),
+            Err(err) => {
+                mark_error(&self.inner.statuses, route, &sanitize_error(&err));
+                return None;
+            }
+        };
         let provider: Arc<dyn EmbeddingProvider> = provider.into();
         let rate_limit_per_min = router.rate_limit_per_min(provider.id());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -216,11 +246,13 @@ impl EmbedQueueHandle {
             .or_default();
         let spec = WorkerSpec {
             route: route.to_string(),
+            vector_route,
             provider,
             rate_limit_per_min,
             debounce: self.inner.debounce,
             retry_backoff: self.inner.retry_backoff,
             statuses: self.inner.statuses.clone(),
+            persist_vectors: true,
         };
         tokio::spawn(worker_loop(spec, rx));
         self.inner
@@ -264,7 +296,7 @@ impl EmbedQueueHandle {
         Self::from_providers(
             providers
                 .into_iter()
-                .map(|(route, provider)| (route.to_string(), provider, None))
+                .map(|(route, provider)| (route.to_string(), provider, None, route.to_string()))
                 .collect(),
             debounce,
             retry_backoff,
@@ -273,14 +305,14 @@ impl EmbedQueueHandle {
     }
 
     fn from_providers(
-        providers: Vec<(String, Arc<dyn EmbeddingProvider>, Option<u32>)>,
+        providers: Vec<(String, Arc<dyn EmbeddingProvider>, Option<u32>, String)>,
         debounce: Duration,
         retry_backoff: Duration,
         router: Option<EmbeddingRouter>,
     ) -> Self {
         let statuses = Arc::new(RwLock::new(BTreeMap::new()));
         let mut senders = BTreeMap::new();
-        for (route, provider, rate_limit_per_min) in providers {
+        for (route, provider, rate_limit_per_min, vector_route) in providers {
             statuses
                 .write()
                 .entry(route.clone())
@@ -288,11 +320,13 @@ impl EmbedQueueHandle {
             let (tx, rx) = mpsc::unbounded_channel();
             let spec = WorkerSpec {
                 route: route.clone(),
+                vector_route,
                 provider,
                 rate_limit_per_min,
                 debounce,
                 retry_backoff,
                 statuses: statuses.clone(),
+                persist_vectors: router.is_some(),
             };
             tokio::spawn(worker_loop(spec, rx));
             senders.insert(route, tx);
@@ -327,12 +361,29 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
         let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
         match spec.provider.embed_batch(&texts).await {
             Ok(vectors) => {
+                if spec.persist_vectors {
+                    if let Err(err) = persist_vectors(&spec, &batch, vectors) {
+                    let sanitized = sanitize_error(&err);
+                    tracing::warn!(
+                        route = %spec.route,
+                        vector_route = %spec.vector_route,
+                        error = %sanitized,
+                        "embedding vector persistence failed; route will retry"
+                    );
+                    mark_error(&spec.statuses, &spec.route, &sanitized);
+                    retry_batch = batch;
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+                    continue;
+                    }
+                }
                 tracing::debug!(
                     route = %spec.route,
-                    vectors = vectors.len(),
+                    vector_route = %spec.vector_route,
+                    vectors = batch.len(),
                     dimensions = spec.provider.dimensions(),
                     model = spec.provider.model_name(),
-                    "embedding vectors computed and discarded until E3 storage lands"
+                    "embedding vectors persisted"
                 );
                 mark_success(&spec.statuses, &spec.route, batch.len() as u64);
                 retry_batch.clear();
@@ -386,6 +437,25 @@ async fn apply_rate_limit(rate_limit_per_min: Option<u32>) {
     if delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
+}
+
+fn persist_vectors(spec: &WorkerSpec, batch: &[EmbedRequest], vectors: Vec<Vec<f32>>) -> Result<()> {
+    if vectors.len() != batch.len() {
+        return Err(anyhow!(
+            "provider returned {} vectors for {} requests",
+            vectors.len(),
+            batch.len()
+        ));
+    }
+    for (request, vector) in batch.iter().zip(vectors) {
+        crate::vectors::upsert(
+            &spec.vector_route,
+            &request.entity_id,
+            &request.chunk_hash,
+            vector,
+        )?;
+    }
+    Ok(())
 }
 
 fn increment_depth(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, delta: i64) {

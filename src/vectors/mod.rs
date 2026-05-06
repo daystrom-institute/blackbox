@@ -44,6 +44,10 @@ pub fn delete(route: &str, entity_id: &str) -> Result<()> {
     global().delete(route, entity_id)
 }
 
+pub fn delete_entity_all_routes(entity_id: &str) -> Result<()> {
+    global().delete_entity_all_routes(entity_id)
+}
+
 pub fn search(route: &str, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
     global().search(route, query, k)
 }
@@ -105,6 +109,19 @@ impl VectorStore {
             .delete(entity_id)
             .with_context(|| format!("deleting vector entity {entity_id} from {route}"));
         result
+    }
+
+    pub fn delete_entity_all_routes(&self, entity_id: &str) -> Result<()> {
+        let partitions = self
+            .partitions
+            .read()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for partition in partitions {
+            partition.write().delete(entity_id)?;
+        }
+        Ok(())
     }
 
     pub fn search(&self, route: &str, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {

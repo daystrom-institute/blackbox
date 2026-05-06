@@ -7575,6 +7575,9 @@ async fn main() -> anyhow::Result<()> {
         councils: Arc::new(council::CouncilRegistry::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
     });
+    vectors::install_global(Arc::new(vectors::VectorStore::open(
+        vectors::default_vectors_dir(),
+    )?));
     embed_queue::install(embed::queue::EmbedQueueHandle::start_default());
 
     // Restore webhook + workflow registries from disk so installs
