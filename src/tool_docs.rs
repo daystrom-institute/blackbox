@@ -763,6 +763,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Pre-dispatch inspection: understand the full computed tool surface an agent will have at runtime, including which brofile it resolves to and whether filters from the brofile and manifest overlay conflict. Use before bro_agent_dispatch to preview the dispatch plan.",
         example: Some(r#"bro_agent_describe(agent="code-reviewer")"#),
     },
+    ToolDoc {
+        name: "bro_agent_search",
+        category: ToolCategory::Orchestration,
+        summary: "Search installed agents by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and matched anti-patterns.",
+        when_to_use: "Discovery: find agents relevant to a task before dispatching. Call with the task description to get ranked candidates. Set exclude_anti_pattern_matches=false to see all matches including anti-pattern hits (useful for review). Filter by cost_class or provenance_kind to narrow results.",
+        example: Some(r#"bro_agent_search(query="review pull request for security issues", limit=3)"#),
+    },
     // ── Whiteboards ─────────────────────────────────────────────
     ToolDoc {
         name: "whiteboard_open",

@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use anyhow::Result;
 
 use crate::artifacts::{ArtifactCatalog, ArtifactKind, ArtifactListParams};
@@ -13,6 +15,25 @@ pub struct ListFilter {
     pub include_superseded: bool,
     pub cost_class: Option<AgentCostClass>,
     pub provenance_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilter {
+    pub cost_class: Option<AgentCostClass>,
+    pub provenance_kind: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSearchResult {
+    pub name: String,
+    pub version: String,
+    pub score: f64,
+    pub description: String,
+    pub when_to_use: Vec<String>,
+    pub anti_patterns: Vec<String>,
+    pub cost_class: Option<AgentCostClass>,
+    pub provenance_kind: Option<String>,
+    pub matched_anti_patterns: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +201,113 @@ impl<'a> AgentRegistry<'a> {
             Err(e) => (None, Some(e.to_string())),
         }
     }
+
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &SearchFilter,
+        exclude_anti_pattern_matches: bool,
+    ) -> Result<Vec<AgentSearchResult>> {
+        let params = ArtifactListParams {
+            kind: Some(ArtifactKind::Agent),
+            name: None,
+            include_superseded: false,
+        };
+        let entries = self.catalog.list(&params)?;
+        let query_lower = query.to_lowercase();
+        let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+
+        let mut candidates: Vec<AgentSearchResult> = Vec::new();
+
+        for entry in entries {
+            if !entry.active {
+                continue;
+            }
+            let (manifest, _) = self.load_manifest_degraded(&entry.name);
+            let Some(manifest) = manifest else {
+                continue;
+            };
+
+            let cost_class = manifest.cost_class;
+            let provenance_kind = manifest.provenance.as_ref().map(|p| match p {
+                AgentProvenance::HandAuthored { .. } => "hand_authored",
+                AgentProvenance::Distilled { .. } => "distilled",
+                AgentProvenance::Imported { .. } => "imported",
+            });
+            if let Some(ref wanted) = filter.cost_class {
+                if cost_class != *wanted {
+                    continue;
+                }
+            }
+            if let Some(ref wanted_kind) = filter.provenance_kind {
+                if provenance_kind != Some(wanted_kind.as_str()) {
+                    continue;
+                }
+            }
+
+            let desc_lower = manifest.description.to_lowercase();
+            let wtu_lower: Vec<String> =
+                manifest.when_to_use.iter().map(|s| s.to_lowercase()).collect();
+            let ap_lower: Vec<String> =
+                manifest.anti_patterns.iter().map(|s| s.to_lowercase()).collect();
+
+            let positive_score = text_relevance(&query_terms, &desc_lower, &wtu_lower);
+            let anti_score = text_relevance(&query_terms, "", &ap_lower);
+
+            let mut matched_anti_patterns = Vec::new();
+            for (i, ap) in manifest.anti_patterns.iter().enumerate() {
+                let ap_l = ap.to_lowercase();
+                if query_terms.iter().any(|t| ap_l.contains(t)) {
+                    matched_anti_patterns.push(ap.clone());
+                }
+                let _ = i;
+            }
+
+            if positive_score == 0.0 {
+                continue;
+            }
+
+            if exclude_anti_pattern_matches && anti_score > positive_score {
+                continue;
+            }
+
+            let penalty = if anti_score > positive_score {
+                0.3 * anti_score
+            } else {
+                0.0
+            };
+            let final_score = (positive_score - penalty).max(0.0);
+
+            if final_score <= 0.0 {
+                continue;
+            }
+
+            candidates.push(AgentSearchResult {
+                name: entry.name,
+                version: entry.version,
+                score: final_score,
+                description: manifest.description,
+                when_to_use: manifest.when_to_use,
+                anti_patterns: manifest.anti_patterns,
+                cost_class: Some(cost_class),
+                provenance_kind: provenance_kind.map(String::from),
+                matched_anti_patterns,
+            });
+        }
+
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    cost_rank(a.cost_class).cmp(&cost_rank(b.cost_class))
+                })
+        });
+        candidates.truncate(limit);
+
+        Ok(candidates)
+    }
 }
 
 /// Parse an agent name or versioned ref into `(name, optional_version)`.
@@ -222,6 +350,38 @@ fn parse_versioned(input: &str) -> Result<(String, Option<String>)> {
         Ok((name.to_string(), Some(ver.to_string())))
     } else {
         Ok((input.to_string(), None))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text relevance scoring (BM25-like simplified)
+// ---------------------------------------------------------------------------
+
+fn text_relevance(query_terms: &[&str], description: &str, lines: &[String]) -> f64 {
+    let all_text: String = {
+        let mut s = description.to_string();
+        for line in lines {
+            s.push(' ');
+            s.push_str(line);
+        }
+        s.to_lowercase()
+    };
+    let mut score = 0.0f64;
+    for term in query_terms {
+        let count = all_text.matches(term).count();
+        if count > 0 {
+            score += 1.0 + (count as f64).ln_1p();
+        }
+    }
+    score
+}
+
+fn cost_rank(cc: Option<AgentCostClass>) -> u8 {
+    match cc {
+        Some(AgentCostClass::Cheap) => 0,
+        Some(AgentCostClass::Normal) => 1,
+        Some(AgentCostClass::Expensive) => 2,
+        None => 3,
     }
 }
 
@@ -520,5 +680,123 @@ mod tests {
     fn parse_rejects_non_numeric_version() {
         let err = parse_name_or_ref("reviewer@vabc").unwrap_err();
         assert!(err.to_string().contains("positive integer"));
+    }
+
+    #[test]
+    fn text_relevance_basic_scoring() {
+        let score = text_relevance(
+            &["review", "code"],
+            "reviews pull requests for code quality",
+            &["when you need a review".to_string()],
+        );
+        assert!(score > 0.0, "should have positive score: {score}");
+        let zero = text_relevance(&["xyz"], "unrelated text", &[]);
+        assert_eq!(zero, 0.0);
+    }
+
+    #[test]
+    fn text_relevance_multi_occurrence_boosts() {
+        let one = text_relevance(&["agent"], "agent", &[]);
+        let two = text_relevance(&["agent"], "agent agent", &[]);
+        assert!(two > one, "more occurrences should score higher: {one} vs {two}");
+    }
+
+    #[test]
+    fn search_penalizes_anti_pattern_dominance() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = setup_catalog(&dir);
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "penalized.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "penalized",
+                    "version": 1,
+                    "manifest": {
+                        "description": "Does things.",
+                        "when_to_use": ["use sometimes"],
+                        "anti_patterns": ["do not use for thing"],
+                        "brofile_inline": {"provider": "claude"},
+                    },
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let reg = AgentRegistry::new(&catalog);
+        let results = reg
+            .search("thing", 10, &SearchFilter::default(), false)
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results[0].score < 2.0,
+            "anti-pattern penalty should reduce score: {results:?}"
+        );
+        assert!(
+            !results[0].matched_anti_patterns.is_empty(),
+            "anti-pattern should be matched: {results:?}"
+        );
+    }
+
+    #[test]
+    fn search_cost_class_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = setup_catalog(&dir);
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "cheap.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "cheap-agent",
+                    "version": 1,
+                    "manifest": {
+                        "description": "A cheap search agent.",
+                        "when_to_use": ["when testing"],
+                        "cost_class": "cheap",
+                        "brofile_inline": {"provider": "claude"},
+                    },
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "expensive.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "expensive-agent",
+                    "version": 1,
+                    "manifest": {
+                        "description": "An expensive search agent.",
+                        "when_to_use": ["when testing"],
+                        "cost_class": "expensive",
+                        "brofile_inline": {"provider": "claude"},
+                    },
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let reg = AgentRegistry::new(&catalog);
+        let results = reg
+            .search(
+                "search agent",
+                10,
+                &SearchFilter {
+                    cost_class: Some(AgentCostClass::Cheap),
+                    provenance_kind: None,
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "cheap-agent");
     }
 }

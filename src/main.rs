@@ -1879,6 +1879,19 @@ struct AgentDescribeParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentSearchParams {
+    query: String,
+    #[serde(default)]
+    limit: Option<u64>,
+    #[serde(default)]
+    cost_class: Option<String>,
+    #[serde(default)]
+    provenance_kind: Option<String>,
+    #[serde(default)]
+    exclude_anti_pattern_matches: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct BrofileParams {
     /// Operation: create, list, get, delete, set_account, list_accounts,
     /// set_provider_default, get_provider_default, list_provider_defaults,
@@ -4769,6 +4782,77 @@ Constraints:\n\
             serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
         );
         Self::ok_json(&serde_json::Value::Object(result))
+    }
+
+    #[tool(
+        name = "bro_agent_search",
+        description = "Search installed agents by query. Matches description and when_to_use; penalizes anti-pattern overlap. Returns ranked results with score, provenance, and match explanation."
+    )]
+    fn bro_agent_search(&self, Parameters(p): Parameters<AgentSearchParams>) -> CallToolResult {
+        use orchestration::agents::registry::{AgentRegistry, SearchFilter};
+        use orchestration::agents::types::AgentCostClass;
+        let query = p.query.trim();
+        if query.is_empty() {
+            return Self::err_text("query is required");
+        }
+        let limit = p.limit.unwrap_or(5).min(50) as usize;
+        let cost_class = match p.cost_class.as_deref() {
+            Some("cheap") => Some(AgentCostClass::Cheap),
+            Some("normal") => Some(AgentCostClass::Normal),
+            Some("expensive") => Some(AgentCostClass::Expensive),
+            Some(other) => return Self::err_text(&format!("invalid cost_class: {other}")),
+            None => None,
+        };
+        let filter = SearchFilter {
+            cost_class,
+            provenance_kind: p.provenance_kind,
+        };
+        let exclude_ap = p.exclude_anti_pattern_matches.unwrap_or(true);
+        let catalog = self.state.artifacts.read();
+        let reg = AgentRegistry::new(&catalog);
+        let results = match reg.search(query, limit, &filter, exclude_ap) {
+            Ok(r) => r,
+            Err(e) => return Self::err_text(&format!("search failed: {e}")),
+        };
+        let json_results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name,
+                    "version": r.version,
+                    "score": (r.score * 1000.0).round() / 1000.0,
+                    "description": r.description,
+                    "when_to_use": r.when_to_use,
+                    "anti_patterns": r.anti_patterns,
+                    "cost_class": r.cost_class,
+                    "provenance_kind": r.provenance_kind,
+                    "matched_anti_patterns": r.matched_anti_patterns,
+                })
+            })
+            .collect();
+        let active_count = match reg.list(&orchestration::agents::registry::ListFilter::default())
+        {
+            Ok(list) => list.len(),
+            Err(_) => 0,
+        };
+        let coverage = if active_count > 0 {
+            results.len() as f64 / active_count as f64
+        } else {
+            0.0
+        };
+        Self::ok_json(&serde_json::json!({
+            "results": json_results,
+            "search_mode": "keyword",
+            "total_matched": json_results.len(),
+            "active_agents": active_count,
+            "degraded": {
+                "embedding_pending": true,
+                "vector_search_unavailable": true,
+            },
+            "vector_status": {
+                "coverage_ratio": (coverage * 100.0).round() / 100.0,
+            },
+        }))
     }
 
     #[tool(
@@ -11186,5 +11270,294 @@ mod tests {
             serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["name"], "broken");
         assert!(body["error"].as_str().unwrap().contains("manifest parse failed"));
+    }
+
+    #[test]
+    fn bro_agent_search_result_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "reviewer.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "code-reviewer",
+                "version": 1,
+                "manifest": {
+                    "description": "Reviews pull requests for code quality and security.",
+                    "when_to_use": ["when you need a PR reviewed"],
+                    "anti_patterns": ["reviewing your own code"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "review pull request security".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["search_mode"], "keyword");
+        assert!(body["results"].is_array());
+        assert!(body["total_matched"].as_u64().unwrap() > 0);
+        assert!(body["active_agents"].as_u64().unwrap() > 0);
+        assert!(body["degraded"]["embedding_pending"].as_bool().unwrap());
+        assert!(body["vector_status"]["coverage_ratio"].is_number());
+        let first = &body["results"][0];
+        assert_eq!(first["name"], "code-reviewer");
+        assert!(first["score"].as_f64().unwrap() > 0.0);
+        assert!(first["description"].is_string());
+        assert!(first["when_to_use"].is_array());
+        assert!(first["anti_patterns"].is_array());
+    }
+
+    #[test]
+    fn bro_agent_search_limit_caps_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        for i in 0..5 {
+            cat.install_value(
+                artifacts::ArtifactKind::Agent,
+                format!("agent{i}.json"),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": format!("search-agent-{i}"),
+                    "version": 1,
+                    "manifest": {
+                        "description": format!("Agent {i} for testing search functionality."),
+                        "when_to_use": ["when testing search"],
+                        "brofile_inline": {"provider": "claude"},
+                    },
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "testing search".into(),
+            limit: Some(2),
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        assert!(body["results"].as_array().unwrap().len() <= 2);
+    }
+
+    #[test]
+    fn bro_agent_search_empty_query_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "  ".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("query is required"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_search_default_excludes_anti_pattern_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "ap-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "deploy-bot",
+                "version": 1,
+                "manifest": {
+                    "description": "Deploys code to production.",
+                    "when_to_use": ["when deploying to production"],
+                    "anti_patterns": ["deploying untested code"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "deploy untested code".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        let results = body["results"].as_array().unwrap();
+        assert!(
+            results.is_empty(),
+            "anti-pattern match should be excluded by default: {results:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_search_include_anti_pattern_returns_matched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "ap-agent2.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "deploy-bot-2",
+                "version": 1,
+                "manifest": {
+                    "description": "Deploys code to production safely.",
+                    "when_to_use": ["when deploying to production"],
+                    "anti_patterns": ["deploying untested code"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "deploy untested code".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: Some(false),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        let results = body["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "should return result when exclude=false");
+        let matched_ap = results[0]["matched_anti_patterns"].as_array().unwrap();
+        assert!(
+            matched_ap.iter().any(|v| v.as_str().unwrap().contains("untested")),
+            "matched_anti_patterns should include the matching anti-pattern: {matched_ap:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_search_inactive_agents_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "active.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "active-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "An active search test agent.",
+                    "when_to_use": ["when testing"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "retired-v1.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "retired-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "A retired search test agent.",
+                    "when_to_use": ["when testing"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "replacement-v2.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "retired-agent",
+                "version": 2,
+                "manifest": {
+                    "description": "An active replacement search test agent.",
+                    "when_to_use": ["when testing"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            Some("retired-agent".to_string()),
+        )
+        .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "search test agent".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        let results = body["results"].as_array().unwrap();
+        let retired_entries: Vec<_> = results
+            .iter()
+            .filter(|r| r["name"].as_str() == Some("retired-agent"))
+            .collect();
+        assert_eq!(retired_entries.len(), 1, "only v2 of retired-agent should appear");
+        assert_eq!(retired_entries[0]["version"], "2");
+        assert!(
+            results.iter().any(|r| r["name"].as_str() == Some("active-agent")),
+            "active-agent should appear: {results:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_search_invalid_cost_class_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "test".into(),
+            limit: None,
+            cost_class: Some("invalid".into()),
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("invalid cost_class"), "got: {text}");
     }
 }
