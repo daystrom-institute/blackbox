@@ -11,6 +11,8 @@ use crate::mcp_tools::inspect::compact_label;
 use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache, PathDirection, PathStep};
 use crate::providers::ProviderContext;
 
+const RENDERED_TEXT_CAP_BYTES: usize = 30 * 1024;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindPathsParams {
     pub from: String,
@@ -174,6 +176,7 @@ fn render_response(ctx: &ProviderContext<'_>, paths: &[CachedPath]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let text = cap_rendered_text(text);
     serde_json::to_string_pretty(&json!({
         "status": "ok",
         "text": text,
@@ -184,6 +187,23 @@ fn render_response(ctx: &ProviderContext<'_>, paths: &[CachedPath]) -> String {
         })).collect::<Vec<_>>(),
     }))
     .expect("path response serializes")
+}
+
+fn cap_rendered_text(text: String) -> String {
+    if text.len() <= RENDERED_TEXT_CAP_BYTES {
+        return text;
+    }
+    let suffix = "\n[... paths text truncated at 30KB; use a lower limit or narrower edge_types]";
+    let target = RENDERED_TEXT_CAP_BYTES.saturating_sub(suffix.len());
+    let mut out = String::new();
+    for ch in text.chars() {
+        if out.len() + ch.len_utf8() > target {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str(suffix);
+    out
 }
 
 pub(crate) fn render_path(ctx: &ProviderContext<'_>, path: &CachedPath) -> String {

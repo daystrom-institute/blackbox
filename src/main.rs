@@ -295,6 +295,8 @@ struct BlackboxServer {
 }
 
 impl BlackboxServer {
+    const MCP_RESPONSE_CAP_BYTES: usize = 80 * 1024;
+
     fn new(state: Arc<SharedState>) -> Self {
         Self {
             state,
@@ -650,18 +652,35 @@ impl BlackboxServer {
     }
 
     fn ok_text(text: &str) -> CallToolResult {
-        CallToolResult::success(text.to_string().into_contents())
+        CallToolResult::success(Self::cap_response_text(text).into_contents())
     }
 
     fn ok_json(value: &Value) -> CallToolResult {
         let text = serde_json::to_string_pretty(value).unwrap_or_default();
-        CallToolResult::success(text.into_contents())
+        CallToolResult::success(Self::cap_response_text(&text).into_contents())
     }
 
     fn err_text(msg: &str) -> CallToolResult {
-        let mut r = CallToolResult::success(msg.to_string().into_contents());
+        let mut r = CallToolResult::success(Self::cap_response_text(msg).into_contents());
         r.is_error = Some(true);
         r
+    }
+
+    fn cap_response_text(text: &str) -> String {
+        if text.len() <= Self::MCP_RESPONSE_CAP_BYTES {
+            return text.to_string();
+        }
+        let suffix = "\n\n[... response truncated to 80KB by bbox response cap]";
+        let target = Self::MCP_RESPONSE_CAP_BYTES.saturating_sub(suffix.len());
+        let mut out = String::new();
+        for ch in text.chars() {
+            if out.len() + ch.len_utf8() > target {
+                break;
+            }
+            out.push(ch);
+        }
+        out.push_str(suffix);
+        out
     }
 
     /// Run a sync tool handler: time it, log at debug (ok) / warn (err),
@@ -1379,7 +1398,7 @@ impl BlackboxServer {
             let threads = self.state.threads.read();
             let notes = self.state.notes.read();
             let task_store = self.state.task_store.read();
-            inbox::compute_inbox(&kb, &threads, &notes, &task_store, &p)
+            inbox::compute_inbox(&kb, &threads, &notes, &task_store, &self.state.whiteboards, &p)
         })
     }
 
@@ -8883,6 +8902,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shipped_packet_audit_examples_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let packets = [
+            "examples/agentic-corpus/packets/workflow-policy/arc-budget.json",
+            "examples/agentic-corpus/packets/embed/compaction-policy.json",
+            "examples/agentic-corpus/packets/cron-routing/embed-compaction.json",
+            "examples/agentic-corpus/packets/bro-trust/per-brofile.json",
+            "examples/agentic-corpus/packets/auto-digest/task-completed-routing.json",
+            "examples/agentic-corpus/packets/auto-digest/entry-quality.json",
+            "examples/agentic-corpus/packets/contradiction/review-synthesis.json",
+            "examples/agentic-corpus/packets/auto-edge/vote-aggregate.json",
+            "examples/agentic-corpus/packets/eval/drift-policy.json",
+        ];
+        for rel in packets {
+            let path = root.join(rel);
+            let value: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            install_artifact_value(
+                &server.state,
+                ArtifactInstallParams {
+                    kind: artifacts::ArtifactKind::Packet,
+                    source: rel.into(),
+                    name: None,
+                    version: None,
+                    supersedes: None,
+                },
+                value,
+            )
+            .await
+            .unwrap();
+        }
+
+        let audits = [
+            "examples/agentic-corpus/packets/workflow-policy/arc-budget.audit_examples.json",
+            "examples/agentic-corpus/packets/embed/compaction-policy.audit_examples.json",
+            "examples/agentic-corpus/packets/cron-routing/embed-compaction.audit_examples.json",
+            "examples/agentic-corpus/packets/bro-trust/per-brofile.audit_examples.json",
+            "examples/agentic-corpus/packets/auto-digest/task-completed-routing.audit_examples.json",
+            "examples/agentic-corpus/packets/auto-digest/entry-quality.audit_examples.json",
+            "examples/agentic-corpus/packets/contradiction/review-synthesis.audit_examples.json",
+            "examples/agentic-corpus/packets/auto-edge/vote-aggregate.audit_examples.json",
+            "examples/agentic-corpus/packets/eval/drift-policy.audit_examples.json",
+        ];
+        let packet_store = server.state.packets.read();
+        for rel in audits {
+            let spec: Value =
+                serde_json::from_str(&std::fs::read_to_string(root.join(rel)).unwrap()).unwrap();
+            let rendered = packet_store
+                .audit_tool(&packets::AuditParams {
+                    packet_id: spec["packet_id"].as_str().unwrap().into(),
+                    dataset: spec["dataset"].clone(),
+                    mode: None,
+                })
+                .unwrap();
+            let report: Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(
+                report["fidelity"].as_f64().unwrap(),
+                1.0,
+                "audit examples failed for {rel}: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
@@ -9220,6 +9305,14 @@ mod tests {
         assert_eq!(checkpoint.dispute_count, 1);
         assert_eq!(checkpoint.notes.blocked_count, 1);
         assert_eq!(checkpoint.notes.dispute_count, 1);
+    }
+
+    #[test]
+    fn mcp_response_cap_limits_large_text() {
+        let huge = "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES + 1024);
+        let capped = BlackboxServer::cap_response_text(&huge);
+        assert!(capped.len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        assert!(capped.contains("response truncated"));
     }
 
     #[tokio::test]

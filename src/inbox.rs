@@ -7,6 +7,7 @@ use crate::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
 use crate::notes::{NoteKind, NoteResolution, Notes};
 use crate::orchestration::{TaskStatus, TaskStore};
 use crate::threads::{Thread, ThreadStatus, Threads};
+use crate::whiteboards::{Phase, WhiteboardRegistry};
 
 // ── MCP parameter struct ──────────────────────────────────────────
 
@@ -33,6 +34,7 @@ pub fn compute_inbox(
     threads: &Threads,
     notes: &Notes,
     task_store: &TaskStore,
+    whiteboards: &WhiteboardRegistry,
     p: &InboxParams,
 ) -> Result<String> {
     let limit = p.limit.unwrap_or(10).max(1) as usize;
@@ -74,6 +76,64 @@ pub fn compute_inbox(
         out.push_str(&format!("## Followups ({})\n", followups.len()));
         for n in &followups {
             out.push_str(&format!("  {} — {}\n", n.id, truncate(&n.body, 120)));
+        }
+        out.push('\n');
+    }
+
+    let auto_digest = unresolved_notes_matching(
+        notes,
+        "Auto-digest candidate held for review",
+        project_filter.as_deref(),
+        limit,
+    );
+    if !auto_digest.is_empty() {
+        out.push_str(&format!(
+            "## Auto-digest entries held for review ({})\n",
+            auto_digest.len()
+        ));
+        for n in &auto_digest {
+            out.push_str(&format!("  {} — {}\n", n.id, truncate(&n.body, 120)));
+        }
+        out.push('\n');
+    }
+
+    let tier0 = unresolved_notes_matching(
+        notes,
+        "Tier-0 contradiction detected",
+        project_filter.as_deref(),
+        limit,
+    );
+    if !tier0.is_empty() {
+        out.push_str(&format!("## Tier-0 contradictions ({})\n", tier0.len()));
+        for n in &tier0 {
+            out.push_str(&format!("  {} — {}\n", n.id, truncate(&n.body, 120)));
+        }
+        out.push('\n');
+    }
+
+    let eval_drift =
+        unresolved_notes_matching(notes, "eval drift", project_filter.as_deref(), limit);
+    if !eval_drift.is_empty() {
+        out.push_str(&format!("## Eval drift alerts ({})\n", eval_drift.len()));
+        for n in &eval_drift {
+            out.push_str(&format!("  {} — {}\n", n.id, truncate(&n.body, 120)));
+        }
+        out.push('\n');
+    }
+
+    let boards = contradiction_boards_waiting(whiteboards, project_filter.as_deref(), limit);
+    if !boards.is_empty() {
+        out.push_str(&format!(
+            "## Contradiction-review boards waiting on synthesis ({})\n",
+            boards.len()
+        ));
+        for (id, topic, phase) in &boards {
+            out.push_str(&format!(
+                "  {} [{}] — {}\n",
+                id,
+                phase,
+                truncate(topic, 120)
+            ));
         }
         out.push('\n');
     }
@@ -193,6 +253,74 @@ fn unresolved_notes_of(
     rows.into_iter().take(limit).map(|(_, r)| r).collect()
 }
 
+fn unresolved_notes_matching(
+    notes: &Notes,
+    needle: &str,
+    project_filter: Option<&str>,
+    limit: usize,
+) -> Vec<NoteRow> {
+    let needle = needle.to_lowercase();
+    let mut rows: Vec<(String, NoteRow)> = notes
+        .all()
+        .iter()
+        .filter(|n| n.resolution != NoteResolution::Addressed)
+        .filter(|n| n.body.to_lowercase().contains(&needle))
+        .filter(|n| match project_filter {
+            Some(pf) => n
+                .project
+                .as_deref()
+                .map(|p| p.to_lowercase().contains(pf))
+                .unwrap_or(false),
+            None => true,
+        })
+        .map(|n| {
+            (
+                n.created_at.clone(),
+                NoteRow {
+                    id: n.id.clone(),
+                    kind: n.kind.as_ref().to_string(),
+                    body: n.body.clone(),
+                },
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.into_iter().take(limit).map(|(_, r)| r).collect()
+}
+
+fn contradiction_boards_waiting(
+    whiteboards: &WhiteboardRegistry,
+    project_filter: Option<&str>,
+    limit: usize,
+) -> Vec<(String, String, String)> {
+    let mut rows = Vec::new();
+    for id in whiteboards.list_ids() {
+        let Some(board) = whiteboards.get(&id) else {
+            continue;
+        };
+        let board = board.read();
+        if board.phase != Phase::Resolve {
+            continue;
+        }
+        if !board.topic.to_lowercase().contains("contradiction review") {
+            continue;
+        }
+        if let Some(pf) = project_filter {
+            if !board.project.to_lowercase().contains(pf) {
+                continue;
+            }
+        }
+        rows.push((
+            board.id.clone(),
+            board.topic.clone(),
+            board.phase.as_str().to_string(),
+        ));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.truncate(limit);
+    rows
+}
+
 fn stale_threads<'a>(
     threads: &'a Threads,
     stale_days: u64,
@@ -284,6 +412,7 @@ mod tests {
     use crate::knowledge::LearnParams;
     use crate::notes::NoteParams;
     use crate::threads::ThreadParams;
+    use crate::whiteboards::Role;
     use tempfile::tempdir;
 
     #[test]
@@ -293,12 +422,14 @@ mod tests {
         let threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let task_store = TaskStore::new();
+        let whiteboards = WhiteboardRegistry::new();
 
         let out = compute_inbox(
             &kb,
             &threads,
             &notes,
             &task_store,
+            &whiteboards,
             &InboxParams {
                 project: None,
                 limit: None,
@@ -317,6 +448,7 @@ mod tests {
         let mut threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let task_store = TaskStore::new();
+        let whiteboards = WhiteboardRegistry::new();
 
         // Agent-inferred knowledge → should appear in "Unverified"
         kb.learn(
@@ -384,12 +516,70 @@ mod tests {
                 bro: None,
             })
             .unwrap();
+        notes
+            .create(&NoteParams {
+                kind: "followup".into(),
+                body: "Auto-digest candidate held for review: durable note".into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        notes
+            .create(&NoteParams {
+                kind: "surprise".into(),
+                body: "Tier-0 contradiction detected between knowledge:a and knowledge:b".into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        notes
+            .create(&NoteParams {
+                kind: "followup".into(),
+                body: "eval drift alert: drift_minor on nightly suite".into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        whiteboards
+            .open(
+                "board-1",
+                "Contradiction review: knowledge:a vs knowledge:b",
+                "/repo/x",
+                None,
+                "operator",
+            )
+            .unwrap();
+        whiteboards
+            .register("board-1", "operator", Role::Operator, "operator")
+            .unwrap();
+        whiteboards
+            .transition("board-1", "operator", Phase::Read, None)
+            .unwrap();
+        whiteboards
+            .transition("board-1", "operator", Phase::Debate, None)
+            .unwrap();
+        whiteboards
+            .transition("board-1", "operator", Phase::Resolve, None)
+            .unwrap();
 
         let out = compute_inbox(
             &kb,
             &threads,
             &notes,
             &task_store,
+            &whiteboards,
             &InboxParams {
                 project: None,
                 limit: None,
@@ -403,6 +593,10 @@ mod tests {
         assert!(out.contains("brief assumes invariant X"));
         assert!(out.contains("## Followups"));
         assert!(out.contains("add tests for the cycle detector"));
+        assert!(out.contains("## Auto-digest entries held for review"));
+        assert!(out.contains("## Tier-0 contradictions"));
+        assert!(out.contains("## Eval drift alerts"));
+        assert!(out.contains("## Contradiction-review boards waiting on synthesis"));
         assert!(out.contains("## Stale threads"));
         assert!(out.contains("reviewing ingestion"));
         assert!(out.contains("## Unverified knowledge"));

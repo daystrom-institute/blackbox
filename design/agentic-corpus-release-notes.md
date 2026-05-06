@@ -170,6 +170,24 @@ shape: three read-only classifier brofiles vote independently, the
 `write_edge | hold_for_review | reject`, and `write_semantic_edge` writes the
 reviewed edge.
 
+## H5
+
+MCP tool responses now have a final 80KB text cap, with tighter per-tool caps
+on the high-fanout agentic surfaces: inspect next-hop and coverage summaries,
+path rendering, and evidence-bundle entity/path/edge counts. The cap is a last
+resort; tools should still prefer targeted filters (`edge_types`,
+`per_type_limit`, `limit`) for useful smaller responses.
+
+`bbox_inbox` now has explicit sections for auto-digest entries held for review,
+tier-0 contradiction fallbacks, eval drift alerts, and contradiction-review
+whiteboards in the resolve phase awaiting synthesis. Failed bro tasks remain
+part of the inbox when task surfacing is enabled.
+
+`bbox_embed_status` includes each route's provider, model, and dimension so
+operators can audit data-export routes without opening the embedding config.
+See `design/agentic-corpus-data-export-policy.md` for the default Voyage
+routing policy and local-only Ollama override examples.
+
 For v1, the scheduled candidate scan is observable-only and capped at 50; seed
 `vars.candidate` manually when running the arc for a specific candidate pair.
 `REFERENCES` edges append to `KnowledgeEntry.links`; `DESCRIBES` edges are

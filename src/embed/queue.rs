@@ -30,6 +30,9 @@ pub struct EmbedRequest {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct RouteStatus {
     pub available: bool,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub dim: Option<usize>,
     pub indexed_count: u64,
     pub queue_depth: u64,
     pub retried_count: u64,
@@ -41,6 +44,9 @@ impl Default for RouteStatus {
     fn default() -> Self {
         Self {
             available: true,
+            provider: None,
+            model: None,
+            dim: None,
             indexed_count: 0,
             queue_depth: 0,
             retried_count: 0,
@@ -282,12 +288,18 @@ impl EmbedQueueHandle {
         };
         let provider: Arc<dyn EmbeddingProvider> = provider.into();
         let rate_limit_per_min = router.rate_limit_per_min(provider.id());
+        let status = RouteStatus {
+            provider: Some(provider.id().to_string()),
+            model: Some(provider.model_name().to_string()),
+            dim: Some(provider.dimensions()),
+            ..RouteStatus::default()
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner
             .statuses
             .write()
             .entry(route.to_string())
-            .or_default();
+            .or_insert(status);
         let spec = WorkerSpec {
             route: route.to_string(),
             vector_route: resolved.vector_route.clone(),
@@ -356,10 +368,13 @@ impl EmbedQueueHandle {
         let statuses = Arc::new(RwLock::new(BTreeMap::new()));
         let mut senders = BTreeMap::new();
         for (route, provider, rate_limit_per_min, vector_route) in providers {
-            statuses
-                .write()
-                .entry(route.clone())
-                .or_insert_with(RouteStatus::default);
+            let status = RouteStatus {
+                provider: Some(provider.id().to_string()),
+                model: Some(provider.model_name().to_string()),
+                dim: Some(provider.dimensions()),
+                ..RouteStatus::default()
+            };
+            statuses.write().entry(route.clone()).or_insert(status);
             let (tx, rx) = mpsc::unbounded_channel();
             let spec = WorkerSpec {
                 route: route.clone(),

@@ -12,6 +12,10 @@ use crate::mcp_tools::find_paths::{render_node, render_path};
 use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache};
 use crate::providers::ProviderContext;
 
+const ENTITY_CAP: usize = 50;
+const PATH_CAP: usize = 20;
+const INTRA_BUNDLE_EDGE_CAP: usize = 200;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BundleEvidenceParams {
     pub question: String,
@@ -37,7 +41,8 @@ pub fn bundle_evidence(
     if p.entity_refs.is_empty() {
         return Ok(not_found_bundle(Vec::new()));
     }
-    for raw in &p.entity_refs {
+    let omitted_entity_refs = p.entity_refs.len().saturating_sub(ENTITY_CAP);
+    for raw in p.entity_refs.iter().take(ENTITY_CAP) {
         let r = match EntityRef::parse(raw) {
             Ok(r) => r,
             Err(err) => {
@@ -66,7 +71,8 @@ pub fn bundle_evidence(
 
     let mut paths = Vec::new();
     let mut stale_path_ids = Vec::new();
-    for path_id in &p.path_ids {
+    let omitted_path_ids = p.path_ids.len().saturating_sub(PATH_CAP);
+    for path_id in p.path_ids.iter().take(PATH_CAP) {
         match cache.get(PROCESS_SESSION_KEY, path_id) {
             Some(path) => paths.push(path),
             None => stale_path_ids.push(path_id.clone()),
@@ -74,7 +80,9 @@ pub fn bundle_evidence(
     }
 
     let refs = entities.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>();
-    let intra_bundle_edges = intra_bundle_edges(edge_index, &refs);
+    let mut intra_bundle_edges = intra_bundle_edges(edge_index, &refs);
+    let intra_bundle_edges_truncated = intra_bundle_edges.len() > INTRA_BUNDLE_EDGE_CAP;
+    intra_bundle_edges.truncate(INTRA_BUNDLE_EDGE_CAP);
     let text = render_text(
         ctx,
         &p.question,
@@ -101,6 +109,9 @@ pub fn bundle_evidence(
         "degraded": {
             "stale_path_ids": stale_path_ids,
             "unresolved_entity_refs": unresolved_entity_refs,
+            "omitted_entity_refs": omitted_entity_refs,
+            "omitted_path_ids": omitted_path_ids,
+            "intra_bundle_edges_truncated": intra_bundle_edges_truncated,
         }
     }))?)
 }

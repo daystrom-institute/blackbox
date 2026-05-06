@@ -1,0 +1,16 @@
+{
+  "packet_id": "domain:bro-trust/per-brofile",
+  "mode": "first",
+  "dataset": [
+    {
+      "entity": {
+        "vars": {
+          "candidate": {
+            "brofile": "digest-extractor"
+          }
+        }
+      },
+      "expected": "trusted"
+    }
+  ]
+}

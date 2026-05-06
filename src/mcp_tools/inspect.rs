@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::edge_index::{Edge, EdgeIndex};
-use crate::entity_ref::EntityRef;
 use crate::entity_loader;
+use crate::entity_ref::EntityRef;
 use crate::providers::{self, EntityView, Neighborhood, NextHop, ProviderContext};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -149,6 +149,7 @@ pub fn inspect_entity(
     let coverage = provider
         .expected_edge_families(r)
         .into_iter()
+        .take(10)
         .map(|expectation| {
             let count = full_neighborhood
                 .forward
@@ -159,7 +160,12 @@ pub fn inspect_entity(
             RenderedCoverage {
                 family: expectation.family_name,
                 count,
-                expected: if expectation.required { "required" } else { "optional" }.into(),
+                expected: if expectation.required {
+                    "required"
+                } else {
+                    "optional"
+                }
+                .into(),
                 status: if count > 0 { "present" } else { "0 (expected)" }.into(),
             }
         })
@@ -278,6 +284,7 @@ pub(crate) fn compact_label(
 
 fn render_next_hops(hops: Vec<NextHop>) -> Vec<RenderedNextHop> {
     hops.into_iter()
+        .take(5)
         .map(|hop| RenderedNextHop {
             edge_family: hop.edge_family_name,
             count: hop.count,
@@ -330,8 +337,8 @@ fn render_text(input: InspectText<'_>) -> String {
         recommended,
         coverage,
     } = input;
-    let header =
-        compact_label(ctx, r, Some(&entity.properties)).unwrap_or_else(|| entity.ref_string.clone());
+    let header = compact_label(ctx, r, Some(&entity.properties))
+        .unwrap_or_else(|| entity.ref_string.clone());
     let mut text = format!("## {header}\n\n");
     text.push_str(&format!(
         "`{}` ({})\n\n",

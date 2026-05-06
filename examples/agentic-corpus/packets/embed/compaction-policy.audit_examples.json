@@ -1,0 +1,16 @@
+{
+  "packet_id": "domain:embed/compaction-policy",
+  "mode": "first",
+  "dataset": [
+    {
+      "entity": {
+        "vars": {
+          "vector_status": {
+            "max_deleted_ratio": 0.4
+          }
+        }
+      },
+      "expected": "compact"
+    }
+  ]
+}

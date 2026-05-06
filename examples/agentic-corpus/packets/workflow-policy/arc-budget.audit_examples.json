@@ -1,0 +1,12 @@
+{
+  "packet_id": "domain:workflow-policy/arc-budget",
+  "mode": "first",
+  "dataset": [
+    {
+      "entity": {
+        "step": 60
+      },
+      "expected": "warn"
+    }
+  ]
+}
