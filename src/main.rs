@@ -7728,10 +7728,17 @@ async fn main() -> anyhow::Result<()> {
         .with_stateful_mode(true);
 
     let shared_for_mcp = shared.clone();
+    let session_keep_alive = std::env::var("BBOX_MCP_SESSION_KEEPALIVE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(6 * 60 * 60);
+    let mut session_manager = LocalSessionManager::default();
+    session_manager.session_config.keep_alive =
+        Some(std::time::Duration::from_secs(session_keep_alive));
     let mcp_service: StreamableHttpService<BlackboxServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(BlackboxServer::new(shared_for_mcp.clone())),
-            Default::default(),
+            session_manager.into(),
             config,
         );
 
