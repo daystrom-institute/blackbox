@@ -163,7 +163,11 @@ pub fn migrate_legacy_defaults(home: &Path) -> anyhow::Result<Vec<String>> {
         let old = home.join(".claude-shared").join("BLACKBOX.md");
         let new = blackbox_global_common_md_path(home);
         if migrate_legacy_path(&old, &new)? {
-            moved.push(format!("blackbox-md: {} -> {}", old.display(), new.display()));
+            moved.push(format!(
+                "blackbox-md: {} -> {}",
+                old.display(),
+                new.display()
+            ));
         }
     }
 

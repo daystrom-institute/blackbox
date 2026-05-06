@@ -162,11 +162,10 @@ struct SharedState {
     /// are prevented via `resume_leases`.
     councils: council::SharedRegistry,
     /// Daemon-wide resume lease registry keyed `(provider, session_id)`.
-    /// Currently used only by the council drain worker — other resume
-    /// paths (`bro_broadcast`, ad-hoc `bro_resume`, advisor) remain a
-    /// single-resume-at-a-time assumption that this lease can later
-    /// mechanize. Acquire returns an owned guard held across spawn +
-    /// wait; drop on completion.
+    /// All resume paths must acquire this before spawning a provider
+    /// resume process and hold it until the task reaches a terminal
+    /// state. Concurrent resumes on the same provider session race
+    /// transcript writes and can fork/corrupt the session.
     resume_leases: Arc<orchestration::resume_lease::ResumeLeaseRegistry>,
 }
 
@@ -377,6 +376,19 @@ impl BlackboxServer {
             None if matches!(provider, Provider::Claude) => uuid::Uuid::new_v4().to_string(),
             None => "pending".to_string(),
         };
+        let resume_lease = if is_resume {
+            match try_acquire_resume_lease(
+                &self.state.task_store,
+                self.state.resume_leases.as_ref(),
+                provider,
+                &session_id,
+            ) {
+                Ok(lease) => Some(lease),
+                Err(err) => return Err(err),
+            }
+        } else {
+            None
+        };
 
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
@@ -430,6 +442,9 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        if let Some(lease) = resume_lease {
+            release_resume_lease_when_done(task.clone(), lease);
+        }
         self.record_task_to_bro(brofile, &task);
         Ok(task)
     }
@@ -962,12 +977,7 @@ impl BlackboxServer {
         Self::run("bbox_blame", || {
             let provider_ctx = ProviderContext::new(&self.state);
             let projects = self.state.projects.read().list();
-            mcp_tools::blame::blame(
-                &p,
-                &provider_ctx,
-                &self.state.edge_index.read(),
-                &projects,
-            )
+            mcp_tools::blame::blame(&p, &provider_ctx, &self.state.edge_index.read(), &projects)
         })
     }
 
@@ -981,11 +991,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_provenance_export", || {
             let projects = self.state.projects.read().list();
-            mcp_tools::provenance::export_provenance(
-                &p,
-                &self.state.edge_index.read(),
-                &projects,
-            )
+            mcp_tools::provenance::export_provenance(&p, &self.state.edge_index.read(), &projects)
         })
     }
 
@@ -1269,10 +1275,7 @@ impl BlackboxServer {
         })
     }
 
-    #[tool(
-        name = "bbox_knowledge_link",
-        description = "Append a knowledge edge."
-    )]
+    #[tool(name = "bbox_knowledge_link", description = "Append a knowledge edge.")]
     fn bbox_knowledge_link(
         &self,
         Parameters(p): Parameters<KnowledgeLinkParams>,
@@ -1343,7 +1346,13 @@ impl BlackboxServer {
         description = "Open / continue / resolve / promote / rename / link a work thread."
     )]
     fn bbox_thread(&self, Parameters(p): Parameters<ThreadParams>) -> CallToolResult {
-        Self::run("bbox_thread", || self.state.threads.write().thread(&p))
+        Self::run("bbox_thread", || {
+            let result = { self.state.threads.write().thread(&p) }?;
+            if p.action != "get" {
+                self.rebuild_edge_index_from_stores();
+            }
+            Ok(result)
+        })
     }
 
     #[tool(
@@ -1398,7 +1407,14 @@ impl BlackboxServer {
             let threads = self.state.threads.read();
             let notes = self.state.notes.read();
             let task_store = self.state.task_store.read();
-            inbox::compute_inbox(&kb, &threads, &notes, &task_store, &self.state.whiteboards, &p)
+            inbox::compute_inbox(
+                &kb,
+                &threads,
+                &notes,
+                &task_store,
+                &self.state.whiteboards,
+                &p,
+            )
         })
     }
 
@@ -2005,6 +2021,46 @@ pub(crate) fn cleanup_policy_file_when_done(
     });
 }
 
+fn try_acquire_resume_lease(
+    task_store: &RwLock<TaskStore>,
+    leases: &orchestration::resume_lease::ResumeLeaseRegistry,
+    provider: Provider,
+    session_id: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    if let Some(lease) = leases.try_acquire(provider, session_id) {
+        return Ok(lease);
+    }
+    let running_task = running_task_for_session(task_store, provider, session_id)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    Err(format!(
+        "session {session_id} for provider {provider} already has an in-flight resume task ({running_task}). Wait for it with bro_wait(task_id=\"{running_task}\", timeout_seconds=120) or cancel it with bro_cancel(task_id=\"{running_task}\") before calling bro_resume again."
+    ))
+}
+
+fn running_task_for_session(
+    task_store: &RwLock<TaskStore>,
+    provider: Provider,
+    session_id: &str,
+) -> Option<String> {
+    task_store.read().all_tasks().into_iter().find_map(|task| {
+        let inner = task.inner.lock();
+        (inner.provider == provider
+            && inner.session_id == session_id
+            && inner.status == orch::TaskStatus::Running)
+            .then(|| inner.id.clone())
+    })
+}
+
+fn release_resume_lease_when_done(
+    task: std::sync::Arc<orch::Task>,
+    lease: tokio::sync::OwnedMutexGuard<()>,
+) {
+    tokio::spawn(async move {
+        orch::wait_for_task(&task).await;
+        drop(lease);
+    });
+}
+
 fn spawn_progress_notifier(
     tasks: Vec<Arc<orch::Task>>,
     peer: rmcp::service::Peer<rmcp::RoleServer>,
@@ -2150,7 +2206,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_resume",
-        description = "Continue an existing session with a follow-up."
+        description = "Continue an existing session with a follow-up. Single-flight per provider session."
     )]
     async fn bro_resume(&self, Parameters(p): Parameters<ResumeParams>) -> CallToolResult {
         let store_dir = self.state.store_dir.clone();
@@ -2189,6 +2245,15 @@ impl BlackboxServer {
 
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let task_id = uuid::Uuid::new_v4().to_string();
+        let resume_lease = match try_acquire_resume_lease(
+            &self.state.task_store,
+            self.state.resume_leases.as_ref(),
+            provider,
+            &session_id,
+        ) {
+            Ok(lease) => lease,
+            Err(err) => return Self::err_text(&err),
+        };
 
         // Re-apply ambient on resume: each resume is its own dispatch with a
         // fresh task_id, and the per-turn recall directive + completion
@@ -2248,6 +2313,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        release_resume_lease_when_done(task.clone(), resume_lease);
 
         if let Some(bro_name) = &p.bro {
             self.record_task_to_bro(bro_name, &task);
@@ -2572,6 +2638,21 @@ impl BlackboxServer {
                         None => cwd.clone(),
                     };
                     let task_id = uuid::Uuid::new_v4().to_string();
+                    let resume_lease = match try_acquire_resume_lease(
+                        &self.state.task_store,
+                        self.state.resume_leases.as_ref(),
+                        brofile.provider,
+                        sid,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(err) => {
+                            launched.push(json!({
+                                "bro": member.name,
+                                "error": err,
+                            }));
+                            continue;
+                        }
+                    };
                     let mut args =
                         brofile
                             .provider
@@ -2596,6 +2677,7 @@ impl BlackboxServer {
                         self.state.tail_tx.clone(),
                     );
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
+                    release_resume_lease_when_done(t.clone(), resume_lease);
                     t
                 } else {
                     launched.push(json!({
@@ -4881,6 +4963,12 @@ Next step: <one concrete steering suggestion>\n",
                 ));
             }
             Some(session_id) => {
+                let resume_lease = try_acquire_resume_lease(
+                    &self.state.task_store,
+                    self.state.resume_leases.as_ref(),
+                    provider,
+                    session_id,
+                )?;
                 let ambient_ctx = orch::AmbientContext {
                     task_id: Some(task_id.clone()),
                     session_id: Some(session_id.to_string()),
@@ -4922,6 +5010,7 @@ Next step: <one concrete steering suggestion>\n",
                     self.state.tail_tx.clone(),
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+                release_resume_lease_when_done(task.clone(), resume_lease);
                 task
             }
             None => {
@@ -8903,12 +8992,10 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(orchestration::brofile::resolve_brofile(
-                name,
-                &server.state.store_dir,
-                None
-            )
-            .is_some());
+            assert!(
+                orchestration::brofile::resolve_brofile(name, &server.state.store_dir, None)
+                    .is_some()
+            );
         }
         install_artifact_value(
             &server.state,
@@ -8936,10 +9023,8 @@ mod tests {
         for cases in [
             serde_json::from_str::<Value>(include_str!("../eval/audit/auto-edge/describes.json"))
                 .unwrap(),
-            serde_json::from_str::<Value>(include_str!(
-                "../eval/audit/auto-edge/references.json"
-            ))
-            .unwrap(),
+            serde_json::from_str::<Value>(include_str!("../eval/audit/auto-edge/references.json"))
+                .unwrap(),
         ] {
             let rows = cases.as_array().unwrap();
             let mut matched = 0usize;
@@ -9076,7 +9161,8 @@ mod tests {
         let server = test_server(&tmp);
         embed_queue::install_contradiction_threshold(0.85);
         embed_queue::install_contradiction_state(server.state.clone());
-        let vector_store = Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+        let vector_store =
+            Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
         let _guard = vectors::install_test_global(vector_store.clone());
         let now = "2026-01-01T00:00:00Z".to_string();
         for (id, content) in [
@@ -9117,10 +9203,20 @@ mod tests {
                 .unwrap();
         }
         vector_store
-            .upsert("knowledge-test", "knowledge:ccccdddd", "h-old", vec![1.0, 0.0])
+            .upsert(
+                "knowledge-test",
+                "knowledge:ccccdddd",
+                "h-old",
+                vec![1.0, 0.0],
+            )
             .unwrap();
         vector_store
-            .upsert("knowledge-test", "knowledge:aaaabbbb", "h-new", vec![0.99, 0.01])
+            .upsert(
+                "knowledge-test",
+                "knowledge:aaaabbbb",
+                "h-new",
+                vec![0.99, 0.01],
+            )
             .unwrap();
         let request = embed::queue::EmbedRequest {
             bucket: embed::Bucket::Knowledge,

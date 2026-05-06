@@ -91,10 +91,7 @@ impl PathCache {
         let session = self.sessions.get_mut(session_key)?;
         session.access_clock += 1;
         let accessed_at = session.access_clock;
-        let path = session
-            .entries
-            .iter_mut()
-            .find(|path| path.id == path_id)?;
+        let path = session.entries.iter_mut().find(|path| path.id == path_id)?;
         path.accessed_at = accessed_at;
         Some(path.clone())
     }

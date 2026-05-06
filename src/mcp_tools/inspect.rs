@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;

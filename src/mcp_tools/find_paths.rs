@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::edge_index::EdgeIndex;
 use crate::entity_ref::{EntityRef, EntityType};
 use crate::mcp_tools::inspect::compact_label;
-use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache, PathDirection, PathStep};
+use crate::path_cache::{CachedPath, PathCache, PathDirection, PathStep, PROCESS_SESSION_KEY};
 use crate::providers::ProviderContext;
 
 const RENDERED_TEXT_CAP_BYTES: usize = 30 * 1024;

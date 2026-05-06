@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::chunker::EdgeConfidence;
 use crate::entity_ref::EntityRef;
 
-use crate::query::{QueryAtom, QueryNode, parse_query};
+use crate::query::{parse_query, QueryAtom, QueryNode};
 
 // ── MCP parameter structs ─────────────────────────────────────────
 //
@@ -2566,12 +2566,11 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             report.contains("Global absorb is no-op"),
             "report: {report}"
         );
-        assert!(
-            kb.store
-                .entries
-                .iter()
-                .all(|e| e.approval != Approval::Imported)
-        );
+        assert!(kb
+            .store
+            .entries
+            .iter()
+            .all(|e| e.approval != Approval::Imported));
     }
 
     #[test]

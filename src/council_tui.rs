@@ -262,7 +262,12 @@ pub async fn run(council_id: String, url: Option<String>) -> anyhow::Result<()> 
     let base_url = base_url.trim_end_matches('/').to_string();
 
     let initial = fetch_initial(&base_url, &council_id).await?;
-    let mut app = App::new(council_id.clone(), base_url.clone(), initial.summary, &initial.charter);
+    let mut app = App::new(
+        council_id.clone(),
+        base_url.clone(),
+        initial.summary,
+        &initial.charter,
+    );
     app.posts = initial.posts;
     app.refresh_members_from_envelopes(&initial.envelopes);
 
@@ -467,9 +472,7 @@ fn handle_key(app: &mut App, key: KeyEvent, tx: &mpsc::Sender<Signal>, post_url:
         KeyCode::Home => app.scroll_from_bottom = usize::MAX / 2,
         KeyCode::End => app.scroll_from_bottom = 0,
         KeyCode::Up if ctrl => app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(1),
-        KeyCode::Down if ctrl => {
-            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(1)
-        }
+        KeyCode::Down if ctrl => app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(1),
 
         // Submit
         KeyCode::Enter if !ctrl => {
@@ -563,7 +566,9 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
         Span::styled(
             app.council_id.clone(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  team="),
         Span::styled(app.team_id.clone(), Style::default().fg(Color::White)),
@@ -697,10 +702,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     buf.push_str(&app.input);
     buf.push('▏'); // cursor marker
 
-    f.render_widget(
-        Paragraph::new(buf).wrap(Wrap { trim: false }),
-        inner,
-    );
+    f.render_widget(Paragraph::new(buf).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
@@ -744,11 +746,7 @@ fn render_post(p: &CouncilPost) -> Vec<Line<'static>> {
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     ))];
     let md = tui_markdown::from_str(&p.body);
-    let owned: Vec<Line<'static>> = md
-        .lines
-        .into_iter()
-        .map(super::line_into_owned)
-        .collect();
+    let owned: Vec<Line<'static>> = md.lines.into_iter().map(super::line_into_owned).collect();
     lines.extend(super::stitch_ordered_list_markers(owned));
     lines
 }

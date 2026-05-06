@@ -2,11 +2,11 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use tree_sitter::Node;
-use tree_sitter_language_pack::{ProcessConfig, ProcessResult, StructureItem, get_parser, process};
+use tree_sitter_language_pack::{get_parser, process, ProcessConfig, ProcessResult, StructureItem};
 
-use super::{Chunk, Edge, SourceFormatChunker, placeholder_chunk};
+use super::{placeholder_chunk, Chunk, Edge, SourceFormatChunker};
 
 pub struct CodeChunker;
 
@@ -460,11 +460,9 @@ impl Display for EntityRef {
         let (chunks, _edges) = CodeChunker
             .chunk(Path::new("src/entity_ref.rs"), source)
             .unwrap();
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.content.contains("impl Display for EntityRef"))
-        );
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.content.contains("impl Display for EntityRef")));
         assert!(chunks.iter().any(|chunk| chunk.symbol.is_some()));
     }
 

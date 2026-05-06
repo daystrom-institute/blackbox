@@ -48,7 +48,7 @@ to step 3.
 
 **7 edge families**:
 
-- **Structural** (`IN_FILE`, `IN_SESSION`, `THREAD_HAS_SESSION`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`) — containment + sequence
+- **Structural** (`IN_FILE`, `IN_SESSION`, `THREAD_HAS_SESSION`, `THREAD_SPAWNED_FROM`, `THREAD_BLOCKED_BY`, `THREAD_RELATES_TO`, `THREAD_SUBSUMES`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`) — containment, thread relations, and sequence
 - **AST** (`DEFINED_IN`, `CONTAINS_SYMBOL`, `HAS_FIELD`, `IMPLEMENTS_TRAIT`, `CALLS`, `USES_TYPE`) — code navigation
 - **Knowledge** (`SUPERSEDES`, `DERIVED_FROM`, `Contradicts`, `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD`) — rule lifecycle
 - **Provenance** (`SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE`) — origin trails

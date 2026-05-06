@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::json;
@@ -94,7 +94,11 @@ fn resolve_target(
     ctx: &ProviderContext<'_>,
     projects: &[ProjectRecord],
 ) -> Result<BlameTarget> {
-    if let Some(entity_ref) = p.entity_ref.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(entity_ref) = p
+        .entity_ref
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         let r = EntityRef::parse(entity_ref)?;
         if !matches!(r, EntityRef::ProjectFile { .. }) {
             bail!("entity_ref must be a project_file ref");
@@ -455,7 +459,10 @@ mod tests {
 
         assert_eq!(reads.len(), 1);
         assert_eq!(
-            reads[0].metadata.get("anchor.file_path").map(String::as_str),
+            reads[0]
+                .metadata
+                .get("anchor.file_path")
+                .map(String::as_str),
             Some("src/auth.rs")
         );
         assert_eq!(read_before.kind, "READ_FILE");
@@ -466,17 +473,17 @@ mod tests {
         let edit = edit_edge_at_event("src/main.rs", 100, 100);
         let stale_read = read_edge_at_event("src/stale.rs", 80, 79);
         let recent_read = read_edge_at_event("src/recent.rs", 90, 90);
-        let index = EdgeIndex::from_edges_for_tests(vec![
-            edit.clone(),
-            stale_read,
-            recent_read.clone(),
-        ]);
+        let index =
+            EdgeIndex::from_edges_for_tests(vec![edit.clone(), stale_read, recent_read.clone()]);
 
         let reads = prior_read_edges(&index, &edit);
 
         assert_eq!(reads.len(), 1);
         assert_eq!(
-            reads[0].metadata.get("anchor.file_path").map(String::as_str),
+            reads[0]
+                .metadata
+                .get("anchor.file_path")
+                .map(String::as_str),
             Some("src/recent.rs")
         );
     }
@@ -530,7 +537,10 @@ mod tests {
             target: EntityRef::ProjectFile {
                 project_id: "proj1234".into(),
                 rel_path_hash: "pathhash".into(),
-                chunk_hash: path.bytes().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                chunk_hash: path
+                    .bytes()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
                 occurrence_idx: 0,
             },
             provenance: EdgeProvenance::Explicit,

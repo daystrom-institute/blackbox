@@ -105,7 +105,10 @@ pub fn load_identities(path: &str) -> Result<SlackIdentities> {
             serde_json::from_str(&text).with_context(|| format!("parsing {}", resolved.display()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!("identities file not found at {}; all users anonymous", resolved.display());
+            tracing::info!(
+                "identities file not found at {}; all users anonymous",
+                resolved.display()
+            );
             Ok(SlackIdentities::default())
         }
         Err(e) => Err(e).with_context(|| format!("reading {}", resolved.display())),
@@ -312,13 +315,34 @@ pub fn normalize_envelope(
     match sm_type {
         "events_api" => {
             let ev = payload.get("event");
-            event.event_type = ev.and_then(|e| e.get("type")).and_then(Value::as_str).map(String::from);
-            event.user = ev.and_then(|e| e.get("user")).and_then(Value::as_str).map(String::from);
-            event.channel = ev.and_then(|e| e.get("channel")).and_then(Value::as_str).map(String::from);
-            event.channel_type = ev.and_then(|e| e.get("channel_type")).and_then(Value::as_str).map(String::from);
-            event.text = ev.and_then(|e| e.get("text")).and_then(Value::as_str).map(String::from);
-            event.ts = ev.and_then(|e| e.get("ts")).and_then(Value::as_str).map(String::from);
-            event.thread_ts = ev.and_then(|e| e.get("thread_ts")).and_then(Value::as_str).map(String::from);
+            event.event_type = ev
+                .and_then(|e| e.get("type"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.user = ev
+                .and_then(|e| e.get("user"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.channel = ev
+                .and_then(|e| e.get("channel"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.channel_type = ev
+                .and_then(|e| e.get("channel_type"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.text = ev
+                .and_then(|e| e.get("text"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.ts = ev
+                .and_then(|e| e.get("ts"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.thread_ts = ev
+                .and_then(|e| e.get("thread_ts"))
+                .and_then(Value::as_str)
+                .map(String::from);
             // For app_mention and message events, fall back thread_ts to ts
             // so root mentions always have a thread_ts for reply threading.
             if event.thread_ts.is_none() && event.ts.is_some() {
@@ -327,9 +351,18 @@ pub fn normalize_envelope(
                     event.thread_ts = event.ts.clone();
                 }
             }
-            event.subtype = ev.and_then(|e| e.get("subtype")).and_then(Value::as_str).map(String::from);
-            event.bot_id = ev.and_then(|e| e.get("bot_id")).and_then(Value::as_str).map(String::from);
-            event.reaction = ev.and_then(|e| e.get("reaction")).and_then(Value::as_str).map(String::from);
+            event.subtype = ev
+                .and_then(|e| e.get("subtype"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.bot_id = ev
+                .and_then(|e| e.get("bot_id"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.reaction = ev
+                .and_then(|e| e.get("reaction"))
+                .and_then(Value::as_str)
+                .map(String::from);
             event.item_ts = ev
                 .and_then(|e| e.get("item"))
                 .and_then(|i| i.get("ts"))
@@ -349,22 +382,48 @@ pub fn normalize_envelope(
                 .map(String::from);
 
             // Self-loop filter
-            if is_self_loop(event.user.as_deref(), event.bot_id.as_deref(), self_user_id, self_bot_id) {
+            if is_self_loop(
+                event.user.as_deref(),
+                event.bot_id.as_deref(),
+                self_user_id,
+                self_bot_id,
+            ) {
                 return Ok(None);
             }
         }
         "slash_commands" => {
-            event.command = payload.get("command").and_then(Value::as_str).map(String::from);
-            event.command_text = payload.get("text").and_then(Value::as_str).map(String::from);
+            event.command = payload
+                .get("command")
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.command_text = payload
+                .get("text")
+                .and_then(Value::as_str)
+                .map(String::from);
             // Normalize: set `text` from `command_text` so workflows
             // get a consistent `${vars.text}` regardless of event source.
             event.text = event.command_text.clone();
-            event.user = payload.get("user_id").and_then(Value::as_str).map(String::from);
-            event.channel = payload.get("channel_id").and_then(Value::as_str).map(String::from);
+            event.user = payload
+                .get("user_id")
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.channel = payload
+                .get("channel_id")
+                .and_then(Value::as_str)
+                .map(String::from);
             event.channel_type = event.channel.as_deref().map(channel_type_from_id);
-            event.team_id = payload.get("team_id").and_then(Value::as_str).map(String::from);
-            event.response_url = payload.get("response_url").and_then(Value::as_str).map(String::from);
-            event.trigger_id = payload.get("trigger_id").and_then(Value::as_str).map(String::from);
+            event.team_id = payload
+                .get("team_id")
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.response_url = payload
+                .get("response_url")
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.trigger_id = payload
+                .get("trigger_id")
+                .and_then(Value::as_str)
+                .map(String::from);
 
             // Self-loop filter (slash commands can't loop but be defensive)
             if is_self_loop(event.user.as_deref(), None, self_user_id, self_bot_id) {
@@ -377,20 +436,12 @@ pub fn normalize_envelope(
 
             event.user = payload
                 .get("user")
-                .and_then(|u| {
-                    u.get("id")
-                        .and_then(Value::as_str)
-                        .or_else(|| u.as_str())
-                })
+                .and_then(|u| u.get("id").and_then(Value::as_str).or_else(|| u.as_str()))
                 .map(String::from);
 
             event.channel = payload
                 .get("channel")
-                .and_then(|c| {
-                    c.get("id")
-                        .and_then(Value::as_str)
-                        .or_else(|| c.as_str())
-                })
+                .and_then(|c| c.get("id").and_then(Value::as_str).or_else(|| c.as_str()))
                 .map(String::from);
 
             event.channel_type = event.channel.as_deref().map(channel_type_from_id);
@@ -407,14 +458,26 @@ pub fn normalize_envelope(
                 })
                 .map(String::from);
 
-            event.response_url = payload.get("response_url").and_then(Value::as_str).map(String::from);
-            event.trigger_id = payload.get("trigger_id").and_then(Value::as_str).map(String::from);
+            event.response_url = payload
+                .get("response_url")
+                .and_then(Value::as_str)
+                .map(String::from);
+            event.trigger_id = payload
+                .get("trigger_id")
+                .and_then(Value::as_str)
+                .map(String::from);
 
             // Block Kit actions
             if let Some(actions) = payload.get("actions").and_then(|a| a.as_array()) {
                 if let Some(first_action) = actions.first() {
-                    event.action_id = first_action.get("action_id").and_then(Value::as_str).map(String::from);
-                    event.action_value = first_action.get("value").and_then(Value::as_str).map(String::from);
+                    event.action_id = first_action
+                        .get("action_id")
+                        .and_then(Value::as_str)
+                        .map(String::from);
+                    event.action_value = first_action
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(String::from);
                 }
             }
 
@@ -431,7 +494,9 @@ pub fn normalize_envelope(
             }
         }
         other => {
-            return Err(format!("unknown Socket Mode type '{other}' in envelope {envelope_id}"));
+            return Err(format!(
+                "unknown Socket Mode type '{other}' in envelope {envelope_id}"
+            ));
         }
     }
 
@@ -593,7 +658,8 @@ impl InFlightSet {
     }
 
     fn prune(&mut self, now: Instant) {
-        self.entries.retain(|_, ts| now.duration_since(*ts) < IN_FLIGHT_TTL);
+        self.entries
+            .retain(|_, ts| now.duration_since(*ts) < IN_FLIGHT_TTL);
     }
 }
 
@@ -610,10 +676,7 @@ impl Default for InFlightSet {
 // the 3rd attempt fails (ack-and-drop with warning).
 
 const MAX_POST_ATTEMPTS: u32 = 3;
-const RETRY_DELAYS: [Duration; 2] = [
-    Duration::from_millis(500),
-    Duration::from_millis(1000),
-];
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(500), Duration::from_millis(1000)];
 /// Per-attempt timeout for daemon POST. Worst-case: 3 attempts ×
 /// 1s timeout + 1500ms inter-attempt sleep ≈ 4.5s before ack/drop.
 /// This is over Slack's ~3s ack window, but the daemon is loopback
@@ -693,10 +756,7 @@ pub async fn post_to_daemon_with_retry(
                     "daemon POST failed"
                 );
                 if attempt < MAX_POST_ATTEMPTS {
-                    PostOutcome::Retryable {
-                        status: 0,
-                        attempt,
-                    }
+                    PostOutcome::Retryable { status: 0, attempt }
                 } else {
                     PostOutcome::Exhausted
                 }
@@ -709,10 +769,7 @@ pub async fn post_to_daemon_with_retry(
                     DAEMON_POST_TIMEOUT
                 );
                 if attempt < MAX_POST_ATTEMPTS {
-                    PostOutcome::Retryable {
-                        status: 0,
-                        attempt,
-                    }
+                    PostOutcome::Retryable { status: 0, attempt }
                 } else {
                     PostOutcome::Exhausted
                 }
@@ -729,7 +786,8 @@ pub async fn post_to_daemon_with_retry(
                 return true;
             }
             PostOutcome::Retryable { status, attempt: a } => {
-                let delay = RETRY_DELAYS.get((a as usize).saturating_sub(1))
+                let delay = RETRY_DELAYS
+                    .get((a as usize).saturating_sub(1))
                     .copied()
                     .unwrap_or(Duration::from_secs(1));
                 tracing::warn!(
@@ -845,8 +903,16 @@ impl HealthStats {
                     .max(0) as u64
             })
             .unwrap_or(0);
-        let last_event = self.last_event_at.lock().map(|t| t.to_rfc3339()).unwrap_or_default();
-        let disconnect = self.last_disconnect_reason.lock().clone().unwrap_or_default();
+        let last_event = self
+            .last_event_at
+            .lock()
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default();
+        let disconnect = self
+            .last_disconnect_reason
+            .lock()
+            .clone()
+            .unwrap_or_default();
         let workspace = self.workspace_id.lock().clone();
 
         json!({
@@ -949,7 +1015,10 @@ where
     // 1. In-flight dedup
     let now = Instant::now();
     if !in_flight.claim(envelope_id, now) {
-        tracing::debug!(envelope_id = envelope_id, "duplicate envelope dropped (in-flight)");
+        tracing::debug!(
+            envelope_id = envelope_id,
+            "duplicate envelope dropped (in-flight)"
+        );
         return Ok(false);
     }
 
@@ -976,7 +1045,11 @@ where
 {
     // 2. Normalize (includes self-loop filter)
     let normalized = match normalize_envelope(
-        envelope_json, ctx.identities, ctx.self_user_id, ctx.self_bot_id, 0,
+        envelope_json,
+        ctx.identities,
+        ctx.self_user_id,
+        ctx.self_bot_id,
+        0,
     ) {
         Ok(Some(n)) => n,
         Ok(None) => {
@@ -1021,12 +1094,16 @@ where
         if delivered {
             h.events_forwarded.fetch_add(1, Ordering::Relaxed);
         } else {
-            h.events_failed_post_exhausted.fetch_add(1, Ordering::Relaxed);
+            h.events_failed_post_exhausted
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
     if !delivered {
-        tracing::warn!(envelope_id = envelope_id, "ack-and-drop after exhausted retries");
+        tracing::warn!(
+            envelope_id = envelope_id,
+            "ack-and-drop after exhausted retries"
+        );
     }
 
     Ok(true)
@@ -1080,7 +1157,10 @@ async fn run_socket_loop(
             }
             None => {
                 let elapsed = connected_at.elapsed();
-                tracing::info!(elapsed_secs = elapsed.as_secs(), "WebSocket stream ended; reconnecting");
+                tracing::info!(
+                    elapsed_secs = elapsed.as_secs(),
+                    "WebSocket stream ended; reconnecting"
+                );
                 return Ok(elapsed);
             }
         };
@@ -1104,9 +1184,12 @@ async fn run_socket_loop(
                 // If shutdown is already signalled, drain with 2s deadline.
                 if shutdown.load(Ordering::Relaxed) {
                     tracing::info!(envelope_id = %env_id, "shutdown before processing; 2s drain");
-                    let drain = process_slack_envelope(&mut ws_write, ctx, &envelope, &mut in_flight);
+                    let drain =
+                        process_slack_envelope(&mut ws_write, ctx, &envelope, &mut in_flight);
                     match tokio::time::timeout(Duration::from_secs(2), drain).await {
-                        Ok(Ok(_)) => tracing::debug!(envelope_id = %env_id, "drained before shutdown"),
+                        Ok(Ok(_)) => {
+                            tracing::debug!(envelope_id = %env_id, "drained before shutdown")
+                        }
                         Ok(Err(e)) => {
                             tracing::error!(envelope_id = %env_id, error = %e, "drain error");
                             let _ = ack_to_slack(&mut ws_write, &env_id).await;
@@ -1124,7 +1207,10 @@ async fn run_socket_loop(
                 // with 2s deadline; if processing completes first,
                 // handle normally.
                 let mut process = Box::pin(process_slack_envelope(
-                    &mut ws_write, ctx, &envelope, &mut in_flight,
+                    &mut ws_write,
+                    ctx,
+                    &envelope,
+                    &mut in_flight,
                 ));
 
                 tokio::select! {
@@ -1159,7 +1245,10 @@ async fn run_socket_loop(
             }
             WsMessage::Close(_) => {
                 let elapsed = connected_at.elapsed();
-                tracing::info!(elapsed_secs = elapsed.as_secs(), "WebSocket close frame received; reconnecting");
+                tracing::info!(
+                    elapsed_secs = elapsed.as_secs(),
+                    "WebSocket close frame received; reconnecting"
+                );
                 return Ok(elapsed);
             }
             WsMessage::Ping(data) => {
@@ -1176,14 +1265,22 @@ async fn run_socket_loop(
 // Resets after a successful connection that runs ≥30s.
 // Cancellable via the shutdown Notify — returns true if cancelled.
 
-async fn backoff_sleep(attempt: &mut u32, flag: &AtomicBool, shutdown: Arc<tokio::sync::Notify>) -> bool {
+async fn backoff_sleep(
+    attempt: &mut u32,
+    flag: &AtomicBool,
+    shutdown: Arc<tokio::sync::Notify>,
+) -> bool {
     // Check flag first — SIGTERM may have fired before we entered.
     if flag.load(Ordering::Relaxed) {
         tracing::info!("shutdown flag set before backoff; cancelling reconnect");
         return true;
     }
     let delay_secs = (1u64 << (*attempt as u64)).min(60);
-    tracing::info!(attempt = *attempt, delay_secs = delay_secs, "backoff before reconnect");
+    tracing::info!(
+        attempt = *attempt,
+        delay_secs = delay_secs,
+        "backoff before reconnect"
+    );
     *attempt = attempt.saturating_add(1);
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_secs(delay_secs)) => false,
@@ -1212,7 +1309,10 @@ async fn main() -> Result<()> {
 
     let identities = load_identities(&args.identities_file)?;
     let mapped_count: usize = identities.workspaces.values().map(|w| w.len()).sum();
-    tracing::info!("loaded identities: {mapped_count} users across {} workspaces", identities.workspaces.len());
+    tracing::info!(
+        "loaded identities: {mapped_count} users across {} workspaces",
+        identities.workspaces.len()
+    );
 
     let app_token = std::env::var(&args.app_token_env)
         .with_context(|| format!("app token env var {} not set", args.app_token_env))?;
@@ -1221,7 +1321,10 @@ async fn main() -> Result<()> {
     }
     let _signing_secret = std::env::var(&args.signing_secret_env).ok();
     if _signing_secret.is_none() || _signing_secret.as_deref() == Some("") {
-        tracing::info!("signing secret not set ({}); Events API signature verification inactive", args.signing_secret_env);
+        tracing::info!(
+            "signing secret not set ({}); Events API signature verification inactive",
+            args.signing_secret_env
+        );
     }
 
     tracing::info!(
@@ -1259,10 +1362,9 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            )
-            .expect("register SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("register SIGTERM handler");
             tokio::select! {
                 _ = sigterm.recv() => {}
                 _ = tokio::signal::ctrl_c() => {}
@@ -1323,7 +1425,8 @@ async fn main() -> Result<()> {
             h.connected.store(true, Ordering::Relaxed);
         }
 
-        let result = run_socket_loop(&ws_url, &ctx, shutdown.clone(), shutdown_notify.clone()).await;
+        let result =
+            run_socket_loop(&ws_url, &ctx, shutdown.clone(), shutdown_notify.clone()).await;
 
         // Mark disconnected
         if let Some(h) = &health {
@@ -1340,9 +1443,15 @@ async fn main() -> Result<()> {
             Ok(elapsed) => {
                 if elapsed >= Duration::from_secs(30) {
                     reconnect_attempt = 0;
-                    tracing::info!("healthy connection ran for {:.0}s; backoff reset", elapsed.as_secs());
+                    tracing::info!(
+                        "healthy connection ran for {:.0}s; backoff reset",
+                        elapsed.as_secs()
+                    );
                 } else {
-                    tracing::warn!("connection lasted {:.0}s (< 30s healthy threshold); keeping backoff state", elapsed.as_secs());
+                    tracing::warn!(
+                        "connection lasted {:.0}s (< 30s healthy threshold); keeping backoff state",
+                        elapsed.as_secs()
+                    );
                 }
                 if let Some(h) = &health {
                     h.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -1395,7 +1504,10 @@ mod tests {
         assert_eq!(ids.workspaces.len(), 2);
         assert_eq!(ids.workspaces["T01AAA"].len(), 2);
         assert_eq!(ids.workspaces["T01AAA"]["U01ABC"].bbox_user, "alice");
-        assert_eq!(ids.workspaces["T02BBB"]["U03GHI"].email.as_deref(), Some("carol@x.com"));
+        assert_eq!(
+            ids.workspaces["T02BBB"]["U03GHI"].email.as_deref(),
+            Some("carol@x.com")
+        );
     }
 
     #[test]
@@ -1500,7 +1612,9 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.type_discrim, "events_api");
         assert_eq!(norm.event_type.as_deref(), Some("app_mention"));
         assert_eq!(norm.user.as_deref(), Some("Uhuman"));
@@ -1538,7 +1652,9 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.event_type.as_deref(), Some("reaction_added"));
         assert_eq!(norm.reaction.as_deref(), Some("white_check_mark"));
         assert_eq!(norm.item_ts.as_deref(), Some("123.500"));
@@ -1589,7 +1705,10 @@ mod tests {
         });
         let ids = SlackIdentities::default();
         let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok");
-        assert!(norm.is_none(), "bot_message subtype with bot_id should be dropped");
+        assert!(
+            norm.is_none(),
+            "bot_message subtype with bot_id should be dropped"
+        );
     }
 
     #[test]
@@ -1612,7 +1731,9 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.files.len(), 1);
         assert_eq!(norm.files[0]["id"], "F01");
     }
@@ -1634,7 +1755,9 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.team_id.as_deref(), Some("TfromEvent"));
     }
 
@@ -1657,12 +1780,18 @@ mod tests {
         });
         let mut ids = identities_fixture();
         // Ensure team/user mapping exists
-        ids.workspaces.entry("T01".into()).or_default().entry("Ualice".into()).or_insert(IdentityEntry {
-            bbox_user: "alice".into(),
-            scopes: vec!["all".into()],
-            email: None,
-        });
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        ids.workspaces
+            .entry("T01".into())
+            .or_default()
+            .entry("Ualice".into())
+            .or_insert(IdentityEntry {
+                bbox_user: "alice".into(),
+                scopes: vec!["all".into()],
+                email: None,
+            });
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.type_discrim, "slash_commands");
         assert!(norm.event_type.is_none());
         assert_eq!(norm.command.as_deref(), Some("/bbox"));
@@ -1670,7 +1799,10 @@ mod tests {
         assert_eq!(norm.user.as_deref(), Some("Ualice"));
         assert_eq!(norm.channel.as_deref(), Some("C01"));
         assert_eq!(norm.channel_type.as_deref(), Some("channel"));
-        assert_eq!(norm.response_url.as_deref(), Some("https://hooks.slack.com/cmd/T01/R01"));
+        assert_eq!(
+            norm.response_url.as_deref(),
+            Some("https://hooks.slack.com/cmd/T01/R01")
+        );
         assert_eq!(norm.trigger_id.as_deref(), Some("trig-1"));
         // ACL should resolve to alice
         assert_eq!(norm.meta.bbox_user, "alice");
@@ -1697,12 +1829,18 @@ mod tests {
             }
         });
         let mut ids = identities_fixture();
-        ids.workspaces.entry("T01".into()).or_default().entry("Ualice".into()).or_insert(IdentityEntry {
-            bbox_user: "alice".into(),
-            scopes: vec!["all".into()],
-            email: None,
-        });
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        ids.workspaces
+            .entry("T01".into())
+            .or_default()
+            .entry("Ualice".into())
+            .or_insert(IdentityEntry {
+                bbox_user: "alice".into(),
+                scopes: vec!["all".into()],
+                email: None,
+            });
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.type_discrim, "interactive");
         assert_eq!(norm.event_type.as_deref(), Some("block_actions"));
         assert_eq!(norm.action_id.as_deref(), Some("apply_proposal"));
@@ -1740,11 +1878,16 @@ mod tests {
             }
         });
         let ids = identities_fixture();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.event_type.as_deref(), Some("view_submission"));
         assert_eq!(norm.view_id.as_deref(), Some("V01"));
         let vsv = norm.view_state_values.as_ref().unwrap();
-        assert_eq!(vsv["reason_block"]["reason_input"]["value"], "not ready yet");
+        assert_eq!(
+            vsv["reason_block"]["reason_input"]["value"],
+            "not ready yet"
+        );
     }
 
     #[test]
@@ -1763,7 +1906,9 @@ mod tests {
             }
         });
         let ids = identities_fixture();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.channel.as_deref(), Some("D01"));
         assert_eq!(norm.channel_type.as_deref(), Some("im"));
     }
@@ -1787,7 +1932,9 @@ mod tests {
             }
         });
         let ids = identities_fixture();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.meta.bbox_user, "alice");
         assert_eq!(norm.meta.bbox_scopes, vec!["all"]);
         assert!(norm.meta.bbox_can_dispatch);
@@ -1810,7 +1957,9 @@ mod tests {
             }
         });
         let ids = identities_fixture();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.meta.bbox_user, "bob");
         assert_eq!(norm.meta.bbox_scopes, vec!["read"]);
         assert!(!norm.meta.bbox_can_dispatch);
@@ -1879,7 +2028,9 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         let serialized = serde_json::to_value(&norm).unwrap();
 
         // Top-level discriminators
@@ -1893,7 +2044,10 @@ mod tests {
         assert_eq!(serialized["_meta"]["self_bot_id"], "Bbot");
         assert_eq!(serialized["_meta"]["envelope_id"], "env-ser");
         assert_eq!(serialized["_meta"]["bbox_user"], "anonymous");
-        assert_eq!(serialized["_meta"]["bbox_scopes"].as_array().unwrap(), &vec![json!("read")]);
+        assert_eq!(
+            serialized["_meta"]["bbox_scopes"].as_array().unwrap(),
+            &vec![json!("read")]
+        );
         assert_eq!(serialized["_meta"]["bbox_can_dispatch"], false);
 
         // _headers block
@@ -1905,7 +2059,10 @@ mod tests {
 
         // Fields not present in this event should be null
         assert!(serialized.get("command").and_then(Value::as_str).is_none());
-        assert!(serialized.get("action_id").and_then(Value::as_str).is_none());
+        assert!(serialized
+            .get("action_id")
+            .and_then(Value::as_str)
+            .is_none());
         // files is always emitted (empty array when no files)
         assert_eq!(serialized["files"].as_array().unwrap().len(), 0);
     }
@@ -2058,11 +2215,17 @@ mod tests {
     fn test_classify_non_2xx_retryable() {
         assert_eq!(
             classify_post_response(500, 1),
-            PostOutcome::Retryable { status: 500, attempt: 1 }
+            PostOutcome::Retryable {
+                status: 500,
+                attempt: 1
+            }
         );
         assert_eq!(
             classify_post_response(502, 2),
-            PostOutcome::Retryable { status: 502, attempt: 2 }
+            PostOutcome::Retryable {
+                status: 502,
+                attempt: 2
+            }
         );
     }
 
@@ -2104,7 +2267,10 @@ mod tests {
         // This is intentional for now — the daemon may be temporarily sick.
         assert_eq!(
             classify_post_response(400, 1),
-            PostOutcome::Retryable { status: 400, attempt: 1 }
+            PostOutcome::Retryable {
+                status: 400,
+                attempt: 1
+            }
         );
     }
 
@@ -2201,7 +2367,9 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 2).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 2)
+            .expect("ok")
+            .expect("some");
         assert_eq!(norm.meta.retry_attempt, 2);
     }
 
@@ -2224,7 +2392,9 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         // thread_ts should fall back to ts for app_mention
         assert_eq!(norm.thread_ts.as_deref(), Some("100.200"));
         assert_eq!(norm.ts.as_deref(), Some("100.200"));
@@ -2248,7 +2418,9 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         // thread_ts is already set, should not be overwritten
         assert_eq!(norm.thread_ts.as_deref(), Some("100.100"));
         assert_eq!(norm.ts.as_deref(), Some("100.300"));
@@ -2268,7 +2440,9 @@ mod tests {
             }
         });
         let ids = SlackIdentities::default();
-        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0).expect("ok").expect("some");
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0)
+            .expect("ok")
+            .expect("some");
         // text should be set from command_text for slash commands
         assert_eq!(norm.text.as_deref(), Some("inbox"));
         assert_eq!(norm.command_text.as_deref(), Some("inbox"));
@@ -2300,14 +2474,16 @@ mod tests {
             }
             let raw = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let instance: Value =
-                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+            let instance: Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
             let result = compiled.validate(&instance);
             assert!(
                 result.is_ok(),
                 "schema validation failed for {}: {:?}",
                 path.display(),
-                result.err().map(|e| e.map(|ee| ee.to_string()).collect::<Vec<_>>())
+                result
+                    .err()
+                    .map(|e| e.map(|ee| ee.to_string()).collect::<Vec<_>>())
             );
         }
     }
@@ -2315,9 +2491,8 @@ mod tests {
     #[test]
     fn test_routing_packet_shape() {
         // Validate the routing-slack.json has the required structure.
-        let raw =
-            std::fs::read_to_string("examples/slack/packets/routing-slack.json")
-                .expect("routing-slack.json readable");
+        let raw = std::fs::read_to_string("examples/slack/packets/routing-slack.json")
+            .expect("routing-slack.json readable");
         let packet: Value = serde_json::from_str(&raw).expect("valid JSON");
 
         assert_eq!(packet["domain"], "webhook-routing/slack");
@@ -2345,26 +2520,32 @@ mod tests {
         // Every rule must have id, classification, antecedent, consequent
         for rule in rules {
             assert!(rule["id"].is_string(), "rule missing id");
-            assert!(rule["classification"].is_string(), "rule missing classification");
+            assert!(
+                rule["classification"].is_string(),
+                "rule missing classification"
+            );
             assert!(rule["antecedent"].is_object(), "rule missing antecedent");
-            assert!(rule["consequent"].is_string() || rule["consequent"].is_object(),
-                "rule missing consequent");
+            assert!(
+                rule["consequent"].is_string() || rule["consequent"].is_object(),
+                "rule missing consequent"
+            );
         }
     }
 
     #[test]
     fn test_webhook_spec_shape() {
-        let raw =
-            std::fs::read_to_string("examples/slack/webhooks/slack.json")
-                .expect("slack.json readable");
+        let raw = std::fs::read_to_string("examples/slack/webhooks/slack.json")
+            .expect("slack.json readable");
         let spec: Value = serde_json::from_str(&raw).expect("valid JSON");
 
         assert_eq!(spec["name"], "slack");
         assert_eq!(spec["signature"]["kind"], "hmac_sha256");
         assert_eq!(spec["delivery_id_header"], "X-Slack-Envelope-Id");
         assert_eq!(spec["routing_packet"], "domain:webhook-routing/slack");
-        assert!(spec["extractor"]["outputs"].as_object().unwrap().len() > 10,
-            "expected at least 10 extractor outputs");
+        assert!(
+            spec["extractor"]["outputs"].as_object().unwrap().len() > 10,
+            "expected at least 10 extractor outputs"
+        );
     }
 
     #[test]

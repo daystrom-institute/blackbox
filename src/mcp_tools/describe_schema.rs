@@ -64,6 +64,10 @@ fn edge_families() -> Vec<serde_json::Value> {
             &[
                 "IN_SESSION",
                 "THREAD_HAS_SESSION",
+                "THREAD_SPAWNED_FROM",
+                "THREAD_BLOCKED_BY",
+                "THREAD_RELATES_TO",
+                "THREAD_SUBSUMES",
                 "IN_FILE",
                 "NEXT_CHUNK",
                 "PREV_CHUNK",

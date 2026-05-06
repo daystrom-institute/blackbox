@@ -30,7 +30,10 @@ use tokio_util::sync::CancellationToken;
 use crate::orchestration::{
     self as orch,
     brofile::{resolve_brofile, resolve_provider_env},
-    mcp::{global_store_path, project_store_path, resolve_effective, write_gemini_policy_file, McpFilters, McpStore},
+    mcp::{
+        global_store_path, project_store_path, resolve_effective, write_gemini_policy_file,
+        McpFilters, McpStore,
+    },
     providers::{ExecOpts, Provider},
     team::{load_all_teams, Team, TeamMember},
     AmbientContext,
@@ -208,10 +211,22 @@ async fn process_envelope(
         }
     };
 
-    let dispatch = match build_dispatch(shared, council, team, member, &envelope, queue_depth_at_drain) {
+    let dispatch = match build_dispatch(
+        shared,
+        council,
+        team,
+        member,
+        &envelope,
+        queue_depth_at_drain,
+    ) {
         Ok(d) => d,
         Err(e) => {
-            fail_envelope(council, registry, &envelope.id, &format!("build dispatch: {e}"));
+            fail_envelope(
+                council,
+                registry,
+                &envelope.id,
+                &format!("build dispatch: {e}"),
+            );
             return;
         }
     };
@@ -311,7 +326,11 @@ async fn process_envelope(
 
     let cfg = council.session.read().config.clone();
     let trimmed = reply_text.trim();
-    let drop_reason = decide_drop(trimmed, envelope.addressed_by_user, &cfg.low_signal_patterns);
+    let drop_reason = decide_drop(
+        trimmed,
+        envelope.addressed_by_user,
+        &cfg.low_signal_patterns,
+    );
 
     if let Some(reason) = drop_reason {
         // Low-signal / pass — no post emitted, envelope marked Dropped
@@ -349,7 +368,12 @@ async fn process_envelope(
         envelope.id.clone(),
     );
     if let Err(e) = council.append_post(post.clone()) {
-        retry_or_fail(council, registry, &envelope.id, &format!("append post: {e}"));
+        retry_or_fail(
+            council,
+            registry,
+            &envelope.id,
+            &format!("append post: {e}"),
+        );
         return;
     }
 
@@ -538,11 +562,16 @@ fn build_dispatch(
         bf.provider
             .build_resume_args(&session_id, &final_prompt, exec_opts.as_ref())
     } else {
-        bf.provider
-            .build_exec_args(&final_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref())
+        bf.provider.build_exec_args(
+            &final_prompt,
+            &session_id,
+            cwd.as_deref(),
+            exec_opts.as_ref(),
+        )
     };
 
-    let filter_pieces = build_filter_args(bf.provider, cwd.as_deref(), &task_id, bf.filters.as_ref());
+    let filter_pieces =
+        build_filter_args(bf.provider, cwd.as_deref(), &task_id, bf.filters.as_ref());
     args.extend(filter_pieces.args);
 
     Ok(Dispatch {
@@ -584,7 +613,11 @@ fn build_filter_args(
     let project = project_dir
         .map(|pd| project_store_path(std::path::Path::new(pd)))
         .and_then(|p| McpStore::load(&p).ok());
-    let mut eff = resolve_effective(&global, project.as_ref(), /* include_default_guard */ true);
+    let mut eff = resolve_effective(
+        &global,
+        project.as_ref(),
+        /* include_default_guard */ true,
+    );
     if let Some(extra) = extra {
         eff.filters.merge_from(extra);
     }
@@ -673,8 +706,7 @@ fn forward_mentions(
         HashSet::new()
     };
 
-    let team_member_names: HashSet<String> =
-        team.members.iter().map(|m| m.name.clone()).collect();
+    let team_member_names: HashSet<String> = team.members.iter().map(|m| m.name.clone()).collect();
 
     let mut new_envelopes = Vec::new();
     for mentioned in &post.addressed_to {
@@ -894,7 +926,10 @@ mod tests {
         // Not addressed + low_signal => dropped
         assert_eq!(decide_drop("pass", false, &patterns), Some("low_signal"));
         // Addressed + empty => failed (addressed_but_empty)
-        assert_eq!(decide_drop("", true, &patterns), Some("addressed_but_empty"));
+        assert_eq!(
+            decide_drop("", true, &patterns),
+            Some("addressed_but_empty")
+        );
         // Not addressed + empty => dropped
         assert_eq!(decide_drop("", false, &patterns), Some("empty"));
     }

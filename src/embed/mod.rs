@@ -42,16 +42,18 @@ pub enum Bucket {
     Transcripts,
     GitMessage,
     Notes,
+    Threads,
 }
 
 impl Bucket {
-    pub const ALL: [Bucket; 6] = [
+    pub const ALL: [Bucket; 7] = [
         Bucket::Knowledge,
         Bucket::Code,
         Bucket::Docs,
         Bucket::Transcripts,
         Bucket::GitMessage,
         Bucket::Notes,
+        Bucket::Threads,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -62,6 +64,7 @@ impl Bucket {
             Self::Transcripts => "transcripts",
             Self::GitMessage => "git_message",
             Self::Notes => "notes",
+            Self::Threads => "threads",
         }
     }
 }
@@ -140,6 +143,7 @@ pub struct RoutesConfig {
     pub transcripts: Option<String>,
     pub git_message: Option<String>,
     pub notes: Option<String>,
+    pub threads: Option<String>,
     #[serde(default)]
     pub per_project: BTreeMap<String, BucketRoutes>,
 }
@@ -152,6 +156,7 @@ pub struct BucketRoutes {
     pub transcripts: Option<String>,
     pub git_message: Option<String>,
     pub notes: Option<String>,
+    pub threads: Option<String>,
 }
 
 impl BucketRoutes {
@@ -163,6 +168,7 @@ impl BucketRoutes {
             Bucket::Transcripts => self.transcripts.as_deref(),
             Bucket::GitMessage => self.git_message.as_deref(),
             Bucket::Notes => self.notes.as_deref(),
+            Bucket::Threads => self.threads.as_deref(),
         }
     }
 }
@@ -176,6 +182,7 @@ impl RoutesConfig {
             Bucket::Transcripts => self.transcripts.as_deref(),
             Bucket::GitMessage => self.git_message.as_deref(),
             Bucket::Notes => self.notes.as_deref(),
+            Bucket::Threads => self.threads.as_deref(),
         }
     }
 }
@@ -386,6 +393,15 @@ fn enqueue_reembed_routes(
             enqueued += 1;
         }
     }
+    if buckets.contains(&Bucket::Threads) {
+        for thread in state.threads.read().all() {
+            if limit_reached(max_entities, enqueued) {
+                return Ok(enqueued);
+            }
+            crate::embed_queue::enqueue_thread(thread);
+            enqueued += 1;
+        }
+    }
     let doc_types = reembed_index_doc_types(buckets);
     if !doc_types.is_empty() {
         let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
@@ -450,7 +466,7 @@ fn enqueue_reembed_index_docs(
                 crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content);
                 enqueued += 1;
             }
-            Bucket::Knowledge | Bucket::Notes => {}
+            Bucket::Knowledge | Bucket::Notes | Bucket::Threads => {}
         }
     }
     enqueued
@@ -551,22 +567,22 @@ mod tests {
         let router = EmbeddingRouter::from_toml_str(
             r#"
 [embed.routes]
-code = "voyage"
+threads = "voyage"
 
 [embed.routes.per_project."proj1234"]
-code = "ollama"
+threads = "ollama"
 "#,
         )
         .unwrap();
         assert_eq!(
             router
-                .route(Bucket::Code, Some("proj1234"))
+                .route(Bucket::Threads, Some("proj1234"))
                 .unwrap()
                 .provider_id,
             OLLAMA_PROVIDER_ID
         );
         assert_eq!(
-            router.route(Bucket::Code, None).unwrap().provider_id,
+            router.route(Bucket::Threads, None).unwrap().provider_id,
             VOYAGE_PROVIDER_ID
         );
     }
@@ -585,6 +601,10 @@ code = "ollama"
         assert_eq!(
             buckets_for_reembed_route("knowledge").unwrap(),
             vec![Bucket::Knowledge]
+        );
+        assert_eq!(
+            buckets_for_reembed_route("threads").unwrap(),
+            vec![Bucket::Threads]
         );
         let err = buckets_for_reembed_route("missing").unwrap_err();
         assert!(err.to_string().contains("unknown embedding route"));

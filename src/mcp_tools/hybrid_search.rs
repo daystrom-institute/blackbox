@@ -42,12 +42,13 @@ pub struct HybridSearchParams {
     pub query_vector: Option<Vec<f32>>,
     /// Restrict results to entities scoped to a specific project. Accepts
     /// either an absolute project path (e.g. `/home/user/repos/my-app`) or
-    /// a project_id (8-hex). When set, only `project_file:<this_project>:*`
-    /// entries are kept; commits, knowledge, transcripts, and other
-    /// project-agnostic entity types pass through unfiltered. Use this to
-    /// scope queries to your current repo when cross-project keyword
-    /// pollution would otherwise dominate the top-N (a common case when
-    /// multiple registered repos share vocabulary like "voyage" or "embed").
+    /// a project_id (8-hex). When set, only project_file entries from that
+    /// project and thread entries whose stored project resolves to that id
+    /// are kept; commits, knowledge, transcripts, and other project-agnostic
+    /// entity types pass through unfiltered. Use this to scope queries to
+    /// your current repo when cross-project keyword pollution would otherwise
+    /// dominate the top-N (a common case when multiple registered repos share
+    /// vocabulary like "voyage" or "embed").
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -225,15 +226,19 @@ pub(crate) fn hybrid_search_typed(
             .total_cmp(&a.score)
             .then_with(|| a.entity_id.cmp(&b.entity_id))
     });
-    // Project scoping: when the caller passed `project`, drop project_file
+    // Project scoping: when the caller passed `project`, drop scoped entity
     // results from other projects so cross-project keyword pollution
     // (e.g. erlang-test/voyage.ex outranking transcript-search/voyage.rs
     // for "voyage" queries on the local repo) doesn't dominate top-N.
-    // Other entity types pass through unfiltered — commits / knowledge /
-    // transcripts are project-agnostic enough that the agent can decide
-    // which ones are relevant on its own.
+    // Project files encode their project id in the EntityRef; threads carry
+    // the source project in their store record. Other entity types pass
+    // through unfiltered — commits / knowledge / transcripts are project-
+    // agnostic enough that the agent can decide relevance on its own.
     if let Some(target_project_id) = resolve_project_filter(p.project.as_deref(), ctx) {
-        results.retain(|hit| keep_under_project_filter(&hit.entity_id, &target_project_id));
+        results.retain(|hit| keep_under_project_filter(&hit.entity_id, &target_project_id, ctx));
+    }
+    if let Some(doc_type) = p.doc_type.as_deref().filter(|value| !value.is_empty()) {
+        results.retain(|hit| hit.doc_type.as_deref() == Some(doc_type));
     }
     // Per-file collapse: keep only the best-scoring chunk per file. Without
     // this the top-N gets dominated by 3-5 chunks of the same .rs file when
@@ -277,9 +282,7 @@ pub(crate) fn hybrid_search_typed(
 /// ranked list keyed on the highest-scoring chunk per file. Chunks of
 /// non-project_file entities (commits, transcripts, knowledge) pass through
 /// individually so they're not double-counted in the file aggregation.
-fn aggregate_bm25_by_file(
-    chunks: &[crate::index::HybridBm25Hit],
-) -> Vec<RankedHit> {
+fn aggregate_bm25_by_file(chunks: &[crate::index::HybridBm25Hit]) -> Vec<RankedHit> {
     use std::collections::HashMap;
     // Group project_file chunks by (project_id, rel_path_hash). Track
     // sum-of-scores AND count, then rank by `sum * sqrt(count)` so a file
@@ -288,8 +291,7 @@ fn aggregate_bm25_by_file(
     // across many sections) ranks above a file with fewer but slightly
     // denser chunks. Score sum alone underweights breadth; sqrt(count)
     // alone overweights it. The geometric blend lifts coverage cleanly.
-    let mut by_file: HashMap<String, (f32, usize, &crate::index::HybridBm25Hit)> =
-        HashMap::new();
+    let mut by_file: HashMap<String, (f32, usize, &crate::index::HybridBm25Hit)> = HashMap::new();
     let mut non_file_hits: Vec<&crate::index::HybridBm25Hit> = Vec::new();
     for hit in chunks {
         let Some(key) = file_dedup_key(&hit.entity_id) else {
@@ -367,15 +369,39 @@ fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Optio
 }
 
 /// Decides whether a search hit survives the project filter. Project-file
-/// refs must match the target project_id; other entity types pass through
-/// (commits/knowledge/transcripts/sessions/etc are project-agnostic enough
-/// that the agent can prune them itself if needed).
-fn keep_under_project_filter(entity_id: &str, target_project_id: &str) -> bool {
+/// refs must match the target project_id; thread refs must resolve through
+/// their stored `project`; other entity types pass through (commits/knowledge/
+/// transcripts/sessions/etc are project-agnostic enough that the agent can
+/// prune them itself if needed).
+fn keep_under_project_filter(
+    entity_id: &str,
+    target_project_id: &str,
+    ctx: &ProviderContext<'_>,
+) -> bool {
     let mut parts = entity_id.split(':');
-    if parts.next() != Some("project_file") {
-        return true;
+    match parts.next() {
+        Some("project_file") => parts.next() == Some(target_project_id),
+        Some("thread") => thread_matches_project_filter(parts.next(), target_project_id, ctx),
+        _ => true,
     }
-    parts.next() == Some(target_project_id)
+}
+
+fn thread_matches_project_filter(
+    thread_id: Option<&str>,
+    target_project_id: &str,
+    ctx: &ProviderContext<'_>,
+) -> bool {
+    let (Some(thread_id), Some(state)) = (thread_id, ctx.state()) else {
+        return true;
+    };
+    let threads = state.threads.read();
+    let Some(thread) = threads.all().iter().find(|thread| thread.id == thread_id) else {
+        return true;
+    };
+    crate::entity_ref::project_id_for_path(&thread.project)
+        .ok()
+        .as_deref()
+        == Some(target_project_id)
 }
 
 /// Returns a per-file dedup key when `entity_id` refers to a project_file
@@ -615,6 +641,11 @@ fn enrich_fused_features<'a>(
             if entity_id.starts_with("knowledge:") && feature.doc_type.is_none() {
                 feature.doc_type = Some("knowledge".into());
             }
+            if feature.doc_type.is_none() {
+                if let Ok(entity_ref) = EntityRef::parse(entity_id) {
+                    feature.doc_type = Some(entity_ref.entity_type().as_str().into());
+                }
+            }
             features.insert(entity_id.to_string(), feature);
         }
         if let Some(properties) = knowledge_properties(knowledge, entity_id) {
@@ -801,9 +832,8 @@ mod tests {
                 hnsw: None,
             },
         )]);
-        let lists =
-            vector_ranked_lists("q", Some(&[1.0, 0.0]), 5, 0.6, &partitions, &mut degraded)
-                .unwrap();
+        let lists = vector_ranked_lists("q", Some(&[1.0, 0.0]), 5, 0.6, &partitions, &mut degraded)
+            .unwrap();
         assert!(lists.is_empty());
         assert!(degraded.skipped_partitions["route-a"].contains("do not match"));
     }

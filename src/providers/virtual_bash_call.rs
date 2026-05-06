@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 
 use super::{
+    empty_neighborhood_view, ensure_type, expected, next_hops, schema, truncate_label,
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
-    truncate_label,
+    NextHop, ProviderContext,
 };
 use crate::entity_ref::{EntityRef, EntityType};
 
@@ -40,7 +40,11 @@ impl InspectableEntityProvider for BashCallProvider {
         schema(
             self.entity_type(),
             &["session", "turn", "virtual"],
-            &["RAN_BASH", "BASH_CALL_IN_SESSION", "BASH_CALL_PRODUCED_OUTPUT"],
+            &[
+                "RAN_BASH",
+                "BASH_CALL_IN_SESSION",
+                "BASH_CALL_PRODUCED_OUTPUT",
+            ],
             &["session"],
         )
     }
@@ -60,7 +64,11 @@ impl InspectableEntityProvider for BashCallProvider {
     ) -> Vec<NextHop> {
         next_hops(
             full_neighborhood,
-            &["RAN_BASH", "BASH_CALL_IN_SESSION", "BASH_CALL_PRODUCED_OUTPUT"],
+            &[
+                "RAN_BASH",
+                "BASH_CALL_IN_SESSION",
+                "BASH_CALL_PRODUCED_OUTPUT",
+            ],
         )
     }
 

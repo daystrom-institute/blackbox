@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 
 use super::{
+    empty_neighborhood_view, ensure_type, expected, next_hops, schema, truncate_label,
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
-    truncate_label,
+    NextHop, ProviderContext,
 };
 use crate::entity_ref::{EntityRef, EntityType};
 

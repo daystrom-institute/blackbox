@@ -14,7 +14,7 @@ use crate::index::{EdgeProjectionDoc, TranscriptIndex};
 use crate::knowledge::{Knowledge, KnowledgeEdgeKind};
 use crate::notes::Notes;
 use crate::orchestration::TaskStore;
-use crate::threads::Threads;
+use crate::threads::{EdgeKind, EdgeTarget, Threads};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Edge {
@@ -240,6 +240,12 @@ impl EdgeIndex {
     }
 
     fn project_thread_edges(&mut self, threads: &Threads, seen: &mut HashSet<Edge>) {
+        let session_providers = threads
+            .all()
+            .iter()
+            .flat_map(|thread| thread.sessions.iter())
+            .map(|session| (session.session_id.clone(), session.provider.clone()))
+            .collect::<HashMap<_, _>>();
         for thread in threads.all() {
             let source = EntityRef::Thread {
                 thread_id: thread.id.clone(),
@@ -255,6 +261,36 @@ impl EdgeIndex {
                         },
                         EdgeProvenance::Derived,
                     ),
+                    seen,
+                );
+            }
+            for edge in &thread.edges {
+                let target = match &edge.target_type {
+                    EdgeTarget::Thread => EntityRef::Thread {
+                        thread_id: edge.target.clone(),
+                    },
+                    EdgeTarget::Session => EntityRef::Session {
+                        provider: session_providers
+                            .get(&edge.target)
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        session_id: edge.target.clone(),
+                    },
+                };
+                let mut metadata = BTreeMap::new();
+                if let Some(note) = &edge.note {
+                    metadata.insert("note".into(), note.clone());
+                }
+                metadata.insert("created_at".into(), edge.created_at.clone());
+                self.insert(
+                    Edge {
+                        source: source.clone(),
+                        kind: thread_edge_kind_name(&edge.kind).to_string(),
+                        target,
+                        provenance: EdgeProvenance::Explicit,
+                        confidence: EdgeConfidence::Exact,
+                        metadata,
+                    },
                     seen,
                 );
             }
@@ -588,6 +624,15 @@ fn exact_edge(
     }
 }
 
+fn thread_edge_kind_name(kind: &EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::SpawnedFrom => "THREAD_SPAWNED_FROM",
+        EdgeKind::BlockedBy => "THREAD_BLOCKED_BY",
+        EdgeKind::RelatesTo => "THREAD_RELATES_TO",
+        EdgeKind::Subsumes => "THREAD_SUBSUMES",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +730,86 @@ mod tests {
     }
 
     #[test]
+    fn thread_store_edges_project_into_agentic_graph() {
+        use crate::threads::{ThreadParams, Threads};
+
+        fn params(action: &str) -> ThreadParams {
+            ThreadParams {
+                action: action.into(),
+                name: None,
+                id: None,
+                topic: None,
+                project: None,
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: None,
+            }
+        }
+
+        fn created_id(output: &str) -> String {
+            output
+                .split_whitespace()
+                .find(|part| part.starts_with("thread-"))
+                .unwrap()
+                .to_string()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+        let mut open_parent = params("open");
+        open_parent.topic = Some("parent".into());
+        open_parent.project = Some("/repo".into());
+        let parent = created_id(&threads.thread(&open_parent).unwrap());
+
+        let mut open_child = params("open");
+        open_child.topic = Some("child".into());
+        open_child.project = Some("/repo".into());
+        open_child.session_id = Some("sess-1".into());
+        open_child.provider = Some("claude".into());
+        let child = created_id(&threads.thread(&open_child).unwrap());
+
+        let mut link = params("link");
+        link.id = Some(child.clone());
+        link.edge = Some("spawned_from".into());
+        link.target = Some(parent.clone());
+        link.target_type = Some("thread".into());
+        link.note = Some("child came from parent".into());
+        threads.thread(&link).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_thread_edges(&threads, &mut seen);
+
+        let child_ref = EntityRef::Thread {
+            thread_id: child.clone(),
+        };
+        assert!(index.forward_edges(&child_ref).iter().any(|edge| edge.kind
+            == "THREAD_HAS_SESSION"
+            && edge.target
+                == (EntityRef::Session {
+                    provider: "claude".into(),
+                    session_id: "sess-1".into(),
+                })));
+        let relation = index
+            .forward_edges_filtered(&child_ref, &["THREAD_SPAWNED_FROM"])
+            .into_iter()
+            .next()
+            .expect("spawned_from edge should project");
+        assert_eq!(relation.target, EntityRef::Thread { thread_id: parent });
+        assert_eq!(
+            relation.metadata.get("note").map(String::as_str),
+            Some("child came from parent")
+        );
+    }
+
+    #[test]
     fn project_edge_sidecar_round_trips_and_dedupes() {
         let dir = tempfile::tempdir().unwrap();
         let source = EntityRef::ProjectFile {
@@ -775,10 +900,7 @@ mod tests {
             },
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
-            metadata: BTreeMap::from([(
-                "anchor.commit_sha_at_edit".into(),
-                "abc123".into(),
-            )]),
+            metadata: BTreeMap::from([("anchor.commit_sha_at_edit".into(), "abc123".into())]),
         };
 
         assert_eq!(

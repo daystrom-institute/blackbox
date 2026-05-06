@@ -721,8 +721,7 @@ mod tests {
         let blackbox_md = blackbox_dir.join("BLACKBOX.md");
         fs::write(&blackbox_md, "# global guidance").unwrap();
 
-        let config =
-            with_fake_home(home.path(), || build_opencode_config(Provider::Glm, None));
+        let config = with_fake_home(home.path(), || build_opencode_config(Provider::Glm, None));
         let instructions = config
             .get("instructions")
             .and_then(Value::as_array)
@@ -737,8 +736,7 @@ mod tests {
     #[test]
     fn test_build_opencode_config_omits_instructions_when_blackbox_md_missing() {
         let home = temp_store();
-        let config =
-            with_fake_home(home.path(), || build_opencode_config(Provider::Glm, None));
+        let config = with_fake_home(home.path(), || build_opencode_config(Provider::Glm, None));
         assert!(
             config.get("instructions").is_none(),
             "instructions field should be absent when BLACKBOX.md does not exist"

@@ -146,9 +146,8 @@ fn notable_edges(
         return Vec::new();
     }
     let neighborhood = Neighborhood { forward, reverse };
-    let entity = entity_loader::load(ctx, entity_ref).unwrap_or_else(|_| {
-        providers::empty_neighborhood_view(entity_ref, Default::default())
-    });
+    let entity = entity_loader::load(ctx, entity_ref)
+        .unwrap_or_else(|_| providers::empty_neighborhood_view(entity_ref, Default::default()));
     let priorities = providers::provider_for(entity_ref.entity_type())
         .recommended_next_hops(&entity, &neighborhood)
         .into_iter()
@@ -207,10 +206,9 @@ fn select_notable_edges(
             if selected.len() >= PER_DIRECTION_EDGE_LIMIT {
                 break;
             }
-            if selected
-                .iter()
-                .any(|selected| selected.kind == edge.kind && selected.target == edge.target.to_string())
-            {
+            if selected.iter().any(|selected| {
+                selected.kind == edge.kind && selected.target == edge.target.to_string()
+            }) {
                 continue;
             }
             selected.push(render_notable_edge(ctx, edge, direction));
@@ -219,11 +217,7 @@ fn select_notable_edges(
     selected
 }
 
-fn render_notable_edge(
-    ctx: &ProviderContext<'_>,
-    edge: &Edge,
-    direction: &str,
-) -> NotableEdge {
+fn render_notable_edge(ctx: &ProviderContext<'_>, edge: &Edge, direction: &str) -> NotableEdge {
     let other = if direction == "out" {
         &edge.target
     } else {
@@ -257,7 +251,11 @@ fn render_text(query: &str, seeds: &[SeedEntity]) -> String {
             out.push_str(&format!("   {}\n", seed.entity_ref));
         }
         for edge in &seed.notable_edges {
-            let arrow = if edge.direction == "out" { "-->" } else { "<--" };
+            let arrow = if edge.direction == "out" {
+                "-->"
+            } else {
+                "<--"
+            };
             out.push_str(&format!(
                 "   {arrow}[{}] {} ({})\n",
                 edge.kind, edge.target, edge.target_label

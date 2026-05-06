@@ -113,7 +113,7 @@ pub enum EdgeKind {
     Subsumes,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum EdgeTarget {
@@ -308,8 +308,9 @@ impl Threads {
             resolved_at: None,
         };
 
-        self.store.threads.push(thread);
+        self.store.threads.push(thread.clone());
         self.save()?;
+        crate::embed_queue::enqueue_thread(&thread);
 
         Ok(format!("Thread created: {} — \"{}\"", id, topic))
     }
@@ -487,7 +488,9 @@ impl Threads {
         thread.last_activity = now;
 
         let topic = thread.topic.clone();
+        let thread_for_embed = thread.clone();
         self.save()?;
+        crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(format!(
             "Thread {id} ({topic}) — added {kind_str} edge to {target}"
@@ -560,8 +563,10 @@ impl Threads {
         thread.status = ThreadStatus::Active;
         thread.last_activity = now;
         let topic = thread.topic.clone();
+        let thread_for_embed = thread.clone();
 
         self.save()?;
+        crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(format!("Thread {id} continued — \"{topic}\""))
     }
@@ -586,8 +591,10 @@ impl Threads {
         thread.last_activity = now.clone();
         thread.resolved_at = Some(now);
         let topic = thread.topic.clone();
+        let thread_for_embed = thread.clone();
 
         self.save()?;
+        crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(format!("Thread {id} resolved — \"{topic}\""))
     }
@@ -617,8 +624,10 @@ impl Threads {
         thread.last_activity = now.clone();
         thread.resolved_at = Some(now);
         let topic = thread.topic.clone();
+        let thread_for_embed = thread.clone();
 
         self.save()?;
+        crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(format!(
             "Thread {id} promoted to {promoted_to} — \"{topic}\""
@@ -643,8 +652,10 @@ impl Threads {
         thread.name = Some(new_name.to_string());
         thread.last_activity = Self::now_iso();
         let topic = thread.topic.clone();
+        let thread_for_embed = thread.clone();
 
         self.save()?;
+        crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(format!(
             "Thread {id} renamed to \"{new_name}\" (topic: {topic})"

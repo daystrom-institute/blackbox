@@ -10,6 +10,13 @@ The orchestration surface is small, but the workflow shapes are different enough
 
 If you want continuity, do not call `bro_exec` again.
 
+One provider session is single-flight: do not call `bro_resume` for a
+session while that session's previous task is still running. First call
+`bro_wait(task_id=...)` and use the returned result, or call
+`bro_cancel(task_id=...)` if you are deliberately abandoning that turn.
+Starting another resume before the prior one reaches a terminal state can
+fork/corrupt provider session history.
+
 ## Standard patterns
 
 ### One worker
@@ -17,13 +24,19 @@ If you want continuity, do not call `bro_exec` again.
 1. `bro_exec(...)`
 2. `bro_wait(...)`
 3. inspect result
+4. only then `bro_resume(...)` if you need a follow-up
 
 ### Blind deliberation
 
 1. `bro_broadcast(...)`
 2. `bro_when_all(...)`
 3. compare answers
-4. optionally `bro_resume(...)` selected members with follow-up prompts
+4. optionally `bro_resume(...)` selected members with follow-up prompts,
+   but only after the selected members' current tasks are terminal
+
+`bro_broadcast` resumes existing team member sessions on later rounds, so it
+obeys the same single-flight rule as `bro_resume`: do not broadcast a new
+round to a member while that member's prior task is still running.
 
 ### Race
 
@@ -37,6 +50,8 @@ If you want continuity, do not call `bro_exec` again.
 1. `bro_exec(...)`
 2. `bro_status(...)` occasionally
 3. `bro_wait(...)` only when you actually need completion
+4. do not resume the same session while `bro_status` still reports
+   `running`
 
 ## Team and brofile hygiene
 

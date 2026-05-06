@@ -6,12 +6,12 @@
 //! exposes a single async mutex per `(provider, session_id)` key so
 //! every dispatch path can serialize against the same invariant.
 //!
-//! Council's drain worker is the first adopter (multi-producer
-//! collisions are *expected* there). Other paths — `bro_broadcast`,
-//! ad-hoc `bro_resume`, workflow durable actors, team advisor resume
-//! — should adopt incrementally; until then they remain a latent
-//! single-resume-at-a-time assumption that this lease can later
-//! mechanize.
+//! Council's drain worker uses the blocking acquire path because
+//! multi-producer collisions are expected there. Operator-facing paths
+//! such as ad-hoc `bro_resume`, workflow durable actors, and team
+//! advisor resumes use the non-blocking path and fail fast with a
+//! `bro_wait` / `bro_cancel` instruction instead of silently queuing a
+//! follow-up that can outlive the caller's tool timeout.
 //!
 //! Lease acquisition is async: callers `await` the guard, holding it
 //! across the full dispatch (`spawn_task` → `wait_for_task`). Drop
@@ -57,6 +57,25 @@ impl ResumeLeaseRegistry {
                 .clone()
         };
         lock.lock_owned().await
+    }
+
+    /// Try to acquire the resume lease without waiting. This is the
+    /// operator-facing path: if a session already has an in-flight
+    /// resume, callers should `bro_wait` or `bro_cancel` that task
+    /// instead of silently queuing another turn that may outlive the
+    /// caller's tool timeout.
+    pub fn try_acquire(&self, provider: Provider, session_id: &str) -> Option<OwnedMutexGuard<()>> {
+        let key = LeaseKey {
+            provider,
+            session_id: session_id.to_string(),
+        };
+        let lock = {
+            let mut map = self.inner.lock();
+            map.entry(key)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        lock.try_lock_owned().ok()
     }
 }
 
@@ -119,5 +138,16 @@ mod tests {
             "leases for different keys serialized: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn try_acquire_returns_none_when_same_key_busy() {
+        let reg = ResumeLeaseRegistry::new();
+        let first = reg
+            .try_acquire(Provider::Claude, "sid")
+            .expect("first lease should acquire");
+        assert!(reg.try_acquire(Provider::Claude, "sid").is_none());
+        drop(first);
+        assert!(reg.try_acquire(Provider::Claude, "sid").is_some());
     }
 }

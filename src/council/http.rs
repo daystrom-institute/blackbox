@@ -84,9 +84,13 @@ pub async fn create(
     Json(req): Json<CreateCouncilRequest>,
 ) -> impl IntoResponse {
     let store_dir = state.store_dir.clone();
-    let res = state
-        .councils
-        .create(req.team.clone(), req.topic.clone(), req.charter, req.project, &store_dir);
+    let res = state.councils.create(
+        req.team.clone(),
+        req.topic.clone(),
+        req.charter,
+        req.project,
+        &store_dir,
+    );
     match res {
         Ok(c) => {
             let s = c.session.read();

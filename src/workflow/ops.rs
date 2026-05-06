@@ -191,9 +191,7 @@ pub async fn execute_op(
             exec_read_session(&rendered_args, hook.into_var.as_deref(), ctx).await
         }
         OpKind::ValidateSchema => exec_validate_schema(&rendered_args, hook.into_var.as_deref()),
-        OpKind::ApplyEntry => {
-            exec_apply_entry(&rendered_args, hook.into_var.as_deref(), ctx).await
-        }
+        OpKind::ApplyEntry => exec_apply_entry(&rendered_args, hook.into_var.as_deref(), ctx).await,
         OpKind::AppendKnowledgeLink => {
             exec_append_knowledge_link(&rendered_args, hook.into_var.as_deref(), ctx).await
         }
@@ -442,7 +440,9 @@ async fn exec_write_semantic_edge(
                 .map(str::to_string)
                 .or_else(|| project_id_from_ref(&source_ref))
                 .or_else(|| project_id_from_ref(&target_ref))
-                .ok_or_else(|| anyhow!("WriteSemanticEdge DESCRIBES requires a project_id-bearing ref"))?;
+                .ok_or_else(|| {
+                    anyhow!("WriteSemanticEdge DESCRIBES requires a project_id-bearing ref")
+                })?;
             let mut metadata = BTreeMap::new();
             metadata.insert("source_arc".to_string(), ctx.meta.arc_id.clone());
             if !note.is_empty() {

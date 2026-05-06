@@ -179,7 +179,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_reembed",
         category: ToolCategory::Transcripts,
         summary: "Request an embedding rebuild for a configured route.",
-        when_to_use: "Use after changing embedding routes or provider dimensions. E3 performs the rebuild. Use max_entities for progressive refills. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
+        when_to_use: "Use after changing embedding routes or provider dimensions. E3 performs the rebuild. Routes include knowledge, code, docs, git_message, notes, threads, and guarded transcripts. Use max_entities for progressive refills. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
         example: None,
     },
     ToolDoc {
@@ -515,8 +515,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_resume",
         category: ToolCategory::Orchestration,
-        summary: "Continue an existing session with a follow-up.",
-        when_to_use: "Use for follow-ups on an existing bro session. Do not use `bro_exec` again when you need continuity. Named bro targeting auto-resolves the session ID. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
+        summary: "Continue an existing session with a follow-up. Single-flight per provider session.",
+        when_to_use: "Use for follow-ups on an existing bro session. Do not use `bro_exec` again when you need continuity. Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. Named bro targeting auto-resolves the session ID. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
         example: Some(
             r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#,
         ),
@@ -546,7 +546,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_broadcast",
         category: ToolCategory::Orchestration,
         summary: "Send the same prompt to every team member.",
-        when_to_use: "Ensemble work. Follow with `bro_when_all` (deliberation) or `bro_when_any` (race). Interleave with individual `bro_resume` for cross-pollination between rounds.",
+        when_to_use: "Ensemble work. Follow with `bro_when_all` (deliberation) or `bro_when_any` (race). Resumed members are single-flight like `bro_resume`; wait or cancel a member's current task before broadcasting another turn to that same session. Interleave with individual `bro_resume` for cross-pollination between rounds.",
         example: None,
     },
     ToolDoc {

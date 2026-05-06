@@ -422,9 +422,9 @@ Dispatch agent tasks to Claude, GLM, DeepSeek, Inception, Codex, Copilot, Vibe, 
 | Tool | Description |
 |---|---|
 | `bro_exec` | Launch an agent task. Returns `{taskId, sessionId}` immediately. |
-| `bro_resume` | Resume a previous agent session with a follow-up prompt. |
+| `bro_resume` | Resume a previous agent session with a follow-up prompt. Single-flight per provider session: wait or cancel the prior task before resuming the same session again. |
 | `bro_wait` / `bro_when_all` / `bro_when_any` | Block until one / all / first task(s) complete. Emits MCP progress notifications (client-echoed `progressToken`) with a multi-lane activity snapshot every 15s. |
-| `bro_broadcast` | Send the same prompt to every team member. |
+| `bro_broadcast` | Send the same prompt to every team member. Resumed members obey the same single-flight session rule as `bro_resume`. |
 | `bro_status` | Non-blocking progress check. |
 | `bro_cancel` | Send SIGTERM to a running task. |
 | `bro_dashboard` | List recent tasks and sessions. |

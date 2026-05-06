@@ -9,7 +9,7 @@ use crate::edge_index::EdgeIndex;
 use crate::entity_loader;
 use crate::entity_ref::EntityRef;
 use crate::mcp_tools::find_paths::{render_node, render_path};
-use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache};
+use crate::path_cache::{CachedPath, PathCache, PROCESS_SESSION_KEY};
 use crate::providers::ProviderContext;
 
 const ENTITY_CAP: usize = 50;
@@ -149,10 +149,7 @@ fn intra_bundle_edges(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<serde_j
 /// Direct edges (1-hop) already surface in `intra_bundle_edges`; this fills
 /// in the structurally more common case where bundled chunks aren't
 /// directly connected but share an originating event.
-fn intra_bundle_convergences(
-    edge_index: &EdgeIndex,
-    refs: &[EntityRef],
-) -> Vec<serde_json::Value> {
+fn intra_bundle_convergences(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<serde_json::Value> {
     use std::collections::HashMap;
     // For each ref, gather the set of (neighbor_ref, edge_kind, direction)
     // tuples reachable in one hop. Direction lets us distinguish the source
@@ -182,9 +179,8 @@ fn intra_bundle_convergences(
                 None => continue,
             };
             // Index B's neighbors by ref for O(1) intersection lookup.
-            let b_index: HashMap<&EntityRef, Vec<&Neighbor>> = b_neighbors
-                .iter()
-                .fold(HashMap::new(), |mut acc, n| {
+            let b_index: HashMap<&EntityRef, Vec<&Neighbor>> =
+                b_neighbors.iter().fold(HashMap::new(), |mut acc, n| {
                     acc.entry(&n.0).or_default().push(n);
                     acc
                 });

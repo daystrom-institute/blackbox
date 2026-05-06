@@ -345,7 +345,10 @@ impl CouncilState {
     }
 
     pub fn write_frame(&self, envelope_id: &str, body: &str) -> Result<()> {
-        let path = self.storage_path.join("frames").join(format!("{envelope_id}.txt"));
+        let path = self
+            .storage_path
+            .join("frames")
+            .join(format!("{envelope_id}.txt"));
         atomic_write(&path, body.as_bytes())
     }
 
@@ -463,10 +466,7 @@ fn restore_council(dir: &Path) -> Result<CouncilState> {
             }
             match serde_json::from_str::<CouncilPost>(&line) {
                 Ok(p) => posts.push(p),
-                Err(e) => tracing::warn!(
-                    "council {}: skip malformed post line: {e}",
-                    session.id
-                ),
+                Err(e) => tracing::warn!("council {}: skip malformed post line: {e}", session.id),
             }
         }
     }
