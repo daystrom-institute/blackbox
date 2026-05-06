@@ -47,7 +47,7 @@ fn default_model() -> String {
 }
 
 fn default_rate_limit() -> u32 {
-    100
+    2_000
 }
 
 fn default_endpoint() -> String {

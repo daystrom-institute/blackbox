@@ -304,6 +304,8 @@ pub struct ReembedParams {
     pub route: String,
     #[serde(default)]
     pub include_transcripts: bool,
+    #[serde(default)]
+    pub max_entities: Option<usize>,
 }
 
 pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<String> {
@@ -314,10 +316,11 @@ pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<Strin
         );
     }
     let route = p.route.trim().to_string();
+    let max_entities = p.max_entities;
     tokio::spawn(async move {
-        match enqueue_reembed_routes(&state, &buckets) {
+        match enqueue_reembed_routes(&state, &buckets, max_entities) {
             Ok(enqueued) => {
-                tracing::info!(route = %route, enqueued, "embedding rebuild queue refill completed");
+                tracing::info!(route = %route, ?max_entities, enqueued, "embedding rebuild queue refill completed");
             }
             Err(err) => {
                 tracing::warn!(route = %route, error = %err, "embedding rebuild queue refill failed");
@@ -327,6 +330,7 @@ pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<Strin
     Ok(serde_json::to_string_pretty(&json!({
         "status": "ok",
         "route": p.route,
+        "max_entities": p.max_entities,
         "message": "rebuild queue refill started; final enqueue count will be logged",
     }))?)
 }
@@ -356,10 +360,17 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
         })
 }
 
-fn enqueue_reembed_routes(state: &Arc<SharedState>, buckets: &[Bucket]) -> Result<usize> {
+fn enqueue_reembed_routes(
+    state: &Arc<SharedState>,
+    buckets: &[Bucket],
+    max_entities: Option<usize>,
+) -> Result<usize> {
     let mut enqueued = 0usize;
     if buckets.contains(&Bucket::Knowledge) {
         for entry in state.kb.read().all_entries() {
+            if limit_reached(max_entities, enqueued) {
+                return Ok(enqueued);
+            }
             let entity_id = crate::index::knowledge_entity_id(&entry.id);
             let chunk_hash = crate::index::knowledge_chunk_hash(entry);
             crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash);
@@ -368,17 +379,21 @@ fn enqueue_reembed_routes(state: &Arc<SharedState>, buckets: &[Bucket]) -> Resul
     }
     if buckets.contains(&Bucket::Notes) {
         for note in state.notes.read().all() {
+            if limit_reached(max_entities, enqueued) {
+                return Ok(enqueued);
+            }
             crate::embed_queue::enqueue_note(note);
             enqueued += 1;
         }
     }
     let doc_types = reembed_index_doc_types(buckets);
     if !doc_types.is_empty() {
+        let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
         let docs = state
             .idx
             .read()
-            .embedding_source_docs_for_doc_types(&doc_types)?;
-        enqueued += enqueue_reembed_index_docs(buckets, &docs);
+            .embedding_source_docs_for_doc_types(&doc_types, remaining)?;
+        enqueued += enqueue_reembed_index_docs(buckets, &docs, remaining);
     }
     Ok(enqueued)
 }
@@ -389,9 +404,16 @@ fn count_reembed_index_docs(buckets: &[Bucket], docs: &[EmbeddingSourceDoc]) -> 
         .count()
 }
 
-fn enqueue_reembed_index_docs(buckets: &[Bucket], docs: &[EmbeddingSourceDoc]) -> usize {
+fn enqueue_reembed_index_docs(
+    buckets: &[Bucket],
+    docs: &[EmbeddingSourceDoc],
+    max_entities: Option<usize>,
+) -> usize {
     let mut enqueued = 0usize;
     for doc in docs {
+        if limit_reached(max_entities, enqueued) {
+            break;
+        }
         let Some(bucket) = reembed_index_doc_bucket(doc) else {
             continue;
         };
@@ -432,6 +454,10 @@ fn enqueue_reembed_index_docs(buckets: &[Bucket], docs: &[EmbeddingSourceDoc]) -
         }
     }
     enqueued
+}
+
+fn limit_reached(max_entities: Option<usize>, enqueued: usize) -> bool {
+    max_entities.is_some_and(|max| enqueued >= max)
 }
 
 fn reembed_index_doc_types(buckets: &[Bucket]) -> Vec<&'static str> {
@@ -568,6 +594,46 @@ code = "ollama"
     fn reembed_empty_index_doc_enumeration_counts_zero() {
         assert_eq!(count_reembed_index_docs(&[Bucket::Code], &[]), 0);
         assert_eq!(count_reembed_index_docs(&Bucket::ALL, &[]), 0);
+    }
+
+    #[test]
+    fn reembed_index_enqueue_honors_max_entities() {
+        let docs = vec![
+            EmbeddingSourceDoc {
+                doc_type: "transcript".into(),
+                account: "claude".into(),
+                session_id: "s1".into(),
+                project: String::new(),
+                file_path: String::new(),
+                byte_offset: 0,
+                chunk_kind: String::new(),
+                language: None,
+                symbol: None,
+                symbol_exact: None,
+                chunk_hash: Some("h1".into()),
+                entity_id: None,
+                content: "one".into(),
+            },
+            EmbeddingSourceDoc {
+                doc_type: "transcript".into(),
+                account: "claude".into(),
+                session_id: "s2".into(),
+                project: String::new(),
+                file_path: String::new(),
+                byte_offset: 0,
+                chunk_kind: String::new(),
+                language: None,
+                symbol: None,
+                symbol_exact: None,
+                chunk_hash: Some("h2".into()),
+                entity_id: None,
+                content: "two".into(),
+            },
+        ];
+        assert_eq!(
+            enqueue_reembed_index_docs(&[Bucket::Transcripts], &docs, Some(1)),
+            1
+        );
     }
 
     #[test]

@@ -270,6 +270,7 @@ impl TranscriptIndex {
     pub(crate) fn embedding_source_docs_for_doc_types(
         &self,
         doc_types: &[&str],
+        max_docs: Option<usize>,
     ) -> Result<Vec<EmbeddingSourceDoc>> {
         if doc_types.is_empty() {
             return Ok(Vec::new());
@@ -296,7 +297,10 @@ impl TranscriptIndex {
                     .collect(),
             ))
         };
-        let limit = searcher.search(&*query, &Count)?;
+        let limit = match max_docs {
+            Some(max_docs) => max_docs,
+            None => searcher.search(&*query, &Count)?,
+        };
         if limit == 0 {
             return Ok(Vec::new());
         }

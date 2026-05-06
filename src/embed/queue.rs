@@ -448,17 +448,26 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
             }
             acc
         };
-        // Sequential rate-limit acquire (one acquire per batch, total
-        // across all in-flight) — preserves the per-minute cap semantic
-        // even when we issue concurrent requests.
         if let Some(limiter) = &mut rate_limiter {
-            for batch in &batches {
-                limiter.acquire(batch.len()).await;
+            for batch in batches {
+                limiter.acquire(1).await;
+                let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
+                let result = spec.provider.embed_batch(&texts).await;
+                process_batch_outcome(
+                    &spec,
+                    &mut retry_batch,
+                    &mut retry_attempts,
+                    &mut backoff,
+                    batch,
+                    result,
+                )
+                .await;
             }
+            continue;
         }
-        // Dispatch all batches concurrently. Single-batch path (the common
-        // case after the queue drains) is identical to the prior behavior;
-        // the multi-batch path overlaps voyage HTTP latency.
+        // Dispatch all unthrottled batches concurrently. The rate-limited
+        // path sends each batch as soon as its permit is available; otherwise
+        // a worker can look stuck while it waits for permits for later batches.
         let provider = &spec.provider;
         let mut results: Vec<(Vec<EmbedRequest>, anyhow::Result<Vec<Vec<f32>>>)> = {
             let futures = batches
@@ -608,10 +617,10 @@ const MAX_BATCH_DOCS: usize = 128;
 const MAX_BATCH_BYTES: usize = 100 * 1024;
 // Per-worker concurrency: we dispatch multiple full batches in parallel
 // before awaiting any of them. With 4 in-flight batches at ~1.5s each =
-// ~2.7 batches/sec/worker = ~21 RPM/worker. Across 6 routes that's well
-// under voyage's 2000 RPM ceiling. If you raise this, also lower it
-// further for routes that share the same provider+model partition to
-// avoid lock contention on persist_vectors.
+// ~2.7 batches/sec/worker = ~162 RPM/worker. Across 6 routes that's below
+// Voyage's 2000 RPM ceiling; MAX_BATCH_BYTES is the separate TPM guard.
+// If you raise this, also consider routes that share the same provider+model
+// partition to avoid lock contention on persist_vectors.
 const WORKER_CONCURRENCY: usize = 4;
 
 async fn collect_quiescent_batch(
@@ -928,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn token_bucket_counts_input_items() {
+    fn token_bucket_counts_requests() {
         let mut bucket = TokenBucket::new(3).unwrap();
         assert!(bucket.try_take_now(2));
         assert!(!bucket.try_take_now(2));

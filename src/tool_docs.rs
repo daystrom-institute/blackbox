@@ -179,7 +179,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_reembed",
         category: ToolCategory::Transcripts,
         summary: "Request an embedding rebuild for a configured route.",
-        when_to_use: "Use after changing embedding routes or provider dimensions. E3 performs the rebuild. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
+        when_to_use: "Use after changing embedding routes or provider dimensions. E3 performs the rebuild. Use max_entities for progressive refills. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
         example: None,
     },
     ToolDoc {
@@ -953,7 +953,9 @@ pub fn render_markdown() -> String {
     out.push_str("**For any task that touches the codebase, prior decisions, or conversational history, run this five-step sequence before falling back to filesystem search or training-prior answers:**\n\n");
     out.push_str("```\n");
     out.push_str("1. bbox_describe_schema           # orient — entity types + edge families\n");
-    out.push_str("2. bbox_hybrid_search(q, k=5)     # seeds — mixed-modal results with notable_edges\n");
+    out.push_str(
+        "2. bbox_hybrid_search(q, k=5)     # seeds — mixed-modal results with notable_edges\n",
+    );
     out.push_str("3. bbox_inspect_entity(ref)       # confirm — properties + edges in one call\n");
     out.push_str("4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS chains (when multi-hop)\n");
     out.push_str("5. bbox_bundle_evidence(...)      # answer — package refs + path_ids\n");
