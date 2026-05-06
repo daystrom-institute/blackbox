@@ -34,6 +34,92 @@ AS-D4 sits off the agent-system critical path.
 
 ---
 
+## Implementation status — 2026-05-06
+
+Badgey core is implemented on `agent-system-duplex` through the wrapper,
+registry, proposal, action-journal, lifecycle-tool, agent-adapter, and
+IaC/eval scaffold layers. The branch passed full `cargo test`
+(`945 passed`) after rebasing on `origin/main`, and Claude review of the
+Badgey diff returned `NO BLOCKING FINDINGS`.
+
+Completed / materially satisfied:
+
+- **A0-core dependency:** agent-system substrate is present: agent
+  artifact kind, manifest validation/install, embedding bucket, agent
+  entity projection, MCP search/list/get/dispatch surface, and adapter
+  registry.
+- **D1:** Rust-level spawn helper accepts caller-provided task ids and
+  rejects duplicates; Badgey privileged dispatch uses it for sub-bros
+  and redispatch.
+- **B1a / P1 / P2 / I1:** Badgey and Badgey-scout brofile artifacts
+  exist under `examples/badgey/brofiles/` with bro-recursion filters and
+  functional persona lenses.
+- **B1b:** Badgey and Badgey-scout agent manifests exist under
+  `examples/badgey/agents/`; Badgey routes through the dedicated wrapper
+  adapter.
+- **B2 / B3 / B4:** Badgey ids/scopes/proposals/action journal types and
+  durable stores are implemented with transition checks, file locks, and
+  non-terminal listing for recovery.
+- **R1:** Thread-of-record event schemas are implemented and serialized
+  through structured notes (`exec`, `turn`, `path_cached`,
+  `scout_dispatched`, `subbro_spawned`, proposal events, disputes,
+  dismiss).
+- **W1 / W2 / W3 / W4 / W5 / W6:** Wrapper registry, exec/resume/dismiss,
+  strict command parser, per-instance resume queue, turn post-processor,
+  proposal apply/reject/retry, and privileged bg-action handling are
+  wired. Badgey exec waits for an observed provider session id and never
+  persists `provider_session_id="pending"` as a live instance.
+- **W7 partial:** Budget is durable and visible as a numeric advisory
+  counter (`budget_extended` events, scope-bind/status exposure). Hard
+  token enforcement is not implemented.
+- **M1:** `badgey_exec`, `badgey_resume`, `badgey_ask`,
+  `badgey_dismiss`, `badgey_status`, `badgey_list`, and the
+  `bro_agent_dispatch(agent="badgey")` adapter are wired.
+- **M2 partial:** `badgey_scout` creates durable scout ids/events and the
+  wrapper dispatches emitted `bg-action-spawn-subbro` actions. `collect`
+  waits for every spawned task id to have a done note unless an explicit
+  aggregate `scout_done` / `subbro_done` event exists.
+- **M3 / M4 partial:** `badgey_triage_inbox` and `badgey_close_loops`
+  exist, emit structured proposal/classification shapes, and ship cron
+  artifacts. They are useful first cuts, not full autonomous arcs.
+- **P3:** Scope-bind includes badgey id, thread, project, current time,
+  queue status, recent cached paths, recent proposals, and budget.
+- **R2 / H2 partial:** Startup replay restores live registry state from
+  thread notes, skips unobserved `pending` sessions with surprise notes,
+  and reconciles non-terminal journal/proposal entries conservatively.
+- **C1 / C2 / C3 / C4 base:** Answer/teach/narrated/proposal behavior is
+  represented through persona + wrapper mechanics; proposal drafts route
+  through the gated ProposalStore and apply path. This is capability
+  plumbing, not a quality guarantee.
+- **E1 / E2 / I2 partial:** Badgey eval checker, nine query manifests,
+  cron/workflow/packet examples, and parse/shape tests are present.
+- **H3 partial:** `badgey_status` exposes queue/proposal/observability
+  counters and learning-loop eligibility.
+
+Known remaining work:
+
+- **A0-distill / C5:** The bounded learning loop is not a full
+  threshold-driven lens/propose-agent system. Status exposes eligibility;
+  Badgey must still draft and user-gate any lens/brofile proposal.
+- **W7:** Token-budget accounting and hard enforcement remain future
+  work. The current implementation records extensions and exposes an
+  advisory budget.
+- **M2:** There is no long-running independent scout monitor/aggregator
+  loop beyond note/event collection and wrapper-dispatched sub-bros.
+- **M3 / M4 / E3 / E4:** The cron/workflow examples are installable
+  scaffolds, not full nightly eval/baseline/regression engines.
+- **E1:** The eval suite has 3 manifests per mode, not the roughly 20 per
+  mode described below.
+- **H3:** Observability is local to `badgey_status`; there are no
+  per-scope dashboards, spend rollups, or trend histories yet.
+
+Interpretation: the branch is positioned to use Badgey as a real
+wrapper-managed consultant and to build the remaining quality/automation
+loops incrementally. The original phase text below remains the target
+spec; the bullets above describe what is actually landed now.
+
+---
+
 ## Substrate dependencies
 
 ### Phase A0-core — Agent dispatch infrastructure (upstream)
