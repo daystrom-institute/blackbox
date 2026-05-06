@@ -732,12 +732,13 @@ impl BlackboxServer {
     )]
     fn bbox_search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
         Self::run("bbox_search", || {
-            let mut idx = self.state.idx.write();
-            if idx.is_empty() {
-                idx.build_index(false)
+            if self.state.idx.read().is_empty() {
+                self.state
+                    .idx
+                    .write()
+                    .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            drop(idx);
             self.state.idx.read().search(&p)
         })
     }
@@ -748,12 +749,18 @@ impl BlackboxServer {
     )]
     fn bbox_hybrid_search(&self, Parameters(p): Parameters<HybridSearchParams>) -> CallToolResult {
         Self::run("bbox_hybrid_search", || {
-            let mut idx = self.state.idx.write();
-            if idx.is_empty() {
-                idx.build_index(false)
+            // Fast path: read-lock the index to check emptiness. Only escalate
+            // to a write lock if we actually need to build_index. The previous
+            // unconditional write lock blocked every search behind the
+            // auto-reindex thread's writer, adding 5-30 seconds of latency
+            // to interactive queries during reindex windows.
+            if self.state.idx.read().is_empty() {
+                self.state
+                    .idx
+                    .write()
+                    .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            drop(idx);
             let provider_ctx = ProviderContext::new(&self.state);
             mcp_tools::hybrid_search::hybrid_search(
                 &self.state.idx.read(),
@@ -773,12 +780,13 @@ impl BlackboxServer {
         Parameters(p): Parameters<DiscoverSeedParams>,
     ) -> CallToolResult {
         Self::run("bbox_discover_seed_entities", || {
-            let mut idx = self.state.idx.write();
-            if idx.is_empty() {
-                idx.build_index(false)
+            if self.state.idx.read().is_empty() {
+                self.state
+                    .idx
+                    .write()
+                    .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            drop(idx);
             let provider_ctx = ProviderContext::new(&self.state);
             mcp_tools::discover_seed::discover_seed_entities(
                 &self.state.idx.read(),

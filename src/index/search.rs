@@ -343,11 +343,12 @@ impl TranscriptIndex {
                 self.fields.path_tokens,
             ],
         );
-        // Boost path-token matches over generic content matches: a query
-        // mentioning `voyage` should preferentially surface files literally
-        // named voyage.rs over arbitrary text mentions of "voyage".
-        qp.set_field_boost(self.fields.path_tokens, 2.5);
-        qp.set_field_boost(self.fields.symbol, 2.0);
+        // Modest boost for path/symbol matches: a query mentioning `voyage`
+        // should preferentially surface files literally named voyage.rs over
+        // arbitrary text mentions of "voyage", but not so aggressively that
+        // commits whose subject also matches get pushed off the page.
+        qp.set_field_boost(self.fields.path_tokens, 1.5);
+        qp.set_field_boost(self.fields.symbol, 1.5);
         let text_query = qp.parse_query(&query_str)?;
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
             vec![(Occur::Must, text_query.box_clone())];

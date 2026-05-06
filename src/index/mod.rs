@@ -11,7 +11,7 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g2-path-tokens";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g3-commit-subject-tokens";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.

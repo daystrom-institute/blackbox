@@ -102,7 +102,10 @@ pub(crate) fn hybrid_search_typed(
         .limit
         .unwrap_or(DEFAULT_LIMIT as u64)
         .min(MAX_LIMIT as u64) as usize;
-    let fetch = DEFAULT_FETCH.max(limit * 4);
+    // Widened to limit*8 (was limit*4) so per-file collapse has enough
+    // depth to surface `limit` distinct files even when the top-N is
+    // dominated by multiple chunks of the same hot file.
+    let fetch = DEFAULT_FETCH.max(limit * 8);
     let (bm25_weight, vector_weight) = fusion_weights(p.vector_weight);
     let bm25_hits = index.hybrid_bm25_hits(query, fetch, p.doc_type.as_deref())?;
     let mut features = features_from_bm25(&bm25_hits);
@@ -185,6 +188,30 @@ pub(crate) fn hybrid_search_typed(
             .total_cmp(&a.score)
             .then_with(|| a.entity_id.cmp(&b.entity_id))
     });
+    // Per-file collapse: keep only the best-scoring chunk per file. Without
+    // this the top-N gets dominated by 3-5 chunks of the same .rs file when
+    // the query matches multiple symbols in one file, starving the user of
+    // breadth. Daystrom-mk2's AgenticTools used this pattern to lift recall
+    // from 23% to 97% vs naive rerank. Keys off the (project_id,
+    // rel_path_hash) prefix of project_file refs; commits / transcripts /
+    // knowledge entities are not deduped (different files entirely).
+    let mut seen_files = std::collections::HashSet::<String>::new();
+    results.retain(|hit| {
+        let Some(key) = file_dedup_key(&hit.entity_id) else {
+            return true;
+        };
+        seen_files.insert(key)
+    });
+    // Modal diversification: when the top-`limit` would be entirely
+    // doc_section (or entirely code_block, or entirely commits), pull the
+    // highest-scoring entry of each missing kind from the rest of `results`
+    // and substitute it for the lowest-scoring kept entry of the dominant
+    // kind. Aim for at least 1 of each present (code_block, doc_section,
+    // git_message) when the fetch set has them. Mirrors Daystrom-mk2
+    // AgenticTools' diversity-by-type pass: a query like
+    // "triad implementation" should surface BOTH the design markdown and
+    // the .ex implementation file in top-N, not docs only.
+    diversify_by_chunk_kind(&mut results, limit);
     results.truncate(limit);
     for (idx, result) in results.iter_mut().enumerate() {
         result.rank = idx + 1;
@@ -197,6 +224,68 @@ pub(crate) fn hybrid_search_typed(
         vector_status,
         degraded,
     })
+}
+
+/// Returns a per-file dedup key when `entity_id` refers to a project_file
+/// chunk: `project_file:<proj>:<rel_path_hash>` — i.e. the file path identity
+/// minus chunk_hash + occurrence_idx. Returns `None` for any other entity
+/// type so commits / transcripts / knowledge entries are passed through
+/// without being collapsed against each other.
+fn file_dedup_key(entity_id: &str) -> Option<String> {
+    let mut parts = entity_id.split(':');
+    if parts.next()? != "project_file" {
+        return None;
+    }
+    let proj = parts.next()?;
+    let rel_path_hash = parts.next()?;
+    Some(format!("project_file:{proj}:{rel_path_hash}"))
+}
+
+/// Promotes the highest-scoring entry of each chunk_kind into the top-`limit`
+/// window so the surface returned to the caller covers code + docs + commits
+/// when the fetch set has them. Approach: keep results sorted by score, walk
+/// from the back of the kept window swapping the lowest-ranked entry of the
+/// dominant kind out for the highest-ranked entry of an absent kind sitting
+/// just below the cutoff. Conservative — never displaces an entry of a kind
+/// that's already underrepresented.
+fn diversify_by_chunk_kind(results: &mut [HybridResult], limit: usize) {
+    if results.len() <= limit {
+        return;
+    }
+    // Kinds we deliberately balance. `None` chunk_kind is left alone (it's
+    // mostly transcripts and synthetic entities — pure-vector fallback hits
+    // that don't fit into the modal taxonomy).
+    const TARGET_KINDS: &[&str] = &["code_block", "doc_section", "git_message"];
+    for &target in TARGET_KINDS {
+        let already_in_top = results[..limit]
+            .iter()
+            .any(|r| r.chunk_kind.as_deref() == Some(target));
+        if already_in_top {
+            continue;
+        }
+        // Find the best below-cutoff entry of the missing kind.
+        let Some(promote_idx) = results[limit..]
+            .iter()
+            .position(|r| r.chunk_kind.as_deref() == Some(target))
+            .map(|i| limit + i)
+        else {
+            continue; // not present in fetch set; skip
+        };
+        // Find the displaceable kept entry: the lowest-ranked one whose
+        // kind is over-represented (i.e. not the target and not the only
+        // representative of its kind in the kept window).
+        let mut kind_counts = std::collections::HashMap::<Option<&str>, usize>::new();
+        for r in &results[..limit] {
+            *kind_counts.entry(r.chunk_kind.as_deref()).or_default() += 1;
+        }
+        let displaceable = (0..limit).rev().find(|&i| {
+            let kind = results[i].chunk_kind.as_deref();
+            kind != Some(target) && kind_counts.get(&kind).copied().unwrap_or(0) > 1
+        });
+        if let Some(displace_idx) = displaceable {
+            results.swap(displace_idx, promote_idx);
+        }
+    }
 }
 
 fn vector_ranked_lists(

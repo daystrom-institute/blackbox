@@ -141,6 +141,14 @@ pub(crate) fn build_commit_doc(
     doc.add_text(f.chunk_kind, "git_message");
     doc.add_text(f.entity_id, &entity_id);
     doc.add_text(f.content, &message);
+    // Mirror the commit subject into path_tokens so commits get the same
+    // 1.5x boost as project-file path matches when the query mentions
+    // subject keywords. Without this, the path_tokens boost asymmetrically
+    // pushes project_file results above commits whose subject also matches.
+    let subject = message.lines().next().unwrap_or("").trim();
+    if !subject.is_empty() {
+        doc.add_text(f.path_tokens, subject);
+    }
     doc.add_text(f.chunk_hash, commit_message_hash(&message));
     doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
     doc.add_text(f.repo_id, repo_id);
