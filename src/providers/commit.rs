@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -20,7 +20,7 @@ impl InspectableEntityProvider for CommitProvider {
         matches!(r, EntityRef::Commit { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::Commit { repo_id, sha } = r else {
             unreachable!();
@@ -28,6 +28,14 @@ impl InspectableEntityProvider for CommitProvider {
         let mut properties = BTreeMap::new();
         properties.insert("repo_id".into(), repo_id.clone());
         properties.insert("sha".into(), sha.clone());
+        if let Some(state) = ctx.state() {
+            let indexed = state
+                .idx
+                .read()
+                .entity_properties(&r.to_string())?
+                .ok_or_else(|| anyhow::anyhow!("commit entity {r} not found"))?;
+            properties.extend(indexed);
+        }
         Ok(base_view(r, properties))
     }
 
@@ -71,11 +79,19 @@ impl InspectableEntityProvider for CommitProvider {
         )
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::Commit { sha, .. } = r else {
             return None;
         };
         let short = sha.chars().take(7).collect::<String>();
+        if let Some(state) = ctx.state() {
+            if let Ok(Some(properties)) = state.idx.read().entity_properties(&r.to_string()) {
+                if let Some(preview) = properties.get("content_preview") {
+                    let subject = preview.lines().next().unwrap_or(preview);
+                    return Some(truncate_label(format!("{short} {subject}")));
+                }
+            }
+        }
         Some(truncate_label(short))
     }
 }

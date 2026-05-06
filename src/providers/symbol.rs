@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -20,7 +20,7 @@ impl InspectableEntityProvider for SymbolProvider {
         matches!(r, EntityRef::Symbol { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::Symbol {
             project_id,
@@ -34,6 +34,14 @@ impl InspectableEntityProvider for SymbolProvider {
         properties.insert("project_id".into(), project_id.clone());
         properties.insert("qualified_name".into(), qualified_name.clone());
         properties.insert("defn_hash".into(), defn_hash.clone());
+        if let Some(state) = ctx.state() {
+            let indexed = state
+                .idx
+                .read()
+                .entity_properties(&r.to_string())?
+                .ok_or_else(|| anyhow::anyhow!("symbol entity {r} not found"))?;
+            properties.extend(indexed);
+        }
         Ok(base_view(r, properties))
     }
 
@@ -80,7 +88,7 @@ impl InspectableEntityProvider for SymbolProvider {
         )
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, _ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::Symbol { qualified_name, .. } = r else {
             return None;
         };

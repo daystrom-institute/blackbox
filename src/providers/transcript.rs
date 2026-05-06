@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -20,7 +20,7 @@ impl InspectableEntityProvider for TranscriptProvider {
         matches!(r, EntityRef::Transcript { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::Transcript {
             provider,
@@ -36,6 +36,14 @@ impl InspectableEntityProvider for TranscriptProvider {
         properties.insert("session_id".into(), session_id.clone());
         properties.insert("line_offset".into(), line_offset.to_string());
         properties.insert("event_idx".into(), event_idx.to_string());
+        if let Some(state) = ctx.state() {
+            let indexed = state
+                .idx
+                .read()
+                .transcript_properties(provider, session_id, *line_offset)?
+                .ok_or_else(|| anyhow::anyhow!("transcript entity {r} not found"))?;
+            properties.extend(indexed);
+        }
         Ok(base_view(r, properties))
     }
 
@@ -71,7 +79,7 @@ impl InspectableEntityProvider for TranscriptProvider {
         )
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::Transcript {
             provider,
             session_id,
@@ -81,6 +89,20 @@ impl InspectableEntityProvider for TranscriptProvider {
         else {
             return None;
         };
+        if let Some(state) = ctx.state() {
+            if let Ok(Some(properties)) =
+                state
+                    .idx
+                    .read()
+                    .transcript_properties(provider, session_id, *line_offset)
+            {
+                if let Some(role) = properties.get("role") {
+                    if let Some(preview) = properties.get("content_preview") {
+                        return Some(truncate_label(format!("{role}: {preview}")));
+                    }
+                }
+            }
+        }
         Some(truncate_label(format!(
             "{provider}:{session_id}@{line_offset}"
         )))

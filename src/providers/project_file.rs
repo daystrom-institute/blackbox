@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -20,7 +20,7 @@ impl InspectableEntityProvider for ProjectFileProvider {
         matches!(r, EntityRef::ProjectFile { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::ProjectFile {
             project_id,
@@ -36,6 +36,14 @@ impl InspectableEntityProvider for ProjectFileProvider {
         properties.insert("rel_path_hash".into(), rel_path_hash.clone());
         properties.insert("chunk_hash".into(), chunk_hash.clone());
         properties.insert("occurrence_idx".into(), occurrence_idx.to_string());
+        if let Some(state) = ctx.state() {
+            let indexed = state
+                .idx
+                .read()
+                .entity_properties(&r.to_string())?
+                .ok_or_else(|| anyhow::anyhow!("project file entity {r} not found"))?;
+            properties.extend(indexed);
+        }
         Ok(base_view(r, properties))
     }
 
@@ -105,7 +113,7 @@ impl InspectableEntityProvider for ProjectFileProvider {
         )
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::ProjectFile {
             rel_path_hash,
             occurrence_idx,
@@ -114,6 +122,16 @@ impl InspectableEntityProvider for ProjectFileProvider {
         else {
             return None;
         };
+        if let Some(state) = ctx.state() {
+            if let Ok(Some(properties)) = state.idx.read().entity_properties(&r.to_string()) {
+                if let Some(path) = properties.get("file_path") {
+                    return Some(truncate_label(path));
+                }
+                if let Some(preview) = properties.get("content_preview") {
+                    return Some(truncate_label(preview));
+                }
+            }
+        }
         Some(truncate_label(format!("{rel_path_hash}#{occurrence_idx}")))
     }
 }

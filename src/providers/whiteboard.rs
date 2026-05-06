@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -20,13 +20,23 @@ impl InspectableEntityProvider for WhiteboardProvider {
         matches!(r, EntityRef::Whiteboard { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::Whiteboard { board_id } = r else {
             unreachable!();
         };
         let mut properties = BTreeMap::new();
         properties.insert("board_id".into(), board_id.clone());
+        if let Some(state) = ctx.state() {
+            let board = state
+                .whiteboards
+                .get(board_id)
+                .ok_or_else(|| anyhow::anyhow!("whiteboard entity {board_id} not found"))?;
+            let board = board.read();
+            properties.insert("topic".into(), board.topic.clone());
+            properties.insert("project".into(), board.project.clone());
+            properties.insert("phase".into(), format!("{:?}", board.phase));
+        }
         Ok(base_view(r, properties))
     }
 
@@ -61,10 +71,15 @@ impl InspectableEntityProvider for WhiteboardProvider {
         )
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::Whiteboard { board_id } = r else {
             return None;
         };
+        if let Some(state) = ctx.state() {
+            if let Some(board) = state.whiteboards.get(board_id) {
+                return Some(truncate_label(&board.read().topic));
+            }
+        }
         Some(truncate_label(board_id))
     }
 }

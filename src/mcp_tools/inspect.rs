@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::edge_index::{Edge, EdgeIndex};
 use crate::entity_ref::EntityRef;
-use crate::providers::{self, EntityView, Neighborhood};
+use crate::providers::{self, EntityView, Neighborhood, ProviderContext};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InspectEntityParams {
@@ -105,14 +105,10 @@ pub fn similar_refs(edge_index: &EdgeIndex, r: &EntityRef) -> Vec<String> {
 
 pub fn inspect_entity(
     p: &InspectEntityParams,
+    ctx: &ProviderContext<'_>,
     r: &EntityRef,
     edge_index: &EdgeIndex,
-    mut extra_properties: BTreeMap<String, String>,
-    exists: bool,
 ) -> Result<String> {
-    if !exists {
-        return Ok(not_found(r, similar_refs(edge_index, r)));
-    }
     let direction = match InspectDirection::parse(p.direction.as_deref()) {
         Ok(direction) => direction,
         Err(err) => return Ok(bad_input(&p.entity_ref, err.to_string())),
@@ -121,8 +117,10 @@ pub fn inspect_entity(
     let per_type_limit = p.per_type_limit.unwrap_or(5);
     let edge_filter = parse_edge_filter(p.edge_types.as_deref());
     let provider = providers::provider_for(r.entity_type());
-    let mut entity = provider.get_entity(r)?;
-    entity.properties.append(&mut extra_properties);
+    let mut entity = match provider.get_entity(ctx, r) {
+        Ok(entity) => entity,
+        Err(_) => return Ok(not_found(r, similar_refs(edge_index, r))),
+    };
     let full_neighborhood = full_neighborhood(edge_index, r);
     entity.neighborhood = filtered_neighborhood(
         &full_neighborhood,
@@ -130,8 +128,8 @@ pub fn inspect_entity(
         edge_filter.as_ref(),
         per_type_limit,
     );
-    let rendered_forward = render_edges(&entity.neighborhood.forward, "out");
-    let rendered_reverse = render_edges(&entity.neighborhood.reverse, "in");
+    let rendered_forward = render_edges(ctx, &entity.neighborhood.forward, "out");
+    let rendered_reverse = render_edges(ctx, &entity.neighborhood.reverse, "in");
     let recommended = provider.recommended_next_hops(&entity, &full_neighborhood);
     let coverage = provider
         .expected_edge_families(r)
@@ -235,22 +233,26 @@ fn filter_and_limit(
     out
 }
 
-fn render_edges(edges: &[Edge], direction: &str) -> Vec<RenderedEdge> {
+pub(crate) fn render_edges(
+    ctx: &ProviderContext<'_>,
+    edges: &[Edge],
+    direction: &str,
+) -> Vec<RenderedEdge> {
     edges
         .iter()
         .map(|edge| RenderedEdge {
             kind: edge.kind.clone(),
             source: edge.source.to_string(),
-            source_label: compact_label(&edge.source),
+            source_label: compact_label(ctx, &edge.source),
             target: edge.target.to_string(),
-            target_label: compact_label(&edge.target),
+            target_label: compact_label(ctx, &edge.target),
             direction: direction.to_string(),
         })
         .collect()
 }
 
-fn compact_label(r: &EntityRef) -> Option<String> {
-    providers::provider_for(r.entity_type()).compact_label(r)
+pub(crate) fn compact_label(ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
+    providers::provider_for(r.entity_type()).compact_label(ctx, r)
 }
 
 fn render_properties(entity: &EntityView, property_mode: PropertyMode) -> BTreeMap<String, String> {

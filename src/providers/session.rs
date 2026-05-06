@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -20,7 +20,7 @@ impl InspectableEntityProvider for SessionProvider {
         matches!(r, EntityRef::Session { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::Session {
             provider,
@@ -32,6 +32,14 @@ impl InspectableEntityProvider for SessionProvider {
         let mut properties = BTreeMap::new();
         properties.insert("provider".into(), provider.clone());
         properties.insert("session_id".into(), session_id.clone());
+        if let Some(state) = ctx.state() {
+            let indexed = state
+                .idx
+                .read()
+                .session_properties(provider, session_id)?
+                .ok_or_else(|| anyhow::anyhow!("session entity {r} not found"))?;
+            properties.extend(indexed);
+        }
         Ok(base_view(r, properties))
     }
 
@@ -67,7 +75,7 @@ impl InspectableEntityProvider for SessionProvider {
         )
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::Session {
             provider,
             session_id,
@@ -76,6 +84,14 @@ impl InspectableEntityProvider for SessionProvider {
             return None;
         };
         let short = session_id.chars().take(12).collect::<String>();
+        if let Some(state) = ctx.state() {
+            if let Ok(Some(properties)) = state.idx.read().session_properties(provider, session_id)
+            {
+                if let Some(prompt) = properties.get("first_user_prompt") {
+                    return Some(truncate_label(prompt));
+                }
+            }
+        }
         Some(truncate_label(format!("session {provider}:{short}")))
     }
 }

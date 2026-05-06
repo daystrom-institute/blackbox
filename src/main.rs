@@ -66,6 +66,7 @@ use orchestration::{self as orch, TaskStore};
 use packets::{Packets, ScannerConfig};
 use pins::{AmbientPinQuery, PinParams, Pins};
 use projects::{ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry};
+use providers::ProviderContext;
 use threads::Threads;
 
 // ---------------------------------------------------------------------------
@@ -310,114 +311,6 @@ impl BlackboxServer {
         self.state.idx.write().delete_knowledge_entry(entry_id)?;
         embed_queue::tombstone_knowledge(&crate::index::knowledge_entity_id(entry_id));
         Ok(())
-    }
-
-    fn inspect_extra_properties(
-        &self,
-        r: &crate::entity_ref::EntityRef,
-    ) -> anyhow::Result<Option<BTreeMap<String, String>>> {
-        use crate::entity_ref::EntityRef;
-        match r {
-            EntityRef::Knowledge { id } => Ok(self.state.kb.read().entry(id).map(|entry| {
-                let mut properties = BTreeMap::new();
-                properties.insert("id".into(), entry.id.clone());
-                properties.insert("title".into(), entry.title.clone());
-                properties.insert("content".into(), entry.content.clone());
-                properties.insert("category".into(), format!("{:?}", entry.category));
-                properties.insert("scope".into(), format!("{:?}", entry.scope));
-                properties.insert("status".into(), format!("{:?}", entry.status));
-                properties.insert("approval".into(), format!("{:?}", entry.approval));
-                if let Some(project) = &entry.project {
-                    properties.insert("project".into(), project.clone());
-                }
-                if let Some(supersedes) = &entry.supersedes {
-                    properties.insert("supersedes".into(), supersedes.clone());
-                }
-                properties
-            })),
-            EntityRef::Thread { thread_id } => Ok(self
-                .state
-                .threads
-                .read()
-                .all()
-                .iter()
-                .find(|thread| thread.id == *thread_id)
-                .map(|thread| {
-                    let mut properties = BTreeMap::new();
-                    properties.insert("thread_id".into(), thread.id.clone());
-                    properties.insert("topic".into(), thread.topic.clone());
-                    properties.insert("project".into(), thread.project.clone());
-                    properties.insert("status".into(), format!("{:?}", thread.status));
-                    if let Some(name) = &thread.name {
-                        properties.insert("name".into(), name.clone());
-                    }
-                    properties
-                })),
-            EntityRef::Note { note_id } => Ok(self
-                .state
-                .notes
-                .read()
-                .all()
-                .iter()
-                .find(|note| note.id == *note_id)
-                .map(|note| {
-                    let mut properties = BTreeMap::new();
-                    properties.insert("note_id".into(), note.id.clone());
-                    properties.insert("kind".into(), format!("{:?}", note.kind));
-                    properties.insert("body".into(), note.body.clone());
-                    properties.insert("created_at".into(), note.created_at.clone());
-                    if let Some(task_id) = &note.task_id {
-                        properties.insert("task_id".into(), task_id.clone());
-                    }
-                    if let Some(thread_id) = &note.thread_id {
-                        properties.insert("thread_id".into(), thread_id.clone());
-                    }
-                    properties
-                })),
-            EntityRef::Whiteboard { board_id } => {
-                Ok(self.state.whiteboards.get(board_id).map(|board| {
-                    let board = board.read();
-                    let mut properties = BTreeMap::new();
-                    properties.insert("board_id".into(), board.id.clone());
-                    properties.insert("topic".into(), board.topic.clone());
-                    properties.insert("project".into(), board.project.clone());
-                    properties.insert("phase".into(), format!("{:?}", board.phase));
-                    properties
-                }))
-            }
-            EntityRef::Brofile { name } => {
-                Ok(
-                    orch::brofile::list_brofiles("global", &self.state.store_dir, None)
-                        .into_iter()
-                        .find(|brofile| brofile.name == *name)
-                        .map(|brofile| {
-                            let mut properties = BTreeMap::new();
-                            properties.insert("name".into(), brofile.name);
-                            properties.insert("provider".into(), brofile.provider.as_str().into());
-                            if let Some(model) = brofile.model {
-                                properties.insert("model".into(), model);
-                            }
-                            if let Some(effort) = brofile.effort {
-                                properties.insert("effort".into(), effort);
-                            }
-                            properties
-                        }),
-                )
-            }
-            _ => self.state.idx.read().entity_properties(&r.to_string()),
-        }
-    }
-
-    fn inspect_entity_exists(
-        &self,
-        r: &crate::entity_ref::EntityRef,
-        extra_properties: Option<&BTreeMap<String, String>>,
-    ) -> bool {
-        if extra_properties.is_some() {
-            return true;
-        }
-        let edge_index = self.state.edge_index.read();
-        !edge_index.forward_edges(r).is_empty() || !edge_index.reverse_edges(r).is_empty()
     }
 
     fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
@@ -897,14 +790,12 @@ impl BlackboxServer {
                     ));
                 }
             };
-            let extra_properties = self.inspect_extra_properties(&entity_ref)?;
-            let exists = self.inspect_entity_exists(&entity_ref, extra_properties.as_ref());
+            let provider_ctx = ProviderContext::new(&self.state);
             mcp_tools::inspect::inspect_entity(
                 &p,
+                &provider_ctx,
                 &entity_ref,
                 &self.state.edge_index.read(),
-                extra_properties.unwrap_or_default(),
-                exists,
             )
         })
     }

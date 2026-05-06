@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -20,13 +20,36 @@ impl InspectableEntityProvider for NoteProvider {
         matches!(r, EntityRef::Note { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::Note { note_id } = r else {
             unreachable!();
         };
         let mut properties = BTreeMap::new();
         properties.insert("note_id".into(), note_id.clone());
+        if let Some(state) = ctx.state() {
+            let notes = state.notes.read();
+            let note = notes
+                .all()
+                .into_iter()
+                .find(|note| note.id == *note_id)
+                .ok_or_else(|| anyhow::anyhow!("note entity {note_id} not found"))?;
+            properties.insert("kind".into(), format!("{:?}", note.kind));
+            properties.insert("body".into(), note.body.clone());
+            properties.insert("created_at".into(), note.created_at.clone());
+            if let Some(task_id) = &note.task_id {
+                properties.insert("task_id".into(), task_id.clone());
+            }
+            if let Some(session_id) = &note.session_id {
+                properties.insert("session_id".into(), session_id.clone());
+            }
+            if let Some(thread_id) = &note.thread_id {
+                properties.insert("thread_id".into(), thread_id.clone());
+            }
+            if let Some(project) = &note.project {
+                properties.insert("project".into(), project.clone());
+            }
+        }
         Ok(base_view(r, properties))
     }
 
@@ -69,10 +92,21 @@ impl InspectableEntityProvider for NoteProvider {
         )
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::Note { note_id } = r else {
             return None;
         };
+        if let Some(state) = ctx.state() {
+            if let Some(note) = state
+                .notes
+                .read()
+                .all()
+                .into_iter()
+                .find(|note| note.id == *note_id)
+            {
+                return Some(truncate_label(format!("{:?}: {}", note.kind, note.body)));
+            }
+        }
         Some(truncate_label(note_id))
     }
 }

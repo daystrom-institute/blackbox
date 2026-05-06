@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -20,13 +20,28 @@ impl InspectableEntityProvider for ThreadProvider {
         matches!(r, EntityRef::Thread { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::Thread { thread_id } = r else {
             unreachable!();
         };
         let mut properties = BTreeMap::new();
         properties.insert("thread_id".into(), thread_id.clone());
+        if let Some(state) = ctx.state() {
+            let threads = state.threads.read();
+            let thread = threads
+                .all()
+                .into_iter()
+                .find(|thread| thread.id == *thread_id)
+                .ok_or_else(|| anyhow::anyhow!("thread entity {thread_id} not found"))?;
+            properties.insert("topic".into(), thread.topic.clone());
+            properties.insert("project".into(), thread.project.clone());
+            properties.insert("status".into(), format!("{:?}", thread.status));
+            properties.insert("kind".into(), format!("{:?}", thread.kind));
+            if let Some(name) = &thread.name {
+                properties.insert("name".into(), name.clone());
+            }
+        }
         Ok(base_view(r, properties))
     }
 
@@ -76,10 +91,24 @@ impl InspectableEntityProvider for ThreadProvider {
         )
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::Thread { thread_id } = r else {
             return None;
         };
+        if let Some(state) = ctx.state() {
+            if let Some(thread) = state
+                .threads
+                .read()
+                .all()
+                .into_iter()
+                .find(|thread| thread.id == *thread_id)
+            {
+                if let Some(name) = &thread.name {
+                    return Some(truncate_label(name));
+                }
+                return Some(truncate_label(&thread.topic));
+            }
+        }
         Some(truncate_label(thread_id))
     }
 }

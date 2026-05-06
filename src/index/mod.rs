@@ -251,6 +251,71 @@ impl TranscriptIndex {
             return Ok(None);
         };
         let doc: TantivyDocument = searcher.doc(addr)?;
+        Ok(Some(self.properties_from_doc(&doc)))
+    }
+
+    pub(crate) fn session_properties(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        let searcher = self.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.session_id, session_id),
+            IndexRecordOption::Basic,
+        );
+        for (_score, addr) in
+            searcher.search(&query, &tantivy::collector::TopDocs::with_limit(100))?
+        {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            if optional_text(&doc, self.fields.account).as_deref() != Some(provider) {
+                continue;
+            }
+            let mut properties = self.properties_from_doc(&doc);
+            properties.insert("provider".into(), provider.to_string());
+            properties.insert("session_id".into(), session_id.to_string());
+            if let Some(content) = optional_text(&doc, self.fields.content) {
+                properties.insert(
+                    "first_user_prompt".into(),
+                    content.chars().take(300).collect(),
+                );
+            }
+            return Ok(Some(properties));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn transcript_properties(
+        &self,
+        provider: &str,
+        session_id: &str,
+        byte_offset: u64,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        let searcher = self.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.session_id, session_id),
+            IndexRecordOption::Basic,
+        );
+        for (_score, addr) in
+            searcher.search(&query, &tantivy::collector::TopDocs::with_limit(500))?
+        {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            if optional_text(&doc, self.fields.account).as_deref() != Some(provider) {
+                continue;
+            }
+            if optional_u64(&doc, self.fields.byte_offset) != Some(byte_offset) {
+                continue;
+            }
+            let mut properties = self.properties_from_doc(&doc);
+            properties.insert("provider".into(), provider.to_string());
+            properties.insert("session_id".into(), session_id.to_string());
+            properties.insert("line_offset".into(), byte_offset.to_string());
+            return Ok(Some(properties));
+        }
+        Ok(None)
+    }
+
+    fn properties_from_doc(&self, doc: &TantivyDocument) -> BTreeMap<String, String> {
         let mut properties = BTreeMap::new();
         for (name, field) in [
             ("doc_type", self.fields.doc_type),
@@ -263,16 +328,17 @@ impl TranscriptIndex {
             ("commit_sha", self.fields.commit_sha),
             ("commit_author_name", self.fields.commit_author_name),
             ("commit_author_email", self.fields.commit_author_email),
+            ("role", self.fields.role),
         ] {
-            if let Some(value) = optional_text(&doc, field).filter(|value| !value.is_empty()) {
+            if let Some(value) = optional_text(doc, field).filter(|value| !value.is_empty()) {
                 properties.insert(name.to_string(), value);
             }
         }
-        if let Some(content) = optional_text(&doc, self.fields.content) {
+        if let Some(content) = optional_text(doc, self.fields.content) {
             let preview = content.chars().take(300).collect::<String>();
             properties.insert("content_preview".into(), preview);
         }
-        Ok(Some(properties))
+        properties
     }
 }
 
@@ -285,6 +351,10 @@ fn optional_text(doc: &TantivyDocument, field: Field) -> Option<String> {
         tantivy::schema::OwnedValue::Str(text) => Some(text.clone()),
         _ => None,
     })
+}
+
+fn optional_u64(doc: &TantivyDocument, field: Field) -> Option<u64> {
+    doc.get_first(field).and_then(|v| v.as_value().as_u64())
 }
 
 fn first_u64(doc: &TantivyDocument, field: Field) -> u64 {

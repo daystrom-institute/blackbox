@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -20,13 +20,31 @@ impl InspectableEntityProvider for KnowledgeProvider {
         matches!(r, EntityRef::Knowledge { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::Knowledge { id } = r else {
             unreachable!();
         };
         let mut properties = BTreeMap::new();
         properties.insert("id".into(), id.clone());
+        if let Some(state) = ctx.state() {
+            let kb = state.kb.read();
+            let entry = kb
+                .entry(id)
+                .ok_or_else(|| anyhow::anyhow!("knowledge entry {id} not found"))?;
+            properties.insert("title".into(), entry.title.clone());
+            properties.insert("content".into(), entry.content.clone());
+            properties.insert("category".into(), format!("{:?}", entry.category));
+            properties.insert("scope".into(), format!("{:?}", entry.scope));
+            properties.insert("status".into(), format!("{:?}", entry.status));
+            properties.insert("approval".into(), format!("{:?}", entry.approval));
+            if let Some(project) = &entry.project {
+                properties.insert("project".into(), project.clone());
+            }
+            if let Some(supersedes) = &entry.supersedes {
+                properties.insert("supersedes".into(), supersedes.clone());
+            }
+        }
         Ok(base_view(r, properties))
     }
 
@@ -76,10 +94,15 @@ impl InspectableEntityProvider for KnowledgeProvider {
         )
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::Knowledge { id } = r else {
             return None;
         };
+        if let Some(state) = ctx.state() {
+            if let Some(entry) = state.kb.read().entry(id) {
+                return Some(truncate_label(&entry.title));
+            }
+        }
         Some(truncate_label(id))
     }
 }

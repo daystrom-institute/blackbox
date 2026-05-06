@@ -57,6 +57,25 @@ pub struct EdgeFamilyExpectation {
     pub required: bool,
 }
 
+pub(crate) struct ProviderContext<'a> {
+    state: Option<&'a crate::SharedState>,
+}
+
+impl<'a> ProviderContext<'a> {
+    pub(crate) fn new(state: &'a crate::SharedState) -> Self {
+        Self { state: Some(state) }
+    }
+
+    #[cfg(test)]
+    fn empty_for_tests() -> Self {
+        Self { state: None }
+    }
+
+    pub(crate) fn state(&self) -> Option<&'a crate::SharedState> {
+        self.state
+    }
+}
+
 pub trait InspectableEntityProvider: Send + Sync {
     fn entity_type(&self) -> EntityType;
     fn owns_ref(&self, r: &EntityRef) -> bool;
@@ -64,7 +83,7 @@ pub trait InspectableEntityProvider: Send + Sync {
         false
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView>;
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView>;
     fn schema(&self) -> EntitySchemaView;
     fn forward_edges(&self, r: &EntityRef) -> Vec<Edge>;
     fn expected_edge_families(&self, r: &EntityRef) -> Vec<EdgeFamilyExpectation>;
@@ -75,7 +94,7 @@ pub trait InspectableEntityProvider: Send + Sync {
         full_neighborhood: &Neighborhood,
     ) -> Vec<NextHop>;
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String>;
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String>;
 }
 
 pub fn provider_for(entity_type: EntityType) -> &'static dyn InspectableEntityProvider {
@@ -211,23 +230,25 @@ mod tests {
 
     #[test]
     fn registry_dispatches_every_entity_type() {
+        let ctx = ProviderContext::empty_for_tests();
         for raw in sample_refs() {
             let parsed = EntityRef::parse(raw).unwrap();
             assert_eq!(parsed.render(), raw);
             let provider = provider_for(parsed.entity_type());
             assert!(provider.owns_ref(&parsed));
             assert_eq!(provider.handles_virtual(), parsed.is_virtual());
-            let view = provider.get_entity(&parsed).unwrap();
+            let view = provider.get_entity(&ctx, &parsed).unwrap();
             assert_eq!(view.entity_type, parsed.entity_type());
         }
     }
 
     #[test]
     fn compact_labels_fit_inline_budget() {
+        let ctx = ProviderContext::empty_for_tests();
         for raw in sample_refs() {
             let parsed = EntityRef::parse(raw).unwrap();
             let provider = provider_for(parsed.entity_type());
-            let label = provider.compact_label(&parsed).unwrap();
+            let label = provider.compact_label(&ctx, &parsed).unwrap();
             assert!(label.len() <= 80, "{raw}: {label}");
         }
     }
