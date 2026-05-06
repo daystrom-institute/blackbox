@@ -95,6 +95,12 @@ serves concurrently across multiple mutable snapshots, `QuiesceSearch` must grow
 a real traffic-drain implementation and `SwapAtomic` should own the explicit
 publish/rename step.
 
+Each compaction-arc tick rebuilds only the single partition with the worst
+`deleted_ratio`. Additional partitions above the threshold wait for later cron
+ticks. Multi-partition compaction needs a follow-up workflow phase that loops
+inside the arc or fans out with `fork` once the workflow engine supports that
+shape for this use case.
+
 ## M3
 
 `auto-digest-arc.json` is the first agentic-corpus workflow that dispatches an
