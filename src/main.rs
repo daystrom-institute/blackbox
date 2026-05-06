@@ -1,4 +1,5 @@
 mod artifacts;
+mod chunker;
 mod council;
 mod crons;
 pub mod entity_ref;
@@ -59,7 +60,7 @@ use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
 use packets::{Packets, ScannerConfig};
 use pins::{AmbientPinQuery, PinParams, Pins};
-use projects::{ProjectListResponse, ProjectRegisterParams, ProjectRegistry};
+use projects::{ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry};
 use threads::Threads;
 
 // ---------------------------------------------------------------------------
@@ -745,6 +746,11 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_project_register", || {
             let record = self.state.projects.write().register_path(&p.path)?;
+            trigger_project_bootstrap_arc(self.state.clone(), record.clone());
+            self.state
+                .idx
+                .write()
+                .reindex(&ReindexParams { full: Some(false) })?;
             Ok(serde_json::to_string_pretty(&record)?)
         })
     }
@@ -6372,6 +6378,57 @@ fn deactivate_artifact(
     Ok(())
 }
 
+fn trigger_project_bootstrap_arc(state: Arc<SharedState>, record: ProjectRecord) {
+    let Some(spec) = state
+        .workflow_registry
+        .read()
+        .get("project-bootstrap-arc")
+        .cloned()
+    else {
+        tracing::debug!(
+            project_id = %record.project_id,
+            "project-bootstrap-arc is not installed; registration recorded without arc trigger"
+        );
+        return;
+    };
+    let compiled = match workflow::compile(spec) {
+        Ok(compiled) => compiled,
+        Err(err) => {
+            tracing::warn!(error = %err, "project-bootstrap-arc compile failed");
+            return;
+        }
+    };
+    if let Err(err) = validate_workflow_capabilities(&compiled, &state) {
+        tracing::warn!(error = %err, "project-bootstrap-arc capability validation failed");
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("no tokio runtime available; skipped project-bootstrap-arc trigger");
+        return;
+    };
+    let project_dir = Some(record.canonical_path.clone());
+    let mut vars = serde_json::Map::new();
+    vars.insert("project_id".to_string(), Value::String(record.project_id));
+    vars.insert(
+        "project_path".to_string(),
+        Value::String(record.canonical_path),
+    );
+    if let Some(repo_id) = record.repo_id {
+        vars.insert("repo_id".to_string(), Value::String(repo_id));
+    }
+    handle.spawn(async move {
+        let server = BlackboxServer::new(state);
+        let _ = workflow::run_workflow_with_initial_vars(
+            &server,
+            &compiled,
+            project_dir,
+            Some(50),
+            vars,
+        )
+        .await;
+    });
+}
+
 #[derive(Debug, Deserialize)]
 struct AdminWorkflowInstallReq {
     #[serde(default)]
@@ -7777,6 +7834,86 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn artifact_install_wires_project_bootstrap_arc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/project-bootstrap-arc.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/project-bootstrap-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("project-bootstrap-arc"));
+        let rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: Some(artifacts::ArtifactKind::Workflow),
+                name: Some("project-bootstrap-arc".into()),
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let compiled = {
+            let workflow = server
+                .state
+                .workflow_registry
+                .read()
+                .get("project-bootstrap-arc")
+                .cloned()
+                .unwrap();
+            workflow::compile(workflow).unwrap()
+        };
+        let mut vars = serde_json::Map::new();
+        vars.insert("project_id".into(), Value::String("proj1234".into()));
+        vars.insert(
+            "project_path".into(),
+            Value::String(tmp.path().to_string_lossy().into_owned()),
+        );
+        let result = workflow::run_workflow_with_initial_vars(
+            &server,
+            &compiled,
+            Some(tmp.path().to_string_lossy().into_owned()),
+            Some(50),
+            vars,
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.vars.get("published"), Some(&Value::Bool(true)));
+        let arc_id = result.arc_thread_id.as_deref().unwrap_or_default();
+        let snapshot = server
+            .state
+            .running_arcs
+            .read()
+            .get(arc_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(snapshot.status, "completed");
+        assert!(snapshot
+            .completed_nodes
+            .iter()
+            .any(|node| node == "Publish"));
     }
 
     #[tokio::test]

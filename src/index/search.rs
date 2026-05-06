@@ -14,6 +14,7 @@ use tantivy::{IndexWriter, TantivyDocument, Term};
 use walkdir::WalkDir;
 
 use super::helpers::*;
+use super::project_files;
 use super::reindex::*;
 use super::{FileMeta, TranscriptIndex};
 use crate::parser;
@@ -1295,8 +1296,18 @@ impl TranscriptIndex {
             }
         }
 
+        let project_stats = project_files::index_registered_projects_standalone(
+            &self.config,
+            f,
+            &mut writer,
+            &mut meta,
+        )?;
+        indexed_files += project_stats.indexed_files;
+        indexed_docs += project_stats.indexed_docs;
+        skipped += project_stats.skipped;
+
         // Purge documents for deleted source files
-        let current_files = scan_source_files(&self.config);
+        let current_files = scan_all_source_files(&self.config);
         let current_paths: std::collections::HashSet<String> =
             current_files.iter().map(|(p, _, _)| p.clone()).collect();
         let mut purged = 0u64;
@@ -1339,5 +1350,62 @@ impl TranscriptIndex {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod agentic_project_file_tests {
+    use super::*;
+    use crate::projects::ProjectRegistry;
+
+    #[test]
+    fn registered_project_markdown_is_searchable_without_rust_source_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects_path = dir.path().join("projects.json");
+        let mut projects = ProjectRegistry::open(&projects_path).unwrap();
+        projects.register_path(env!("CARGO_MANIFEST_DIR")).unwrap();
+
+        let mut index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            projects_path,
+        )
+        .unwrap();
+        let msg = index.build_index(false).unwrap();
+        assert!(msg.contains("Indexed"));
+
+        let design_hits = index
+            .search(&SearchParams {
+                query: "agentic-corpus".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(10),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(design_hits.contains("design/agentic-corpus.md"));
+
+        let trait_hits = index
+            .search(&SearchParams {
+                query: "trait SourceFormatChunker".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(10),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(trait_hits.contains("design/agentic-corpus.md"));
+        let chunker_source = format!("{}/src/chunker/mod.rs", env!("CARGO_MANIFEST_DIR"));
+        assert!(!trait_hits.contains(&format!("File: {chunker_source}")));
+
+        let rerun = index.build_index(false).unwrap();
+        assert!(rerun.contains("skipped"));
     }
 }

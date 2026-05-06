@@ -10,6 +10,7 @@ use tantivy::{Index, IndexWriter, TantivyDocument};
 use walkdir::WalkDir;
 
 use super::helpers::*;
+use super::project_files;
 use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::entity_ref;
 use crate::parser;
@@ -117,11 +118,20 @@ pub(super) fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64
     files
 }
 
+pub(super) fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
+    let mut files = scan_source_files(config);
+    match project_files::scan_registered_project_files(config) {
+        Ok(mut project_files) => files.append(&mut project_files),
+        Err(err) => tracing::warn!(error = %err, "failed to scan registered project files"),
+    }
+    files
+}
+
 /// Check if any source files have changed since last index.
 /// Returns true if reindexing is needed (cheap — stat only, no I/O on file contents).
 pub(super) fn needs_reindex(config: &ReindexConfig) -> bool {
     let meta = load_meta(&config.meta_path).unwrap_or_default();
-    let files = scan_source_files(config);
+    let files = scan_all_source_files(config);
     let current_paths: std::collections::HashSet<&str> =
         files.iter().map(|(p, _, _)| p.as_str()).collect();
     // Check for new or changed files
@@ -147,10 +157,6 @@ fn try_background_reindex(
     config: &ReindexConfig,
     fields: FieldHandles,
 ) -> Result<()> {
-    let project_count =
-        crate::projects::ProjectRegistry::load_records(&config.projects_path)?.len();
-    tracing::debug!(project_count, "auto-reindex: loaded registered projects");
-
     // 1. Speculative scan — cheap, no writer allocation
     if !needs_reindex(config) {
         tracing::debug!("auto-reindex: no changes detected");
@@ -231,8 +237,24 @@ fn try_background_reindex(
         }
     }
 
+    let project_stats = project_files::index_registered_projects_standalone(
+        config,
+        fields,
+        &mut writer,
+        &mut meta,
+    )?;
+    indexed_files += project_stats.indexed_files;
+    indexed_docs += project_stats.indexed_docs;
+    skipped += project_stats.skipped;
+    if project_stats.emitted_edges > 0 {
+        tracing::debug!(
+            emitted_edges = project_stats.emitted_edges,
+            "auto-reindex: accumulated project-file edges"
+        );
+    }
+
     // 4b. Purge documents for deleted source files
-    let current_files = scan_source_files(config);
+    let current_files = scan_all_source_files(config);
     let current_paths: std::collections::HashSet<String> =
         current_files.iter().map(|(p, _, _)| p.clone()).collect();
     let mut purged = 0u64;

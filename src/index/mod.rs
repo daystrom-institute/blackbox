@@ -253,6 +253,7 @@ mod tests {
 }
 
 mod helpers;
+mod project_files;
 mod reindex;
 mod search;
 
