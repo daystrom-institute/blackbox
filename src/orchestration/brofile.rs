@@ -398,6 +398,7 @@ mod tests {
     }
 
     fn with_fake_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
         std::env::set_var("HOME", home);
         let result = f();

@@ -185,8 +185,9 @@ mod tests {
             _manifest: &AgentManifest,
             _args: serde_json::Value,
             _ctx: DispatchContext,
-        ) -> Pin<Box<dyn Future<Output = Result<AgentDispatchResult, AgentDispatchError>> + Send + '_>>
-        {
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AgentDispatchResult, AgentDispatchError>> + Send + '_>,
+        > {
             Box::pin(async {
                 Ok(AgentDispatchResult {
                     session: AgentSession {

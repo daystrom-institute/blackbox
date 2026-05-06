@@ -1,10 +1,10 @@
 #[cfg(test)]
 #[path = "../eval/agents/check.rs"]
 mod agent_eval_check;
+mod artifacts;
 #[cfg(test)]
 #[path = "../eval/badgey/check.rs"]
 mod badgey_eval_check;
-mod artifacts;
 mod chunker;
 mod council;
 mod crons;
@@ -987,7 +987,8 @@ impl BlackboxServer {
         let id = self.badgey_parse_id(badgey_id)?;
         match parse_command(prompt) {
             Some(WrapperCommand::Dismiss) => {
-                return self.badgey_dismiss_internal(badgey_id, Some("wrapper command".to_string()));
+                return self
+                    .badgey_dismiss_internal(badgey_id, Some("wrapper command".to_string()));
             }
             Some(WrapperCommand::ApplyProposal(proposal_id)) => {
                 return self
@@ -1284,7 +1285,10 @@ impl BlackboxServer {
     ) -> Result<String, String> {
         let mut body = serde_json::Map::new();
         body.insert("event".to_string(), Value::String(event.to_string()));
-        body.insert("action_id".to_string(), Value::String(action_id.to_string()));
+        body.insert(
+            "action_id".to_string(),
+            Value::String(action_id.to_string()),
+        );
         body.insert("payload".to_string(), payload);
         self.state
             .notes
@@ -1312,7 +1316,12 @@ impl BlackboxServer {
             .filter_map(|note| {
                 serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body).ok()
             })
-            .filter(|event| matches!(event, orchestration::badgey::events::ThreadEvent::Turn { .. }))
+            .filter(|event| {
+                matches!(
+                    event,
+                    orchestration::badgey::events::ThreadEvent::Turn { .. }
+                )
+            })
             .count() as u64
             + 1
     }
@@ -1382,11 +1391,15 @@ impl BlackboxServer {
             .unwrap_or_default();
         let applied = proposals
             .iter()
-            .filter(|proposal| proposal.state == orchestration::badgey::types::ProposalState::Applied)
+            .filter(|proposal| {
+                proposal.state == orchestration::badgey::types::ProposalState::Applied
+            })
             .count() as u64;
         let rejected = proposals
             .iter()
-            .filter(|proposal| proposal.state == orchestration::badgey::types::ProposalState::Failed)
+            .filter(|proposal| {
+                proposal.state == orchestration::badgey::types::ProposalState::Failed
+            })
             .count() as u64;
         let total_decided = applied + rejected;
         let accept_rate = if total_decided == 0 {
@@ -1437,11 +1450,10 @@ impl BlackboxServer {
         let mut strings = Vec::new();
         collect_strings(result, &mut strings);
         for text in strings {
-            for raw in text
-                .split(|c: char| c.is_whitespace() || matches!(c, ',' | ')' | '(' | '[' | ']'))
+            for raw in
+                text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ')' | '(' | '[' | ']'))
             {
-                let token =
-                    raw.trim_matches(|c: char| matches!(c, '"' | '\'' | '.' | ';' | ':'));
+                let token = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | '.' | ';' | ':'));
                 if token.starts_with("knowledge:")
                     || token.starts_with("agent:")
                     || token.starts_with("decision:")
@@ -1474,7 +1486,11 @@ impl BlackboxServer {
         refs
     }
 
-    fn badgey_existing_audit_decision_id(&self, badgey_id: &str, proposal_id: &str) -> Option<String> {
+    fn badgey_existing_audit_decision_id(
+        &self,
+        badgey_id: &str,
+        proposal_id: &str,
+    ) -> Option<String> {
         let needle = format!("Badgey proposal {proposal_id} for {badgey_id} was applied.");
         self.state
             .kb
@@ -1495,7 +1511,9 @@ impl BlackboxServer {
             notes
                 .all()
                 .iter()
-                .filter(|note| note.thread_id.as_deref() == Some(instance.thread_of_record_id.as_str()))
+                .filter(|note| {
+                    note.thread_id.as_deref() == Some(instance.thread_of_record_id.as_str())
+                })
                 .filter(|note| note.created_at.as_str() >= turn_start_iso)
                 .filter_map(|note| serde_json::from_str::<Value>(&note.body).ok())
                 .filter(|body| {
@@ -1541,9 +1559,9 @@ impl BlackboxServer {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("{event} failed without action_id: {reason}"))?
             .to_string();
-        let action_id: ActionId = action_id_raw
-            .parse()
-            .map_err(|e| format!("invalid action_id {action_id_raw}: {e}; original error: {reason}"))?;
+        let action_id: ActionId = action_id_raw.parse().map_err(|e| {
+            format!("invalid action_id {action_id_raw}: {e}; original error: {reason}")
+        })?;
         let entry = self
             .state
             .badgey_journal
@@ -1560,7 +1578,12 @@ impl BlackboxServer {
             );
         }
         let payload = json!({"reason": reason});
-        self.badgey_action_result_note(instance, &action_id_raw, "bg-action-failed", payload.clone())?;
+        self.badgey_action_result_note(
+            instance,
+            &action_id_raw,
+            "bg-action-failed",
+            payload.clone(),
+        )?;
         Ok(json!({
             "action_id": action_id_raw,
             "event": event,
@@ -1654,18 +1677,16 @@ impl BlackboxServer {
                     && draft.get("task_id").is_none()
                 {
                     if let Some(map) = draft.as_object_mut() {
-                        map.insert("task_id".to_string(), Value::String(uuid::Uuid::new_v4().to_string()));
+                        map.insert(
+                            "task_id".to_string(),
+                            Value::String(uuid::Uuid::new_v4().to_string()),
+                        );
                     }
                 }
                 let proposal = self
                     .state
                     .badgey_proposals
-                    .create(
-                        &instance.id,
-                        kind,
-                        draft.clone(),
-                        idempotency_key,
-                    )
+                    .create(&instance.id, kind, draft.clone(), idempotency_key)
                     .map_err(|e| format!("creating badgey proposal: {e}"))?;
                 self.badgey_write_event(
                     instance,
@@ -1915,7 +1936,9 @@ impl BlackboxServer {
                     .or_else(|| applying.draft.get("draft_path"))
                     .or_else(|| applying.draft.get("path"))
                     .and_then(Value::as_str)
-                    .ok_or_else(|| "artifact proposal draft missing source/draft_path".to_string())?;
+                    .ok_or_else(|| {
+                        "artifact proposal draft missing source/draft_path".to_string()
+                    })?;
                 let metadata = install_artifact_from_params(
                     &self.state,
                     ArtifactInstallParams {
@@ -1950,7 +1973,9 @@ impl BlackboxServer {
                     .get("prompt")
                     .or_else(|| applying.draft.get("refined_charter"))
                     .and_then(Value::as_str)
-                    .ok_or_else(|| "redispatch proposal missing prompt/refined_charter".to_string())?;
+                    .ok_or_else(|| {
+                        "redispatch proposal missing prompt/refined_charter".to_string()
+                    })?;
                 if applying.idempotency_key.is_none() {
                     return Err("redispatch proposal missing idempotency_key".to_string());
                 }
@@ -1999,7 +2024,9 @@ impl BlackboxServer {
                     .or_else(|| applying.draft.get("draft_path"))
                     .or_else(|| applying.draft.get("path"))
                     .and_then(Value::as_str)
-                    .ok_or_else(|| "artifact promotion draft missing source/draft_path".to_string())?;
+                    .ok_or_else(|| {
+                        "artifact promotion draft missing source/draft_path".to_string()
+                    })?;
                 let metadata = install_artifact_from_params(
                     &self.state,
                     ArtifactInstallParams {
@@ -2284,9 +2311,7 @@ impl BlackboxServer {
             .read()
             .all()
             .iter()
-            .filter(|note| {
-                thread_filter.is_none() || note.thread_id.as_deref() == thread_filter
-            })
+            .filter(|note| thread_filter.is_none() || note.thread_id.as_deref() == thread_filter)
             .filter(|note| {
                 let body = serde_json::from_str::<Value>(&note.body).ok();
                 let event = body
@@ -2295,13 +2320,16 @@ impl BlackboxServer {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 note.kind == notes::NoteKind::Done
-                    || matches!(event, "scout_dispatched" | "subbro_spawned" | "scout_done" | "subbro_done")
+                    || matches!(
+                        event,
+                        "scout_dispatched" | "subbro_spawned" | "scout_done" | "subbro_done"
+                    )
                     || event.starts_with("bg-action-spawn-subbro")
             })
             .filter(|note| {
-                let body = serde_json::from_str::<Value>(&note.body).unwrap_or_else(|_| {
-                    json!({"kind": note.kind.clone(), "body": note.body.clone()})
-                });
+                let body = serde_json::from_str::<Value>(&note.body).unwrap_or_else(
+                    |_| json!({"kind": note.kind.clone(), "body": note.body.clone()}),
+                );
                 scout_id.is_none()
                     || body.get("scout_id").and_then(Value::as_str) == scout_id
                     || body
@@ -2315,20 +2343,29 @@ impl BlackboxServer {
         let events: Vec<Value> = matching_notes
             .iter()
             .map(|note| {
-                serde_json::from_str::<Value>(&note.body)
-                    .unwrap_or_else(|_| json!({"kind": note.kind.clone(), "body": note.body.clone()}))
+                serde_json::from_str::<Value>(&note.body).unwrap_or_else(
+                    |_| json!({"kind": note.kind.clone(), "body": note.body.clone()}),
+                )
             })
             .collect();
         let explicit_aggregate_done = matching_notes.iter().any(|note| {
             serde_json::from_str::<Value>(&note.body)
                 .ok()
-                .and_then(|body| body.get("event").and_then(Value::as_str).map(str::to_string))
+                .and_then(|body| {
+                    body.get("event")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
                 .is_some_and(|event| matches!(event.as_str(), "scout_done" | "subbro_done"))
         });
         let spawned_task_ids: std::collections::HashSet<String> = events
             .iter()
             .filter(|body| body.get("event").and_then(Value::as_str) == Some("subbro_spawned"))
-            .filter_map(|body| body.get("task_id").and_then(Value::as_str).map(String::from))
+            .filter_map(|body| {
+                body.get("task_id")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
             .collect();
         let done_task_ids: std::collections::HashSet<String> = matching_notes
             .iter()
@@ -2359,7 +2396,11 @@ impl BlackboxServer {
         badgey_id: Option<String>,
     ) -> Result<Value, String> {
         let project = scope
-            .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()))
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            })
             .unwrap_or_default();
         let stale_threads: Vec<Value> = self
             .state
@@ -2917,7 +2958,8 @@ fn restore_badgey_registry_from_notes(state: &Arc<SharedState>) {
         let Some(id) = thread_badgey_ids.get(thread_id).cloned() else {
             continue;
         };
-        let Ok(event) = serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body)
+        let Ok(event) =
+            serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body)
         else {
             continue;
         };
@@ -12220,7 +12262,9 @@ mod tests {
 
     async fn codex_bin_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
     }
 
     #[tokio::test]
@@ -14035,13 +14079,9 @@ mod tests {
             .filter(|note| note.thread_id.as_deref() == Some(thread_id.as_str()))
             .map(|note| note.body.as_str())
             .collect();
-        assert!(bodies
-            .iter()
-            .any(|body| body.contains(r#""event":"exec""#)
-                && body.contains(r#""provider_session_id":"codex-session-test""#)));
-        assert!(bodies
-            .iter()
-            .any(|body| body.contains(r#""event":"turn""#)));
+        assert!(bodies.iter().any(|body| body.contains(r#""event":"exec""#)
+            && body.contains(r#""provider_session_id":"codex-session-test""#)));
+        assert!(bodies.iter().any(|body| body.contains(r#""event":"turn""#)));
         assert!(bodies
             .iter()
             .any(|body| body.contains(r#""event":"dismiss""#)));
@@ -14122,8 +14162,7 @@ mod tests {
     async fn badgey_post_processor_records_emit_proposal_actions_once() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let id: orchestration::badgey::types::BadgeyId =
-            "bg-0123abcd-4567ef89".parse().unwrap();
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
         let instance = orchestration::badgey::registry::BadgeyInstance::new(
             id.clone(),
             orchestration::badgey::types::BadgeyScope {
@@ -14189,15 +14228,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.len(), 1);
-        assert_eq!(server.state.badgey_proposals.list_by_instance(&id).unwrap().len(), 1);
+        assert_eq!(
+            server
+                .state
+                .badgey_proposals
+                .list_by_instance(&id)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn badgey_post_processor_marks_bad_actions_failed() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let id: orchestration::badgey::types::BadgeyId =
-            "bg-0123abcd-4567ef89".parse().unwrap();
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
         let instance = orchestration::badgey::registry::BadgeyInstance::new(
             id.clone(),
             orchestration::badgey::types::BadgeyScope {
@@ -14256,8 +14302,7 @@ mod tests {
     async fn badgey_apply_and_reject_commands_update_proposal_store() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let id: orchestration::badgey::types::BadgeyId =
-            "bg-0123abcd-4567ef89".parse().unwrap();
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
         let instance = orchestration::badgey::registry::BadgeyInstance::new(
             id.clone(),
             orchestration::badgey::types::BadgeyScope {
@@ -14309,12 +14354,10 @@ mod tests {
             }))
             .await;
         assert_ne!(apply.is_error, Some(true), "{}", extract_text(&apply));
-        assert!(orchestration::brofile::resolve_brofile(
-            "new-bro",
-            &tmp.path().join("bro"),
-            None
-        )
-        .is_some());
+        assert!(
+            orchestration::brofile::resolve_brofile("new-bro", &tmp.path().join("bro"), None)
+                .is_some()
+        );
         assert_eq!(
             server
                 .state
@@ -14350,8 +14393,7 @@ mod tests {
     fn badgey_restart_replay_restores_registry_from_thread_notes() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let id: orchestration::badgey::types::BadgeyId =
-            "bg-0123abcd-4567ef89".parse().unwrap();
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
         let thread_result = server
             .state
             .threads
@@ -14414,8 +14456,7 @@ mod tests {
     fn badgey_restart_replay_skips_unobserved_pending_session() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let id: orchestration::badgey::types::BadgeyId =
-            "bg-0123abcd-4567ef89".parse().unwrap();
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
         let thread_result = server
             .state
             .threads
@@ -14470,22 +14511,18 @@ mod tests {
 
         restore_badgey_registry_from_notes(&server.state);
         assert!(server.state.badgey_registry.get(&id).is_err());
-        assert!(server
-            .state
-            .notes
-            .read()
-            .all()
-            .iter()
-            .any(|note| note.kind == notes::NoteKind::Surprise
-                && note.body.contains("badgey_restore_skipped_unobserved_session")));
+        assert!(server.state.notes.read().all().iter().any(|note| note.kind
+            == notes::NoteKind::Surprise
+            && note
+                .body
+                .contains("badgey_restore_skipped_unobserved_session")));
     }
 
     #[test]
     fn badgey_collect_waits_for_done_note_after_spawn() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let id: orchestration::badgey::types::BadgeyId =
-            "bg-0123abcd-4567ef89".parse().unwrap();
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
         let instance = orchestration::badgey::registry::BadgeyInstance::new(
             id.clone(),
             orchestration::badgey::types::BadgeyScope {
@@ -14496,7 +14533,11 @@ mod tests {
             "codex-session-7".to_string(),
             "thread-00000001".to_string(),
         );
-        server.state.badgey_registry.register(instance.clone()).unwrap();
+        server
+            .state
+            .badgey_registry
+            .register(instance.clone())
+            .unwrap();
         server
             .badgey_write_event(
                 &instance,
@@ -14580,8 +14621,7 @@ mod tests {
     fn badgey_triage_attached_to_instance_stores_redispatch_proposals() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        let id: orchestration::badgey::types::BadgeyId =
-            "bg-0123abcd-4567ef89".parse().unwrap();
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
         let instance = orchestration::badgey::registry::BadgeyInstance::new(
             id.clone(),
             orchestration::badgey::types::BadgeyScope {
@@ -14653,8 +14693,7 @@ mod tests {
                 serde_json::json!({"event": "bg-action-spawn-subbro"}),
             )
             .unwrap();
-        let id: orchestration::badgey::types::BadgeyId =
-            "bg-0123abcd-4567ef89".parse().unwrap();
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
         let proposal = server
             .state
             .badgey_proposals

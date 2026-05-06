@@ -57,14 +57,9 @@ mod artifact_tests {
             include_str!("../../../examples/badgey/brofiles/badgey-scout-persona.json"),
         ] {
             let brofile: Brofile = serde_json::from_str(raw).unwrap();
-            assert!(
-                brofile
-                    .filters
-                    .as_ref()
-                    .is_some_and(|filters| filters
-                        .disallow
-                        .contains(&"mcp__blackbox__bro_*".to_string()))
-            );
+            assert!(brofile.filters.as_ref().is_some_and(|filters| filters
+                .disallow
+                .contains(&"mcp__blackbox__bro_*".to_string())));
             assert!(brofile.lens.as_deref().is_some_and(|lens| !lens.is_empty()));
         }
     }
@@ -76,7 +71,10 @@ mod artifact_tests {
                 .unwrap();
         assert_eq!(badgey.kind, "agent");
         assert_eq!(badgey.name, "badgey");
-        assert_eq!(badgey.manifest.brofile_ref.as_deref(), Some("badgey-persona"));
+        assert_eq!(
+            badgey.manifest.brofile_ref.as_deref(),
+            Some("badgey-persona")
+        );
         assert_eq!(badgey.manifest.dispatch_adapter.as_deref(), Some("badgey"));
 
         let scout: AgentArtifact = serde_json::from_str(include_str!(
@@ -150,17 +148,15 @@ mod artifact_tests {
             crate::workflow::compile(workflow).unwrap();
         }
 
-        let packet: crate::packets::CompileParams =
-            serde_json::from_str(include_str!(
-                "../../../examples/badgey/packets/badgey-self-eval.json"
-            ))
-            .unwrap();
+        let packet: crate::packets::CompileParams = serde_json::from_str(include_str!(
+            "../../../examples/badgey/packets/badgey-self-eval.json"
+        ))
+        .unwrap();
         assert_eq!(packet.domain, "badgey/self-eval");
-        let routing_packet: crate::packets::CompileParams =
-            serde_json::from_str(include_str!(
-                "../../../examples/badgey/packets/badgey-cron-routing.json"
-            ))
-            .unwrap();
+        let routing_packet: crate::packets::CompileParams = serde_json::from_str(include_str!(
+            "../../../examples/badgey/packets/badgey-cron-routing.json"
+        ))
+        .unwrap();
         assert_eq!(routing_packet.domain, "badgey/cron-routing");
     }
 }

@@ -142,7 +142,12 @@ fn missing_required_refs(case: &BadgeyEvalCase, bundle: &BadgeyBundle) -> Vec<St
 fn missing_citation_kinds(case: &BadgeyEvalCase, bundle: &BadgeyBundle) -> Vec<String> {
     case.required_citation_kinds
         .iter()
-        .filter(|required| !bundle.citations.iter().any(|citation| &citation.kind == *required))
+        .filter(|required| {
+            !bundle
+                .citations
+                .iter()
+                .any(|citation| &citation.kind == *required)
+        })
         .map(|required| format!("missing_citation_kind:{required}"))
         .collect()
 }
@@ -151,7 +156,12 @@ fn missing_path_edges(case: &BadgeyEvalCase, bundle: &BadgeyBundle) -> Vec<Strin
     case.required_path_edges
         .iter()
         .filter(|required| !bundle.path_edges.contains(required))
-        .map(|required| format!("missing_path_edge:{}:{}:{}", required.from, required.edge, required.to))
+        .map(|required| {
+            format!(
+                "missing_path_edge:{}:{}:{}",
+                required.from, required.edge, required.to
+            )
+        })
         .collect()
 }
 
@@ -220,7 +230,10 @@ mod tests {
         let result = check_pass(&case(BadgeyMode::Answer), &bundle);
         assert!(!result.pass);
         assert_eq!(result.stage, "required_refs");
-        assert_eq!(result.failures, vec!["missing_entity_ref:knowledge:abc12345"]);
+        assert_eq!(
+            result.failures,
+            vec!["missing_entity_ref:knowledge:abc12345"]
+        );
     }
 
     #[test]

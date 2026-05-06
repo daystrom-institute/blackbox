@@ -96,10 +96,7 @@ fn render_text(
         for agent in agents {
             text.push_str(&format!(
                 "- **{}** (v{}, {}): {}\n",
-                agent.name,
-                agent.version,
-                agent.cost_class,
-                agent.description
+                agent.name, agent.version, agent.cost_class, agent.description
             ));
             if !agent.when_to_use.is_empty() {
                 for w in &agent.when_to_use {
@@ -339,7 +336,10 @@ mod tests {
             "agents should be empty array"
         );
         assert_eq!(
-            value["agents_by_dispatch_adapter"].as_object().unwrap().len(),
+            value["agents_by_dispatch_adapter"]
+                .as_object()
+                .unwrap()
+                .len(),
             0,
             "agents_by_dispatch_adapter should be empty object"
         );

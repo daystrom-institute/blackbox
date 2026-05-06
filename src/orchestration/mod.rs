@@ -854,15 +854,8 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
 
     if let Err(err) = task_store.write().insert_reserved(id.clone(), task.clone()) {
         task_store.write().release_reservation(&id);
-        let failed = failed_duplicate_task(
-            id,
-            provider,
-            session_id,
-            cwd,
-            None,
-            None,
-            err.to_string(),
-        );
+        let failed =
+            failed_duplicate_task(id, provider, session_id, cwd, None, None, err.to_string());
         failed.notify.notify_waiters();
         return failed;
     }

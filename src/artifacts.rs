@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -925,17 +925,13 @@ mod tests {
         assert_eq!(meta.version, "2");
         assert!(meta.active);
 
-        assert!(
-            catalog
-                .load_artifact_value(ArtifactKind::Agent, "nonexistent")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            catalog
-                .metadata_for(ArtifactKind::Agent, "nonexistent")
-                .unwrap()
-                .is_none()
-        );
+        assert!(catalog
+            .load_artifact_value(ArtifactKind::Agent, "nonexistent")
+            .unwrap()
+            .is_none());
+        assert!(catalog
+            .metadata_for(ArtifactKind::Agent, "nonexistent")
+            .unwrap()
+            .is_none());
     }
 }

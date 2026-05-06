@@ -225,10 +225,7 @@ impl TranscriptIndex {
         Ok(())
     }
 
-    pub(crate) fn index_threads_store(
-        &mut self,
-        threads: &crate::threads::Threads,
-    ) -> Result<()> {
+    pub(crate) fn index_threads_store(&mut self, threads: &crate::threads::Threads) -> Result<()> {
         thread_docs::upsert_threads_store(
             &self.index,
             self.fields,

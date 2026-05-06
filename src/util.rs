@@ -7,6 +7,17 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BLACKBOX_MCP_NAME: &str = "blackbox";
 
+#[cfg(test)]
+static TEST_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
 /// ISO-8601 UTC timestamp with second precision and a trailing `Z`.
 /// Canonical format for every timestamp written into bbox stores
 /// (knowledge, threads, notes, tool_docs). Hoisted from per-store

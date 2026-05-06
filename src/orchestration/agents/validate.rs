@@ -2,8 +2,8 @@ use anyhow::Result;
 
 use super::adapter::AgentAdapterRegistry;
 use super::types::{
-    AgentFilterOverlay, AgentManifest, AgentProvenance, validate_description_length,
-    validate_when_to_use_nonempty,
+    validate_description_length, validate_when_to_use_nonempty, AgentFilterOverlay, AgentManifest,
+    AgentProvenance,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

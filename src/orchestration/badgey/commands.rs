@@ -106,7 +106,10 @@ mod tests {
             parse_command("trust sub-bro A"),
             Some(WrapperCommand::TrustSubBro("A".to_string()))
         );
-        assert_eq!(parse_command("extend budget"), Some(WrapperCommand::BudgetExtend));
+        assert_eq!(
+            parse_command("extend budget"),
+            Some(WrapperCommand::BudgetExtend)
+        );
     }
 
     #[test]

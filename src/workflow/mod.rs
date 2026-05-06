@@ -17,17 +17,17 @@ pub mod schema;
 pub mod wait;
 
 pub use engine::{
-    WorkflowRunResult, run_workflow, run_workflow_streaming, run_workflow_streaming_with_vars,
-    run_workflow_with_initial_vars,
+    run_workflow, run_workflow_streaming, run_workflow_streaming_with_vars,
+    run_workflow_with_initial_vars, WorkflowRunResult,
 };
 pub use schema::{
-    ActorKind, ActorSpec, BranchSelector, GateMode, NodeMode, NodeTransition, Workflow,
-    load_workflow,
+    load_workflow, ActorKind, ActorSpec, BranchSelector, GateMode, NodeMode, NodeTransition,
+    Workflow,
 };
 #[cfg(test)]
 pub use schema::{InjectPolicy, LateInject, NodeSpec, RetryPolicy};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
 
 /// A workflow that has been loaded AND cross-validated. Produced by
