@@ -12453,6 +12453,20 @@ mod tests {
 
         let badgey = agents.iter().find(|a| a["name"] == "badgey-agent").unwrap();
         assert_eq!(badgey["dispatch_adapter"].as_str(), Some("badgey"));
+        assert_eq!(
+            badgey["when_to_use"]
+                .as_array()
+                .expect("when_to_use always present"),
+            &Vec::<serde_json::Value>::new(),
+            "badgey-agent has empty when_to_use but field must be present"
+        );
+        assert_eq!(
+            badgey["anti_patterns"]
+                .as_array()
+                .expect("anti_patterns always present"),
+            &Vec::<serde_json::Value>::new(),
+            "badgey-agent has empty anti_patterns but field must be present"
+        );
 
         let by_adapter = body["agents_by_dispatch_adapter"]
             .as_object()

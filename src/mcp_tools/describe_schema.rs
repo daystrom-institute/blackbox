@@ -10,9 +10,7 @@ pub struct AgentSchemaEntry {
     pub name: String,
     pub version: String,
     pub description: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub when_to_use: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub anti_patterns: Vec<String>,
     pub cost_class: String,
     #[serde(skip_serializing_if = "Option::is_none")]
