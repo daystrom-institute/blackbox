@@ -10295,17 +10295,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         let agent_v1 = serde_json::json!({
+            "kind": "agent",
             "name": "test-reviewer",
             "version": 1,
-            "description": "Reviews code",
-            "brofile": "sonnet-standard"
+            "manifest": {
+                "description": "Reviews code for correctness.",
+                "when_to_use": ["after writing code"],
+                "brofile_inline": {"provider": "claude", "lens": "reviewer"}
+            }
         });
         let agent_v2 = serde_json::json!({
+            "kind": "agent",
             "name": "test-reviewer-v2",
             "version": 2,
             "supersedes": "test-reviewer",
-            "description": "Reviews code with style checks",
-            "brofile": "sonnet-standard"
+            "manifest": {
+                "description": "Reviews code with style checks.",
+                "when_to_use": ["after writing code"],
+                "brofile_inline": {"provider": "claude", "lens": "reviewer"}
+            }
         });
 
         let meta1 = install_artifact_value(
@@ -12207,7 +12215,7 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
 
-        // Verify handle shape — every field the agent-system.md §5.3 contract requires
+        // Verify handle shape: every field the agent-system.md 5.3 contract requires
         assert!(
             body["session"].is_object(),
             "should have session object"

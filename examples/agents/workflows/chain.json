@@ -1,23 +1,18 @@
 {
   "name": "agent-chain",
   "version": 1,
-  "actors": {
-    "placeholder": {
-      "kind": "executor",
-      "brofile": "probe-haiku"
-    }
-  },
+  "actors": {},
   "start": "RunFirst",
   "vars_schema": {
-    "input": { "kind": "string", "required": true },
+    "diff": { "kind": "string", "required": true },
     "first_handle": { "kind": "any" },
     "first_output": { "kind": "any" },
-    "second_handle": { "kind": "any" }
+    "second_handle": { "kind": "any" },
+    "second_output": { "kind": "any" }
   },
   "nodes": {
     "RunFirst": {
-      "actor": "placeholder",
-      "prompt": "Chain: dispatching diff-narrator, then waiting for completion.",
+      "prompt": "Chain step 1: diff-narrator dispatched and waited.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -26,7 +21,7 @@
             "tool": "bro_agent_dispatch",
             "arguments": {
               "agent": "diff-narrator",
-              "args": { "diff": "${vars.input}" }
+              "args": { "diff": "${vars.diff}" }
             },
             "timeout_secs": 120
           },
@@ -51,8 +46,7 @@
       "next": { "type": "goto", "to": "RunSecond" }
     },
     "RunSecond": {
-      "actor": "placeholder",
-      "prompt": "Chain: dispatching code-reviewer with diff-narrator output as context.",
+      "prompt": "Chain step 2: code-reviewer dispatched with diff-narrator narrative, then waited for completion.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -61,11 +55,28 @@
             "tool": "bro_agent_dispatch",
             "arguments": {
               "agent": "code-reviewer",
-              "args": { "diff": "${vars.input}", "context_refs": ["${vars.first_output.result}"] }
+              "args": {
+                "diff": "${vars.diff}",
+                "context_refs": ["${vars.first_output.result}"]
+              }
             },
             "timeout_secs": 120
           },
           "into_var": "second_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.second_handle.task_id}",
+              "timeout_seconds": 120
+            },
+            "timeout_secs": 130
+          },
+          "into_var": "second_output",
           "on_failure": "halt"
         }
       ],

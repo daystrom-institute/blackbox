@@ -1,23 +1,18 @@
 {
   "name": "agent-escalation",
   "version": 1,
-  "actors": {
-    "placeholder": {
-      "kind": "executor",
-      "brofile": "probe-haiku"
-    }
-  },
+  "actors": {},
   "start": "CheapAttempt",
   "vars_schema": {
     "diff": { "kind": "string", "required": true },
     "cheap_handle": { "kind": "any" },
     "cheap_output": { "kind": "any" },
-    "expensive_handle": { "kind": "any" }
+    "expensive_handle": { "kind": "any" },
+    "expensive_output": { "kind": "any" }
   },
   "nodes": {
     "CheapAttempt": {
-      "actor": "placeholder",
-      "prompt": "Escalation: dispatching cheap diff-narrator, then evaluating output quality.",
+      "prompt": "Escalation: cheap diff-narrator dispatched and waited.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -59,8 +54,7 @@
       }
     },
     "Escalate": {
-      "actor": "placeholder",
-      "prompt": "Escalating to code-reviewer. Diff-narrator output was unsuitable.",
+      "prompt": "Escalation: expensive code-reviewer dispatched and waited.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -75,12 +69,25 @@
           },
           "into_var": "expensive_handle",
           "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.expensive_handle.task_id}",
+              "timeout_seconds": 120
+            },
+            "timeout_secs": 130
+          },
+          "into_var": "expensive_output",
+          "on_failure": "halt"
         }
       ],
       "next": { "type": "terminal" }
     },
     "Done": {
-      "actor": "placeholder",
       "prompt": "Diff-narrator output was sufficient. Result: ${vars.cheap_output.result}",
       "next": { "type": "terminal" }
     }

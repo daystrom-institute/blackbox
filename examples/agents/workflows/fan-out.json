@@ -1,12 +1,7 @@
 {
   "name": "agent-fan-out",
   "version": 1,
-  "actors": {
-    "placeholder": {
-      "kind": "executor",
-      "brofile": "probe-haiku"
-    }
-  },
+  "actors": {},
   "start": "DispatchBoth",
   "vars_schema": {
     "diff": { "kind": "string", "required": true },
@@ -17,8 +12,7 @@
   },
   "nodes": {
     "DispatchBoth": {
-      "actor": "placeholder",
-      "prompt": "Fan-out: dispatching diff-narrator and code-reviewer sequentially (engine on_enter hooks run in order); then waiting for both.",
+      "prompt": "Fan-out: dispatched diff-narrator and code-reviewer.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -32,7 +26,7 @@
             "timeout_secs": 120
           },
           "into_var": "left_handle",
-          "on_failure": "warn"
+          "on_failure": "halt"
         },
         {
           "op": "mcp_call",
@@ -46,14 +40,13 @@
             "timeout_secs": 120
           },
           "into_var": "right_handle",
-          "on_failure": "warn"
+          "on_failure": "halt"
         }
       ],
       "next": { "type": "goto", "to": "WaitBoth" }
     },
     "WaitBoth": {
-      "actor": "placeholder",
-      "prompt": "Waiting for both agents to complete.",
+      "prompt": "Fan-out: waiting for both agents to complete.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -67,7 +60,7 @@
             "timeout_secs": 130
           },
           "into_var": "left_output",
-          "on_failure": "warn"
+          "on_failure": "halt"
         },
         {
           "op": "mcp_call",
@@ -81,13 +74,12 @@
             "timeout_secs": 130
           },
           "into_var": "right_output",
-          "on_failure": "warn"
+          "on_failure": "halt"
         }
       ],
       "next": { "type": "goto", "to": "Aggregate" }
     },
     "Aggregate": {
-      "actor": "placeholder",
       "prompt": "Fan-out aggregation. Synthesize both agent outputs into a balanced recommendation.\n\nDiff-narrator output:\n${vars.left_output.result}\n\nCode-reviewer output:\n${vars.right_output.result}",
       "next": { "type": "terminal" }
     }

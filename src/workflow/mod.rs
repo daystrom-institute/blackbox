@@ -998,7 +998,7 @@ mod tests {
             "bro_wait should use task_id (snake_case), not taskId"
         );
         let run_second = spec.nodes.get("RunSecond").expect("RunSecond node");
-        assert_eq!(run_second.on_enter.len(), 1, "RunSecond dispatches code-reviewer");
+        assert_eq!(run_second.on_enter.len(), 2, "RunSecond should dispatch code-reviewer and wait");
         let r2_args = run_second.on_enter[0]
             .args
             .as_object()
@@ -1012,6 +1012,23 @@ mod tests {
             Some("code-reviewer"),
             "chain second agent should be code-reviewer"
         );
+        let r2_wait_args = run_second.on_enter[1]
+            .args
+            .as_object()
+            .expect("RunSecond wait args");
+        let r2_wait_arguments = r2_wait_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("RunSecond wait arguments");
+        assert!(
+            r2_wait_arguments.get("task_id").is_some(),
+            "RunSecond bro_wait should use task_id"
+        );
+        // All on_failure policies should be halt (not warn)
+        for (i, hook) in run_second.on_enter.iter().enumerate() {
+            assert_eq!(hook.on_failure, super::ops::OnFailure::Halt,
+                "RunSecond hook[{i}] should halt on failure");
+        }
     }
 
     #[test]
@@ -1114,6 +1131,7 @@ mod tests {
             other => panic!("CheapAttempt next should be Branch, got: {other:?}"),
         }
         let escalate = spec.nodes.get("Escalate").expect("Escalate node");
+        assert_eq!(escalate.on_enter.len(), 2, "Escalate should dispatch + wait");
         let esc_args = escalate.on_enter[0]
             .args
             .as_object()
@@ -1126,6 +1144,22 @@ mod tests {
             esc_arguments.get("agent").and_then(|v| v.as_str()),
             Some("code-reviewer"),
             "escalation expensive agent should be code-reviewer"
+        );
+        let esc_wait_args = escalate.on_enter[1]
+            .args
+            .as_object()
+            .expect("escalate wait args");
+        let esc_wait_arguments = esc_wait_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("escalate wait arguments");
+        assert!(
+            esc_wait_arguments.get("task_id").is_some(),
+            "Escalate bro_wait should use task_id"
+        );
+        assert!(
+            spec.vars_schema.as_ref().is_some_and(|vs| vs.contains_key("expensive_output")),
+            "vars_schema should include expensive_output for completed escalation wait"
         );
     }
 }
