@@ -28,6 +28,7 @@ mod providers;
 mod query;
 mod render;
 mod routing;
+mod search;
 mod system_memory;
 mod threads;
 mod tool_docs;
@@ -687,6 +688,7 @@ use knowledge::{
 };
 use mcp_tools::bundle_evidence::BundleEvidenceParams;
 use mcp_tools::find_paths::FindPathsParams;
+use mcp_tools::hybrid_search::HybridSearchParams;
 use mcp_tools::inspect::InspectEntityParams;
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
@@ -711,6 +713,26 @@ impl BlackboxServer {
             }
             drop(idx);
             self.state.idx.read().search(&p)
+        })
+    }
+
+    #[tool(
+        name = "bbox_hybrid_search",
+        description = "Search typed agentic-corpus entities with BM25 plus vector RRF fusion; returns entity refs, scores, and vector_status."
+    )]
+    fn bbox_hybrid_search(&self, Parameters(p): Parameters<HybridSearchParams>) -> CallToolResult {
+        Self::run("bbox_hybrid_search", || {
+            let mut idx = self.state.idx.write();
+            if idx.is_empty() {
+                idx.build_index(false)
+                    .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
+            }
+            drop(idx);
+            mcp_tools::hybrid_search::hybrid_search(
+                &self.state.idx.read(),
+                &self.state.kb.read(),
+                &p,
+            )
         })
     }
 

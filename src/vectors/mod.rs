@@ -65,6 +65,10 @@ pub fn rebuild(route: &str) -> Result<()> {
     global().rebuild(route)
 }
 
+pub fn metrics() -> BTreeMap<String, PartitionMetrics> {
+    global().metrics()
+}
+
 pub fn default_vectors_dir() -> PathBuf {
     dirs::state_dir()
         .unwrap_or_else(|| {

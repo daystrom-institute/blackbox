@@ -61,11 +61,9 @@ impl ToolCategory {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
             }
             Self::Graph => {
-                "Inspect typed agentic-corpus entities and graph vocabulary. Use these tools after search returns entity refs, before path finding, or when you need to understand what edges and filters exist."
+                "Inspect agentic-corpus entities, graph vocabulary, paths, bundles, and retrieval."
             }
-            Self::Projects => {
-                "Register project roots for later file indexing."
-            }
+            Self::Projects => "Register project roots for later file indexing.",
             Self::Knowledge => {
                 "Memory has four lanes: `bbox_learn` for standing rendered rules, `bbox_remember` for cold indexed recall, `bbox_decide` for durable commitments with rationale, and `bbox_pin` for persisted but scope-limited ambient context on an active session/bro/thread/work-item. Render pipeline emits provider-specific markdown files (CLAUDE.md / AGENTS.md / GEMINI.md) only for the standing lanes."
             }
@@ -127,6 +125,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax.",
         when_to_use: "Use when you know the topic but not the exact session. Default `smart` mode treats adjacent terms as broad recall, preserves quoted phrases, and understands `-term`; switch to `mode=fulltext` when you want raw boolean query syntax with conjunction semantics. Filter by account, project, or role as early as possible. Pass `exclude_self=true` to suppress the caller's own current session. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders and query-shaping guidance.",
         example: Some(r#"bbox_search(query="redis locking", project="my-app", role="user")"#),
+    },
+    ToolDoc {
+        name: "bbox_hybrid_search",
+        category: ToolCategory::Graph,
+        summary: "Search typed agentic-corpus entities with BM25 plus vector RRF fusion; returns entity refs, scores, and vector_status.",
+        when_to_use: "Use for mixed corpus questions.",
+        example: None,
     },
     ToolDoc {
         name: "bbox_cite",
@@ -204,7 +209,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Graph,
         summary: "Inspect a vertex: returns properties AND targeted edges in one call. Prefer targeted inspection over broad exploration: 1) Set edge_types to the specific edges you want (e.g. 'SUPERSEDES,DERIVED_FROM'). 2) Set direction to 'out' or 'in' when you know which way to traverse. 3) Use 'both' only for initial orientation on an unfamiliar entity. 4) Set per_type_limit=0 for property-only inspection. property_mode controls detail: 'summary' (names/titles only), 'smart' (full text <=300 chars, truncated for longer - default), 'full' (no truncation).",
         when_to_use: "Prefer targeted inspection over broad sweeps. Set `edge_types` to the specific edges you want, set `direction` to `out` or `in` when known, use `both` only for initial orientation, and set `per_type_limit=0` for property-only inspection. Do not answer lifecycle or history questions from one inspect call when the claim depends on a multi-hop chain.",
-        example: Some(r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", edge_types="SUPERSEDES,DERIVED_FROM", direction="both")"#),
+        example: Some(
+            r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", edge_types="SUPERSEDES,DERIVED_FROM", direction="both")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_describe_schema",
@@ -389,7 +396,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Artifacts,
         summary: "Install a workflow, packet, or brofile artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
         when_to_use: "Use for producer-side artifacts shipped under examples/agentic-corpus or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, or brofile registry, then records version/source/supersession metadata in the catalog.",
-        example: Some(r#"bbox_artifact_install(kind="workflow", source="examples/agentic-corpus/workflows/schema-migration-arc.json")"#),
+        example: Some(
+            r#"bbox_artifact_install(kind="workflow", source="examples/agentic-corpus/workflows/schema-migration-arc.json")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_artifact_list",
@@ -403,7 +412,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Artifacts,
         summary: "Mark one installed artifact superseded by another artifact of the same kind.",
         when_to_use: "Use when a customized workflow/packet/brofile replaces an installed version but you want the old version retained for audit.",
-        example: Some(r#"bbox_artifact_supersede(kind="workflow", name="auto-digest-arc", superseded_by="auto-digest-arc-v2")"#),
+        example: Some(
+            r#"bbox_artifact_supersede(kind="workflow", name="auto-digest-arc", superseded_by="auto-digest-arc-v2")"#,
+        ),
     },
     // ── Rule-packets ─────────────────────────────────────────────────
     ToolDoc {
@@ -782,7 +793,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use after the deliberation completes and any synthesis artifact (ADR markdown, PR body, etc.) has been produced. Archived boards stay readable on disk for audit but no longer count toward inbox attention.",
         example: Some(r#"whiteboard_archive(board_id="adr-2026-04-27", agent_name="facilitator")"#),
     },
-
     // ── Councils ──────────────────────────────────────────────────
     ToolDoc {
         name: "bro_council_list",

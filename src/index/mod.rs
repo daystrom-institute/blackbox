@@ -635,6 +635,6 @@ pub use helpers::find_session_file;
 pub(crate) use knowledge_docs::{knowledge_chunk_hash, knowledge_entity_id};
 pub use reindex::spawn_reindex_thread;
 pub use search::{
-    CiteParams, ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
-    SessionsListParams, TopicsParams,
+    CiteParams, ContextParams, HybridBm25Hit, MessagesParams, ReindexParams, SearchParams,
+    SessionParams, SessionsListParams, TopicsParams,
 };

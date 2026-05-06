@@ -55,6 +55,18 @@ pub struct SearchParams {
     pub exclude_self: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridBm25Hit {
+    pub entity_id: String,
+    pub score: f32,
+    pub rank: usize,
+    pub doc_type: String,
+    pub chunk_kind: String,
+    pub role: String,
+    pub title: Option<String>,
+    pub excerpt: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TranscriptSearchMode {
     Smart,
@@ -305,6 +317,112 @@ impl TranscriptIndex {
             results.len(),
             results.join("\n\n---\n\n")
         ))
+    }
+
+    pub(crate) fn hybrid_bm25_hits(
+        &self,
+        query: &str,
+        limit: usize,
+        doc_type: Option<&str>,
+    ) -> Result<Vec<HybridBm25Hit>> {
+        if self.is_empty() || query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query_str = smart_query_to_tantivy(query).unwrap_or_else(|| query.to_string());
+        let searcher = self.reader.searcher();
+        let qp = QueryParser::for_index(
+            &self.index,
+            vec![
+                self.fields.content,
+                self.fields.project,
+                self.fields.code_content,
+                self.fields.symbol,
+                self.fields.commit_author_name,
+            ],
+        );
+        let text_query = qp.parse_query(&query_str)?;
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
+            vec![(Occur::Must, text_query.box_clone())];
+        if let Some(doc_type) = doc_type.filter(|value| !value.trim().is_empty()) {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.doc_type, doc_type),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        let query = BooleanQuery::new(clauses);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        if top_docs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (idx, (score, addr)) in top_docs.into_iter().enumerate() {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            let entity_id = self.hybrid_entity_id(&doc);
+            if entity_id.is_empty() {
+                continue;
+            }
+            let snippet = snippet_gen.snippet_from_doc(&doc);
+            let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
+            hits.push(HybridBm25Hit {
+                entity_id,
+                score,
+                rank: idx + 1,
+                doc_type: self.doc_text(&doc, self.fields.doc_type),
+                chunk_kind: self.doc_text(&doc, self.fields.chunk_kind),
+                role: self.doc_text(&doc, self.fields.role),
+                title: self.hybrid_title(&doc),
+                excerpt,
+            });
+        }
+        Ok(hits)
+    }
+
+    fn hybrid_entity_id(&self, doc: &TantivyDocument) -> String {
+        let explicit = self.doc_text(doc, self.fields.entity_id);
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        if self.doc_text(doc, self.fields.doc_type) == "transcript" {
+            let provider = self.doc_text(doc, self.fields.account);
+            let session_id = self.doc_text(doc, self.fields.session_id);
+            let line_offset = doc
+                .get_first(self.fields.byte_offset)
+                .and_then(|value| match value {
+                    tantivy::schema::OwnedValue::U64(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return crate::entity_ref::EntityRef::Transcript {
+                provider,
+                session_id,
+                line_offset,
+                event_idx: 0,
+            }
+            .to_string();
+        }
+        String::new()
+    }
+
+    fn hybrid_title(&self, doc: &TantivyDocument) -> Option<String> {
+        for field in [
+            self.fields.symbol,
+            self.fields.symbol_exact,
+            self.fields.commit_sha,
+            self.fields.file_path,
+            self.fields.session_id,
+        ] {
+            let value = self.doc_text(doc, field);
+            if !value.is_empty() {
+                return Some(value.chars().take(80).collect());
+            }
+        }
+        None
     }
 
     // ── Cite ────────────────────────────────────────────────────────
