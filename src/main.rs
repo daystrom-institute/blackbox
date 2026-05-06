@@ -1864,6 +1864,8 @@ struct AgentListParams {
     cost_class: Option<String>,
     #[serde(default)]
     provenance_kind: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -4511,8 +4513,13 @@ Constraints:\n\
             provenance_kind: p.provenance_kind,
         };
         match reg.list(&filter) {
-            Ok(summaries) => Self::ok_json(&serde_json::json!({
-                "agents": summaries.iter().map(|s| {
+            Ok(summaries) => {
+                let capped = match p.limit {
+                    Some(n) => summaries.into_iter().take(n).collect::<Vec<_>>(),
+                    None => summaries,
+                };
+                Self::ok_json(&serde_json::json!({
+                "agents": capped.iter().map(|s| {
                     let mut m = serde_json::Map::from_iter([
                         ("name".into(), serde_json::Value::String(s.name.clone())),
                         ("version".into(), serde_json::Value::String(s.version.clone())),
@@ -4539,7 +4546,8 @@ Constraints:\n\
                     }
                     serde_json::Value::Object(m)
                 }).collect::<Vec<_>>()
-            })),
+            }))
+            }
             Err(e) => Self::err_text(&format!("registry list failed: {e}")),
         }
     }
@@ -10456,6 +10464,7 @@ mod tests {
             include_superseded: None,
             cost_class: None,
             provenance_kind: None,
+            limit: None,
         }));
         assert_ne!(result.is_error, Some(true));
 
@@ -10487,6 +10496,7 @@ mod tests {
             include_superseded: None,
             cost_class: Some("notavalidclass".into()),
             provenance_kind: None,
+            limit: None,
         }));
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
@@ -10564,5 +10574,104 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
         assert!(text.contains("requires a name"), "got: {text}");
+    }
+
+    fn seed_test_agent_with_provenance(
+        catalog: &artifacts::ArtifactCatalog,
+        file_name: &str,
+        name: &str,
+        version: u64,
+        provenance: serde_json::Value,
+    ) {
+        let manifest = serde_json::json!({
+            "description": format!("Agent {name} with provenance."),
+            "when_to_use": ["when testing"],
+            "brofile_inline": {"provider": "claude"},
+            "provenance": provenance,
+        });
+        catalog
+            .install_value(
+                artifacts::ArtifactKind::Agent,
+                file_name.into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": name,
+                    "version": version,
+                    "manifest": manifest,
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn bro_agent_list_limit_caps_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        seed_test_agent(cat, "a1.json", "alpha", 1, None);
+        seed_test_agent(cat, "a2.json", "beta", 1, None);
+        seed_test_agent(cat, "a3.json", "gamma", 1, None);
+
+        let result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: None,
+            provenance_kind: None,
+            limit: Some(2),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["agents"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn bro_agent_list_provenance_kind_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        seed_test_agent(cat, "hand.json", "handmade", 1, None);
+        seed_test_agent_with_provenance(
+            cat,
+            "distilled.json",
+            "distilled",
+            1,
+            serde_json::json!({"kind": "distilled", "distilled_by": "badgey-01", "evidence_session_ids": [], "created_from_threads": [], "accept_count": 5, "reject_count": 0}),
+        );
+
+        let result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: None,
+            provenance_kind: Some("distilled".into()),
+            limit: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        let agents = body["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["name"], "distilled");
+    }
+
+    #[test]
+    fn bro_agent_get_pinned_version_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            5,
+            None,
+        );
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "reviewer@v4".into(),
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("agent not found"), "got: {text}");
     }
 }
