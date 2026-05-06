@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use super::EmbeddingProvider;
 
@@ -58,7 +59,7 @@ pub struct VoyageProvider {
 }
 
 impl VoyageProvider {
-    pub fn from_config(config: VoyageConfig) -> Self {
+    pub fn from_config(config: VoyageConfig) -> Result<Self> {
         let api_key = std::env::var(&config.api_key_env)
             .or_else(|_| {
                 if config.api_key_env == DEFAULT_API_KEY_ENV {
@@ -68,23 +69,29 @@ impl VoyageProvider {
                 }
             })
             .ok();
-        Self {
-            client: reqwest::Client::new(),
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .context("building voyage HTTP client")?,
             config,
             api_key,
-        }
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(endpoint: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    pub(crate) fn for_test(endpoint: String) -> Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .context("building voyage test HTTP client")?,
             config: VoyageConfig {
                 endpoint,
                 ..VoyageConfig::default()
             },
             api_key: Some("test-key".into()),
-        }
+        })
     }
 }
 
@@ -181,7 +188,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let provider = VoyageProvider::for_test(format!("http://{addr}/v1/embeddings"));
+        let provider = VoyageProvider::for_test(format!("http://{addr}/v1/embeddings")).unwrap();
         assert_eq!(provider.id(), super::super::VOYAGE_PROVIDER_ID);
         assert_eq!(provider.model_name(), DEFAULT_MODEL);
         assert_eq!(provider.dimensions(), VOYAGE_DIMENSIONS);

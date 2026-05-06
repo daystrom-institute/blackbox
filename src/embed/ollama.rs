@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use super::EmbeddingProvider;
 
@@ -41,11 +42,14 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    pub fn from_config(config: OllamaConfig) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    pub fn from_config(config: OllamaConfig) -> Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .context("building ollama HTTP client")?,
             config,
-        }
+        })
     }
 
     fn embed_url(&self) -> String {
@@ -140,7 +144,8 @@ mod tests {
         let provider = OllamaProvider::from_config(OllamaConfig {
             endpoint: format!("http://{addr}"),
             ..OllamaConfig::default()
-        });
+        })
+        .unwrap();
         assert_eq!(provider.id(), super::super::OLLAMA_PROVIDER_ID);
         assert_eq!(provider.model_name(), DEFAULT_MODEL);
         assert_eq!(provider.dimensions(), OLLAMA_DIMENSIONS);

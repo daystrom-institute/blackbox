@@ -188,10 +188,10 @@ impl EmbeddingRouter {
         match provider_id {
             VOYAGE_PROVIDER_ID => Ok(Box::new(voyage::VoyageProvider::from_config(
                 self.config.providers.voyage.clone(),
-            ))),
+            )?)),
             OLLAMA_PROVIDER_ID => Ok(Box::new(ollama::OllamaProvider::from_config(
                 self.config.providers.ollama.clone(),
-            ))),
+            )?)),
             other => bail!("unknown embedding provider `{other}` for bucket {}", bucket.as_str()),
         }
     }
