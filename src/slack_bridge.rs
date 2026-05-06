@@ -1042,6 +1042,7 @@ async fn run_socket_loop(
     ws_url: &str,
     ctx: &BridgeContext<'_>,
     shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 ) -> Result<Duration> {
     let connected_at = Instant::now();
     let (ws_stream, _resp) = tokio_tungstenite::connect_async(ws_url)
@@ -1100,23 +1101,14 @@ async fn run_socket_loop(
                     .unwrap_or("?")
                     .to_string();
 
-                let draining = shutdown.load(Ordering::Relaxed);
-                let process = process_slack_envelope(
-                    &mut ws_write,
-                    ctx,
-                    &envelope,
-                    &mut in_flight,
-                );
-
-                if draining {
-                    // Shutdown with bounded drain per §5.1
-                    tracing::info!(envelope_id = %env_id, "shutdown during processing; 2s drain");
-                    match tokio::time::timeout(Duration::from_secs(2), process).await {
-                        Ok(Ok(_)) => {
-                            tracing::debug!(envelope_id = %env_id, "drained before shutdown");
-                        }
+                // If shutdown is already signalled, drain with 2s deadline.
+                if shutdown.load(Ordering::Relaxed) {
+                    tracing::info!(envelope_id = %env_id, "shutdown before processing; 2s drain");
+                    let drain = process_slack_envelope(&mut ws_write, ctx, &envelope, &mut in_flight);
+                    match tokio::time::timeout(Duration::from_secs(2), drain).await {
+                        Ok(Ok(_)) => tracing::debug!(envelope_id = %env_id, "drained before shutdown"),
                         Ok(Err(e)) => {
-                            tracing::error!(envelope_id = %env_id, error = %e, "processing error during drain");
+                            tracing::error!(envelope_id = %env_id, error = %e, "drain error");
                             let _ = ack_to_slack(&mut ws_write, &env_id).await;
                         }
                         Err(_) => {
@@ -1127,14 +1119,41 @@ async fn run_socket_loop(
                     return Ok(connected_at.elapsed());
                 }
 
-                match process.await {
-                    Ok(_) => {
-                        tracing::debug!(envelope_id = %env_id, "envelope processed");
+                // Not shutting down yet — race the processing future
+                // against the shutdown signal. If shutdown wins, drain
+                // with 2s deadline; if processing completes first,
+                // handle normally.
+                let mut process = Box::pin(process_slack_envelope(
+                    &mut ws_write, ctx, &envelope, &mut in_flight,
+                ));
+
+                tokio::select! {
+                    result = &mut process => {
+                        drop(process);
+                        match result {
+                            Ok(_) => tracing::debug!(envelope_id = %env_id, "envelope processed"),
+                            Err(e) => {
+                                tracing::error!(envelope_id = %env_id, error = %e, "processing failed");
+                                let _ = ack_to_slack(&mut ws_write, &env_id).await;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(envelope_id = %env_id, error = %e, "envelope processing failed");
-                        // Try to ack so Slack doesn't redeliver forever
-                        let _ = ack_to_slack(&mut ws_write, &env_id).await;
+                    _ = shutdown_notify.notified() => {
+                        // Shutdown signalled mid-processing — 2s drain
+                        tracing::info!(envelope_id = %env_id, "shutdown during processing; 2s drain");
+                        let drain_result = tokio::time::timeout(Duration::from_secs(2), process).await;
+                        match drain_result {
+                            Ok(Ok(_)) => tracing::debug!(envelope_id = %env_id, "drained before shutdown"),
+                            Ok(Err(e)) => {
+                                tracing::error!(envelope_id = %env_id, error = %e, "processing error during drain");
+                                let _ = ack_to_slack(&mut ws_write, &env_id).await;
+                            }
+                            Err(_) => {
+                                tracing::warn!(envelope_id = %env_id, "drain deadline exceeded; ack-and-exit");
+                                let _ = ack_to_slack(&mut ws_write, &env_id).await;
+                            }
+                        }
+                        return Ok(connected_at.elapsed());
                     }
                 }
             }
@@ -1157,7 +1176,12 @@ async fn run_socket_loop(
 // Resets after a successful connection that runs ≥30s.
 // Cancellable via the shutdown Notify — returns true if cancelled.
 
-async fn backoff_sleep(attempt: &mut u32, shutdown: Arc<tokio::sync::Notify>) -> bool {
+async fn backoff_sleep(attempt: &mut u32, flag: &AtomicBool, shutdown: Arc<tokio::sync::Notify>) -> bool {
+    // Check flag first — SIGTERM may have fired before we entered.
+    if flag.load(Ordering::Relaxed) {
+        tracing::info!("shutdown flag set before backoff; cancelling reconnect");
+        return true;
+    }
     let delay_secs = (1u64 << (*attempt as u64)).min(60);
     tracing::info!(attempt = *attempt, delay_secs = delay_secs, "backoff before reconnect");
     *attempt = attempt.saturating_add(1);
@@ -1264,6 +1288,13 @@ async fn main() -> Result<()> {
     let mut reconnect_attempt: u32 = 0;
 
     loop {
+        // Check flag before blocking on open_socket_mode_url.
+        // Notify is edge-triggered and can fire before the select
+        // is entered; fall back to the atomic flag.
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("shutdown before open_socket_mode_url");
+            return Ok(());
+        }
         let ws_url = tokio::select! {
             result = open_socket_mode_url(&app_token) => result,
             _ = shutdown_notify.notified() => {
@@ -1278,7 +1309,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 tracing::error!("open_socket_mode_url failed: {e:#}");
-                if backoff_sleep(&mut reconnect_attempt, shutdown_notify.clone()).await {
+                if backoff_sleep(&mut reconnect_attempt, &shutdown, shutdown_notify.clone()).await {
                     return Ok(());
                 }
                 continue;
@@ -1290,7 +1321,7 @@ async fn main() -> Result<()> {
             h.connected.store(true, Ordering::Relaxed);
         }
 
-        let result = run_socket_loop(&ws_url, &ctx, shutdown.clone()).await;
+        let result = run_socket_loop(&ws_url, &ctx, shutdown.clone(), shutdown_notify.clone()).await;
 
         // Mark disconnected
         if let Some(h) = &health {
@@ -1314,7 +1345,7 @@ async fn main() -> Result<()> {
                 if let Some(h) = &health {
                     h.reconnects.fetch_add(1, Ordering::Relaxed);
                 }
-                if backoff_sleep(&mut reconnect_attempt, shutdown_notify.clone()).await {
+                if backoff_sleep(&mut reconnect_attempt, &shutdown, shutdown_notify.clone()).await {
                     return Ok(());
                 }
             }
@@ -1324,7 +1355,7 @@ async fn main() -> Result<()> {
                     h.reconnects.fetch_add(1, Ordering::Relaxed);
                 }
                 tracing::error!("Socket Mode loop error: {e:#}");
-                if backoff_sleep(&mut reconnect_attempt, shutdown_notify.clone()).await {
+                if backoff_sleep(&mut reconnect_attempt, &shutdown, shutdown_notify.clone()).await {
                     return Ok(());
                 }
             }
