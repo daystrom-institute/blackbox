@@ -180,7 +180,7 @@
   },
   {
     "id": "reject-missing-session-01",
-    "expected_verdict": "reject",
+    "expected_verdict": "auto_apply",
     "proposal": {
       "title": "Missing source session",
       "content": "No source session was provided.",
@@ -188,7 +188,7 @@
       "scope": "project",
       "source_files": ["src/main.rs"],
       "source_query": "missing session",
-      "justification": "No source session.",
+      "justification": "source_files and source_query still provide provenance.",
       "suggested_approval": "auto_apply",
       "rendered": false,
       "daily_count": 0,
@@ -197,7 +197,7 @@
   },
   {
     "id": "reject-null-session-01",
-    "expected_verdict": "reject",
+    "expected_verdict": "auto_apply",
     "proposal": {
       "title": "Null source session",
       "content": "Source session was null.",
@@ -206,7 +206,7 @@
       "source_session": null,
       "source_files": ["src/main.rs"],
       "source_query": "null session",
-      "justification": "Null provenance.",
+      "justification": "source_files and source_query still provide provenance.",
       "suggested_approval": "auto_apply",
       "rendered": false,
       "daily_count": 0,
@@ -215,7 +215,7 @@
   },
   {
     "id": "reject-missing-query-01",
-    "expected_verdict": "reject",
+    "expected_verdict": "auto_apply",
     "proposal": {
       "title": "Missing source query",
       "content": "No source query was provided.",
@@ -223,7 +223,7 @@
       "scope": "project",
       "source_session": "sess-k",
       "source_files": ["src/main.rs"],
-      "justification": "No source query.",
+      "justification": "source_session and source_files still provide provenance.",
       "suggested_approval": "auto_apply",
       "rendered": false,
       "daily_count": 0,
@@ -232,7 +232,7 @@
   },
   {
     "id": "reject-empty-files-01",
-    "expected_verdict": "reject",
+    "expected_verdict": "auto_apply",
     "proposal": {
       "title": "Empty source files",
       "content": "No source file was provided.",
@@ -241,7 +241,7 @@
       "source_session": "sess-l",
       "source_files": [],
       "source_query": "empty files",
-      "justification": "No source file.",
+      "justification": "source_session and source_query still provide provenance.",
       "suggested_approval": "auto_apply",
       "rendered": false,
       "daily_count": 0,
@@ -253,12 +253,10 @@
     "expected_verdict": "reject",
     "proposal": {
       "title": "Missing source files",
-      "content": "The source_files field was absent.",
+      "content": "No source session, source query, or source files were provided.",
       "category": "memory",
       "scope": "project",
-      "source_session": "sess-m",
-      "source_query": "missing files",
-      "justification": "No source file field.",
+      "justification": "All provenance fields are absent.",
       "suggested_approval": "auto_apply",
       "rendered": false,
       "daily_count": 0,

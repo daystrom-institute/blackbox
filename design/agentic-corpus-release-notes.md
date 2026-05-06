@@ -118,6 +118,12 @@ surface and seed `source_session`, `task_kind`, and `daily_count` in initial
 vars. A later phase should emit the completion signal from bro task
 finalization and route it into this installed workflow.
 
+The v1 trigger does not reliably populate `source_query`. Until the
+`task-completed` signal carries the originating prompt/query, the
+`auto-digest/entry-quality` packet treats provenance as present when any one
+of `source_session`, `source_query`, or `source_files` is present. Candidates
+with all three absent are rejected.
+
 ## M4
 
 `KnowledgeEntry.links` is now the durable authored-edge surface for reviewed

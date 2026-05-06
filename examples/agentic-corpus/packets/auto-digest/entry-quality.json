@@ -18,51 +18,56 @@
       "consequent": "hold_for_review"
     },
     {
-      "id": "reject_missing_source_session",
-      "classification": "reject",
-      "antecedent": {
-        "op": "Any",
-        "args": [
-          { "op": "IsNull", "field": "source_session" },
-          { "op": "IsNull", "field": "vars.candidate.source_session" },
-          {
-            "op": "All",
-            "args": [
-              { "op": "IsMissing", "field": "source_session" },
-              { "op": "IsMissing", "field": "vars.candidate.source_session" }
-            ]
-          }
-        ]
-      },
-      "consequent": "reject"
-    },
-    {
-      "id": "reject_missing_source_query",
-      "classification": "reject",
-      "antecedent": {
-        "op": "Any",
-        "args": [
-          { "op": "IsNull", "field": "source_query" },
-          { "op": "IsNull", "field": "vars.candidate.source_query" },
-          {
-            "op": "All",
-            "args": [
-              { "op": "IsMissing", "field": "source_query" },
-              { "op": "IsMissing", "field": "vars.candidate.source_query" }
-            ]
-          }
-        ]
-      },
-      "consequent": "reject"
-    },
-    {
-      "id": "reject_missing_source_files",
+      "id": "reject_missing_provenance",
       "classification": "reject",
       "antecedent": {
         "op": "All",
         "args": [
-          { "op": "CountCmp", "path": "source_files[*]", "compare": "eq", "value": 0 },
-          { "op": "CountCmp", "path": "vars.candidate.source_files[*]", "compare": "eq", "value": 0 }
+          {
+            "op": "All",
+            "args": [
+              {
+                "op": "Any",
+                "args": [
+                  { "op": "IsNull", "field": "source_session" },
+                  { "op": "IsMissing", "field": "source_session" }
+                ]
+              },
+              {
+                "op": "Any",
+                "args": [
+                  { "op": "IsNull", "field": "vars.candidate.source_session" },
+                  { "op": "IsMissing", "field": "vars.candidate.source_session" }
+                ]
+              }
+            ]
+          },
+          {
+            "op": "All",
+            "args": [
+              {
+                "op": "Any",
+                "args": [
+                  { "op": "IsNull", "field": "source_query" },
+                  { "op": "IsMissing", "field": "source_query" }
+                ]
+              },
+              {
+                "op": "Any",
+                "args": [
+                  { "op": "IsNull", "field": "vars.candidate.source_query" },
+                  { "op": "IsMissing", "field": "vars.candidate.source_query" }
+                ]
+              }
+            ]
+          },
+          {
+            "op": "All",
+            "args": [
+              { "op": "CountCmp", "path": "source_files[*]", "compare": "eq", "value": 0 },
+              { "op": "CountCmp", "path": "vars.candidate.source_files[*]", "compare": "eq", "value": 0 }
+            ]
+          }
         ]
       },
       "consequent": "reject"
