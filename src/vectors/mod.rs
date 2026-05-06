@@ -429,6 +429,28 @@ mod tests {
     }
 
     #[test]
+    fn delete_entity_all_routes_writes_tombstones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "same", "h1", vec![1.0, 0.0])
+            .unwrap();
+        store
+            .upsert("ollama-768", "same", "h1", vec![0.0, 1.0, 0.0])
+            .unwrap();
+        store.delete_entity_all_routes("same").unwrap();
+
+        assert_eq!(store.metrics()["voyage-1024"].active_count, 0);
+        assert_eq!(store.metrics()["ollama-768"].active_count, 0);
+        let voyage_records = wal::read_all(&tmp.path().join("voyage-1024").join("records.wal"))
+            .expect("voyage WAL should read");
+        let ollama_records = wal::read_all(&tmp.path().join("ollama-768").join("records.wal"))
+            .expect("ollama WAL should read");
+        assert!(voyage_records.last().unwrap().deleted_at.is_some());
+        assert!(ollama_records.last().unwrap().deleted_at.is_some());
+    }
+
+    #[test]
     fn dimension_mismatch_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VectorStore::open(tmp.path()).unwrap();
