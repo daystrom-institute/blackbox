@@ -234,14 +234,10 @@ fn render_text(query: &str, seeds: &[SeedEntity]) -> String {
         return out;
     }
     out.push_str("Search results are seeds, not proof. Inspect the best 1-3 hits before answering or traversing further.\n\n");
-    for seed in seeds {
+    for (idx, seed) in seeds.iter().enumerate() {
         out.push_str(&format!(
             "{}. {} — {:.5} ({})\n   {}\n",
-            seeds
-                .iter()
-                .position(|candidate| candidate.entity_ref == seed.entity_ref)
-                .map(|idx| idx + 1)
-                .unwrap_or(1),
+            idx + 1,
             seed.label,
             seed.score,
             seed.match_source,
