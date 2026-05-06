@@ -332,7 +332,7 @@ impl TranscriptIndex {
 
         let query_str = smart_query_to_tantivy(query).unwrap_or_else(|| query.to_string());
         let searcher = self.reader.searcher();
-        let qp = QueryParser::for_index(
+        let mut qp = QueryParser::for_index(
             &self.index,
             vec![
                 self.fields.content,
@@ -340,8 +340,14 @@ impl TranscriptIndex {
                 self.fields.code_content,
                 self.fields.symbol,
                 self.fields.commit_author_name,
+                self.fields.path_tokens,
             ],
         );
+        // Boost path-token matches over generic content matches: a query
+        // mentioning `voyage` should preferentially surface files literally
+        // named voyage.rs over arbitrary text mentions of "voyage".
+        qp.set_field_boost(self.fields.path_tokens, 2.5);
+        qp.set_field_boost(self.fields.symbol, 2.0);
         let text_query = qp.parse_query(&query_str)?;
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
             vec![(Occur::Must, text_query.box_clone())];

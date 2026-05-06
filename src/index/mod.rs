@@ -11,7 +11,7 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g1";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g2-path-tokens";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -32,6 +32,12 @@ pub struct FieldHandles {
     pub role: Field,
     pub timestamp: Field,
     pub file_path: Field,
+    /// Tokenized variant of `file_path` indexed with the code tokenizer so
+    /// path components like `src/embed/voyage.rs` split into `src`, `embed`,
+    /// `voyage`, `rs`. Lets BM25 boost results whose file/symbol path matches
+    /// the query — without this, a query for "voyage queue cap" can't prefer
+    /// files literally named voyage.rs / queue.rs over arbitrary content matches.
+    pub path_tokens: Field,
     pub byte_offset: Field,
     pub git_branch: Field,
     pub is_subagent: Field,
@@ -442,6 +448,7 @@ pub(crate) fn build_schema() -> (Schema, FieldHandles) {
         role: builder.add_text_field("role", STRING | STORED),
         timestamp: builder.add_text_field("timestamp", STRING | STORED),
         file_path: builder.add_text_field("file_path", STRING | STORED),
+        path_tokens: builder.add_text_field("path_tokens", code_options.clone()),
         byte_offset: builder.add_u64_field("byte_offset", STORED),
         git_branch: builder.add_text_field("git_branch", STRING | STORED),
         is_subagent: builder.add_u64_field("is_subagent", INDEXED | STORED),

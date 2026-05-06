@@ -113,7 +113,17 @@ pub(crate) fn build_project_file_doc(
     doc.add_text(f.account, "project_file");
     doc.add_text(f.project, &project.canonical_path);
     doc.add_text(f.role, "file");
-    doc.add_text(f.file_path, absolute_path.to_string_lossy());
+    let path_str = absolute_path.to_string_lossy();
+    doc.add_text(f.file_path, &*path_str);
+    // Reuse the same string for the tokenized path field; the code tokenizer
+    // splits on `/`, `_`, `.`, etc., so /home/x/src/embed/voyage.rs becomes
+    // tokens [home, x, src, embed, voyage, rs] available to BM25 ranking.
+    doc.add_text(f.path_tokens, &*path_str);
+    if let Some(symbol) = &chunk.symbol {
+        // Symbol path also tokenized for BM25 boost — `Witness.Authority` →
+        // [Witness, Authority] so symbol-named queries surface correctly.
+        doc.add_text(f.path_tokens, symbol.as_str());
+    }
     doc.add_u64(f.byte_offset, chunk.byte_start);
     doc.add_u64(f.is_subagent, 0);
     doc.add_text(f.chunk_kind, &chunk.chunk_kind);
