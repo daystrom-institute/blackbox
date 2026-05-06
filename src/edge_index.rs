@@ -42,6 +42,7 @@ pub struct EdgeStoreRefs<'a> {
     pub notes: &'a Notes,
     pub task_store: &'a TaskStore,
     pub edges_dir: PathBuf,
+    pub include_tantivy_projection: bool,
 }
 
 impl EdgeIndex {
@@ -54,8 +55,12 @@ impl EdgeIndex {
         index.project_thread_edges(stores.threads, &mut seen);
         index.project_note_edges(stores.notes, &mut seen);
         index.project_task_edges(stores.task_store, &mut seen);
-        if let Ok(docs) = stores.index.edge_projection_docs() {
-            index.project_tantivy_edges(&docs, &mut seen);
+        if stores.include_tantivy_projection {
+            if let Ok(docs) = stores.index.edge_projection_docs() {
+                index.project_tantivy_edges(&docs, &mut seen);
+            }
+        } else {
+            tracing::debug!("rebuilt EdgeIndex without Tantivy stored-doc projection");
         }
         index.project_sidecar_edges(&stores.edges_dir, &mut seen);
 
@@ -63,6 +68,7 @@ impl EdgeIndex {
             edges = index.edge_count(),
             sources = index.forward.len(),
             targets = index.reverse.len(),
+            include_tantivy_projection = stores.include_tantivy_projection,
             elapsed_ms = started.elapsed().as_millis(),
             "rebuilt EdgeIndex"
         );

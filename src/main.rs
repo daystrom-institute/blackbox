@@ -598,7 +598,7 @@ impl BlackboxServer {
     }
 
     fn rebuild_edge_index_from_stores(&self) {
-        rebuild_edge_index_from_shared(&self.state);
+        rebuild_edge_index_from_shared(&self.state, true);
     }
 
     /// Resolve a workflow by registry id (set via `bro_workflow_install`
@@ -6708,7 +6708,7 @@ fn deactivate_artifact(
     Ok(())
 }
 
-fn rebuild_edge_index_from_shared(state: &SharedState) {
+fn rebuild_edge_index_from_shared(state: &SharedState, include_tantivy_projection: bool) {
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
     let idx = state.idx.read();
     let kb = state.kb.read();
@@ -6722,6 +6722,7 @@ fn rebuild_edge_index_from_shared(state: &SharedState) {
         notes: &notes,
         task_store: &task_store,
         edges_dir,
+        include_tantivy_projection,
     });
     *state.edge_index.write() = rebuilt;
 }
@@ -6729,10 +6730,8 @@ fn rebuild_edge_index_from_shared(state: &SharedState) {
 /// Watcher thread that rebuilds the EdgeIndex when the underlying tantivy
 /// corpus has grown. The auto-reindex thread writes new docs + edge sidecars
 /// every interval, but it can't trigger a rebuild itself (it spawns before
-/// SharedState exists). This watcher polls `idx.num_docs()` and triggers a
-/// rebuild whenever the count advances, which folds in the new project_file
-/// edges (IN_FILE / CONTAINS_SYMBOL / NEXT_CHUNK / etc.) so the agentic
-/// graph surface stays current without manual intervention.
+/// SharedState exists). The watcher uses sidecar-only rebuilds so background
+/// maintenance does not materialize every stored Tantivy document.
 fn spawn_edge_index_rebuild_watcher(state: Arc<SharedState>, interval: std::time::Duration) {
     std::thread::Builder::new()
         .name("blackbox-edge-rebuild".into())
@@ -6745,7 +6744,7 @@ fn spawn_edge_index_rebuild_watcher(state: Arc<SharedState>, interval: std::time
                 let current = state.idx.read().num_docs();
                 if current > last_seen {
                     let started = std::time::Instant::now();
-                    rebuild_edge_index_from_shared(&state);
+                    rebuild_edge_index_from_shared(&state, false);
                     tracing::info!(
                         prev_docs = last_seen,
                         new_docs = current,
@@ -7771,6 +7770,7 @@ async fn main() -> anyhow::Result<()> {
         notes: &notes_store,
         task_store: &task_store,
         edges_dir: edge_index::edges_dir_from_bro_store(&store_dir),
+        include_tantivy_projection: false,
     });
 
     let shared = Arc::new(SharedState {
@@ -8994,6 +8994,7 @@ mod tests {
             notes: &server.state.notes.read(),
             task_store: &server.state.task_store.read(),
             edges_dir,
+            include_tantivy_projection: true,
         });
         let source_ref = entity_ref::EntityRef::parse(source).unwrap();
         let target_ref = entity_ref::EntityRef::parse(target).unwrap();
