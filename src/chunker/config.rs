@@ -63,30 +63,37 @@ impl SourceFormatChunker for YamlChunker {
 
 fn json_top_level_chunks(path: &Path, value: &JsonValue) -> Result<Vec<Chunk>> {
     let mut chunks = Vec::new();
+    let mut byte_offset = 0usize;
     match value {
         JsonValue::Object(map) => {
             for (key, value) in map {
                 let content = serde_json::to_string_pretty(&serde_json::json!({ key: value }))?;
+                let byte_start = byte_offset;
+                let byte_end = byte_start + content.len();
                 chunks.push(placeholder_chunk(
                     path,
                     "config_block",
                     Some("json"),
                     content,
-                    0,
-                    0,
+                    byte_start as u64,
+                    byte_end as u64,
                     chunks.len() as u32,
                 ));
+                byte_offset = byte_end + 1;
             }
         }
-        _ => chunks.push(placeholder_chunk(
-            path,
-            "config_block",
-            Some("json"),
-            serde_json::to_string_pretty(value)?,
-            0,
-            0,
-            0,
-        )),
+        _ => {
+            let content = serde_json::to_string_pretty(value)?;
+            chunks.push(placeholder_chunk(
+                path,
+                "config_block",
+                Some("json"),
+                content.clone(),
+                0,
+                content.len() as u64,
+                0,
+            ));
+        }
     }
     Ok(chunks)
 }
@@ -94,7 +101,10 @@ fn json_top_level_chunks(path: &Path, value: &JsonValue) -> Result<Vec<Chunk>> {
 fn top_level_text_chunks(path: &Path, language: &str, rendered: &str) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let mut current = String::new();
-    for line in rendered.lines() {
+    let mut current_start = 0usize;
+    let mut current_end = 0usize;
+    let mut offset = 0usize;
+    for line in rendered.split_inclusive('\n') {
         let starts_top_level = !line.starts_with(char::is_whitespace) && !line.trim().is_empty();
         if starts_top_level && !current.trim().is_empty() {
             chunks.push(placeholder_chunk(
@@ -102,14 +112,16 @@ fn top_level_text_chunks(path: &Path, language: &str, rendered: &str) -> Vec<Chu
                 "config_block",
                 Some(language),
                 current.trim().to_string(),
-                0,
-                0,
+                current_start as u64,
+                current_end as u64,
                 chunks.len() as u32,
             ));
             current.clear();
+            current_start = offset;
         }
         current.push_str(line);
-        current.push('\n');
+        current_end = offset + line.len();
+        offset = current_end;
     }
     if !current.trim().is_empty() {
         chunks.push(placeholder_chunk(
@@ -117,10 +129,42 @@ fn top_level_text_chunks(path: &Path, language: &str, rendered: &str) -> Vec<Chu
             "config_block",
             Some(language),
             current.trim().to_string(),
-            0,
-            0,
+            current_start as u64,
+            current_end as u64,
             chunks.len() as u32,
         ));
     }
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_chunkers_populate_byte_ranges() {
+        let (json_chunks, _) = JsonChunker
+            .chunk(Path::new("config.json"), br#"{ "b": 2, "a": 1 }"#)
+            .unwrap();
+        assert!(json_chunks
+            .iter()
+            .all(|chunk| chunk.byte_end > chunk.byte_start));
+
+        let (toml_chunks, _) = TomlChunker
+            .chunk(
+                Path::new("Cargo.toml"),
+                b"[package]\nname = \"x\"\n[dependencies]\n",
+            )
+            .unwrap();
+        assert!(toml_chunks
+            .iter()
+            .all(|chunk| chunk.byte_end > chunk.byte_start));
+
+        let (yaml_chunks, _) = YamlChunker
+            .chunk(Path::new("config.yaml"), b"a: 1\nb:\n  c: 2\n")
+            .unwrap();
+        assert!(yaml_chunks
+            .iter()
+            .all(|chunk| chunk.byte_end > chunk.byte_start));
+    }
 }
