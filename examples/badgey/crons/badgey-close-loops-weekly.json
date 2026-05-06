@@ -1,0 +1,12 @@
+{
+  "name": "badgey-close-loops-weekly",
+  "schedule": "0 0 9 * * 0",
+  "payload": {
+    "tool": "badgey_close_loops",
+    "arguments": {
+      "window_days": 14
+    }
+  },
+  "concurrency": 1,
+  "routing_packet": "domain:badgey/cron-routing"
+}

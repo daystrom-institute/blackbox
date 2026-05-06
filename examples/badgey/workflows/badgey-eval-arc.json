@@ -1,0 +1,39 @@
+{
+  "name": "badgey-eval-arc",
+  "version": 1,
+  "actors": {},
+  "start": "RunBadgeyAsk",
+  "vars_schema": {
+    "badgey_id": { "kind": "string", "required": true },
+    "question": { "kind": "string", "required": true },
+    "badgey_result": { "kind": "any" },
+    "eval_result": { "kind": "string" }
+  },
+  "nodes": {
+    "RunBadgeyAsk": {
+      "prompt": "Run one Badgey answer-mode eval query.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_ask",
+            "arguments": {
+              "badgey_id": "${vars.badgey_id}",
+              "question": "${vars.question}",
+              "timeout_seconds": 120
+            },
+            "timeout_secs": 180
+          },
+          "into_var": "badgey_result",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "name": "eval_result", "value": "badgey_query_completed" }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

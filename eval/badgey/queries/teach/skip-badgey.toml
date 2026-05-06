@@ -1,0 +1,11 @@
+id = "badgey-teach-003"
+mode = "teach"
+query = "Teach a caller when they can skip Badgey and use graph tools directly."
+required_entity_refs = ["knowledge:badgey-graduation"]
+required_citation_kinds = ["knowledge"]
+narrative_must_contain = ["skip", "directly"]
+
+[[required_path_edges]]
+from = "knowledge:badgey-graduation"
+edge = "DERIVED_FROM"
+to = "thread:badgey-teach"

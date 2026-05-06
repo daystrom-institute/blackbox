@@ -273,10 +273,11 @@ impl Provider {
                     "stream-json".into(),
                     "--verbose".into(),
                     "--include-partial-messages".into(),
-                    "--session-id".into(),
-                    session_id.into(),
                     "--dangerously-skip-permissions".into(),
                 ];
+                if !session_id.is_empty() && session_id != "pending" {
+                    args.extend(["--session-id".into(), session_id.into()]);
+                }
                 if let Some(m) = model {
                     args.extend(["--model".into(), m.into()]);
                 }
@@ -1082,6 +1083,15 @@ impl Provider {
 }
 
 fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
+    if let Some(session_id) = evt["session_id"]
+        .as_str()
+        .or_else(|| evt["sessionId"].as_str())
+        .or_else(|| evt["message"]["session_id"].as_str())
+        .or_else(|| evt["message"]["sessionId"].as_str())
+    {
+        sink.session_id = Some(session_id.to_string());
+    }
+
     // Partial streaming chunks from --include-partial-messages. Each text_delta
     // grows the in-flight message; a new message_start clears the buffer so we
     // don't concatenate across turns / tool-use blocks.

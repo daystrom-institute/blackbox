@@ -194,6 +194,34 @@ impl ProposalStore {
         Ok(proposal)
     }
 
+    pub fn set_applied_task_id(
+        &self,
+        instance_id: &BadgeyId,
+        proposal_id: &str,
+        task_id: String,
+    ) -> Result<BadgeyProposal> {
+        let path = self.proposal_path(instance_id, proposal_id)?;
+        if !path.exists() {
+            return Err(ProposalStoreError::NotFound {
+                instance_id: instance_id.clone(),
+                proposal_id: proposal_id.to_string(),
+            });
+        }
+        let _lock = lock_path(&path.with_extension("lock"))?;
+        let mut proposal: BadgeyProposal = read_json(&path)?;
+        if proposal.state != ProposalState::Applying {
+            return Err(ProposalStoreError::Conflict {
+                proposal_id: proposal_id.to_string(),
+                expected: ProposalState::Applying,
+                actual: proposal.state,
+            });
+        }
+        proposal.applied_task_id = Some(task_id);
+        proposal.updated_at = now_rfc3339();
+        atomic_write_json(&path, &proposal)?;
+        Ok(proposal)
+    }
+
     pub fn list_by_instance(&self, instance_id: &BadgeyId) -> Result<Vec<BadgeyProposal>> {
         let dir = self.instance_dir(instance_id)?;
         if !dir.exists() {

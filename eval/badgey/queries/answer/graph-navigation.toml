@@ -1,0 +1,11 @@
+id = "badgey-answer-001"
+mode = "answer"
+query = "Which entity refs explain how Badgey should navigate agentic graph evidence?"
+required_entity_refs = ["knowledge:badgey-design", "thread:agentic-corpus"]
+required_citation_kinds = ["knowledge", "thread"]
+narrative_must_contain = ["entity_ref", "evidence"]
+
+[[required_path_edges]]
+from = "knowledge:badgey-design"
+edge = "DERIVED_FROM"
+to = "thread:agentic-corpus"

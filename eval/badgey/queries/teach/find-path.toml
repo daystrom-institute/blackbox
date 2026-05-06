@@ -1,0 +1,11 @@
+id = "badgey-teach-002"
+mode = "teach"
+query = "Teach a caller how to materialize a graph path instead of trusting prose."
+required_entity_refs = ["knowledge:badgey-paths"]
+required_citation_kinds = ["knowledge"]
+narrative_must_contain = ["path", "bbox_find_paths"]
+
+[[required_path_edges]]
+from = "knowledge:badgey-paths"
+edge = "REFERENCES"
+to = "tool:bbox_find_paths"

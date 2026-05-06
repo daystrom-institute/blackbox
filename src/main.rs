@@ -1,6 +1,9 @@
 #[cfg(test)]
 #[path = "../eval/agents/check.rs"]
 mod agent_eval_check;
+#[cfg(test)]
+#[path = "../eval/badgey/check.rs"]
+mod badgey_eval_check;
 mod artifacts;
 mod chunker;
 mod council;
@@ -49,19 +52,19 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::RwLock;
 
 use axum::extract::{Query, State as AxumState};
-use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
-use futures::{StreamExt, stream::Stream};
+use axum::response::IntoResponse;
+use futures::{stream::Stream, StreamExt};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, IntoContents, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -647,6 +650,1657 @@ impl BlackboxServer {
         Ok(task)
     }
 
+    fn badgey_parse_id(&self, raw: &str) -> Result<orchestration::badgey::types::BadgeyId, String> {
+        raw.parse()
+            .map_err(|e: String| format!("error.bad_input(code=invalid_badgey_id): {e}"))
+    }
+
+    fn badgey_thread_id_from_open_result(&self, result: &str) -> Result<String, String> {
+        let re = regex::Regex::new(r"Thread created: (thread-[0-9a-f]{8})")
+            .map_err(|e| format!("internal regex error: {e}"))?;
+        re.captures(result)
+            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+            .ok_or_else(|| format!("could not parse thread id from bbox_thread result: {result}"))
+    }
+
+    fn badgey_scope_bind(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        thread_id: &str,
+        scope: &orchestration::badgey::types::BadgeyScope,
+    ) -> String {
+        let brief = scope
+            .initial_brief
+            .as_deref()
+            .unwrap_or("general consultation");
+        let recent_proposals = self
+            .state
+            .badgey_proposals
+            .list_by_instance(id)
+            .map(|proposals| {
+                proposals
+                    .into_iter()
+                    .rev()
+                    .take(8)
+                    .map(|p| format!("{}:{:?}:{:?}", p.id, p.kind, p.state))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let queue_status = self
+            .state
+            .badgey_registry
+            .queue_status(id)
+            .ok()
+            .and_then(|status| serde_json::to_string(&status).ok())
+            .unwrap_or_else(|| "unregistered".to_string());
+        let recent_paths = self
+            .state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id))
+            .filter_map(|note| {
+                serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body).ok()
+            })
+            .filter_map(|event| match event {
+                orchestration::badgey::events::ThreadEvent::PathCached { id, summary, .. } => {
+                    Some(format!("{id}:{summary}"))
+                }
+                _ => None,
+            })
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "[badgey-scope]\nbadgey_id: {id}\nthread_of_record: {thread_id}\nproject: {project}\ncurrent_time: {current_time}\nbrief: {brief}\nqueue: {queue_status}\nrecent_paths: {recent_paths}\nrecent_proposals: {recent_proposals}\nbudget_remaining: advisory\n[/badgey-scope]\n",
+            current_time = util::now_iso(),
+            project = scope.project_id
+        )
+    }
+
+    fn badgey_write_event(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        event: orchestration::badgey::events::ThreadEvent,
+        task_id: Option<String>,
+    ) -> Result<String, String> {
+        let kind = event.note_kind().to_string();
+        let body = serde_json::to_string(&event)
+            .map_err(|e| format!("serializing badgey thread event: {e}"))?;
+        self.state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind,
+                body,
+                task_id,
+                session_id: Some(instance.provider_session_id.clone()),
+                project: Some(instance.scope.project_id.clone()),
+                thread_id: Some(instance.thread_of_record_id.clone()),
+                provider: Some(instance.provider.as_str().to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .map_err(|e| format!("writing badgey thread event: {e:#}"))
+    }
+
+    fn badgey_launch_exec(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        scope: &orchestration::badgey::types::BadgeyScope,
+        thread_id: &str,
+        bro_label: Option<String>,
+    ) -> Result<
+        (
+            Arc<orch::Task>,
+            Provider,
+            String,
+            orchestration::mcp::McpFilters,
+        ),
+        String,
+    > {
+        let store_dir = self.state.store_dir.clone();
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
+            self.resolve_exec_target(Some("badgey-persona"), None, Some(&scope.project_id))?;
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let session_id = "pending".to_string();
+        let scope_bind = self.badgey_scope_bind(id, thread_id, scope);
+        let prompt = format!(
+            "{}\nInitialize this Badgey consultation and answer the initial brief. Keep all durable observations in the thread of record.\n",
+            scope_bind
+        );
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
+            session_id: Some(session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: Some("badgey-persona".to_string()),
+            thread_id: Some(thread_id.to_string()),
+            work_item_id: Some(id.as_str().to_string()),
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                Some("badgey-persona"),
+                Some(session_id.as_str()),
+                Some(thread_id),
+                Some(id.as_str()),
+            ),
+            completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+            allow_recursion: false,
+            provider: Some(provider),
+        };
+        let final_prompt =
+            orch::apply_brofile_lens(&orch::apply_ambient(&prompt, &ambient_ctx), lens.as_deref());
+        let mut args = provider.build_exec_args(
+            &final_prompt,
+            &session_id,
+            cwd.as_deref(),
+            exec_opts.as_ref(),
+        );
+        let filters = brofile_filters.unwrap_or_default();
+        let dispatch_filters =
+            resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, Some(&filters));
+        let effective_filters = dispatch_filters.filters.clone();
+        args.extend(dispatch_filters.args);
+
+        let task = orch::spawn_task(
+            task_id,
+            provider,
+            args,
+            session_id.clone(),
+            cwd,
+            env_overrides,
+            store_dir,
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+            bro_label.clone(),
+            bro_label,
+        );
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        Ok((task, provider, session_id, effective_filters))
+    }
+
+    async fn badgey_wait_for_observed_session_id(
+        &self,
+        task: &Arc<orch::Task>,
+        timeout_seconds: f64,
+    ) -> Result<String, String> {
+        let wait = async {
+            loop {
+                {
+                    let inner = task.inner.lock();
+                    if inner.session_id != "pending" {
+                        return Ok(inner.session_id.clone());
+                    }
+                    if inner.status.is_terminal() {
+                        return Err(format!(
+                            "provider session id was not observed before task reached {:?}",
+                            inner.status
+                        ));
+                    }
+                }
+                tokio::select! {
+                    _ = task.notify.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs_f64(timeout_seconds), wait)
+            .await
+            .map_err(|_| {
+                "provider session id was not observed before Badgey registration timeout"
+                    .to_string()
+            })?
+    }
+
+    async fn badgey_exec_internal(
+        &self,
+        project_dir: Option<String>,
+        brief: Option<String>,
+        bro_label: Option<String>,
+    ) -> Result<Value, String> {
+        let project_id = project_dir
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        let id = orchestration::badgey::types::BadgeyId::new();
+        let scope = orchestration::badgey::types::BadgeyScope {
+            project_id: project_id.clone(),
+            initial_brief: brief.clone(),
+        };
+        let thread_result = self
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".to_string(),
+                name: Some(format!("badgey:{}", id.as_str())),
+                id: None,
+                topic: Some(format!(
+                    "Badgey consultation: {}",
+                    brief.as_deref().unwrap_or("general consultation")
+                )),
+                project: Some(project_id.clone()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: Some("Badgey thread of record".to_string()),
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".to_string()),
+            })
+            .map_err(|e| format!("opening badgey thread of record: {e:#}"))?;
+        let thread_id = self.badgey_thread_id_from_open_result(&thread_result)?;
+        let (task, provider, _initial_session_id, merged_filters) =
+            self.badgey_launch_exec(&id, &scope, &thread_id, bro_label)?;
+        let task_id = task.inner.lock().id.clone();
+        let session_id = match self.badgey_wait_for_observed_session_id(&task, 10.0).await {
+            Ok(session_id) => session_id,
+            Err(err) => {
+                let _ = self.state.notes.write().create(&notes::NoteParams {
+                    kind: "surprise".to_string(),
+                    body: json!({
+                        "event": "badgey_exec_unobserved_session",
+                        "badgey_id": id,
+                        "task_id": task_id,
+                        "reason": err,
+                    })
+                    .to_string(),
+                    task_id: Some(task_id),
+                    session_id: None,
+                    project: Some(project_id),
+                    thread_id: Some(thread_id),
+                    provider: Some(provider.as_str().to_string()),
+                    bro: Some("badgey".to_string()),
+                });
+                return Err(err);
+            }
+        };
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            scope.clone(),
+            provider,
+            session_id.clone(),
+            thread_id.clone(),
+        );
+        self.state
+            .badgey_registry
+            .register(instance.clone())
+            .map_err(|e| e.to_string())?;
+        let _ = self.state.threads.write().thread(&threads::ThreadParams {
+            action: "continue".to_string(),
+            name: None,
+            id: Some(thread_id.clone()),
+            topic: None,
+            project: None,
+            session_id: Some(session_id.clone()),
+            provider: Some(provider.as_str().to_string()),
+            session_name: Some("badgey".to_string()),
+            handoff_doc: None,
+            note: None,
+            target: None,
+            target_type: None,
+            edge: None,
+            promoted_to: None,
+            kind: None,
+        });
+        self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::Exec {
+                brofile_version: "badgey-persona".to_string(),
+                scope,
+                charter: brief.unwrap_or_else(|| "general consultation".to_string()),
+                provider,
+                provider_session_id: session_id.clone(),
+            },
+            Some(task_id.clone()),
+        )?;
+        Ok(json!({
+            "badgey_id": id,
+            "task_id": task_id,
+            "session_id": session_id,
+            "provider": provider,
+            "thread_id": thread_id,
+            "status": "running",
+            "resolved_brofile": "badgey-persona",
+            "merged_filters": merged_filters,
+        }))
+    }
+
+    async fn badgey_resume_internal(
+        &self,
+        badgey_id: &str,
+        prompt: &str,
+        timeout_seconds: Option<f64>,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::commands::{parse_command, WrapperCommand};
+
+        let id = self.badgey_parse_id(badgey_id)?;
+        match parse_command(prompt) {
+            Some(WrapperCommand::Dismiss) => {
+                return self.badgey_dismiss_internal(badgey_id, Some("wrapper command".to_string()));
+            }
+            Some(WrapperCommand::ApplyProposal(proposal_id)) => {
+                return self
+                    .badgey_apply_proposal_internal(&id, &proposal_id, false)
+                    .await;
+            }
+            Some(WrapperCommand::RetryApply(proposal_id)) => {
+                return self
+                    .badgey_apply_proposal_internal(&id, &proposal_id, true)
+                    .await;
+            }
+            Some(WrapperCommand::RejectProposal(proposal_id)) => {
+                return self.badgey_reject_proposal_internal(&id, &proposal_id);
+            }
+            Some(WrapperCommand::ExpandPath(path_id)) => {
+                return Ok(json!({
+                    "badgey_id": id,
+                    "path_id": path_id,
+                    "status": "not_found",
+                    "degraded": {"reason": "path cache replay is not populated for this instance"}
+                }));
+            }
+            Some(WrapperCommand::BudgetExtend) => {
+                return Ok(json!({
+                    "badgey_id": id,
+                    "status": "accepted",
+                    "degraded": {"reason": "budget tracking is advisory in this build"}
+                }));
+            }
+            Some(WrapperCommand::RevertBrofileTo(version)) => {
+                return Ok(json!({
+                    "badgey_id": id,
+                    "version": version,
+                    "status": "not_applied",
+                    "degraded": {"reason": "brofile revert proposals must be represented as artifacts"}
+                }));
+            }
+            Some(WrapperCommand::TrustSubBro(label)) => {
+                return Ok(json!({
+                    "badgey_id": id,
+                    "sub_bro": label,
+                    "status": "recorded",
+                    "degraded": {"reason": "sub-bro trust is advisory until scout state is durable"}
+                }));
+            }
+            None => {}
+        }
+        let instance = self
+            .state
+            .badgey_registry
+            .get(&id)
+            .map_err(|e| e.to_string())?;
+        if !instance.provider.supports_resume() {
+            return Err(format!("{} does not support resume", instance.provider));
+        }
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        self.state
+            .badgey_registry
+            .enqueue_resume(
+                &id,
+                orchestration::badgey::queue::PendingTurn {
+                    turn_id: turn_id.clone(),
+                    prompt: prompt.to_string(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let _permit = self
+            .state
+            .badgey_registry
+            .wait_for_resume_turn(&id, &turn_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let turn_start = util::now_iso();
+        let cwd = instance
+            .provider
+            .resolve_session_cwd(&instance.provider_session_id)
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| Some(instance.scope.project_id.clone()));
+        let (provider, _lens, exec_opts, env_overrides, _resolved_cwd, brofile_filters) =
+            self.resolve_exec_target(Some("badgey-persona"), None, cwd.as_deref())?;
+        let scope_bind =
+            self.badgey_scope_bind(&id, &instance.thread_of_record_id, &instance.scope);
+        let wrapped_user_prompt = format!("{scope_bind}\n{prompt}");
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
+            session_id: Some(instance.provider_session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: Some("badgey-persona".to_string()),
+            thread_id: Some(instance.thread_of_record_id.clone()),
+            work_item_id: Some(id.as_str().to_string()),
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                Some("badgey-persona"),
+                Some(instance.provider_session_id.as_str()),
+                Some(instance.thread_of_record_id.as_str()),
+                Some(id.as_str()),
+            ),
+            completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+            allow_recursion: false,
+            provider: Some(provider),
+        };
+        let final_prompt = orch::apply_ambient(&wrapped_user_prompt, &ambient_ctx);
+        let mut args = provider.build_resume_args(
+            &instance.provider_session_id,
+            &final_prompt,
+            exec_opts.as_ref(),
+        );
+        let dispatch_filters = resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            false,
+            &task_id,
+            brofile_filters.as_ref(),
+        );
+        let effective_filters = dispatch_filters.filters.clone();
+        args.extend(dispatch_filters.args);
+        let task = orch::spawn_task(
+            task_id.clone(),
+            provider,
+            args,
+            instance.provider_session_id.clone(),
+            cwd.clone(),
+            env_overrides,
+            self.state.store_dir.clone(),
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+            Some("badgey".to_string()),
+            Some("agent:badgey@v1".to_string()),
+        );
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        let completed = orch::wait_for_task_with_timeout(&task, timeout_seconds).await;
+        let result = if completed {
+            orch::task_result_json(&task)
+        } else {
+            orch::timeout_snapshot_json(&task)
+        };
+        let action_results = self
+            .badgey_post_process_turn(&instance, &turn_start)
+            .await?;
+        let refs_consumed = self.badgey_refs_consumed_from_result(&result);
+        self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::Turn {
+                turn_id: self.badgey_next_turn_id(&instance.thread_of_record_id),
+                mode: "answer".to_string(),
+                caller: orchestration::badgey::events::CallerRef {
+                    provider,
+                    session_id: instance.provider_session_id.clone(),
+                },
+                question: prompt.to_string(),
+                bundle_summary: result
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed")
+                    .to_string(),
+                refs_consumed,
+                proposals_emitted: action_results
+                    .iter()
+                    .filter_map(|value| {
+                        value
+                            .get("proposal_id")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    })
+                    .collect(),
+            },
+            Some(task_id.clone()),
+        )?;
+        Ok(json!({
+            "badgey_id": id,
+            "task_id": task_id,
+            "session_id": instance.provider_session_id,
+            "provider": provider,
+            "thread_id": instance.thread_of_record_id,
+            "result": result,
+            "actions": action_results,
+            "merged_filters": effective_filters,
+        }))
+    }
+
+    fn badgey_parse_proposal_kind(
+        &self,
+        value: &Value,
+    ) -> Result<orchestration::badgey::types::ProposalKind, String> {
+        let raw = value
+            .as_str()
+            .ok_or_else(|| "proposal kind must be a string".to_string())?;
+        let normalized = match raw.to_ascii_lowercase().replace('-', "_").as_str() {
+            "workflow" => "workflow",
+            "packet" => "packet",
+            "brofile" => "brofile",
+            "lens" => "lens",
+            "agent" => "agent",
+            "redispatch" | "re_dispatch" | "redispatch_task" => "redispatch_task",
+            "artifact_promotion" => "artifact_promotion",
+            other => return Err(format!("unknown proposal kind: {other}")),
+        };
+        serde_json::from_value(Value::String(normalized.to_string()))
+            .map_err(|e| format!("invalid proposal kind {raw}: {e}"))
+    }
+
+    fn badgey_artifact_kind_for_proposal(
+        &self,
+        kind: orchestration::badgey::types::ProposalKind,
+    ) -> Option<artifacts::ArtifactKind> {
+        use orchestration::badgey::types::ProposalKind;
+        match kind {
+            ProposalKind::Workflow => Some(artifacts::ArtifactKind::Workflow),
+            ProposalKind::Packet => Some(artifacts::ArtifactKind::Packet),
+            ProposalKind::Brofile | ProposalKind::Lens => Some(artifacts::ArtifactKind::Brofile),
+            ProposalKind::Agent => Some(artifacts::ArtifactKind::Agent),
+            ProposalKind::ArtifactPromotion | ProposalKind::RedispatchTask => None,
+        }
+    }
+
+    fn badgey_action_result_note(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        action_id: &str,
+        event: &str,
+        payload: Value,
+    ) -> Result<String, String> {
+        let mut body = serde_json::Map::new();
+        body.insert("event".to_string(), Value::String(event.to_string()));
+        body.insert("action_id".to_string(), Value::String(action_id.to_string()));
+        body.insert("payload".to_string(), payload);
+        self.state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "learned".to_string(),
+                body: Value::Object(body).to_string(),
+                task_id: None,
+                session_id: Some(instance.provider_session_id.clone()),
+                project: Some(instance.scope.project_id.clone()),
+                thread_id: Some(instance.thread_of_record_id.clone()),
+                provider: Some(instance.provider.as_str().to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .map_err(|e| format!("writing badgey action result note: {e:#}"))
+    }
+
+    fn badgey_next_turn_id(&self, thread_id: &str) -> u64 {
+        self.state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id))
+            .filter_map(|note| {
+                serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body).ok()
+            })
+            .filter(|event| matches!(event, orchestration::badgey::events::ThreadEvent::Turn { .. }))
+            .count() as u64
+            + 1
+    }
+
+    fn badgey_refs_consumed_from_result(&self, result: &Value) -> Vec<String> {
+        fn collect_strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+            match value {
+                Value::String(text) => out.push(text),
+                Value::Array(items) => {
+                    for item in items {
+                        collect_strings(item, out);
+                    }
+                }
+                Value::Object(map) => {
+                    for value in map.values() {
+                        collect_strings(value, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut refs = Vec::new();
+        let mut strings = Vec::new();
+        collect_strings(result, &mut strings);
+        for text in strings {
+            for raw in text
+                .split(|c: char| c.is_whitespace() || matches!(c, ',' | ')' | '(' | '[' | ']'))
+            {
+                let token =
+                    raw.trim_matches(|c: char| matches!(c, '"' | '\'' | '.' | ';' | ':'));
+                if token.starts_with("knowledge:")
+                    || token.starts_with("agent:")
+                    || token.starts_with("decision:")
+                    || token.starts_with("session:")
+                    || token.starts_with("transcript:")
+                    || token.starts_with("project_file:")
+                    || token.starts_with("symbol:")
+                    || token.starts_with("brofile:")
+                    || token.starts_with("whiteboard:")
+                    || token.starts_with("commit:")
+                    || token.starts_with("task:")
+                    || token.starts_with("bash_call:")
+                    || token.starts_with("domain:")
+                    || token.starts_with("artifact:")
+                    || token.starts_with("entity:")
+                    || token.starts_with("thread-")
+                    || token.starts_with("task-")
+                    || token.starts_with("note-")
+                {
+                    let candidate = token.to_string();
+                    if !refs.contains(&candidate) {
+                        refs.push(candidate);
+                    }
+                }
+                if refs.len() >= 20 {
+                    return refs;
+                }
+            }
+        }
+        refs
+    }
+
+    fn badgey_existing_audit_decision_id(&self, badgey_id: &str, proposal_id: &str) -> Option<String> {
+        let needle = format!("Badgey proposal {proposal_id} for {badgey_id} was applied.");
+        self.state
+            .kb
+            .read()
+            .all_entries()
+            .iter()
+            .find(|entry| entry.content == needle)
+            .map(|entry| entry.id.clone())
+    }
+
+    async fn badgey_post_process_turn(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        turn_start_iso: &str,
+    ) -> Result<Vec<Value>, String> {
+        let action_bodies: Vec<Value> = {
+            let notes = self.state.notes.read();
+            notes
+                .all()
+                .iter()
+                .filter(|note| note.thread_id.as_deref() == Some(instance.thread_of_record_id.as_str()))
+                .filter(|note| note.created_at.as_str() >= turn_start_iso)
+                .filter_map(|note| serde_json::from_str::<Value>(&note.body).ok())
+                .filter(|body| {
+                    body.get("event")
+                        .and_then(Value::as_str)
+                        .is_some_and(|event| {
+                            matches!(
+                                event,
+                                "bg-action-spawn-subbro"
+                                    | "bg-action-emit-proposal"
+                                    | "bg-action-escalate-dispute"
+                                    | "bg-action-extend-budget"
+                            )
+                        })
+                })
+                .collect()
+        };
+        let mut results = Vec::new();
+        for body in action_bodies {
+            match self.badgey_process_action(instance, body.clone()).await {
+                Ok(result) => results.push(result),
+                Err(reason) => results.push(self.badgey_fail_action_body(instance, body, reason)?),
+            }
+        }
+        Ok(results)
+    }
+
+    fn badgey_fail_action_body(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        body: Value,
+        reason: String,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::{ActionId, ActionJournalState};
+
+        let event = body
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or("bg-action-invalid")
+            .to_string();
+        let action_id_raw = body
+            .get("action_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{event} failed without action_id: {reason}"))?
+            .to_string();
+        let action_id: ActionId = action_id_raw
+            .parse()
+            .map_err(|e| format!("invalid action_id {action_id_raw}: {e}; original error: {reason}"))?;
+        let entry = self
+            .state
+            .badgey_journal
+            .record_seen(action_id.clone(), event.clone(), body)
+            .map_err(|e| format!("recording failed action journal: {e}"))?;
+        if !entry.state.is_terminal() {
+            let _ = self.state.badgey_journal.transition(
+                &action_id,
+                ActionJournalState::Seen,
+                ActionJournalState::Failed {
+                    reason: reason.clone(),
+                },
+                Some("action failed validation or dispatch".to_string()),
+            );
+        }
+        let payload = json!({"reason": reason});
+        self.badgey_action_result_note(instance, &action_id_raw, "bg-action-failed", payload.clone())?;
+        Ok(json!({
+            "action_id": action_id_raw,
+            "event": event,
+            "status": "failed",
+            "payload": payload,
+        }))
+    }
+
+    async fn badgey_process_action(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        body: Value,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::{ActionId, ActionJournalState};
+
+        let event = body
+            .get("event")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "badgey action missing event".to_string())?
+            .to_string();
+        let action_id_raw = body
+            .get("action_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{event} missing action_id"))?;
+        let action_id: ActionId = action_id_raw
+            .parse()
+            .map_err(|e| format!("invalid action_id {action_id_raw}: {e}"))?;
+        let entry = self
+            .state
+            .badgey_journal
+            .record_seen(action_id.clone(), event.clone(), body.clone())
+            .map_err(|e| format!("recording action journal: {e}"))?;
+        if entry.state.is_terminal() {
+            return Ok(json!({
+                "action_id": action_id_raw,
+                "event": event,
+                "status": "already_terminal",
+                "state": entry.state,
+            }));
+        }
+        if let ActionJournalState::Dispatching { task_id } = &entry.state {
+            if let Some(task) = self.state.task_store.read().get(task_id) {
+                let status = task.inner.lock().status;
+                if status.is_terminal() {
+                    let terminal_state = if status == orch::TaskStatus::Completed {
+                        ActionJournalState::Completed {
+                            result_ref: format!("task:{task_id}"),
+                        }
+                    } else {
+                        ActionJournalState::Failed {
+                            reason: format!("task {task_id} ended with {status:?}"),
+                        }
+                    };
+                    let _ = self.state.badgey_journal.transition(
+                        &action_id,
+                        entry.state.clone(),
+                        terminal_state,
+                        Some("reconciled existing dispatch".to_string()),
+                    );
+                }
+            }
+            return Ok(json!({
+                "action_id": action_id_raw,
+                "event": event,
+                "status": "dispatching",
+                "task_id": task_id,
+            }));
+        }
+
+        let mut completion_from = ActionJournalState::Seen;
+        let dispatch_result = match event.as_str() {
+            "bg-action-emit-proposal" => {
+                let kind_value = body
+                    .get("kind")
+                    .ok_or_else(|| "bg-action-emit-proposal missing kind".to_string())?;
+                let kind = self.badgey_parse_proposal_kind(kind_value)?;
+                let idempotency_key = body
+                    .get("idempotency_key")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| {
+                        (kind == orchestration::badgey::types::ProposalKind::RedispatchTask)
+                            .then(|| uuid::Uuid::new_v4().to_string())
+                    });
+                let mut draft = body
+                    .get("draft")
+                    .or_else(|| body.get("proposal"))
+                    .cloned()
+                    .ok_or_else(|| "bg-action-emit-proposal missing draft".to_string())?;
+                if kind == orchestration::badgey::types::ProposalKind::RedispatchTask
+                    && draft.get("task_id").is_none()
+                {
+                    if let Some(map) = draft.as_object_mut() {
+                        map.insert("task_id".to_string(), Value::String(uuid::Uuid::new_v4().to_string()));
+                    }
+                }
+                let proposal = self
+                    .state
+                    .badgey_proposals
+                    .create(
+                        &instance.id,
+                        kind,
+                        draft.clone(),
+                        idempotency_key,
+                    )
+                    .map_err(|e| format!("creating badgey proposal: {e}"))?;
+                self.badgey_write_event(
+                    instance,
+                    orchestration::badgey::events::ThreadEvent::ProposalEmitted {
+                        proposal_id: proposal.id.clone(),
+                        kind,
+                        draft_ref: draft
+                            .get("source")
+                            .or_else(|| draft.get("draft_path"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("inline-draft")
+                            .to_string(),
+                        state: proposal.state,
+                    },
+                    None,
+                )?;
+                json!({
+                    "proposal_id": proposal.id,
+                    "kind": kind,
+                    "state": proposal.state,
+                })
+            }
+            "bg-action-spawn-subbro" => {
+                let charter = body
+                    .get("charter")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "bg-action-spawn-subbro missing charter".to_string())?;
+                let task_id = uuid::Uuid::new_v4().to_string();
+                let dispatching = ActionJournalState::Dispatching {
+                    task_id: task_id.clone(),
+                };
+                self.state
+                    .badgey_journal
+                    .transition(
+                        &action_id,
+                        ActionJournalState::Seen,
+                        dispatching.clone(),
+                        Some("privileged sub-bro dispatch reserved".to_string()),
+                    )
+                    .map_err(|e| format!("marking action dispatching: {e}"))?;
+                completion_from = dispatching.clone();
+                if let Err(err) = self.badgey_spawn_privileged_task(
+                    &task_id,
+                    "badgey-scout-persona",
+                    charter,
+                    &instance.scope.project_id,
+                    Some(instance.thread_of_record_id.as_str()),
+                    Some(instance.id.as_str()),
+                    Some("badgey-scout".to_string()),
+                ) {
+                    let _ = self.state.badgey_journal.transition(
+                        &action_id,
+                        dispatching,
+                        ActionJournalState::Failed {
+                            reason: err.clone(),
+                        },
+                        Some("privileged sub-bro dispatch failed".to_string()),
+                    );
+                    return Err(err);
+                }
+                self.badgey_write_event(
+                    instance,
+                    orchestration::badgey::events::ThreadEvent::SubbroSpawned {
+                        task_id: task_id.clone(),
+                        scout_id: body
+                            .get("scout_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("scout")
+                            .to_string(),
+                        charter: charter.to_string(),
+                    },
+                    Some(task_id.clone()),
+                )?;
+                json!({"task_id": task_id})
+            }
+            "bg-action-escalate-dispute" => {
+                self.badgey_write_event(
+                    instance,
+                    orchestration::badgey::events::ThreadEvent::DisputeEscalated {
+                        subbro_results: body
+                            .get("subbro_results")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default(),
+                    },
+                    None,
+                )?;
+                json!({"dispute": "escalated"})
+            }
+            "bg-action-extend-budget" => {
+                json!({"budget": "extended_advisory"})
+            }
+            _ => return Err(format!("unknown badgey action event: {event}")),
+        };
+
+        self.state
+            .badgey_journal
+            .transition(
+                &action_id,
+                completion_from,
+                ActionJournalState::Completed {
+                    result_ref: dispatch_result.to_string(),
+                },
+                Some("action completed".to_string()),
+            )
+            .map_err(|e| format!("completing action journal: {e}"))?;
+        self.badgey_action_result_note(
+            instance,
+            action_id_raw,
+            "bg-action-completed",
+            dispatch_result.clone(),
+        )?;
+        let mut result = dispatch_result;
+        result["action_id"] = Value::String(action_id_raw.to_string());
+        result["event"] = Value::String(event);
+        result["status"] = Value::String("completed".to_string());
+        Ok(result)
+    }
+
+    fn badgey_spawn_privileged_task(
+        &self,
+        task_id: &str,
+        brofile: &str,
+        prompt: &str,
+        project_dir: &str,
+        thread_id: Option<&str>,
+        work_item_id: Option<&str>,
+        label: Option<String>,
+    ) -> Result<Arc<orch::Task>, String> {
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
+            self.resolve_exec_target(Some(brofile), None, Some(project_dir))?;
+        let session_id = "pending".to_string();
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.to_string()),
+            session_id: Some(session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: Some(brofile.to_string()),
+            thread_id: thread_id.map(String::from),
+            work_item_id: work_item_id.map(String::from),
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                Some(brofile),
+                Some(session_id.as_str()),
+                thread_id,
+                work_item_id,
+            ),
+            completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+            allow_recursion: false,
+            provider: Some(provider),
+        };
+        let final_prompt =
+            orch::apply_brofile_lens(&orch::apply_ambient(prompt, &ambient_ctx), lens.as_deref());
+        let mut args = provider.build_exec_args(
+            &final_prompt,
+            &session_id,
+            cwd.as_deref(),
+            exec_opts.as_ref(),
+        );
+        let dispatch_filters = resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            false,
+            task_id,
+            brofile_filters.as_ref(),
+        );
+        args.extend(dispatch_filters.args);
+        let task = orch::spawn_with_pre_minted_id(
+            task_id.to_string(),
+            orch::SpawnTaskParams {
+                provider,
+                args,
+                session_id,
+                cwd,
+                env_overrides,
+                store_dir: self.state.store_dir.clone(),
+                task_store: self.state.task_store.clone(),
+                tail_tx: self.state.tail_tx.clone(),
+                bro_label: label.clone(),
+                agent_label: label,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        Ok(task)
+    }
+
+    async fn badgey_apply_proposal_internal(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        proposal_id: &str,
+        retry_failed: bool,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::{ProposalKind, ProposalState};
+
+        let instance = self
+            .state
+            .badgey_registry
+            .get(id)
+            .map_err(|e| e.to_string())?;
+        let proposal = self
+            .state
+            .badgey_proposals
+            .get(id, proposal_id)
+            .map_err(|e| format!("reading proposal: {e}"))?
+            .ok_or_else(|| format!("error.not_found: proposal {proposal_id}"))?;
+        match proposal.state {
+            ProposalState::Applied => {
+                return Ok(json!({
+                    "badgey_id": id,
+                    "proposal_id": proposal_id,
+                    "already_applied": true,
+                    "prior_task_id": proposal.applied_task_id,
+                }));
+            }
+            ProposalState::Applying => {
+                return Err("error.bad_input(code=already_in_progress)".to_string());
+            }
+            ProposalState::Failed if !retry_failed => {
+                return Err(format!(
+                    "error.bad_input(code=proposal_failed): retry with `retry apply {proposal_id}`"
+                ));
+            }
+            ProposalState::Pending | ProposalState::Failed => {}
+        }
+        let from = proposal.state;
+        let applying = self
+            .state
+            .badgey_proposals
+            .transition(
+                id,
+                proposal_id,
+                from,
+                ProposalState::Applying,
+                Some(if retry_failed {
+                    "retry apply requested".to_string()
+                } else {
+                    "apply requested".to_string()
+                }),
+            )
+            .map_err(|e| format!("transitioning proposal to applying: {e}"))?;
+
+        let apply_result = async {
+            if let Some(kind) = self.badgey_artifact_kind_for_proposal(applying.kind) {
+                let source = applying
+                    .draft
+                    .get("source")
+                    .or_else(|| applying.draft.get("draft_path"))
+                    .or_else(|| applying.draft.get("path"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "artifact proposal draft missing source/draft_path".to_string())?;
+                let metadata = install_artifact_from_params(
+                    &self.state,
+                    ArtifactInstallParams {
+                        kind,
+                        source: source.to_string(),
+                        name: applying
+                            .draft
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        version: applying
+                            .draft
+                            .get("version")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        supersedes: applying
+                            .draft
+                            .get("supersedes")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                    },
+                )
+                .await
+                .map_err(|e| format!("installing artifact proposal: {e:#}"))?;
+                Ok(json!({
+                    "artifact_ref": format!("{:?}:{}@{}", kind, metadata.name, metadata.version),
+                    "metadata": metadata,
+                }))
+            } else if applying.kind == ProposalKind::RedispatchTask {
+                let prompt = applying
+                    .draft
+                    .get("prompt")
+                    .or_else(|| applying.draft.get("refined_charter"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "redispatch proposal missing prompt/refined_charter".to_string())?;
+                if applying.idempotency_key.is_none() {
+                    return Err("redispatch proposal missing idempotency_key".to_string());
+                }
+                let task_id = applying
+                    .applied_task_id
+                    .clone()
+                    .or_else(|| {
+                        applying
+                            .draft
+                            .get("task_id")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    })
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                self.state
+                    .badgey_proposals
+                    .set_applied_task_id(id, proposal_id, task_id.clone())
+                    .map_err(|e| format!("recording redispatch task id: {e}"))?;
+                self.badgey_spawn_privileged_task(
+                    &task_id,
+                    "badgey-persona",
+                    prompt,
+                    &instance.scope.project_id,
+                    Some(instance.thread_of_record_id.as_str()),
+                    Some(id.as_str()),
+                    Some("badgey-redispatch".to_string()),
+                )?;
+                Ok(json!({"task_id": task_id}))
+            } else {
+                Err("artifact_promotion proposals are not supported in this apply path yet".to_string())
+            }
+        }
+        .await;
+
+        match apply_result {
+            Ok(outcome) => {
+                let applied = self
+                    .state
+                    .badgey_proposals
+                    .transition(
+                        id,
+                        proposal_id,
+                        ProposalState::Applying,
+                        ProposalState::Applied,
+                        Some(outcome.to_string()),
+                    )
+                    .map_err(|e| format!("transitioning proposal to applied: {e}"))?;
+                let decide_id = if let Some(existing) =
+                    self.badgey_existing_audit_decision_id(id.as_str(), proposal_id)
+                {
+                    existing
+                } else {
+                    self.state
+                        .kb
+                        .write()
+                        .decide_result(
+                            &knowledge::DecideParams {
+                                content: format!(
+                                    "Badgey proposal {proposal_id} for {id} was applied."
+                                ),
+                                rationale: format!("User approved Badgey proposal {proposal_id}."),
+                                supersedes: applying
+                                    .draft
+                                    .get("audit_supersedes")
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                                title: Some(format!("Badgey proposal {proposal_id} applied")),
+                                scope: Some("project".to_string()),
+                                project: Some(instance.scope.project_id.clone()),
+                                priority: Some("standard".to_string()),
+                                render: Some(false),
+                            },
+                            false,
+                        )
+                        .map_err(|e| format!("writing proposal audit decision: {e:#}"))?
+                        .id
+                };
+                let artifact_ref = outcome
+                    .get("artifact_ref")
+                    .and_then(Value::as_str)
+                    .unwrap_or("task")
+                    .to_string();
+                self.badgey_write_event(
+                    &instance,
+                    orchestration::badgey::events::ThreadEvent::ProposalApplied {
+                        proposal_id: proposal_id.to_string(),
+                        artifact_ref,
+                        decide_id: decide_id.clone(),
+                    },
+                    applied.applied_task_id.clone(),
+                )?;
+                Ok(json!({
+                    "badgey_id": id,
+                    "proposal_id": proposal_id,
+                    "status": "applied",
+                    "proposal": applied,
+                    "outcome": outcome,
+                    "decide_id": decide_id,
+                }))
+            }
+            Err(err) => {
+                let _ = self.state.badgey_proposals.transition(
+                    id,
+                    proposal_id,
+                    ProposalState::Applying,
+                    ProposalState::Failed,
+                    Some(err.clone()),
+                );
+                Err(err)
+            }
+        }
+    }
+
+    fn badgey_reject_proposal_internal(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        proposal_id: &str,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::ProposalState;
+
+        let instance = self
+            .state
+            .badgey_registry
+            .get(id)
+            .map_err(|e| e.to_string())?;
+        let current = self
+            .state
+            .badgey_proposals
+            .get(id, proposal_id)
+            .map_err(|e| format!("reading proposal: {e}"))?
+            .ok_or_else(|| format!("error.not_found: proposal {proposal_id}"))?;
+        if current.state == ProposalState::Applied {
+            return Err("error.bad_input(code=already_applied)".to_string());
+        }
+        if current.state == ProposalState::Failed {
+            return Ok(json!({
+                "badgey_id": id,
+                "proposal_id": proposal_id,
+                "status": "already_rejected",
+            }));
+        }
+        let rejected = self
+            .state
+            .badgey_proposals
+            .transition(
+                id,
+                proposal_id,
+                current.state,
+                ProposalState::Failed,
+                Some("rejected by user".to_string()),
+            )
+            .map_err(|e| format!("rejecting proposal: {e}"))?;
+        self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::ProposalRejected {
+                proposal_id: proposal_id.to_string(),
+                reason: "rejected by user".to_string(),
+            },
+            None,
+        )?;
+        Ok(json!({
+            "badgey_id": id,
+            "proposal_id": proposal_id,
+            "status": "rejected",
+            "proposal": rejected,
+        }))
+    }
+
+    fn badgey_dismiss_internal(
+        &self,
+        badgey_id: &str,
+        reason: Option<String>,
+    ) -> Result<Value, String> {
+        let id = self.badgey_parse_id(badgey_id)?;
+        let instance = self
+            .state
+            .badgey_registry
+            .dismiss(&id)
+            .map_err(|e| e.to_string())?;
+        let reason = reason.unwrap_or_else(|| "dismissed by caller".to_string());
+        self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::Dismiss {
+                reason: reason.clone(),
+                summary: "Badgey instance dismissed; pending resume queue drained.".to_string(),
+            },
+            None,
+        )?;
+        let _ = self.state.threads.write().thread(&threads::ThreadParams {
+            action: "resolve".to_string(),
+            name: None,
+            id: Some(instance.thread_of_record_id.clone()),
+            topic: None,
+            project: None,
+            session_id: None,
+            provider: None,
+            session_name: None,
+            handoff_doc: None,
+            note: Some(reason),
+            target: None,
+            target_type: None,
+            edge: None,
+            promoted_to: None,
+            kind: None,
+        });
+        Ok(json!({
+            "badgey_id": id,
+            "status": "dismissed",
+            "thread_id": instance.thread_of_record_id,
+        }))
+    }
+
+    fn badgey_status_internal(&self, badgey_id: Option<&str>) -> Result<Value, String> {
+        if let Some(raw) = badgey_id {
+            let id = self.badgey_parse_id(raw)?;
+            let instance = self
+                .state
+                .badgey_registry
+                .get_including_dismissed(&id)
+                .map_err(|e| e.to_string())?;
+            let queue = self
+                .state
+                .badgey_registry
+                .queue_status(&id)
+                .map_err(|e| e.to_string())?;
+            let proposals = self
+                .state
+                .badgey_proposals
+                .list_by_instance(&id)
+                .map_err(|e| format!("listing proposals: {e:#}"))?;
+            return Ok(json!({
+                "instance": instance,
+                "queue": queue,
+                "proposals": proposals,
+            }));
+        }
+        self.badgey_list_internal(false)
+    }
+
+    fn badgey_list_internal(&self, include_dismissed: bool) -> Result<Value, String> {
+        let instances: Vec<_> = self
+            .state
+            .badgey_registry
+            .list()
+            .into_iter()
+            .filter(|instance| include_dismissed || !instance.is_dismissed())
+            .map(|instance| {
+                let queue = self.state.badgey_registry.queue_status(&instance.id).ok();
+                json!({
+                    "id": instance.id,
+                    "scope": instance.scope,
+                    "provider": instance.provider,
+                    "session_id": instance.provider_session_id,
+                    "thread_id": instance.thread_of_record_id,
+                    "dismissed": instance.is_dismissed(),
+                    "queue": queue,
+                })
+            })
+            .collect();
+        Ok(json!({ "instances": instances }))
+    }
+
+    fn badgey_collect_internal(
+        &self,
+        scout_id: Option<&str>,
+        badgey_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let instance = if let Some(raw) = badgey_id {
+            let id = self.badgey_parse_id(raw)?;
+            Some(
+                self.state
+                    .badgey_registry
+                    .get_including_dismissed(&id)
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        let thread_filter = instance.as_ref().map(|i| i.thread_of_record_id.as_str());
+        let matching_notes: Vec<_> = self
+            .state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| {
+                thread_filter.is_none() || note.thread_id.as_deref() == thread_filter
+            })
+            .filter(|note| {
+                let body = serde_json::from_str::<Value>(&note.body).ok();
+                let event = body
+                    .as_ref()
+                    .and_then(|body| body.get("event"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                note.kind == notes::NoteKind::Done
+                    || matches!(event, "scout_dispatched" | "subbro_spawned" | "scout_done" | "subbro_done")
+                    || event.starts_with("bg-action-spawn-subbro")
+            })
+            .filter(|note| {
+                let body = serde_json::from_str::<Value>(&note.body).unwrap_or_else(|_| {
+                    json!({"kind": note.kind.clone(), "body": note.body.clone()})
+                });
+                scout_id.is_none()
+                    || body.get("scout_id").and_then(Value::as_str) == scout_id
+                    || body
+                        .get("payload")
+                        .and_then(|p| p.get("scout_id"))
+                        .and_then(Value::as_str)
+                        == scout_id
+            })
+            .cloned()
+            .collect();
+        let events: Vec<Value> = matching_notes
+            .iter()
+            .map(|note| {
+                serde_json::from_str::<Value>(&note.body)
+                    .unwrap_or_else(|_| json!({"kind": note.kind.clone(), "body": note.body.clone()}))
+            })
+            .collect();
+        let explicit_aggregate_done = matching_notes.iter().any(|note| {
+            serde_json::from_str::<Value>(&note.body)
+                .ok()
+                .and_then(|body| body.get("event").and_then(Value::as_str).map(str::to_string))
+                .is_some_and(|event| matches!(event.as_str(), "scout_done" | "subbro_done"))
+        });
+        let spawned_task_ids: std::collections::HashSet<String> = events
+            .iter()
+            .filter(|body| body.get("event").and_then(Value::as_str) == Some("subbro_spawned"))
+            .filter_map(|body| body.get("task_id").and_then(Value::as_str).map(String::from))
+            .collect();
+        let done_task_ids: std::collections::HashSet<String> = matching_notes
+            .iter()
+            .filter(|note| note.kind == notes::NoteKind::Done)
+            .filter_map(|note| note.task_id.clone())
+            .collect();
+        let done = explicit_aggregate_done
+            || (!spawned_task_ids.is_empty()
+                && spawned_task_ids
+                    .iter()
+                    .all(|task_id| done_task_ids.contains(task_id)))
+            || (spawned_task_ids.is_empty()
+                && matching_notes
+                    .iter()
+                    .any(|note| note.kind == notes::NoteKind::Done));
+        Ok(json!({
+            "status": if done { "done" } else { "still_walking" },
+            "scout_id": scout_id,
+            "badgey_id": badgey_id,
+            "events": events,
+        }))
+    }
+
+    fn badgey_triage_inbox_internal(
+        &self,
+        scope: Option<String>,
+        since: Option<String>,
+        badgey_id: Option<String>,
+    ) -> Result<Value, String> {
+        let project = scope
+            .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        let stale_threads: Vec<Value> = self
+            .state
+            .threads
+            .read()
+            .all()
+            .iter()
+            .filter(|thread| project.is_empty() || thread.project == project)
+            .filter(|thread| {
+                since
+                    .as_deref()
+                    .is_none_or(|since| thread.last_activity.as_str() >= since)
+            })
+            .filter(|thread| !matches!(thread.status, threads::ThreadStatus::Resolved))
+            .take(20)
+            .map(|thread| {
+                json!({
+                    "thread_id": thread.id,
+                    "topic": thread.topic,
+                    "status": thread.status,
+                    "last_activity": thread.last_activity,
+                })
+            })
+            .collect();
+        let proposals: Vec<Value> = stale_threads
+            .iter()
+            .enumerate()
+            .map(|(idx, thread)| {
+                let stored = badgey_id
+                    .as_deref()
+                    .and_then(|raw| self.badgey_parse_id(raw).ok())
+                    .and_then(|id| {
+                        self.state
+                            .badgey_proposals
+                            .create(
+                                &id,
+                                orchestration::badgey::types::ProposalKind::RedispatchTask,
+                                json!({
+                                    "task_id": uuid::Uuid::new_v4().to_string(),
+                                    "prompt": format!(
+                                        "Review stale work item {} and either close it or issue a narrower follow-up charter.",
+                                        thread["thread_id"].as_str().unwrap_or("unknown")
+                                    ),
+                                    "source_thread_id": thread["thread_id"],
+                                    "source": "badgey_triage_inbox",
+                                }),
+                                thread["thread_id"]
+                                    .as_str()
+                                    .map(|thread_id| format!("triage:{thread_id}")),
+                            )
+                            .ok()
+                    });
+                json!({
+                    "id": stored
+                        .as_ref()
+                        .map(|proposal| proposal.id.clone())
+                        .unwrap_or_else(|| format!("triage-{}", idx + 1)),
+                    "kind": "redispatch_task",
+                    "subject": thread["thread_id"],
+                    "proposal": "Review stale work item and either close it or issue a narrower follow-up charter.",
+                    "stored": stored.is_some(),
+                    "apply_via": badgey_id
+                        .as_ref()
+                        .map(|id| format!("badgey_resume(id={id:?}, prompt=\"apply P-N\")")),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "scope": project,
+            "since": since,
+            "badgey_id": badgey_id,
+            "proposal_sheet": {
+                "proposals": proposals,
+                "source_threads": stale_threads,
+            }
+        }))
+    }
+
+    fn badgey_close_loops_internal(
+        &self,
+        window_days: Option<u64>,
+        project_dir: Option<String>,
+    ) -> Result<Value, String> {
+        let window_days = window_days.unwrap_or(14);
+        let cutoff_ms = orch::now_ms().saturating_sub(window_days.saturating_mul(86_400_000));
+        let mut notes = self.state.notes.read();
+        let done_task_ids: std::collections::HashSet<String> = notes
+            .all()
+            .iter()
+            .filter(|note| note.kind == notes::NoteKind::Done)
+            .filter_map(|note| note.task_id.clone())
+            .collect();
+        let tasks = self.state.task_store.read().all_tasks();
+        let mut classifications = Vec::new();
+        for task in tasks {
+            let inner = task.inner.lock();
+            if project_dir
+                .as_deref()
+                .is_some_and(|project| inner.cwd.as_deref() != Some(project))
+            {
+                continue;
+            }
+            if inner.started_at < cutoff_ms {
+                continue;
+            }
+            if done_task_ids.contains(&inner.id) {
+                continue;
+            }
+            let classification = match inner.status {
+                orch::TaskStatus::Failed | orch::TaskStatus::Cancelled => "crashed",
+                orch::TaskStatus::Running => "stalled",
+                orch::TaskStatus::Completed => "forgot_emit_done",
+            };
+            if classification == "forgot_emit_done" {
+                let already_noted = notes.all().iter().any(|note| {
+                    note.kind == notes::NoteKind::Learned
+                        && note.task_id.as_deref() == Some(inner.id.as_str())
+                        && note.body.contains("closer-suspected-completion")
+                });
+                if !already_noted {
+                    drop(notes);
+                    let _ = self.state.notes.write().create(&notes::NoteParams {
+                        kind: "learned".to_string(),
+                        body: json!({
+                            "event": "closer-suspected-completion",
+                            "task_id": inner.id.clone(),
+                            "contract": "default_completion_contract",
+                            "evidence_session": inner.session_id.clone(),
+                            "evidence_summary": inner.last_assistant_message.clone(),
+                            "synthesized_by": "badgey",
+                            "does_not_replace_executor_done": true,
+                        })
+                        .to_string(),
+                        task_id: Some(inner.id.clone()),
+                        session_id: Some(inner.session_id.clone()),
+                        project: inner.cwd.clone(),
+                        thread_id: None,
+                        provider: Some(inner.provider.as_str().to_string()),
+                        bro: inner.bro_label.clone(),
+                    });
+                    notes = self.state.notes.read();
+                }
+            }
+            classifications.push(json!({
+                "task_id": inner.id,
+                "session_id": inner.session_id,
+                "provider": inner.provider,
+                "classification": classification,
+                "does_not_replace_executor_done": true,
+            }));
+        }
+        Ok(json!({
+            "window_days": window_days,
+            "project_dir": project_dir,
+            "classifications": classifications,
+            "done_notes_synthesized": 0,
+        }))
+    }
+
     /// Dispatch every member of an ensemble team with the same prompt,
     /// returning one task per member. Each dispatch goes through
     /// `workflow_dispatch_executor`, so durable-session reuse + ambient
@@ -907,6 +2561,307 @@ impl BlackboxServer {
     }
 }
 
+struct BadgeyAgentAdapter {
+    state: Arc<SharedState>,
+}
+
+impl orchestration::agents::adapter::AgentDispatchAdapter for BadgeyAgentAdapter {
+    fn name(&self) -> &'static str {
+        "badgey"
+    }
+
+    fn dispatch(
+        &self,
+        _manifest: &orchestration::agents::types::AgentManifest,
+        args: Value,
+        ctx: orchestration::agents::adapter::DispatchContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        orchestration::agents::adapter::AgentDispatchResult,
+                        orchestration::agents::adapter::AgentDispatchError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        let state = self.state.clone();
+        Box::pin(async move {
+            use orchestration::agents::adapter::{
+                AgentDispatchError, AgentDispatchResult, DispatchDegraded,
+            };
+            use orchestration::agents::types::{AgentRef, AgentSession, MergedFilters};
+
+            let server = BlackboxServer::new(state);
+            let project_dir = args
+                .get("project_dir")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or(ctx.project_dir);
+            let result = if let Some(badgey_id) = args.get("badgey_id").and_then(Value::as_str) {
+                let prompt = args
+                    .get("prompt")
+                    .or_else(|| args.get("question"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if prompt.trim().is_empty() {
+                    return Err(AgentDispatchError::BadInput {
+                        message: "badgey adapter resume requires args.prompt or args.question"
+                            .to_string(),
+                    });
+                }
+                server
+                    .badgey_resume_internal(badgey_id, prompt, None)
+                    .await
+                    .map_err(|message| AgentDispatchError::AdapterFailed { message })?
+            } else {
+                let brief = args
+                    .get("brief")
+                    .or_else(|| args.get("prompt"))
+                    .or_else(|| args.get("question"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                server
+                    .badgey_exec_internal(project_dir.clone(), brief, ctx.bro_label_prefix.clone())
+                    .await
+                    .map_err(|message| AgentDispatchError::AdapterFailed { message })?
+            };
+            let session_id = result
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let provider = result
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let task_id = result
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let degraded = result.get("degraded").map(|_| DispatchDegraded {
+                reasons: vec!["badgey reported degraded status".to_string()],
+            });
+            let merged_filters = result
+                .get("merged_filters")
+                .and_then(|value| serde_json::from_value::<MergedFilters>(value.clone()).ok())
+                .unwrap_or_default();
+            Ok(AgentDispatchResult {
+                session: AgentSession {
+                    session_id,
+                    provider,
+                    project_dir,
+                    agent: AgentRef {
+                        name: "badgey".to_string(),
+                        version: 1,
+                    },
+                    task_id,
+                },
+                resolved_brofile: Some("badgey-persona".to_string()),
+                merged_filters,
+                degraded,
+            })
+        })
+    }
+}
+
+fn restore_badgey_registry_from_notes(state: &Arc<SharedState>) {
+    let mut thread_badgey_ids: HashMap<String, orchestration::badgey::types::BadgeyId> =
+        HashMap::new();
+    for thread in state.threads.read().all() {
+        if let Some(name) = thread.name.as_deref() {
+            if let Some(raw) = name.strip_prefix("badgey:") {
+                if let Ok(id) = raw.parse() {
+                    thread_badgey_ids.insert(thread.id.clone(), id);
+                }
+            }
+        }
+    }
+
+    let mut latest_execs: HashMap<
+        orchestration::badgey::types::BadgeyId,
+        (
+            String,
+            String,
+            orchestration::badgey::types::BadgeyScope,
+            Provider,
+            String,
+        ),
+    > = HashMap::new();
+    let mut latest_dismissed: HashMap<orchestration::badgey::types::BadgeyId, String> =
+        HashMap::new();
+    for note in state.notes.read().all() {
+        let Some(thread_id) = note.thread_id.as_deref() else {
+            continue;
+        };
+        let Some(id) = thread_badgey_ids.get(thread_id).cloned() else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body)
+        else {
+            continue;
+        };
+        match event {
+            orchestration::badgey::events::ThreadEvent::Exec {
+                scope,
+                provider,
+                provider_session_id,
+                ..
+            } => {
+                let replace = latest_execs
+                    .get(&id)
+                    .is_none_or(|(created_at, ..)| note.created_at > *created_at);
+                if replace {
+                    latest_execs.insert(
+                        id,
+                        (
+                            note.created_at.clone(),
+                            thread_id.to_string(),
+                            scope,
+                            provider,
+                            provider_session_id,
+                        ),
+                    );
+                }
+            }
+            orchestration::badgey::events::ThreadEvent::Dismiss { .. } => {
+                let replace = latest_dismissed
+                    .get(&id)
+                    .is_none_or(|created_at| note.created_at > *created_at);
+                if replace {
+                    latest_dismissed.insert(id, note.created_at.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    for (id, (exec_at, thread_id, scope, provider, provider_session_id)) in latest_execs {
+        if provider_session_id == "pending" {
+            let _ = state.notes.write().create(&notes::NoteParams {
+                kind: "surprise".to_string(),
+                body: json!({
+                    "event": "badgey_restore_skipped_unobserved_session",
+                    "badgey_id": id,
+                    "reason": "exec event had no observed provider session id"
+                })
+                .to_string(),
+                task_id: None,
+                session_id: None,
+                project: Some(scope.project_id),
+                thread_id: Some(thread_id),
+                provider: Some(provider.as_str().to_string()),
+                bro: Some("badgey".to_string()),
+            });
+            continue;
+        }
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            scope,
+            provider,
+            provider_session_id,
+            thread_id,
+        );
+        let _ = state.badgey_registry.register(instance);
+        if latest_dismissed
+            .get(&id)
+            .is_some_and(|dismissed_at| *dismissed_at > exec_at)
+        {
+            let _ = state.badgey_registry.dismiss(&id);
+        }
+    }
+}
+
+fn recover_badgey_non_terminal_state(state: &Arc<SharedState>) {
+    use orchestration::badgey::types::{ActionJournalState, ProposalState};
+
+    if let Ok(entries) = state.badgey_journal.list_non_terminal() {
+        for entry in entries {
+            match entry.state.clone() {
+                ActionJournalState::Seen => {
+                    let _ = state.badgey_journal.transition(
+                        &entry.action_id,
+                        ActionJournalState::Seen,
+                        ActionJournalState::Failed {
+                            reason: "daemon restart before action dispatch".to_string(),
+                        },
+                        Some("startup recovery failed un-dispatched action".to_string()),
+                    );
+                }
+                ActionJournalState::Dispatching { task_id } => {
+                    let terminal = state.task_store.read().get(&task_id).map(|task| {
+                        let inner = task.inner.lock();
+                        if inner.status == orch::TaskStatus::Completed {
+                            ActionJournalState::Completed {
+                                result_ref: format!("task:{task_id}"),
+                            }
+                        } else if inner.status.is_terminal() {
+                            ActionJournalState::Failed {
+                                reason: format!("task {task_id} ended with {:?}", inner.status),
+                            }
+                        } else {
+                            ActionJournalState::Dispatching {
+                                task_id: task_id.clone(),
+                            }
+                        }
+                    });
+                    let to = terminal.unwrap_or_else(|| ActionJournalState::Failed {
+                        reason: format!("dispatched task {task_id} not found after restart"),
+                    });
+                    if !matches!(to, ActionJournalState::Dispatching { .. }) {
+                        let _ = state.badgey_journal.transition(
+                            &entry.action_id,
+                            entry.state,
+                            to,
+                            Some("startup recovery reconciled dispatched action".to_string()),
+                        );
+                    }
+                }
+                ActionJournalState::Completed { .. } | ActionJournalState::Failed { .. } => {}
+            }
+        }
+    }
+
+    if let Ok(proposals) = state.badgey_proposals.list_non_terminal() {
+        for proposal in proposals {
+            if proposal.state != ProposalState::Applying {
+                continue;
+            }
+            let to = match proposal.applied_task_id.as_deref() {
+                Some(task_id) => state.task_store.read().get(task_id).map_or_else(
+                    || ProposalState::Failed,
+                    |task| {
+                        let status = task.inner.lock().status;
+                        if status == orch::TaskStatus::Completed {
+                            ProposalState::Applied
+                        } else if status.is_terminal() {
+                            ProposalState::Failed
+                        } else {
+                            ProposalState::Applying
+                        }
+                    },
+                ),
+                None => ProposalState::Failed,
+            };
+            if to != ProposalState::Applying {
+                let note = if to == ProposalState::Applied {
+                    "startup recovery observed applied task completion"
+                } else {
+                    "startup recovery failed orphaned applying proposal"
+                };
+                let _ = state.badgey_proposals.transition(
+                    &proposal.instance_id,
+                    &proposal.id,
+                    ProposalState::Applying,
+                    to,
+                    Some(note.to_string()),
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bbox tools (search, knowledge, threads)
 // ---------------------------------------------------------------------------
@@ -931,8 +2886,9 @@ use mcp_tools::inspect::InspectEntityParams;
 use mcp_tools::provenance::ProvenanceParams;
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
+    apply_with as apply_packet_with, packet_matches_query, packet_summary,
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
-    PacketListParams, apply_with as apply_packet_with, packet_matches_query, packet_summary,
+    PacketListParams,
 };
 use threads::{ThreadListParams, ThreadParams};
 
@@ -1792,6 +3748,105 @@ struct ResumeParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyExecParams {
+    /// Project root / scope Badgey should consult against.
+    #[serde(default)]
+    project_dir: Option<String>,
+    /// Initial charter or question for the Badgey instance.
+    #[serde(default)]
+    brief: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyResumeParams {
+    /// Badgey instance id returned by badgey_exec.
+    badgey_id: String,
+    /// User turn, or a wrapper-direct command such as "dismiss".
+    prompt: String,
+    /// Max seconds to wait for the underlying provider turn.
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyAskParams {
+    /// Badgey instance id returned by badgey_exec.
+    badgey_id: String,
+    /// Question to ask the existing Badgey instance.
+    question: String,
+    /// Max seconds to wait for the underlying provider turn.
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyDismissParams {
+    /// Badgey instance id returned by badgey_exec.
+    badgey_id: String,
+    /// Optional close reason written to the thread of record.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyStatusParams {
+    /// Badgey instance id. If omitted, returns the active list summary.
+    #[serde(default)]
+    badgey_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyListParams {
+    /// Include dismissed instances. Default false.
+    #[serde(default)]
+    include_dismissed: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyScoutParams {
+    /// Badgey instance id returned by badgey_exec.
+    badgey_id: String,
+    /// Focused scout charter.
+    charter: String,
+    /// Max seconds to wait for the charter-authoring turn.
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyCollectParams {
+    /// Scout id to collect, or omit to list scout/sub-bro events for a Badgey instance.
+    #[serde(default)]
+    scout_id: Option<String>,
+    /// Badgey instance id returned by badgey_exec.
+    #[serde(default)]
+    badgey_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyTriageInboxParams {
+    /// Project path or registered scope. Defaults to current working directory.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Optional ISO timestamp lower bound.
+    #[serde(default)]
+    since: Option<String>,
+    /// Existing Badgey instance to attach proposal context to.
+    #[serde(default)]
+    badgey_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyCloseLoopsParams {
+    /// Window in days. Default 14.
+    #[serde(default)]
+    window_days: Option<u64>,
+    /// Optional project filter.
+    #[serde(default)]
+    project_dir: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct WaitParams {
     /// Task ID from exec or resume
     task_id: String,
@@ -2171,6 +4226,7 @@ struct DispatchFilters {
     args: Vec<String>,
     /// Tempfile path for Gemini policy cleanup; None for other providers.
     policy_file: Option<PathBuf>,
+    filters: orchestration::mcp::McpFilters,
 }
 
 /// Build a per-dispatch McpFilters overlay from a tool's allow/disallow
@@ -2259,7 +4315,11 @@ fn resolve_dispatch_filters(
         }
     }
 
-    DispatchFilters { args, policy_file }
+    DispatchFilters {
+        args,
+        policy_file,
+        filters: eff.filters,
+    }
 }
 
 /// Delete a Gemini policy tempfile once the associated task reaches a
@@ -2597,6 +4657,162 @@ impl BlackboxServer {
             "sessionId": inner.session_id,
             "status": "running",
         }))
+    }
+
+    #[tool(
+        name = "badgey_exec",
+        description = "Start a Badgey consultant instance for a project scope and return its badgey_id, provider session, task, and thread-of-record ids."
+    )]
+    async fn badgey_exec(&self, Parameters(p): Parameters<BadgeyExecParams>) -> CallToolResult {
+        match self
+            .badgey_exec_internal(p.project_dir, p.brief, Some("agent:badgey@v1".to_string()))
+            .await
+        {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_resume",
+        description = "Send a turn to an existing Badgey instance. Mechanical commands such as `dismiss` are handled by the wrapper before provider resume."
+    )]
+    async fn badgey_resume(&self, Parameters(p): Parameters<BadgeyResumeParams>) -> CallToolResult {
+        match self
+            .badgey_resume_internal(&p.badgey_id, &p.prompt, p.timeout_seconds)
+            .await
+        {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_ask",
+        description = "Question-shaped alias for badgey_resume."
+    )]
+    async fn badgey_ask(&self, Parameters(p): Parameters<BadgeyAskParams>) -> CallToolResult {
+        match self
+            .badgey_resume_internal(&p.badgey_id, &p.question, p.timeout_seconds)
+            .await
+        {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_dismiss",
+        description = "Dismiss a Badgey instance, drain queued turns, write a dismiss event, and resolve its thread of record."
+    )]
+    fn badgey_dismiss(&self, Parameters(p): Parameters<BadgeyDismissParams>) -> CallToolResult {
+        match self.badgey_dismiss_internal(&p.badgey_id, p.reason) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_status",
+        description = "Inspect one Badgey instance, including queue status and proposals; without badgey_id, returns active instances."
+    )]
+    fn badgey_status(&self, Parameters(p): Parameters<BadgeyStatusParams>) -> CallToolResult {
+        match self.badgey_status_internal(p.badgey_id.as_deref()) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_list",
+        description = "List Badgey instances and their thread/session bindings."
+    )]
+    fn badgey_list(&self, Parameters(p): Parameters<BadgeyListParams>) -> CallToolResult {
+        match self.badgey_list_internal(p.include_dismissed.unwrap_or(false)) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_scout",
+        description = "Ask Badgey to author scout sub-charters for a focused question; wrapper post-processing dispatches emitted scout actions."
+    )]
+    async fn badgey_scout(&self, Parameters(p): Parameters<BadgeyScoutParams>) -> CallToolResult {
+        let id = match self.badgey_parse_id(&p.badgey_id) {
+            Ok(id) => id,
+            Err(err) => return Self::err_text(&err),
+        };
+        let instance = match self.state.badgey_registry.get(&id) {
+            Ok(instance) => instance,
+            Err(err) => return Self::err_text(&err.to_string()),
+        };
+        let scout_id = format!("scout-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        if let Err(err) = self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::ScoutDispatched {
+                scout_id: scout_id.clone(),
+                scout_thread_id: instance.thread_of_record_id.clone(),
+                charters: vec![p.charter.clone()],
+            },
+            None,
+        ) {
+            return Self::err_text(&err);
+        }
+        let prompt = format!(
+            "Scout mode. Use scout_id={scout_id}. Author wrapper-mediated sub-bro charters for this question and emit bg-action-spawn-subbro notes with this scout_id as needed.\n\nCharter: {}",
+            p.charter
+        );
+        match self
+            .badgey_resume_internal(&p.badgey_id, &prompt, p.timeout_seconds)
+            .await
+        {
+            Ok(mut value) => {
+                value["scout_id"] = Value::String(scout_id);
+                value["scout_thread_id"] = Value::String(instance.thread_of_record_id);
+                Self::ok_json(&value)
+            }
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_collect",
+        description = "Collect scout/sub-bro events for a Badgey instance or scout id."
+    )]
+    fn badgey_collect(&self, Parameters(p): Parameters<BadgeyCollectParams>) -> CallToolResult {
+        match self.badgey_collect_internal(p.scout_id.as_deref(), p.badgey_id.as_deref()) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_triage_inbox",
+        description = "Produce a Badgey-shaped inbox triage proposal sheet for stale/open work in a scope."
+    )]
+    fn badgey_triage_inbox(
+        &self,
+        Parameters(p): Parameters<BadgeyTriageInboxParams>,
+    ) -> CallToolResult {
+        match self.badgey_triage_inbox_internal(p.scope, p.since, p.badgey_id) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_close_loops",
+        description = "Classify dispatched tasks without done notes; never synthesizes executor done notes."
+    )]
+    fn badgey_close_loops(
+        &self,
+        Parameters(p): Parameters<BadgeyCloseLoopsParams>,
+    ) -> CallToolResult {
+        match self.badgey_close_loops_internal(p.window_days, p.project_dir) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
     }
 
     #[tool(
@@ -4653,16 +6869,15 @@ Constraints:\n\
         let reg = AgentRegistry::new(&catalog);
         let cost_class = match p.cost_class.as_deref() {
             Some(s) => {
-                let parsed: AgentCostClass = match serde_json::from_value(
-                    serde_json::Value::String(s.to_string()),
-                ) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return Self::err_text(&format!(
+                let parsed: AgentCostClass =
+                    match serde_json::from_value(serde_json::Value::String(s.to_string())) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            return Self::err_text(&format!(
                             "unknown cost_class: {s} (expected one of: cheap, normal, expensive)"
                         ));
-                    }
-                };
+                        }
+                    };
                 Some(parsed)
             }
             None => None,
@@ -7035,8 +9250,8 @@ async fn orchestrate_stream_handler(
 ) -> axum::response::Sse<
     impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
-    use axum::response::Sse;
     use axum::response::sse::Event;
+    use axum::response::Sse;
     let compiled = workflow::compile(req.workflow);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
 
@@ -9190,7 +11405,9 @@ async fn main() -> anyhow::Result<()> {
     let badgey_proposals = Arc::new(orchestration::badgey::ProposalStore::new(
         store_dir.clone(),
     )?);
-    let badgey_journal = Arc::new(orchestration::badgey::ActionJournal::new(store_dir.clone())?);
+    let badgey_journal = Arc::new(orchestration::badgey::ActionJournal::new(
+        store_dir.clone(),
+    )?);
 
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);
 
@@ -9257,6 +11474,14 @@ async fn main() -> anyhow::Result<()> {
         badgey_proposals,
         badgey_journal,
     });
+    shared
+        .agent_adapter_registry
+        .write()
+        .register(Arc::new(BadgeyAgentAdapter {
+            state: shared.clone(),
+        }));
+    restore_badgey_registry_from_notes(&shared);
+    recover_badgey_non_terminal_state(&shared);
     std::thread::Builder::new()
         .name("blackbox-vectors-warmup".into())
         .spawn(|| {
@@ -9736,6 +11961,50 @@ mod tests {
         );
     }
 
+    fn save_badgey_test_brofile(tmp: &tempfile::TempDir) {
+        orchestration::brofile::save_brofile(
+            &orchestration::brofile::Brofile {
+                name: "badgey-persona".to_string(),
+                provider: Provider::Codex,
+                account: None,
+                lens: Some("Badgey test lens".to_string()),
+                model: None,
+                effort: None,
+                filters: Some(orchestration::mcp::McpFilters {
+                    allow: Vec::new(),
+                    disallow: vec!["mcp__blackbox__bro_*".to_string()],
+                }),
+            },
+            "global",
+            &tmp.path().join("bro"),
+            None,
+        );
+    }
+
+    fn fake_codex_bin(tmp: &tempfile::TempDir, session_id: &str) -> String {
+        let path = tmp.path().join("fake-codex");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                serde_json::json!({
+                    "type": "thread.started",
+                    "thread_id": session_id,
+                })
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    async fn codex_bin_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+    }
+
     #[tokio::test]
     async fn artifact_install_wires_f3_workflow_and_packet() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9776,21 +12045,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            server
-                .state
-                .workflow_registry
-                .read()
-                .contains_key("schema-migration-arc")
-        );
-        assert!(
-            server
-                .state
-                .packets
-                .read()
-                .load("domain:workflow-policy/arc-budget")
-                .is_ok()
-        );
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("schema-migration-arc"));
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:workflow-policy/arc-budget")
+            .is_ok());
         let rows = server
             .state
             .artifacts
@@ -9827,13 +12092,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            server
-                .state
-                .workflow_registry
-                .read()
-                .contains_key("project-bootstrap-arc")
-        );
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("project-bootstrap-arc"));
         let rows = server
             .state
             .artifacts
@@ -9881,12 +12144,10 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(snapshot.status, "completed");
-        assert!(
-            snapshot
-                .completed_nodes
-                .iter()
-                .any(|node| node == "Publish")
-        );
+        assert!(snapshot
+            .completed_nodes
+            .iter()
+            .any(|node| node == "Publish"));
     }
 
     #[tokio::test]
@@ -9946,29 +12207,23 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            server
-                .state
-                .workflow_registry
-                .read()
-                .contains_key("embed-compaction-arc")
-        );
-        assert!(
-            server
-                .state
-                .packets
-                .read()
-                .load("domain:embed/compaction-policy")
-                .is_ok()
-        );
-        assert!(
-            server
-                .state
-                .packets
-                .read()
-                .load("domain:cron-routing/embed-compaction")
-                .is_ok()
-        );
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("embed-compaction-arc"));
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:embed/compaction-policy")
+            .is_ok());
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:cron-routing/embed-compaction")
+            .is_ok());
     }
 
     #[tokio::test]
@@ -10144,37 +12399,29 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            server
-                .state
-                .workflow_registry
-                .read()
-                .contains_key("auto-digest-arc")
-        );
-        assert!(
-            server
-                .state
-                .packets
-                .read()
-                .load("domain:auto-digest/entry-quality")
-                .is_ok()
-        );
-        assert!(
-            server
-                .state
-                .packets
-                .read()
-                .load("domain:auto-digest/task-completed-routing")
-                .is_ok()
-        );
-        assert!(
-            orchestration::brofile::resolve_brofile(
-                "digest-extractor",
-                &server.state.store_dir,
-                None
-            )
-            .is_some()
-        );
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("auto-digest-arc"));
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:auto-digest/entry-quality")
+            .is_ok());
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:auto-digest/task-completed-routing")
+            .is_ok());
+        assert!(orchestration::brofile::resolve_brofile(
+            "digest-extractor",
+            &server.state.store_dir,
+            None
+        )
+        .is_some());
 
         let cases: Value =
             serde_json::from_str(include_str!("../eval/audit/auto-digest/cases.json")).unwrap();
@@ -10290,13 +12537,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            server
-                .state
-                .workflow_registry
-                .read()
-                .contains_key("contradiction-review-arc")
-        );
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("contradiction-review-arc"));
         let packet_store = server.state.packets.read();
         let packet = packet_store
             .load("domain:contradiction/review-synthesis")
@@ -10308,14 +12553,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prediction.classification, "contradicts");
-        assert!(
-            orchestration::brofile::resolve_brofile(
-                "contradiction-facilitator",
-                &server.state.store_dir,
-                None
-            )
-            .is_some()
-        );
+        assert!(orchestration::brofile::resolve_brofile(
+            "contradiction-facilitator",
+            &server.state.store_dir,
+            None
+        )
+        .is_some());
     }
 
     #[tokio::test]
@@ -10420,13 +12663,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            server
-                .state
-                .workflow_registry
-                .read()
-                .contains_key("auto-edge-arc")
-        );
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("auto-edge-arc"));
 
         let packet_store = server.state.packets.read();
         let packet = packet_store
@@ -10495,12 +12736,10 @@ mod tests {
         });
         let source_ref = entity_ref::EntityRef::parse(source).unwrap();
         let target_ref = entity_ref::EntityRef::parse(target).unwrap();
-        assert!(
-            edge_index
-                .forward_edges(&source_ref)
-                .iter()
-                .any(|edge| edge.kind == "DESCRIBES" && edge.target == target_ref)
-        );
+        assert!(edge_index
+            .forward_edges(&source_ref)
+            .iter()
+            .any(|edge| edge.kind == "DESCRIBES" && edge.target == target_ref));
     }
 
     #[tokio::test]
@@ -10695,13 +12934,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            server
-                .state
-                .workflow_registry
-                .read()
-                .contains_key("workflow-a")
-        );
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a"));
 
         install_artifact_value(
             &server.state,
@@ -10717,28 +12954,22 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            !server
-                .state
-                .workflow_registry
-                .read()
-                .contains_key("workflow-a")
-        );
-        assert!(
-            server
-                .state
-                .workflow_registry
-                .read()
-                .contains_key("workflow-a2")
-        );
-        assert!(
-            !server
-                .state
-                .store_dir
-                .join("workflows")
-                .join("workflow-a.json")
-                .exists()
-        );
+        assert!(!server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a"));
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a2"));
+        assert!(!server
+            .state
+            .store_dir
+            .join("workflows")
+            .join("workflow-a.json")
+            .exists());
     }
 
     #[tokio::test]
@@ -11541,6 +13772,716 @@ mod tests {
         wire["content"][0]["text"].as_str().unwrap().to_string()
     }
 
+    #[tokio::test]
+    async fn badgey_lifecycle_tools_write_thread_events() {
+        let _env_guard = codex_bin_test_guard().await;
+        let prior_bin = std::env::var("CODEX_BIN").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test"));
+        save_badgey_test_brofile(&tmp);
+        let server = test_server(&tmp);
+
+        let exec = server
+            .badgey_exec(Parameters(BadgeyExecParams {
+                project_dir: Some(tmp.path().to_string_lossy().into_owned()),
+                brief: Some("answer graph questions".to_string()),
+            }))
+            .await;
+        assert_ne!(exec.is_error, Some(true), "{}", extract_text(&exec));
+        let exec_body: Value = serde_json::from_str(&extract_text(&exec)).unwrap();
+        let badgey_id = exec_body["badgey_id"].as_str().unwrap().to_string();
+        let task_id = exec_body["task_id"].as_str().unwrap().to_string();
+        let thread_id = exec_body["thread_id"].as_str().unwrap().to_string();
+        assert_eq!(exec_body["session_id"], "codex-session-test");
+        assert!(server.state.task_store.read().get(&task_id).is_some());
+
+        let resume = server
+            .badgey_resume(Parameters(BadgeyResumeParams {
+                badgey_id: badgey_id.clone(),
+                prompt: "ping".to_string(),
+                timeout_seconds: Some(2.0),
+            }))
+            .await;
+        assert_ne!(resume.is_error, Some(true), "{}", extract_text(&resume));
+
+        let dismiss = server.badgey_dismiss(Parameters(BadgeyDismissParams {
+            badgey_id: badgey_id.clone(),
+            reason: Some("done".to_string()),
+        }));
+        assert_ne!(dismiss.is_error, Some(true), "{}", extract_text(&dismiss));
+
+        let notes = server.state.notes.read();
+        let bodies: Vec<_> = notes
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id.as_str()))
+            .map(|note| note.body.as_str())
+            .collect();
+        assert!(bodies
+            .iter()
+            .any(|body| body.contains(r#""event":"exec""#)
+                && body.contains(r#""provider_session_id":"codex-session-test""#)));
+        assert!(bodies
+            .iter()
+            .any(|body| body.contains(r#""event":"turn""#)));
+        assert!(bodies
+            .iter()
+            .any(|body| body.contains(r#""event":"dismiss""#)));
+
+        match prior_bin {
+            Some(value) => std::env::set_var("CODEX_BIN", value),
+            None => std::env::remove_var("CODEX_BIN"),
+        }
+    }
+
+    #[tokio::test]
+    async fn badgey_agent_dispatch_routes_through_wrapper_adapter() {
+        let _env_guard = codex_bin_test_guard().await;
+        let prior_bin = std::env::var("CODEX_BIN").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test"));
+        save_badgey_test_brofile(&tmp);
+        let server = test_server(&tmp);
+        server
+            .state
+            .agent_adapter_registry
+            .write()
+            .register(std::sync::Arc::new(BadgeyAgentAdapter {
+                state: server.state.clone(),
+            }));
+        server
+            .state
+            .artifacts
+            .read()
+            .install_value(
+                artifacts::ArtifactKind::Agent,
+                "badgey.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "badgey",
+                    "version": 1,
+                    "manifest": {
+                        "description": "Badgey test agent.",
+                        "dispatch_adapter": "badgey",
+                        "brofile_ref": "badgey-persona"
+                    }
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = server
+            .bro_agent_dispatch(Parameters(AgentDispatchParams {
+                agent: "badgey".into(),
+                args: serde_json::json!({"prompt": "advise"}),
+                project_dir: Some(tmp.path().to_string_lossy().into_owned()),
+                bro: None,
+                ambient: None,
+                caller_provider: None,
+                caller_session_id: None,
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
+        let body: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["session"]["provider"], "codex");
+        assert_eq!(body["session"]["session_id"], "codex-session-test");
+        assert_eq!(body["resolved_brofile"], "badgey-persona");
+        assert_eq!(
+            body["merged_filters"]["disallow"][0],
+            "mcp__blackbox__bro_*"
+        );
+        assert_eq!(server.state.badgey_registry.list().len(), 1);
+
+        match prior_bin {
+            Some(value) => std::env::set_var("CODEX_BIN", value),
+            None => std::env::remove_var("CODEX_BIN"),
+        }
+    }
+
+    #[tokio::test]
+    async fn badgey_post_processor_records_emit_proposal_actions_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId =
+            "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-3".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server
+            .state
+            .badgey_registry
+            .register(instance.clone())
+            .unwrap();
+        let action_id = uuid::Uuid::new_v4().to_string();
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "followup".to_string(),
+                body: serde_json::json!({
+                    "event": "bg-action-emit-proposal",
+                    "action_id": action_id,
+                    "kind": "agent",
+                    "draft": {"source": "draft-agent.json", "name": "draft-agent"}
+                })
+                .to_string(),
+                task_id: None,
+                session_id: Some("codex-session-3".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                thread_id: Some("thread-00000001".to_string()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .unwrap();
+
+        let results = server
+            .badgey_post_process_turn(&instance, "1970-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["proposal_id"], "P-1");
+        let proposals = server.state.badgey_proposals.list_by_instance(&id).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].kind,
+            orchestration::badgey::types::ProposalKind::Agent
+        );
+        assert!(matches!(
+            server
+                .state
+                .badgey_journal
+                .list_non_terminal()
+                .unwrap()
+                .as_slice(),
+            []
+        ));
+
+        let replay = server
+            .badgey_post_process_turn(&instance, "1970-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(server.state.badgey_proposals.list_by_instance(&id).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn badgey_post_processor_marks_bad_actions_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId =
+            "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-4".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server
+            .state
+            .badgey_registry
+            .register(instance.clone())
+            .unwrap();
+        let action_id = uuid::Uuid::new_v4().to_string();
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "followup".to_string(),
+                body: serde_json::json!({
+                    "event": "bg-action-emit-proposal",
+                    "action_id": action_id,
+                    "draft": {"source": "missing-kind.json"}
+                })
+                .to_string(),
+                task_id: None,
+                session_id: Some("codex-session-4".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                thread_id: Some("thread-00000001".to_string()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .unwrap();
+
+        let results = server
+            .badgey_post_process_turn(&instance, "1970-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(results[0]["status"], "failed");
+        let failure_notes: Vec<_> = server
+            .state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.body.contains("bg-action-failed"))
+            .cloned()
+            .collect();
+        assert_eq!(failure_notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn badgey_apply_and_reject_commands_update_proposal_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId =
+            "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-5".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server.state.badgey_registry.register(instance).unwrap();
+        let draft_path = tmp.path().join("new-bro.json");
+        std::fs::write(
+            &draft_path,
+            serde_json::json!({
+                "name": "new-bro",
+                "version": 1,
+                "provider": "codex"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let apply_proposal = server
+            .state
+            .badgey_proposals
+            .create(
+                &id,
+                orchestration::badgey::types::ProposalKind::Brofile,
+                serde_json::json!({"source": draft_path.to_string_lossy()}),
+                None,
+            )
+            .unwrap();
+        let reject_proposal = server
+            .state
+            .badgey_proposals
+            .create(
+                &id,
+                orchestration::badgey::types::ProposalKind::Agent,
+                serde_json::json!({"source": "not-used.json"}),
+                None,
+            )
+            .unwrap();
+
+        let apply = server
+            .badgey_resume(Parameters(BadgeyResumeParams {
+                badgey_id: id.to_string(),
+                prompt: format!("apply {}", apply_proposal.id),
+                timeout_seconds: None,
+            }))
+            .await;
+        assert_ne!(apply.is_error, Some(true), "{}", extract_text(&apply));
+        assert!(orchestration::brofile::resolve_brofile(
+            "new-bro",
+            &tmp.path().join("bro"),
+            None
+        )
+        .is_some());
+        assert_eq!(
+            server
+                .state
+                .badgey_proposals
+                .get(&id, &apply_proposal.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            orchestration::badgey::types::ProposalState::Applied
+        );
+
+        let reject = server
+            .badgey_resume(Parameters(BadgeyResumeParams {
+                badgey_id: id.to_string(),
+                prompt: format!("reject {}", reject_proposal.id),
+                timeout_seconds: None,
+            }))
+            .await;
+        assert_ne!(reject.is_error, Some(true), "{}", extract_text(&reject));
+        assert_eq!(
+            server
+                .state
+                .badgey_proposals
+                .get(&id, &reject_proposal.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            orchestration::badgey::types::ProposalState::Failed
+        );
+    }
+
+    #[test]
+    fn badgey_restart_replay_restores_registry_from_thread_notes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId =
+            "bg-0123abcd-4567ef89".parse().unwrap();
+        let thread_result = server
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".to_string(),
+                name: Some(format!("badgey:{id}")),
+                id: None,
+                topic: Some("Badgey replay".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".to_string()),
+            })
+            .unwrap();
+        let thread_id = server
+            .badgey_thread_id_from_open_result(&thread_result)
+            .unwrap();
+        let scope = orchestration::badgey::types::BadgeyScope {
+            project_id: tmp.path().to_string_lossy().into_owned(),
+            initial_brief: Some("replay".to_string()),
+        };
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "learned".to_string(),
+                body: serde_json::to_string(&orchestration::badgey::events::ThreadEvent::Exec {
+                    brofile_version: "badgey-persona".to_string(),
+                    scope: scope.clone(),
+                    charter: "replay".to_string(),
+                    provider: Provider::Codex,
+                    provider_session_id: "codex-session-6".to_string(),
+                })
+                .unwrap(),
+                task_id: None,
+                session_id: Some("codex-session-6".to_string()),
+                project: Some(scope.project_id.clone()),
+                thread_id: Some(thread_id.clone()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .unwrap();
+
+        restore_badgey_registry_from_notes(&server.state);
+        let restored = server.state.badgey_registry.get(&id).unwrap();
+        assert_eq!(restored.thread_of_record_id, thread_id);
+        assert_eq!(restored.provider_session_id, "codex-session-6");
+    }
+
+    #[test]
+    fn badgey_restart_replay_skips_unobserved_pending_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId =
+            "bg-0123abcd-4567ef89".parse().unwrap();
+        let thread_result = server
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".to_string(),
+                name: Some(format!("badgey:{id}")),
+                id: None,
+                topic: Some("Badgey pending replay".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".to_string()),
+            })
+            .unwrap();
+        let thread_id = server
+            .badgey_thread_id_from_open_result(&thread_result)
+            .unwrap();
+        let scope = orchestration::badgey::types::BadgeyScope {
+            project_id: tmp.path().to_string_lossy().into_owned(),
+            initial_brief: Some("pending replay".to_string()),
+        };
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "learned".to_string(),
+                body: serde_json::to_string(&orchestration::badgey::events::ThreadEvent::Exec {
+                    brofile_version: "badgey-persona".to_string(),
+                    scope: scope.clone(),
+                    charter: "pending replay".to_string(),
+                    provider: Provider::Codex,
+                    provider_session_id: "pending".to_string(),
+                })
+                .unwrap(),
+                task_id: None,
+                session_id: None,
+                project: Some(scope.project_id.clone()),
+                thread_id: Some(thread_id),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .unwrap();
+
+        restore_badgey_registry_from_notes(&server.state);
+        assert!(server.state.badgey_registry.get(&id).is_err());
+        assert!(server
+            .state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .any(|note| note.kind == notes::NoteKind::Surprise
+                && note.body.contains("badgey_restore_skipped_unobserved_session")));
+    }
+
+    #[test]
+    fn badgey_collect_waits_for_done_note_after_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId =
+            "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-7".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server.state.badgey_registry.register(instance.clone()).unwrap();
+        server
+            .badgey_write_event(
+                &instance,
+                orchestration::badgey::events::ThreadEvent::SubbroSpawned {
+                    task_id: "task-1".to_string(),
+                    scout_id: "scout-1".to_string(),
+                    charter: "look".to_string(),
+                },
+                Some("task-1".to_string()),
+            )
+            .unwrap();
+        server
+            .badgey_write_event(
+                &instance,
+                orchestration::badgey::events::ThreadEvent::SubbroSpawned {
+                    task_id: "task-2".to_string(),
+                    scout_id: "scout-1".to_string(),
+                    charter: "compare".to_string(),
+                },
+                Some("task-2".to_string()),
+            )
+            .unwrap();
+
+        let walking = server
+            .badgey_collect_internal(Some("scout-1"), Some(id.as_str()))
+            .unwrap();
+        assert_eq!(walking["status"], "still_walking");
+
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "done".to_string(),
+                body: serde_json::json!({
+                    "scout_id": "scout-1",
+                    "verdict": "found",
+                    "summary": "done"
+                })
+                .to_string(),
+                task_id: Some("task-1".to_string()),
+                session_id: Some("codex-session-7".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                thread_id: Some("thread-00000001".to_string()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey-scout".to_string()),
+            })
+            .unwrap();
+        let done = server
+            .badgey_collect_internal(Some("scout-1"), Some(id.as_str()))
+            .unwrap();
+        assert_eq!(done["status"], "still_walking");
+
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "done".to_string(),
+                body: serde_json::json!({
+                    "scout_id": "scout-1",
+                    "verdict": "found",
+                    "summary": "done 2"
+                })
+                .to_string(),
+                task_id: Some("task-2".to_string()),
+                session_id: Some("codex-session-7".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                thread_id: Some("thread-00000001".to_string()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey-scout".to_string()),
+            })
+            .unwrap();
+        let done = server
+            .badgey_collect_internal(Some("scout-1"), Some(id.as_str()))
+            .unwrap();
+        assert_eq!(done["status"], "done");
+    }
+
+    #[test]
+    fn badgey_triage_attached_to_instance_stores_redispatch_proposals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId =
+            "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-8".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server.state.badgey_registry.register(instance).unwrap();
+        let thread_result = server
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".to_string(),
+                name: Some("stale-work".to_string()),
+                id: None,
+                topic: Some("stale work".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".to_string()),
+            })
+            .unwrap();
+        let thread_id = server
+            .badgey_thread_id_from_open_result(&thread_result)
+            .unwrap();
+
+        let triage = server
+            .badgey_triage_inbox_internal(
+                Some(tmp.path().to_string_lossy().into_owned()),
+                None,
+                Some(id.to_string()),
+            )
+            .unwrap();
+        assert_eq!(triage["proposal_sheet"]["proposals"][0]["stored"], true);
+        let proposals = server.state.badgey_proposals.list_by_instance(&id).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].kind,
+            orchestration::badgey::types::ProposalKind::RedispatchTask
+        );
+        assert_eq!(
+            proposals[0].idempotency_key.as_deref(),
+            Some(format!("triage:{thread_id}").as_str())
+        );
+    }
+
+    #[test]
+    fn badgey_startup_recovery_fails_orphaned_non_terminal_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let action_id = orchestration::badgey::types::ActionId::new_v4();
+        server
+            .state
+            .badgey_journal
+            .record_seen(
+                action_id.clone(),
+                "bg-action-spawn-subbro".to_string(),
+                serde_json::json!({"event": "bg-action-spawn-subbro"}),
+            )
+            .unwrap();
+        let id: orchestration::badgey::types::BadgeyId =
+            "bg-0123abcd-4567ef89".parse().unwrap();
+        let proposal = server
+            .state
+            .badgey_proposals
+            .create(
+                &id,
+                orchestration::badgey::types::ProposalKind::RedispatchTask,
+                serde_json::json!({"prompt": "retry"}),
+                Some("redispatch-task-1".to_string()),
+            )
+            .unwrap();
+        server
+            .state
+            .badgey_proposals
+            .transition(
+                &id,
+                &proposal.id,
+                orchestration::badgey::types::ProposalState::Pending,
+                orchestration::badgey::types::ProposalState::Applying,
+                None,
+            )
+            .unwrap();
+
+        recover_badgey_non_terminal_state(&server.state);
+        assert!(matches!(
+            server
+                .state
+                .badgey_journal
+                .get(&action_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            orchestration::badgey::types::ActionJournalState::Failed { .. }
+        ));
+        assert_eq!(
+            server
+                .state
+                .badgey_proposals
+                .get(&id, &proposal.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            orchestration::badgey::types::ProposalState::Failed
+        );
+    }
+
     #[test]
     fn bro_agent_list_output_shape() {
         let tmp = tempfile::tempdir().unwrap();
@@ -12245,12 +15186,10 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["name"], "broken");
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .contains("manifest parse failed")
-        );
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("manifest parse failed"));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+id = "badgey-answer-002"
+mode = "answer"
+query = "Explain why Badgey proposals require an explicit apply command."
+required_entity_refs = ["knowledge:badgey-proposals"]
+required_citation_kinds = ["knowledge"]
+narrative_must_contain = ["apply", "proposal"]
+
+[[required_path_edges]]
+from = "knowledge:badgey-proposals"
+edge = "REFERENCES"
+to = "thread:badgey-impl"

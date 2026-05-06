@@ -1,0 +1,39 @@
+{
+  "name": "badgey-graduation-eval",
+  "version": 1,
+  "actors": {},
+  "start": "RunTeachQuery",
+  "vars_schema": {
+    "badgey_id": { "kind": "string", "required": true },
+    "question": { "kind": "string", "required": true },
+    "teach_result": { "kind": "any" },
+    "graduation_result": { "kind": "string" }
+  },
+  "nodes": {
+    "RunTeachQuery": {
+      "prompt": "Run one Badgey teach-mode graduation query.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_ask",
+            "arguments": {
+              "badgey_id": "${vars.badgey_id}",
+              "question": "Teach mode: ${vars.question}",
+              "timeout_seconds": 120
+            },
+            "timeout_secs": 180
+          },
+          "into_var": "teach_result",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "name": "graduation_result", "value": "teach_query_completed" }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

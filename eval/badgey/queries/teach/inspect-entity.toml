@@ -1,0 +1,11 @@
+id = "badgey-teach-001"
+mode = "teach"
+query = "Teach a caller how to inspect the entity refs behind a Badgey answer."
+required_entity_refs = ["knowledge:badgey-teach"]
+required_citation_kinds = ["knowledge"]
+narrative_must_contain = ["inspect", "next time"]
+
+[[required_path_edges]]
+from = "knowledge:badgey-teach"
+edge = "REFERENCES"
+to = "tool:bbox_inspect_entity"

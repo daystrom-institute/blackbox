@@ -18,6 +18,15 @@ pub struct AgentSchemaEntry {
     pub example_invocation: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsultantSchemaEntry {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub tools: Vec<&'static str>,
+    pub use_cases: Vec<&'static str>,
+    pub anti_patterns: Vec<&'static str>,
+}
+
 pub fn describe_schema(
     counts: &BTreeMap<String, usize>,
     agents: &[AgentSchemaEntry],
@@ -39,14 +48,16 @@ pub fn describe_schema(
         .collect::<Vec<_>>();
     let edge_families = edge_families();
     let agents_by_adapter = group_agents_by_adapter(agents);
-    let text = render_text(&vertex_types, &edge_families, agents);
-    let mut response = json!({
+    let consultants = consultants();
+    let text = render_text(&vertex_types, &edge_families, agents, &consultants);
+    let response = json!({
         "status": "ok",
         "text": text,
         "vertex_types": vertex_types,
         "edge_families": edge_families,
         "agents": agents,
         "agents_by_dispatch_adapter": agents_by_adapter,
+        "consultants": consultants,
     });
     Ok(serde_json::to_string_pretty(&response)?)
 }
@@ -55,6 +66,7 @@ fn render_text(
     vertex_types: &[serde_json::Value],
     edge_families: &[serde_json::Value],
     agents: &[AgentSchemaEntry],
+    consultants: &[ConsultantSchemaEntry],
 ) -> String {
     let mut text = String::from("## Agentic Corpus Schema\n\n### Vertex Types\n");
     for vertex in vertex_types {
@@ -96,6 +108,17 @@ fn render_text(
             }
         }
     }
+    if !consultants.is_empty() {
+        text.push_str("\n### Consultants\n");
+        for consultant in consultants {
+            text.push_str(&format!(
+                "- **{}**: {} Tools: {}\n",
+                consultant.name,
+                consultant.description,
+                consultant.tools.join(", ")
+            ));
+        }
+    }
     text
 }
 
@@ -109,6 +132,35 @@ fn group_agents_by_adapter(agents: &[AgentSchemaEntry]) -> BTreeMap<String, Vec<
         groups.entry(key).or_default().push(&agent.name);
     }
     groups
+}
+
+fn consultants() -> Vec<ConsultantSchemaEntry> {
+    vec![ConsultantSchemaEntry {
+        name: "badgey",
+        description: "Agentic-corpus consultant with wrapper-owned session continuity, proposal gating, scout fan-out, and thread-of-record audit notes.",
+        tools: vec![
+            "badgey_exec",
+            "badgey_resume",
+            "badgey_ask",
+            "badgey_scout",
+            "badgey_collect",
+            "badgey_triage_inbox",
+            "badgey_close_loops",
+            "badgey_status",
+            "badgey_list",
+            "badgey_dismiss",
+        ],
+        use_cases: vec![
+            "answer graph/corpus questions with cited entity refs",
+            "teach a caller how to navigate the corpus without Badgey next time",
+            "draft gated workflow, packet, brofile, lens, agent, or redispatch proposals",
+        ],
+        anti_patterns: vec![
+            "do not use for direct code execution",
+            "do not auto-apply proposals",
+            "do not synthesize executor done notes",
+        ],
+    }]
 }
 
 fn edge_families() -> Vec<serde_json::Value> {
@@ -296,5 +348,22 @@ mod tests {
             !text.contains("### Installed Agents"),
             "no agents header when empty"
         );
+    }
+
+    #[test]
+    fn schema_includes_badgey_consultant_section() {
+        let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let consultants = value["consultants"].as_array().unwrap();
+        let badgey = consultants
+            .iter()
+            .find(|entry| entry["name"] == "badgey")
+            .expect("badgey consultant entry");
+        assert!(badgey["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool == "badgey_exec"));
+        assert!(value["text"].as_str().unwrap().contains("### Consultants"));
     }
 }

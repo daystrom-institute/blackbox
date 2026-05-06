@@ -129,4 +129,38 @@ mod artifact_tests {
         };
         validate_agent_install(&value, &ctx).unwrap();
     }
+
+    #[test]
+    fn badgey_iac_examples_parse() {
+        for raw in [
+            include_str!("../../../examples/badgey/crons/badgey-triage-daily.json"),
+            include_str!("../../../examples/badgey/crons/badgey-close-loops-weekly.json"),
+        ] {
+            let cron: crate::crons::CronSpec = serde_json::from_str(raw).unwrap();
+            assert!(cron.name.starts_with("badgey-"));
+            assert_eq!(cron.concurrency, 1);
+        }
+
+        for raw in [
+            include_str!("../../../examples/badgey/workflows/badgey-eval-arc.json"),
+            include_str!("../../../examples/badgey/workflows/badgey-graduation-eval.json"),
+        ] {
+            let workflow: crate::workflow::Workflow = serde_json::from_str(raw).unwrap();
+            assert!(workflow.name.starts_with("badgey-"));
+            crate::workflow::compile(workflow).unwrap();
+        }
+
+        let packet: crate::packets::CompileParams =
+            serde_json::from_str(include_str!(
+                "../../../examples/badgey/packets/badgey-self-eval.json"
+            ))
+            .unwrap();
+        assert_eq!(packet.domain, "badgey/self-eval");
+        let routing_packet: crate::packets::CompileParams =
+            serde_json::from_str(include_str!(
+                "../../../examples/badgey/packets/badgey-cron-routing.json"
+            ))
+            .unwrap();
+        assert_eq!(routing_packet.domain, "badgey/cron-routing");
+    }
 }

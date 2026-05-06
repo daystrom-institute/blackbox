@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 pub const DEFAULT_RESUME_QUEUE_CAP: usize = 3;
@@ -12,7 +13,7 @@ pub struct PendingTurn {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueueStatus {
     pub depth: usize,
     pub active: bool,

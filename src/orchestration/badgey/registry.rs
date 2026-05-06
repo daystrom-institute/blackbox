@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::orchestration::providers::Provider;
 
-use super::queue::{PendingTurn, QueueError, QueueStatus, ResumeQueue};
+use super::queue::{PendingTurn, QueueError, QueuePermit, QueueStatus, ResumeQueue};
 use super::types::{now_rfc3339, BadgeyId, BadgeyScope};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,15 +141,14 @@ impl BadgeyRegistry {
         instances
     }
 
-    pub fn enqueue_resume(
-        &self,
-        id: &BadgeyId,
-        turn: PendingTurn,
-    ) -> Result<usize, RegistryError> {
+    pub fn enqueue_resume(&self, id: &BadgeyId, turn: PendingTurn) -> Result<usize, RegistryError> {
         let queue = self.queue_for_active_instance(id)?;
         queue
             .enqueue(turn)
-            .map_err(|err| RegistryError::QueueRejected { id: id.clone(), err })
+            .map_err(|err| RegistryError::QueueRejected {
+                id: id.clone(),
+                err,
+            })
     }
 
     pub fn enqueue_priority_resume(
@@ -160,11 +159,29 @@ impl BadgeyRegistry {
         let queue = self.queue_for_active_instance(id)?;
         queue
             .enqueue_priority(turn)
-            .map_err(|err| RegistryError::QueueRejected { id: id.clone(), err })
+            .map_err(|err| RegistryError::QueueRejected {
+                id: id.clone(),
+                err,
+            })
     }
 
     pub fn pop_next_resume(&self, id: &BadgeyId) -> Result<Option<PendingTurn>, RegistryError> {
         Ok(self.queue_for_active_instance(id)?.pop_next())
+    }
+
+    pub async fn wait_for_resume_turn(
+        &self,
+        id: &BadgeyId,
+        turn_id: &str,
+    ) -> Result<QueuePermit, RegistryError> {
+        let queue = self.queue_for_active_instance(id)?;
+        queue
+            .wait_until_turn(turn_id)
+            .await
+            .map_err(|err| RegistryError::QueueRejected {
+                id: id.clone(),
+                err,
+            })
     }
 
     pub fn queue_status(&self, id: &BadgeyId) -> Result<QueueStatus, RegistryError> {
@@ -176,7 +193,10 @@ impl BadgeyRegistry {
         self.queue_for_existing_instance(id)
     }
 
-    fn queue_for_existing_instance(&self, id: &BadgeyId) -> Result<Arc<ResumeQueue>, RegistryError> {
+    fn queue_for_existing_instance(
+        &self,
+        id: &BadgeyId,
+    ) -> Result<Arc<ResumeQueue>, RegistryError> {
         self.queues
             .read()
             .get(id)

@@ -1,0 +1,40 @@
+{
+  "domain": "badgey/self-eval",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["fail", "warn", "pass"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "fail_missing_refs",
+      "classification": "fail",
+      "antecedent": {
+        "op": "StringContains",
+        "field": "vars.eval_result",
+        "needle": "missing_entity_ref",
+        "case_insensitive": true
+      },
+      "consequent": "Fail",
+      "confidence": 0.95
+    },
+    {
+      "id": "warn_keyword_only",
+      "classification": "warn",
+      "antecedent": {
+        "op": "StringContains",
+        "field": "vars.eval_result",
+        "needle": "keyword_only",
+        "case_insensitive": true
+      },
+      "consequent": "Warn",
+      "confidence": 0.8
+    },
+    {
+      "id": "pass_default",
+      "classification": "pass",
+      "antecedent": { "op": "True" },
+      "consequent": "Pass",
+      "confidence": 0.75
+    }
+  ]
+}

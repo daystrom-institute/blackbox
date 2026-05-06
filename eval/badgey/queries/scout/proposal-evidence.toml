@@ -1,0 +1,11 @@
+id = "badgey-scout-002"
+mode = "scout"
+query = "Scout for evidence that a proposed packet is warranted."
+required_entity_refs = ["knowledge:badgey-packets"]
+required_citation_kinds = ["knowledge"]
+narrative_must_contain = ["proposal", "packet"]
+
+[[required_path_edges]]
+from = "knowledge:badgey-packets"
+edge = "REFERENCES"
+to = "packet:badgey-self-eval"

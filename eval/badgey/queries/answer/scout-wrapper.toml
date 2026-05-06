@@ -1,0 +1,11 @@
+id = "badgey-answer-003"
+mode = "answer"
+query = "How does the wrapper dispatch Badgey scout work without giving Badgey bro_exec?"
+required_entity_refs = ["knowledge:badgey-wrapper"]
+required_citation_kinds = ["knowledge"]
+narrative_must_contain = ["wrapper", "scout"]
+
+[[required_path_edges]]
+from = "knowledge:badgey-wrapper"
+edge = "DESCRIBES"
+to = "agent:badgey-scout"

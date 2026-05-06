@@ -522,6 +522,76 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
+        name: "badgey_exec",
+        category: ToolCategory::Orchestration,
+        summary: "Start a Badgey consultant instance for a project scope and return its badgey_id, provider session, task, and thread-of-record ids.",
+        when_to_use: "Use when you want Badgey to consult over a project with continuity. The wrapper opens a work-item thread, dispatches the badgey brofile, and owns the session mapping. Use `badgey_resume` or `badgey_ask` for follow-up turns.",
+        example: Some(r#"badgey_exec(project_dir="/repo/x", brief="help me navigate the agent graph work")"#),
+    },
+    ToolDoc {
+        name: "badgey_resume",
+        category: ToolCategory::Orchestration,
+        summary: "Send a turn to an existing Badgey instance. Mechanical commands such as `dismiss` are handled by the wrapper before provider resume.",
+        when_to_use: "Use for any follow-up where Badgey should keep its thread-of-record context. Calls are serialized per badgey_id so concurrent callers do not corrupt the provider session.",
+        example: Some(r#"badgey_resume(badgey_id="bg-0123abcd-4567ef89", prompt="teach me why this edge matters")"#),
+    },
+    ToolDoc {
+        name: "badgey_ask",
+        category: ToolCategory::Orchestration,
+        summary: "Question-shaped alias for badgey_resume.",
+        when_to_use: "Use when the caller is asking a direct question of an existing Badgey instance and you prefer `question` over `prompt` in the request shape.",
+        example: Some(r#"badgey_ask(badgey_id="bg-0123abcd-4567ef89", question="what should I inspect next?")"#),
+    },
+    ToolDoc {
+        name: "badgey_dismiss",
+        category: ToolCategory::Orchestration,
+        summary: "Dismiss a Badgey instance, drain queued turns, write a dismiss event, and resolve its thread of record.",
+        when_to_use: "Use when a Badgey consultation is done or should stop accepting turns. After dismissal, new resumes for that badgey_id fail with instance_dismissed.",
+        example: Some(r#"badgey_dismiss(badgey_id="bg-0123abcd-4567ef89", reason="work complete")"#),
+    },
+    ToolDoc {
+        name: "badgey_status",
+        category: ToolCategory::Orchestration,
+        summary: "Inspect one Badgey instance, including queue status and proposals; without badgey_id, returns active instances.",
+        when_to_use: "Use to debug a Badgey consultation, see queue depth, inspect provider/session/thread bindings, or check proposal state before applying.",
+        example: Some(r#"badgey_status(badgey_id="bg-0123abcd-4567ef89")"#),
+    },
+    ToolDoc {
+        name: "badgey_list",
+        category: ToolCategory::Orchestration,
+        summary: "List Badgey instances and their thread/session bindings.",
+        when_to_use: "Use when you need to find active Badgey instances or include dismissed records for audit.",
+        example: Some(r#"badgey_list(include_dismissed=true)"#),
+    },
+    ToolDoc {
+        name: "badgey_scout",
+        category: ToolCategory::Orchestration,
+        summary: "Ask Badgey to author scout sub-charters for a focused question; wrapper post-processing dispatches emitted scout actions.",
+        when_to_use: "Use for bounded fan-out investigation when Badgey should decompose one question into focused scout turns without exposing bro_exec to the Badgey provider session.",
+        example: Some(r#"badgey_scout(badgey_id="bg-0123abcd-4567ef89", charter="compare these two graph paths")"#),
+    },
+    ToolDoc {
+        name: "badgey_collect",
+        category: ToolCategory::Orchestration,
+        summary: "Collect scout/sub-bro events for a Badgey instance or scout id.",
+        when_to_use: "Use after badgey_scout or bg-action-spawn-subbro processing to see whether scout work is still walking or has produced dispatch records.",
+        example: Some(r#"badgey_collect(badgey_id="bg-0123abcd-4567ef89")"#),
+    },
+    ToolDoc {
+        name: "badgey_triage_inbox",
+        category: ToolCategory::Orchestration,
+        summary: "Produce a Badgey-shaped inbox triage proposal sheet for stale/open work in a scope.",
+        when_to_use: "Use for morning-brief triage. The result is a proposal-sheet shape; applying concrete actions still goes through Badgey's proposal gate.",
+        example: Some(r#"badgey_triage_inbox(scope="/repo/x")"#),
+    },
+    ToolDoc {
+        name: "badgey_close_loops",
+        category: ToolCategory::Orchestration,
+        summary: "Classify dispatched tasks without done notes; never synthesizes executor done notes.",
+        when_to_use: "Use for completion-contract audits. Results may identify suspected completions, crashes, or stalls, but the tool does not write kind=done on behalf of executors.",
+        example: Some(r#"badgey_close_loops(window_days=14, project_dir="/repo/x")"#),
+    },
+    ToolDoc {
         name: "bro_wait",
         category: ToolCategory::Orchestration,
         summary: "Block until a single task completes.",
@@ -1297,7 +1367,11 @@ mod tests {
             let name = extract_string_arg(body, "name");
             let desc = extract_string_arg(body, "description");
             if let (Some(n), Some(d)) = (name, desc) {
-                if n.starts_with("bbox_") || n.starts_with("bro_") || n.starts_with("whiteboard_") {
+                if n.starts_with("bbox_")
+                    || n.starts_with("bro_")
+                    || n.starts_with("badgey_")
+                    || n.starts_with("whiteboard_")
+                {
                     out.push((n, d));
                 }
             }
