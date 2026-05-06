@@ -262,6 +262,35 @@ pub struct MergedFilters {
     pub disallow: Vec<String>,
 }
 
+impl Default for MergedFilters {
+    fn default() -> Self {
+        Self {
+            allow: Vec::new(),
+            disallow: Vec::new(),
+        }
+    }
+}
+
+impl Default for AgentManifest {
+    fn default() -> Self {
+        Self {
+            description: String::new(),
+            when_to_use: Vec::new(),
+            anti_patterns: Vec::new(),
+            brofile_ref: None,
+            brofile_inline: None,
+            filter_overlay: None,
+            inputs: None,
+            outputs: None,
+            composition: None,
+            cost_class: default_cost_class(),
+            dispatch_adapter: None,
+            provenance: None,
+            embedding: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

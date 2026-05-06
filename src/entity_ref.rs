@@ -261,7 +261,18 @@ impl EntityRef {
             EntityRef::Commit { repo_id, sha } => Ok(format!("commit:{repo_id}:{sha}")),
             EntityRef::Task { task_id } => Ok(format!("task:{task_id}")),
             EntityRef::BashCall { session, turn } => Ok(format!("bash_call:{session}:{turn}")),
-            EntityRef::Agent { name, version } => Ok(format!("agent:{name}@v{version}")),
+            EntityRef::Agent { name, version } => {
+                if name.is_empty() || name.contains(':') || *version == 0 {
+                    return Err(EntityRefRenderError {
+                        field: "name/version",
+                        value: format!("{name}@v{version}"),
+                        message: format!(
+                            "agent ref has invalid name/version: name={name:?}, version={version}"
+                        ),
+                    });
+                }
+                Ok(format!("agent:{name}@v{version}"))
+            }
         }
     }
 
@@ -861,6 +872,33 @@ mod tests {
     fn agent_ref_rejects_empty_name() {
         let err = EntityRef::parse("agent:@v1").unwrap_err();
         assert!(err.message.contains("name"));
+    }
+
+    #[test]
+    fn agent_ref_render_rejects_empty_name() {
+        let bad = EntityRef::Agent {
+            name: "".to_string(),
+            version: 1,
+        };
+        assert!(bad.try_render().is_err());
+    }
+
+    #[test]
+    fn agent_ref_render_rejects_colon_in_name() {
+        let bad = EntityRef::Agent {
+            name: "bad:name".to_string(),
+            version: 1,
+        };
+        assert!(bad.try_render().is_err());
+    }
+
+    #[test]
+    fn agent_ref_render_rejects_version_zero() {
+        let bad = EntityRef::Agent {
+            name: "reviewer".to_string(),
+            version: 0,
+        };
+        assert!(bad.try_render().is_err());
     }
 
     #[derive(Clone)]

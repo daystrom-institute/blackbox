@@ -254,6 +254,34 @@ impl ArtifactCatalog {
         Ok(meta)
     }
 
+    pub fn load_artifact_value(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+    ) -> Result<Option<Value>> {
+        let path = self.artifact_path(kind, name)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let value: Value =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Some(value))
+    }
+
+    pub fn load_metadata_public(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+    ) -> Result<Option<ArtifactMetadata>> {
+        let path = self.metadata_path(kind, name)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(self.load_metadata(kind, name)?))
+    }
+
     fn load_metadata(&self, kind: ArtifactKind, name: &str) -> Result<ArtifactMetadata> {
         let path = self.metadata_path(kind, name)?;
         let raw =
@@ -706,5 +734,51 @@ mod tests {
             })
             .unwrap();
         assert!(workflow_rows.is_empty());
+    }
+
+    #[test]
+    fn load_artifact_value_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        let agent = serde_json::json!({
+            "name": "test-agent",
+            "version": 2,
+            "description": "A test agent.",
+            "brofile_ref": "reviewer-persona"
+        });
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "test.json".into(),
+                &agent,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let value = catalog
+            .load_artifact_value(ArtifactKind::Agent, "test-agent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["description"], "A test agent.");
+        assert_eq!(value["brofile_ref"], "reviewer-persona");
+
+        let meta = catalog
+            .load_metadata_public(ArtifactKind::Agent, "test-agent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.name, "test-agent");
+        assert_eq!(meta.version, "2");
+        assert!(meta.active);
+
+        assert!(catalog
+            .load_artifact_value(ArtifactKind::Agent, "nonexistent")
+            .unwrap()
+            .is_none());
+        assert!(catalog
+            .load_metadata_public(ArtifactKind::Agent, "nonexistent")
+            .unwrap()
+            .is_none());
     }
 }

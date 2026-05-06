@@ -164,5 +164,8 @@ mod tests {
         assert!(vertex_types
             .iter()
             .any(|value| value["entity_type"] == "bash_call"));
+        assert!(vertex_types
+            .iter()
+            .any(|value| value["entity_type"] == "agent"));
     }
 }

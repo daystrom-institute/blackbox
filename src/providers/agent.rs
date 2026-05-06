@@ -34,7 +34,13 @@ impl InspectableEntityProvider for AgentProvider {
     fn schema(&self) -> EntitySchemaView {
         schema(
             self.entity_type(),
-            &["name", "version", "description", "brofile"],
+            &[
+                "name",
+                "version",
+                "description",
+                "brofile_ref",
+                "when_to_use",
+            ],
             &["DERIVED_FROM", "SUPERSEDES"],
             &["name", "version"],
         )
