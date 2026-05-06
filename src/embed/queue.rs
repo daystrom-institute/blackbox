@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rmcp::schemars;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -60,10 +60,14 @@ pub struct EmbedQueueHandle {
 struct EmbedQueueInner {
     senders: RwLock<BTreeMap<String, mpsc::UnboundedSender<WorkerCommand>>>,
     statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
-    seen_hashes: Mutex<HashSet<String>>,
     router: Option<EmbeddingRouter>,
     debounce: Duration,
     retry_backoff: Duration,
+}
+
+struct ResolvedRoute {
+    queue_route: String,
+    vector_route: String,
 }
 
 enum WorkerCommand {
@@ -140,44 +144,44 @@ impl EmbedQueueHandle {
     }
 
     pub fn enqueue(&self, request: EmbedRequest) -> bool {
-        let route = match self.resolve_route(&request) {
-            Ok(route) => route,
+        let resolved = match self.resolve_route(&request) {
+            Ok(resolved) => resolved,
             Err(err) => {
                 let fallback = request.bucket.as_str().to_string();
                 mark_error(&self.inner.statuses, &fallback, &sanitize_error(&err));
                 return false;
             }
         };
-        let seen_key = format!("{route}:{}", request.chunk_hash);
-        if !self.inner.seen_hashes.lock().insert(seen_key) {
+        if !self.should_embed(&request, &resolved.vector_route) {
             tracing::debug!(
-                route = %route,
+                route = %resolved.queue_route,
+                vector_route = %resolved.vector_route,
                 entity_id = %request.entity_id,
                 chunk_hash = %request.chunk_hash,
-                "embedding enqueue skipped unchanged content hash"
+                "embedding enqueue skipped unchanged vector record"
             );
             return false;
         }
-        increment_depth(&self.inner.statuses, &route, 1);
-        let sender = self.ensure_sender(&route, &request);
+        increment_depth(&self.inner.statuses, &resolved.queue_route, 1);
+        let sender = self.ensure_sender(&resolved, &request);
         match sender {
             Some(sender) => {
                 let sent = sender.send(WorkerCommand::Enqueue(request)).is_ok();
                 if !sent {
-                    increment_depth(&self.inner.statuses, &route, -1);
+                    increment_depth(&self.inner.statuses, &resolved.queue_route, -1);
                     mark_error(
                         &self.inner.statuses,
-                        &route,
+                        &resolved.queue_route,
                         "embedding route worker stopped",
                     );
                 }
                 sent
             }
             None => {
-                increment_depth(&self.inner.statuses, &route, -1);
+                increment_depth(&self.inner.statuses, &resolved.queue_route, -1);
                 mark_error(
                     &self.inner.statuses,
-                    &route,
+                    &resolved.queue_route,
                     "embedding route is not configured",
                 );
                 false
@@ -208,45 +212,66 @@ impl EmbedQueueHandle {
         }
     }
 
-    fn resolve_route(&self, request: &EmbedRequest) -> Result<String> {
+    fn resolve_route(&self, request: &EmbedRequest) -> Result<ResolvedRoute> {
         let Some(router) = &self.inner.router else {
-            return Ok(request.bucket.as_str().to_string());
+            let route = request.bucket.as_str().to_string();
+            return Ok(ResolvedRoute {
+                queue_route: route.clone(),
+                vector_route: route,
+            });
         };
         let route = router.route(request.bucket, request.project_id.as_deref())?;
         let default = router.route(request.bucket, None)?;
-        if request.project_id.is_some()
+        let queue_route = if request.project_id.is_some()
             && (route.provider_id != default.provider_id
                 || route.model != default.model
                 || route.dimensions != default.dimensions)
         {
-            Ok(format!(
+            format!(
                 "{}:{}",
                 request.bucket.as_str(),
                 request.project_id.as_deref().unwrap_or_default()
-            ))
+            )
         } else {
-            Ok(request.bucket.as_str().to_string())
+            request.bucket.as_str().to_string()
+        };
+        Ok(ResolvedRoute {
+            queue_route,
+            vector_route: route.vector_route_id(),
+        })
+    }
+
+    fn should_embed(&self, request: &EmbedRequest, vector_route: &str) -> bool {
+        if self.inner.router.is_none() {
+            return true;
+        }
+        match crate::vectors::contains_active(vector_route, &request.entity_id, &request.chunk_hash)
+        {
+            Ok(already_indexed) => !already_indexed,
+            Err(err) => {
+                tracing::warn!(
+                    vector_route,
+                    entity_id = %request.entity_id,
+                    error = %err,
+                    "embedding dedup check failed; enqueueing so vector store can recover"
+                );
+                true
+            }
         }
     }
 
     fn ensure_sender(
         &self,
-        route: &str,
+        resolved: &ResolvedRoute,
         request: &EmbedRequest,
     ) -> Option<mpsc::UnboundedSender<WorkerCommand>> {
+        let route = resolved.queue_route.as_str();
         if let Some(sender) = self.inner.senders.read().get(route).cloned() {
             return Some(sender);
         }
         let router = self.inner.router.as_ref()?;
         let provider = match router.route_for(request.bucket, request.project_id.as_deref()) {
             Ok(provider) => provider,
-            Err(err) => {
-                mark_error(&self.inner.statuses, route, &sanitize_error(&err));
-                return None;
-            }
-        };
-        let vector_route = match router.route(request.bucket, request.project_id.as_deref()) {
-            Ok(route) => route.vector_route_id(),
             Err(err) => {
                 mark_error(&self.inner.statuses, route, &sanitize_error(&err));
                 return None;
@@ -262,7 +287,7 @@ impl EmbedQueueHandle {
             .or_default();
         let spec = WorkerSpec {
             route: route.to_string(),
-            vector_route,
+            vector_route: resolved.vector_route.clone(),
             provider,
             rate_limit_per_min,
             debounce: self.inner.debounce,
@@ -295,7 +320,6 @@ impl EmbedQueueHandle {
             inner: Arc::new(EmbedQueueInner {
                 senders: RwLock::new(BTreeMap::new()),
                 statuses: Arc::new(RwLock::new(statuses)),
-                seen_hashes: Mutex::new(HashSet::new()),
                 router: None,
                 debounce: DEFAULT_DEBOUNCE,
                 retry_backoff: DEFAULT_RETRY_BACKOFF,
@@ -351,7 +375,6 @@ impl EmbedQueueHandle {
             inner: Arc::new(EmbedQueueInner {
                 senders: RwLock::new(senders),
                 statuses,
-                seen_hashes: Mutex::new(HashSet::new()),
                 router,
                 debounce,
                 retry_backoff,
@@ -598,7 +621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn debounce_batches_and_dedups_by_content_hash() {
+    async fn debounce_batches_requests() {
         let provider = Arc::new(MockProvider::ok());
         let queue = EmbedQueueHandle::from_providers_for_test(
             vec![("knowledge", provider.clone())],
@@ -606,12 +629,12 @@ mod tests {
             Duration::from_millis(20),
         );
         assert!(queue.enqueue(request(Bucket::Knowledge, "a", "h1")));
-        assert!(!queue.enqueue(request(Bucket::Knowledge, "b", "h1")));
+        assert!(queue.enqueue(request(Bucket::Knowledge, "b", "h1")));
         assert!(queue.enqueue(request(Bucket::Knowledge, "c", "h2")));
         tokio::time::sleep(Duration::from_millis(80)).await;
         let status = queue.status().routes["knowledge"].clone();
         assert!(status.available);
-        assert_eq!(status.indexed_count, 2);
+        assert_eq!(status.indexed_count, 3);
         assert_eq!(status.queue_depth, 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         queue.shutdown();
@@ -651,9 +674,12 @@ mod tests {
             Duration::from_millis(20),
         );
         let mut req = request(Bucket::Code, "a", "h1");
-        assert_eq!(queue.resolve_route(&req).unwrap(), "code");
+        assert_eq!(queue.resolve_route(&req).unwrap().queue_route, "code");
         req.project_id = Some("proj1234".into());
-        assert_eq!(queue.resolve_route(&req).unwrap(), "code:proj1234");
+        assert_eq!(
+            queue.resolve_route(&req).unwrap().queue_route,
+            "code:proj1234"
+        );
         queue.shutdown();
     }
 

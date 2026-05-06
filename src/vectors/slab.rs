@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -37,6 +37,12 @@ impl VectorSlab {
 
     pub fn active_entries(&self) -> impl Iterator<Item = &SlabEntry> {
         self.entries.iter().filter(|entry| entry.active)
+    }
+
+    pub fn contains_active(&self, entity_id: &str, content_hash: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.active && entry.entity_id == entity_id && entry.content_hash == content_hash
+        })
     }
 
     pub fn upsert(

@@ -49,6 +49,10 @@ pub fn delete_entity_all_routes(entity_id: &str) -> Result<()> {
     global().delete_entity_all_routes(entity_id)
 }
 
+pub fn contains_active(route: &str, entity_id: &str, content_hash: &str) -> Result<bool> {
+    global().contains_active(route, entity_id, content_hash)
+}
+
 pub fn search(route: &str, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
     global().search(route, query, k)
 }
@@ -118,6 +122,19 @@ impl VectorStore {
             partition.write().delete(entity_id)?;
         }
         Ok(())
+    }
+
+    pub fn contains_active(
+        &self,
+        route: &str,
+        entity_id: &str,
+        content_hash: &str,
+    ) -> Result<bool> {
+        let Some(partition) = self.partitions.read().get(route).cloned() else {
+            return Ok(false);
+        };
+        let contains = partition.read().contains_active(entity_id, content_hash);
+        Ok(contains)
     }
 
     pub fn search(&self, route: &str, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
@@ -261,6 +278,10 @@ impl Partition {
             .unwrap_or_default()
     }
 
+    fn contains_active(&self, entity_id: &str, content_hash: &str) -> bool {
+        self.slab.contains_active(entity_id, content_hash)
+    }
+
     fn rebuild_from_wal(&mut self) -> Result<()> {
         let records = wal::read_all(&self.wal_path())?;
         self.slab = VectorSlab::default();
@@ -376,6 +397,20 @@ mod tests {
             .search("voyage-1024", &[1.0, 0.0, 0.0, 0.0], 5)
             .unwrap();
         assert_eq!(hits[0].id, "a");
+    }
+
+    #[test]
+    fn contains_active_uses_entity_and_content_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0])
+            .unwrap();
+
+        assert!(store.contains_active("voyage-1024", "a", "h1").unwrap());
+        assert!(!store.contains_active("voyage-1024", "a", "h2").unwrap());
+        store.delete("voyage-1024", "a").unwrap();
+        assert!(!store.contains_active("voyage-1024", "a", "h1").unwrap());
     }
 
     #[test]
