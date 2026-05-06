@@ -31,6 +31,7 @@ pub struct EdgeIndex {
     forward: HashMap<EntityRef, Vec<Edge>>,
     reverse: HashMap<EntityRef, Vec<Edge>>,
     commit_anchor_index: HashMap<String, Vec<Edge>>,
+    session_tool_calls: HashMap<(String, String), Vec<Edge>>,
 }
 
 pub struct EdgeStoreRefs<'a> {
@@ -117,6 +118,13 @@ impl EdgeIndex {
             .unwrap_or_default()
     }
 
+    pub(crate) fn session_tool_call_edges(&self, provider: &str, session_id: &str) -> Vec<&Edge> {
+        self.session_tool_calls
+            .get(&(provider.to_string(), session_id.to_string()))
+            .map(|edges| edges.iter().collect())
+            .unwrap_or_default()
+    }
+
     fn insert(&mut self, edge: Edge, seen: &mut HashSet<Edge>) {
         if !seen.insert(edge.clone()) {
             return;
@@ -125,6 +133,19 @@ impl EdgeIndex {
             if let Some(commit_sha) = edge.metadata.get("anchor.commit_sha_at_edit") {
                 self.commit_anchor_index
                     .entry(commit_sha.clone())
+                    .or_default()
+                    .push(edge.clone());
+            }
+        }
+        if matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE" | "RAN_BASH") {
+            if let EntityRef::Transcript {
+                provider,
+                session_id,
+                ..
+            } = &edge.source
+            {
+                self.session_tool_calls
+                    .entry((provider.clone(), session_id.clone()))
                     .or_default()
                     .push(edge.clone());
             }

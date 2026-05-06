@@ -199,7 +199,8 @@ fn prior_read_edges<'a>(edge_index: &'a EdgeIndex, edit_edge: &Edge) -> Vec<&'a 
         return Vec::new();
     };
     let mut reads = edge_index
-        .all_edges()
+        .session_tool_call_edges(provider, session_id)
+        .into_iter()
         .filter(|edge| edge.kind == "READ_FILE")
         .filter(|edge| {
             transcript_source(&edge.source).is_some_and(|(read_provider, read_session, offset)| {
@@ -393,6 +394,27 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_millis(1),
             "commit anchor lookup should be O(k), elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn prior_read_edges_uses_session_tool_call_index() {
+        let edit = edit_edge_at("src/main.rs", 10_001);
+        let mut edges = (0..10_000)
+            .map(|idx| read_edge_for_session(&format!("src/{idx}.rs"), "other", idx))
+            .collect::<Vec<_>>();
+        edges.push(read_edge_at("src/auth.rs", 10_000));
+        edges.push(edit.clone());
+        let index = EdgeIndex::from_edges_for_tests(edges);
+        let started = std::time::Instant::now();
+
+        let reads = prior_read_edges(&index, &edit);
+
+        assert_eq!(reads.len(), 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1),
+            "session tool-call lookup should be O(k), elapsed {:?}",
             started.elapsed()
         );
     }
