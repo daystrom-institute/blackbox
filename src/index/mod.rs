@@ -9,7 +9,7 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-s3-code-tokenizer";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g1";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -54,6 +54,10 @@ pub struct FieldHandles {
     pub commit_sha: Field,
     #[allow(dead_code)]
     pub repo_id: Field,
+    #[allow(dead_code)]
+    pub commit_author_name: Field,
+    #[allow(dead_code)]
+    pub commit_author_email: Field,
 }
 
 /// Config needed by the background reindex thread.
@@ -285,6 +289,8 @@ pub(crate) fn build_schema() -> (Schema, FieldHandles) {
         parser_version: builder.add_text_field("parser_version", STRING | STORED),
         commit_sha: builder.add_text_field("commit_sha", STRING | STORED),
         repo_id: builder.add_text_field("repo_id", STRING | STORED),
+        commit_author_name: builder.add_text_field("commit_author_name", TEXT | STORED),
+        commit_author_email: builder.add_text_field("commit_author_email", STRING | STORED),
     };
     (builder.build(), fields)
 }

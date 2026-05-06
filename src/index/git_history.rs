@@ -141,6 +141,8 @@ pub(crate) fn build_commit_doc(
     doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
     doc.add_text(f.repo_id, repo_id);
     doc.add_text(f.commit_sha, &commit.sha);
+    doc.add_text(f.commit_author_name, &commit.author_name);
+    doc.add_text(f.commit_author_email, &commit.author_email);
     doc.add_text(f.session_id, "");
     doc.add_text(f.account, "git");
     doc.add_text(f.project, &project.canonical_path);
@@ -173,14 +175,6 @@ fn commit_edges(
             EdgeConfidence::Exact,
         ));
     }
-    if let Some(author) = author_placeholder(commit) {
-        edges.push(edge(
-            source.clone(),
-            "COMMIT_BY_AUTHOR",
-            EntityRef::Brofile { name: author },
-            EdgeConfidence::Unknown,
-        ));
-    }
     for file in crate::git::changed_files_for_commit(root, &commit.sha)? {
         if let Some(target) = project_chunks.get(&file) {
             edges.push(edge(
@@ -202,23 +196,6 @@ fn edge(source: EntityRef, kind: &str, target: EntityRef, confidence: EdgeConfid
         provenance: EdgeProvenance::Derived,
         confidence,
     }
-}
-
-fn author_placeholder(commit: &GitCommit) -> Option<String> {
-    let raw = if commit.author_email.is_empty() {
-        commit.author_name.as_str()
-    } else {
-        commit.author_email.as_str()
-    };
-    let mut sanitized = String::from("git-");
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '@') {
-            sanitized.push(ch);
-        } else {
-            sanitized.push('_');
-        }
-    }
-    (sanitized != "git-").then_some(sanitized)
 }
 
 fn commit_entity_id(repo_id: &str, sha: &str) -> String {
@@ -309,23 +286,12 @@ mod tests {
         assert_eq!(text(&doc, fields.chunk_kind), "git_message");
         assert_eq!(text(&doc, fields.repo_id), "repo1234");
         assert_eq!(text(&doc, fields.commit_sha), commit.sha);
+        assert_eq!(text(&doc, fields.commit_author_name), "A");
+        assert_eq!(text(&doc, fields.commit_author_email), "a@example.test");
         assert_eq!(
             text(&doc, fields.entity_id),
             format!("commit:repo1234:{}", commit.sha)
         );
-    }
-
-    #[test]
-    fn author_placeholder_is_valid_entity_ref() {
-        let commit = GitCommit {
-            sha: "a".repeat(40),
-            parent_shas: Vec::new(),
-            author_name: "Alice Smith".into(),
-            author_email: "alice@example.test".into(),
-            message: String::new(),
-        };
-        let name = author_placeholder(&commit).unwrap();
-        EntityRef::parse(&format!("brofile:{name}")).unwrap();
     }
 
     #[test]

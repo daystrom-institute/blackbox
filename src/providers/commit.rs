@@ -37,7 +37,6 @@ impl InspectableEntityProvider for CommitProvider {
             &["repo_id", "sha", "subject", "author"],
             &[
                 "COMMIT_PARENT",
-                "COMMIT_BY_AUTHOR",
                 "COMMIT_PRODUCED_BY_ARC",
                 "COMMIT_TOUCHED_FILE",
             ],
@@ -52,7 +51,6 @@ impl InspectableEntityProvider for CommitProvider {
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
         vec![
             expected("COMMIT_PARENT", false),
-            expected("COMMIT_BY_AUTHOR", false),
             expected("COMMIT_PRODUCED_BY_ARC", false),
             expected("COMMIT_TOUCHED_FILE", false),
         ]
@@ -67,7 +65,6 @@ impl InspectableEntityProvider for CommitProvider {
             full_neighborhood,
             &[
                 "COMMIT_PARENT",
-                "COMMIT_BY_AUTHOR",
                 "COMMIT_PRODUCED_BY_ARC",
                 "COMMIT_TOUCHED_FILE",
             ],
