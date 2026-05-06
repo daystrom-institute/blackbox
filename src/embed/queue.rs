@@ -533,18 +533,30 @@ fn persist_vectors(
             batch.len()
         ));
     }
-    crate::vectors::upsert_batch(
-        &spec.vector_route,
-        batch
-            .iter()
-            .zip(vectors)
-            .map(|(request, vector)| crate::vectors::VectorUpsert {
+    let mut contradiction_checks = Vec::new();
+    let records = batch
+        .iter()
+        .zip(vectors)
+        .map(|(request, vector)| {
+            if request.bucket == Bucket::Knowledge {
+                contradiction_checks.push((request.clone(), vector.clone()));
+            }
+            crate::vectors::VectorUpsert {
                 entity_id: request.entity_id.clone(),
                 content_hash: request.chunk_hash.clone(),
                 vector,
-            })
-            .collect(),
-    )
+            }
+        })
+        .collect();
+    crate::vectors::upsert_batch(&spec.vector_route, records)?;
+    for (request, vector) in contradiction_checks {
+        crate::embed_queue::maybe_detect_knowledge_contradiction(
+            &request,
+            &spec.vector_route,
+            &vector,
+        );
+    }
+    Ok(())
 }
 
 struct TokenBucket {

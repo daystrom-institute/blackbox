@@ -116,6 +116,8 @@ pub enum OpKind {
     ValidateSchema,
     /// Apply an auto-digest candidate through the knowledge MCP tools.
     ApplyEntry,
+    /// Append an authored edge to `KnowledgeEntry.links` via bbox_knowledge_link.
+    AppendKnowledgeLink,
     /// Surface an auto-digest candidate for operator review.
     SurfaceToInbox,
     /// Record an auto-digest rejection.
@@ -181,6 +183,9 @@ pub async fn execute_op(
         OpKind::ValidateSchema => exec_validate_schema(&rendered_args, hook.into_var.as_deref()),
         OpKind::ApplyEntry => {
             exec_apply_entry(&rendered_args, hook.into_var.as_deref(), ctx).await
+        }
+        OpKind::AppendKnowledgeLink => {
+            exec_append_knowledge_link(&rendered_args, hook.into_var.as_deref(), ctx).await
         }
         OpKind::SurfaceToInbox => exec_surface_to_inbox(&rendered_args, ctx).await,
         OpKind::LogReject => exec_log_reject(&rendered_args, ctx).await,
@@ -315,6 +320,31 @@ async fn exec_apply_entry(
     let result = call_blackbox_tool(tool, Value::Object(arguments), ctx).await?;
     Ok(OpEffect::SetVar {
         key: into_var.unwrap_or("applied_entry").to_string(),
+        value: result,
+    })
+}
+
+async fn exec_append_knowledge_link(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let mut arguments = Map::new();
+    for key in ["source", "target", "kind"] {
+        let value = args
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("AppendKnowledgeLink requires args.{key}"))?;
+        arguments.insert(key.into(), Value::String(value.to_string()));
+    }
+    for key in ["note", "source_arc", "confidence"] {
+        if let Some(value) = args.get(key).and_then(Value::as_str) {
+            arguments.insert(key.into(), Value::String(value.to_string()));
+        }
+    }
+    let result = call_blackbox_tool("bbox_knowledge_link", Value::Object(arguments), ctx).await?;
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("knowledge_link").to_string(),
         value: result,
     })
 }

@@ -701,8 +701,8 @@ use index::{
     SessionsListParams, TopicsParams,
 };
 use knowledge::{
-    AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeListParams, LearnParams,
-    RememberParams, RenderParams, ResponseFormat, ReviewParams,
+    AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeLinkParams,
+    KnowledgeListParams, LearnParams, RememberParams, RenderParams, ResponseFormat, ReviewParams,
 };
 use mcp_tools::blame::BlameParams;
 use mcp_tools::bundle_evidence::BundleEvidenceParams;
@@ -1247,6 +1247,26 @@ impl BlackboxServer {
                 }
             }
             Ok(combined)
+        })
+    }
+
+    #[tool(
+        name = "bbox_knowledge_link",
+        description = "Append a knowledge edge."
+    )]
+    fn bbox_knowledge_link(
+        &self,
+        Parameters(p): Parameters<KnowledgeLinkParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_knowledge_link", || {
+            let edge = self.state.kb.write().append_link(&p)?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "linked",
+                "source": p.source,
+                "target": p.target,
+                "kind": edge.kind.edge_kind(),
+                "confidence": edge.confidence,
+            }))?)
         })
     }
 
@@ -7716,6 +7736,7 @@ async fn main() -> anyhow::Result<()> {
     vectors::install_global(Arc::new(vectors::VectorStore::open(
         vectors::default_vectors_dir(),
     )?));
+    embed_queue::install_contradiction_state(shared.clone());
     embed_queue::install(embed::queue::EmbedQueueHandle::start_default());
 
     // Restore webhook + workflow registries from disk so installs
@@ -8530,6 +8551,187 @@ mod tests {
             cases.len()
         );
         assert_eq!(matched, cases.len());
+    }
+
+    #[tokio::test]
+    async fn artifact_install_wires_m4_contradiction_review_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/contradiction-review-arc.json"
+        ))
+        .unwrap();
+        let packet_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/contradiction/review-synthesis.json"
+        ))
+        .unwrap();
+        let brofiles: [(&str, Value); 4] = [
+            (
+                "contradiction-provenance",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/contradiction-provenance.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "contradiction-lifecycle",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/contradiction-lifecycle.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "contradiction-coherence",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/contradiction-coherence.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "contradiction-facilitator",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/contradiction-facilitator.json"
+                ))
+                .unwrap(),
+            ),
+        ];
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/contradiction/review-synthesis.json"
+                    .into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            packet_value,
+        )
+        .await
+        .unwrap();
+        for (name, value) in brofiles {
+            install_artifact_value(
+                &server.state,
+                ArtifactInstallParams {
+                    kind: artifacts::ArtifactKind::Brofile,
+                    source: format!("examples/agentic-corpus/brofiles/{name}.json"),
+                    name: None,
+                    version: None,
+                    supersedes: None,
+                },
+                value,
+            )
+            .await
+            .unwrap();
+        }
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/contradiction-review-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("contradiction-review-arc"));
+        let packet_store = server.state.packets.read();
+        let packet = packet_store
+            .load("domain:contradiction/review-synthesis")
+            .unwrap();
+        let prediction = packets::apply_with(
+            &packet,
+            &json!({"vars": {"verdict": {"verdict": "contradicts"}}}),
+            &*packet_store,
+        )
+        .unwrap();
+        assert_eq!(prediction.classification, "contradicts");
+        assert!(orchestration::brofile::resolve_brofile(
+            "contradiction-facilitator",
+            &server.state.store_dir,
+            None
+        )
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        embed_queue::install_contradiction_state(server.state.clone());
+        let vector_store = Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+        let _guard = vectors::install_test_global(vector_store.clone());
+        let now = "2026-01-01T00:00:00Z".to_string();
+        for (id, content) in [
+            ("aaaabbbb", "use provider A for embeddings"),
+            ("ccccdddd", "never use provider A for embeddings"),
+        ] {
+            server
+                .state
+                .kb
+                .write()
+                .upsert_generated(knowledge::KnowledgeEntry {
+                    id: id.into(),
+                    title: id.into(),
+                    content: content.into(),
+                    cluster: None,
+                    variants: Default::default(),
+                    category: knowledge::Category::Memory,
+                    scope: knowledge::Scope::Global,
+                    project: None,
+                    providers: Vec::new(),
+                    priority: knowledge::Priority::Standard,
+                    weight: 100,
+                    status: knowledge::Status::Active,
+                    approval: knowledge::Approval::UserConfirmed,
+                    render: false,
+                    decay: true,
+                    review_at: None,
+                    supersedes: None,
+                    links: Vec::new(),
+                    rationale: None,
+                    expires_at: None,
+                    source: "test".into(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    recall_count: 0,
+                    last_recalled: None,
+                })
+                .unwrap();
+        }
+        vector_store
+            .upsert("knowledge-test", "knowledge:ccccdddd", "h-old", vec![1.0, 0.0])
+            .unwrap();
+        vector_store
+            .upsert("knowledge-test", "knowledge:aaaabbbb", "h-new", vec![0.99, 0.01])
+            .unwrap();
+        let request = embed::queue::EmbedRequest {
+            bucket: embed::Bucket::Knowledge,
+            project_id: None,
+            entity_id: "knowledge:aaaabbbb".into(),
+            chunk_hash: "h-new".into(),
+            text: "use provider A for embeddings".into(),
+        };
+        embed_queue::maybe_detect_knowledge_contradiction(
+            &request,
+            "knowledge-test",
+            &[0.99, 0.01],
+        );
+
+        assert!(server.state.notes.read().all().iter().any(|note| {
+            note.body.contains("Tier-0 contradiction detected")
+                && note.body.contains("knowledge:aaaabbbb")
+                && note.body.contains("knowledge:ccccdddd")
+        }));
     }
 
     #[tokio::test]

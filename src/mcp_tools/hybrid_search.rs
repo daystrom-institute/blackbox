@@ -601,6 +601,7 @@ mod tests {
                 decay: true,
                 review_at: None,
                 supersedes: None,
+                links: Vec::new(),
                 rationale: None,
                 expires_at: None,
                 source: "test".into(),

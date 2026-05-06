@@ -118,6 +118,28 @@ surface and seed `source_session`, `task_kind`, and `daily_count` in initial
 vars. A later phase should emit the completion signal from bro task
 finalization and route it into this installed workflow.
 
+## M4
+
+`KnowledgeEntry.links` is now the durable authored-edge surface for reviewed
+knowledge relationships. EdgeIndex projects those links on rebuild with
+explicit provenance and the stored confidence, while the older
+`KnowledgeEntry.supersedes` field continues to project the legacy `SUPERSEDES`
+chain.
+
+`contradiction-review-arc.json` uses the engine whiteboard primitive: three
+specialist brofiles post and debate independently, a facilitator emits strict
+JSON, and `contradiction/review-synthesis` routes the result into
+`append_knowledge_link` hook ops. The `supersedes` verdict writes an authored
+`SUPERSEDES` link for graph traversal; primary decision supersession should
+still use `bbox_decide(supersedes=...)`.
+
+Tier-0 contradiction detection runs in the knowledge embedding success path.
+When a new knowledge vector has cosine > 0.85 against another knowledge entry
+outside the immediate supersession relation, bbox starts
+`contradiction-review-arc` if installed; otherwise it emits a
+`bbox_note(kind=surprise)` so the unresolved contradiction surfaces in
+`bbox_inbox`.
+
 ## S3
 
 - Code chunking uses `tree-sitter-language-pack` with runtime downloads

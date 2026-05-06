@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::chunker::{EdgeConfidence, EdgeProvenance};
 use crate::entity_ref::EntityRef;
 use crate::index::{EdgeProjectionDoc, TranscriptIndex};
-use crate::knowledge::Knowledge;
+use crate::knowledge::{Knowledge, KnowledgeEdgeKind};
 use crate::notes::Notes;
 use crate::orchestration::TaskStore;
 use crate::threads::Threads;
@@ -185,6 +185,41 @@ impl EdgeIndex {
                     ),
                     seen,
                 );
+            }
+            for link in &entry.links {
+                let Ok(target) = EntityRef::parse(&link.target) else {
+                    tracing::debug!(
+                        source = %entry.id,
+                        target = %link.target,
+                        "skipping malformed KnowledgeEntry.links target"
+                    );
+                    continue;
+                };
+                let mut metadata = BTreeMap::new();
+                if let Some(note) = &link.note {
+                    metadata.insert("note".into(), note.clone());
+                }
+                if let Some(source_arc) = &link.source_arc {
+                    metadata.insert("source_arc".into(), source_arc.clone());
+                }
+                self.insert(
+                    Edge {
+                        source: EntityRef::Knowledge {
+                            id: entry.id.clone(),
+                        },
+                        kind: link.kind.edge_kind().into(),
+                        target,
+                        provenance: EdgeProvenance::Explicit,
+                        confidence: link.confidence,
+                        metadata,
+                    },
+                    seen,
+                );
+                if link.kind == KnowledgeEdgeKind::Supersedes {
+                    // Keep authored supersession links queryable through the
+                    // same edge family as the legacy `supersedes` field.
+                    tracing::debug!(source = %entry.id, "projected authored SUPERSEDES knowledge link");
+                }
             }
         }
     }
@@ -581,6 +616,73 @@ mod tests {
             1
         );
         assert!(index.reverse_edges_filtered(&target, &["CALLS"]).is_empty());
+    }
+
+    #[test]
+    fn knowledge_links_project_authored_edges() {
+        use crate::knowledge::{
+            Approval, Category, KnowledgeEdge, KnowledgeEdgeKind, KnowledgeEntry, Priority, Scope,
+            Status,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut knowledge = Knowledge::open(&dir.path().join("knowledge.json")).unwrap();
+        let now = "2026-01-01T00:00:00Z".to_string();
+        knowledge
+            .upsert_generated(KnowledgeEntry {
+                id: "aaaabbbb".into(),
+                title: "A".into(),
+                content: "claim A".into(),
+                cluster: None,
+                variants: Default::default(),
+                category: Category::Memory,
+                scope: Scope::Global,
+                project: None,
+                providers: Vec::new(),
+                priority: Priority::Standard,
+                weight: 100,
+                status: Status::Active,
+                approval: Approval::UserConfirmed,
+                render: false,
+                decay: true,
+                review_at: None,
+                supersedes: None,
+                links: vec![KnowledgeEdge {
+                    target: "knowledge:ccccdddd".into(),
+                    kind: KnowledgeEdgeKind::Contradicts,
+                    note: Some("claims conflict".into()),
+                    source_arc: Some("arc-123".into()),
+                    confidence: EdgeConfidence::Heuristic,
+                }],
+                rationale: None,
+                expires_at: None,
+                source: "test".into(),
+                created_at: now.clone(),
+                updated_at: now,
+                recall_count: 0,
+                last_recalled: None,
+            })
+            .unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_knowledge_edges(&knowledge, &mut seen);
+
+        let source = EntityRef::Knowledge {
+            id: "aaaabbbb".into(),
+        };
+        let target = EntityRef::Knowledge {
+            id: "ccccdddd".into(),
+        };
+        let edges = index.forward_edges_filtered(&source, &["Contradicts"]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, target);
+        assert_eq!(edges[0].provenance, EdgeProvenance::Explicit);
+        assert_eq!(edges[0].confidence, EdgeConfidence::Heuristic);
+        assert_eq!(
+            edges[0].metadata.get("source_arc").map(String::as_str),
+            Some("arc-123")
+        );
     }
 
     #[test]

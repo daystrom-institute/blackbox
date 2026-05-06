@@ -2,14 +2,20 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 use parking_lot::RwLock;
+use serde_json::json;
 
 use crate::chunker::Chunk;
 use crate::embed::queue::{EmbedQueueHandle, EmbedRequest, EmbedStatusResponse};
 use crate::embed::{queue, Bucket};
 use crate::entity_ref::EntityRef;
 use crate::knowledge::KnowledgeEntry;
+use crate::notes::NoteParams;
+use crate::routing::RoutingVerdict;
+use crate::SharedState;
 
 static GLOBAL_QUEUE: OnceLock<RwLock<Option<EmbedQueueHandle>>> = OnceLock::new();
+static CONTRADICTION_STATE: OnceLock<RwLock<Option<std::sync::Arc<SharedState>>>> =
+    OnceLock::new();
 
 fn queue_slot() -> &'static RwLock<Option<EmbedQueueHandle>> {
     GLOBAL_QUEUE.get_or_init(|| RwLock::new(None))
@@ -17,6 +23,10 @@ fn queue_slot() -> &'static RwLock<Option<EmbedQueueHandle>> {
 
 pub(crate) fn install(handle: EmbedQueueHandle) {
     *queue_slot().write() = Some(handle);
+}
+
+pub(crate) fn install_contradiction_state(state: std::sync::Arc<SharedState>) {
+    *CONTRADICTION_STATE.get_or_init(|| RwLock::new(None)).write() = Some(state);
 }
 
 pub(crate) fn status_response() -> EmbedStatusResponse {
@@ -111,4 +121,102 @@ fn enqueue(request: queue::EmbedRequest) {
             "embedding queue not installed; accepted enqueue as no-op"
         );
     }
+}
+
+pub(crate) fn maybe_detect_knowledge_contradiction(
+    request: &EmbedRequest,
+    vector_route: &str,
+    vector: &[f32],
+) {
+    if request.bucket != Bucket::Knowledge {
+        return;
+    }
+    let Some(state) = CONTRADICTION_STATE
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .clone()
+    else {
+        return;
+    };
+    let Some(entry_a) = request.entity_id.strip_prefix("knowledge:") else {
+        return;
+    };
+    let hits = match crate::vectors::search(vector_route, vector, 5) {
+        Ok(hits) => hits,
+        Err(err) => {
+            tracing::debug!(error = %err, "knowledge contradiction nearest-neighbor scan failed");
+            return;
+        }
+    };
+    let kb = state.kb.read();
+    let Some(source) = kb.entry(entry_a).cloned() else {
+        return;
+    };
+    let Some((entry_b, cosine)) = hits.into_iter().find_map(|hit| {
+        if hit.id == request.entity_id || hit.distance > 0.15 {
+            return None;
+        }
+        let id = hit.id.strip_prefix("knowledge:")?;
+        let target = kb.entry(id)?.clone();
+        if supersession_related(&source, &target) {
+            return None;
+        }
+        Some((target, 1.0 - hit.distance))
+    }) else {
+        return;
+    };
+    drop(kb);
+
+    let payload = json!({
+        "entry_a": format!("knowledge:{}", source.id),
+        "entry_b": format!("knowledge:{}", entry_b.id),
+        "cosine": cosine,
+        "vector_route": vector_route,
+    });
+    if state
+        .workflow_registry
+        .read()
+        .contains_key("contradiction-review-arc")
+    {
+        let state_for_task = state.clone();
+        let mut initial_vars = serde_json::Map::new();
+        initial_vars.insert("entry_a".into(), json!(format!("knowledge:{}", source.id)));
+        initial_vars.insert("entry_b".into(), json!(format!("knowledge:{}", entry_b.id)));
+        initial_vars.insert("cosine".into(), json!(cosine));
+        tokio::spawn(async move {
+            let _ = crate::dispatch_routing_verdict_direct(
+                state_for_task,
+                "contradiction-detected",
+                RoutingVerdict::StartArc {
+                    workflow: "contradiction-review-arc".into(),
+                    initial_vars,
+                },
+                payload,
+            )
+            .await;
+        });
+    } else {
+        let project = source.project.clone().or(entry_b.project.clone());
+        let body = format!(
+            "Tier-0 contradiction detected between knowledge:{} and knowledge:{} (cosine {:.3}), but contradiction-review-arc is not installed.",
+            source.id, entry_b.id, cosine
+        );
+        if let Err(err) = state.notes.write().create(&NoteParams {
+            kind: "surprise".into(),
+            body,
+            task_id: None,
+            session_id: None,
+            project,
+            thread_id: None,
+            provider: None,
+            bro: None,
+        }) {
+            tracing::warn!(error = %err, "failed to surface contradiction fallback note");
+        }
+    }
+}
+
+fn supersession_related(a: &KnowledgeEntry, b: &KnowledgeEntry) -> bool {
+    a.supersedes.as_deref() == Some(b.id.as_str())
+        || b.supersedes.as_deref() == Some(a.id.as_str())
 }
