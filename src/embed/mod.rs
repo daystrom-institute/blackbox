@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 pub const VOYAGE_PROVIDER_ID: &str = "voyage";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";
@@ -66,6 +67,41 @@ pub struct Route {
     pub provider_id: String,
     pub model: String,
     pub dimensions: usize,
+}
+
+impl Route {
+    pub fn vector_route_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.provider_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.model.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.dimensions.to_string().as_bytes());
+        let digest = hasher.finalize();
+        format!(
+            "{}-{}-{}-{:02x}{:02x}{:02x}{:02x}",
+            sanitize_route_component(&self.provider_id),
+            sanitize_route_component(&self.model),
+            self.dimensions,
+            digest[0],
+            digest[1],
+            digest[2],
+            digest[3]
+        )
+    }
+}
+
+fn sanitize_route_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -32,6 +32,7 @@ mod system_memory;
 mod threads;
 mod tool_docs;
 mod util;
+mod vectors;
 mod webhooks;
 mod whiteboards;
 mod workflow;

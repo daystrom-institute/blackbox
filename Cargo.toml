@@ -117,6 +117,8 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 regex = "1"
+ordered-float = "5"
+wide = "0.7"
 
 # Cron schedule parsing for the cron-inlet primitive (calendar-driven
 # tick → routing packet → arc dispatch).
