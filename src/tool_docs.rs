@@ -130,7 +130,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_hybrid_search",
         category: ToolCategory::Graph,
         summary: "Hybrid BM25+vector search over typed entities.",
-        when_to_use: "Use for mixed questions.",
+        when_to_use: "Use for mixed questions. `vector_weight=0.6` is default; set 0.0 for BM25-only behavior, 1.0 for vector-only.",
         example: None,
     },
     ToolDoc {

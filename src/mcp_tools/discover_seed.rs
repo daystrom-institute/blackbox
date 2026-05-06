@@ -27,6 +27,8 @@ pub struct DiscoverSeedParams {
     #[serde(default)]
     pub include_vectors: Option<bool>,
     #[serde(default)]
+    pub vector_weight: Option<f32>,
+    #[serde(default)]
     pub query_vector: Option<Vec<f32>>,
 }
 
@@ -73,6 +75,7 @@ pub fn discover_seed_entities(
             limit: Some(limit),
             doc_type: p.doc_type.clone(),
             include_vectors: p.include_vectors,
+            vector_weight: p.vector_weight,
             query_vector: p.query_vector.clone(),
         },
     )?;

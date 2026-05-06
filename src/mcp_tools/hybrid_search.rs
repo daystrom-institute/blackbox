@@ -20,7 +20,6 @@ const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 50;
 const DEFAULT_FETCH: usize = 50;
 const RRF_K: f32 = 60.0;
-const BM25_WEIGHT: f32 = 0.4;
 const VECTOR_WEIGHT: f32 = 0.6;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -32,6 +31,10 @@ pub struct HybridSearchParams {
     pub doc_type: Option<String>,
     #[serde(default)]
     pub include_vectors: Option<bool>,
+    /// Weight assigned to vector rank lists during RRF fusion.
+    /// Defaults to 0.6; 0.0 is BM25-only, 1.0 is vector-only.
+    #[serde(default)]
+    pub vector_weight: Option<f32>,
     /// Optional deterministic query vector for fixtures and operator probes.
     /// When absent, bbox_hybrid_search embeds the query through each configured
     /// route and degrades per route if a provider is unavailable.
@@ -89,12 +92,13 @@ pub fn hybrid_search(
         .unwrap_or(DEFAULT_LIMIT as u64)
         .min(MAX_LIMIT as u64) as usize;
     let fetch = DEFAULT_FETCH.max(limit * 4);
+    let (bm25_weight, vector_weight) = fusion_weights(p.vector_weight);
     let bm25_hits = index.hybrid_bm25_hits(query, fetch, p.doc_type.as_deref())?;
     let mut features = features_from_bm25(&bm25_hits);
 
     let mut lists = vec![RankedList {
         source: "bm25".into(),
-        weight: BM25_WEIGHT,
+        weight: bm25_weight,
         hits: bm25_hits
             .iter()
             .map(|hit| RankedHit {
@@ -112,11 +116,12 @@ pub fn hybrid_search(
         searched_partitions: Vec::new(),
     };
     let mut degraded = HybridDegraded::default();
-    if p.include_vectors.unwrap_or(true) {
+    if p.include_vectors.unwrap_or(true) && vector_weight > 0.0 {
         let vector_lists = vector_ranked_lists(
             query,
             p.query_vector.as_deref(),
             fetch,
+            vector_weight,
             &vector_status.partitions,
             &mut degraded,
         )?;
@@ -187,6 +192,7 @@ fn vector_ranked_lists(
     query: &str,
     supplied_query_vector: Option<&[f32]>,
     fetch: usize,
+    vector_weight: f32,
     partitions: &BTreeMap<String, PartitionMetrics>,
     degraded: &mut HybridDegraded,
 ) -> Result<Vec<RankedList>> {
@@ -259,7 +265,7 @@ fn vector_ranked_lists(
             .with_context(|| format!("searching vector partition {route}"))?;
         lists.push(RankedList {
             source: format!("vector:{route}"),
-            weight: VECTOR_WEIGHT,
+            weight: vector_weight,
             hits: hits
                 .into_iter()
                 .enumerate()
@@ -273,6 +279,11 @@ fn vector_ranked_lists(
         });
     }
     Ok(lists)
+}
+
+fn fusion_weights(vector_weight: Option<f32>) -> (f32, f32) {
+    let vector_weight = vector_weight.unwrap_or(VECTOR_WEIGHT).clamp(0.0, 1.0);
+    (1.0 - vector_weight, vector_weight)
 }
 
 fn embed_query(router: &EmbeddingRouter, bucket: Bucket, query: &str) -> Result<Vec<f32>> {
@@ -537,9 +548,20 @@ mod tests {
             },
         )]);
         let lists =
-            vector_ranked_lists("q", Some(&[1.0, 0.0]), 5, &partitions, &mut degraded).unwrap();
+            vector_ranked_lists("q", Some(&[1.0, 0.0]), 5, 0.6, &partitions, &mut degraded)
+                .unwrap();
         assert!(lists.is_empty());
         assert!(degraded.skipped_partitions["route-a"].contains("do not match"));
+    }
+
+    #[test]
+    fn vector_weight_is_clamped_and_complemented() {
+        assert_eq!(fusion_weights(Some(1.8)), (0.0, 1.0));
+        assert_eq!(fusion_weights(Some(-0.2)), (1.0, 0.0));
+
+        let (bm25, vector) = fusion_weights(None);
+        assert!((bm25 - 0.4).abs() < f32::EPSILON);
+        assert!((vector - 0.6).abs() < f32::EPSILON);
     }
 
     #[test]

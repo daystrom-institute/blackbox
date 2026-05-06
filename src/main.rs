@@ -719,7 +719,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_hybrid_search",
-        description = "Hybrid BM25+vector search over typed entities."
+        description = "Hybrid BM25+vector search over typed entities. vector_weight=0.6 by default; set 0.0 for BM25-only behavior, 1.0 for vector-only."
     )]
     fn bbox_hybrid_search(&self, Parameters(p): Parameters<HybridSearchParams>) -> CallToolResult {
         Self::run("bbox_hybrid_search", || {
