@@ -15,6 +15,10 @@ path = "src/cli.rs"
 name = "bro-irc"
 path = "src/irc_bridge.rs"
 
+[[bin]]
+name = "bro-slack"
+path = "src/slack_bridge.rs"
+
 [dependencies]
 # Search index
 tantivy = "0.22"
