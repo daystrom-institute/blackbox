@@ -855,7 +855,7 @@ impl BlackboxServer {
                 &p,
                 &provider_ctx,
                 &self.state.edge_index.read(),
-                &self.state.path_cache.read(),
+                &mut self.state.path_cache.write(),
             )
         })
     }

@@ -23,7 +23,7 @@ pub fn bundle_evidence(
     p: &BundleEvidenceParams,
     ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
-    cache: &PathCache,
+    cache: &mut PathCache,
 ) -> Result<String> {
     let mut entities = Vec::new();
     for raw in &p.entity_refs {
@@ -154,7 +154,7 @@ mod tests {
             &params,
             &ProviderContext::empty_for_tests(),
             &EdgeIndex::default(),
-            &PathCache::default(),
+            &mut PathCache::default(),
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();

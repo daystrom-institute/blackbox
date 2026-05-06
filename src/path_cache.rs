@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -32,12 +32,14 @@ pub enum PathDirection {
 pub struct CachedPath {
     pub id: String,
     pub steps: Vec<PathStep>,
+    pub accessed_at: u64,
 }
 
 #[derive(Default)]
 struct SessionPathCache {
     next_id: u64,
-    entries: VecDeque<CachedPath>,
+    access_clock: u64,
+    entries: Vec<CachedPath>,
 }
 
 pub struct PathCache {
@@ -68,28 +70,33 @@ impl PathCache {
         let mut cached = Vec::new();
         for steps in paths {
             session.next_id += 1;
+            session.access_clock += 1;
             let path = CachedPath {
                 id: format!("P{}", session.next_id),
                 steps,
+                accessed_at: session.access_clock,
             };
-            session.entries.push_back(path.clone());
+            session.entries.push(path.clone());
             cached.push(path);
         }
         while session.entries.len() > self.cache_size {
-            for _ in 0..EVICT_BATCH.min(session.entries.len()) {
-                session.entries.pop_front();
-            }
+            session.entries.sort_by_key(|path| path.accessed_at);
+            let evict_count = EVICT_BATCH.min(session.entries.len());
+            session.entries.drain(0..evict_count);
         }
         cached
     }
 
-    pub fn get(&self, session_key: &str, path_id: &str) -> Option<CachedPath> {
-        self.sessions
-            .get(session_key)?
+    pub fn get(&mut self, session_key: &str, path_id: &str) -> Option<CachedPath> {
+        let session = self.sessions.get_mut(session_key)?;
+        session.access_clock += 1;
+        let accessed_at = session.access_clock;
+        let path = session
             .entries
-            .iter()
-            .find(|path| path.id == path_id)
-            .cloned()
+            .iter_mut()
+            .find(|path| path.id == path_id)?;
+        path.accessed_at = accessed_at;
+        Some(path.clone())
     }
 }
 
@@ -117,13 +124,17 @@ mod tests {
     }
 
     #[test]
-    fn path_cache_evicts_oldest_batch_on_overflow() {
+    fn path_cache_evicts_least_recently_used_batch_on_overflow() {
         let mut cache = PathCache::new(100);
-        for i in 0..101 {
+        for i in 0..100 {
             cache.insert_paths(PROCESS_SESSION_KEY, vec![vec![step(i)]]);
         }
-        assert!(cache.get(PROCESS_SESSION_KEY, "P1").is_none());
-        assert!(cache.get(PROCESS_SESSION_KEY, "P31").is_some());
+        assert!(cache.get(PROCESS_SESSION_KEY, "P1").is_some());
+        cache.insert_paths(PROCESS_SESSION_KEY, vec![vec![step(101)]]);
+        assert!(cache.get(PROCESS_SESSION_KEY, "P1").is_some());
+        assert!(cache.get(PROCESS_SESSION_KEY, "P2").is_none());
+        assert!(cache.get(PROCESS_SESSION_KEY, "P31").is_none());
+        assert!(cache.get(PROCESS_SESSION_KEY, "P32").is_some());
         assert!(cache.get(PROCESS_SESSION_KEY, "P101").is_some());
     }
 }
