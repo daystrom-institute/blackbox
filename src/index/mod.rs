@@ -61,6 +61,7 @@ pub struct ReindexConfig {
     pub roots: Vec<(String, PathBuf)>,
     pub codex_root: Option<PathBuf>,
     pub meta_path: PathBuf,
+    pub projects_path: PathBuf,
 }
 
 pub struct TranscriptIndex {
@@ -83,6 +84,7 @@ impl TranscriptIndex {
         index_path: &Path,
         roots: Vec<(String, PathBuf)>,
         codex_root: Option<PathBuf>,
+        projects_path: PathBuf,
     ) -> Result<Self> {
         reset_index_on_schema_mismatch(index_path)?;
         let meta_path = index_path.join("_meta.json");
@@ -113,6 +115,7 @@ impl TranscriptIndex {
             roots,
             codex_root,
             meta_path,
+            projects_path,
         };
 
         Ok(Self {
@@ -215,7 +218,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index_path = dir.path().join("index");
 
-        let _index = TranscriptIndex::open_or_create(&index_path, Vec::new(), None).unwrap();
+        let _index = TranscriptIndex::open_or_create(
+            &index_path,
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+        )
+        .unwrap();
 
         let marker = fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)).unwrap();
         assert_eq!(marker.trim(), INDEX_SCHEMA_VERSION);
@@ -229,7 +238,13 @@ mod tests {
         fs::write(index_path.join(SCHEMA_VERSION_FILE), "old-schema\n").unwrap();
         fs::write(index_path.join("stale-file"), "stale").unwrap();
 
-        let _index = TranscriptIndex::open_or_create(&index_path, Vec::new(), None).unwrap();
+        let _index = TranscriptIndex::open_or_create(
+            &index_path,
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+        )
+        .unwrap();
 
         assert!(!index_path.join("stale-file").exists());
         let marker = fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)).unwrap();

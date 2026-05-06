@@ -422,7 +422,7 @@ fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     }
 }
 
-fn git_root_for_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn git_root_for_path(path: &Path) -> Option<PathBuf> {
     let output = git_output(
         path,
         &["rev-parse", "--show-toplevel"],

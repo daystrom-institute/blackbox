@@ -10,7 +10,7 @@ use tantivy::{Index, IndexWriter, TantivyDocument};
 use walkdir::WalkDir;
 
 use super::helpers::*;
-use super::{build_schema, FieldHandles, FileMeta, ReindexConfig};
+use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::entity_ref;
 use crate::parser;
 
@@ -147,6 +147,10 @@ fn try_background_reindex(
     config: &ReindexConfig,
     fields: FieldHandles,
 ) -> Result<()> {
+    let project_count =
+        crate::projects::ProjectRegistry::load_records(&config.projects_path)?.len();
+    tracing::debug!(project_count, "auto-reindex: loaded registered projects");
+
     // 1. Speculative scan — cheap, no writer allocation
     if !needs_reindex(config) {
         tracing::debug!("auto-reindex: no changes detected");
@@ -648,7 +652,7 @@ mod tests {
 
     #[test]
     fn transcript_docs_include_doc_type_and_parser_version() {
-        let (_schema, fields) = build_schema();
+        let (_schema, fields) = crate::index::build_schema();
         let event = ParsedEvent {
             role: MessageRole::User,
             content: "schema migration smoke".to_string(),

@@ -15,6 +15,7 @@ mod packets;
 mod parser;
 mod pins;
 mod pollers;
+mod projects;
 mod query;
 mod render;
 mod routing;
@@ -58,6 +59,7 @@ use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
 use packets::{Packets, ScannerConfig};
 use pins::{AmbientPinQuery, PinParams, Pins};
+use projects::{ProjectListResponse, ProjectRegisterParams, ProjectRegistry};
 use threads::Threads;
 
 // ---------------------------------------------------------------------------
@@ -70,6 +72,7 @@ struct SharedState {
     threads: RwLock<Threads>,
     notes: RwLock<Notes>,
     pins: RwLock<Pins>,
+    projects: RwLock<ProjectRegistry>,
     packets: RwLock<Packets>,
     artifacts: RwLock<artifacts::ArtifactCatalog>,
     task_store: Arc<RwLock<TaskStore>>,
@@ -730,6 +733,33 @@ impl BlackboxServer {
     )]
     fn bbox_stats(&self) -> CallToolResult {
         Self::run("bbox_stats", || self.state.idx.read().stats())
+    }
+
+    #[tool(
+        name = "bbox_project_register",
+        description = "Register a project directory for agentic-corpus indexing."
+    )]
+    fn bbox_project_register(
+        &self,
+        Parameters(p): Parameters<ProjectRegisterParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_project_register", || {
+            let record = self.state.projects.write().register_path(&p.path)?;
+            Ok(serde_json::to_string_pretty(&record)?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_project_list",
+        description = "List registered project roots."
+    )]
+    fn bbox_project_list(&self) -> CallToolResult {
+        Self::ok_json(
+            &serde_json::to_value(ProjectListResponse {
+                projects: self.state.projects.read().list(),
+            })
+            .unwrap_or_default(),
+        )
     }
 
     #[tool(
@@ -7119,7 +7149,11 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("Index path: {}", index_path.display());
 
-    let idx = TranscriptIndex::open_or_create(&index_path, roots, codex_root)?;
+    let projects_path = util::blackbox_projects_path(&home);
+    let idx =
+        TranscriptIndex::open_or_create(&index_path, roots, codex_root, projects_path.clone())?;
+    let projects_store = ProjectRegistry::open(&projects_path)?;
+    tracing::info!("Project registry: {}", projects_path.display());
 
     let kb_path = util::blackbox_knowledge_path(&home);
     let mut kb = Knowledge::open(&kb_path)?;
@@ -7230,6 +7264,7 @@ async fn main() -> anyhow::Result<()> {
         threads: RwLock::new(th),
         notes: RwLock::new(notes_store),
         pins: RwLock::new(pins_store),
+        projects: RwLock::new(projects_store),
         packets: RwLock::new(packets_store),
         artifacts: RwLock::new(artifacts_store),
         task_store: Arc::new(RwLock::new(task_store)),
@@ -7555,12 +7590,18 @@ mod tests {
     use super::*;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
-        let index =
-            TranscriptIndex::open_or_create(&tmp.path().join("index"), Vec::new(), None).unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &tmp.path().join("index"),
+            Vec::new(),
+            None,
+            tmp.path().join("projects.json"),
+        )
+        .unwrap();
         let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
         let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
         let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
         let pins = Pins::open(&tmp.path().join("pins.json")).unwrap();
+        let projects = ProjectRegistry::open(tmp.path().join("projects.json")).unwrap();
         let packets = Packets::open(tmp.path()).unwrap();
         let artifacts = artifacts::ArtifactCatalog::open(tmp.path().join("artifacts")).unwrap();
         let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
@@ -7570,6 +7611,7 @@ mod tests {
             threads: RwLock::new(threads),
             notes: RwLock::new(notes),
             pins: RwLock::new(pins),
+            projects: RwLock::new(projects),
             packets: RwLock::new(packets),
             artifacts: RwLock::new(artifacts),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
@@ -7672,6 +7714,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn bbox_project_list_round_trips_through_tool_serialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let server = test_server(&tmp);
+
+        let register = server.bbox_project_register(Parameters(ProjectRegisterParams {
+            path: project.to_string_lossy().into_owned(),
+        }));
+        assert_ne!(register.is_error, Some(true));
+
+        let listed = server.bbox_project_list();
+        assert_ne!(listed.is_error, Some(true));
+        let wire = serde_json::to_value(&listed).unwrap();
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        let response: ProjectListResponse = serde_json::from_str(text).unwrap();
+
+        assert_eq!(response.projects.len(), 1);
+        assert_eq!(
+            response.projects[0].project_id,
+            entity_ref::project_id_for_path(&project).unwrap()
+        );
     }
 
     #[test]

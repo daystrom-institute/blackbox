@@ -65,6 +65,11 @@ pub fn blackbox_pins_path(home: &Path) -> PathBuf {
         .unwrap_or_else(|| blackbox_state_dir(home).join("blackbox-pins.json"))
 }
 
+pub fn blackbox_projects_path(home: &Path) -> PathBuf {
+    env_path("BLACKBOX_PROJECTS_PATH")
+        .unwrap_or_else(|| blackbox_state_dir(home).join("projects.json"))
+}
+
 /// Rule-packets live as one-file-per-packet under a directory rather than
 /// a single merged JSON. Each packet can be substantial (rank tables,
 /// rule trees, provenance arrays) and the per-scope layout makes

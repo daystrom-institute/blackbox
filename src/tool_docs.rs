@@ -20,6 +20,7 @@ pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCategory {
     Transcripts,
+    Projects,
     Knowledge,
     Threads,
     Notes,
@@ -36,6 +37,7 @@ impl ToolCategory {
     fn heading(&self) -> &'static str {
         match self {
             Self::Transcripts => "Transcripts",
+            Self::Projects => "Projects",
             Self::Knowledge => "Knowledge",
             Self::Threads => "Threads",
             Self::Notes => "Side-channel notes",
@@ -53,6 +55,9 @@ impl ToolCategory {
         match self {
             Self::Transcripts => {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
+            }
+            Self::Projects => {
+                "Register project roots for later file indexing."
             }
             Self::Knowledge => {
                 "Memory has four lanes: `bbox_learn` for standing rendered rules, `bbox_remember` for cold indexed recall, `bbox_decide` for durable commitments with rationale, and `bbox_pin` for persisted but scope-limited ambient context on an active session/bro/thread/work-item. Render pipeline emits provider-specific markdown files (CLAUDE.md / AGENTS.md / GEMINI.md) only for the standing lanes."
@@ -170,6 +175,21 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Transcripts,
         summary: "Corpus statistics (doc count, index size, file counts).",
         when_to_use: "Sanity-check the index; diagnose 'did my new sessions get indexed?'.",
+        example: None,
+    },
+    // ── Projects ─────────────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_project_register",
+        category: ToolCategory::Projects,
+        summary: "Register a project directory for agentic-corpus indexing.",
+        when_to_use: "Use before S2+ needs a repo root. Symlink aliases collapse to one `project_id`; git repos also get `repo_id`.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_project_list",
+        category: ToolCategory::Projects,
+        summary: "List registered project roots.",
+        when_to_use: "Use to inspect registered roots or confirm symlink aliases collapsed.",
         example: None,
     },
     // ── Knowledge ────────────────────────────────────────────────────
@@ -854,6 +874,7 @@ pub fn render_markdown() -> String {
 
     let categories = [
         ToolCategory::Transcripts,
+        ToolCategory::Projects,
         ToolCategory::Knowledge,
         ToolCategory::Threads,
         ToolCategory::Notes,
