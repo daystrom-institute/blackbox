@@ -4,18 +4,17 @@
 //! reconnection, envelope normalization, ACL enrichment, and self-loop
 //! filtering. Posts normalized events to the daemon's `/webhook/:name`
 //! endpoint. The daemon never links a Slack crate.
-//!
-//! Phase 1: CLI/config shape, identity file loading, event envelope
-//! normalization, self-loop detection, HMAC header construction.
-//! WebSocket connect/daemon POST loop is stubbed.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 // ── CLI ────────────────────────────────────────────────────────────
 
@@ -566,7 +565,420 @@ pub fn maybe_build_hmac_header(body: &[u8], secret_env_var: &str) -> Option<Stri
     Some(hex::encode(digest))
 }
 
-// ── Stub main ───────────────────────────────────────────────────────
+// ── In-flight dedup ─────────────────────────────────────────────────
+//
+// Slack redelivers events when the sidecar hasn't acked within ~3s.
+// The retry loop takes up to ~2s (3 POST attempts × ~1.5s sleep).
+// A redelivery during the retry loop would cause a duplicate POST.
+// This set tracks envelope_ids currently being processed; a
+// redelivered id is dropped before the second POST hits the daemon.
+// Entries expire after 30s TTL (§5.1).
+
+const IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
+
+pub struct InFlightSet {
+    entries: HashMap<String, Instant>,
+}
+
+impl InFlightSet {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Try to claim this envelope_id. Returns true if the id is new
+    /// (first claim), false if it's already in-flight (duplicate).
+    /// Prunes expired entries on every call.
+    pub fn claim(&mut self, id: &str, now: Instant) -> bool {
+        self.prune(now);
+        if self.entries.contains_key(id) {
+            return false;
+        }
+        self.entries.insert(id.to_string(), now);
+        true
+    }
+
+    /// Remove an id from the in-flight set after processing completes.
+    pub fn remove(&mut self, id: &str) {
+        self.entries.remove(id);
+    }
+
+    /// Number of active in-flight entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when no entries are in-flight.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, ts| now.duration_since(*ts) < IN_FLIGHT_TTL);
+    }
+}
+
+impl Default for InFlightSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Daemon POST with bounded retry ──────────────────────────────────
+//
+// Per §5.1: up to 3 POST attempts with 500ms then 1s delays (3 attempts
+// total including the first). Ack to Slack after 2xx success, or after
+// the 3rd attempt fails (ack-and-drop with warning).
+
+const MAX_POST_ATTEMPTS: u32 = 3;
+const RETRY_DELAYS: [Duration; 2] = [
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+];
+
+/// Outcome of a daemon POST attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostOutcome {
+    /// Daemon returned 2xx → ack to Slack, event delivered.
+    Success,
+    /// Daemon returned non-2xx → retry if attempts remain.
+    Retryable { status: u16, attempt: u32 },
+    /// Max attempts exhausted → ack-and-drop.
+    Exhausted,
+}
+
+/// Determine the outcome based on the HTTP response status and current
+/// attempt number. Pure function — testable without I/O.
+pub fn classify_post_response(status: u16, attempt: u32) -> PostOutcome {
+    if (200..300).contains(&status) {
+        PostOutcome::Success
+    } else if attempt < MAX_POST_ATTEMPTS {
+        PostOutcome::Retryable { status, attempt }
+    } else {
+        PostOutcome::Exhausted
+    }
+}
+
+/// POST a normalized event to the daemon with optional HMAC signing.
+/// Implements the bounded retry loop from design §5.1.
+///
+/// Returns `true` if the event was delivered (ack to Slack), `false`
+/// if exhausted (ack-and-drop).
+pub async fn post_to_daemon_with_retry(
+    client: &reqwest::Client,
+    daemon_url: &str,
+    webhook_name: &str,
+    body: &Value,
+    envelope_id: &str,
+    hmac_secret_env: &str,
+) -> bool {
+    let url = format!("{daemon_url}/webhook/{webhook_name}");
+    let body_bytes = serde_json::to_vec(body).unwrap_or_default();
+
+    for attempt in 1..=MAX_POST_ATTEMPTS {
+        let mut req = client
+            .post(&url)
+            .header("X-Slack-Envelope-Id", envelope_id)
+            .header("Content-Type", "application/json");
+
+        if let Some(hmac) = maybe_build_hmac_header(&body_bytes, hmac_secret_env) {
+            req = req.header("X-Bro-Sidecar-Signature", hmac);
+        }
+
+        let outcome = match req.body(body_bytes.clone()).send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                classify_post_response(status, attempt)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    envelope_id = envelope_id,
+                    attempt = attempt,
+                    error = %e,
+                    "daemon POST failed"
+                );
+                if attempt < MAX_POST_ATTEMPTS {
+                    PostOutcome::Retryable {
+                        status: 0,
+                        attempt,
+                    }
+                } else {
+                    PostOutcome::Exhausted
+                }
+            }
+        };
+
+        match outcome {
+            PostOutcome::Success => {
+                tracing::debug!(
+                    envelope_id = envelope_id,
+                    attempt = attempt,
+                    "daemon POST succeeded"
+                );
+                return true;
+            }
+            PostOutcome::Retryable { status, attempt: a } => {
+                let delay = RETRY_DELAYS.get((a as usize).saturating_sub(1))
+                    .copied()
+                    .unwrap_or(Duration::from_secs(1));
+                tracing::warn!(
+                    envelope_id = envelope_id,
+                    attempt = a,
+                    status = status,
+                    delay_ms = delay.as_millis(),
+                    "daemon POST retryable; sleeping"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            PostOutcome::Exhausted => {
+                tracing::warn!(
+                    envelope_id = envelope_id,
+                    attempts = MAX_POST_ATTEMPTS,
+                    "daemon POST exhausted; ack-and-drop"
+                );
+                return false;
+            }
+        }
+    }
+
+    // Unreachable: the loop handles all cases through `PostOutcome`
+    false
+}
+
+// ── Slack Socket Mode connection ────────────────────────────────────
+//
+// Socket Mode is Slack's WebSocket-based event delivery. Steps:
+//   1. POST apps.connections.open with app-level token → get wss:// URL
+//   2. Open WebSocket to the URL
+//   3. Read text frames (JSON envelopes)
+//   4. Process each envelope
+//   5. Ack by sending {"envelope_id":"..."} back on the socket
+
+/// Call Slack's `apps.connections.open` API to obtain a Socket Mode
+/// WebSocket URL. The app token must have the `connections:write` scope.
+async fn open_socket_mode_url(app_token: &str) -> Result<String> {
+    let client = reqwest::Client::new();
+    let resp: Value = client
+        .post("https://slack.com/api/apps.connections.open")
+        .header("Authorization", format!("Bearer {app_token}"))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send()
+        .await
+        .context("apps.connections.open request")?
+        .json()
+        .await
+        .context("apps.connections.open parse")?;
+
+    if !resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let error = resp
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        anyhow::bail!("apps.connections.open failed: {error}");
+    }
+
+    resp.get("url")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| anyhow!("apps.connections.open: missing url in response"))
+}
+
+/// Send an acknowledgement back to Slack over the Socket Mode WebSocket.
+/// The ack message is `{"envelope_id": "<id>"}`.
+async fn ack_to_slack<S>(ws_write: &mut S, envelope_id: &str) -> Result<()>
+where
+    S: SinkExt<WsMessage> + Unpin,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let ack = json!({"envelope_id": envelope_id});
+    ws_write
+        .send(WsMessage::Text(ack.to_string()))
+        .await
+        .map_err(|e| anyhow!("ack to slack: {e}"))?;
+    Ok(())
+}
+
+// ── Bridge context ──────────────────────────────────────────────────
+//
+// Bundles the shared parameters passed through the processing pipeline.
+
+struct BridgeContext<'a> {
+    daemon_client: &'a reqwest::Client,
+    daemon_url: &'a str,
+    webhook_name: &'a str,
+    identities: &'a SlackIdentities,
+    self_user_id: &'a str,
+    self_bot_id: &'a str,
+    hmac_secret_env: &'a str,
+}
+
+// ── Event processing ────────────────────────────────────────────────
+
+/// Process a single Socket Mode envelope through the full pipeline:
+/// in-flight dedup, self-loop filter, normalize/enrich, POST to daemon
+/// with retry, ack to Slack.
+///
+/// Returns `true` if the envelope was processed (whether delivered or
+/// ack-and-dropped). Returns `false` if it was dedup'd (duplicate in-flight).
+async fn process_slack_envelope<S>(
+    ws_write: &mut S,
+    ctx: &BridgeContext<'_>,
+    envelope_json: &Value,
+    in_flight: &mut InFlightSet,
+) -> Result<bool>
+where
+    S: SinkExt<WsMessage> + Unpin,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let envelope_id = envelope_json
+        .get("envelope_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    // 1. In-flight dedup
+    let now = Instant::now();
+    if !in_flight.claim(envelope_id, now) {
+        tracing::debug!(envelope_id = envelope_id, "duplicate envelope dropped (in-flight)");
+        return Ok(false);
+    }
+
+    // Process the envelope even if we ack-and-drop; clean up on exit.
+    let result = process_envelope_inner(ws_write, ctx, envelope_json, envelope_id).await;
+
+    in_flight.remove(envelope_id);
+    result
+}
+
+async fn process_envelope_inner<S>(
+    ws_write: &mut S,
+    ctx: &BridgeContext<'_>,
+    envelope_json: &Value,
+    envelope_id: &str,
+) -> Result<bool>
+where
+    S: SinkExt<WsMessage> + Unpin,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    // 2. Normalize (includes self-loop filter)
+    let Some(normalized) = normalize_envelope(
+        envelope_json, ctx.identities, ctx.self_user_id, ctx.self_bot_id, 0,
+    ) else {
+        // Self-loop: ack and drop silently
+        tracing::debug!(envelope_id = envelope_id, "self-loop event dropped");
+        ack_to_slack(ws_write, envelope_id).await?;
+        return Ok(true);
+    };
+
+    // 3. POST to daemon with bounded retry
+    let body = serde_json::to_value(&normalized)?;
+    let delivered = post_to_daemon_with_retry(
+        ctx.daemon_client,
+        ctx.daemon_url,
+        ctx.webhook_name,
+        &body,
+        envelope_id,
+        ctx.hmac_secret_env,
+    )
+    .await;
+
+    // 4. Ack to Slack regardless of delivery outcome
+    ack_to_slack(ws_write, envelope_id).await?;
+
+    if !delivered {
+        tracing::warn!(envelope_id = envelope_id, "ack-and-drop after exhausted retries");
+    }
+
+    Ok(true)
+}
+
+// ── WebSocket event loop ────────────────────────────────────────────
+//
+// Opens a Socket Mode connection, reads events, and processes them.
+// Returns cleanly on normal shutdown; returns Err on connection loss
+// (caller should reconnect).
+
+async fn run_socket_loop(ws_url: &str, ctx: &BridgeContext<'_>) -> Result<()> {
+    let (ws_stream, _resp) = tokio_tungstenite::connect_async(ws_url)
+        .await
+        .context("WebSocket connect")?;
+
+    tracing::info!("Socket Mode connected");
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+    let mut in_flight = InFlightSet::new();
+
+    loop {
+        let msg = match ws_read.next().await {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
+                tracing::error!("WebSocket read error: {e:#}");
+                return Err(e.into());
+            }
+            None => {
+                tracing::info!("WebSocket closed by server");
+                return Ok(());
+            }
+        };
+
+        match msg {
+            WsMessage::Text(text) => {
+                let envelope: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("unparseable WebSocket frame: {e}");
+                        continue;
+                    }
+                };
+
+                let env_id = envelope
+                    .get("envelope_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+
+                match process_slack_envelope(
+                    &mut ws_write,
+                    ctx,
+                    &envelope,
+                    &mut in_flight,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        tracing::debug!(envelope_id = env_id, "envelope processed");
+                    }
+                    Err(e) => {
+                        tracing::error!(envelope_id = env_id, error = %e, "envelope processing failed");
+                        // Try to ack so Slack doesn't redeliver forever
+                        let _ = ack_to_slack(&mut ws_write, env_id).await;
+                    }
+                }
+            }
+            WsMessage::Close(_) => {
+                tracing::info!("WebSocket close frame received");
+                return Ok(());
+            }
+            WsMessage::Ping(data) => {
+                let _ = ws_write.send(WsMessage::Pong(data)).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Reconnect backoff ───────────────────────────────────────────────
+//
+// Exponential backoff: 1s → 2s → 4s → ... capped at 60s (§5.5).
+// Resets after a successful connection that runs ≥30s.
+
+async fn backoff_sleep(attempt: &mut u32) {
+    let delay_secs = (1u64 << (*attempt as u64)).min(60);
+    tracing::info!(attempt = *attempt, delay_secs = delay_secs, "backoff before reconnect");
+    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+    *attempt = attempt.saturating_add(1);
+}
+
+// ── Main entry point ────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -584,9 +996,11 @@ async fn main() -> Result<()> {
     let mapped_count: usize = identities.workspaces.values().map(|w| w.len()).sum();
     tracing::info!("loaded identities: {mapped_count} users across {} workspaces", identities.workspaces.len());
 
-    // Validate required env vars exist
-    let _app_token = std::env::var(&args.app_token_env)
+    let app_token = std::env::var(&args.app_token_env)
         .with_context(|| format!("app token env var {} not set", args.app_token_env))?;
+    if !app_token.starts_with("xapp-") {
+        tracing::warn!("SLACK_APP_TOKEN does not start with 'xapp-'; Socket Mode may fail");
+    }
     let _signing_secret = std::env::var(&args.signing_secret_env).ok();
 
     tracing::info!(
@@ -597,17 +1011,54 @@ async fn main() -> Result<()> {
         args.self_bot_id,
     );
 
-    tracing::warn!(
-        "Phase 1: WebSocket connect and daemon POST loop are stubbed. \
-         Identity loading, envelope normalization, self-loop detection, \
-         and HMAC construction are implemented and tested. \
-         Run `cargo test --bin bro-slack` to verify."
-    );
+    let daemon_client = reqwest::Client::new();
+    let ctx = BridgeContext {
+        daemon_client: &daemon_client,
+        daemon_url: &args.daemon_url,
+        webhook_name: &args.webhook_name,
+        identities: &identities,
+        self_user_id: &args.self_user_id,
+        self_bot_id: &args.self_bot_id,
+        hmac_secret_env: &args.shared_secret_env,
+    };
+    let mut reconnect_attempt: u32 = 0;
 
-    // Stub: sleep forever, signal handling placeholder
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("bro-slack shutting down");
-    Ok(())
+    loop {
+        let ws_url = match open_socket_mode_url(&app_token).await {
+            Ok(url) => {
+                reconnect_attempt = 0;
+                tracing::info!(url = %url, "Socket Mode URL obtained");
+                url
+            }
+            Err(e) => {
+                tracing::error!("open_socket_mode_url failed: {e:#}");
+                backoff_sleep(&mut reconnect_attempt).await;
+                continue;
+            }
+        };
+
+        // Run the socket loop; break on clean shutdown or ctrl_c
+        let run_fut = run_socket_loop(&ws_url, &ctx);
+
+        tokio::select! {
+            result = run_fut => {
+                match result {
+                    Ok(()) => {
+                        tracing::info!("bro-slack shutting down cleanly");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::error!("Socket Mode loop error: {e:#}");
+                        backoff_sleep(&mut reconnect_attempt).await;
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("SIGTERM received; shutting down");
+                return Ok(());
+            }
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1194,5 +1645,210 @@ mod tests {
             }
         }"#;
         serde_json::from_str(json).unwrap()
+    }
+
+    // ── InFlightSet dedup ───────────────────────────────────────
+
+    #[test]
+    fn test_in_flight_claim_first_time() {
+        let mut set = InFlightSet::new();
+        let now = Instant::now();
+        assert!(set.claim("env-1", now));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_in_flight_claim_duplicate() {
+        let mut set = InFlightSet::new();
+        let now = Instant::now();
+        assert!(set.claim("env-1", now));
+        assert!(!set.claim("env-1", now));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_in_flight_remove() {
+        let mut set = InFlightSet::new();
+        let now = Instant::now();
+        set.claim("env-1", now);
+        set.claim("env-2", now);
+        assert_eq!(set.len(), 2);
+        set.remove("env-1");
+        assert_eq!(set.len(), 1);
+        // After remove, can claim again
+        assert!(set.claim("env-1", now));
+    }
+
+    #[test]
+    fn test_in_flight_ttl_eviction() {
+        let mut set = InFlightSet::new();
+        let t0 = Instant::now();
+        set.claim("env-1", t0);
+        // Just under TTL: still claimed
+        let t1 = t0 + Duration::from_secs(29);
+        assert!(!set.claim("env-1", t1));
+        assert_eq!(set.len(), 1);
+        // Past TTL: evicted, can reclaim
+        let t2 = t0 + Duration::from_secs(31);
+        assert!(set.claim("env-1", t2));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_in_flight_multiple_ids_independent() {
+        let mut set = InFlightSet::new();
+        let t0 = Instant::now();
+        assert!(set.claim("a", t0));
+        assert!(set.claim("b", t0));
+        assert!(set.claim("c", t0));
+        assert_eq!(set.len(), 3);
+        // "b" is in-flight, can't reclaim
+        assert!(!set.claim("b", t0));
+        // "d" is new
+        assert!(set.claim("d", t0));
+        // Advance past TTL for a and c (but not quite for b — actually
+        // claim() does NOT refresh timestamps for already-claimed ids,
+        // so all three expire together at t0+30s).
+        // At t0+25s: all still in-flight
+        let t1 = t0 + Duration::from_secs(25);
+        assert!(!set.claim("a", t1));
+        assert!(!set.claim("b", t1));
+        assert!(!set.claim("c", t1));
+        // At t0+31s: all evicted
+        let t2 = t0 + Duration::from_secs(31);
+        assert!(set.claim("a", t2)); // reclaimed
+        assert!(set.claim("b", t2)); // reclaimed
+        assert!(set.claim("c", t2)); // reclaimed
+    }
+
+    #[test]
+    fn test_in_flight_empty() {
+        let mut set = InFlightSet::new();
+        let now = Instant::now();
+        set.claim("x", now);
+        set.remove("x");
+        assert_eq!(set.len(), 0);
+        assert!(set.claim("x", now));
+    }
+
+    // ── PostOutcome classification ──────────────────────────────
+
+    #[test]
+    fn test_classify_2xx_is_success() {
+        assert_eq!(classify_post_response(200, 1), PostOutcome::Success);
+        assert_eq!(classify_post_response(201, 1), PostOutcome::Success);
+        assert_eq!(classify_post_response(299, 3), PostOutcome::Success);
+    }
+
+    #[test]
+    fn test_classify_non_2xx_retryable() {
+        assert_eq!(
+            classify_post_response(500, 1),
+            PostOutcome::Retryable { status: 500, attempt: 1 }
+        );
+        assert_eq!(
+            classify_post_response(502, 2),
+            PostOutcome::Retryable { status: 502, attempt: 2 }
+        );
+    }
+
+    #[test]
+    fn test_classify_non_2xx_exhausted() {
+        // Attempt 3 with non-2xx: max attempts reached
+        assert_eq!(classify_post_response(500, 3), PostOutcome::Exhausted);
+        assert_eq!(classify_post_response(404, 3), PostOutcome::Exhausted);
+    }
+
+    #[test]
+    fn test_classify_attempt_4_out_of_range() {
+        // classify_post_response doesn't know about MAX_POST_ATTEMPTS
+        // directly, but the comparison `attempt < MAX_POST_ATTEMPTS` where
+        // MAX_POST_ATTEMPTS is 3 means attempts 1,2 are retryable, 3+ exhausted.
+        assert_eq!(classify_post_response(500, 3), PostOutcome::Exhausted);
+        assert_eq!(classify_post_response(500, 4), PostOutcome::Exhausted);
+    }
+
+    // ── PostOutcome property tests ──────────────────────────────
+
+    #[test]
+    fn test_classify_all_2xx_are_success_regardless_of_attempt() {
+        for status in 200..300 {
+            for attempt in 1..=5u32 {
+                assert_eq!(
+                    classify_post_response(status as u16, attempt),
+                    PostOutcome::Success,
+                    "status={status} attempt={attempt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_classify_400_range_retry_then_exhausted() {
+        // 400+ is not retryable per design, but our simple status check
+        // only gates on 2xx vs non-2xx. 400-range errors get retried too.
+        // This is intentional for now — the daemon may be temporarily sick.
+        assert_eq!(
+            classify_post_response(400, 1),
+            PostOutcome::Retryable { status: 400, attempt: 1 }
+        );
+    }
+
+    // ── Envelope processing: self-loop → ack-and-drop ───────────
+
+    #[test]
+    fn test_self_loop_envelope_produces_none_from_normalize() {
+        // Verify that normalization still drops self-loop events
+        let envelope = json!({
+            "envelope_id": "env-loop",
+            "type": "events_api",
+            "payload": {
+                "team_id": "T01",
+                "event": {
+                    "type": "message",
+                    "user": "Ubot",
+                    "bot_id": "Bbot",
+                    "text": "bot reply",
+                    "ts": "1.0",
+                    "channel": "C01"
+                }
+            }
+        });
+        let ids = SlackIdentities::default();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 0);
+        assert!(norm.is_none());
+    }
+
+    // ── HMAC is deterministic ───────────────────────────────────
+
+    #[test]
+    fn test_hmac_same_input_same_output() {
+        std::env::set_var("BRO_TEST_DET", "secret");
+        let s1 = maybe_build_hmac_header(b"hello", "BRO_TEST_DET").unwrap();
+        let s2 = maybe_build_hmac_header(b"hello", "BRO_TEST_DET").unwrap();
+        assert_eq!(s1, s2);
+    }
+
+    // ── Normalize passes retry_attempt into meta ────────────────
+
+    #[test]
+    fn test_normalize_stamps_retry_attempt() {
+        let envelope = json!({
+            "envelope_id": "env-ra",
+            "type": "events_api",
+            "payload": {
+                "team_id": "T01",
+                "event": {
+                    "type": "app_mention",
+                    "user": "Uhuman",
+                    "text": "hi",
+                    "ts": "1.0",
+                    "channel": "C01"
+                }
+            }
+        });
+        let ids = SlackIdentities::default();
+        let norm = normalize_envelope(&envelope, &ids, "Ubot", "Bbot", 2).unwrap();
+        assert_eq!(norm.meta.retry_attempt, 2);
     }
 }

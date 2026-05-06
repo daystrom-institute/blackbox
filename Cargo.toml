@@ -112,6 +112,9 @@ tui-markdown = "0.3"
 # SSE stream construction
 async-stream = "0.3"
 
+# Slack Socket Mode WebSocket (bro-slack sidecar)
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
 # Process management (SIGTERM)
 libc = "0.2"
 
