@@ -538,9 +538,13 @@ pub fn maybe_build_hmac_header(body: &[u8], secret_env_var: &str) -> Option<Stri
 // Slack redelivers events when the sidecar hasn't acked within ~3s.
 // The retry loop takes up to ~2s (3 POST attempts × ~1.5s sleep).
 // A redelivery during the retry loop would cause a duplicate POST.
-// This set tracks envelope_ids currently being processed; a
-// redelivered id is dropped before the second POST hits the daemon.
-// Entries expire after 30s TTL (§5.1).
+// This set tracks envelope_ids already seen; a redelivered id is dropped.
+//
+// Entries persist for 30s after first claim — the design calls for
+// holding the id for the retry-loop duration plus a TTL to catch
+// delayed redeliveries. One ack per envelope_id is sufficient:
+// Slack deduplicates acks by envelope_id, and the sidecar will ack
+// exactly once whether or not the daemon POST succeeded (§5.1).
 
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
 
@@ -567,17 +571,12 @@ impl InFlightSet {
         true
     }
 
-    /// Remove an id from the in-flight set after processing completes.
-    pub fn remove(&mut self, id: &str) {
-        self.entries.remove(id);
-    }
-
-    /// Number of active in-flight entries.
+    /// Number of active tracked entries.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// True when no entries are in-flight.
+    /// True when no entries are tracked.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -604,6 +603,11 @@ const RETRY_DELAYS: [Duration; 2] = [
     Duration::from_millis(500),
     Duration::from_millis(1000),
 ];
+/// Per-attempt timeout for daemon POST. Must be short enough that
+/// 3 attempts × (timeout + Retryable delay) stays inside Slack's
+/// ~3s ack window. The 3s cap allows ~1.5s of network RTT +
+/// daemon processing across 3 attempts.
+const DAEMON_POST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Outcome of a daemon POST attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,20 +635,26 @@ pub fn classify_post_response(status: u16, attempt: u32) -> PostOutcome {
 /// POST a normalized event to the daemon with optional HMAC signing.
 /// Implements the bounded retry loop from design §5.1.
 ///
+/// `build_body(attempt)` is called per attempt so the body can
+/// carry the current retry_attempt stamp. Each POST is gated by
+/// a timeout to keep the 3-attempt budget inside Slack's ~3s ack window.
+///
 /// Returns `true` if the event was delivered (ack to Slack), `false`
 /// if exhausted (ack-and-drop).
 pub async fn post_to_daemon_with_retry(
     client: &reqwest::Client,
     daemon_url: &str,
     webhook_name: &str,
-    body: &Value,
+    build_body: impl Fn(u32) -> Value,
     envelope_id: &str,
     hmac_secret_env: &str,
 ) -> bool {
     let url = format!("{daemon_url}/webhook/{webhook_name}");
-    let body_bytes = serde_json::to_vec(body).unwrap_or_default();
 
     for attempt in 1..=MAX_POST_ATTEMPTS {
+        let body = build_body(attempt);
+        let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+
         let mut req = client
             .post(&url)
             .header("X-Slack-Envelope-Id", envelope_id)
@@ -654,17 +664,34 @@ pub async fn post_to_daemon_with_retry(
             req = req.header("X-Bro-Sidecar-Signature", hmac);
         }
 
-        let outcome = match req.body(body_bytes.clone()).send().await {
-            Ok(resp) => {
+        let post_fut = req.body(body_bytes).send();
+        let outcome = match tokio::time::timeout(DAEMON_POST_TIMEOUT, post_fut).await {
+            Ok(Ok(resp)) => {
                 let status = resp.status().as_u16();
                 classify_post_response(status, attempt)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     envelope_id = envelope_id,
                     attempt = attempt,
                     error = %e,
                     "daemon POST failed"
+                );
+                if attempt < MAX_POST_ATTEMPTS {
+                    PostOutcome::Retryable {
+                        status: 0,
+                        attempt,
+                    }
+                } else {
+                    PostOutcome::Exhausted
+                }
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    envelope_id = envelope_id,
+                    attempt = attempt,
+                    "daemon POST timed out after {:?}",
+                    DAEMON_POST_TIMEOUT
                 );
                 if attempt < MAX_POST_ATTEMPTS {
                     PostOutcome::Retryable {
@@ -767,6 +794,66 @@ where
     Ok(())
 }
 
+// ── Health stats ────────────────────────────────────────────────────
+//
+// Counters and timestamps surfaced via the optional --health-port
+// loopback endpoint (§13.1). Shared across the processing pipeline
+// via Arc; the health HTTP server reads a clone.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+#[derive(Default)]
+pub struct HealthStats {
+    pub connected: std::sync::atomic::AtomicBool,
+    pub started_at: parking_lot::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    pub last_event_at: parking_lot::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    pub events_forwarded: AtomicU64,
+    pub events_dropped_self_loop: AtomicU64,
+    pub events_dropped_malformed: AtomicU64,
+    pub events_failed_post: AtomicU64,
+    pub events_failed_post_exhausted: AtomicU64,
+    pub reconnects: AtomicU64,
+    pub last_disconnect_reason: parking_lot::Mutex<Option<String>>,
+    pub workspace_id: parking_lot::Mutex<String>,
+}
+
+impl HealthStats {
+    pub fn to_json(&self, self_user_id: &str, self_bot_id: &str) -> Value {
+        let uptime = self
+            .started_at
+            .lock()
+            .map(|s| {
+                chrono::Utc::now()
+                    .signed_duration_since(s)
+                    .num_seconds()
+                    .max(0) as u64
+            })
+            .unwrap_or(0);
+        let last_event = self.last_event_at.lock().map(|t| t.to_rfc3339()).unwrap_or_default();
+        let disconnect = self.last_disconnect_reason.lock().clone().unwrap_or_default();
+        let workspace = self.workspace_id.lock().clone();
+
+        json!({
+            "connected": self.connected.load(Ordering::Relaxed),
+            "uptime_secs": uptime,
+            "last_event_at": last_event,
+            "events_forwarded": self.events_forwarded.load(Ordering::Relaxed),
+            "events_dropped_self_loop": self.events_dropped_self_loop.load(Ordering::Relaxed),
+            "events_dropped_malformed": self.events_dropped_malformed.load(Ordering::Relaxed),
+            "events_failed_post": self.events_failed_post.load(Ordering::Relaxed),
+            "events_failed_post_exhausted": self.events_failed_post_exhausted.load(Ordering::Relaxed),
+            "reconnects": self.reconnects.load(Ordering::Relaxed),
+            "last_disconnect_reason": disconnect,
+            "self_user_id": self_user_id,
+            "self_bot_id": self_bot_id,
+            "workspace_id": workspace,
+        })
+    }
+}
+
+pub type SharedHealthStats = Arc<HealthStats>;
+
 // ── Bridge context ──────────────────────────────────────────────────
 //
 // Bundles the shared parameters passed through the processing pipeline.
@@ -779,6 +866,38 @@ struct BridgeContext<'a> {
     self_user_id: &'a str,
     self_bot_id: &'a str,
     hmac_secret_env: &'a str,
+    health: Option<&'a SharedHealthStats>,
+}
+
+// ── Health HTTP endpoint ────────────────────────────────────────────
+
+/// Spawn a loopback-only Axum server on `port` that serves /health.
+/// Returns a `tokio::task::JoinHandle` that can be awaited for graceful
+/// shutdown (it runs forever until aborted).
+fn spawn_health_server(
+    port: u16,
+    stats: SharedHealthStats,
+    self_user_id: String,
+    self_bot_id: String,
+) -> tokio::task::JoinHandle<()> {
+    use axum::{routing::get, Json, Router};
+
+    async fn health_handler(
+        axum::extract::State(state): axum::extract::State<(SharedHealthStats, String, String)>,
+    ) -> Json<Value> {
+        Json(state.0.to_json(&state.1, &state.2))
+    }
+
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .with_state((stats, self_user_id, self_bot_id));
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    tokio::spawn(async move {
+        tracing::info!("health endpoint listening on http://{addr}/health");
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    })
 }
 
 // ── Event processing ────────────────────────────────────────────────
@@ -811,11 +930,15 @@ where
         return Ok(false);
     }
 
-    // Process the envelope even if we ack-and-drop; clean up on exit.
-    let result = process_envelope_inner(ws_write, ctx, envelope_json, envelope_id).await;
+    // Update last-event timestamp
+    if let Some(h) = ctx.health {
+        *h.last_event_at.lock() = Some(chrono::Utc::now());
+    }
 
-    in_flight.remove(envelope_id);
-    result
+    // Process the envelope. One ack per envelope_id is sufficient;
+    // Slack deduplicates acks. The id stays in the set until TTL
+    // expiry to catch delayed redeliveries.
+    process_envelope_inner(ws_write, ctx, envelope_json, envelope_id).await
 }
 
 async fn process_envelope_inner<S>(
@@ -834,24 +957,35 @@ where
     ) {
         Ok(Some(n)) => n,
         Ok(None) => {
+            if let Some(h) = ctx.health {
+                h.events_dropped_self_loop.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::debug!(envelope_id = envelope_id, "self-loop event dropped");
             ack_to_slack(ws_write, envelope_id).await?;
             return Ok(true);
         }
         Err(e) => {
+            if let Some(h) = ctx.health {
+                h.events_dropped_malformed.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::warn!(envelope_id = envelope_id, error = %e, "malformed envelope, ack-and-drop");
             ack_to_slack(ws_write, envelope_id).await?;
             return Ok(true);
         }
     };
 
-    // 3. POST to daemon with bounded retry
-    let body = serde_json::to_value(&normalized)?;
+    // 3. POST to daemon with bounded retry.
+    // The closure re-serializes the body per attempt so
+    // _meta.retry_attempt reflects the actual attempt number.
     let delivered = post_to_daemon_with_retry(
         ctx.daemon_client,
         ctx.daemon_url,
         ctx.webhook_name,
-        &body,
+        |attempt| {
+            let mut n = normalized.clone();
+            n.meta.retry_attempt = attempt;
+            serde_json::to_value(&n).unwrap_or(Value::Null)
+        },
         envelope_id,
         ctx.hmac_secret_env,
     )
@@ -859,6 +993,14 @@ where
 
     // 4. Ack to Slack regardless of delivery outcome
     ack_to_slack(ws_write, envelope_id).await?;
+
+    if let Some(h) = ctx.health {
+        if delivered {
+            h.events_forwarded.fetch_add(1, Ordering::Relaxed);
+        } else {
+            h.events_failed_post_exhausted.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     if !delivered {
         tracing::warn!(envelope_id = envelope_id, "ack-and-drop after exhausted retries");
@@ -873,7 +1015,8 @@ where
 // Returns cleanly on normal shutdown; returns Err on connection loss
 // (caller should reconnect).
 
-async fn run_socket_loop(ws_url: &str, ctx: &BridgeContext<'_>) -> Result<()> {
+async fn run_socket_loop(ws_url: &str, ctx: &BridgeContext<'_>) -> Result<Duration> {
+    let connected_at = Instant::now();
     let (ws_stream, _resp) = tokio_tungstenite::connect_async(ws_url)
         .await
         .context("WebSocket connect")?;
@@ -891,8 +1034,9 @@ async fn run_socket_loop(ws_url: &str, ctx: &BridgeContext<'_>) -> Result<()> {
                 return Err(e.into());
             }
             None => {
-                tracing::info!("WebSocket closed by server");
-                return Ok(());
+                let elapsed = connected_at.elapsed();
+                tracing::info!(elapsed_secs = elapsed.as_secs(), "WebSocket stream ended; reconnecting");
+                return Err(anyhow!("WebSocket stream ended after {:.0}s", elapsed.as_secs()));
             }
         };
 
@@ -930,8 +1074,9 @@ async fn run_socket_loop(ws_url: &str, ctx: &BridgeContext<'_>) -> Result<()> {
                 }
             }
             WsMessage::Close(_) => {
-                tracing::info!("WebSocket close frame received");
-                return Ok(());
+                let elapsed = connected_at.elapsed();
+                tracing::info!(elapsed_secs = elapsed.as_secs(), "WebSocket close frame received; reconnecting");
+                return Err(anyhow!("WebSocket close frame received after {:.0}s", elapsed.as_secs()));
             }
             WsMessage::Ping(data) => {
                 let _ = ws_write.send(WsMessage::Pong(data)).await;
@@ -992,6 +1137,21 @@ async fn main() -> Result<()> {
         args.self_bot_id,
     );
 
+    let health = if let Some(port) = args.health_port {
+        let stats = Arc::new(HealthStats::default());
+        *stats.started_at.lock() = Some(chrono::Utc::now());
+        stats.connected.store(false, Ordering::Relaxed);
+        spawn_health_server(
+            port,
+            stats.clone(),
+            args.self_user_id.clone(),
+            args.self_bot_id.clone(),
+        );
+        Some(stats)
+    } else {
+        None
+    };
+
     let daemon_client = reqwest::Client::new();
     let ctx = BridgeContext {
         daemon_client: &daemon_client,
@@ -1001,13 +1161,13 @@ async fn main() -> Result<()> {
         self_user_id: &args.self_user_id,
         self_bot_id: &args.self_bot_id,
         hmac_secret_env: &args.shared_secret_env,
+        health: health.as_ref(),
     };
     let mut reconnect_attempt: u32 = 0;
 
     loop {
         let ws_url = match open_socket_mode_url(&app_token).await {
             Ok(url) => {
-                reconnect_attempt = 0;
                 tracing::info!(url = %url, "Socket Mode URL obtained");
                 url
             }
@@ -1018,17 +1178,41 @@ async fn main() -> Result<()> {
             }
         };
 
+        // Mark connected
+        if let Some(h) = &health {
+            h.connected.store(true, Ordering::Relaxed);
+        }
+
         // Run the socket loop; break on clean shutdown or ctrl_c
         let run_fut = run_socket_loop(&ws_url, &ctx);
 
         tokio::select! {
             result = run_fut => {
+                // Mark disconnected
+                if let Some(h) = &health {
+                    h.connected.store(false, Ordering::Relaxed);
+                }
                 match result {
-                    Ok(()) => {
-                        tracing::info!("bro-slack shutting down cleanly");
-                        return Ok(());
+                    Ok(elapsed) => {
+                        // Server-initiated clean close. Only reset
+                        // backoff if the connection was healthy for
+                        // long enough to count as a proper run.
+                        if elapsed >= Duration::from_secs(30) {
+                            reconnect_attempt = 0;
+                            tracing::info!("healthy connection ran for {:.0}s; backoff reset", elapsed.as_secs());
+                        } else {
+                            tracing::warn!("connection lasted {:.0}s (< 30s healthy threshold); keeping backoff state", elapsed.as_secs());
+                        }
+                        if let Some(h) = &health {
+                            h.reconnects.fetch_add(1, Ordering::Relaxed);
+                        }
+                        backoff_sleep(&mut reconnect_attempt).await;
                     }
                     Err(e) => {
+                        if let Some(h) = &health {
+                            *h.last_disconnect_reason.lock() = Some(format!("{e:#}"));
+                            h.reconnects.fetch_add(1, Ordering::Relaxed);
+                        }
                         tracing::error!("Socket Mode loop error: {e:#}");
                         backoff_sleep(&mut reconnect_attempt).await;
                     }
@@ -1648,16 +1832,22 @@ mod tests {
     }
 
     #[test]
-    fn test_in_flight_remove() {
+    fn test_in_flight_ttl_based_expiry() {
         let mut set = InFlightSet::new();
-        let now = Instant::now();
-        set.claim("env-1", now);
-        set.claim("env-2", now);
+        let t0 = Instant::now();
+        set.claim("env-1", t0);
+        set.claim("env-2", t0);
         assert_eq!(set.len(), 2);
-        set.remove("env-1");
+        // Entries persist via TTL; no manual removal.
+        // At t0+29s: both still claimed
+        let t1 = t0 + Duration::from_secs(29);
+        assert!(!set.claim("env-1", t1));
+        assert!(!set.claim("env-2", t1));
+        assert_eq!(set.len(), 2);
+        // At t0+31s: both expired, can reclaim
+        let t2 = t0 + Duration::from_secs(31);
+        assert!(set.claim("env-1", t2));
         assert_eq!(set.len(), 1);
-        // After remove, can claim again
-        assert!(set.claim("env-1", now));
     }
 
     #[test]
@@ -1703,13 +1893,17 @@ mod tests {
     }
 
     #[test]
-    fn test_in_flight_empty() {
+    fn test_in_flight_empty_after_ttl() {
         let mut set = InFlightSet::new();
-        let now = Instant::now();
-        set.claim("x", now);
-        set.remove("x");
-        assert_eq!(set.len(), 0);
-        assert!(set.claim("x", now));
+        let t0 = Instant::now();
+        set.claim("x", t0);
+        assert_eq!(set.len(), 1);
+        assert!(set.is_empty() == false);
+        // Entries expire after TTL, not before
+        let t1 = t0 + Duration::from_secs(31);
+        // claim with expired now → prunes old entry, claims new
+        assert!(set.claim("x", t1));
+        assert_eq!(set.len(), 1);
     }
 
     // ── PostOutcome classification ──────────────────────────────

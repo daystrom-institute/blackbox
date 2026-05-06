@@ -18,7 +18,11 @@ examples/slack/
 │   └── slack-bbox-command.json # /bbox slash command dispatch handler
 ├── scripts/
 │   └── install.sh              # compile + install artifacts via /admin/* endpoints
-└── README.md                   # this file
+├── manifest.yaml               # Slack app manifest template (v1 scopes)
+├── README.md                   # this file
+
+deploy/
+└── bro-slack.service           # systemd unit template
 ```
 
 ## Prerequisites
@@ -387,16 +391,84 @@ other webhook source:
 The sidecar logs to stderr in `tracing` JSON format. Cross-process
 correlation key is `envelope_id`.
 
+## Deployment
+
+### systemd unit
+
+A service template is at `deploy/bro-slack.service`. Install:
+
+```sh
+install -m 755 target/release/bro-slack ~/.local/bin/bro-slack
+cp deploy/bro-slack.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+```
+
+Create a drop-in for secrets (never commit these):
+
+```sh
+mkdir -p ~/.config/systemd/user/bro-slack.service.d
+cat > ~/.config/systemd/user/bro-slack.service.d/secrets.conf <<'EOF'
+[Service]
+Environment=SLACK_APP_TOKEN=xapp-1-your-app-token-here
+Environment=SLACK_SELF_USER_ID=U0BOTUSR0
+Environment=SLACK_SELF_BOT_ID=B0BOTBOT0
+Environment=BRO_SLACK_SHARED_SECRET=...same value in blackboxd env...
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now bro-slack.service
+```
+
+The service requires `blackbox.service` (Wants+After). Restart policy is
+`on-failure` with 3s delay; `bro-slack` handles its own reconnect backoff
+internally, so the systemd restart only fires on process crash.
+
+### app manifest
+
+A template Slack app manifest is at `examples/slack/manifest.yaml`.
+It covers v1 scopes (§9.2) and Socket Mode enablement. See comments
+in the file for install steps. You must review the scopes and event
+subscriptions before installing.
+
+### Health endpoint
+
+Run with `--health-port 7299` to expose a loopback-only `/health` endpoint:
+
+```sh
+curl http://127.0.0.1:7299/health | jq
+```
+
+Returns per §13.1:
+```json
+{
+  "connected": true,
+  "uptime_secs": 3712,
+  "last_event_at": "2026-05-05T12:34:50Z",
+  "events_forwarded": 1284,
+  "events_dropped_self_loop": 47,
+  "events_dropped_malformed": 3,
+  "events_failed_post": 2,
+  "events_failed_post_exhausted": 0,
+  "reconnects": 1,
+  "last_disconnect_reason": "",
+  "self_user_id": "U0BOTUSR0",
+  "self_bot_id": "B0BOTBOT0",
+  "workspace_id": "T01234567"
+}
+```
+
 ## Known limitations (v1)
 
-- **No persistent buffer.** Daemon down past 3-retry budget → events dropped.
-- **No start_arc idempotency.** Two app_mentions on the same thread before the
-  arc registers a Wait → duplicate arcs race.
-- **Reactions on mid-thread messages.** `item.ts != thread_ts` → correlation
-  misses. Only bot-posted parent messages can serve as reaction targets.
-- **No outbound 429 handling.** Workflow nodes that hit Slack rate limits fail
-  the node; no automatic retry-after-aware backoff.
-- **No modal flows or App Home.** v1.5 surface.
+| Limitation | Impact | Mitigation |
+|---|---|---|
+| **No persistent buffer** | Daemon down past 3-retry budget → events dropped. Sidecar ack-and-drops with warning log. | Restart daemon promptly. Systemd `After=blackbox.service` ensures daemon starts first. |
+| **No `start_arc` idempotency** | Two `app_mention` events on the same thread before the first arc registers a Wait → duplicate arcs race. `bbox_pin` is not atomic. | v1.5: daemon-side `start_arc` idempotency keyed on `(workflow, correlate)`. |
+| **Reaction on mid-thread messages** | `reaction_added.item.ts != thread_ts` when a reaction lands on a reply instead of the parent → correlation misses. | Constrain UX to react on the bot's parent message. v1.5: sidecar enriches `parent_thread_ts` via `conversations.replies`. |
+| **No outbound 429 handling** | Workflow `http_json` nodes hitting Slack rate limits fail the node; `on_failure: warn` drops the post, `on_failure: halt` terminates the arc. No `retry-after` awareness. | v1.5: expose response headers in `HttpFetchResult` or add Slack-aware retry hook. |
+| **In-memory `WaitStore`** | Daemon restart loses every suspended arc. Slack events arriving while the arc is gone correlate to nothing. | v1.5: disk-backed `WaitStore` (daemon-wide, not Slack-specific). |
+| **No Phase II ingestion / entity refs** | `file_shared`, channel history, permalink-anchored provenance, Slack entity types in agentic-corpus — all out of scope. | Phase II. |
+| **No modal flows or App Home** | Rejection rationale capture via `views.open`/`view_submission`, personal inbox dashboard via `views.publish` — v1.5. | v1 accepts the gap. |
+| **Reaction destructive verbs** | `:x:` / `:stop_sign:` for reject/cancel need modal confirmation → v1.5 surface. | v1 ships only non-destructive `:white_check_mark:` approval signal. |
+| **Council channels on Slack** | Council streaming + per-persona display needs polling-loop pattern + `chat:write.customize` scope analysis → v1.5. | v1 runs councils via the existing `/council/*` HTTP routes (bro-irc/terminal) only. |
 
 ## v1 boundary
 

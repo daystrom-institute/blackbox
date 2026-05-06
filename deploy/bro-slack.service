@@ -1,0 +1,36 @@
+[Unit]
+Description=blackbox Slack sidecar — Socket Mode event bridge
+After=network.target blackbox.service
+Wants=blackbox.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bro-slack \
+  --self-user-id ${SLACK_SELF_USER_ID} \
+  --self-bot-id ${SLACK_SELF_BOT_ID} \
+  --daemon-url http://127.0.0.1:${BBOX_PORT:-7264} \
+  --webhook-name slack \
+  --app-token-env SLACK_APP_TOKEN \
+  --signing-secret-env SLACK_SIGNING_SECRET \
+  --shared-secret-env BRO_SLACK_SHARED_SECRET \
+  --identities-file %h/.bro/slack-identities.json \
+  --health-port 7299 \
+  --log-level info
+Restart=on-failure
+RestartSec=3
+WorkingDirectory=%h
+StandardOutput=journal
+StandardError=journal
+
+# ── Required environment ───────────────────────────────────────
+# SLACK_APP_TOKEN=xapp-1-...       (Socket Mode app-level token)
+# SLACK_SELF_USER_ID=U...          (bot's U-prefix user id)
+# SLACK_SELF_BOT_ID=B...           (bot's B-prefix bot id)
+#
+# ── Optional ───────────────────────────────────────────────────
+# SLACK_SIGNING_SECRET=...         (Events API signing secret; unused on Socket Mode path)
+# BRO_SLACK_SHARED_SECRET=...      (HMAC key for sidecar→daemon hop; also set in blackboxd env)
+# BBOX_PORT=7264                   (override daemon port)
+
+[Install]
+WantedBy=default.target
