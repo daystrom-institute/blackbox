@@ -1198,6 +1198,8 @@ async fn backoff_sleep(attempt: &mut u32, flag: &AtomicBool, shutdown: Arc<tokio
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args = Args::parse();
 
     tracing_subscriber::fmt()

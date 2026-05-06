@@ -5,6 +5,8 @@
 /.direnv/
 /result
 /daystrom/
+/.env
+/.env.bro-slack-dev
 
 # keystone-arc demo writes admin token + webhook secret here on bootstrap.
 examples/keystone/.env
