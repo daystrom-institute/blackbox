@@ -6,9 +6,10 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tantivy::schema::*;
+use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-f3";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-s3-code-tokenizer";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -126,6 +127,7 @@ impl TranscriptIndex {
                 Index::create_in_dir(index_path, schema.clone())?
             }
         };
+        register_code_tokenizer(&index);
         write_schema_version_marker(index_path)?;
 
         let reader = index
@@ -219,6 +221,13 @@ fn first_u64(doc: &TantivyDocument, field: Field) -> u64 {
 
 pub(crate) fn build_schema() -> (Schema, FieldHandles) {
     let mut builder = Schema::builder();
+    let code_options = TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(code_tokenizer::CODE_TOKENIZER_NAME)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        )
+        .set_stored();
     let fields = FieldHandles {
         content: builder.add_text_field("content", TEXT | STORED),
         session_id: builder.add_text_field("session_id", STRING | STORED),
@@ -236,7 +245,7 @@ pub(crate) fn build_schema() -> (Schema, FieldHandles) {
         language: builder.add_text_field("language", STRING | STORED),
         symbol: builder.add_text_field("symbol", TEXT | STORED),
         symbol_exact: builder.add_text_field("symbol_exact", STRING | STORED),
-        code_content: builder.add_text_field("code_content", TEXT | STORED),
+        code_content: builder.add_text_field("code_content", code_options),
         chunk_hash: builder.add_text_field("chunk_hash", STRING | STORED),
         entity_id: builder.add_text_field("entity_id", STRING | STORED),
         parser_version: builder.add_text_field("parser_version", STRING | STORED),
@@ -244,6 +253,13 @@ pub(crate) fn build_schema() -> (Schema, FieldHandles) {
         repo_id: builder.add_text_field("repo_id", STRING | STORED),
     };
     (builder.build(), fields)
+}
+
+pub(crate) fn register_code_tokenizer(index: &Index) {
+    index.tokenizers().register(
+        code_tokenizer::CODE_TOKENIZER_NAME,
+        TextAnalyzer::from(code_tokenizer::CodeTokenizer::default()),
+    );
 }
 
 fn reset_index_on_schema_mismatch(index_path: &Path) -> Result<()> {
@@ -318,8 +334,68 @@ mod tests {
         let marker = fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)).unwrap();
         assert_eq!(marker.trim(), INDEX_SCHEMA_VERSION);
     }
+
+    #[test]
+    fn code_content_tokenizer_finds_identifier_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        let index = TranscriptIndex::open_or_create(
+            &index_path,
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+        )
+        .unwrap();
+        let project = crate::projects::ProjectRecord {
+            project_id: "proj1234".into(),
+            repo_id: Some("repo1234".into()),
+            canonical_path: "/tmp/repo".into(),
+            registered_at: "2026-05-05T17:30:00Z".into(),
+            is_git_repo: true,
+        };
+        let chunk = crate::chunker::Chunk {
+            project_id: "proj1234".into(),
+            file_path: PathBuf::from("src/lib.rs"),
+            rel_path_hash: "abcd1234".into(),
+            chunk_kind: "code_block".into(),
+            chunk_hash: "f".repeat(64),
+            occurrence_idx: 0,
+            language: Some("rust".into()),
+            symbol: Some("KnowledgeStore".into()),
+            symbol_exact: Some("KnowledgeStore".into()),
+            content: "pub struct KnowledgeStore;".into(),
+            byte_start: 0,
+            byte_end: 26,
+        };
+        let doc = project_files::build_project_file_doc(
+            &chunk,
+            &project,
+            Path::new("/tmp/repo/src/lib.rs"),
+            Some("a".repeat(40).as_str()),
+            index.field_handles(),
+        );
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        index.reader.reload().unwrap();
+
+        let result = index
+            .search(&SearchParams {
+                query: "Knowledge".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(5),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(result.contains("/tmp/repo/src/lib.rs"), "{result}");
+    }
 }
 
+mod code_tokenizer;
 mod helpers;
 mod project_files;
 mod reindex;
