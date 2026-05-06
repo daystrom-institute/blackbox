@@ -40,6 +40,16 @@ pub struct HybridSearchParams {
     /// route and degrades per route if a provider is unavailable.
     #[serde(default)]
     pub query_vector: Option<Vec<f32>>,
+    /// Restrict results to entities scoped to a specific project. Accepts
+    /// either an absolute project path (e.g. `/home/user/repos/my-app`) or
+    /// a project_id (8-hex). When set, only `project_file:<this_project>:*`
+    /// entries are kept; commits, knowledge, transcripts, and other
+    /// project-agnostic entity types pass through unfiltered. Use this to
+    /// scope queries to your current repo when cross-project keyword
+    /// pollution would otherwise dominate the top-N (a common case when
+    /// multiple registered repos share vocabulary like "voyage" or "embed").
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,6 +198,16 @@ pub(crate) fn hybrid_search_typed(
             .total_cmp(&a.score)
             .then_with(|| a.entity_id.cmp(&b.entity_id))
     });
+    // Project scoping: when the caller passed `project`, drop project_file
+    // results from other projects so cross-project keyword pollution
+    // (e.g. erlang-test/voyage.ex outranking transcript-search/voyage.rs
+    // for "voyage" queries on the local repo) doesn't dominate top-N.
+    // Other entity types pass through unfiltered — commits / knowledge /
+    // transcripts are project-agnostic enough that the agent can decide
+    // which ones are relevant on its own.
+    if let Some(target_project_id) = resolve_project_filter(p.project.as_deref(), ctx) {
+        results.retain(|hit| keep_under_project_filter(&hit.entity_id, &target_project_id));
+    }
     // Per-file collapse: keep only the best-scoring chunk per file. Without
     // this the top-N gets dominated by 3-5 chunks of the same .rs file when
     // the query matches multiple symbols in one file, starving the user of
@@ -224,6 +244,50 @@ pub(crate) fn hybrid_search_typed(
         vector_status,
         degraded,
     })
+}
+
+/// Resolves the caller's `project` parameter to a canonical project_id
+/// (8-hex). Accepts:
+///   - a bare 8-hex project_id (returned as-is)
+///   - an absolute path that's already in the registry (looked up)
+///   - any other absolute path (computed via `entity_ref::project_id_for_path`)
+/// Returns `None` when no parameter was supplied or resolution failed (the
+/// caller treats `None` as "no scoping").
+fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Bare project_id pass-through.
+    if raw.len() == 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(raw.to_lowercase());
+    }
+    // Try the registry first so symlink aliases collapse to the same id.
+    if let Some(state) = ctx.state() {
+        let projects = state.projects.read().list();
+        let canonical = std::fs::canonicalize(raw).ok()?;
+        if let Some(record) = projects
+            .iter()
+            .find(|r| std::path::PathBuf::from(&r.canonical_path) == canonical)
+        {
+            return Some(record.project_id.clone());
+        }
+    }
+    // Fall back to the deterministic path-derived id even when the project
+    // hasn't been registered yet — useful for one-shot scoped searches.
+    crate::entity_ref::project_id_for_path(raw).ok()
+}
+
+/// Decides whether a search hit survives the project filter. Project-file
+/// refs must match the target project_id; other entity types pass through
+/// (commits/knowledge/transcripts/sessions/etc are project-agnostic enough
+/// that the agent can prune them itself if needed).
+fn keep_under_project_filter(entity_id: &str, target_project_id: &str) -> bool {
+    let mut parts = entity_id.split(':');
+    if parts.next() != Some("project_file") {
+        return true;
+    }
+    parts.next() == Some(target_project_id)
 }
 
 /// Returns a per-file dedup key when `entity_id` refers to a project_file
