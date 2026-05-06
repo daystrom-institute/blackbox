@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::chunker::{EdgeConfidence, EdgeProvenance};
 use crate::entity_ref::EntityRef;
@@ -466,6 +467,52 @@ pub(crate) fn append_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -
     Ok(())
 }
 
+pub(crate) fn append_edges_dedup(
+    edges_dir: &Path,
+    project_id: &str,
+    edges: &[Edge],
+) -> Result<usize> {
+    if edges.is_empty() {
+        return Ok(0);
+    }
+    fs::create_dir_all(edges_dir)?;
+    let path = edges_dir.join(format!("{project_id}.jsonl"));
+    let mut seen = HashSet::new();
+    if let Ok(file) = fs::File::open(&path) {
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(edge) = serde_json::from_str::<Edge>(&line) {
+                seen.insert(edge_import_key(&edge));
+            }
+        }
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut written = 0usize;
+    for edge in edges {
+        if !seen.insert(edge_import_key(edge)) {
+            continue;
+        }
+        serde_json::to_writer(&mut file, edge)?;
+        file.write_all(b"\n")?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+fn edge_import_key(edge: &Edge) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(edge.source.to_string());
+    hasher.update(b"\0");
+    hasher.update(&edge.kind);
+    hasher.update(b"\0");
+    hasher.update(edge.target.to_string());
+    hasher.update(b"\0");
+    if let Some(commit) = edge.metadata.get("anchor.commit_sha_at_edit") {
+        hasher.update(commit);
+    }
+    hex::encode(hasher.finalize())
+}
+
 fn derived_tool_projection(edge: &Edge) -> Option<Edge> {
     if edge.kind != "EDITED_FILE" {
         return None;
@@ -606,5 +653,42 @@ mod tests {
                         provider: "claude".into(),
                         session_id: "sess-1".into(),
                     })));
+    }
+
+    #[test]
+    fn append_edges_dedup_skips_reimported_provenance_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let edge = Edge {
+            source: EntityRef::Transcript {
+                provider: "claude".into(),
+                session_id: "sess-1".into(),
+                line_offset: 42,
+                event_idx: 0,
+            },
+            kind: "EDITED_FILE".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "proj1234".into(),
+                rel_path_hash: "pathhash".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata: BTreeMap::from([(
+                "anchor.commit_sha_at_edit".into(),
+                "abc123".into(),
+            )]),
+        };
+
+        assert_eq!(
+            append_edges_dedup(dir.path(), "proj1234", std::slice::from_ref(&edge)).unwrap(),
+            1
+        );
+        assert_eq!(
+            append_edges_dedup(dir.path(), "proj1234", std::slice::from_ref(&edge)).unwrap(),
+            0
+        );
+        let sidecar = fs::read_to_string(dir.path().join("proj1234.jsonl")).unwrap();
+        assert_eq!(sidecar.lines().count(), 1);
     }
 }
