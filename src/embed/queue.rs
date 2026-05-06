@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -391,6 +391,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
     let mut retry_batch = Vec::new();
     let mut retry_attempts = 0_u8;
     let mut backoff = spec.retry_backoff;
+    let mut rate_limiter = spec.rate_limit_per_min.and_then(TokenBucket::new);
     loop {
         let batch = if retry_batch.is_empty() {
             match collect_quiescent_batch(&mut rx, &mut pending, spec.debounce).await {
@@ -400,7 +401,9 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
         } else {
             retry_batch.clone()
         };
-        apply_rate_limit(spec.rate_limit_per_min).await;
+        if let Some(limiter) = &mut rate_limiter {
+            limiter.acquire(batch.len()).await;
+        }
         let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
         match spec.provider.embed_batch(&texts).await {
             Ok(vectors) => {
@@ -518,19 +521,6 @@ async fn collect_quiescent_batch(
     Some(pending.drain(..).collect())
 }
 
-async fn apply_rate_limit(rate_limit_per_min: Option<u32>) {
-    let Some(rate_limit) = rate_limit_per_min else {
-        return;
-    };
-    if rate_limit == 0 {
-        return;
-    }
-    let delay_ms = 60_000_u64 / u64::from(rate_limit);
-    if delay_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-    }
-}
-
 fn persist_vectors(
     spec: &WorkerSpec,
     batch: &[EmbedRequest],
@@ -552,6 +542,66 @@ fn persist_vectors(
         )?;
     }
     Ok(())
+}
+
+struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    refill_per_second: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate_limit_per_min: u32) -> Option<Self> {
+        if rate_limit_per_min == 0 {
+            return None;
+        }
+        let capacity = f64::from(rate_limit_per_min);
+        Some(Self {
+            capacity,
+            tokens: capacity,
+            refill_per_second: capacity / 60.0,
+            last_refill: Instant::now(),
+        })
+    }
+
+    async fn acquire(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let needed = (count as f64).min(self.capacity);
+        loop {
+            self.refill();
+            if self.tokens >= needed {
+                self.tokens -= needed;
+                return;
+            }
+            let missing = needed - self.tokens;
+            let wait = Duration::from_secs_f64(missing / self.refill_per_second);
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    fn refill(&mut self) {
+        let elapsed = self.last_refill.elapsed().as_secs_f64();
+        if elapsed <= 0.0 {
+            return;
+        }
+        self.tokens = (self.tokens + elapsed * self.refill_per_second).min(self.capacity);
+        self.last_refill = Instant::now();
+    }
+
+    #[cfg(test)]
+    fn try_take_now(&mut self, count: usize) -> bool {
+        self.refill();
+        let needed = (count as f64).min(self.capacity);
+        if self.tokens >= needed {
+            self.tokens -= needed;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn increment_depth(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, delta: i64) {
@@ -732,6 +782,15 @@ mod tests {
                 .contains("dropped after 3 retries")
         );
         queue.shutdown();
+    }
+
+    #[test]
+    fn token_bucket_counts_input_items() {
+        let mut bucket = TokenBucket::new(3).unwrap();
+        assert!(bucket.try_take_now(2));
+        assert!(!bucket.try_take_now(2));
+        assert!(bucket.try_take_now(1));
+        assert!(!bucket.try_take_now(1));
     }
 
     #[tokio::test]
