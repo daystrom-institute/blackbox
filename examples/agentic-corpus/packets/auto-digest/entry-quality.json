@@ -49,12 +49,9 @@
       "id": "hold_untrusted_brofile",
       "classification": "hold_for_review",
       "antecedent": {
-        "op": "Not",
-        "arg": {
-          "op": "Apply",
-          "packet_id": "domain:bro-trust/per-brofile",
-          "expect": ["trusted"]
-        }
+        "op": "Apply",
+        "packet_id": "domain:bro-trust/per-brofile",
+        "expect": ["observe", "quarantine"]
       },
       "consequent": "hold_for_review"
     },
