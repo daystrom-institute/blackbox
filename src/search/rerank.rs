@@ -54,7 +54,10 @@ pub fn temporal_decay(features: &RerankFeatures, now: DateTime<Utc>) -> f32 {
 }
 
 pub fn apply_rerank(base_score: f32, features: &RerankFeatures, now: DateTime<Utc>) -> f32 {
-    base_score * type_multiplier(features) * temporal_decay(features, now)
+    let uncapped = base_score * type_multiplier(features) * temporal_decay(features, now);
+    // Keep independent type and temporal boosts from compounding into a
+    // runaway promotion; one result can gain at most 50% over its base RRF rank.
+    uncapped.min(base_score * 1.50)
 }
 
 fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
@@ -100,5 +103,22 @@ mod tests {
         };
         assert!(temporal_decay(&stale, now) < 1.0);
         assert_eq!(temporal_decay(&code, now), 1.0);
+    }
+
+    #[test]
+    fn apply_rerank_caps_stacked_boosts_at_fifty_percent() {
+        let now = DateTime::parse_from_rfc3339("2026-05-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let fresh_confirmed = RerankFeatures {
+            doc_type: Some("knowledge".into()),
+            approval: Some("UserConfirmed".into()),
+            created_at: Some("2026-05-05T00:00:00Z".into()),
+            last_recalled: Some("2026-05-05T00:00:00Z".into()),
+            recall_count: 10,
+            ..RerankFeatures::default()
+        };
+
+        assert_eq!(apply_rerank(0.2, &fresh_confirmed, now), 0.3);
     }
 }
