@@ -1042,14 +1042,25 @@ pub fn render_markdown() -> String {
 }
 
 fn hot_summary(summary: &'static str) -> Cow<'static, str> {
-    const MAX_SUMMARY_BYTES: usize = 12;
+    // Cap at 240 bytes — long enough for one or two informative sentences
+    // per tool, short enough that the rendered tool reference stays
+    // skimmable. Earlier value of 12 truncated mid-word and produced
+    // unreadable lines like "Hybrid BM25+ See MCP." for every entry.
+    const MAX_SUMMARY_BYTES: usize = 240;
     if summary.len() <= MAX_SUMMARY_BYTES {
         return Cow::Borrowed(summary);
     }
+    // Prefer breaking at a sentence boundary when one fits inside the cap.
     let end = summary[..MAX_SUMMARY_BYTES]
         .rfind(". ")
         .map(|idx| idx + 1)
-        .unwrap_or(MAX_SUMMARY_BYTES);
+        .unwrap_or_else(|| {
+            // Fall back to the last word boundary so we don't truncate a
+            // word in half. Walk backward from the cap to find the last space.
+            summary[..MAX_SUMMARY_BYTES]
+                .rfind(' ')
+                .unwrap_or(MAX_SUMMARY_BYTES)
+        });
     Cow::Owned(format!("{} See MCP.", summary[..end].trim()))
 }
 
