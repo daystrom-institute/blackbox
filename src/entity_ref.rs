@@ -374,13 +374,17 @@ pub fn repo_id_for_path(path: impl AsRef<Path>) -> io::Result<String> {
     let Some(repo_root) = git_root_for_path(&canonical) else {
         return Ok(hash_path(&canonical));
     };
-    if let Some(first_commit) = git_first_commit_for_path(&repo_root) {
+    repo_id_for_root(&repo_root)
+}
+
+pub(crate) fn repo_id_for_root(git_root: &Path) -> io::Result<String> {
+    if let Some(first_commit) = git_first_commit_for_path(git_root) {
         return Ok(hash_string(&first_commit));
     }
-    if let Some(remote_url) = git_remote_origin_for_path(&repo_root) {
+    if let Some(remote_url) = git_remote_origin_for_path(git_root) {
         return Ok(hash_string(&remote_url));
     }
-    Ok(hash_path(&repo_root))
+    Ok(hash_path(git_root))
 }
 
 pub fn realpath_hash(path: impl AsRef<Path>) -> io::Result<String> {

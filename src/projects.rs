@@ -69,12 +69,12 @@ impl ProjectRegistry {
             return Ok(existing.clone());
         }
 
-        let is_git_repo = entity_ref::git_root_for_path(&canonical).is_some();
-        let repo_id = if is_git_repo {
-            Some(entity_ref::repo_id_for_path(&canonical)?)
-        } else {
-            None
-        };
+        let git_root = entity_ref::git_root_for_path(&canonical);
+        let repo_id = git_root
+            .as_deref()
+            .map(entity_ref::repo_id_for_root)
+            .transpose()?;
+        let is_git_repo = git_root.is_some();
         let record = ProjectRecord {
             project_id,
             repo_id,
