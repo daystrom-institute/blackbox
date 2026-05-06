@@ -405,6 +405,7 @@ impl Partition {
     }
 
     fn flush_derived_files(&self) -> Result<()> {
+        let options = HnswOptions::default();
         fs::create_dir_all(&self.path)?;
         fs::write(
             self.path.join("meta.json"),
@@ -414,10 +415,10 @@ impl Partition {
                 "dims": self.slab.dims(),
                 "wal_records": self.wal_records,
                 "active_count": self.slab.active_count(),
-                "m": HnswOptions::default().m,
-                "ef_construction": HnswOptions::default().ef_construction,
-                "ef_search": HnswOptions::default().ef_search,
-                "max_layers": HnswOptions::default().max_layers,
+                "m": options.m,
+                "ef_construction": options.ef_construction,
+                "ef_search": options.ef_search,
+                "max_layers": options.max_layers,
             }))?,
         )?;
         write_f32_file(&self.path.join("slab.bin"), &self.slab.to_f32_slab())?;
