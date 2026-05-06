@@ -1874,6 +1874,11 @@ struct AgentGetParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentDescribeParams {
+    agent: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct BrofileParams {
     /// Operation: create, list, get, delete, set_account, list_accounts,
     /// set_provider_default, get_provider_default, list_provider_defaults,
@@ -4604,6 +4609,119 @@ Constraints:\n\
             Ok(None) => Self::err_text(&format!("agent not found: {}", p.name)),
             Err(e) => Self::err_text(&format!("registry get failed: {e}")),
         }
+    }
+
+    #[tool(
+        name = "bro_agent_describe",
+        description = "Full manifest + resolved brofile + merged filters for one agent. Returns the computed dispatch surface (deny-wins filter merge of brofile + overlay), brofile info, embedding status, and any warnings."
+    )]
+    fn bro_agent_describe(
+        &self,
+        Parameters(p): Parameters<AgentDescribeParams>,
+    ) -> CallToolResult {
+        use orchestration::agents::registry::AgentRegistry;
+        use orchestration::agents::types::MergedFilters;
+        let catalog = self.state.artifacts.read();
+        let reg = AgentRegistry::new(&catalog);
+        let rec = match reg.get(&p.agent) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Self::err_text(&format!("agent not found: {}", p.agent)),
+            Err(e) => return Self::err_text(&format!("registry get failed: {e}")),
+        };
+        let manifest = match rec.manifest {
+            Some(m) => m,
+            None => {
+                return Self::ok_json(&serde_json::json!({
+                    "name": rec.name,
+                    "version": rec.version,
+                    "active": rec.active,
+                    "error": format!("manifest parse failed: {}", rec.manifest_parse_error.unwrap_or_default()),
+                }));
+            }
+        };
+
+        let mut warnings: Vec<String> = Vec::new();
+
+        let (brofile_kind, brofile_name, brofile_provider) = if let Some(ref br) = manifest.brofile_ref {
+            let bf = orchestration::brofile::list_brofiles("global", &self.state.store_dir, None)
+                .into_iter()
+                .find(|b| b.name == *br);
+            match bf {
+                Some(b) => ("ref", br.clone(), Some(b.provider.as_str().to_string())),
+                None => {
+                    warnings.push(format!("brofile_ref '{br}' not found in global brofile store"));
+                    ("ref", br.clone(), None)
+                }
+            }
+        } else if manifest.brofile_inline.is_some() {
+            let inline = manifest.brofile_inline.as_ref().unwrap();
+            let prov = inline
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            ("inline", String::new(), Some(prov.to_string()))
+        } else {
+            warnings.push("manifest has neither brofile_ref nor brofile_inline".into());
+            ("none", String::new(), None)
+        };
+
+        let (base_allow, base_disallow) = if let Some(ref br) = manifest.brofile_ref {
+            let bf = orchestration::brofile::list_brofiles("global", &self.state.store_dir, None)
+                .into_iter()
+                .find(|b| b.name == *br);
+            match bf.and_then(|b| b.filters) {
+                Some(f) => (f.allow, f.disallow),
+                None => (Vec::new(), Vec::new()),
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let merged = MergedFilters::merge(&base_allow, &base_disallow, manifest.filter_overlay.as_ref());
+
+        let embedding_status = match manifest.embedding {
+            Some(_) => "embedded",
+            None => "pending",
+        };
+
+        let mut result = serde_json::Map::from_iter([
+            ("name".into(), serde_json::Value::String(rec.name)),
+            ("version".into(), serde_json::Value::String(rec.version)),
+            ("active".into(), serde_json::Value::Bool(rec.active)),
+            (
+                "embedding_status".into(),
+                serde_json::Value::String(embedding_status.to_string()),
+            ),
+            (
+                "brofile_kind".into(),
+                serde_json::Value::String(brofile_kind.to_string()),
+            ),
+            (
+                "merged_filters".into(),
+                serde_json::to_value(&merged).unwrap_or(serde_json::Value::Null),
+            ),
+        ]);
+        if !brofile_name.is_empty() {
+            result.insert("brofile_name".into(), serde_json::Value::String(brofile_name));
+        }
+        if let Some(provider) = brofile_provider {
+            result.insert("brofile_provider".into(), serde_json::Value::String(provider));
+        }
+        if !warnings.is_empty() {
+            result.insert(
+                "warnings".into(),
+                serde_json::Value::Array(
+                    warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        result.insert(
+            "manifest".into(),
+            serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
+        );
+        Self::ok_json(&serde_json::Value::Object(result))
     }
 
     #[tool(
@@ -10755,5 +10873,124 @@ mod tests {
         );
         let old = all_agents.iter().find(|a| a["name"] == "old-agent").unwrap();
         assert_eq!(old["active"], false);
+    }
+
+    #[test]
+    fn bro_agent_describe_inline_brofile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            1,
+            Some("normal"),
+        );
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "reviewer".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["name"], "reviewer");
+        assert_eq!(body["version"], "1");
+        assert_eq!(body["active"], true);
+        assert_eq!(body["brofile_kind"], "inline");
+        assert_eq!(body["brofile_provider"], "claude");
+        assert_eq!(body["embedding_status"], "pending");
+        assert!(body["manifest"].is_object());
+        assert!(body["merged_filters"].is_object());
+    }
+
+    #[test]
+    fn bro_agent_describe_missing_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "nonexistent".into(),
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("agent not found"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_describe_filter_merge_deny_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        let mut manifest = serde_json::json!({
+            "description": "Agent with filter overlay.",
+            "when_to_use": ["when testing"],
+            "brofile_inline": {"provider": "claude"},
+            "filter_overlay": {
+                "allow": ["mcp__blackbox__bbox_search", "mcp__blackbox__bbox_cite"],
+                "disallow": ["mcp__blackbox__bro_exec"]
+            },
+        });
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "filtered.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "filtered",
+                "version": 1,
+                "manifest": manifest,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "filtered".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        let mf = &body["merged_filters"];
+        let allow = mf["allow"].as_array().unwrap();
+        let disallow = mf["disallow"].as_array().unwrap();
+        assert!(
+            allow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
+            "overlay allow should be in merged: {allow:?}"
+        );
+        assert!(
+            disallow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
+            "overlay disallow should be in merged: {disallow:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_describe_degraded_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "broken.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "broken",
+                "version": 1,
+                "manifest": 42,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "broken".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["name"], "broken");
+        assert!(body["error"].as_str().unwrap().contains("manifest parse failed"));
     }
 }

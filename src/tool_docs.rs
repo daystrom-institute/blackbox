@@ -756,6 +756,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Inspect a specific agent's manifest (brofile config, filter overlay, inputs/outputs, composition constraints) before dispatching or composing it into a pipeline.",
         example: Some(r#"bro_agent_get(name="reviewer")"#),
     },
+    ToolDoc {
+        name: "bro_agent_describe",
+        category: ToolCategory::Orchestration,
+        summary: "Full manifest + resolved brofile + merged filters for one agent. Returns the computed dispatch surface (deny-wins filter merge of brofile + overlay), brofile info, embedding status, and any warnings.",
+        when_to_use: "Pre-dispatch inspection: understand the full computed tool surface an agent will have at runtime, including which brofile it resolves to and whether filters from the brofile and manifest overlay conflict. Use before bro_agent_dispatch to preview the dispatch plan.",
+        example: Some(r#"bro_agent_describe(agent="code-reviewer")"#),
+    },
     // ── Whiteboards ─────────────────────────────────────────────
     ToolDoc {
         name: "whiteboard_open",
