@@ -149,6 +149,11 @@ Before running the arc, install the ensemble team with
 `contradiction-specialists` with the three specialist brofiles. The F4 catalog
 installs the brofiles and workflow; teams remain an operator setup step in v1.
 
+Workflow gate predicates can reference runtime vars directly via `vars.X.Y`.
+Flat-entity field paths are only needed for packets applied outside workflow
+vars. The auto-digest quality and bro-trust packets now use single
+`vars.candidate.*` paths, matching `contradiction/review-synthesis`.
+
 Tier-0 contradiction detection runs in the knowledge embedding success path.
 When a new knowledge vector has cosine > 0.85 against another knowledge entry
 outside the immediate supersession relation, bbox starts
