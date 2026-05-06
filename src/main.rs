@@ -3089,7 +3089,7 @@ Constraints:\n\
         // Capability validation — walk every actor's brofile/team →
         // provider and verify the actor's `requires` capabilities are
         // covered. Hard fail rather than silent route-around.
-        if let Err(e) = self.validate_workflow_capabilities(&compiled) {
+        if let Err(e) = validate_workflow_capabilities(&compiled, &self.state) {
             return Self::err_text(&format!("workflow capability validation failed: {e}"));
         }
         if p.dry_run.unwrap_or(false) {
@@ -3106,102 +3106,6 @@ Constraints:\n\
         )
         .await;
         Self::ok_json(&serde_json::to_value(&result).unwrap_or_default())
-    }
-
-    /// Walk each ActorSpec.requires → resolve actor's brofile (or
-    /// team's member brofiles) → resolve provider → check provider
-    /// capabilities cover the requirements. Hard fail with the first
-    /// mismatch. Empty `requires` (default) is always satisfied.
-    fn validate_workflow_capabilities(
-        &self,
-        compiled: &workflow::CompiledWorkflow,
-    ) -> Result<(), String> {
-        for (actor_name, actor) in &compiled.spec.actors {
-            if actor.requires.is_empty() {
-                continue;
-            }
-            let providers = self.resolve_actor_providers(actor)?;
-            if providers.is_empty() {
-                return Err(format!(
-                    "actor '{actor_name}' requires {:?} but resolves to no providers",
-                    actor.requires
-                ));
-            }
-            for provider in &providers {
-                let caps = provider.capabilities();
-                let missing: Vec<_> = actor
-                    .requires
-                    .iter()
-                    .filter(|r| !caps.contains(r))
-                    .collect();
-                if !missing.is_empty() {
-                    return Err(format!(
-                        "actor '{actor_name}' requires {:?} but provider '{provider}' lacks {:?}",
-                        actor.requires, missing
-                    ));
-                }
-            }
-        }
-        // Recursively validate sub-workflows.
-        for (node_id, node) in &compiled.spec.nodes {
-            if let Some(sub) = &node.subworkflow {
-                let sub_compiled = workflow::compile((**sub).clone())
-                    .map_err(|e| format!("subworkflow on '{node_id}' compile: {e}"))?;
-                self.validate_workflow_capabilities(&sub_compiled)
-                    .map_err(|e| format!("subworkflow on '{node_id}': {e}"))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Walk an ActorSpec to the providers it dispatches to. For
-    /// executor/advisor: lookup brofile, return its provider. For
-    /// ensemble: lookup team, walk its member brofiles. Returns the
-    /// distinct provider set.
-    fn resolve_actor_providers(
-        &self,
-        actor: &workflow::schema::ActorSpec,
-    ) -> Result<Vec<orchestration::providers::Provider>, String> {
-        use std::collections::HashSet;
-        let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
-        match actor.kind {
-            workflow::schema::ActorKind::Executor => {
-                let brofile_name = actor
-                    .brofile
-                    .as_deref()
-                    .ok_or_else(|| format!("actor (kind={:?}) missing brofile", actor.kind))?;
-                let bf = orchestration::brofile::resolve_brofile(
-                    brofile_name,
-                    &self.state.store_dir,
-                    None,
-                )
-                .ok_or_else(|| format!("brofile '{brofile_name}' not found"))?;
-                providers.insert(bf.provider);
-            }
-            workflow::schema::ActorKind::Ensemble => {
-                let team_name = actor
-                    .team
-                    .as_deref()
-                    .ok_or_else(|| "ensemble actor missing team".to_string())?;
-                let team = orchestration::team::load_team(team_name, &self.state.store_dir)
-                    .ok_or_else(|| format!("team '{team_name}' not found"))?;
-                for member in team.members.iter() {
-                    let bf = orchestration::brofile::resolve_brofile(
-                        &member.brofile,
-                        &self.state.store_dir,
-                        None,
-                    )
-                    .ok_or_else(|| {
-                        format!(
-                            "team '{team_name}' member '{}' brofile '{}' not found",
-                            member.name, member.brofile
-                        )
-                    })?;
-                    providers.insert(bf.provider);
-                }
-            }
-        }
-        Ok(providers.into_iter().collect())
     }
 
     #[tool(
@@ -3959,7 +3863,7 @@ Constraints:\n\
             Ok(c) => c,
             Err(e) => return Self::err_text(&format!("workflow compile failed: {e}")),
         };
-        if let Err(e) = self.validate_workflow_capabilities(&compiled) {
+        if let Err(e) = validate_workflow_capabilities(&compiled, &self.state) {
             return Self::err_text(&format!("capability validation failed: {e}"));
         }
         let id = p.id.unwrap_or_else(|| spec.name.clone());
@@ -4051,6 +3955,91 @@ Constraints:\n\
             "posts": posts,
         }))
     }
+}
+
+/// Walk each ActorSpec.requires -> resolve actor brofiles/teams -> provider
+/// capabilities. Empty `requires` is satisfied.
+pub(crate) fn validate_workflow_capabilities(
+    compiled: &workflow::CompiledWorkflow,
+    state: &Arc<SharedState>,
+) -> Result<(), String> {
+    for (actor_name, actor) in &compiled.spec.actors {
+        if actor.requires.is_empty() {
+            continue;
+        }
+        let providers = resolve_actor_providers(actor, state)?;
+        if providers.is_empty() {
+            return Err(format!(
+                "actor '{actor_name}' requires {:?} but resolves to no providers",
+                actor.requires
+            ));
+        }
+        for provider in &providers {
+            let caps = provider.capabilities();
+            let missing: Vec<_> = actor
+                .requires
+                .iter()
+                .filter(|r| !caps.contains(r))
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "actor '{actor_name}' requires {:?} but provider '{provider}' lacks {:?}",
+                    actor.requires, missing
+                ));
+            }
+        }
+    }
+    for (node_id, node) in &compiled.spec.nodes {
+        if let Some(sub) = &node.subworkflow {
+            let sub_compiled = workflow::compile((**sub).clone())
+                .map_err(|e| format!("subworkflow on '{node_id}' compile: {e}"))?;
+            validate_workflow_capabilities(&sub_compiled, state)
+                .map_err(|e| format!("subworkflow on '{node_id}': {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_actor_providers(
+    actor: &workflow::schema::ActorSpec,
+    state: &Arc<SharedState>,
+) -> Result<Vec<orchestration::providers::Provider>, String> {
+    use std::collections::HashSet;
+    let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
+    match actor.kind {
+        workflow::schema::ActorKind::Executor => {
+            let brofile_name = actor
+                .brofile
+                .as_deref()
+                .ok_or_else(|| format!("actor (kind={:?}) missing brofile", actor.kind))?;
+            let bf = orchestration::brofile::resolve_brofile(brofile_name, &state.store_dir, None)
+                .ok_or_else(|| format!("brofile '{brofile_name}' not found"))?;
+            providers.insert(bf.provider);
+        }
+        workflow::schema::ActorKind::Ensemble => {
+            let team_name = actor
+                .team
+                .as_deref()
+                .ok_or_else(|| "ensemble actor missing team".to_string())?;
+            let team = orchestration::team::load_team(team_name, &state.store_dir)
+                .ok_or_else(|| format!("team '{team_name}' not found"))?;
+            for member in team.members.iter() {
+                let bf = orchestration::brofile::resolve_brofile(
+                    &member.brofile,
+                    &state.store_dir,
+                    None,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "team '{team_name}' member '{}' brofile '{}' not found",
+                        member.name, member.brofile
+                    )
+                })?;
+                providers.insert(bf.provider);
+            }
+        }
+    }
+    Ok(providers.into_iter().collect())
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -6015,13 +6004,12 @@ async fn dispatch_verdict(
             })?;
             let compiled = workflow::compile(workflow_spec)
                 .map_err(|e| anyhow::anyhow!("workflow compile: {e}"))?;
-            let server = BlackboxServer::new(state.clone());
             // Validate brofile/team capability composition against the
             // workflow's actor `requires` lists. Webhook ingress used
             // to skip this and let dispatch silently downgrade — fix
             // is to gate the spawn on the same check the MCP / HTTP
             // dispatch paths already use.
-            if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+            if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
                 return Err(anyhow::anyhow!(
                     "workflow '{workflow_id}' capability validation: {e}"
                 ));
@@ -6068,6 +6056,7 @@ async fn dispatch_verdict(
             // name here.
             let cron_name = inlet_name.strip_prefix("cron:").map(|s| s.to_string());
             let crons_for_done = state.crons.clone();
+            let server = BlackboxServer::new(state.clone());
             tokio::spawn(async move {
                 let _ = workflow::run_workflow_with_initial_vars(
                     &server,
@@ -6134,7 +6123,7 @@ async fn orchestrate_by_id_handler(
         }
     };
     let server = BlackboxServer::new(state.clone());
-    if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+    if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             format!("capability validation failed: {e}"),
@@ -6322,8 +6311,7 @@ async fn install_artifact_value(
         artifacts::ArtifactKind::Workflow => {
             let spec: workflow::Workflow = serde_json::from_value(value.clone())?;
             let compiled = workflow::compile(spec.clone())?;
-            let server = BlackboxServer::new(state.clone());
-            if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+            if let Err(e) = validate_workflow_capabilities(&compiled, state) {
                 anyhow::bail!("workflow capability validation failed: {e}");
             }
             let id = p.name.clone().unwrap_or_else(|| spec.name.clone());
@@ -6416,8 +6404,7 @@ async fn admin_workflow_install(
                 .into_response();
         }
     };
-    let server = BlackboxServer::new(state.clone());
-    if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+    if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             format!("capability validation: {e}"),

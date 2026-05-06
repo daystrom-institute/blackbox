@@ -1756,8 +1756,7 @@ impl<'a> WorkflowRunner<'a> {
         // subworkflow silently dispatches against a now-incapable
         // provider. Ref-resolution is dispatch-time, so this check
         // must happen here, not at parent compile.
-        self.server
-            .validate_workflow_capabilities(&compiled)
+        crate::validate_workflow_capabilities(&compiled, &self.server.state)
             .map_err(|e| anyhow!("subworkflow on node '{node_id}' capability validation: {e}"))?;
         let project_dir = self.project_dir.clone();
         // Seed the sub-runner with the parent's node_outputs so sub
