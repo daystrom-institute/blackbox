@@ -14,12 +14,16 @@
 //! runs. That stays with the gate packet at the node level. A misuse
 //! that would do that should be refactored into a node + gate.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+
+use crate::chunker::{EdgeConfidence, EdgeProvenance};
+use crate::entity_ref::EntityRef;
 
 use super::context::{resolve_arg_value, ArcContext, VarsSchema};
 
@@ -91,6 +95,43 @@ pub enum OpKind {
     /// arc has to dispatch a bro to make every grounding call, which
     /// is both expensive and non-deterministic.
     McpCall,
+    /// Read vector partition metrics and expose max deleted-ratio state
+    /// for compaction-policy gates.
+    ReadVectorStatus,
+    /// Marker hook for pausing search traffic before a vector rebuild.
+    ///
+    /// V1 is intentionally observable-only: vector reads serve from the
+    /// in-memory partition snapshot while `vectors::rebuild(route)` rebuilds
+    /// from WAL under the partition lock. If search becomes more concurrent or
+    /// moves out of process, this hook is where real quiescence belongs.
+    QuiesceSearch,
+    /// Rebuild one vector partition's HNSW from WAL.
+    RebuildHnsw,
+    /// Marker hook for the atomic swap step.
+    ///
+    /// V1 is intentionally observable-only: `vectors::rebuild(route)` already
+    /// swaps the rebuilt in-memory partition and rewrites derived files from
+    /// WAL, so there is no separate file-system rename step for the workflow to
+    /// perform yet.
+    SwapAtomic,
+    /// Load a transcript session through bbox_messages for auto-digest arcs.
+    ReadSession,
+    /// Validate auto-digest candidate JSON shape before packet gating.
+    ValidateSchema,
+    /// Apply an auto-digest candidate through the knowledge MCP tools.
+    ApplyEntry,
+    /// Append an authored edge to `KnowledgeEntry.links` via bbox_knowledge_link.
+    AppendKnowledgeLink,
+    /// Scan for semantic auto-edge candidate pairs.
+    ExtractCandidatePairs,
+    /// Aggregate three classifier votes into a compact gate entity.
+    AggregateAutoEdgeVotes,
+    /// Write a reviewed semantic edge (REFERENCES or DESCRIBES).
+    WriteSemanticEdge,
+    /// Surface an auto-digest candidate for operator review.
+    SurfaceToInbox,
+    /// Record an auto-digest rejection.
+    LogReject,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -140,7 +181,443 @@ pub async fn execute_op(
         OpKind::HttpJson => exec_http_json(&rendered_args, hook.into_var.as_deref()).await,
         OpKind::FindFirst => exec_find_first(&rendered_args, hook.into_var.as_deref()),
         OpKind::McpCall => exec_mcp_call(&rendered_args, hook.into_var.as_deref(), ctx).await,
+        OpKind::ReadVectorStatus => {
+            exec_read_vector_status(&rendered_args, hook.into_var.as_deref())
+        }
+        OpKind::QuiesceSearch => Ok(OpEffect::None),
+        OpKind::RebuildHnsw => exec_rebuild_hnsw(&rendered_args),
+        OpKind::SwapAtomic => Ok(OpEffect::None),
+        OpKind::ReadSession => {
+            exec_read_session(&rendered_args, hook.into_var.as_deref(), ctx).await
+        }
+        OpKind::ValidateSchema => exec_validate_schema(&rendered_args, hook.into_var.as_deref()),
+        OpKind::ApplyEntry => {
+            exec_apply_entry(&rendered_args, hook.into_var.as_deref(), ctx).await
+        }
+        OpKind::AppendKnowledgeLink => {
+            exec_append_knowledge_link(&rendered_args, hook.into_var.as_deref(), ctx).await
+        }
+        OpKind::ExtractCandidatePairs => {
+            exec_extract_candidate_pairs(&rendered_args, hook.into_var.as_deref())
+        }
+        OpKind::AggregateAutoEdgeVotes => {
+            exec_aggregate_auto_edge_votes(&rendered_args, hook.into_var.as_deref())
+        }
+        OpKind::WriteSemanticEdge => {
+            exec_write_semantic_edge(&rendered_args, hook.into_var.as_deref(), ctx).await
+        }
+        OpKind::SurfaceToInbox => exec_surface_to_inbox(&rendered_args, ctx).await,
+        OpKind::LogReject => exec_log_reject(&rendered_args, ctx).await,
     }
+}
+
+async fn exec_read_session(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let session_id = args
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("ReadSession requires args.session_id"))?;
+    let limit = args
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(200);
+    let result = call_blackbox_tool(
+        "bbox_messages",
+        json!({
+            "session_id": session_id,
+            "limit": limit,
+            "max_content_length": 12000u64,
+        }),
+        ctx,
+    )
+    .await?;
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("session").to_string(),
+        value: result,
+    })
+}
+
+fn exec_validate_schema(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let input = args
+        .get("from")
+        .ok_or_else(|| anyhow!("ValidateSchema requires args.from"))?;
+    let candidate = first_candidate(input)
+        .ok_or_else(|| anyhow!("ValidateSchema requires a candidate object or candidates array"))?;
+    let required = [
+        "title",
+        "content",
+        "category",
+        "scope",
+        "source_session",
+        "source_query",
+        "justification",
+        "suggested_approval",
+    ];
+    for field in required {
+        if candidate.get(field).and_then(Value::as_str).is_none() {
+            bail!("ValidateSchema candidate missing string field '{field}'");
+        }
+    }
+    let source_files = candidate
+        .get("source_files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("ValidateSchema candidate missing source_files array"))?;
+    if source_files.iter().any(|value| value.as_str().is_none()) {
+        bail!("ValidateSchema source_files must contain only strings");
+    }
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("candidate").to_string(),
+        value: Value::Object(candidate.clone()),
+    })
+}
+
+async fn exec_apply_entry(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let candidate = first_candidate(
+        args.get("from")
+            .ok_or_else(|| anyhow!("ApplyEntry requires args.from"))?,
+    )
+    .ok_or_else(|| anyhow!("ApplyEntry requires a candidate object or candidates array"))?;
+    let category = candidate
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("memory");
+    let title = candidate.get("title").and_then(Value::as_str);
+    let content = candidate
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("ApplyEntry candidate missing content"))?;
+    let scope = candidate
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("project");
+    let project = candidate
+        .get("project")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| ctx.meta.project_dir.clone());
+    let mut arguments = Map::new();
+    arguments.insert("content".into(), Value::String(content.to_string()));
+    if let Some(title) = title {
+        arguments.insert("title".into(), Value::String(title.to_string()));
+    }
+    arguments.insert("scope".into(), Value::String(scope.to_string()));
+    if let Some(project) = project {
+        arguments.insert("project".into(), Value::String(project));
+    }
+    let tool = match category {
+        "decision" => {
+            arguments.insert(
+                "rationale".into(),
+                Value::String(
+                    candidate
+                        .get("justification")
+                        .and_then(Value::as_str)
+                        .unwrap_or("auto-digest candidate")
+                        .to_string(),
+                ),
+            );
+            arguments.insert("render".into(), Value::Bool(false));
+            "bbox_decide"
+        }
+        "convention" | "workflow" => {
+            arguments.insert("category".into(), Value::String(category.to_string()));
+            "bbox_learn"
+        }
+        _ => {
+            arguments.insert("category".into(), Value::String(category.to_string()));
+            "bbox_remember"
+        }
+    };
+    let result = call_blackbox_tool(tool, Value::Object(arguments), ctx).await?;
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("applied_entry").to_string(),
+        value: result,
+    })
+}
+
+async fn exec_append_knowledge_link(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let mut arguments = Map::new();
+    for key in ["source", "target", "kind"] {
+        let value = args
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("AppendKnowledgeLink requires args.{key}"))?;
+        arguments.insert(key.into(), Value::String(value.to_string()));
+    }
+    for key in ["note", "source_arc", "confidence"] {
+        if let Some(value) = args.get(key).and_then(Value::as_str) {
+            arguments.insert(key.into(), Value::String(value.to_string()));
+        }
+    }
+    let result = call_blackbox_tool("bbox_knowledge_link", Value::Object(arguments), ctx).await?;
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("knowledge_link").to_string(),
+        value: result,
+    })
+}
+
+fn exec_extract_candidate_pairs(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50);
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("candidate_pairs").to_string(),
+        value: json!({
+            "limit": limit,
+            "candidates": [],
+            "degraded": {
+                "reason": "scheduled candidate scan is observable-only in v1; seed vars.candidate for manual runs"
+            }
+        }),
+    })
+}
+
+fn exec_aggregate_auto_edge_votes(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let votes = args
+        .get("votes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut gate = Map::new();
+    for idx in 0..3 {
+        let vote = votes
+            .get(idx)
+            .and_then(|value| value.get("vote"))
+            .and_then(Value::as_str)
+            .unwrap_or("no");
+        gate.insert(format!("vote{}", idx + 1), Value::String(vote.to_string()));
+    }
+    gate.insert("votes".into(), Value::Array(votes));
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("vote_aggregate").to_string(),
+        value: Value::Object(gate),
+    })
+}
+
+async fn exec_write_semantic_edge(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let source = required_str(args, "source")?;
+    let target = required_str(args, "target")?;
+    let kind = required_str(args, "kind")?;
+    let note = args.get("note").and_then(Value::as_str).unwrap_or("");
+    let source_ref = EntityRef::parse(source)?;
+    let target_ref = EntityRef::parse(target)?;
+    match kind {
+        "REFERENCES" => {
+            let result = call_blackbox_tool(
+                "bbox_knowledge_link",
+                json!({
+                    "source": source,
+                    "target": target,
+                    "kind": "REFERENCES",
+                    "note": note,
+                    "source_arc": ctx.meta.arc_id,
+                    "confidence": "heuristic"
+                }),
+                ctx,
+            )
+            .await?;
+            Ok(OpEffect::SetVar {
+                key: into_var.unwrap_or("semantic_edge").to_string(),
+                value: result,
+            })
+        }
+        "DESCRIBES" => {
+            let project_id = args
+                .get("project_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| project_id_from_ref(&source_ref))
+                .or_else(|| project_id_from_ref(&target_ref))
+                .ok_or_else(|| anyhow!("WriteSemanticEdge DESCRIBES requires a project_id-bearing ref"))?;
+            let mut metadata = BTreeMap::new();
+            metadata.insert("source_arc".to_string(), ctx.meta.arc_id.clone());
+            if !note.is_empty() {
+                metadata.insert("note".to_string(), note.to_string());
+            }
+            let edge = crate::edge_index::Edge {
+                source: source_ref,
+                kind: "DESCRIBES".to_string(),
+                target: target_ref,
+                provenance: EdgeProvenance::Explicit,
+                confidence: EdgeConfidence::Heuristic,
+                metadata,
+            };
+            let edges_dir = args
+                .get("edges_dir")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(default_edges_dir);
+            let written = crate::edge_index::append_edges_dedup(&edges_dir, &project_id, &[edge])?;
+            Ok(OpEffect::SetVar {
+                key: into_var.unwrap_or("semantic_edge").to_string(),
+                value: json!({
+                    "status": "ok",
+                    "kind": "DESCRIBES",
+                    "project_id": project_id,
+                    "written": written
+                }),
+            })
+        }
+        other => bail!("WriteSemanticEdge unsupported kind `{other}`"),
+    }
+}
+
+fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("WriteSemanticEdge requires args.{key}"))
+}
+
+fn project_id_from_ref(r: &EntityRef) -> Option<String> {
+    match r {
+        EntityRef::ProjectFile { project_id, .. } | EntityRef::Symbol { project_id, .. } => {
+            Some(project_id.clone())
+        }
+        _ => None,
+    }
+}
+
+fn default_edges_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| crate::util::blackbox_state_dir(&home).join("edges"))
+        .unwrap_or_else(|| PathBuf::from("edges"))
+}
+
+async fn exec_surface_to_inbox(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
+    let candidate = first_candidate(
+        args.get("from")
+            .ok_or_else(|| anyhow!("SurfaceToInbox requires args.from"))?,
+    )
+    .ok_or_else(|| anyhow!("SurfaceToInbox requires a candidate object or candidates array"))?;
+    let title = candidate
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("(untitled)");
+    call_blackbox_tool(
+        "bbox_note",
+        json!({
+            "kind": "followup",
+            "project": ctx.meta.project_dir,
+            "body": format!("Auto-digest candidate held for review: {title}")
+        }),
+        ctx,
+    )
+    .await?;
+    Ok(OpEffect::None)
+}
+
+async fn exec_log_reject(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
+    let candidate = first_candidate(
+        args.get("from")
+            .ok_or_else(|| anyhow!("LogReject requires args.from"))?,
+    )
+    .ok_or_else(|| anyhow!("LogReject requires a candidate object or candidates array"))?;
+    let title = candidate
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("(untitled)");
+    call_blackbox_tool(
+        "bbox_note",
+        json!({
+            "kind": "learned",
+            "project": ctx.meta.project_dir,
+            "body": format!("Auto-digest candidate rejected by entry-quality gate: {title}")
+        }),
+        ctx,
+    )
+    .await?;
+    Ok(OpEffect::None)
+}
+
+async fn call_blackbox_tool(tool: &str, arguments: Value, ctx: &ArcContext) -> Result<Value> {
+    let arguments = arguments
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("blackbox tool arguments must be an object"))?;
+    crate::mcp_client::call_tool(
+        "blackbox",
+        tool,
+        arguments,
+        300,
+        ctx.meta.project_dir.as_deref(),
+        ctx.meta
+            .worktree
+            .as_deref()
+            .or(ctx.meta.project_dir.as_deref()),
+    )
+    .await
+    .map_err(|e| anyhow!("McpCall 'blackbox.{tool}': {e}"))
+}
+
+fn first_candidate(value: &Value) -> Option<&Map<String, Value>> {
+    if let Some(obj) = value.as_object() {
+        if let Some(candidate) = obj.get("candidate").and_then(Value::as_object) {
+            return Some(candidate);
+        }
+        if let Some(candidate) = obj
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_object)
+        {
+            return Some(candidate);
+        }
+        return Some(obj);
+    }
+    value
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(Value::as_object)
+}
+
+fn exec_read_vector_status(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let into = into_var.unwrap_or("vector_status");
+    let route_filter = args.get("route").and_then(|value| value.as_str());
+    let mut partitions = crate::vectors::metrics();
+    if let Some(route) = route_filter {
+        partitions.retain(|name, _| name == route);
+    }
+    let mut max_deleted_route = None::<String>;
+    let mut max_deleted_ratio = 0.0f32;
+    for (route, metrics) in &partitions {
+        if metrics.deleted_ratio >= max_deleted_ratio {
+            max_deleted_ratio = metrics.deleted_ratio;
+            max_deleted_route = Some(route.clone());
+        }
+    }
+    Ok(OpEffect::SetVar {
+        key: into.to_string(),
+        value: json!({
+            "partitions": partitions,
+            "max_deleted_route": max_deleted_route,
+            "max_deleted_ratio": max_deleted_ratio,
+        }),
+    })
+}
+
+fn exec_rebuild_hnsw(args: &Value) -> Result<OpEffect> {
+    let route = args
+        .get("route")
+        .and_then(|value| value.as_str())
+        .filter(|route| !route.trim().is_empty())
+        .ok_or_else(|| anyhow!("RebuildHnsw requires args.route"))?;
+    crate::vectors::rebuild(route)?;
+    Ok(OpEffect::None)
 }
 
 async fn exec_mcp_call(args: &Value, into_var: Option<&str>, ctx: &ArcContext) -> Result<OpEffect> {

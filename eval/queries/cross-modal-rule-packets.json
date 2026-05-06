@@ -1,0 +1,33 @@
+{
+  "id": "cross-modal-rule-packets",
+  "query_class": "cross_modal_code_prose",
+  "pass_strictness": "all",
+  "query": "show where rule-packets are documented and implemented.",
+  "target_locators": [
+    {
+      "description": "The sm-rule-packets system memory or tool docs describing the packet mechanism.",
+      "entity_type_hint": "knowledge",
+      "knowledge_hint": "sm-rule-packets"
+    },
+    {
+      "description": "The Rust packet evaluator and compiler implementation.",
+      "entity_type_hint": "project_file",
+      "path_hint": "src/packets.rs"
+    }
+  ],
+  "expected_entity_refs": [
+    "knowledge:sm-rule-packets",
+    "project_file:d723917f:c4453102:e7e1c91d986cf6841a36d7101f858eb54313d94b287bc54fa238d28dbd1a2a67:8"
+  ],
+  "required_evidence": {
+    "kind": "entity_set",
+    "value": [
+      "knowledge",
+      "project_file"
+    ]
+  },
+  "forbidden_stale_answers": [
+    "Do not answer only with the PR triage rubric; this query is about the reusable packet system."
+  ],
+  "pass_classifier": "check_cross_modal_rule_packets"
+}

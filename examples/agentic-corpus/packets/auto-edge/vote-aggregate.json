@@ -1,0 +1,45 @@
+{
+  "domain": "auto-edge/vote-aggregate",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["write_edge", "hold_for_review", "reject"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "write_two_or_more_yes_votes",
+      "classification": "write_edge",
+      "antecedent": {
+        "op": "CountMatches",
+        "args": [
+          { "op": "Eq", "field": "vars.vote_aggregate.vote1", "value": "yes" },
+          { "op": "Eq", "field": "vars.vote_aggregate.vote2", "value": "yes" },
+          { "op": "Eq", "field": "vars.vote_aggregate.vote3", "value": "yes" }
+        ],
+        "compare": "ge",
+        "value": 2
+      },
+      "consequent": "write_edge"
+    },
+    {
+      "id": "hold_exactly_one_yes_vote",
+      "classification": "hold_for_review",
+      "antecedent": {
+        "op": "CountMatches",
+        "args": [
+          { "op": "Eq", "field": "vars.vote_aggregate.vote1", "value": "yes" },
+          { "op": "Eq", "field": "vars.vote_aggregate.vote2", "value": "yes" },
+          { "op": "Eq", "field": "vars.vote_aggregate.vote3", "value": "yes" }
+        ],
+        "compare": "eq",
+        "value": 1
+      },
+      "consequent": "hold_for_review"
+    },
+    {
+      "id": "reject_zero_yes_votes",
+      "classification": "reject",
+      "antecedent": { "op": "True" },
+      "consequent": "reject"
+    }
+  ]
+}

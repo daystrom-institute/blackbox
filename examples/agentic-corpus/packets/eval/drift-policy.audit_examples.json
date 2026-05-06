@@ -1,0 +1,12 @@
+{
+  "packet_id": "domain:eval/drift-policy",
+  "mode": "first",
+  "dataset": [
+    {
+      "entity": {
+        "drift_pp": 7.0
+      },
+      "expected": "drift_minor"
+    }
+  ]
+}

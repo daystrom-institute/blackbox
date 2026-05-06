@@ -1,0 +1,26 @@
+{
+  "domain": "eval/drift-policy",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["drift_major", "drift_minor", "stable"],
+  "rules": [
+    {
+      "id": "drift_major_over_10pp",
+      "classification": "drift_major",
+      "antecedent": { "op": "GtF", "field": "drift_pp", "value": 10.0 },
+      "consequent": "drift_major"
+    },
+    {
+      "id": "drift_minor_5_to_10pp",
+      "classification": "drift_minor",
+      "antecedent": { "op": "GtF", "field": "drift_pp", "value": 5.0 },
+      "consequent": "drift_minor"
+    },
+    {
+      "id": "stable_within_5pp",
+      "classification": "stable",
+      "antecedent": { "op": "True" },
+      "consequent": "stable"
+    }
+  ]
+}

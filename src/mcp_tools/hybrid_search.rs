@@ -1,0 +1,880 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use rmcp::schemars;
+use serde::{Deserialize, Serialize};
+
+use crate::embed::{Bucket, EmbeddingProvider, EmbeddingRouter};
+use crate::embed_queue;
+use crate::entity_loader;
+use crate::entity_ref::EntityRef;
+use crate::index::{HybridBm25Hit, TranscriptIndex};
+use crate::knowledge::Knowledge;
+use crate::providers::ProviderContext;
+use crate::search::rerank::{self, RerankFeatures};
+use crate::search::rrf::{self, RankedHit, RankedList};
+use crate::vectors::{self, PartitionMetrics};
+
+const DEFAULT_LIMIT: usize = 10;
+const MAX_LIMIT: usize = 50;
+const DEFAULT_FETCH: usize = 50;
+const RRF_K: f32 = 60.0;
+const VECTOR_WEIGHT: f32 = 0.6;
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HybridSearchParams {
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub doc_type: Option<String>,
+    #[serde(default)]
+    pub include_vectors: Option<bool>,
+    /// Weight assigned to vector rank lists during RRF fusion.
+    /// Defaults to 0.6; 0.0 is BM25-only, 1.0 is vector-only.
+    #[serde(default)]
+    pub vector_weight: Option<f32>,
+    /// Optional deterministic query vector for fixtures and operator probes.
+    /// When absent, bbox_hybrid_search embeds the query through each configured
+    /// route and degrades per route if a provider is unavailable.
+    #[serde(default)]
+    pub query_vector: Option<Vec<f32>>,
+    /// Restrict results to entities scoped to a specific project. Accepts
+    /// either an absolute project path (e.g. `/home/user/repos/my-app`) or
+    /// a project_id (8-hex). When set, only `project_file:<this_project>:*`
+    /// entries are kept; commits, knowledge, transcripts, and other
+    /// project-agnostic entity types pass through unfiltered. Use this to
+    /// scope queries to your current repo when cross-project keyword
+    /// pollution would otherwise dominate the top-N (a common case when
+    /// multiple registered repos share vocabulary like "voyage" or "embed").
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HybridSearchResponse {
+    pub(crate) text: String,
+    pub(crate) results: Vec<HybridResult>,
+    pub(crate) vector_status: HybridVectorStatus,
+    pub(crate) degraded: HybridDegraded,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HybridResult {
+    pub(crate) rank: usize,
+    pub(crate) entity_id: String,
+    pub(crate) score: f32,
+    pub(crate) base_score: f32,
+    pub(crate) label: String,
+    pub(crate) doc_type: Option<String>,
+    pub(crate) chunk_kind: Option<String>,
+    pub(crate) role: Option<String>,
+    pub(crate) sources: BTreeMap<String, f32>,
+    pub(crate) excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct HybridVectorStatus {
+    pub(crate) queues: BTreeMap<String, crate::embed::queue::RouteStatus>,
+    pub(crate) partitions: BTreeMap<String, PartitionMetrics>,
+    pub(crate) searched_partitions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct HybridDegraded {
+    pub(crate) vector_errors: BTreeMap<String, String>,
+    pub(crate) skipped_partitions: BTreeMap<String, String>,
+}
+
+pub fn hybrid_search(
+    index: &TranscriptIndex,
+    knowledge: &Knowledge,
+    ctx: &ProviderContext<'_>,
+    p: &HybridSearchParams,
+) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&hybrid_search_typed(
+        index, knowledge, ctx, p,
+    )?)?)
+}
+
+pub(crate) fn hybrid_search_typed(
+    index: &TranscriptIndex,
+    knowledge: &Knowledge,
+    ctx: &ProviderContext<'_>,
+    p: &HybridSearchParams,
+) -> Result<HybridSearchResponse> {
+    let query = p.query.trim();
+    if query.is_empty() {
+        anyhow::bail!("query is required");
+    }
+    let limit = p
+        .limit
+        .unwrap_or(DEFAULT_LIMIT as u64)
+        .min(MAX_LIMIT as u64) as usize;
+    // Widened to limit*8 so per-file collapse has enough depth to surface
+    // `limit` distinct files even when the top-N is dominated by multiple
+    // chunks of the same hot file.
+    let fetch = DEFAULT_FETCH.max(limit * 8);
+    // BM25 fetches deeper (limit*32) specifically to feed the file-level
+    // aggregation pass. A high-mention file with chunks spread across many
+    // sections (e.g. STATUS.md with 21 mentions across ~30 chunks) can
+    // have every chunk individually rank below the chunk-level fetch
+    // window, missing top-N entirely. Aggregating over a larger sample
+    // lets the file's total query-term density surface even when no
+    // single chunk is competitive.
+    let bm25_fetch = (limit * 32).max(fetch);
+    let (bm25_weight, vector_weight) = fusion_weights(p.vector_weight);
+    let bm25_hits_full = index.hybrid_bm25_hits(query, bm25_fetch, p.doc_type.as_deref())?;
+    // Truncate the chunk-level list to `fetch` so it doesn't dilute RRF with
+    // tail chunks that rank too low to matter. The full set still feeds
+    // file-level aggregation below.
+    let bm25_hits: Vec<_> = bm25_hits_full.iter().take(fetch).cloned().collect();
+    let mut features = features_from_bm25(&bm25_hits);
+
+    let mut lists = vec![RankedList {
+        source: "bm25".into(),
+        weight: bm25_weight,
+        hits: bm25_hits
+            .iter()
+            .map(|hit| RankedHit {
+                entity_id: hit.entity_id.clone(),
+                rank: hit.rank,
+                score: hit.score,
+                source: "bm25".into(),
+            })
+            .collect(),
+    }];
+    // File-level BM25 aggregation: sum chunk scores per (project_id,
+    // rel_path_hash) over the FULL bm25 fetch (not the truncated chunk
+    // list) and contribute the file-level ranking as a separate signal
+    // into RRF. Lifts files with many sparse mentions across many chunks
+    // (STATUS.md, ARCS.md, etc.) — without aggregation each chunk gets
+    // a low individual score and the file falls off the top-N even when
+    // its total query-term density is the highest in the corpus.
+    let bm25_file_hits = aggregate_bm25_by_file(&bm25_hits_full);
+    if !bm25_file_hits.is_empty() {
+        lists.push(RankedList {
+            source: "bm25_file".into(),
+            weight: bm25_weight,
+            hits: bm25_file_hits,
+        });
+    }
+
+    let mut vector_status = HybridVectorStatus {
+        queues: embed_queue::status_response().routes,
+        partitions: vectors::metrics(),
+        searched_partitions: Vec::new(),
+    };
+    let mut degraded = HybridDegraded::default();
+    if p.include_vectors.unwrap_or(true) && vector_weight > 0.0 {
+        let vector_lists = vector_ranked_lists(
+            query,
+            p.query_vector.as_deref(),
+            fetch,
+            vector_weight,
+            &vector_status.partitions,
+            &mut degraded,
+        )?;
+        vector_status.searched_partitions = vector_lists
+            .iter()
+            .map(|list| list.source.trim_start_matches("vector:").to_string())
+            .collect();
+        lists.extend(vector_lists);
+    }
+
+    let fused = rrf::fuse_rrf(&lists, RRF_K, fetch);
+    let mut loaded_properties = BTreeMap::new();
+    enrich_fused_features(
+        index,
+        knowledge,
+        fused.iter().map(|hit| hit.entity_id.as_str()),
+        &mut features,
+        &mut loaded_properties,
+    )?;
+    let now = Utc::now();
+    let mut results = fused
+        .into_iter()
+        .map(|hit| {
+            let feature = features.get(&hit.entity_id).cloned().unwrap_or_default();
+            let score = rerank::apply_rerank(hit.score, &feature, now);
+            let bm25 = bm25_hits
+                .iter()
+                .find(|bm25| bm25.entity_id == hit.entity_id);
+            HybridResult {
+                rank: 0,
+                entity_id: hit.entity_id.clone(),
+                score,
+                base_score: hit.score,
+                label: label_for_entity(
+                    ctx,
+                    &hit.entity_id,
+                    loaded_properties.get(&hit.entity_id),
+                    bm25.and_then(|hit| hit.title.as_deref()),
+                ),
+                doc_type: feature.doc_type,
+                chunk_kind: feature.chunk_kind,
+                role: feature.role,
+                sources: hit.sources,
+                excerpt: bm25.map(|hit| hit.excerpt.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+    results.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.entity_id.cmp(&b.entity_id))
+    });
+    // Project scoping: when the caller passed `project`, drop project_file
+    // results from other projects so cross-project keyword pollution
+    // (e.g. erlang-test/voyage.ex outranking transcript-search/voyage.rs
+    // for "voyage" queries on the local repo) doesn't dominate top-N.
+    // Other entity types pass through unfiltered — commits / knowledge /
+    // transcripts are project-agnostic enough that the agent can decide
+    // which ones are relevant on its own.
+    if let Some(target_project_id) = resolve_project_filter(p.project.as_deref(), ctx) {
+        results.retain(|hit| keep_under_project_filter(&hit.entity_id, &target_project_id));
+    }
+    // Per-file collapse: keep only the best-scoring chunk per file. Without
+    // this the top-N gets dominated by 3-5 chunks of the same .rs file when
+    // the query matches multiple symbols in one file, starving the user of
+    // breadth. Daystrom-mk2's AgenticTools used this pattern to lift recall
+    // from 23% to 97% vs naive rerank. Keys off the (project_id,
+    // rel_path_hash) prefix of project_file refs; commits / transcripts /
+    // knowledge entities are not deduped (different files entirely).
+    let mut seen_files = std::collections::HashSet::<String>::new();
+    results.retain(|hit| {
+        let Some(key) = file_dedup_key(&hit.entity_id) else {
+            return true;
+        };
+        seen_files.insert(key)
+    });
+    // Modal diversification: when the top-`limit` would be entirely
+    // doc_section (or entirely code_block, or entirely commits), pull the
+    // highest-scoring entry of each missing kind from the rest of `results`
+    // and substitute it for the lowest-scoring kept entry of the dominant
+    // kind. Aim for at least 1 of each present (code_block, doc_section,
+    // git_message) when the fetch set has them. Mirrors Daystrom-mk2
+    // AgenticTools' diversity-by-type pass: a query like
+    // "triad implementation" should surface BOTH the design markdown and
+    // the .ex implementation file in top-N, not docs only.
+    diversify_by_chunk_kind(&mut results, limit);
+    results.truncate(limit);
+    for (idx, result) in results.iter_mut().enumerate() {
+        result.rank = idx + 1;
+    }
+
+    let text = render_text(query, &results, &vector_status, &degraded);
+    Ok(HybridSearchResponse {
+        text,
+        results,
+        vector_status,
+        degraded,
+    })
+}
+
+/// Aggregates per-chunk BM25 scores up to per-file scores and returns a
+/// ranked list keyed on the highest-scoring chunk per file. Chunks of
+/// non-project_file entities (commits, transcripts, knowledge) pass through
+/// individually so they're not double-counted in the file aggregation.
+fn aggregate_bm25_by_file(
+    chunks: &[crate::index::HybridBm25Hit],
+) -> Vec<RankedHit> {
+    use std::collections::HashMap;
+    // Group project_file chunks by (project_id, rel_path_hash). Track
+    // sum-of-scores AND count, then rank by `sum * sqrt(count)` so a file
+    // with many matching chunks (high topical coverage even when each
+    // chunk's individual TF-IDF is mediocre, e.g. STATUS.md sprawled
+    // across many sections) ranks above a file with fewer but slightly
+    // denser chunks. Score sum alone underweights breadth; sqrt(count)
+    // alone overweights it. The geometric blend lifts coverage cleanly.
+    let mut by_file: HashMap<String, (f32, usize, &crate::index::HybridBm25Hit)> =
+        HashMap::new();
+    let mut non_file_hits: Vec<&crate::index::HybridBm25Hit> = Vec::new();
+    for hit in chunks {
+        let Some(key) = file_dedup_key(&hit.entity_id) else {
+            non_file_hits.push(hit);
+            continue;
+        };
+        by_file
+            .entry(key)
+            .and_modify(|(score, count, repr)| {
+                *score += hit.score;
+                *count += 1;
+                if hit.score > repr.score {
+                    *repr = hit;
+                }
+            })
+            .or_insert((hit.score, 1, hit));
+    }
+    if by_file.len() <= 1 {
+        // Aggregation only contributes signal when multiple files appear in
+        // the chunk-level results. With one or zero, there's nothing to
+        // re-rank — return empty so the existing chunk-level RRF pass owns
+        // the ranking.
+        return Vec::new();
+    }
+    let mut aggregated: Vec<(String, f32, &crate::index::HybridBm25Hit)> = by_file
+        .into_iter()
+        .map(|(_, (score, count, repr))| {
+            let combined = score * (count as f32).sqrt();
+            (repr.entity_id.clone(), combined, repr)
+        })
+        .collect();
+    aggregated.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    aggregated
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (entity_id, score, _repr))| RankedHit {
+            entity_id,
+            rank: idx + 1,
+            score,
+            source: "bm25_file".into(),
+        })
+        .collect()
+}
+
+/// Resolves the caller's `project` parameter to a canonical project_id
+/// (8-hex). Accepts:
+///   - a bare 8-hex project_id (returned as-is)
+///   - an absolute path that's already in the registry (looked up)
+///   - any other absolute path (computed via `entity_ref::project_id_for_path`)
+/// Returns `None` when no parameter was supplied or resolution failed (the
+/// caller treats `None` as "no scoping").
+fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Bare project_id pass-through.
+    if raw.len() == 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(raw.to_lowercase());
+    }
+    // Try the registry first so symlink aliases collapse to the same id.
+    if let Some(state) = ctx.state() {
+        let projects = state.projects.read().list();
+        let canonical = std::fs::canonicalize(raw).ok()?;
+        if let Some(record) = projects
+            .iter()
+            .find(|r| std::path::PathBuf::from(&r.canonical_path) == canonical)
+        {
+            return Some(record.project_id.clone());
+        }
+    }
+    // Fall back to the deterministic path-derived id even when the project
+    // hasn't been registered yet — useful for one-shot scoped searches.
+    crate::entity_ref::project_id_for_path(raw).ok()
+}
+
+/// Decides whether a search hit survives the project filter. Project-file
+/// refs must match the target project_id; other entity types pass through
+/// (commits/knowledge/transcripts/sessions/etc are project-agnostic enough
+/// that the agent can prune them itself if needed).
+fn keep_under_project_filter(entity_id: &str, target_project_id: &str) -> bool {
+    let mut parts = entity_id.split(':');
+    if parts.next() != Some("project_file") {
+        return true;
+    }
+    parts.next() == Some(target_project_id)
+}
+
+/// Returns a per-file dedup key when `entity_id` refers to a project_file
+/// chunk: `project_file:<proj>:<rel_path_hash>` — i.e. the file path identity
+/// minus chunk_hash + occurrence_idx. Returns `None` for any other entity
+/// type so commits / transcripts / knowledge entries are passed through
+/// without being collapsed against each other.
+fn file_dedup_key(entity_id: &str) -> Option<String> {
+    let mut parts = entity_id.split(':');
+    if parts.next()? != "project_file" {
+        return None;
+    }
+    let proj = parts.next()?;
+    let rel_path_hash = parts.next()?;
+    Some(format!("project_file:{proj}:{rel_path_hash}"))
+}
+
+/// Promotes the highest-scoring entry of each chunk_kind into the top-`limit`
+/// window so the surface returned to the caller covers code + docs + commits
+/// when the fetch set has them. Approach: keep results sorted by score, walk
+/// from the back of the kept window swapping the lowest-ranked entry of the
+/// dominant kind out for the highest-ranked entry of an absent kind sitting
+/// just below the cutoff. Conservative — never displaces an entry of a kind
+/// that's already underrepresented.
+fn diversify_by_chunk_kind(results: &mut [HybridResult], limit: usize) {
+    if results.len() <= limit {
+        return;
+    }
+    // Kinds we deliberately balance. `None` chunk_kind is left alone (it's
+    // mostly transcripts and synthetic entities — pure-vector fallback hits
+    // that don't fit into the modal taxonomy).
+    const TARGET_KINDS: &[&str] = &["code_block", "doc_section", "git_message"];
+    for &target in TARGET_KINDS {
+        let already_in_top = results[..limit]
+            .iter()
+            .any(|r| r.chunk_kind.as_deref() == Some(target));
+        if already_in_top {
+            continue;
+        }
+        // Find the best below-cutoff entry of the missing kind.
+        let Some(promote_idx) = results[limit..]
+            .iter()
+            .position(|r| r.chunk_kind.as_deref() == Some(target))
+            .map(|i| limit + i)
+        else {
+            continue; // not present in fetch set; skip
+        };
+        // Find the displaceable kept entry: the lowest-ranked one whose
+        // kind is over-represented (i.e. not the target and not the only
+        // representative of its kind in the kept window).
+        let mut kind_counts = std::collections::HashMap::<Option<&str>, usize>::new();
+        for r in &results[..limit] {
+            *kind_counts.entry(r.chunk_kind.as_deref()).or_default() += 1;
+        }
+        let displaceable = (0..limit).rev().find(|&i| {
+            let kind = results[i].chunk_kind.as_deref();
+            kind != Some(target) && kind_counts.get(&kind).copied().unwrap_or(0) > 1
+        });
+        if let Some(displace_idx) = displaceable {
+            results.swap(displace_idx, promote_idx);
+        }
+    }
+}
+
+fn vector_ranked_lists(
+    query: &str,
+    supplied_query_vector: Option<&[f32]>,
+    fetch: usize,
+    vector_weight: f32,
+    partitions: &BTreeMap<String, PartitionMetrics>,
+    degraded: &mut HybridDegraded,
+) -> Result<Vec<RankedList>> {
+    let router = EmbeddingRouter::load_default().unwrap_or_default();
+    let mut route_buckets = BTreeMap::<String, BTreeSet<Bucket>>::new();
+    for bucket in Bucket::ALL {
+        match router.route(bucket, None) {
+            Ok(route) => {
+                route_buckets
+                    .entry(route.vector_route_id())
+                    .or_default()
+                    .insert(bucket);
+            }
+            Err(err) => {
+                degraded
+                    .vector_errors
+                    .insert(bucket.as_str().into(), sanitize_error(&err));
+            }
+        }
+    }
+
+    let mut lists = Vec::new();
+    let mut embedded_queries = HashMap::<String, Vec<f32>>::new();
+    for (route, metrics) in partitions {
+        if metrics.active_count == 0 {
+            continue;
+        }
+        let query_vector = if let Some(vector) = supplied_query_vector {
+            if vector.len() != metrics.dims {
+                degraded.skipped_partitions.insert(
+                    route.clone(),
+                    format!(
+                        "query vector dims {} do not match partition dims {}",
+                        vector.len(),
+                        metrics.dims
+                    ),
+                );
+                continue;
+            }
+            vector.to_vec()
+        } else {
+            let Some(buckets) = route_buckets.get(route) else {
+                degraded.skipped_partitions.insert(
+                    route.clone(),
+                    "no configured bucket maps to this partition".into(),
+                );
+                continue;
+            };
+            let bucket = *buckets.iter().next().unwrap_or(&Bucket::Knowledge);
+            let cache_key = format!("{route}:{}", bucket.as_str());
+            if !embedded_queries.contains_key(&cache_key) {
+                match embed_query(&router, bucket, query) {
+                    Ok(vector) => {
+                        embedded_queries.insert(cache_key.clone(), vector);
+                    }
+                    Err(err) => {
+                        degraded
+                            .vector_errors
+                            .insert(route.clone(), sanitize_error(&err));
+                        continue;
+                    }
+                }
+            }
+            embedded_queries
+                .get(&cache_key)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let hits = vectors::search(route, &query_vector, fetch)
+            .with_context(|| format!("searching vector partition {route}"))?;
+        lists.push(RankedList {
+            source: format!("vector:{route}"),
+            weight: vector_weight,
+            hits: hits
+                .into_iter()
+                .enumerate()
+                .map(|(idx, hit)| RankedHit {
+                    entity_id: hit.id,
+                    rank: idx + 1,
+                    score: 1.0 - hit.distance,
+                    source: format!("vector:{route}"),
+                })
+                .collect(),
+        });
+    }
+    Ok(lists)
+}
+
+fn fusion_weights(vector_weight: Option<f32>) -> (f32, f32) {
+    let vector_weight = vector_weight.unwrap_or(VECTOR_WEIGHT).clamp(0.0, 1.0);
+    (1.0 - vector_weight, vector_weight)
+}
+
+fn embed_query(router: &EmbeddingRouter, bucket: Bucket, query: &str) -> Result<Vec<f32>> {
+    let provider = router.route_for(bucket, None)?;
+    embed_with_provider(provider, query)
+}
+
+fn embed_with_provider(provider: Box<dyn EmbeddingProvider>, query: &str) -> Result<Vec<f32>> {
+    let texts = vec![query.to_string()];
+    let vectors = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(provider.embed_batch(&texts))),
+        Err(_) => {
+            let runtime = tokio::runtime::Runtime::new().context("creating embedding runtime")?;
+            runtime.block_on(provider.embed_batch(&texts))
+        }
+    }?;
+    vectors
+        .into_iter()
+        .next()
+        .context("embedding provider returned no query vector")
+}
+
+fn features_from_bm25(hits: &[HybridBm25Hit]) -> BTreeMap<String, RerankFeatures> {
+    hits.iter()
+        .map(|hit| {
+            (
+                hit.entity_id.clone(),
+                RerankFeatures {
+                    doc_type: non_empty(&hit.doc_type),
+                    chunk_kind: non_empty(&hit.chunk_kind),
+                    role: non_empty(&hit.role),
+                    ..RerankFeatures::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn enrich_knowledge_features(
+    knowledge: &Knowledge,
+    features: &mut BTreeMap<String, RerankFeatures>,
+) {
+    for (entity_id, feature) in features {
+        let Some(id) = entity_id.strip_prefix("knowledge:") else {
+            continue;
+        };
+        let Some(entry) = knowledge.entry(id) else {
+            continue;
+        };
+        if feature.doc_type.is_none() {
+            feature.doc_type = Some("knowledge".into());
+        }
+        feature.approval = Some(format!("{:?}", entry.approval));
+        feature.created_at = Some(entry.created_at.clone());
+        feature.last_recalled = entry.last_recalled.clone();
+        feature.recall_count = entry.recall_count.min(u64::from(u32::MAX)) as u32;
+    }
+}
+
+fn enrich_fused_features<'a>(
+    index: &TranscriptIndex,
+    knowledge: &Knowledge,
+    entity_ids: impl Iterator<Item = &'a str>,
+    features: &mut BTreeMap<String, RerankFeatures>,
+    loaded_properties: &mut BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<()> {
+    for entity_id in entity_ids {
+        if !features.contains_key(entity_id) {
+            let indexed_properties = index.entity_properties(entity_id)?;
+            let mut feature = indexed_properties
+                .as_ref()
+                .map(features_from_properties)
+                .unwrap_or_default();
+            if let Some(properties) = indexed_properties {
+                loaded_properties.insert(entity_id.to_string(), properties);
+            }
+            if entity_id.starts_with("knowledge:") && feature.doc_type.is_none() {
+                feature.doc_type = Some("knowledge".into());
+            }
+            features.insert(entity_id.to_string(), feature);
+        }
+        if let Some(properties) = knowledge_properties(knowledge, entity_id) {
+            loaded_properties
+                .entry(entity_id.to_string())
+                .or_default()
+                .extend(properties);
+        }
+    }
+    enrich_knowledge_features(knowledge, features);
+    Ok(())
+}
+
+fn features_from_properties(properties: &BTreeMap<String, String>) -> RerankFeatures {
+    RerankFeatures {
+        doc_type: properties.get("doc_type").cloned(),
+        chunk_kind: properties.get("chunk_kind").cloned(),
+        role: properties.get("role").cloned(),
+        ..RerankFeatures::default()
+    }
+}
+
+fn knowledge_properties(
+    knowledge: &Knowledge,
+    entity_id: &str,
+) -> Option<BTreeMap<String, String>> {
+    let id = entity_id.strip_prefix("knowledge:")?;
+    let entry = knowledge.entry(id)?;
+    let mut properties = BTreeMap::new();
+    properties.insert("title".into(), entry.title.clone());
+    properties.insert("doc_type".into(), "knowledge".into());
+    properties.insert("approval".into(), format!("{:?}", entry.approval));
+    properties.insert("created_at".into(), entry.created_at.clone());
+    if let Some(last_recalled) = &entry.last_recalled {
+        properties.insert("last_recalled".into(), last_recalled.clone());
+    }
+    Some(properties)
+}
+
+fn label_for_entity(
+    ctx: &ProviderContext<'_>,
+    entity_id: &str,
+    loaded: Option<&BTreeMap<String, String>>,
+    bm25_title: Option<&str>,
+) -> String {
+    EntityRef::parse(entity_id)
+        .ok()
+        .and_then(|r| entity_loader::compact_label(ctx, &r, loaded))
+        .or_else(|| bm25_title.map(str::to_string))
+        .unwrap_or_else(|| compact_entity_label(entity_id))
+}
+
+fn render_text(
+    query: &str,
+    results: &[HybridResult],
+    vector_status: &HybridVectorStatus,
+    degraded: &HybridDegraded,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Hybrid search: {query}\n\n"));
+    if results.is_empty() {
+        out.push_str("No results found.\n");
+    } else {
+        for result in results {
+            out.push_str(&format!(
+                "{}. {} — {:.5}\n   {}\n",
+                result.rank, result.label, result.score, result.entity_id
+            ));
+            if let Some(excerpt) = &result.excerpt {
+                out.push_str(&format!("   > {}\n", excerpt.replace('\n', " ")));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\nVector status: {} queue route(s), {} partition(s), {} searched\n",
+        vector_status.queues.len(),
+        vector_status.partitions.len(),
+        vector_status.searched_partitions.len()
+    ));
+    if !degraded.vector_errors.is_empty() || !degraded.skipped_partitions.is_empty() {
+        out.push_str("Degraded vector routes:\n");
+        for (route, err) in &degraded.vector_errors {
+            out.push_str(&format!("  - {route}: {err}\n"));
+        }
+        for (route, err) in &degraded.skipped_partitions {
+            out.push_str(&format!("  - {route}: {err}\n"));
+        }
+    }
+    out
+}
+
+fn compact_entity_label(entity_id: &str) -> String {
+    entity_id.chars().take(80).collect()
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn sanitize_error(err: &anyhow::Error) -> String {
+    let mut value = err.to_string();
+    if let Some((first, _)) = value.split_once('\n') {
+        value = first.to_string();
+    }
+    if value.len() > 200 {
+        value.truncate(197);
+        value.push_str("...");
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::knowledge::{
+        Approval, Category, KnowledgeEntry, KnowledgeStore, Priority, Scope, Status,
+    };
+    use crate::search::rrf::{FusedHit, RankedList};
+
+    #[test]
+    fn response_shape_includes_vector_status() {
+        let text = render_text(
+            "fixture",
+            &[HybridResult {
+                rank: 1,
+                entity_id: "knowledge:a".into(),
+                score: 0.1,
+                base_score: 0.1,
+                label: "A".into(),
+                doc_type: Some("knowledge".into()),
+                chunk_kind: None,
+                role: None,
+                sources: BTreeMap::new(),
+                excerpt: None,
+            }],
+            &HybridVectorStatus::default(),
+            &HybridDegraded::default(),
+        );
+        assert!(text.contains("Hybrid search: fixture"));
+        assert!(text.contains("Vector status"));
+    }
+
+    #[test]
+    fn reranked_results_collapse_same_entity() {
+        let fused = vec![FusedHit {
+            entity_id: "knowledge:a".into(),
+            score: 0.2,
+            sources: BTreeMap::from([("bm25".into(), 0.1), ("vector:x".into(), 0.1)]),
+        }];
+        let lists = vec![RankedList {
+            source: "bm25".into(),
+            weight: 1.0,
+            hits: vec![RankedHit {
+                entity_id: "knowledge:a".into(),
+                rank: 1,
+                score: 1.0,
+                source: "bm25".into(),
+            }],
+        }];
+        assert_eq!(
+            crate::search::rrf::fuse_rrf(&lists, 60.0, 10)[0].entity_id,
+            fused[0].entity_id
+        );
+    }
+
+    #[test]
+    fn query_vector_dim_mismatch_degrades_partition() {
+        let mut degraded = HybridDegraded::default();
+        let partitions = BTreeMap::from([(
+            "route-a".into(),
+            PartitionMetrics {
+                route: "route-a".into(),
+                state: crate::vectors::PartitionState::Active { dims: 3 },
+                dims: 3,
+                wal_records: 1,
+                active_count: 1,
+                deleted_count: 0,
+                deleted_ratio: 0.0,
+                hnsw_rebuilds: 1,
+                hnsw: None,
+            },
+        )]);
+        let lists =
+            vector_ranked_lists("q", Some(&[1.0, 0.0]), 5, 0.6, &partitions, &mut degraded)
+                .unwrap();
+        assert!(lists.is_empty());
+        assert!(degraded.skipped_partitions["route-a"].contains("do not match"));
+    }
+
+    #[test]
+    fn vector_weight_is_clamped_and_complemented() {
+        assert_eq!(fusion_weights(Some(1.8)), (0.0, 1.0));
+        assert_eq!(fusion_weights(Some(-0.2)), (1.0, 0.0));
+
+        let (bm25, vector) = fusion_weights(None);
+        assert!((bm25 - 0.4).abs() < f32::EPSILON);
+        assert!((vector - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn vector_only_knowledge_features_receive_approval_multiplier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("knowledge.json");
+        let store = KnowledgeStore {
+            version: 1,
+            entries: vec![KnowledgeEntry {
+                id: "vector-only".into(),
+                title: "Vector only".into(),
+                content: "semantic-only content".into(),
+                cluster: None,
+                variants: HashMap::new(),
+                category: Category::Memory,
+                scope: Scope::Project,
+                project: Some("/tmp/project".into()),
+                providers: Vec::new(),
+                priority: Priority::Standard,
+                weight: 100,
+                status: Status::Active,
+                approval: Approval::UserConfirmed,
+                render: true,
+                decay: true,
+                review_at: None,
+                supersedes: None,
+                links: Vec::new(),
+                rationale: None,
+                expires_at: None,
+                source: "test".into(),
+                created_at: "2026-05-05T00:00:00Z".into(),
+                updated_at: "2026-05-05T00:00:00Z".into(),
+                recall_count: 0,
+                last_recalled: None,
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let knowledge = Knowledge::open(&path).unwrap();
+        let mut features = BTreeMap::from([(
+            "knowledge:vector-only".to_string(),
+            RerankFeatures::default(),
+        )]);
+
+        enrich_knowledge_features(&knowledge, &mut features);
+
+        let feature = &features["knowledge:vector-only"];
+        assert_eq!(feature.doc_type.as_deref(), Some("knowledge"));
+        assert_eq!(feature.approval.as_deref(), Some("UserConfirmed"));
+        assert_eq!(rerank::type_multiplier(feature), 1.35);
+    }
+
+    #[test]
+    fn label_for_entity_prefers_loaded_properties() {
+        let ctx = ProviderContext::empty_for_tests();
+        let loaded = BTreeMap::from([("title".into(), "Loaded Knowledge Title".into())]);
+
+        assert_eq!(
+            label_for_entity(&ctx, "knowledge:abc12345", Some(&loaded), None),
+            "Loaded Knowledge Title"
+        );
+    }
+}

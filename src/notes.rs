@@ -273,8 +273,9 @@ impl Notes {
             resolution_note: None,
         };
 
-        self.store.notes.push(note);
+        self.store.notes.push(note.clone());
         self.save()?;
+        crate::embed_queue::enqueue_note(&note);
 
         Ok(format!("Note {id} recorded (kind={})", kind.as_ref()))
     }

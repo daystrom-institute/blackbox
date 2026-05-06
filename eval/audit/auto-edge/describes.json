@@ -1,0 +1,17 @@
+[
+  { "id": "describes-01", "entity": { "vars": { "vote_aggregate": { "vote1": "yes", "vote2": "yes", "vote3": "yes" } } }, "expected": "write_edge" },
+  { "id": "describes-02", "entity": { "vars": { "vote_aggregate": { "vote1": "yes", "vote2": "yes", "vote3": "no" } } }, "expected": "write_edge" },
+  { "id": "describes-03", "entity": { "vars": { "vote_aggregate": { "vote1": "yes", "vote2": "no", "vote3": "yes" } } }, "expected": "write_edge" },
+  { "id": "describes-04", "entity": { "vars": { "vote_aggregate": { "vote1": "no", "vote2": "yes", "vote3": "yes" } } }, "expected": "write_edge" },
+  { "id": "describes-05", "entity": { "vars": { "vote_aggregate": { "vote1": "yes", "vote2": "yes", "vote3": "yes" } } }, "expected": "write_edge" },
+  { "id": "describes-06", "entity": { "vars": { "vote_aggregate": { "vote1": "yes", "vote2": "no", "vote3": "no" } } }, "expected": "hold_for_review" },
+  { "id": "describes-07", "entity": { "vars": { "vote_aggregate": { "vote1": "no", "vote2": "yes", "vote3": "no" } } }, "expected": "hold_for_review" },
+  { "id": "describes-08", "entity": { "vars": { "vote_aggregate": { "vote1": "no", "vote2": "no", "vote3": "yes" } } }, "expected": "hold_for_review" },
+  { "id": "describes-09", "entity": { "vars": { "vote_aggregate": { "vote1": "yes", "vote2": "no", "vote3": "no" } } }, "expected": "hold_for_review" },
+  { "id": "describes-10", "entity": { "vars": { "vote_aggregate": { "vote1": "no", "vote2": "yes", "vote3": "no" } } }, "expected": "hold_for_review" },
+  { "id": "describes-11", "entity": { "vars": { "vote_aggregate": { "vote1": "no", "vote2": "no", "vote3": "no" } } }, "expected": "reject" },
+  { "id": "describes-12", "entity": { "vars": { "vote_aggregate": { "vote1": "no", "vote2": "no", "vote3": "no" } } }, "expected": "reject" },
+  { "id": "describes-13", "entity": { "vars": { "vote_aggregate": { "vote1": "no", "vote2": "no", "vote3": "no" } } }, "expected": "reject" },
+  { "id": "describes-14", "entity": { "vars": { "vote_aggregate": { "vote1": "no", "vote2": "no", "vote3": "no" } } }, "expected": "reject" },
+  { "id": "describes-15", "entity": { "vars": { "vote_aggregate": { "vote1": "no", "vote2": "no", "vote3": "no" } } }, "expected": "reject" }
+]

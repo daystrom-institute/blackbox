@@ -1,0 +1,24 @@
+{
+  "id": "decision-rule-packet-validation",
+  "query_class": "stale_decision_lookup",
+  "pass_strictness": "all",
+  "query": "what validated the rule-packet gap-to-primitive loop?",
+  "target_locators": [
+    {
+      "description": "Decision 7ee3f895 saying the rule-packet system validated the gap-to-primitive-to-adoption loop.",
+      "entity_type_hint": "knowledge",
+      "knowledge_hint": "7ee3f895"
+    }
+  ],
+  "expected_entity_refs": [
+    "knowledge:7ee3f895"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "KNOWLEDGE_FROM_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer only with the generic sm-rule-packets runbook; the decision entry is the target."
+  ],
+  "pass_classifier": "check_decision_rule_packet_validation"
+}

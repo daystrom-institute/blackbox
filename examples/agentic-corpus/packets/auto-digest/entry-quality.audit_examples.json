@@ -1,0 +1,20 @@
+{
+  "packet_id": "domain:auto-digest/entry-quality",
+  "mode": "first",
+  "dataset": [
+    {
+      "entity": {
+        "vars": {
+          "candidate": {
+            "rendered": false,
+            "source_session": "session-1",
+            "source_files": [],
+            "daily_count": 1,
+            "brofile": "digest-extractor"
+          }
+        }
+      },
+      "expected": "auto_apply"
+    }
+  ]
+}

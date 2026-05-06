@@ -1,0 +1,33 @@
+{
+  "id": "cross-modal-recursion-guard",
+  "query_class": "cross_modal_code_prose",
+  "pass_strictness": "all",
+  "query": "show the docs and implementation for the mechanical recursion guard.",
+  "target_locators": [
+    {
+      "description": "The project convention describing the mechanical recursion guard.",
+      "entity_type_hint": "project_file",
+      "path_hint": "AGENTS.md"
+    },
+    {
+      "description": "The MCP filter implementation that applies the default bro_* disallow guard.",
+      "entity_type_hint": "project_file",
+      "path_hint": "src/orchestration/mcp.rs"
+    }
+  ],
+  "expected_entity_refs": [
+    "project_file:d723917f:a54ff182:27d6dd72cfbc502d8378c0f2972645f56e3f54dbde99481de3b2d04e624b7f60:5",
+    "project_file:d723917f:3f15b6df:e871e9b8511d5436016fa80df2cbea8d89fa4568ece5fb3825060e6377afe542:20"
+  ],
+  "required_evidence": {
+    "kind": "entity_set",
+    "value": [
+      "project_file",
+      "symbol"
+    ]
+  },
+  "forbidden_stale_answers": [
+    "Do not use the retired prose-only recursion guard as the implementation."
+  ],
+  "pass_classifier": "check_cross_modal_recursion_guard"
+}

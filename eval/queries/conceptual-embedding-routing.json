@@ -1,0 +1,23 @@
+{
+  "id": "conceptual-embedding-routing",
+  "query_class": "conceptual_design_doc",
+  "query": "how are embedding providers routed per bucket?",
+  "target_locators": [
+    {
+      "description": "The design section for config-driven per-bucket routing across Voyage and Ollama.",
+      "entity_type_hint": "project_file",
+      "path_hint": "design/agentic-corpus.md"
+    }
+  ],
+  "expected_entity_refs": [
+    "project_file:d723917f:3b317e2b:9e962df35fb0d350805331d9fd58dd98af72a31399cc7c97e320bf1bced3d29f:5"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "LINKS_TO_SECTION"
+  },
+  "forbidden_stale_answers": [
+    "Do not hardcode Voyage as the provider for all buckets; routing is config-driven."
+  ],
+  "pass_classifier": "check_conceptual_embedding_routing"
+}

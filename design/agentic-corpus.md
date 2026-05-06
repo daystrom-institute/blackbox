@@ -368,13 +368,30 @@ cost is measured.
 ### 5.6 Project + repo identity
 
 `project_id` = realpath hash (sha256 of the canonicalized absolute path of the
-project root, truncated to 8 hex). Stable across symlink aliases — the same
-underlying repo accessed from different paths collapses to one project_id.
+project root, truncated to 8 hex). Stable across symlink aliases on the SAME
+machine — the same underlying repo accessed from different paths collapses to
+one project_id. **Per-machine by construction**; this is acceptable because
+project_id is internal to one daemon's corpus.
 
-`repo_id` = same algorithm, applied at the git repo root (which may be the
-same as project root or an ancestor for monorepo subdirs). For projects not
-under git, `repo_id == project_id` and git-related edges/entity types are
-absent.
+`repo_id` is **content-derived** so it survives clones and is portable across
+machines. Resolution order:
+1. **First-commit SHA** — `git rev-list --max-parents=0 HEAD` returns the
+   root commit. Hash truncated to 8 hex. Same for every clone of the same
+   git history. Default for full clones.
+2. **Remote URL** — `git config remote.origin.url`. Hash truncated to 8 hex.
+   Fallback for shallow clones (which lack the root commit) and for cases
+   where the first commit is rewritten by history-rewriting tools.
+3. **Realpath hash** — same algorithm as `project_id`. Last-resort fallback
+   for projects not under git, or git repos with no root commit and no
+   remote (rare).
+
+This matters for cross-machine portability of provenance (§15). When alice's
+daemon writes `commit:<repo_id>:<sha>` into `refs/notes/bbox/*`, bob fetches
+the notes; both daemons compute the same `repo_id` from the same git
+content, so the edge target resolves consistently.
+
+For projects not under git, `repo_id == project_id` and git-related
+edges/entity types are absent.
 
 There's no notion of "account" in entity refs. Bbox tracks one daemon, one
 unified corpus, accessible from any client (Claude Code / Codex / Gemini /

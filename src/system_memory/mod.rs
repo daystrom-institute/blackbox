@@ -41,7 +41,57 @@ pub struct SystemMemory {
 
 /// The full catalog. Order is stable; agents fetching by ID are immune to it,
 /// but listings return in this order so hand-curated priority is preserved.
+/// `sm-agentic-opening-sequence` sits at position [0] so any unfiltered
+/// listing surfaces it first — it's the cold-agent grounding pattern that
+/// every other primitive composes into.
 pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
+    SystemMemory {
+        id: "sm-agentic-opening-sequence",
+        title: "Agentic opening sequence — orient, search, inspect, traverse, answer",
+        tags: &[
+            // Direct names
+            "opening",
+            "opening-sequence",
+            "grounding",
+            "first-step",
+            "first-loop",
+            "agentic",
+            "agentic-tools",
+            "discover",
+            "discover-seed",
+            "inspect",
+            "inspect-entity",
+            "find-paths",
+            "bundle-evidence",
+            "bundle",
+            "describe-schema",
+            // Subject-facing vocabulary cold agents reach for when they
+            // don't yet know the bbox surface. These are the queries that
+            // SHOULD route to this runbook before the agent defaults to a
+            // single bbox_knowledge call.
+            "where",
+            "what",
+            "why",
+            "who",
+            "how",
+            "when",
+            "trace",
+            "chain",
+            "blast-radius",
+            "impact",
+            "lineage",
+            "history",
+            "provenance",
+            "navigate",
+            "search-quality",
+            "graph-walk",
+            "answer-protocol",
+            "verification",
+            "self-check",
+            "answer",
+        ],
+        content: include_str!("agentic-opening-sequence.md"),
+    },
     SystemMemory {
         id: "sm-rule-packets",
         title: "Rule-packets — compile a reusable mechanism from examples",

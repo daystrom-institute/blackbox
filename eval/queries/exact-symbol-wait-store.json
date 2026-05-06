@@ -1,0 +1,24 @@
+{
+  "id": "exact-symbol-wait-store",
+  "query_class": "exact_symbol",
+  "query": "what code defines WaitStore for workflow waits?",
+  "target_locators": [
+    {
+      "description": "The Rust WaitStore type used by workflow wait nodes and signal dispatch.",
+      "entity_type_hint": "symbol",
+      "path_hint": "src/workflow/wait.rs",
+      "symbol_hint": "WaitStore"
+    }
+  ],
+  "expected_entity_refs": [
+    "symbol:d723917f:WaitStore:77ea635a6c7e4fe4783cfe1894804d2a96bba10caff0378c35f9dfc9ef382df1"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "DEFINED_IN"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer with the workflow run store or task store; this query is specifically about wait-node signal storage."
+  ],
+  "pass_classifier": "check_exact_symbol_wait_store"
+}

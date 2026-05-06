@@ -1,10 +1,26 @@
 # blackbox
 
-Single daemon for AI dev tooling: full-text search across Claude Code / Codex / Copilot / Vibe / Gemini transcripts, a unified knowledge store rendered into each provider's markdown files, work-thread tracking, and multi-provider agent orchestration with a live multi-lane tail TUI. Backed by [tantivy](https://github.com/quickwit-oss/tantivy) (Rust, BM25 ranking). Sub-50ms queries over hundreds of thousands of indexed documents.
+Single daemon for AI dev tooling: hybrid (BM25 + vector + path-token)
+search across Claude Code / Codex / Copilot / Vibe / Gemini transcripts
+**plus** registered project source code, an agentic graph projection
+over the same substrate (12 entity types, 7 edge families, ~1.1M
+indexed docs / ~1.9M edges as of this writing), a unified knowledge
+store rendered into each provider's markdown files, work-thread
+tracking, and multi-provider agent orchestration with a live
+multi-lane tail TUI. Backed by [tantivy](https://github.com/quickwit-oss/tantivy)
+(Rust) and HNSW vector partitions per provider+model+dim combination.
+Voyage `voyage-code-3` (1024d) is the default embedding provider; Ollama
+`nomic-embed-text` (768d) supported as a local fallback.
 
 The crate is `blackbox`. It produces two binaries:
 - **`blackboxd`** — HTTP-MCP daemon (one long-lived user service, shared across all CLIs on the host)
 - **`bro`** — terminal TUI for tailing live orchestration activity
+
+**For deep operating notes** — agentic graph internals, hybrid retrieval
+internals, embedding pipeline + voyage/ollama config, schema migration
+flow, upkeep checklist, key paths on disk, system memories index,
+provider integration matrix — see
+[`docs/operating-blackbox.md`](docs/operating-blackbox.md).
 
 ---
 
@@ -337,6 +353,28 @@ closed networks).
 
 ## MCP tools reference
 
+For deep operating notes — agentic graph internals, hybrid retrieval,
+embedding pipeline, schema migration, upkeep checklist, key paths on
+disk, system memories, provider integration matrix, open follow-ups —
+see [`docs/operating-blackbox.md`](docs/operating-blackbox.md).
+
+### Agentic graph (`bbox_*`)
+
+The 5-step opening sequence — orient → search → inspect → traverse →
+answer. Pull `sm-agentic-opening-sequence` via `bbox_knowledge` for the
+full protocol + question-type checklist.
+
+| Tool | Description |
+|---|---|
+| `bbox_describe_schema` | Catalog of 12 entity types + 7 edge families with population counts. Step 1 of the opening sequence. |
+| `bbox_hybrid_search` | BM25 + vector + path-token fusion with per-file collapse + modal diversification + project filter. Default search call. |
+| `bbox_discover_seed_entities` | `bbox_hybrid_search` variant rendering `notable_edges` per seed for orientation hops. |
+| `bbox_inspect_entity` | Properties + edges in one call. Pass `edge_types` and `direction` to scope. Follow `recommended_next_hops`. |
+| `bbox_find_paths` | Direction-preserving BFS chains. Pass `path_ids` from this directly into `bbox_bundle_evidence`. |
+| `bbox_bundle_evidence` | Package selected refs + cached path IDs into a structured answer kit with content_previews + 1-hop intra-bundle edges + 2-hop convergences (shared session/commit). |
+| `bbox_blame` | Walk a code line back to the producing commit + (when bbox-anchored) the originating session/brofile/arc. |
+| `bbox_provenance_export` / `bbox_provenance_import` | Round-trip provenance via `refs/notes/bbox/provenance` git notes. |
+
 ### Transcript search (`bbox_*`)
 
 | Tool | Description |
@@ -348,7 +386,11 @@ closed networks).
 | `bbox_topics` | Top terms from a session by frequency analysis (no LLM). Stop-word filtered. |
 | `bbox_sessions_list` | Browse sessions across accounts, sorted by recency. Filter by account, project. |
 | `bbox_reindex` | Incremental (default) or full rebuild. Only re-processes new/modified files. |
+| `bbox_reembed` | Re-fill the embedding queue for one route from indexed entities. Used after provider changes or to backfill embeddings that were dropped during outages. |
+| `bbox_embed_status` | Per-route status: provider, model, dimensions, queue depth, indexed count, last error. |
 | `bbox_stats` | Corpus statistics: document count, index size, per-account file counts. |
+| `bbox_project_register` / `bbox_project_list` | Register a repo root for project_file indexing + git history tracking. |
+| `bbox_cite` | Origin-finding for a rule or claim — returns transcripts oldest-first. |
 
 ### Knowledge store (`bbox_*`)
 

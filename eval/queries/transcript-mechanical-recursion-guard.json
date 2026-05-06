@@ -1,0 +1,24 @@
+{
+  "id": "transcript-mechanical-recursion-guard",
+  "query_class": "transcript_provenance",
+  "pass_strictness": "first",
+  "query": "where was the mechanical bro recursion guard discussed?",
+  "target_locators": [
+    {
+      "description": "Transcript turns mentioning the default mcp__blackbox__bro_* disallow filter and mechanical recursion guard.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "mechanical recursion guard mcp__blackbox__bro_*"
+    }
+  ],
+  "expected_entity_refs": [
+    "transcript:account2:f11989a9-6057-4c12-af3a-cd2b86a0699f:2516124:0"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not return only the AGENTS.md convention; the provenance should include transcript hits."
+  ],
+  "pass_classifier": "check_transcript_mechanical_recursion_guard"
+}

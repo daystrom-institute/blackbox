@@ -15,6 +15,10 @@ path = "src/cli.rs"
 name = "bro-irc"
 path = "src/irc_bridge.rs"
 
+[[bin]]
+name = "bro-slack"
+path = "src/slack_bridge.rs"
+
 [dependencies]
 # Search index
 tantivy = "0.22"
@@ -22,12 +26,28 @@ tantivy = "0.22"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
 schemars = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 
 # Filesystem
 walkdir = "2"
 dirs = "6"
+ignore = "0.4"
+
+# Code parsing
+tree-sitter = "0.26"
+tree-sitter-c = "0.24.2"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-language-pack = "1.8.0-rc.26"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
 
 # Error handling
 anyhow = "1"
@@ -49,6 +69,7 @@ chrono = "0.4"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 
 # MCP SDK
 rmcp = { version = "1.4", features = [
@@ -91,6 +112,10 @@ tui-markdown = "0.3"
 # SSE stream construction
 async-stream = "0.3"
 
+# Slack Socket Mode WebSocket (bro-slack sidecar)
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
 # Process management (SIGTERM)
 libc = "0.2"
 
@@ -100,6 +125,8 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 regex = "1"
+ordered-float = "5"
+wide = "0.7"
 
 # Cron schedule parsing for the cron-inlet primitive (calendar-driven
 # tick → routing packet → arc dispatch).

@@ -11,6 +11,8 @@
 //!
 //! Adding or changing a tool = one edit here. No hand-curated drift.
 
+use std::borrow::Cow;
+
 use anyhow::Result;
 
 use crate::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
@@ -20,10 +22,13 @@ pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCategory {
     Transcripts,
+    Graph,
+    Projects,
     Knowledge,
     Threads,
     Notes,
     Inbox,
+    Artifacts,
     Packets,
     Orchestration,
     Workflows,
@@ -35,10 +40,13 @@ impl ToolCategory {
     fn heading(&self) -> &'static str {
         match self {
             Self::Transcripts => "Transcripts",
+            Self::Graph => "Agentic graph",
+            Self::Projects => "Projects",
             Self::Knowledge => "Knowledge",
             Self::Threads => "Threads",
             Self::Notes => "Side-channel notes",
             Self::Inbox => "Attention / inbox",
+            Self::Artifacts => "Artifact catalog",
             Self::Packets => "Rule-packets",
             Self::Orchestration => "Bro orchestration",
             Self::Workflows => "Workflow orchestration",
@@ -52,8 +60,12 @@ impl ToolCategory {
             Self::Transcripts => {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
             }
+            Self::Graph => {
+                "Inspect entities, graph vocabulary, paths, bundles, and retrieval."
+            }
+            Self::Projects => "Register project roots for later file indexing.",
             Self::Knowledge => {
-                "Memory has four lanes: `bbox_learn` for standing rendered rules, `bbox_remember` for cold indexed recall, `bbox_decide` for durable commitments with rationale, and `bbox_pin` for persisted but scope-limited ambient context on an active session/bro/thread/work-item. Render pipeline emits provider-specific markdown files (CLAUDE.md / AGENTS.md / GEMINI.md) only for the standing lanes."
+                "Memory lanes: `bbox_learn` for rendered rules, `bbox_remember` for cold recall, `bbox_decide` for durable commitments, and `bbox_pin` for scoped active context."
             }
             Self::Threads => {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
@@ -63,6 +75,9 @@ impl ToolCategory {
             }
             Self::Inbox => {
                 "Attention aggregator: a single read that surfaces unresolved notes, stale threads, unverified knowledge, and failed tasks. Run at round boundaries, morning-brief style, and whenever you're unsure what needs attention next."
+            }
+            Self::Artifacts => {
+                "Versioned install catalog for producer-side workflows, rule-packets, and brofiles. Use this surface instead of hand-copying shipped artifacts into daemon state; metadata tracks source, active version, and supersession."
             }
             Self::Packets => {
                 "Reusable judges compiled from examples or stated rules. If your task involves writing a priority-ordered rubric, ranking a batch against shared criteria, compressing an access table, coordinating sub-agents against identical standards, or classifying future cases the same way you classified past ones — compile a packet. `bbox_compile` authors the mechanism, `bbox_apply` evaluates any entity deterministically (no LLM), `bbox_audit` self-validates against known labels. Packets are portable: dispatch `packet_id` to sub-agents and every one of them produces bit-identical output. See `sm-rule-packets` via `bbox_knowledge` for the full runbook."
@@ -108,8 +123,22 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_search",
         category: ToolCategory::Transcripts,
         summary: "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax.",
-        when_to_use: "Use when you know the topic but not the exact session. Default `smart` mode treats adjacent terms as broad recall, preserves quoted phrases, and understands `-term`; switch to `mode=fulltext` when you want raw boolean query syntax with conjunction semantics. Filter by account, project, or role as early as possible. Pass `exclude_self=true` to suppress the caller's own current session. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders and query-shaping guidance.",
+        when_to_use: "Use when you know the topic but not the exact session. Filter by account, project, or role early. Pass `exclude_self=true` for current-turn searches. See `sm-transcript-retrieval` for ladders.",
         example: Some(r#"bbox_search(query="redis locking", project="my-app", role="user")"#),
+    },
+    ToolDoc {
+        name: "bbox_hybrid_search",
+        category: ToolCategory::Graph,
+        summary: "Hybrid BM25+vector+path-token search over typed entities. Returns mixed-modal seeds (code, docs, commits, knowledge, transcripts) ranked by RRF fusion, with per-file collapse and modal diversification so top-N covers distinct files and chunk_kinds. Pass `project=<path or project_id>` to scope project_file results to one repo. vector_weight=0.6 by default; set 0.0 for BM25-only, 1.0 for vector-only.",
+        when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits — top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes.",
+        example: Some(r#"bbox_hybrid_search(query="triad implementation", limit=10, project="/home/me/repos/erlang-test")"#),
+    },
+    ToolDoc {
+        name: "bbox_discover_seed_entities",
+        category: ToolCategory::Graph,
+        summary: "Hybrid search variant that emphasizes orientation: returns ranked seeds with their notable_edges (semantic-first prioritization) so you can pick the next inspect target without a separate call.",
+        when_to_use: "Alternate Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`) — same blender as `bbox_hybrid_search` but with `notable_edges` rendered for each seed. Reach for it when the next step will be `bbox_inspect_entity` and you want pre-vetted hops.",
+        example: Some(r#"bbox_discover_seed_entities(query="triad closure convergence test", limit=5)"#),
     },
     ToolDoc {
         name: "bbox_cite",
@@ -147,6 +176,20 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: None,
     },
     ToolDoc {
+        name: "bbox_reembed",
+        category: ToolCategory::Transcripts,
+        summary: "Request an embedding rebuild for a configured route.",
+        when_to_use: "Use after changing embedding routes or provider dimensions. E3 performs the rebuild.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_embed_status",
+        category: ToolCategory::Transcripts,
+        summary: "Return per-route embedding queue health.",
+        when_to_use: "Use when vector search degrades. Reports availability, queue depth, success count, and sanitized error",
+        example: None,
+    },
+    ToolDoc {
         name: "bbox_topics",
         category: ToolCategory::Transcripts,
         summary: "Top terms in a session by frequency.",
@@ -165,6 +208,77 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Transcripts,
         summary: "Corpus statistics (doc count, index size, file counts).",
         when_to_use: "Sanity-check the index; diagnose 'did my new sessions get indexed?'.",
+        example: None,
+    },
+    // ── Agentic graph ────────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_inspect_entity",
+        category: ToolCategory::Graph,
+        summary: "Inspect a vertex: returns properties AND targeted edges in one call. Prefer targeted inspection over broad exploration: 1) Set edge_types to the specific edges you want (e.g. 'SUPERSEDES,DERIVED_FROM'). 2) Set direction to 'out' or 'in' when you know which way to traverse. 3) Use 'both' only for initial orientation on an unfamiliar entity. 4) Set per_type_limit=0 for property-only inspection. property_mode controls detail: 'summary' (names/titles only), 'smart' (full text <=300 chars, truncated for longer - default), 'full' (no truncation).",
+        when_to_use: "Step 3 of the agentic opening sequence (`sm-agentic-opening-sequence`). Prefer targeted inspection over broad sweeps. Set `edge_types` to the specific edges you want, set `direction` to `out` or `in` when known, use `both` only for initial orientation, and set `per_type_limit=0` for property-only inspection. Follow the `recommended_next_hops` list returned in the response — it is ordered semantic-first.",
+        example: Some(
+            r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", edge_types="SUPERSEDES,DERIVED_FROM", direction="both")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_describe_schema",
+        category: ToolCategory::Graph,
+        summary: "Catalog agentic-corpus entity types and edge families. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips.",
+        when_to_use: "Step 1 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use once per session for orientation; cache the schema mentally. Returns 12 entity types + 7 edge families with population counts.",
+        example: Some("bbox_describe_schema()"),
+    },
+    ToolDoc {
+        name: "bbox_find_paths",
+        category: ToolCategory::Graph,
+        summary: "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence. edge_types accepts a comma-separated string (e.g. 'CALLS,CALLED_BY') OR a JSON array of strings. Both shapes are equivalent.",
+        when_to_use: "Step 4 of the agentic opening sequence (`sm-agentic-opening-sequence`) — only when the answer depends on a chain, not a single entity. Prefer narrow `edge_types`, set `to` or `to_type` when known, and pass returned path IDs to `bbox_bundle_evidence` before making a provenance-sensitive claim. State edge directions as the path returned them; do not invert from memory.",
+        example: Some(
+            r#"bbox_find_paths(from="knowledge:abc12345", edge_types="SUPERSEDES", max_depth=3)"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_bundle_evidence",
+        category: ToolCategory::Graph,
+        summary: "Package selected entity refs and cached path IDs into a structured evidence bundle. Use after bbox_find_paths to close the loop before answering; stale path IDs degrade explicitly under degraded.stale_path_ids instead of failing the whole response.",
+        when_to_use: "Step 5 of the agentic opening sequence (`sm-agentic-opening-sequence`) — close the loop before answering. Pass `path_ids` from `bbox_find_paths` directly; do not reconstruct path text from memory (the server holds the validated graph). This tool packages evidence only; it does not synthesize the answer for you.",
+        example: Some(
+            r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"])"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_blame",
+        category: ToolCategory::Graph,
+        summary: "Walk back from a code line to the conversation that produced it. Two modes: 1. Anchor-matching: the line's git blame commit matches a bbox-tracked tool-call anchor, returning the full session/brofile/arc/trigger chain. 2. Git-only fallback: no bbox anchor matches, returning git blame author info only, marked as non-bbox. Use this when you want to understand WHY a line exists, not just WHO wrote it.",
+        when_to_use: "Use for WHY-this-line-exists questions; check anchor-matched vs git-only.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_provenance_export",
+        category: ToolCategory::Graph,
+        summary: "Write bbox provenance git notes for commits with tracked tool-call anchors.",
+        when_to_use: "Use after committing bbox-tracked edits when provenance should travel with git history.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_provenance_import",
+        category: ToolCategory::Graph,
+        summary: "Read bbox provenance git notes and replay them into the local EdgeIndex sidecar.",
+        when_to_use: "Use after fetching or cloning bbox git notes from another machine.",
+        example: None,
+    },
+    // ── Projects ─────────────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_project_register",
+        category: ToolCategory::Projects,
+        summary: "Register a project directory for agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. Triggers the project-bootstrap-arc which walks the project, chunks files, writes to the index, and emits structural edges. project_id is derived from the canonicalized realpath and is per-machine; not portable across hosts. repo_id is null for non-git projects; for git projects it derives from the first-commit SHA (with remote-URL fallback for shallow clones), so it survives clones. Use bbox_project_list to inspect registered projects.",
+        when_to_use: "Use before S2+ needs a repo root. Symlink aliases collapse to one `project_id`; git repos also get `repo_id`.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_project_list",
+        category: ToolCategory::Projects,
+        summary: "List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered.",
+        when_to_use: "Use to inspect registered roots or confirm symlink aliases collapsed.",
         example: None,
     },
     // ── Knowledge ────────────────────────────────────────────────────
@@ -210,6 +324,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (code-embedded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. For structured packet discovery + filtering, use bbox_packet_list.",
         when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes`/`bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for a prior decision to supersede. System memories can also be fetched by canonical `sm-*` ID. Rule-packets appear in a separate section when the query hits their id / domain / rule ids / classifications — reach for bbox_packet_list when you want structured filters (scope, latest_per_domain) or richer per-packet previews.",
         example: Some(r#"bbox_knowledge(query="retry policy")"#),
+    },
+    ToolDoc {
+        name: "bbox_knowledge_link",
+        category: ToolCategory::Knowledge,
+        summary: "Append a knowledge edge.",
+        when_to_use: "",
+        example: None,
     },
     ToolDoc {
         name: "bbox_forget",
@@ -303,6 +424,32 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Aggregate attention layer across every store.",
         when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view.",
         example: Some(r#"bbox_inbox(project="/repo/x", stale_days=3)"#),
+    },
+    // ── Artifact catalog ─────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_artifact_install",
+        category: ToolCategory::Artifacts,
+        summary: "Install a workflow, packet, or brofile artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
+        when_to_use: "Use for producer-side artifacts shipped under examples/agentic-corpus or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, or brofile registry, then records version/source/supersession metadata in the catalog.",
+        example: Some(
+            r#"bbox_artifact_install(kind="workflow", source="examples/agentic-corpus/workflows/schema-migration-arc.json")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_artifact_list",
+        category: ToolCategory::Artifacts,
+        summary: "List installed workflow, packet, and brofile artifacts with version, source, active status, and supersession metadata.",
+        when_to_use: "Inventory check before installing or superseding producer machinery. Use kind/name filters to inspect a specific artifact family.",
+        example: Some(r#"bbox_artifact_list(kind="packet")"#),
+    },
+    ToolDoc {
+        name: "bbox_artifact_supersede",
+        category: ToolCategory::Artifacts,
+        summary: "Mark one installed artifact superseded by another artifact of the same kind.",
+        when_to_use: "Use when a customized workflow/packet/brofile replaces an installed version but you want the old version retained for audit.",
+        example: Some(
+            r#"bbox_artifact_supersede(kind="workflow", name="auto-digest-arc", superseded_by="auto-digest-arc-v2")"#,
+        ),
     },
     // ── Rule-packets ─────────────────────────────────────────────────
     ToolDoc {
@@ -681,7 +828,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use after the deliberation completes and any synthesis artifact (ADR markdown, PR body, etc.) has been produced. Archived boards stay readable on disk for audit but no longer count toward inbox attention.",
         example: Some(r#"whiteboard_archive(board_id="adr-2026-04-27", agent_name="facilitator")"#),
     },
-
     // ── Councils ──────────────────────────────────────────────────
     ToolDoc {
         name: "bro_council_list",
@@ -803,11 +949,30 @@ pub fn render_markdown() -> String {
     );
     out.push_str("Do not hand-edit.\n\n");
 
-    out.push_str("## CORE RULE: contextual recall\n\n");
-    out.push_str("**Early in tasks where durable knowledge-store context could change the answer, query `bbox_knowledge` before committing to an approach.** This is a recall check, not a ritual call for every tiny command.\n\n");
-    out.push_str("Use it for prior decisions, project conventions, rendered rules, remembered facts, system runbooks, and packet discovery. It is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes` / `bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`).\n\n");
-    out.push_str("The signature failure mode here: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. Avoid that on work involving repo conventions, prior decisions, active runbooks, durable user preferences, bro/orchestration behavior, or anything where durable project memory could plausibly override defaults.\n\n");
-    out.push_str("Prefer a short phrase from the user's request over a single generic keyword. If the first query is empty or too broad, try one sharper phrase. Then proceed with filesystem exploration, process probing, or normal implementation work using the retrieved context.\n\n");
+    out.push_str("## CORE RULE: agentic opening sequence\n\n");
+    out.push_str("**For any task that touches the codebase, prior decisions, or conversational history, run this five-step sequence before falling back to filesystem search or training-prior answers:**\n\n");
+    out.push_str("```\n");
+    out.push_str("1. bbox_describe_schema           # orient — entity types + edge families\n");
+    out.push_str("2. bbox_hybrid_search(q, k=5)     # seeds — mixed-modal results with notable_edges\n");
+    out.push_str("3. bbox_inspect_entity(ref)       # confirm — properties + edges in one call\n");
+    out.push_str("4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS chains (when multi-hop)\n");
+    out.push_str("5. bbox_bundle_evidence(...)      # answer — package refs + path_ids\n");
+    out.push_str("```\n\n");
+    out.push_str("Step 1 is one-time per session — cache the schema mentally. Step 4 is conditional (skip when the question is single-hop). Step 5 is the close-the-loop write that lets the user re-query your evidence.\n\n");
+    out.push_str("`bbox_blame(file, line)` is the line-level provenance escape hatch when the question is \"who/why does this line exist?\" rather than a graph walk.\n\n");
+    out.push_str("**Hard rules (break these and quality collapses):**\n\n");
+    out.push_str("1. Entity refs are canonical `<type>:<segments>` — when a tool returns `error.bad_input` with a `suggested_fix`, use the suggestion verbatim, don't guess.\n");
+    out.push_str("2. Don't restate paths from memory — pass `path_ids` from `bbox_find_paths` directly to `bbox_bundle_evidence` (the server holds the validated graph).\n");
+    out.push_str("3. Targeted inspection beats broad inspection — pass `edge_types` and `direction` once you know what you're looking for; default `direction=both` is for orientation only.\n");
+    out.push_str("4. Follow `recommended_next_hops` from `bbox_inspect_entity` — they're ordered semantic-first, structural-last.\n");
+    out.push_str("5. Trust topical hits — `bbox_hybrid_search` blends BM25 + vector + path-token boost. Top seed is the canonical entity even when wording doesn't exactly match.\n\n");
+    out.push_str("Final-answer protocol by question type and pattern recipes (where/what/who/why/how/replacement/historical/impact) live in `sm-agentic-opening-sequence`. Pull it via `bbox_knowledge(query=\"sm-agentic-opening-sequence\")` the first time you handle one of those question shapes.\n\n");
+
+    out.push_str("## CORE RULE: contextual recall fallback\n\n");
+    out.push_str("**When the opening sequence above doesn't fit (fast lookup of stored rules, no graph walk needed), query `bbox_knowledge` directly before committing to an approach.** This is a recall check, not a ritual call for every tiny command.\n\n");
+    out.push_str("Use it for prior decisions, project conventions, rendered rules, remembered facts, system runbooks (sm-* IDs), and packet discovery. It is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes` / `bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`).\n\n");
+    out.push_str("The signature failure mode: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. Avoid that on work involving repo conventions, prior decisions, active runbooks, durable user preferences, bro/orchestration behavior, or anything where durable project memory could plausibly override defaults.\n\n");
+    out.push_str("Prefer a short phrase from the user's request over a single generic keyword. If the first query is empty or too broad, try one sharper phrase or escalate to `bbox_hybrid_search` (vector lane catches paraphrases). Then proceed with the opening sequence above or normal implementation work using the retrieved context.\n\n");
     out.push_str(
         "Cost of a wasted query: near zero. Cost of a confident wrong answer: the entire task.\n\n",
     );
@@ -827,10 +992,13 @@ pub fn render_markdown() -> String {
 
     let categories = [
         ToolCategory::Transcripts,
+        ToolCategory::Graph,
+        ToolCategory::Projects,
         ToolCategory::Knowledge,
         ToolCategory::Threads,
         ToolCategory::Notes,
         ToolCategory::Inbox,
+        ToolCategory::Artifacts,
         ToolCategory::Packets,
         ToolCategory::Orchestration,
         ToolCategory::Workflows,
@@ -850,8 +1018,14 @@ pub fn render_markdown() -> String {
             out.push_str(cat.intro());
             out.push_str("\n\n");
             for doc in TOOL_DOCS.iter().filter(|d| d.category == cat) {
-                out.push_str(&format!("- **`{}`** — {}\n", doc.name, doc.summary));
-                out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
+                out.push_str(&format!(
+                    "- **`{}`** — {}\n",
+                    doc.name,
+                    hot_summary(doc.summary)
+                ));
+                if !doc.when_to_use.is_empty() {
+                    out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
+                }
                 if let Some(ex) = doc.example {
                     out.push_str(&format!("  _Example:_ `{ex}`\n"));
                 }
@@ -865,6 +1039,29 @@ pub fn render_markdown() -> String {
 
     out.push_str(WORKFLOW_NOTES);
     out
+}
+
+fn hot_summary(summary: &'static str) -> Cow<'static, str> {
+    // Cap at 240 bytes — long enough for one or two informative sentences
+    // per tool, short enough that the rendered tool reference stays
+    // skimmable. Earlier value of 12 truncated mid-word and produced
+    // unreadable lines like "Hybrid BM25+ See MCP." for every entry.
+    const MAX_SUMMARY_BYTES: usize = 240;
+    if summary.len() <= MAX_SUMMARY_BYTES {
+        return Cow::Borrowed(summary);
+    }
+    // Prefer breaking at a sentence boundary when one fits inside the cap.
+    let end = summary[..MAX_SUMMARY_BYTES]
+        .rfind(". ")
+        .map(|idx| idx + 1)
+        .unwrap_or_else(|| {
+            // Fall back to the last word boundary so we don't truncate a
+            // word in half. Walk backward from the cap to find the last space.
+            summary[..MAX_SUMMARY_BYTES]
+                .rfind(' ')
+                .unwrap_or(MAX_SUMMARY_BYTES)
+        });
+    Cow::Owned(format!("{} See MCP.", summary[..end].trim()))
 }
 
 // ── Sync into knowledge store ────────────────────────────────────────
@@ -916,6 +1113,7 @@ pub fn sync_into_knowledge(kb: &mut crate::knowledge::Knowledge) -> Result<SyncR
         status: Status::Active,
         approval: Approval::UserConfirmed,
         supersedes: None,
+        links: Vec::new(),
         rationale: None,
         expires_at: None,
         source: "tool_docs".to_string(),

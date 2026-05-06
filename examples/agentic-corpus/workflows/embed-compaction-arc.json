@@ -1,0 +1,106 @@
+{
+  "name": "embed-compaction-arc",
+  "version": 1,
+  "policy_packet": "domain:workflow-policy/arc-budget",
+  "vars_schema": {
+    "vector_status": { "kind": "object" },
+    "search_quiesced": { "kind": "bool" },
+    "rebuild_started": { "kind": "bool" },
+    "swapped": { "kind": "bool" },
+    "notified": { "kind": "bool" }
+  },
+  "actors": {},
+  "start": "Setup",
+  "nodes": {
+    "Setup": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "read_vector_status",
+          "into_var": "vector_status"
+        }
+      ],
+      "next": { "type": "goto", "to": "Decide" }
+    },
+    "Decide": {
+      "actor": "",
+      "gate": "domain:embed/compaction-policy",
+      "prompt": "max_deleted_ratio=${vars.vector_status.max_deleted_ratio} route=${vars.vector_status.max_deleted_route}",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "compact": "Quiesce",
+          "notify": "SurfaceToInbox"
+        },
+        "default": "Done"
+      }
+    },
+    "Quiesce": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "quiesce_search"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "search_quiesced", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "RebuildHnsw" }
+    },
+    "RebuildHnsw": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "rebuild_hnsw",
+          "args": { "route": "${vars.vector_status.max_deleted_route}" }
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "rebuild_started", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "SwapAtomic" }
+    },
+    "SwapAtomic": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "swap_atomic"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "swapped", "value": true }
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "SurfaceToInbox": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bbox_note",
+            "arguments": {
+              "kind": "followup",
+              "project": "${meta.project_dir}",
+              "body": "Vector partition ${vars.vector_status.max_deleted_route} deleted_ratio=${vars.vector_status.max_deleted_ratio}; compaction recommended but below automatic threshold."
+            }
+          },
+          "on_failure": "warn"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "notified", "value": true }
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "Done": {
+      "actor": "",
+      "next": { "type": "terminal" }
+    }
+  }
+}

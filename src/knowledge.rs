@@ -9,7 +9,10 @@ use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::query::{parse_query, QueryAtom, QueryNode};
+use crate::chunker::EdgeConfidence;
+use crate::entity_ref::EntityRef;
+
+use crate::query::{QueryAtom, QueryNode, parse_query};
 
 // ── MCP parameter structs ─────────────────────────────────────────
 //
@@ -200,6 +203,23 @@ pub struct DecideParams {
     pub render: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KnowledgeLinkParams {
+    /// Source knowledge entry id or `knowledge:<id>` entity ref.
+    pub source: String,
+    /// Target entity ref string.
+    pub target: String,
+    /// One of: Contradicts, RelatesTo, TensionWith, Supports, DependsOn,
+    /// DerivedFrom, SUPERSEDES.
+    pub kind: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub source_arc: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<String>,
+}
+
 // ── Schema ─────────────────────────────────────────────────────────
 
 #[derive(
@@ -320,6 +340,13 @@ pub struct LearnWriteResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct KnowledgeWriteResult {
+    pub id: String,
+    pub message: String,
+    pub superseded: Option<String>,
+}
+
 impl Priority {
     /// `None` → `Standard` (schema default). `Some(invalid)` → error.
     fn parse_optional(s: Option<&str>) -> Result<Self> {
@@ -380,6 +407,8 @@ pub struct KnowledgeEntry {
     pub review_at: Option<String>, // soft staleness checkpoint (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<KnowledgeEdge>,
     /// For `decision` entries: the rationale behind this commitment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
@@ -392,6 +421,80 @@ pub struct KnowledgeEntry {
     pub recall_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_recalled: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeEdge {
+    pub target: String,
+    pub kind: KnowledgeEdgeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_arc: Option<String>,
+    pub confidence: EdgeConfidence,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeEdgeKind {
+    #[serde(alias = "Contradicts", alias = "CONTRADICTS")]
+    Contradicts,
+    #[serde(alias = "RelatesTo", alias = "RELATES_TO")]
+    RelatesTo,
+    #[serde(alias = "TensionWith", alias = "TENSION_WITH")]
+    TensionWith,
+    #[serde(alias = "Supports", alias = "SUPPORTS")]
+    Supports,
+    #[serde(alias = "DependsOn", alias = "DEPENDS_ON")]
+    DependsOn,
+    #[serde(alias = "DerivedFrom", alias = "DERIVED_FROM")]
+    DerivedFrom,
+    #[serde(alias = "SUPERSEDES", alias = "Supersedes")]
+    Supersedes,
+    #[serde(alias = "REFERENCES", alias = "References")]
+    References,
+}
+
+impl KnowledgeEdgeKind {
+    pub fn parse(input: &str) -> Result<Self> {
+        match input {
+            "Contradicts" | "contradicts" | "CONTRADICTS" => Ok(Self::Contradicts),
+            "RelatesTo" | "relates_to" | "RELATES_TO" | "related" => Ok(Self::RelatesTo),
+            "TensionWith" | "tension_with" | "TENSION_WITH" => Ok(Self::TensionWith),
+            "Supports" | "supports" | "SUPPORTS" => Ok(Self::Supports),
+            "DependsOn" | "depends_on" | "DEPENDS_ON" => Ok(Self::DependsOn),
+            "DerivedFrom" | "derived_from" | "DERIVED_FROM" => Ok(Self::DerivedFrom),
+            "SUPERSEDES" | "Supersedes" | "supersedes" => Ok(Self::Supersedes),
+            "REFERENCES" | "References" | "references" => Ok(Self::References),
+            other => anyhow::bail!(
+                "invalid knowledge edge kind '{other}' (expected Contradicts, RelatesTo, TensionWith, Supports, DependsOn, DerivedFrom, SUPERSEDES, REFERENCES)"
+            ),
+        }
+    }
+
+    pub fn edge_kind(self) -> &'static str {
+        match self {
+            Self::Contradicts => "Contradicts",
+            Self::RelatesTo => "RelatesTo",
+            Self::TensionWith => "TensionWith",
+            Self::Supports => "Supports",
+            Self::DependsOn => "DependsOn",
+            Self::DerivedFrom => "DERIVED_FROM",
+            Self::Supersedes => "SUPERSEDES",
+            Self::References => "REFERENCES",
+        }
+    }
+}
+
+fn parse_edge_confidence(input: Option<&str>) -> Result<EdgeConfidence> {
+    match input.unwrap_or("heuristic") {
+        "exact" | "Exact" | "EXACT" => Ok(EdgeConfidence::Exact),
+        "heuristic" | "Heuristic" | "HEURISTIC" => Ok(EdgeConfidence::Heuristic),
+        "unknown" | "Unknown" | "UNKNOWN" => Ok(EdgeConfidence::Unknown),
+        other => anyhow::bail!(
+            "invalid edge confidence '{other}' (expected exact, heuristic, or unknown)"
+        ),
+    }
 }
 
 fn default_weight() -> u32 {
@@ -648,6 +751,50 @@ impl Knowledge {
         &self.store.entries
     }
 
+    pub fn entry(&self, id: &str) -> Option<&KnowledgeEntry> {
+        self.store.entries.iter().find(|entry| entry.id == id)
+    }
+
+    pub fn append_link(&mut self, p: &KnowledgeLinkParams) -> Result<KnowledgeEdge> {
+        let source_id = match EntityRef::parse(&p.source) {
+            Ok(EntityRef::Knowledge { id }) => id,
+            Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
+            Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
+        };
+        if source_id.trim().is_empty() {
+            anyhow::bail!("source knowledge id is required");
+        }
+        EntityRef::parse(&p.target)
+            .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
+        let kind = KnowledgeEdgeKind::parse(&p.kind)?;
+        let confidence = parse_edge_confidence(p.confidence.as_deref())?;
+        let edge = KnowledgeEdge {
+            target: p.target.clone(),
+            kind,
+            note: p.note.clone(),
+            source_arc: p.source_arc.clone(),
+            confidence,
+        };
+        let now = Self::now_iso();
+        let entry = self
+            .store
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == source_id)
+            .ok_or_else(|| anyhow::anyhow!("source knowledge entry not found: {source_id}"))?;
+        let duplicate = entry.links.iter().any(|existing| {
+            existing.target == edge.target
+                && existing.kind == edge.kind
+                && existing.source_arc == edge.source_arc
+        });
+        if !duplicate {
+            entry.links.push(edge.clone());
+            entry.updated_at = now;
+            self.save()?;
+        }
+        Ok(edge)
+    }
+
     /// Insert-or-replace a code-generated entry by its stable ID.
     /// Bypasses the normal `learn` flow (no ID generation, no approval
     /// defaulting). Used by `tool_docs::sync_into_knowledge` to keep
@@ -825,6 +972,7 @@ impl Knowledge {
             status: Status::Active,
             approval,
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: p.expires_at.clone(),
             source: if from_agent {
@@ -864,7 +1012,11 @@ impl Knowledge {
     }
 
     /// Remember — store for on-demand recall only, never rendered into markdown.
-    pub fn remember(&mut self, p: &RememberParams, from_agent: bool) -> Result<String> {
+    pub fn remember_result(
+        &mut self,
+        p: &RememberParams,
+        from_agent: bool,
+    ) -> Result<KnowledgeWriteResult> {
         // None → Memory (schema default). Some(invalid) → error rather than
         // silently landing the entry in the wrong bucket.
         let category = match p.category.as_deref() {
@@ -901,6 +1053,7 @@ impl Knowledge {
                 Approval::UserConfirmed
             },
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: p.expires_at.clone(),
             source: if from_agent {
@@ -915,15 +1068,26 @@ impl Knowledge {
         });
 
         self.save()?;
-        Ok(format!(
-            "Remembered entry {id} (indexed only, not rendered)"
-        ))
+        Ok(KnowledgeWriteResult {
+            id: id.clone(),
+            message: format!("Remembered entry {id} (indexed only, not rendered)"),
+            superseded: None,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn remember(&mut self, p: &RememberParams, from_agent: bool) -> Result<String> {
+        Ok(self.remember_result(p, from_agent)?.message)
     }
 
     /// Decide — a durable commitment with rationale. When `supersedes`
     /// is set, marks the prior entry as superseded and records a link
     /// from the old to the new (via the existing `supersedes` field).
-    pub fn decide(&mut self, p: &DecideParams, from_agent: bool) -> Result<String> {
+    pub fn decide_result(
+        &mut self,
+        p: &DecideParams,
+        from_agent: bool,
+    ) -> Result<KnowledgeWriteResult> {
         if p.content.trim().is_empty() {
             anyhow::bail!("'content' is required");
         }
@@ -970,6 +1134,7 @@ impl Knowledge {
                 Approval::UserConfirmed
             },
             supersedes: None,
+            links: Vec::new(),
             rationale: Some(p.rationale.clone()),
             expires_at: None,
             source: if from_agent {
@@ -993,11 +1158,21 @@ impl Knowledge {
         }
 
         self.save()?;
-        if let Some(old_id) = p.supersedes.as_deref() {
-            Ok(format!("Decided entry {id} (supersedes {old_id})"))
+        let message = if let Some(old_id) = p.supersedes.as_deref() {
+            format!("Decided entry {id} (supersedes {old_id})")
         } else {
-            Ok(format!("Decided entry {id}"))
-        }
+            format!("Decided entry {id}")
+        };
+        Ok(KnowledgeWriteResult {
+            id,
+            message,
+            superseded: p.supersedes.clone(),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn decide(&mut self, p: &DecideParams, from_agent: bool) -> Result<String> {
+        Ok(self.decide_result(p, from_agent)?.message)
     }
 
     pub fn forget(&mut self, p: &ForgetParams) -> Result<String> {
@@ -2070,6 +2245,7 @@ mod tests {
             status: Status::Active,
             approval: Approval::UserConfirmed,
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: None,
             source: "test".into(),
@@ -2277,6 +2453,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             status: Status::Active,
             approval: Approval::UserConfirmed,
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: None,
             source: "user".into(),
@@ -2389,11 +2566,12 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             report.contains("Global absorb is no-op"),
             "report: {report}"
         );
-        assert!(kb
-            .store
-            .entries
-            .iter()
-            .all(|e| e.approval != Approval::Imported));
+        assert!(
+            kb.store
+                .entries
+                .iter()
+                .all(|e| e.approval != Approval::Imported)
+        );
     }
 
     #[test]
@@ -2622,6 +2800,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             status: Status::Active,
             approval: Approval::UserConfirmed,
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: None,
             source: "test".into(),
@@ -2657,6 +2836,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
                 status: Status::Active,
                 approval: Approval::UserConfirmed,
                 supersedes: None,
+                links: Vec::new(),
                 rationale: None,
                 expires_at: None,
                 source: "test".into(),
@@ -2717,6 +2897,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             status: Status::Active,
             approval: Approval::UserConfirmed,
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: None,
             source: "test".into(),
@@ -2764,6 +2945,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             status: Status::Active,
             approval: Approval::UserConfirmed,
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: None,
             source: "test".into(),
@@ -2806,6 +2988,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             status: Status::Active,
             approval: Approval::UserConfirmed,
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: None,
             source: "test".into(),
@@ -2832,6 +3015,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             status: Status::Active,
             approval: Approval::UserConfirmed,
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: None,
             source: "test".into(),
@@ -2880,6 +3064,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             status: Status::Active,
             approval: Approval::UserConfirmed,
             supersedes: None,
+            links: Vec::new(),
             rationale: None,
             expires_at: None,
             source: "test".into(),

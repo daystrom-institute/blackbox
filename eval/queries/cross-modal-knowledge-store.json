@@ -1,0 +1,34 @@
+{
+  "id": "cross-modal-knowledge-store",
+  "query_class": "cross_modal_code_prose",
+  "pass_strictness": "all",
+  "query": "show the code and design context for KnowledgeStore indexing.",
+  "target_locators": [
+    {
+      "description": "The KnowledgeStore Rust definition and related knowledge-indexing design target.",
+      "entity_type_hint": "symbol",
+      "path_hint": "src/knowledge.rs",
+      "symbol_hint": "KnowledgeStore"
+    },
+    {
+      "description": "The implementation skeleton phase describing knowledge entry indexing.",
+      "entity_type_hint": "project_file",
+      "path_hint": "design/agentic-corpus-impl.md"
+    }
+  ],
+  "expected_entity_refs": [
+    "symbol:d723917f:KnowledgeStore:3867906959e7ff9c5c0c893d30ba43ea2663089aec664a3da19dffca6dd0df0d",
+    "project_file:d723917f:d369c8bf:64e4e356cd6d72b2e1491d604af055f748d923ba010a74ca64722da0671c4f98:2"
+  ],
+  "required_evidence": {
+    "kind": "entity_set",
+    "value": [
+      "symbol",
+      "project_file"
+    ]
+  },
+  "forbidden_stale_answers": [
+    "Do not return only code or only design prose; this query requires both."
+  ],
+  "pass_classifier": "check_cross_modal_knowledge_store"
+}

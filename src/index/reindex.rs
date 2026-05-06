@@ -10,7 +10,11 @@ use tantivy::{Index, IndexWriter, TantivyDocument};
 use walkdir::WalkDir;
 
 use super::helpers::*;
+use super::knowledge_docs;
+use super::project_files;
+use super::tool_edges::ToolEdgeContext;
 use super::{FieldHandles, FileMeta, ReindexConfig};
+use crate::entity_ref;
 use crate::parser;
 
 pub(super) fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
@@ -116,11 +120,23 @@ pub(super) fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64
     files
 }
 
+pub(super) fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
+    let mut files = scan_source_files(config);
+    if config.knowledge_path.exists() {
+        scan_single_file(&config.knowledge_path, &mut files);
+    }
+    match project_files::scan_registered_project_files(config) {
+        Ok(mut project_files) => files.append(&mut project_files),
+        Err(err) => tracing::warn!(error = %err, "failed to scan registered project files"),
+    }
+    files
+}
+
 /// Check if any source files have changed since last index.
 /// Returns true if reindexing is needed (cheap — stat only, no I/O on file contents).
 pub(super) fn needs_reindex(config: &ReindexConfig) -> bool {
     let meta = load_meta(&config.meta_path).unwrap_or_default();
-    let files = scan_source_files(config);
+    let files = scan_all_source_files(config);
     let current_paths: std::collections::HashSet<&str> =
         files.iter().map(|(p, _, _)| p.as_str()).collect();
     // Check for new or changed files
@@ -169,6 +185,7 @@ fn try_background_reindex(
     let mut indexed_files = 0u64;
     let mut indexed_docs = 0u64;
     let mut skipped = 0u64;
+    let tool_edges = ToolEdgeContext::from_config(config)?;
 
     for (account_name, root) in &config.roots {
         let projects_dir = root.join("projects");
@@ -182,6 +199,7 @@ fn try_background_reindex(
                 &mut indexed_files,
                 &mut indexed_docs,
                 &mut skipped,
+                &tool_edges,
             )?;
         }
         let history = root.join("history.jsonl");
@@ -195,6 +213,7 @@ fn try_background_reindex(
                 &mut indexed_files,
                 &mut indexed_docs,
                 &mut skipped,
+                &tool_edges,
             )?;
         }
     }
@@ -210,6 +229,7 @@ fn try_background_reindex(
                 &mut indexed_files,
                 &mut indexed_docs,
                 &mut skipped,
+                &tool_edges,
             )?;
         }
         let history = codex_root.join("history.jsonl");
@@ -222,12 +242,44 @@ fn try_background_reindex(
                 &mut indexed_files,
                 &mut indexed_docs,
                 &mut skipped,
+                &tool_edges,
             )?;
         }
     }
 
+    let project_stats = project_files::index_registered_projects_standalone(
+        config,
+        fields,
+        &mut writer,
+        &mut meta,
+        false,
+    )?;
+    indexed_files += project_stats.indexed_files;
+    indexed_docs += project_stats.indexed_docs;
+    skipped += project_stats.skipped;
+    if project_stats.emitted_edges > 0 {
+        tracing::debug!(
+            emitted_edges = project_stats.emitted_edges,
+            indexed_commits = project_stats.indexed_commits,
+            call_edges = project_stats.call_edges,
+            resolved_call_edges = project_stats.resolved_call_edges,
+            "auto-reindex: accumulated project-file edges"
+        );
+    }
+
+    let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
+        &config.knowledge_path,
+        fields,
+        &mut writer,
+        &mut meta,
+    )?;
+    if knowledge_docs > 0 {
+        indexed_files += 1;
+        indexed_docs += knowledge_docs;
+    }
+
     // 4b. Purge documents for deleted source files
-    let current_files = scan_source_files(config);
+    let current_files = scan_all_source_files(config);
     let current_paths: std::collections::HashSet<String> =
         current_files.iter().map(|(p, _, _)| p.clone()).collect();
     let mut purged = 0u64;
@@ -298,11 +350,25 @@ pub(super) fn event_to_doc_standalone(
     is_subagent: bool,
     f: FieldHandles,
 ) -> TantivyDocument {
+    build_transcript_doc(event, account, file_path, byte_offset, is_subagent, "", f)
+}
+
+pub(crate) fn build_transcript_doc(
+    event: &parser::ParsedEvent,
+    account: &str,
+    file_path: &str,
+    byte_offset: u64,
+    is_subagent: bool,
+    project_fallback: &str,
+    f: FieldHandles,
+) -> TantivyDocument {
     let mut doc = TantivyDocument::new();
+    doc.add_text(f.doc_type, "transcript");
+    doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
     doc.add_text(f.content, &event.content);
     doc.add_text(f.session_id, &event.session_id);
     doc.add_text(f.account, account);
-    doc.add_text(f.project, event.cwd.as_deref().unwrap_or(""));
+    doc.add_text(f.project, event.cwd.as_deref().unwrap_or(project_fallback));
     doc.add_text(f.role, event.role.as_ref());
     doc.add_text(f.file_path, file_path);
     doc.add_u64(f.byte_offset, byte_offset);
@@ -352,6 +418,7 @@ pub(super) fn index_directory_standalone(
     indexed_files: &mut u64,
     indexed_docs: &mut u64,
     skipped: &mut u64,
+    tool_edges: &ToolEdgeContext,
 ) -> Result<()> {
     for entry in WalkDir::new(dir)
         .follow_links(true)
@@ -399,28 +466,23 @@ pub(super) fn index_directory_standalone(
             let line_offset = offset;
             offset += line.len() as u64 + 1;
 
-            for event in parser::parse_transcript_line(&line) {
+            for (event_idx, event) in parser::parse_transcript_line(&line).into_iter().enumerate()
+            {
+                if let Err(err) =
+                    tool_edges.emit_event_edges(&event, account_name, line_offset, event_idx as u32)
+                {
+                    tracing::debug!(error = %err, "failed to emit transcript tool-call edge");
+                }
                 let is_sub = event.is_subagent || is_subagent;
-                let proj = event.cwd.as_deref().unwrap_or(&project);
-
-                let mut doc = TantivyDocument::new();
-                doc.add_text(f.content, &event.content);
-                doc.add_text(f.session_id, &event.session_id);
-                doc.add_text(f.account, account_name);
-                doc.add_text(f.project, proj);
-                doc.add_text(f.role, event.role.as_ref());
-                doc.add_text(f.file_path, &path_str);
-                doc.add_u64(f.byte_offset, line_offset);
-                doc.add_u64(f.is_subagent, if is_sub { 1 } else { 0 });
-                if let Some(ref ts) = event.timestamp {
-                    doc.add_text(f.timestamp, ts);
-                }
-                if let Some(ref branch) = event.git_branch {
-                    doc.add_text(f.git_branch, branch);
-                }
-                if let Some(ref slug) = event.agent_slug {
-                    doc.add_text(f.agent_slug, slug);
-                }
+                let doc = build_transcript_doc(
+                    &event,
+                    account_name,
+                    &path_str,
+                    line_offset,
+                    is_sub,
+                    &project,
+                    f,
+                );
                 writer.add_document(doc)?;
                 *indexed_docs += 1;
             }
@@ -452,6 +514,7 @@ pub(super) fn index_history_standalone(
     indexed_files: &mut u64,
     indexed_docs: &mut u64,
     skipped: &mut u64,
+    tool_edges: &ToolEdgeContext,
 ) -> Result<()> {
     let path_str = history.to_string_lossy().to_string();
     let file_meta = fs::metadata(history)?;
@@ -475,7 +538,12 @@ pub(super) fn index_history_standalone(
         };
         let line_offset = offset;
         offset += line.len() as u64 + 1;
-        for event in parser::parse_history_line(&line) {
+        for (event_idx, event) in parser::parse_history_line(&line).into_iter().enumerate() {
+            if let Err(err) =
+                tool_edges.emit_event_edges(&event, account_name, line_offset, event_idx as u32)
+            {
+                tracing::debug!(error = %err, "failed to emit history tool-call edge");
+            }
             let doc =
                 event_to_doc_standalone(&event, account_name, &path_str, line_offset, false, f);
             writer.add_document(doc)?;
@@ -493,6 +561,7 @@ pub(super) fn index_history_standalone(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn index_codex_directory_standalone(
     sessions_dir: &Path,
     f: FieldHandles,
@@ -501,6 +570,7 @@ pub(super) fn index_codex_directory_standalone(
     indexed_files: &mut u64,
     indexed_docs: &mut u64,
     skipped: &mut u64,
+    tool_edges: &ToolEdgeContext,
 ) -> Result<()> {
     for entry in WalkDir::new(sessions_dir)
         .follow_links(true)
@@ -547,9 +617,17 @@ pub(super) fn index_codex_directory_standalone(
             };
             let line_offset = offset;
             offset += line.len() as u64 + 1;
-            for mut event in parser::parse_codex_line(&line, &session_id) {
+            for (event_idx, mut event) in parser::parse_codex_line(&line, &session_id)
+                .into_iter()
+                .enumerate()
+            {
                 if event.cwd.is_none() {
                     event.cwd = cwd.clone();
+                }
+                if let Err(err) =
+                    tool_edges.emit_event_edges(&event, "codex", line_offset, event_idx as u32)
+                {
+                    tracing::debug!(error = %err, "failed to emit codex tool-call edge");
                 }
                 let doc =
                     event_to_doc_standalone(&event, "codex", &path_str, line_offset, false, f);
@@ -574,6 +652,7 @@ pub(super) fn index_codex_directory_standalone(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn index_codex_history_standalone(
     history: &Path,
     f: FieldHandles,
@@ -582,6 +661,7 @@ pub(super) fn index_codex_history_standalone(
     indexed_files: &mut u64,
     indexed_docs: &mut u64,
     skipped: &mut u64,
+    tool_edges: &ToolEdgeContext,
 ) -> Result<()> {
     let path_str = history.to_string_lossy().to_string();
     let file_meta = fs::metadata(history)?;
@@ -605,7 +685,15 @@ pub(super) fn index_codex_history_standalone(
         };
         let line_offset = offset;
         offset += line.len() as u64 + 1;
-        for event in parser::parse_codex_history_line(&line) {
+        for (event_idx, event) in parser::parse_codex_history_line(&line)
+            .into_iter()
+            .enumerate()
+        {
+            if let Err(err) =
+                tool_edges.emit_event_edges(&event, "codex", line_offset, event_idx as u32)
+            {
+                tracing::debug!(error = %err, "failed to emit codex history tool-call edge");
+            }
             let doc = event_to_doc_standalone(&event, "codex", &path_str, line_offset, false, f);
             writer.add_document(doc)?;
             *indexed_docs += 1;
@@ -634,5 +722,45 @@ pub(super) fn human_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{MessageRole, ParsedEvent};
+
+    #[test]
+    fn transcript_docs_include_doc_type_and_parser_version() {
+        let (_schema, fields) = crate::index::build_schema();
+        let event = ParsedEvent {
+            role: MessageRole::User,
+            content: "schema migration smoke".to_string(),
+            session_id: "session-1".to_string(),
+            timestamp: None,
+            git_branch: None,
+            is_subagent: false,
+            agent_slug: None,
+            cwd: None,
+            tool_call: None,
+        };
+
+        let doc = event_to_doc_standalone(&event, "codex", "/tmp/session.jsonl", 0, false, fields);
+
+        assert_eq!(first_text(&doc, fields.doc_type), "transcript");
+        assert_eq!(
+            first_text(&doc, fields.parser_version),
+            entity_ref::PARSER_VERSION
+        );
+    }
+
+    fn first_text(doc: &TantivyDocument, field: Field) -> String {
+        doc.get_all(field)
+            .next()
+            .and_then(|v| match v {
+                tantivy::schema::OwnedValue::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 }

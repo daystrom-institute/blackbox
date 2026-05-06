@@ -2194,6 +2194,24 @@ impl Packets {
         Ok(out)
     }
 
+    pub fn remove_domain(&self, domain: &str) -> Result<usize> {
+        let packets: Vec<Packet> = self
+            .list_all()?
+            .into_iter()
+            .filter(|packet| packet.domain == domain)
+            .collect();
+        let mut removed = 0usize;
+        for packet in packets {
+            let path = packet_path(&self.state_dir, &packet.scope, &packet.id);
+            if path.exists() {
+                fs::remove_file(&path)
+                    .with_context(|| format!("removing packet {}", path.display()))?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     // ── bbox_compile (create) ──────────────────────────────────────
 
     pub fn compile(&self, p: &CompileParams) -> Result<String> {
@@ -2562,9 +2580,9 @@ fn unwrap_jsonish(v: &mut serde_json::Value) {
     }
 }
 
-/// Accept `packet-<8hex>` or bare `<8hex>`.
+/// Accept `packet-<8hex>`, `domain:<name>`, or bare `<8hex>`.
 fn normalize_id(id: &str) -> String {
-    if id.starts_with("packet-") {
+    if id.starts_with("packet-") || id.starts_with("domain:") {
         id.to_string()
     } else {
         format!("packet-{id}")

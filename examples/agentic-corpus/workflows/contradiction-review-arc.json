@@ -1,0 +1,333 @@
+{
+  "name": "contradiction-review-arc",
+  "version": 1,
+  "policy_packet": "domain:workflow-policy/arc-budget",
+  "vars_schema": {
+    "entry_a": { "kind": "string", "required": true },
+    "entry_b": { "kind": "string", "required": true },
+    "cosine": { "kind": "float" },
+    "board_id": { "kind": "string" },
+    "open_result": { "kind": "any" },
+    "verdict": { "kind": "object" },
+    "knowledge_link": { "kind": "any" },
+    "notified": { "kind": "bool" }
+  },
+  "actors": {
+    "specialists": {
+      "kind": "ensemble",
+      "team": "contradiction-specialists",
+      "durable": true,
+      "compaction_anchor": true,
+      "requires": []
+    },
+    "facilitator": {
+      "kind": "executor",
+      "brofile": "contradiction-facilitator",
+      "durable": true,
+      "compaction_anchor": true,
+      "requires": []
+    }
+  },
+  "start": "Setup",
+  "nodes": {
+    "Setup": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "board_id",
+            "value": "contradiction-${meta.arc_id}"
+          }
+        }
+      ],
+      "next": { "type": "goto", "to": "OpenBoard" }
+    },
+    "OpenBoard": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_open",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "topic": "Contradiction review: ${vars.entry_a} vs ${vars.entry_b}",
+              "project": "${meta.project_dir}",
+              "arc_thread_id": "${meta.arc_id}",
+              "opened_by": "facilitator",
+              "domain": "contradiction-review"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "open_result",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "provenance",
+              "role": "specialist",
+              "domain": "source-lineage"
+            }
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "lifecycle",
+              "role": "specialist",
+              "domain": "knowledge-lifecycle"
+            }
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "coherence",
+              "role": "specialist",
+              "domain": "semantic-coherence"
+            }
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "operator",
+              "role": "operator",
+              "domain": "human-review"
+            }
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "BlindPost" }
+    },
+    "BlindPost": {
+      "actor": "specialists",
+      "prompt": "Whiteboard board: ${vars.board_id} (phase: blind)\n\nPotential contradiction:\n- A: ${vars.entry_a}\n- B: ${vars.entry_b}\n- cosine: ${vars.cosine}\n\nUse your assigned specialist lens. Post one concise stance with whiteboard_post using your agent_name (provenance, lifecycle, or coherence). Address whether these claims are comparable, contradictory, historical supersession, tension, related, or no conflict. Return one line confirming your post.",
+      "next": { "type": "goto", "to": "TransitionToDebate" }
+    },
+    "TransitionToDebate": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator",
+              "target_phase": "read",
+              "summary": "blind specialist posts complete"
+            }
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator",
+              "target_phase": "debate",
+              "summary": "opening debate"
+            }
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "Debate" }
+    },
+    "Debate": {
+      "actor": "specialists",
+      "prompt": "Whiteboard board: ${vars.board_id} is in debate. Read the board with whiteboard_state, then annotate or vote on peer posts. Vote toward one outcome: contradicts, supersedes, tension_with, related, no_conflict, or hold. Return one line summarizing annotations and votes.",
+      "next": { "type": "goto", "to": "TransitionToResolve" }
+    },
+    "TransitionToResolve": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator",
+              "target_phase": "resolve",
+              "summary": "debate complete; facilitator synthesis requested"
+            }
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "Synthesize" }
+    },
+    "Synthesize": {
+      "actor": "facilitator",
+      "prompt": "Read whiteboard_state and whiteboard_summarize for board ${vars.board_id}. Synthesize the contradiction review for ${vars.entry_a} vs ${vars.entry_b}. Emit strict JSON only: {\"verdict\":\"contradicts|supersedes|tension_with|related|no_conflict|hold\",\"edge_to_write\":\"knowledge:<other_id>\",\"winning_claim\":\"knowledge:<id>\",\"required_human_action\":\"...\",\"evidence\":[\"...\"],\"missing_evidence\":[\"...\"]}. For edge_to_write, choose the other knowledge ref that should be linked from ${vars.entry_a}.",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${Synthesize.output}" },
+          "into_var": "verdict"
+        }
+      ],
+      "next": { "type": "goto", "to": "ApplyVerdict" }
+    },
+    "ApplyVerdict": {
+      "actor": "",
+      "gate": "domain:contradiction/review-synthesis",
+      "prompt": "verdict=${vars.verdict.verdict}",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "contradicts": "AppendContradicts",
+          "supersedes": "AppendSupersedes",
+          "tension_with": "AppendTension",
+          "related": "AppendRelated",
+          "no_conflict": "Done",
+          "hold": "SurfaceToInbox"
+        },
+        "default": "SurfaceToInbox"
+      }
+    },
+    "AppendContradicts": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "append_knowledge_link",
+          "args": {
+            "source": "${vars.entry_a}",
+            "target": "${vars.verdict.edge_to_write}",
+            "kind": "Contradicts",
+            "note": "${vars.verdict.required_human_action}",
+            "source_arc": "${meta.arc_id}",
+            "confidence": "heuristic"
+          },
+          "into_var": "knowledge_link"
+        }
+      ],
+      "next": { "type": "goto", "to": "Done" }
+    },
+    "AppendSupersedes": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "append_knowledge_link",
+          "args": {
+            "source": "${vars.entry_a}",
+            "target": "${vars.verdict.edge_to_write}",
+            "kind": "SUPERSEDES",
+            "note": "${vars.verdict.required_human_action}",
+            "source_arc": "${meta.arc_id}",
+            "confidence": "heuristic"
+          },
+          "into_var": "knowledge_link"
+        }
+      ],
+      "next": { "type": "goto", "to": "Done" }
+    },
+    "AppendTension": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "append_knowledge_link",
+          "args": {
+            "source": "${vars.entry_a}",
+            "target": "${vars.verdict.edge_to_write}",
+            "kind": "TensionWith",
+            "note": "${vars.verdict.required_human_action}",
+            "source_arc": "${meta.arc_id}",
+            "confidence": "heuristic"
+          },
+          "into_var": "knowledge_link"
+        }
+      ],
+      "next": { "type": "goto", "to": "Done" }
+    },
+    "AppendRelated": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "append_knowledge_link",
+          "args": {
+            "source": "${vars.entry_a}",
+            "target": "${vars.verdict.edge_to_write}",
+            "kind": "RelatesTo",
+            "note": "${vars.verdict.required_human_action}",
+            "source_arc": "${meta.arc_id}",
+            "confidence": "heuristic"
+          },
+          "into_var": "knowledge_link"
+        }
+      ],
+      "next": { "type": "goto", "to": "Done" }
+    },
+    "SurfaceToInbox": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bbox_note",
+            "arguments": {
+              "kind": "followup",
+              "project": "${meta.project_dir}",
+              "body": "Contradiction review for ${vars.entry_a} vs ${vars.entry_b} held for operator review: ${vars.verdict.required_human_action}"
+            }
+          },
+          "on_failure": "warn"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "notified", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "Done" }
+    },
+    "Done": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_archive",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator"
+            }
+          },
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

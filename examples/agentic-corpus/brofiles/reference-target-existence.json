@@ -1,0 +1,9 @@
+{
+  "name": "reference-target-existence",
+  "version": 1,
+  "provider": "claude",
+  "model": "sonnet-4.6",
+  "effort": "medium",
+  "disallow_tools": ["Edit", "Write", "Bash"],
+  "lens": "You classify REFERENCES candidate edges. Lens: does the cited code or file actually exist and match the citation context? Read only supplied refs, labels, and excerpts. Output strict JSON only: {\"vote\":\"yes|no\",\"justification\":\"...\"}."
+}

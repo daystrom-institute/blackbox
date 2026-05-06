@@ -1,0 +1,35 @@
+{
+  "domain": "bro-trust/per-brofile",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["trusted", "observe", "quarantine"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "trusted_digest_extractor",
+      "classification": "trusted",
+      "antecedent": {
+        "op": "Eq",
+        "field": "vars.candidate.brofile",
+        "value": "digest-extractor"
+      },
+      "consequent": "trusted"
+    },
+    {
+      "id": "quarantine_known_bad",
+      "classification": "quarantine",
+      "antecedent": {
+        "op": "Eq",
+        "field": "vars.candidate.brofile",
+        "value": "quarantined-brofile"
+      },
+      "consequent": "quarantine"
+    },
+    {
+      "id": "observe_unknown_brofile",
+      "classification": "observe",
+      "antecedent": { "op": "True" },
+      "consequent": "observe"
+    }
+  ]
+}

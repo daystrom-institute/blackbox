@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -7,13 +8,15 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{IndexWriter, TantivyDocument, Term};
 use walkdir::WalkDir;
 
 use super::helpers::*;
+use super::knowledge_docs;
+use super::project_files;
 use super::reindex::*;
 use super::{FileMeta, TranscriptIndex};
 use crate::parser;
@@ -51,6 +54,18 @@ pub struct SearchParams {
     /// its own current turn and would otherwise see itself in results.
     #[serde(default)]
     pub exclude_self: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridBm25Hit {
+    pub entity_id: String,
+    pub score: f32,
+    pub rank: usize,
+    pub doc_type: String,
+    pub chunk_kind: String,
+    pub role: String,
+    pub title: Option<String>,
+    pub excerpt: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,8 +199,15 @@ impl TranscriptIndex {
         let searcher = self.reader.searcher();
 
         // Parse the user's text query against content + project fields
-        let mut qp =
-            QueryParser::for_index(&self.index, vec![self.fields.content, self.fields.project]);
+        let mut qp = QueryParser::for_index(
+            &self.index,
+            vec![
+                self.fields.content,
+                self.fields.project,
+                self.fields.code_content,
+                self.fields.symbol,
+            ],
+        );
         if matches!(mode, TranscriptSearchMode::Fulltext) {
             qp.set_conjunction_by_default();
         }
@@ -296,6 +318,134 @@ impl TranscriptIndex {
             results.len(),
             results.join("\n\n---\n\n")
         ))
+    }
+
+    pub(crate) fn hybrid_bm25_hits(
+        &self,
+        query: &str,
+        limit: usize,
+        doc_type: Option<&str>,
+    ) -> Result<Vec<HybridBm25Hit>> {
+        if self.is_empty() || query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query_str = smart_query_to_tantivy(query).unwrap_or_else(|| query.to_string());
+        let searcher = self.reader.searcher();
+        let mut qp = QueryParser::for_index(
+            &self.index,
+            vec![
+                self.fields.content,
+                self.fields.project,
+                self.fields.code_content,
+                self.fields.symbol,
+                self.fields.commit_author_name,
+                self.fields.path_tokens,
+            ],
+        );
+        // Modest boost for path/symbol matches: a query mentioning `voyage`
+        // should preferentially surface files literally named voyage.rs over
+        // arbitrary text mentions of "voyage", but not so aggressively that
+        // commits whose subject also matches get pushed off the page.
+        qp.set_field_boost(self.fields.path_tokens, 1.5);
+        qp.set_field_boost(self.fields.symbol, 1.5);
+        let text_query = qp.parse_query(&query_str)?;
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
+            vec![(Occur::Must, text_query.box_clone())];
+        // Symbol-defining-file boost: when the user issues a single-token
+        // query that looks like a code symbol (snake_case, CamelCase, dotted
+        // path, or just one word), add an additional SHOULD clause that
+        // matches the symbol_exact field with a heavy boost. Effect: a
+        // query for `triad_closure` lifts the chunk where
+        // `symbol_exact == triad_closure` (the defining .ex chunk) above
+        // arbitrary doc paragraphs that mention the same string in body.
+        if let Some(token) = single_symbol_token(query) {
+            let term = Term::from_field_text(self.fields.symbol_exact, &token);
+            let exact = TermQuery::new(term, IndexRecordOption::Basic);
+            clauses.push((
+                Occur::Should,
+                Box::new(BoostQuery::new(Box::new(exact), 6.0)),
+            ));
+        }
+        if let Some(doc_type) = doc_type.filter(|value| !value.trim().is_empty()) {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.doc_type, doc_type),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        let query = BooleanQuery::new(clauses);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        if top_docs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (idx, (score, addr)) in top_docs.into_iter().enumerate() {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            let entity_id = self.hybrid_entity_id(&doc);
+            if entity_id.is_empty() {
+                continue;
+            }
+            let snippet = snippet_gen.snippet_from_doc(&doc);
+            let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
+            hits.push(HybridBm25Hit {
+                entity_id,
+                score,
+                rank: idx + 1,
+                doc_type: self.doc_text(&doc, self.fields.doc_type),
+                chunk_kind: self.doc_text(&doc, self.fields.chunk_kind),
+                role: self.doc_text(&doc, self.fields.role),
+                title: self.hybrid_title(&doc),
+                excerpt,
+            });
+        }
+        Ok(hits)
+    }
+
+    fn hybrid_entity_id(&self, doc: &TantivyDocument) -> String {
+        let explicit = self.doc_text(doc, self.fields.entity_id);
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        if self.doc_text(doc, self.fields.doc_type) == "transcript" {
+            let provider = self.doc_text(doc, self.fields.account);
+            let session_id = self.doc_text(doc, self.fields.session_id);
+            let line_offset = doc
+                .get_first(self.fields.byte_offset)
+                .and_then(|value| match value {
+                    tantivy::schema::OwnedValue::U64(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return crate::entity_ref::EntityRef::Transcript {
+                provider,
+                session_id,
+                line_offset,
+                event_idx: 0,
+            }
+            .to_string();
+        }
+        String::new()
+    }
+
+    fn hybrid_title(&self, doc: &TantivyDocument) -> Option<String> {
+        for field in [
+            self.fields.symbol,
+            self.fields.symbol_exact,
+            self.fields.commit_sha,
+            self.fields.file_path,
+            self.fields.session_id,
+        ] {
+            let value = self.doc_text(doc, field);
+            if !value.is_empty() {
+                return Some(value.chars().take(80).collect());
+            }
+        }
+        None
     }
 
     // ── Cite ────────────────────────────────────────────────────────
@@ -1199,10 +1349,14 @@ impl TranscriptIndex {
         }
 
         let index_size = dir_size(self.config.meta_path.parent().unwrap_or(Path::new(".")));
+        let tool_call_edges = count_tool_call_edges(
+            &crate::edge_index::edges_dir_from_projects_path(&self.config.projects_path),
+        );
 
         format!(
             "Index documents: {total_docs}\n\
              Index size: {}\n\
+             Tool-call edges: {tool_call_edges}\n\
              Source files:\n\
              {}",
             human_bytes(index_size),
@@ -1238,6 +1392,7 @@ impl TranscriptIndex {
         let mut indexed_docs = 0u64;
         let mut skipped = 0u64;
         let f = self.fields;
+        let tool_edges = crate::index::tool_edges::ToolEdgeContext::from_config(&self.config)?;
 
         for (account_name, root) in &self.config.roots.clone() {
             let projects_dir = root.join("projects");
@@ -1251,6 +1406,7 @@ impl TranscriptIndex {
                     &mut indexed_files,
                     &mut indexed_docs,
                     &mut skipped,
+                    &tool_edges,
                 )?;
             }
             let history = root.join("history.jsonl");
@@ -1264,6 +1420,7 @@ impl TranscriptIndex {
                     &mut indexed_files,
                     &mut indexed_docs,
                     &mut skipped,
+                    &tool_edges,
                 )?;
             }
         }
@@ -1279,6 +1436,7 @@ impl TranscriptIndex {
                     &mut indexed_files,
                     &mut indexed_docs,
                     &mut skipped,
+                    &tool_edges,
                 )?;
             }
             let history = codex_root.join("history.jsonl");
@@ -1291,12 +1449,44 @@ impl TranscriptIndex {
                     &mut indexed_files,
                     &mut indexed_docs,
                     &mut skipped,
+                    &tool_edges,
                 )?;
             }
         }
 
+        let project_stats = project_files::index_registered_projects_standalone(
+            &self.config,
+            f,
+            &mut writer,
+            &mut meta,
+            full,
+        )?;
+        if project_stats.emitted_edges > 0 {
+            tracing::debug!(
+                emitted_edges = project_stats.emitted_edges,
+                indexed_commits = project_stats.indexed_commits,
+                call_edges = project_stats.call_edges,
+                resolved_call_edges = project_stats.resolved_call_edges,
+                "manual reindex: accumulated project-file edges"
+            );
+        }
+        indexed_files += project_stats.indexed_files;
+        indexed_docs += project_stats.indexed_docs;
+        skipped += project_stats.skipped;
+
+        let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
+            &self.config.knowledge_path,
+            f,
+            &mut writer,
+            &mut meta,
+        )?;
+        if knowledge_docs > 0 {
+            indexed_files += 1;
+            indexed_docs += knowledge_docs;
+        }
+
         // Purge documents for deleted source files
-        let current_files = scan_source_files(&self.config);
+        let current_files = scan_all_source_files(&self.config);
         let current_paths: std::collections::HashSet<String> =
             current_files.iter().map(|(p, _, _)| p.clone()).collect();
         let mut purged = 0u64;
@@ -1339,5 +1529,240 @@ impl TranscriptIndex {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+}
+
+/// Returns the query string when it looks like a single code symbol — one
+/// token of identifier-shaped characters (letters/digits/underscore/hyphen
+/// /dot/colon), no spaces, no quotes, no boolean operators. Used by the
+/// BM25 query builder to opt into a symbol_exact boost when the agent
+/// asks about a specific identifier rather than a topical phrase.
+fn single_symbol_token(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    if trimmed.chars().any(|c| {
+        !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.' && c != ':'
+    }) {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("AND")
+        || trimmed.eq_ignore_ascii_case("OR")
+        || trimmed.eq_ignore_ascii_case("NOT")
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn count_tool_call_edges(edges_dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(edges_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .filter_map(|path| fs::File::open(path).ok())
+        .flat_map(|file| std::io::BufReader::new(file).lines().map_while(Result::ok))
+        .filter(|line| {
+            serde_json::from_str::<crate::edge_index::Edge>(line)
+                .ok()
+                .is_some_and(|edge| matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE" | "RAN_BASH"))
+        })
+        .count() as u64
+}
+
+#[cfg(test)]
+mod agentic_project_file_tests {
+    use std::process::Command;
+
+    use super::*;
+    use crate::projects::ProjectRegistry;
+
+    #[test]
+    fn registered_project_markdown_and_rust_source_are_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects_path = dir.path().join("projects.json");
+        let mut projects = ProjectRegistry::open(&projects_path).unwrap();
+        projects.register_path(env!("CARGO_MANIFEST_DIR")).unwrap();
+
+        let mut index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            projects_path,
+            dir.path().join("knowledge.json"),
+        )
+        .unwrap();
+        let msg = index.build_index(false).unwrap();
+        assert!(msg.contains("Indexed"));
+
+        let design_hits = index
+            .search(&SearchParams {
+                query: "agentic-corpus".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(100),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(design_hits.contains("design/agentic-corpus.md"));
+
+        let trait_hits = index
+            .search(&SearchParams {
+                query: "trait SourceFormatChunker".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(100),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(trait_hits.contains("design/agentic-corpus.md"));
+        let chunker_source = format!("{}/src/chunker/mod.rs", env!("CARGO_MANIFEST_DIR"));
+        assert!(trait_hits.contains(&format!("File: {chunker_source}")));
+
+        let display_hits = index
+            .search(&SearchParams {
+                query: "impl Display for EntityRef".into(),
+                mode: Some("fulltext".into()),
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(100),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(display_hits.contains("src/entity_ref.rs"));
+
+        let rerun = index.build_index(false).unwrap();
+        assert!(rerun.contains("skipped"));
+    }
+
+    #[test]
+    fn knowledge_entries_are_searchable_after_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let knowledge_path = dir.path().join("knowledge.json");
+        let mut knowledge = crate::knowledge::Knowledge::open(&knowledge_path).unwrap();
+        knowledge
+            .remember(
+                &crate::knowledge::RememberParams {
+                    content: "durable zebra phrase for knowledge indexing".into(),
+                    category: None,
+                    title: Some("Knowledge indexing fixture".into()),
+                    scope: None,
+                    project: None,
+                    decay: None,
+                    review_at: None,
+                    expires_at: None,
+                },
+                false,
+            )
+            .unwrap();
+
+        let mut index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            knowledge_path,
+        )
+        .unwrap();
+        index.build_index(false).unwrap();
+
+        let hits = index
+            .search(&SearchParams {
+                query: "durable zebra phrase".into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(5),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(hits.contains("durable"), "{hits}");
+        assert!(hits.contains("zebra"), "{hits}");
+        assert!(hits.contains("phrase"), "{hits}");
+    }
+
+    #[test]
+    fn registered_git_project_commit_messages_are_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        run_git(&repo, &["config", "user.email", "test@example.test"]);
+        std::fs::write(repo.join("README.md"), "one\n").unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "-m", "initial commit search fixture"]);
+        std::fs::write(repo.join("README.md"), "two\n").unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "second git message searchable by bbox search",
+            ],
+        );
+
+        let projects_path = dir.path().join("projects.json");
+        let mut projects = ProjectRegistry::open(&projects_path).unwrap();
+        projects.register_path(&repo).unwrap();
+        let mut index = TranscriptIndex::open_or_create(
+            &dir.path().join("index"),
+            Vec::new(),
+            None,
+            projects_path,
+            dir.path().join("knowledge.json"),
+        )
+        .unwrap();
+        index.build_index(false).unwrap();
+
+        let hits = index
+            .search(&SearchParams {
+                query: "\"second git message searchable\"".into(),
+                mode: Some("fulltext".into()),
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(5),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(hits.contains("**second**"), "{hits}");
+        assert!(hits.contains("**git**"), "{hits}");
+        assert!(hits.contains("**message**"), "{hits}");
+        assert!(hits.contains("**searchable**"), "{hits}");
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

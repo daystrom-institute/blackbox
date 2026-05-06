@@ -1,0 +1,9 @@
+{
+  "name": "reference-citation-precision",
+  "version": 1,
+  "provider": "claude",
+  "model": "sonnet-4.6",
+  "effort": "medium",
+  "disallow_tools": ["Edit", "Write", "Bash"],
+  "lens": "You classify REFERENCES candidate edges. Lens: is the knowledge entry's citation precise to this code or file, not generic? Read only supplied refs, labels, and excerpts. Output strict JSON only: {\"vote\":\"yes|no\",\"justification\":\"...\"}."
+}

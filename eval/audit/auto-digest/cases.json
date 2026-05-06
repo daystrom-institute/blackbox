@@ -1,0 +1,356 @@
+[
+  {
+    "id": "auto-apply-01",
+    "expected_verdict": "auto_apply",
+    "proposal": {
+      "title": "Project registration path rule",
+      "content": "Project registration accepts directories, not file paths.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-a",
+      "source_files": ["src/projects.rs"],
+      "source_query": "project register directory",
+      "justification": "Repeated implementation invariant in S1.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 0,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "auto-apply-02",
+    "expected_verdict": "auto_apply",
+    "proposal": {
+      "title": "Artifact install surface",
+      "content": "Workflow and packet examples should install through the artifact catalog after F4.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-b",
+      "source_files": ["src/artifacts.rs"],
+      "source_query": "artifact catalog install",
+      "justification": "F4 hard rule verified by later phases.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 3,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "auto-apply-03",
+    "expected_verdict": "auto_apply",
+    "proposal": {
+      "title": "HNSW insertion model",
+      "content": "Vector partitions use incremental HNSW insertion on upsert.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-c",
+      "source_files": ["src/vectors/hnsw.rs"],
+      "source_query": "incremental hnsw insertion",
+      "justification": "Critical E3 fix established donor parity.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 12,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "auto-apply-04",
+    "expected_verdict": "auto_apply",
+    "proposal": {
+      "title": "EntityRef provider policy",
+      "content": "EntityRef rendering rejects knowledge provider strings containing colons.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-d",
+      "source_files": ["src/entity_ref.rs"],
+      "source_query": "provider colon render reject",
+      "justification": "F1 fix documented and tested the policy.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 25,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "auto-apply-05",
+    "expected_verdict": "auto_apply",
+    "proposal": {
+      "title": "Knowledge index status",
+      "content": "Superseded knowledge remains searchable so historical queries can find it.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-e",
+      "source_files": ["src/index/knowledge_docs.rs"],
+      "source_query": "superseded knowledge searchable",
+      "justification": "K1 fix intentionally keeps superseded active in the index.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 49,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "hold-unknown-brofile-01",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "Borderline unknown extractor",
+      "content": "An unknown brofile proposed a durable repo fact.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-f",
+      "source_files": ["src/main.rs"],
+      "source_query": "unknown extractor",
+      "justification": "Good provenance but untrusted source.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 5,
+      "brofile": "new-extractor"
+    }
+  },
+  {
+    "id": "hold-daily-cap-01",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "Daily cap reached",
+      "content": "A good fact arrived after the auto-apply daily cap.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-g",
+      "source_files": ["src/main.rs"],
+      "source_query": "daily cap",
+      "justification": "Cap boundary should hold.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 50,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "hold-daily-cap-02",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "Daily cap exceeded",
+      "content": "A good fact arrived after the daily cap was exceeded.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-h",
+      "source_files": ["src/main.rs"],
+      "source_query": "daily cap exceeded",
+      "justification": "Cap overrun should hold.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 70,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "hold-quarantined-brofile-01",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "Quarantined brofile",
+      "content": "A quarantined brofile proposed a good-looking fact.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-i",
+      "source_files": ["src/main.rs"],
+      "source_query": "quarantined brofile",
+      "justification": "Bro trust overrides content quality.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 1,
+      "brofile": "quarantined-brofile"
+    }
+  },
+  {
+    "id": "hold-no-daily-count-01",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "No daily count",
+      "content": "A good fact lacks the measurable daily count field.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-j",
+      "source_files": ["src/main.rs"],
+      "source_query": "missing daily count",
+      "justification": "Cap cannot be enforced without the counter.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "reject-missing-session-01",
+    "expected_verdict": "auto_apply",
+    "proposal": {
+      "title": "Missing source session",
+      "content": "No source session was provided.",
+      "category": "memory",
+      "scope": "project",
+      "source_files": ["src/main.rs"],
+      "source_query": "missing session",
+      "justification": "source_files and source_query still provide provenance.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 0,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "reject-null-session-01",
+    "expected_verdict": "auto_apply",
+    "proposal": {
+      "title": "Null source session",
+      "content": "Source session was null.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": null,
+      "source_files": ["src/main.rs"],
+      "source_query": "null session",
+      "justification": "source_files and source_query still provide provenance.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 0,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "reject-missing-query-01",
+    "expected_verdict": "auto_apply",
+    "proposal": {
+      "title": "Missing source query",
+      "content": "No source query was provided.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-k",
+      "source_files": ["src/main.rs"],
+      "justification": "source_session and source_files still provide provenance.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 0,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "reject-empty-files-01",
+    "expected_verdict": "auto_apply",
+    "proposal": {
+      "title": "Empty source files",
+      "content": "No source file was provided.",
+      "category": "memory",
+      "scope": "project",
+      "source_session": "sess-l",
+      "source_files": [],
+      "source_query": "empty files",
+      "justification": "source_session and source_query still provide provenance.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 0,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "reject-missing-files-01",
+    "expected_verdict": "reject",
+    "proposal": {
+      "title": "Missing source files",
+      "content": "No source session, source query, or source files were provided.",
+      "category": "memory",
+      "scope": "project",
+      "justification": "All provenance fields are absent.",
+      "suggested_approval": "auto_apply",
+      "rendered": false,
+      "daily_count": 0,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "rendered-hold-01",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "Rendered convention",
+      "content": "A convention would render into provider memory.",
+      "category": "convention",
+      "scope": "project",
+      "source_session": "sess-n",
+      "source_files": ["AGENTS.md"],
+      "source_query": "rendered convention",
+      "justification": "Rendered entries need operator review.",
+      "suggested_approval": "hold_for_review",
+      "rendered": true,
+      "daily_count": 0,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "rendered-hold-02",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "Rendered decision",
+      "content": "A decision would render into provider memory.",
+      "category": "decision",
+      "scope": "project",
+      "source_session": "sess-o",
+      "source_files": ["design/agentic-corpus.md"],
+      "source_query": "rendered decision",
+      "justification": "Rendered decisions require review.",
+      "suggested_approval": "hold_for_review",
+      "rendered": true,
+      "daily_count": 1,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "rendered-hold-03",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "Rendered global rule",
+      "content": "A global rule would be resident in every session.",
+      "category": "convention",
+      "scope": "global",
+      "source_session": "sess-p",
+      "source_files": ["design/agentic-corpus.md"],
+      "source_query": "global rendered rule",
+      "justification": "Global rendered entries need human review.",
+      "suggested_approval": "hold_for_review",
+      "rendered": true,
+      "daily_count": 2,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "rendered-hold-04",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "Rendered workflow memory",
+      "content": "A workflow category entry would be rendered.",
+      "category": "workflow",
+      "scope": "project",
+      "source_session": "sess-q",
+      "source_files": ["examples/agentic-corpus/workflows/auto-digest-arc.json"],
+      "source_query": "workflow rendered",
+      "justification": "Rendered workflow notes need review.",
+      "suggested_approval": "hold_for_review",
+      "rendered": true,
+      "daily_count": 3,
+      "brofile": "digest-extractor"
+    }
+  },
+  {
+    "id": "rendered-hold-05",
+    "expected_verdict": "hold_for_review",
+    "proposal": {
+      "title": "Rendered operator instruction",
+      "content": "An operator-facing instruction belongs in review.",
+      "category": "convention",
+      "scope": "project",
+      "source_session": "sess-r",
+      "source_files": ["AGENTS.md"],
+      "source_query": "operator instruction",
+      "justification": "Rendered instructions affect future sessions.",
+      "suggested_approval": "hold_for_review",
+      "rendered": true,
+      "daily_count": 4,
+      "brofile": "digest-extractor"
+    }
+  }
+]

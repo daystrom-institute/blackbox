@@ -1,0 +1,18 @@
+{
+  "packet_id": "domain:auto-edge/vote-aggregate",
+  "mode": "first",
+  "dataset": [
+    {
+      "entity": {
+        "vars": {
+          "vote_aggregate": {
+            "vote1": "yes",
+            "vote2": "yes",
+            "vote3": "no"
+          }
+        }
+      },
+      "expected": "write_edge"
+    }
+  ]
+}

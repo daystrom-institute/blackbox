@@ -1,0 +1,24 @@
+{
+  "id": "transcript-postgres-snake-case",
+  "query_class": "transcript_provenance",
+  "pass_strictness": "first",
+  "query": "where did the Postgres snake_case column convention come from?",
+  "target_locators": [
+    {
+      "description": "Transcript hits around the Postgres columns use snake_case convention.",
+      "entity_type_hint": "transcript",
+      "transcript_hint": "Postgres columns use snake_case"
+    }
+  ],
+  "expected_entity_refs": [
+    "transcript:claude:0142cece-dfc1-4e7d-8cce-7b6079454ef0:1954884:0"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "IN_SESSION"
+  },
+  "forbidden_stale_answers": [
+    "Do not invent a current schema migration; this is about the convention's transcript provenance."
+  ],
+  "pass_classifier": "check_transcript_postgres_snake_case"
+}

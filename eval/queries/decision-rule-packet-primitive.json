@@ -1,0 +1,24 @@
+{
+  "id": "decision-rule-packet-primitive",
+  "query_class": "stale_decision_lookup",
+  "pass_strictness": "all",
+  "query": "what was decided about adding rule-packets to blackbox?",
+  "target_locators": [
+    {
+      "description": "Decision 154fd624 describing rule-packets as a first-class memory primitive.",
+      "entity_type_hint": "knowledge",
+      "knowledge_hint": "154fd624"
+    }
+  ],
+  "expected_entity_refs": [
+    "knowledge:154fd624"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "SUPERSEDES"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer that rule-packets are only prose rubrics or external docs."
+  ],
+  "pass_classifier": "check_decision_rule_packet_primitive"
+}

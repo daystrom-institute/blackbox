@@ -1,0 +1,54 @@
+{
+  "name": "slack-badgey-ask",
+  "version": 1,
+  "vars_schema": {
+    "channel": { "kind": "string" },
+    "user": { "kind": "string" },
+    "thread_ts": { "kind": "string" },
+    "text": { "kind": "string" },
+    "response_url": { "kind": "string" },
+    "team_id": { "kind": "string" },
+    "bbox_user": { "kind": "string" }
+  },
+  "actors": {
+    "badgey": {
+      "kind": "executor",
+      "brofile": "badgey-slack",
+      "durable": false
+    }
+  },
+  "start": "Answer",
+  "nodes": {
+    "Answer": {
+      "actor": "badgey",
+      "prompt": "[scope]\nbright\nblackboard\n\nSlack user @${vars.bbox_user} mentioned you in channel ${vars.channel}:\n\n${vars.text}\n\nReply concisely. Use Slack-compatible mrkdwn formatting. For multi-paragraph replies, the response will be posted as a threaded reply in Slack.",
+      "next": { "type": "goto", "to": "PostReply" }
+    },
+    "PostReply": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/chat.postMessage",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel}",
+              "thread_ts": "${vars.thread_ts}",
+              "text": "${outputs.Answer}",
+              "mrkdwn": true
+            },
+            "expect_status": [200]
+          },
+          "into_var": "post_response",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

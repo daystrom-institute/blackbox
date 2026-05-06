@@ -1,22 +1,39 @@
+mod artifacts;
+mod chunker;
 mod council;
 mod crons;
+mod edge_index;
+mod embed;
+mod embed_queue;
+mod entity_loader;
+pub mod entity_ref;
+#[cfg(test)]
+#[path = "../eval/check.rs"]
+mod eval_check;
+mod git;
 mod inbox;
 mod index;
 mod knowledge;
 mod mcp_client;
+mod mcp_tools;
 mod notes;
 mod orchestration;
 mod packets;
 mod parser;
+mod path_cache;
 mod pins;
 mod pollers;
+mod projects;
+mod providers;
 mod query;
 mod render;
 mod routing;
+mod search;
 mod system_memory;
 mod threads;
 mod tool_docs;
 mod util;
+mod vectors;
 mod webhooks;
 mod whiteboards;
 mod workflow;
@@ -31,7 +48,7 @@ use parking_lot::RwLock;
 use axum::extract::{Query, State as AxumState};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use futures::stream::Stream;
+use futures::{stream::Stream, StreamExt};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, IntoContents, ServerCapabilities, ServerInfo};
@@ -53,6 +70,8 @@ use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
 use packets::{Packets, ScannerConfig};
 use pins::{AmbientPinQuery, PinParams, Pins};
+use projects::{ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry};
+use providers::ProviderContext;
 use threads::Threads;
 
 // ---------------------------------------------------------------------------
@@ -65,7 +84,12 @@ struct SharedState {
     threads: RwLock<Threads>,
     notes: RwLock<Notes>,
     pins: RwLock<Pins>,
+    projects: RwLock<ProjectRegistry>,
     packets: RwLock<Packets>,
+    artifacts: RwLock<artifacts::ArtifactCatalog>,
+    #[allow(dead_code)]
+    edge_index: RwLock<edge_index::EdgeIndex>,
+    path_cache: RwLock<path_cache::PathCache>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
     store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
@@ -271,11 +295,40 @@ struct BlackboxServer {
 }
 
 impl BlackboxServer {
+    const MCP_RESPONSE_CAP_BYTES: usize = 80 * 1024;
+
     fn new(state: Arc<SharedState>) -> Self {
         Self {
             state,
             tool_router: Self::bbox_tools() + Self::bro_tools(),
         }
+    }
+
+    fn sync_knowledge_entry_to_index(&self, entry_id: &str) -> anyhow::Result<()> {
+        let Some(entry) = self.state.kb.read().entry(entry_id).cloned() else {
+            return Ok(());
+        };
+        let entity_id = crate::index::knowledge_entity_id(entry_id);
+        let chunk_hash = crate::index::knowledge_chunk_hash(&entry);
+        self.state.idx.write().index_knowledge_entry(&entry)?;
+        embed_queue::enqueue_knowledge(&entry, &entity_id, &chunk_hash);
+        Ok(())
+    }
+
+    fn tombstone_knowledge_entry_in_index(&self, entry_id: &str) -> anyhow::Result<()> {
+        self.state.idx.write().delete_knowledge_entry(entry_id)?;
+        embed_queue::tombstone_knowledge(&crate::index::knowledge_entity_id(entry_id));
+        Ok(())
+    }
+
+    fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts =
+            mcp_tools::inspect::entity_type_count(&self.state.edge_index.read().known_refs());
+        counts.insert("knowledge".into(), self.state.kb.read().all_entries().len());
+        counts.insert("thread".into(), self.state.threads.read().all().len());
+        counts.insert("note".into(), self.state.notes.read().all().len());
+        counts.insert("whiteboard".into(), self.state.whiteboards.list_ids().len());
+        counts
     }
 
     fn ambient_pin_block(
@@ -544,6 +597,10 @@ impl BlackboxServer {
         self.state.cancel_arc(arc_id)
     }
 
+    fn rebuild_edge_index_from_stores(&self) {
+        rebuild_edge_index_from_shared(&self.state);
+    }
+
     /// Resolve a workflow by registry id (set via `bro_workflow_install`
     /// or restored from disk on startup). Returns a clone so the caller
     /// can mutate locally without affecting the registry.
@@ -581,18 +638,35 @@ impl BlackboxServer {
     }
 
     fn ok_text(text: &str) -> CallToolResult {
-        CallToolResult::success(text.to_string().into_contents())
+        CallToolResult::success(Self::cap_response_text(text).into_contents())
     }
 
     fn ok_json(value: &Value) -> CallToolResult {
         let text = serde_json::to_string_pretty(value).unwrap_or_default();
-        CallToolResult::success(text.into_contents())
+        CallToolResult::success(Self::cap_response_text(&text).into_contents())
     }
 
     fn err_text(msg: &str) -> CallToolResult {
-        let mut r = CallToolResult::success(msg.to_string().into_contents());
+        let mut r = CallToolResult::success(Self::cap_response_text(msg).into_contents());
         r.is_error = Some(true);
         r
+    }
+
+    fn cap_response_text(text: &str) -> String {
+        if text.len() <= Self::MCP_RESPONSE_CAP_BYTES {
+            return text.to_string();
+        }
+        let suffix = "\n\n[... response truncated to 80KB by bbox response cap]";
+        let target = Self::MCP_RESPONSE_CAP_BYTES.saturating_sub(suffix.len());
+        let mut out = String::new();
+        for ch in text.chars() {
+            if out.len() + ch.len_utf8() > target {
+                break;
+            }
+            out.push(ch);
+        }
+        out.push_str(suffix);
+        out
     }
 
     /// Run a sync tool handler: time it, log at debug (ok) / warn (err),
@@ -624,15 +698,24 @@ impl BlackboxServer {
 // Bbox tools (search, knowledge, threads)
 // ---------------------------------------------------------------------------
 
+use artifacts::{ArtifactInstallParams, ArtifactListParams, ArtifactSupersedeParams};
+use embed::ReembedParams;
 use inbox::InboxParams;
 use index::{
     CiteParams, ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
     SessionsListParams, TopicsParams,
 };
 use knowledge::{
-    AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeListParams, LearnParams,
-    RememberParams, RenderParams, ResponseFormat, ReviewParams,
+    AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeLinkParams,
+    KnowledgeListParams, LearnParams, RememberParams, RenderParams, ResponseFormat, ReviewParams,
 };
+use mcp_tools::blame::BlameParams;
+use mcp_tools::bundle_evidence::BundleEvidenceParams;
+use mcp_tools::discover_seed::DiscoverSeedParams;
+use mcp_tools::find_paths::FindPathsParams;
+use mcp_tools::hybrid_search::HybridSearchParams;
+use mcp_tools::inspect::InspectEntityParams;
+use mcp_tools::provenance::ProvenanceParams;
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
     apply_with as apply_packet_with, packet_matches_query, packet_summary,
@@ -649,13 +732,69 @@ impl BlackboxServer {
     )]
     fn bbox_search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
         Self::run("bbox_search", || {
-            let mut idx = self.state.idx.write();
-            if idx.is_empty() {
-                idx.build_index(false)
+            if self.state.idx.read().is_empty() {
+                self.state
+                    .idx
+                    .write()
+                    .build_index(false)
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-            drop(idx);
             self.state.idx.read().search(&p)
+        })
+    }
+
+    #[tool(
+        name = "bbox_hybrid_search",
+        description = "Hybrid BM25+vector search over typed entities. vector_weight=0.6 by default; set 0.0 for BM25-only behavior, 1.0 for vector-only."
+    )]
+    fn bbox_hybrid_search(&self, Parameters(p): Parameters<HybridSearchParams>) -> CallToolResult {
+        Self::run("bbox_hybrid_search", || {
+            // Fast path: read-lock the index to check emptiness. Only escalate
+            // to a write lock if we actually need to build_index. The previous
+            // unconditional write lock blocked every search behind the
+            // auto-reindex thread's writer, adding 5-30 seconds of latency
+            // to interactive queries during reindex windows.
+            if self.state.idx.read().is_empty() {
+                self.state
+                    .idx
+                    .write()
+                    .build_index(false)
+                    .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
+            }
+            let provider_ctx = ProviderContext::new(&self.state);
+            mcp_tools::hybrid_search::hybrid_search(
+                &self.state.idx.read(),
+                &self.state.kb.read(),
+                &provider_ctx,
+                &p,
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_discover_seed_entities",
+        description = "Find seed entities with notable_edges; inspect before answering."
+    )]
+    fn bbox_discover_seed_entities(
+        &self,
+        Parameters(p): Parameters<DiscoverSeedParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_discover_seed_entities", || {
+            if self.state.idx.read().is_empty() {
+                self.state
+                    .idx
+                    .write()
+                    .build_index(false)
+                    .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
+            }
+            let provider_ctx = ProviderContext::new(&self.state);
+            mcp_tools::discover_seed::discover_seed_entities(
+                &self.state.idx.read(),
+                &self.state.kb.read(),
+                &provider_ctx,
+                &self.state.edge_index.read(),
+                &p,
+            )
         })
     }
 
@@ -700,6 +839,23 @@ impl BlackboxServer {
     }
 
     #[tool(
+        name = "bbox_reembed",
+        description = "Request an embedding rebuild for a configured route."
+    )]
+    fn bbox_reembed(&self, Parameters(p): Parameters<ReembedParams>) -> CallToolResult {
+        let state = self.state.clone();
+        Self::run("bbox_reembed", || embed::reembed_start(&p, state))
+    }
+
+    #[tool(
+        name = "bbox_embed_status",
+        description = "Return per-route embedding queue health."
+    )]
+    fn bbox_embed_status(&self) -> CallToolResult {
+        Self::run("bbox_embed_status", embed_queue::status_json)
+    }
+
+    #[tool(
         name = "bbox_topics",
         description = "Top terms in a session by frequency."
     )]
@@ -726,6 +882,231 @@ impl BlackboxServer {
     }
 
     #[tool(
+        name = "bbox_inspect_entity",
+        description = "Inspect a vertex: returns properties AND targeted edges in one call. Prefer targeted inspection over broad exploration: 1) Set edge_types to the specific edges you want (e.g. 'SUPERSEDES,DERIVED_FROM'). 2) Set direction to 'out' or 'in' when you know which way to traverse. 3) Use 'both' only for initial orientation on an unfamiliar entity. 4) Set per_type_limit=0 for property-only inspection. property_mode controls detail: 'summary' (names/titles only), 'smart' (full text <=300 chars, truncated for longer - default), 'full' (no truncation)."
+    )]
+    fn bbox_inspect_entity(
+        &self,
+        Parameters(p): Parameters<InspectEntityParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_inspect_entity", || {
+            let entity_ref = match crate::entity_ref::EntityRef::parse(&p.entity_ref) {
+                Ok(entity_ref) => entity_ref,
+                Err(err) => {
+                    return Ok(mcp_tools::inspect::bad_input(
+                        &p.entity_ref,
+                        err.to_string(),
+                    ));
+                }
+            };
+            let provider_ctx = ProviderContext::new(&self.state);
+            mcp_tools::inspect::inspect_entity(
+                &p,
+                &provider_ctx,
+                &entity_ref,
+                &self.state.edge_index.read(),
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_describe_schema",
+        description = "Catalog agentic-corpus entity types and edge families. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips."
+    )]
+    fn bbox_describe_schema(&self) -> CallToolResult {
+        Self::run("bbox_describe_schema", || {
+            mcp_tools::describe_schema::describe_schema(&self.describe_schema_counts())
+        })
+    }
+
+    #[tool(
+        name = "bbox_find_paths",
+        description = "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence. edge_types accepts a comma-separated string (e.g. 'CALLS,CALLED_BY') OR a JSON array of strings. Both shapes are equivalent."
+    )]
+    fn bbox_find_paths(&self, Parameters(p): Parameters<FindPathsParams>) -> CallToolResult {
+        Self::run("bbox_find_paths", || {
+            let provider_ctx = ProviderContext::new(&self.state);
+            mcp_tools::find_paths::find_paths(
+                &p,
+                &provider_ctx,
+                &self.state.edge_index.read(),
+                &mut self.state.path_cache.write(),
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_bundle_evidence",
+        description = "Package selected entity refs and cached path IDs into a structured evidence bundle. Use after bbox_find_paths to close the loop before answering; stale path IDs degrade explicitly under degraded.stale_path_ids instead of failing the whole response."
+    )]
+    fn bbox_bundle_evidence(
+        &self,
+        Parameters(p): Parameters<BundleEvidenceParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_bundle_evidence", || {
+            let provider_ctx = ProviderContext::new(&self.state);
+            mcp_tools::bundle_evidence::bundle_evidence(
+                &p,
+                &provider_ctx,
+                &self.state.edge_index.read(),
+                &mut self.state.path_cache.write(),
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_blame",
+        description = "Walk back from a code line to the conversation that produced it. Two modes: 1. Anchor-matching: the line's git blame commit matches a bbox-tracked tool-call anchor, returning the full session/brofile/arc/trigger chain. 2. Git-only fallback: no bbox anchor matches, returning git blame author info only, marked as non-bbox. Use this when you want to understand WHY a line exists, not just WHO wrote it."
+    )]
+    fn bbox_blame(&self, Parameters(p): Parameters<BlameParams>) -> CallToolResult {
+        Self::run("bbox_blame", || {
+            let provider_ctx = ProviderContext::new(&self.state);
+            let projects = self.state.projects.read().list();
+            mcp_tools::blame::blame(
+                &p,
+                &provider_ctx,
+                &self.state.edge_index.read(),
+                &projects,
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_provenance_export",
+        description = "Write bbox provenance git notes for commits with tracked tool-call anchors."
+    )]
+    fn bbox_provenance_export(
+        &self,
+        Parameters(p): Parameters<ProvenanceParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_provenance_export", || {
+            let projects = self.state.projects.read().list();
+            mcp_tools::provenance::export_provenance(
+                &p,
+                &self.state.edge_index.read(),
+                &projects,
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_provenance_import",
+        description = "Read bbox provenance git notes and replay them into the local EdgeIndex sidecar."
+    )]
+    fn bbox_provenance_import(
+        &self,
+        Parameters(p): Parameters<ProvenanceParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_provenance_import", || {
+            let projects = self.state.projects.read().list();
+            let edges_dir = edge_index::edges_dir_from_bro_store(&self.state.store_dir);
+            let edges_imported =
+                mcp_tools::provenance::import_provenance_to_edges_dir(&p, &projects, &edges_dir)?;
+            self.rebuild_edge_index_from_stores();
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "edges_imported": edges_imported,
+                "notes_ref": crate::git::notes_ref("provenance"),
+            }))?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_project_register",
+        description = "Register a project directory for agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. Triggers the project-bootstrap-arc which walks the project, chunks files, writes to the index, and emits structural edges. project_id is derived from the canonicalized realpath and is per-machine; not portable across hosts. repo_id is null for non-git projects; for git projects it derives from the first-commit SHA (with remote-URL fallback for shallow clones), so it survives clones. Use bbox_project_list to inspect registered projects."
+    )]
+    fn bbox_project_register(
+        &self,
+        Parameters(p): Parameters<ProjectRegisterParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_project_register", || {
+            let record = self.state.projects.write().register_path(&p.path)?;
+            let edges_dir = edge_index::edges_dir_from_bro_store(&self.state.store_dir);
+            let provenance_params = ProvenanceParams {
+                project_id: Some(record.project_id.clone()),
+            };
+            mcp_tools::provenance::import_provenance_to_edges_dir(
+                &provenance_params,
+                std::slice::from_ref(&record),
+                &edges_dir,
+            )?;
+            trigger_project_bootstrap_arc(self.state.clone(), record.clone());
+            self.state
+                .idx
+                .write()
+                .reindex(&ReindexParams { full: Some(false) })?;
+            // Rebuild EdgeIndex AFTER reindex so freshly-derived edges from the
+            // new project's chunks (IN_FILE, CONTAINS_SYMBOL, NEXT_CHUNK, etc.)
+            // are projected into the in-memory index. Doing this before reindex
+            // (the prior order) left the new project's edges invisible until
+            // the next unrelated rebuild trigger.
+            self.rebuild_edge_index_from_stores();
+            Ok(serde_json::to_string_pretty(&record)?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_project_list",
+        description = "List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered."
+    )]
+    fn bbox_project_list(&self) -> CallToolResult {
+        Self::ok_json(
+            &serde_json::to_value(ProjectListResponse {
+                projects: self.state.projects.read().list(),
+            })
+            .unwrap_or_default(),
+        )
+    }
+
+    #[tool(
+        name = "bbox_artifact_install",
+        description = "Install a workflow, packet, or brofile artifact from a local JSON file path or http(s) URL into the versioned artifact catalog."
+    )]
+    async fn bbox_artifact_install(
+        &self,
+        Parameters(p): Parameters<ArtifactInstallParams>,
+    ) -> CallToolResult {
+        match install_artifact_from_params(&self.state, p).await {
+            Ok(meta) => Self::ok_json(&serde_json::to_value(meta).unwrap_or_default()),
+            Err(e) => Self::err_text(&format!("artifact install failed: {e:#}")),
+        }
+    }
+
+    #[tool(
+        name = "bbox_artifact_list",
+        description = "List installed workflow, packet, and brofile artifacts with version, source, active status, and supersession metadata."
+    )]
+    fn bbox_artifact_list(&self, Parameters(p): Parameters<ArtifactListParams>) -> CallToolResult {
+        Self::run("bbox_artifact_list", || {
+            let rows = self.state.artifacts.read().list(&p)?;
+            Ok(serde_json::to_string_pretty(
+                &serde_json::json!({ "artifacts": rows }),
+            )?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_artifact_supersede",
+        description = "Mark one installed artifact superseded by another artifact of the same kind."
+    )]
+    fn bbox_artifact_supersede(
+        &self,
+        Parameters(p): Parameters<ArtifactSupersedeParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_artifact_supersede", || {
+            let kind = p.kind;
+            let name = p.name.clone();
+            let meta = self
+                .state
+                .artifacts
+                .write()
+                .supersede(p.kind, &p.name, &p.superseded_by)?;
+            deactivate_artifact(&self.state, kind, &name)?;
+            Ok(serde_json::to_string_pretty(&meta)?)
+        })
+    }
+
+    #[tool(
         name = "bbox_learn",
         description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically."
     )]
@@ -738,6 +1119,9 @@ impl BlackboxServer {
         match (|| {
             let warning = self.arc_bound_warning(p.id.as_deref(), &p.content);
             let result = self.state.kb.write().learn_result(&p, false)?;
+            if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
+            }
             Ok::<_, anyhow::Error>((result, warning))
         })() {
             Ok((result, warning)) => {
@@ -787,7 +1171,11 @@ impl BlackboxServer {
     )]
     fn bbox_remember(&self, Parameters(p): Parameters<RememberParams>) -> CallToolResult {
         Self::run("bbox_remember", || {
-            self.state.kb.write().remember(&p, false)
+            let result = self.state.kb.write().remember_result(&p, false)?;
+            if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
+            }
+            Ok(result.message)
         })
     }
 
@@ -796,7 +1184,16 @@ impl BlackboxServer {
         description = "Record a durable commitment with required rationale; supports supersession."
     )]
     fn bbox_decide(&self, Parameters(p): Parameters<DecideParams>) -> CallToolResult {
-        Self::run("bbox_decide", || self.state.kb.write().decide(&p, false))
+        Self::run("bbox_decide", || {
+            let result = self.state.kb.write().decide_result(&p, false)?;
+            if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
+                tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
+            }
+            if let Some(old_id) = result.superseded.as_deref() {
+                self.tombstone_knowledge_entry_in_index(old_id)?;
+            }
+            Ok(result.message)
+        })
     }
 
     #[tool(
@@ -872,9 +1269,33 @@ impl BlackboxServer {
         })
     }
 
+    #[tool(
+        name = "bbox_knowledge_link",
+        description = "Append a knowledge edge."
+    )]
+    fn bbox_knowledge_link(
+        &self,
+        Parameters(p): Parameters<KnowledgeLinkParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_knowledge_link", || {
+            let edge = self.state.kb.write().append_link(&p)?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "linked",
+                "source": p.source,
+                "target": p.target,
+                "kind": edge.kind.edge_kind(),
+                "confidence": edge.confidence,
+            }))?)
+        })
+    }
+
     #[tool(name = "bbox_forget", description = "Retire or supersede an entry.")]
     fn bbox_forget(&self, Parameters(p): Parameters<ForgetParams>) -> CallToolResult {
-        Self::run("bbox_forget", || self.state.kb.write().forget(&p))
+        Self::run("bbox_forget", || {
+            let message = self.state.kb.write().forget(&p)?;
+            self.tombstone_knowledge_entry_in_index(&p.id)?;
+            Ok(message)
+        })
     }
 
     #[tool(
@@ -977,7 +1398,7 @@ impl BlackboxServer {
             let threads = self.state.threads.read();
             let notes = self.state.notes.read();
             let task_store = self.state.task_store.read();
-            inbox::compute_inbox(&kb, &threads, &notes, &task_store, &p)
+            inbox::compute_inbox(&kb, &threads, &notes, &task_store, &self.state.whiteboards, &p)
         })
     }
 
@@ -1560,7 +1981,10 @@ fn resolve_dispatch_filters(
 /// Delete a Gemini policy tempfile once the associated task reaches a
 /// terminal state. Spawned as a detached tokio task from the dispatch
 /// path. No-op if path is None.
-pub(crate) fn cleanup_policy_file_when_done(task: std::sync::Arc<orch::Task>, path: Option<PathBuf>) {
+pub(crate) fn cleanup_policy_file_when_done(
+    task: std::sync::Arc<orch::Task>,
+    path: Option<PathBuf>,
+) {
     let Some(path) = path else { return };
     tokio::spawn(async move {
         loop {
@@ -3001,7 +3425,7 @@ Constraints:\n\
         // Capability validation — walk every actor's brofile/team →
         // provider and verify the actor's `requires` capabilities are
         // covered. Hard fail rather than silent route-around.
-        if let Err(e) = self.validate_workflow_capabilities(&compiled) {
+        if let Err(e) = validate_workflow_capabilities(&compiled, &self.state) {
             return Self::err_text(&format!("workflow capability validation failed: {e}"));
         }
         if p.dry_run.unwrap_or(false) {
@@ -3018,102 +3442,6 @@ Constraints:\n\
         )
         .await;
         Self::ok_json(&serde_json::to_value(&result).unwrap_or_default())
-    }
-
-    /// Walk each ActorSpec.requires → resolve actor's brofile (or
-    /// team's member brofiles) → resolve provider → check provider
-    /// capabilities cover the requirements. Hard fail with the first
-    /// mismatch. Empty `requires` (default) is always satisfied.
-    fn validate_workflow_capabilities(
-        &self,
-        compiled: &workflow::CompiledWorkflow,
-    ) -> Result<(), String> {
-        for (actor_name, actor) in &compiled.spec.actors {
-            if actor.requires.is_empty() {
-                continue;
-            }
-            let providers = self.resolve_actor_providers(actor)?;
-            if providers.is_empty() {
-                return Err(format!(
-                    "actor '{actor_name}' requires {:?} but resolves to no providers",
-                    actor.requires
-                ));
-            }
-            for provider in &providers {
-                let caps = provider.capabilities();
-                let missing: Vec<_> = actor
-                    .requires
-                    .iter()
-                    .filter(|r| !caps.contains(r))
-                    .collect();
-                if !missing.is_empty() {
-                    return Err(format!(
-                        "actor '{actor_name}' requires {:?} but provider '{provider}' lacks {:?}",
-                        actor.requires, missing
-                    ));
-                }
-            }
-        }
-        // Recursively validate sub-workflows.
-        for (node_id, node) in &compiled.spec.nodes {
-            if let Some(sub) = &node.subworkflow {
-                let sub_compiled = workflow::compile((**sub).clone())
-                    .map_err(|e| format!("subworkflow on '{node_id}' compile: {e}"))?;
-                self.validate_workflow_capabilities(&sub_compiled)
-                    .map_err(|e| format!("subworkflow on '{node_id}': {e}"))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Walk an ActorSpec to the providers it dispatches to. For
-    /// executor/advisor: lookup brofile, return its provider. For
-    /// ensemble: lookup team, walk its member brofiles. Returns the
-    /// distinct provider set.
-    fn resolve_actor_providers(
-        &self,
-        actor: &workflow::schema::ActorSpec,
-    ) -> Result<Vec<orchestration::providers::Provider>, String> {
-        use std::collections::HashSet;
-        let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
-        match actor.kind {
-            workflow::schema::ActorKind::Executor => {
-                let brofile_name = actor
-                    .brofile
-                    .as_deref()
-                    .ok_or_else(|| format!("actor (kind={:?}) missing brofile", actor.kind))?;
-                let bf = orchestration::brofile::resolve_brofile(
-                    brofile_name,
-                    &self.state.store_dir,
-                    None,
-                )
-                .ok_or_else(|| format!("brofile '{brofile_name}' not found"))?;
-                providers.insert(bf.provider);
-            }
-            workflow::schema::ActorKind::Ensemble => {
-                let team_name = actor
-                    .team
-                    .as_deref()
-                    .ok_or_else(|| "ensemble actor missing team".to_string())?;
-                let team = orchestration::team::load_team(team_name, &self.state.store_dir)
-                    .ok_or_else(|| format!("team '{team_name}' not found"))?;
-                for member in team.members.iter() {
-                    let bf = orchestration::brofile::resolve_brofile(
-                        &member.brofile,
-                        &self.state.store_dir,
-                        None,
-                    )
-                    .ok_or_else(|| {
-                        format!(
-                            "team '{team_name}' member '{}' brofile '{}' not found",
-                            member.name, member.brofile
-                        )
-                    })?;
-                    providers.insert(bf.provider);
-                }
-            }
-        }
-        Ok(providers.into_iter().collect())
     }
 
     #[tool(
@@ -3871,7 +4199,7 @@ Constraints:\n\
             Ok(c) => c,
             Err(e) => return Self::err_text(&format!("workflow compile failed: {e}")),
         };
-        if let Err(e) = self.validate_workflow_capabilities(&compiled) {
+        if let Err(e) = validate_workflow_capabilities(&compiled, &self.state) {
             return Self::err_text(&format!("capability validation failed: {e}"));
         }
         let id = p.id.unwrap_or_else(|| spec.name.clone());
@@ -3963,6 +4291,91 @@ Constraints:\n\
             "posts": posts,
         }))
     }
+}
+
+/// Walk each ActorSpec.requires -> resolve actor brofiles/teams -> provider
+/// capabilities. Empty `requires` is satisfied.
+pub(crate) fn validate_workflow_capabilities(
+    compiled: &workflow::CompiledWorkflow,
+    state: &Arc<SharedState>,
+) -> Result<(), String> {
+    for (actor_name, actor) in &compiled.spec.actors {
+        if actor.requires.is_empty() {
+            continue;
+        }
+        let providers = resolve_actor_providers(actor, state)?;
+        if providers.is_empty() {
+            return Err(format!(
+                "actor '{actor_name}' requires {:?} but resolves to no providers",
+                actor.requires
+            ));
+        }
+        for provider in &providers {
+            let caps = provider.capabilities();
+            let missing: Vec<_> = actor
+                .requires
+                .iter()
+                .filter(|r| !caps.contains(r))
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "actor '{actor_name}' requires {:?} but provider '{provider}' lacks {:?}",
+                    actor.requires, missing
+                ));
+            }
+        }
+    }
+    for (node_id, node) in &compiled.spec.nodes {
+        if let Some(sub) = &node.subworkflow {
+            let sub_compiled = workflow::compile((**sub).clone())
+                .map_err(|e| format!("subworkflow on '{node_id}' compile: {e}"))?;
+            validate_workflow_capabilities(&sub_compiled, state)
+                .map_err(|e| format!("subworkflow on '{node_id}': {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_actor_providers(
+    actor: &workflow::schema::ActorSpec,
+    state: &Arc<SharedState>,
+) -> Result<Vec<orchestration::providers::Provider>, String> {
+    use std::collections::HashSet;
+    let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
+    match actor.kind {
+        workflow::schema::ActorKind::Executor => {
+            let brofile_name = actor
+                .brofile
+                .as_deref()
+                .ok_or_else(|| format!("actor (kind={:?}) missing brofile", actor.kind))?;
+            let bf = orchestration::brofile::resolve_brofile(brofile_name, &state.store_dir, None)
+                .ok_or_else(|| format!("brofile '{brofile_name}' not found"))?;
+            providers.insert(bf.provider);
+        }
+        workflow::schema::ActorKind::Ensemble => {
+            let team_name = actor
+                .team
+                .as_deref()
+                .ok_or_else(|| "ensemble actor missing team".to_string())?;
+            let team = orchestration::team::load_team(team_name, &state.store_dir)
+                .ok_or_else(|| format!("team '{team_name}' not found"))?;
+            for member in team.members.iter() {
+                let bf = orchestration::brofile::resolve_brofile(
+                    &member.brofile,
+                    &state.store_dir,
+                    None,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "team '{team_name}' member '{}' brofile '{}' not found",
+                        member.name, member.brofile
+                    )
+                })?;
+                providers.insert(bf.provider);
+            }
+        }
+    }
+    Ok(providers.into_iter().collect())
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -5927,13 +6340,12 @@ async fn dispatch_verdict(
             })?;
             let compiled = workflow::compile(workflow_spec)
                 .map_err(|e| anyhow::anyhow!("workflow compile: {e}"))?;
-            let server = BlackboxServer::new(state.clone());
             // Validate brofile/team capability composition against the
             // workflow's actor `requires` lists. Webhook ingress used
             // to skip this and let dispatch silently downgrade — fix
             // is to gate the spawn on the same check the MCP / HTTP
             // dispatch paths already use.
-            if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+            if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
                 return Err(anyhow::anyhow!(
                     "workflow '{workflow_id}' capability validation: {e}"
                 ));
@@ -5980,6 +6392,7 @@ async fn dispatch_verdict(
             // name here.
             let cron_name = inlet_name.strip_prefix("cron:").map(|s| s.to_string());
             let crons_for_done = state.crons.clone();
+            let server = BlackboxServer::new(state.clone());
             tokio::spawn(async move {
                 let _ = workflow::run_workflow_with_initial_vars(
                     &server,
@@ -6046,7 +6459,7 @@ async fn orchestrate_by_id_handler(
         }
     };
     let server = BlackboxServer::new(state.clone());
-    if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+    if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             format!("capability validation failed: {e}"),
@@ -6172,6 +6585,231 @@ async fn admin_packet_compile(
     }
 }
 
+async fn read_artifact_source(source: &str) -> anyhow::Result<Value> {
+    const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
+    let raw = if source.starts_with("http://") || source.starts_with("https://") {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()?;
+        let response = client.get(source).send().await?.error_for_status()?;
+        let scheme = response.url().scheme();
+        if scheme != "http" && scheme != "https" {
+            anyhow::bail!("artifact source redirected to unsupported scheme `{scheme}`");
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !(content_type.contains("application/json")
+            || content_type.contains("text/json")
+            || content_type.contains("text/plain"))
+        {
+            anyhow::bail!("artifact source content-type must be JSON or text/plain");
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_ARTIFACT_BYTES as u64)
+        {
+            anyhow::bail!("artifact source too large; limit is {MAX_ARTIFACT_BYTES} bytes");
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len() + chunk.len() > MAX_ARTIFACT_BYTES {
+                anyhow::bail!("artifact source too large; limit is {MAX_ARTIFACT_BYTES} bytes");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        String::from_utf8(bytes)?
+    } else {
+        std::fs::read_to_string(source)?
+    };
+    Ok(serde_json::from_str(&raw)?)
+}
+
+async fn install_artifact_from_params(
+    state: &Arc<SharedState>,
+    p: ArtifactInstallParams,
+) -> anyhow::Result<artifacts::ArtifactMetadata> {
+    let value = read_artifact_source(&p.source).await?;
+    install_artifact_value(state, p, value).await
+}
+
+async fn install_artifact_value(
+    state: &Arc<SharedState>,
+    p: ArtifactInstallParams,
+    value: Value,
+) -> anyhow::Result<artifacts::ArtifactMetadata> {
+    match p.kind {
+        artifacts::ArtifactKind::Workflow => {
+            let spec: workflow::Workflow = serde_json::from_value(value.clone())?;
+            let compiled = workflow::compile(spec.clone())?;
+            if let Err(e) = validate_workflow_capabilities(&compiled, state) {
+                anyhow::bail!("workflow capability validation failed: {e}");
+            }
+            let id = p.name.clone().unwrap_or_else(|| spec.name.clone());
+            let dir = state.store_dir.join("workflows");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join(format!("{id}.json")),
+                serde_json::to_string_pretty(&spec).unwrap_or_default(),
+            )?;
+            state.workflow_registry.write().insert(id, spec);
+        }
+        artifacts::ArtifactKind::Packet => {
+            let params: packets::CompileParams = serde_json::from_value(value.clone())?;
+            state.packets.read().compile(&params)?;
+        }
+        artifacts::ArtifactKind::Brofile => {
+            let brofile: orchestration::brofile::Brofile = serde_json::from_value(value.clone())?;
+            orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None);
+        }
+    }
+    state
+        .artifacts
+        .write()
+        .install_value(p.kind, p.source, &value, p.name, p.version, p.supersedes)
+        .and_then(|meta| {
+            if let Some(prev) = meta.supersedes.as_deref() {
+                deactivate_artifact(state, meta.kind, prev)?;
+            }
+            Ok(meta)
+        })
+}
+
+fn deactivate_artifact(
+    state: &Arc<SharedState>,
+    kind: artifacts::ArtifactKind,
+    name: &str,
+) -> anyhow::Result<()> {
+    match kind {
+        artifacts::ArtifactKind::Workflow => {
+            state.workflow_registry.write().remove(name);
+            let path = state
+                .store_dir
+                .join("workflows")
+                .join(format!("{name}.json"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        artifacts::ArtifactKind::Packet => {
+            state.packets.read().remove_domain(name)?;
+        }
+        artifacts::ArtifactKind::Brofile => {
+            orchestration::brofile::delete_brofile(name, "global", &state.store_dir, None);
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_edge_index_from_shared(state: &SharedState) {
+    let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let idx = state.idx.read();
+    let kb = state.kb.read();
+    let threads = state.threads.read();
+    let notes = state.notes.read();
+    let task_store = state.task_store.read();
+    let rebuilt = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+        index: &idx,
+        knowledge: &kb,
+        threads: &threads,
+        notes: &notes,
+        task_store: &task_store,
+        edges_dir,
+    });
+    *state.edge_index.write() = rebuilt;
+}
+
+/// Watcher thread that rebuilds the EdgeIndex when the underlying tantivy
+/// corpus has grown. The auto-reindex thread writes new docs + edge sidecars
+/// every interval, but it can't trigger a rebuild itself (it spawns before
+/// SharedState exists). This watcher polls `idx.num_docs()` and triggers a
+/// rebuild whenever the count advances, which folds in the new project_file
+/// edges (IN_FILE / CONTAINS_SYMBOL / NEXT_CHUNK / etc.) so the agentic
+/// graph surface stays current without manual intervention.
+fn spawn_edge_index_rebuild_watcher(state: Arc<SharedState>, interval: std::time::Duration) {
+    std::thread::Builder::new()
+        .name("blackbox-edge-rebuild".into())
+        .spawn(move || {
+            // Initial settle so the boot-time rebuild already ran.
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            let mut last_seen: u64 = state.idx.read().num_docs();
+            loop {
+                std::thread::sleep(interval);
+                let current = state.idx.read().num_docs();
+                if current > last_seen {
+                    let started = std::time::Instant::now();
+                    rebuild_edge_index_from_shared(&state);
+                    tracing::info!(
+                        prev_docs = last_seen,
+                        new_docs = current,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "edge-index watcher: corpus grew, EdgeIndex rebuilt"
+                    );
+                    last_seen = current;
+                }
+            }
+        })
+        .expect("failed to spawn edge index rebuild watcher");
+}
+
+fn trigger_project_bootstrap_arc(state: Arc<SharedState>, record: ProjectRecord) {
+    let Some(spec) = state
+        .workflow_registry
+        .read()
+        .get("project-bootstrap-arc")
+        .cloned()
+    else {
+        tracing::debug!(
+            project_id = %record.project_id,
+            "project-bootstrap-arc is not installed; registration recorded without arc trigger"
+        );
+        return;
+    };
+    let compiled = match workflow::compile(spec) {
+        Ok(compiled) => compiled,
+        Err(err) => {
+            tracing::warn!(error = %err, "project-bootstrap-arc compile failed");
+            return;
+        }
+    };
+    if let Err(err) = validate_workflow_capabilities(&compiled, &state) {
+        tracing::warn!(error = %err, "project-bootstrap-arc capability validation failed");
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("no tokio runtime available; skipped project-bootstrap-arc trigger");
+        return;
+    };
+    let project_dir = Some(record.canonical_path.clone());
+    let mut vars = serde_json::Map::new();
+    vars.insert("project_id".to_string(), Value::String(record.project_id));
+    vars.insert(
+        "project_path".to_string(),
+        Value::String(record.canonical_path),
+    );
+    if let Some(repo_id) = record.repo_id {
+        vars.insert("repo_id".to_string(), Value::String(repo_id));
+    }
+    handle.spawn(async move {
+        let server = BlackboxServer::new(state);
+        let _ = workflow::run_workflow_with_initial_vars(
+            &server,
+            &compiled,
+            project_dir,
+            Some(50),
+            vars,
+        )
+        .await;
+    });
+}
+
 #[derive(Debug, Deserialize)]
 struct AdminWorkflowInstallReq {
     #[serde(default)]
@@ -6204,8 +6842,7 @@ async fn admin_workflow_install(
                 .into_response();
         }
     };
-    let server = BlackboxServer::new(state.clone());
-    if let Err(e) = server.validate_workflow_capabilities(&compiled) {
+    if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             format!("capability validation: {e}"),
@@ -6228,6 +6865,62 @@ async fn admin_workflow_install(
     }
     state.workflow_registry.write().insert(id.clone(), spec);
     axum::Json(json!({"status": "installed", "id": id})).into_response()
+}
+
+async fn admin_artifact_install(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<ArtifactInstallParams>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    match install_artifact_from_params(&state, req).await {
+        Ok(meta) => axum::Json(json!({"status": "installed", "artifact": meta})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("artifact install: {e:#}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_artifact_list(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    Query(query): Query<ArtifactListParams>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    match state.artifacts.read().list(&query) {
+        Ok(rows) => axum::Json(json!({"artifacts": rows})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("artifact list: {e:#}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_artifact_supersede(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<ArtifactSupersedeParams>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    match state
+        .artifacts
+        .write()
+        .supersede(req.kind, &req.name, &req.superseded_by)
+    {
+        Ok(meta) => match deactivate_artifact(&state, req.kind, &req.name) {
+            Ok(()) => axum::Json(json!({"status": "superseded", "artifact": meta})).into_response(),
+            Err(e) => (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("artifact deactivate: {e:#}"),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("artifact supersede: {e:#}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -6957,9 +7650,18 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("Index path: {}", index_path.display());
 
-    let idx = TranscriptIndex::open_or_create(&index_path, roots, codex_root)?;
-
+    let projects_path = util::blackbox_projects_path(&home);
     let kb_path = util::blackbox_knowledge_path(&home);
+    let idx = TranscriptIndex::open_or_create(
+        &index_path,
+        roots,
+        codex_root,
+        projects_path.clone(),
+        kb_path.clone(),
+    )?;
+    let projects_store = ProjectRegistry::open(&projects_path)?;
+    tracing::info!("Project registry: {}", projects_path.display());
+
     let mut kb = Knowledge::open(&kb_path)?;
     tracing::info!("Knowledge store: {}", kb_path.display());
 
@@ -7026,6 +7728,10 @@ async fn main() -> anyhow::Result<()> {
     let packets_store = Packets::open(&packets_dir)?;
     tracing::info!("Packets store: {}", packets_dir.join("packets").display());
 
+    let artifacts_dir = util::blackbox_artifacts_dir(&home);
+    let artifacts_store = artifacts::ArtifactCatalog::open(&artifacts_dir)?;
+    tracing::info!("Artifact catalog: {}", artifacts_store.root().display());
+
     // Orchestration state
     let store_dir = PathBuf::from(
         std::env::var("BRO_STORE")
@@ -7058,13 +7764,26 @@ async fn main() -> anyhow::Result<()> {
     let bind_host = std::env::var("BBOX_BIND").unwrap_or_else(|_| "127.0.0.1".into());
     let bind_is_loopback = is_loopback_bind(&bind_host);
 
+    let edge_index = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+        index: &idx,
+        knowledge: &kb,
+        threads: &th,
+        notes: &notes_store,
+        task_store: &task_store,
+        edges_dir: edge_index::edges_dir_from_bro_store(&store_dir),
+    });
+
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
         kb: RwLock::new(kb),
         threads: RwLock::new(th),
         notes: RwLock::new(notes_store),
         pins: RwLock::new(pins_store),
+        projects: RwLock::new(projects_store),
         packets: RwLock::new(packets_store),
+        artifacts: RwLock::new(artifacts_store),
+        edge_index: RwLock::new(edge_index),
+        path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx: tail_tx.clone(),
         store_dir: store_dir.clone(),
@@ -7084,6 +7803,17 @@ async fn main() -> anyhow::Result<()> {
         councils: Arc::new(council::CouncilRegistry::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
     });
+    vectors::install_global(Arc::new(vectors::VectorStore::open(
+        vectors::default_vectors_dir(),
+    )?));
+    embed_queue::install_contradiction_threshold(tier0_cosine_threshold_from_env());
+    embed_queue::install_contradiction_state(shared.clone());
+    embed_queue::install(embed::queue::EmbedQueueHandle::start_default());
+
+    // Watch the tantivy corpus and rebuild the EdgeIndex whenever new docs
+    // land via the auto-reindex thread (60s poll interval is sufficient
+    // since the reindex tick is 120s by default).
+    spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
 
     // Restore webhook + workflow registries from disk so installs
     // survive daemon restart. Re-run install_check at restore time —
@@ -7257,10 +7987,17 @@ async fn main() -> anyhow::Result<()> {
         .with_stateful_mode(true);
 
     let shared_for_mcp = shared.clone();
+    let session_keep_alive = std::env::var("BBOX_MCP_SESSION_KEEPALIVE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(6 * 60 * 60);
+    let mut session_manager = LocalSessionManager::default();
+    session_manager.session_config.keep_alive =
+        Some(std::time::Duration::from_secs(session_keep_alive));
     let mcp_service: StreamableHttpService<BlackboxServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(BlackboxServer::new(shared_for_mcp.clone())),
-            Default::default(),
+            session_manager.into(),
             config,
         );
 
@@ -7313,6 +8050,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/workflow/install",
             axum::routing::post(admin_workflow_install),
+        )
+        .route(
+            "/admin/artifact/install",
+            axum::routing::post(admin_artifact_install),
+        )
+        .route(
+            "/admin/artifact/list",
+            axum::routing::get(admin_artifact_list),
+        )
+        .route(
+            "/admin/artifact/supersede",
+            axum::routing::post(admin_artifact_supersede),
         )
         .route(
             "/admin/webhook/install",
@@ -7371,18 +8120,51 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn tier0_cosine_threshold_from_env() -> f32 {
+    const DEFAULT: f32 = 0.85;
+    match std::env::var("BBOX_TIER0_COSINE_THRESHOLD") {
+        Ok(raw) => match raw.parse::<f32>() {
+            Ok(value) if (0.0..=1.0).contains(&value) => value,
+            Ok(value) => {
+                tracing::warn!(
+                    value,
+                    "BBOX_TIER0_COSINE_THRESHOLD outside [0.0, 1.0]; using default"
+                );
+                DEFAULT
+            }
+            Err(err) => {
+                tracing::warn!(
+                    value = raw,
+                    error = %err,
+                    "invalid BBOX_TIER0_COSINE_THRESHOLD; using default"
+                );
+                DEFAULT
+            }
+        },
+        Err(_) => DEFAULT,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
-        let index =
-            TranscriptIndex::open_or_create(&tmp.path().join("index"), Vec::new(), None).unwrap();
+        let index = TranscriptIndex::open_or_create(
+            &tmp.path().join("index"),
+            Vec::new(),
+            None,
+            tmp.path().join("projects.json"),
+            tmp.path().join("knowledge.json"),
+        )
+        .unwrap();
         let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
         let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
         let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
         let pins = Pins::open(&tmp.path().join("pins.json")).unwrap();
+        let projects = ProjectRegistry::open(tmp.path().join("projects.json")).unwrap();
         let packets = Packets::open(tmp.path()).unwrap();
+        let artifacts = artifacts::ArtifactCatalog::open(tmp.path().join("artifacts")).unwrap();
         let (tail_tx, _) = broadcast::channel::<TailEvent>(16);
         let state = Arc::new(SharedState {
             idx: RwLock::new(index),
@@ -7390,7 +8172,11 @@ mod tests {
             threads: RwLock::new(threads),
             notes: RwLock::new(notes),
             pins: RwLock::new(pins),
+            projects: RwLock::new(projects),
             packets: RwLock::new(packets),
+            artifacts: RwLock::new(artifacts),
+            edge_index: RwLock::new(edge_index::EdgeIndex::default()),
+            path_cache: RwLock::new(path_cache::PathCache::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
             tail_tx,
             store_dir: tmp.path().join("bro"),
@@ -7427,6 +8213,1018 @@ mod tests {
             "global",
             &tmp.path().join("bro"),
             None,
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_install_wires_f3_workflow_and_packet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/schema-migration-arc.json"
+        ))
+        .unwrap();
+        let packet_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/workflow-policy/arc-budget.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/schema-migration-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/workflow-policy/arc-budget.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            packet_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("schema-migration-arc"));
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:workflow-policy/arc-budget")
+            .is_ok());
+        let rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: None,
+                name: None,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn artifact_install_wires_project_bootstrap_arc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/project-bootstrap-arc.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/project-bootstrap-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("project-bootstrap-arc"));
+        let rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: Some(artifacts::ArtifactKind::Workflow),
+                name: Some("project-bootstrap-arc".into()),
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let compiled = {
+            let workflow = server
+                .state
+                .workflow_registry
+                .read()
+                .get("project-bootstrap-arc")
+                .cloned()
+                .unwrap();
+            workflow::compile(workflow).unwrap()
+        };
+        let mut vars = serde_json::Map::new();
+        vars.insert("project_id".into(), Value::String("proj1234".into()));
+        vars.insert(
+            "project_path".into(),
+            Value::String(tmp.path().to_string_lossy().into_owned()),
+        );
+        let result = workflow::run_workflow_with_initial_vars(
+            &server,
+            &compiled,
+            Some(tmp.path().to_string_lossy().into_owned()),
+            Some(50),
+            vars,
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.vars.get("published"), Some(&Value::Bool(true)));
+        let arc_id = result.arc_thread_id.as_deref().unwrap_or_default();
+        let snapshot = server
+            .state
+            .running_arcs
+            .read()
+            .get(arc_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(snapshot.status, "completed");
+        assert!(snapshot
+            .completed_nodes
+            .iter()
+            .any(|node| node == "Publish"));
+    }
+
+    #[tokio::test]
+    async fn artifact_install_wires_m2_compaction_arc_and_packets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/embed-compaction-arc.json"
+        ))
+        .unwrap();
+        let policy_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/embed/compaction-policy.json"
+        ))
+        .unwrap();
+        let cron_routing_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/cron-routing/embed-compaction.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/embed-compaction-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/embed/compaction-policy.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            policy_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/cron-routing/embed-compaction.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            cron_routing_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("embed-compaction-arc"));
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:embed/compaction-policy")
+            .is_ok());
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:cron-routing/embed-compaction")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn embed_compaction_arc_gates_against_vector_status_vars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vector_store =
+            Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+        let _guard = vectors::install_test_global(vector_store.clone());
+        let route = "test-compaction-route";
+        for idx in 0..10 {
+            let theta = idx as f32 * 0.01;
+            vector_store
+                .upsert(
+                    route,
+                    &format!("entity-{idx}"),
+                    &format!("hash-{idx}"),
+                    vec![theta.cos(), theta.sin(), 0.0, 0.0],
+                )
+                .unwrap();
+        }
+        for idx in 0..4 {
+            vector_store
+                .delete(route, &format!("entity-{idx}"))
+                .unwrap();
+        }
+        let before = vector_store.metrics().remove(route).unwrap();
+        assert_eq!(before.active_count, 6);
+        assert_eq!(before.deleted_count, 4);
+        assert!(before.deleted_ratio > 0.3);
+
+        let server = test_server(&tmp);
+        let packet_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/embed/compaction-policy.json"
+        ))
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/embed/compaction-policy.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            packet_value,
+        )
+        .await
+        .unwrap();
+
+        let workflow_spec: workflow::Workflow = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/embed-compaction-arc.json"
+        ))
+        .unwrap();
+        let compiled = workflow::compile(workflow_spec).unwrap();
+        let result = workflow::run_workflow_with_initial_vars(
+            &server,
+            &compiled,
+            Some(tmp.path().to_string_lossy().into_owned()),
+            Some(20),
+            serde_json::Map::new(),
+        )
+        .await;
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.vars.get("rebuild_started"), Some(&Value::Bool(true)));
+        assert_eq!(result.vars.get("swapped"), Some(&Value::Bool(true)));
+        assert!(result
+            .events
+            .iter()
+            .any(
+                |event| event.get("kind").and_then(Value::as_str) == Some("gate_applied")
+                    && event
+                        .get("data")
+                        .and_then(|data| data.get("verdict"))
+                        .and_then(Value::as_str)
+                        == Some("compact")
+            ));
+        let after = vector_store.metrics().remove(route).unwrap();
+        assert_eq!(after.active_count, 6);
+        assert_eq!(after.deleted_count, 0);
+    }
+
+    #[tokio::test]
+    async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let brofile_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/brofiles/digest-extractor.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            brofile_value["disallow_tools"],
+            serde_json::json!(["Edit", "Write", "Bash"])
+        );
+        let trust_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/bro-trust/per-brofile.json"
+        ))
+        .unwrap();
+        let quality_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/auto-digest/entry-quality.json"
+        ))
+        .unwrap();
+        let routing_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/auto-digest/task-completed-routing.json"
+        ))
+        .unwrap();
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/auto-digest-arc.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "examples/agentic-corpus/brofiles/digest-extractor.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            brofile_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/bro-trust/per-brofile.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            trust_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/auto-digest/entry-quality.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            quality_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/auto-digest/task-completed-routing.json"
+                    .into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            routing_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/auto-digest-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("auto-digest-arc"));
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:auto-digest/entry-quality")
+            .is_ok());
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:auto-digest/task-completed-routing")
+            .is_ok());
+        assert!(orchestration::brofile::resolve_brofile(
+            "digest-extractor",
+            &server.state.store_dir,
+            None
+        )
+        .is_some());
+
+        let cases: Value =
+            serde_json::from_str(include_str!("../eval/audit/auto-digest/cases.json")).unwrap();
+        let cases = cases.as_array().unwrap();
+        let packet_store = server.state.packets.read();
+        let packet = packet_store
+            .load("domain:auto-digest/entry-quality")
+            .unwrap();
+        let mut matched = 0usize;
+        for case in cases {
+            let entity = serde_json::json!({
+                "vars": {
+                    "candidate": case["proposal"].clone()
+                }
+            });
+            let prediction = packets::apply_with(&packet, &entity, &*packet_store)
+                .unwrap_or_else(|| panic!("case {} produced no verdict", case["id"]));
+            if prediction.classification == case["expected_verdict"].as_str().unwrap() {
+                matched += 1;
+            }
+        }
+        assert!(
+            matched >= 18,
+            "auto-digest audit fidelity {matched}/{} below gate",
+            cases.len()
+        );
+        assert_eq!(matched, cases.len());
+    }
+
+    #[tokio::test]
+    async fn artifact_install_wires_m4_contradiction_review_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/contradiction-review-arc.json"
+        ))
+        .unwrap();
+        let packet_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/contradiction/review-synthesis.json"
+        ))
+        .unwrap();
+        let brofiles: [(&str, Value); 4] = [
+            (
+                "contradiction-provenance",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/contradiction-provenance.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "contradiction-lifecycle",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/contradiction-lifecycle.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "contradiction-coherence",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/contradiction-coherence.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "contradiction-facilitator",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/contradiction-facilitator.json"
+                ))
+                .unwrap(),
+            ),
+        ];
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/contradiction/review-synthesis.json"
+                    .into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            packet_value,
+        )
+        .await
+        .unwrap();
+        for (name, value) in brofiles {
+            install_artifact_value(
+                &server.state,
+                ArtifactInstallParams {
+                    kind: artifacts::ArtifactKind::Brofile,
+                    source: format!("examples/agentic-corpus/brofiles/{name}.json"),
+                    name: None,
+                    version: None,
+                    supersedes: None,
+                },
+                value,
+            )
+            .await
+            .unwrap();
+        }
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/contradiction-review-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("contradiction-review-arc"));
+        let packet_store = server.state.packets.read();
+        let packet = packet_store
+            .load("domain:contradiction/review-synthesis")
+            .unwrap();
+        let prediction = packets::apply_with(
+            &packet,
+            &json!({"vars": {"verdict": {"verdict": "contradicts"}}}),
+            &*packet_store,
+        )
+        .unwrap();
+        assert_eq!(prediction.classification, "contradicts");
+        assert!(orchestration::brofile::resolve_brofile(
+            "contradiction-facilitator",
+            &server.state.store_dir,
+            None
+        )
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn artifact_install_wires_m5_auto_edge_artifacts_and_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let packet_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/auto-edge/vote-aggregate.json"
+        ))
+        .unwrap();
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/auto-edge-arc.json"
+        ))
+        .unwrap();
+        let brofiles: [(&str, Value); 6] = [
+            (
+                "describe-prose-signal",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/describe-prose-signal.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "describe-symbol-fit",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/describe-symbol-fit.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "describe-narrative-cohesion",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/describe-narrative-cohesion.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "reference-citation-precision",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/reference-citation-precision.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "reference-target-existence",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/reference-target-existence.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "reference-context-fit",
+                serde_json::from_str(include_str!(
+                    "../examples/agentic-corpus/brofiles/reference-context-fit.json"
+                ))
+                .unwrap(),
+            ),
+        ];
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/auto-edge/vote-aggregate.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            packet_value,
+        )
+        .await
+        .unwrap();
+        for (name, value) in brofiles {
+            install_artifact_value(
+                &server.state,
+                ArtifactInstallParams {
+                    kind: artifacts::ArtifactKind::Brofile,
+                    source: format!("examples/agentic-corpus/brofiles/{name}.json"),
+                    name: None,
+                    version: None,
+                    supersedes: None,
+                },
+                value,
+            )
+            .await
+            .unwrap();
+            assert!(orchestration::brofile::resolve_brofile(
+                name,
+                &server.state.store_dir,
+                None
+            )
+            .is_some());
+        }
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/auto-edge-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("auto-edge-arc"));
+
+        let packet_store = server.state.packets.read();
+        let packet = packet_store
+            .load("domain:auto-edge/vote-aggregate")
+            .unwrap();
+        for cases in [
+            serde_json::from_str::<Value>(include_str!("../eval/audit/auto-edge/describes.json"))
+                .unwrap(),
+            serde_json::from_str::<Value>(include_str!(
+                "../eval/audit/auto-edge/references.json"
+            ))
+            .unwrap(),
+        ] {
+            let rows = cases.as_array().unwrap();
+            let mut matched = 0usize;
+            for case in rows {
+                let prediction = packets::apply_with(&packet, &case["entity"], &*packet_store)
+                    .unwrap_or_else(|| panic!("case {} produced no verdict", case["id"]));
+                if prediction.classification == case["expected"].as_str().unwrap() {
+                    matched += 1;
+                }
+            }
+            assert!(
+                matched >= 12,
+                "auto-edge audit fidelity {matched}/{} below gate",
+                rows.len()
+            );
+            assert_eq!(matched, rows.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn write_semantic_edge_projects_describes_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let edges_dir = tmp.path().join("edges");
+        let source = "project_file:proj1234:relhash:chunkhash:0";
+        let target = "symbol:proj1234:EntityRef:defnhash";
+        let ctx = workflow::context::ArcContext::new(workflow::context::ArcMeta {
+            arc_id: "arc-test".into(),
+            workflow_name: "auto-edge-arc".into(),
+            workflow_version: 1,
+            project_dir: Some(tmp.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        let hook = workflow::ops::HookOp {
+            op: workflow::ops::OpKind::WriteSemanticEdge,
+            args: json!({
+                "source": source,
+                "target": target,
+                "kind": "DESCRIBES",
+                "edges_dir": edges_dir,
+                "note": "synthetic doc-section describes EntityRef"
+            }),
+            when: None,
+            on_failure: workflow::ops::OnFailure::Halt,
+            into_var: Some("semantic_edge".into()),
+        };
+        workflow::ops::execute_op(&hook, &ctx, None).await.unwrap();
+        let edge_index = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+            index: &server.state.idx.read(),
+            knowledge: &server.state.kb.read(),
+            threads: &server.state.threads.read(),
+            notes: &server.state.notes.read(),
+            task_store: &server.state.task_store.read(),
+            edges_dir,
+        });
+        let source_ref = entity_ref::EntityRef::parse(source).unwrap();
+        let target_ref = entity_ref::EntityRef::parse(target).unwrap();
+        assert!(edge_index
+            .forward_edges(&source_ref)
+            .iter()
+            .any(|edge| edge.kind == "DESCRIBES" && edge.target == target_ref));
+    }
+
+    #[tokio::test]
+    async fn shipped_packet_audit_examples_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let packets = [
+            "examples/agentic-corpus/packets/workflow-policy/arc-budget.json",
+            "examples/agentic-corpus/packets/embed/compaction-policy.json",
+            "examples/agentic-corpus/packets/cron-routing/embed-compaction.json",
+            "examples/agentic-corpus/packets/bro-trust/per-brofile.json",
+            "examples/agentic-corpus/packets/auto-digest/task-completed-routing.json",
+            "examples/agentic-corpus/packets/auto-digest/entry-quality.json",
+            "examples/agentic-corpus/packets/contradiction/review-synthesis.json",
+            "examples/agentic-corpus/packets/auto-edge/vote-aggregate.json",
+            "examples/agentic-corpus/packets/eval/drift-policy.json",
+        ];
+        for rel in packets {
+            let path = root.join(rel);
+            let value: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            install_artifact_value(
+                &server.state,
+                ArtifactInstallParams {
+                    kind: artifacts::ArtifactKind::Packet,
+                    source: rel.into(),
+                    name: None,
+                    version: None,
+                    supersedes: None,
+                },
+                value,
+            )
+            .await
+            .unwrap();
+        }
+
+        let audits = [
+            "examples/agentic-corpus/packets/workflow-policy/arc-budget.audit_examples.json",
+            "examples/agentic-corpus/packets/embed/compaction-policy.audit_examples.json",
+            "examples/agentic-corpus/packets/cron-routing/embed-compaction.audit_examples.json",
+            "examples/agentic-corpus/packets/bro-trust/per-brofile.audit_examples.json",
+            "examples/agentic-corpus/packets/auto-digest/task-completed-routing.audit_examples.json",
+            "examples/agentic-corpus/packets/auto-digest/entry-quality.audit_examples.json",
+            "examples/agentic-corpus/packets/contradiction/review-synthesis.audit_examples.json",
+            "examples/agentic-corpus/packets/auto-edge/vote-aggregate.audit_examples.json",
+            "examples/agentic-corpus/packets/eval/drift-policy.audit_examples.json",
+        ];
+        let packet_store = server.state.packets.read();
+        for rel in audits {
+            let spec: Value =
+                serde_json::from_str(&std::fs::read_to_string(root.join(rel)).unwrap()).unwrap();
+            let rendered = packet_store
+                .audit_tool(&packets::AuditParams {
+                    packet_id: spec["packet_id"].as_str().unwrap().into(),
+                    dataset: spec["dataset"].clone(),
+                    mode: None,
+                })
+                .unwrap();
+            let report: Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(
+                report["fidelity"].as_f64().unwrap(),
+                1.0,
+                "audit examples failed for {rel}: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        embed_queue::install_contradiction_threshold(0.85);
+        embed_queue::install_contradiction_state(server.state.clone());
+        let vector_store = Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+        let _guard = vectors::install_test_global(vector_store.clone());
+        let now = "2026-01-01T00:00:00Z".to_string();
+        for (id, content) in [
+            ("aaaabbbb", "use provider A for embeddings"),
+            ("ccccdddd", "never use provider A for embeddings"),
+        ] {
+            server
+                .state
+                .kb
+                .write()
+                .upsert_generated(knowledge::KnowledgeEntry {
+                    id: id.into(),
+                    title: id.into(),
+                    content: content.into(),
+                    cluster: None,
+                    variants: Default::default(),
+                    category: knowledge::Category::Memory,
+                    scope: knowledge::Scope::Global,
+                    project: None,
+                    providers: Vec::new(),
+                    priority: knowledge::Priority::Standard,
+                    weight: 100,
+                    status: knowledge::Status::Active,
+                    approval: knowledge::Approval::UserConfirmed,
+                    render: false,
+                    decay: true,
+                    review_at: None,
+                    supersedes: None,
+                    links: Vec::new(),
+                    rationale: None,
+                    expires_at: None,
+                    source: "test".into(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    recall_count: 0,
+                    last_recalled: None,
+                })
+                .unwrap();
+        }
+        vector_store
+            .upsert("knowledge-test", "knowledge:ccccdddd", "h-old", vec![1.0, 0.0])
+            .unwrap();
+        vector_store
+            .upsert("knowledge-test", "knowledge:aaaabbbb", "h-new", vec![0.99, 0.01])
+            .unwrap();
+        let request = embed::queue::EmbedRequest {
+            bucket: embed::Bucket::Knowledge,
+            project_id: None,
+            entity_id: "knowledge:aaaabbbb".into(),
+            chunk_hash: "h-new".into(),
+            text: "use provider A for embeddings".into(),
+        };
+        embed_queue::maybe_detect_knowledge_contradiction(
+            &request,
+            "knowledge-test",
+            &[0.99, 0.01],
+        );
+
+        assert!(server.state.notes.read().all().iter().any(|note| {
+            note.body.contains("Tier-0 contradiction detected")
+                && note.body.contains("knowledge:aaaabbbb")
+                && note.body.contains("knowledge:ccccdddd")
+        }));
+
+        embed_queue::install_contradiction_threshold(1.0);
+        let note_count = server.state.notes.read().all().len();
+        embed_queue::maybe_detect_knowledge_contradiction(
+            &request,
+            "knowledge-test",
+            &[0.99, 0.01],
+        );
+        assert_eq!(server.state.notes.read().all().len(), note_count);
+        embed_queue::install_contradiction_threshold(0.85);
+    }
+
+    #[tokio::test]
+    async fn artifact_supersession_deactivates_workflow_registry_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_a = serde_json::json!({
+            "name": "workflow-a",
+            "version": 1,
+            "actors": {},
+            "start": "Done",
+            "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+        });
+        let workflow_a2 = serde_json::json!({
+            "name": "workflow-a2",
+            "version": 2,
+            "supersedes": "workflow-a",
+            "actors": {},
+            "start": "Done",
+            "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+        });
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "workflow-a.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_a,
+        )
+        .await
+        .unwrap();
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a"));
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "workflow-a2.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_a2,
+        )
+        .await
+        .unwrap();
+
+        assert!(!server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a"));
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a2"));
+        assert!(!server
+            .state
+            .store_dir
+            .join("workflows")
+            .join("workflow-a.json")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn read_artifact_source_rejects_oversized_http_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: 1048577\r\n",
+                "\r\n",
+                "{}"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let err = read_artifact_source(&format!("http://{addr}/artifact.json"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("too large"), "got: {err}");
+    }
+
+    #[test]
+    fn bbox_project_list_round_trips_through_tool_serialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let server = test_server(&tmp);
+
+        let register = server.bbox_project_register(Parameters(ProjectRegisterParams {
+            path: project.to_string_lossy().into_owned(),
+        }));
+        assert_ne!(register.is_error, Some(true));
+
+        let listed = server.bbox_project_list();
+        assert_ne!(listed.is_error, Some(true));
+        let wire = serde_json::to_value(&listed).unwrap();
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        let response: ProjectListResponse = serde_json::from_str(text).unwrap();
+
+        assert_eq!(response.projects.len(), 1);
+        assert_eq!(
+            response.projects[0].project_id,
+            entity_ref::project_id_for_path(&project).unwrap()
         );
     }
 
@@ -7563,6 +9361,14 @@ mod tests {
         assert_eq!(checkpoint.dispute_count, 1);
         assert_eq!(checkpoint.notes.blocked_count, 1);
         assert_eq!(checkpoint.notes.dispute_count, 1);
+    }
+
+    #[test]
+    fn mcp_response_cap_limits_large_text() {
+        let huge = "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES + 1024);
+        let capped = BlackboxServer::cap_response_text(&huge);
+        assert!(capped.len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        assert!(capped.contains("response truncated"));
     }
 
     #[tokio::test]

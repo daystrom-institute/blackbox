@@ -1,0 +1,12 @@
+{
+  "packet_id": "domain:cron-routing/embed-compaction",
+  "mode": "first",
+  "dataset": [
+    {
+      "entity": {
+        "cron_name": "embed-compaction-nightly"
+      },
+      "expected": "{\"route\":\"start_arc\",\"workflow\":\"embed-compaction-arc\",\"initial_vars\":{}}"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "reference-context-fit",
+  "version": 1,
+  "provider": "claude",
+  "model": "sonnet-4.6",
+  "effort": "medium",
+  "disallow_tools": ["Edit", "Write", "Bash"],
+  "lens": "You classify REFERENCES candidate edges. Lens: does the surrounding knowledge entry content corroborate the reference target? Read only supplied refs, labels, and excerpts. Output strict JSON only: {\"vote\":\"yes|no\",\"justification\":\"...\"}."
+}

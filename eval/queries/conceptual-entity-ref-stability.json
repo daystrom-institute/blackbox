@@ -1,0 +1,23 @@
+{
+  "id": "conceptual-entity-ref-stability",
+  "query_class": "conceptual_design_doc",
+  "query": "what makes entity refs stable across reindex?",
+  "target_locators": [
+    {
+      "description": "The design section explaining entity-ref grammar and stability rules for transcript, project_file, symbol, and commit refs.",
+      "entity_type_hint": "project_file",
+      "path_hint": "design/agentic-corpus.md"
+    }
+  ],
+  "expected_entity_refs": [
+    "project_file:d723917f:3b317e2b:366f5e6579d320c753f13faf54c47de10e8ff8e7130d917c818a244f624825a0:6"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "NEXT_SECTION"
+  },
+  "forbidden_stale_answers": [
+    "Do not imply project_file refs are path-only; chunk_hash and occurrence_idx are part of the design."
+  ],
+  "pass_classifier": "check_conceptual_entity_ref_stability"
+}

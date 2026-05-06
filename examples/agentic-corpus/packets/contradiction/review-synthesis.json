@@ -1,0 +1,71 @@
+{
+  "domain": "contradiction/review-synthesis",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": [
+    "contradicts",
+    "supersedes",
+    "tension_with",
+    "related",
+    "no_conflict",
+    "hold"
+  ],
+  "rules": [
+    {
+      "id": "facilitator_says_contradicts",
+      "classification": "contradicts",
+      "antecedent": {
+        "op": "Eq",
+        "field": "vars.verdict.verdict",
+        "value": "contradicts"
+      },
+      "consequent": "contradicts"
+    },
+    {
+      "id": "facilitator_says_supersedes",
+      "classification": "supersedes",
+      "antecedent": {
+        "op": "Eq",
+        "field": "vars.verdict.verdict",
+        "value": "supersedes"
+      },
+      "consequent": "supersedes"
+    },
+    {
+      "id": "facilitator_says_tension_with",
+      "classification": "tension_with",
+      "antecedent": {
+        "op": "Eq",
+        "field": "vars.verdict.verdict",
+        "value": "tension_with"
+      },
+      "consequent": "tension_with"
+    },
+    {
+      "id": "facilitator_says_related",
+      "classification": "related",
+      "antecedent": {
+        "op": "Eq",
+        "field": "vars.verdict.verdict",
+        "value": "related"
+      },
+      "consequent": "related"
+    },
+    {
+      "id": "facilitator_says_no_conflict",
+      "classification": "no_conflict",
+      "antecedent": {
+        "op": "Eq",
+        "field": "vars.verdict.verdict",
+        "value": "no_conflict"
+      },
+      "consequent": "no_conflict"
+    },
+    {
+      "id": "hold_default",
+      "classification": "hold",
+      "antecedent": { "op": "True" },
+      "consequent": "hold"
+    }
+  ]
+}

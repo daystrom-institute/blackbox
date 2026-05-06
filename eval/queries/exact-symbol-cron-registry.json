@@ -1,0 +1,24 @@
+{
+  "id": "exact-symbol-cron-registry",
+  "query_class": "exact_symbol",
+  "query": "what symbol defines the cron inlet registry?",
+  "target_locators": [
+    {
+      "description": "The Rust CronRegistry type that manages installed cron inlets.",
+      "entity_type_hint": "symbol",
+      "path_hint": "src/crons.rs",
+      "symbol_hint": "CronRegistry"
+    }
+  ],
+  "expected_entity_refs": [
+    "symbol:d723917f:CronRegistry:d6945e847a598eed7ae9ea9af98a63161c08728d739650d4627d5d2258fee2f6"
+  ],
+  "required_evidence": {
+    "kind": "edge_family",
+    "value": "DEFINED_IN"
+  },
+  "forbidden_stale_answers": [
+    "Do not answer with poller or webhook registries; the cron registry is separate."
+  ],
+  "pass_classifier": "check_exact_symbol_cron_registry"
+}

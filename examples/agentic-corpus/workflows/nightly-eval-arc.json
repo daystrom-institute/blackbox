@@ -1,0 +1,101 @@
+{
+  "name": "nightly-eval-arc",
+  "version": 1,
+  "policy_packet": "domain:workflow-policy/arc-budget",
+  "vars_schema": {
+    "suite_started": { "kind": "bool" },
+    "suite_complete": { "kind": "bool" },
+    "score_complete": { "kind": "bool" },
+    "published": { "kind": "bool" },
+    "operator_alerted": { "kind": "bool" },
+    "review_board_opened": { "kind": "bool" }
+  },
+  "actors": {},
+  "start": "Setup",
+  "nodes": {
+    "Setup": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "suite_started", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "RunSuite" }
+    },
+    "RunSuite": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["bash", "eval/run-agentic-eval.sh", "all", "1", "1"],
+            "cwd": "${meta.project_dir}"
+          }
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "suite_complete", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "Score" }
+    },
+    "Score": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "score_complete", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "Decide" }
+    },
+    "Decide": {
+      "actor": "",
+      "gate": "domain:eval/drift-policy",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "stable": "Publish",
+          "drift_minor": "AlertOperator",
+          "drift_major": "OpenReviewBoard"
+        },
+        "default": "Publish"
+      }
+    },
+    "Publish": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "published", "value": true }
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "AlertOperator": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "published", "value": true }
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "operator_alerted", "value": true }
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "OpenReviewBoard": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "review_board_opened", "value": true }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

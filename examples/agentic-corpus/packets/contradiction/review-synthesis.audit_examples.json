@@ -1,0 +1,16 @@
+{
+  "packet_id": "domain:contradiction/review-synthesis",
+  "mode": "first",
+  "dataset": [
+    {
+      "entity": {
+        "vars": {
+          "verdict": {
+            "verdict": "contradicts"
+          }
+        }
+      },
+      "expected": "contradicts"
+    }
+  ]
+}

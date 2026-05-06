@@ -1,0 +1,14 @@
+{
+  "packet_id": "domain:auto-digest/task-completed-routing",
+  "mode": "first",
+  "dataset": [
+    {
+      "entity": {
+        "signal": "task-completed",
+        "session_id": "session-1",
+        "task_kind": "implementation"
+      },
+      "expected": "{\"route\":\"start_arc\",\"workflow\":\"auto-digest-arc\",\"initial_vars\":{\"source_session\":\"${session_id}\",\"task_kind\":\"${task_kind}\",\"daily_count\":0}}"
+    }
+  ]
+}
