@@ -86,7 +86,7 @@ pub fn compute_inbox(
                 discovered.len()
             ));
             for a in discovered.iter().take(limit) {
-                out.push_str(&format!("  [{}] {}\n", a.kind, a.path));
+                out.push_str(&format!("  [{}] {}\n", a.kind.as_str(), a.path));
             }
             out.push('\n');
         }

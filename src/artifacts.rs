@@ -89,7 +89,7 @@ pub struct ArtifactListEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveredArtifact {
-    pub kind: String,
+    pub kind: ArtifactKind,
     pub path: String,
 }
 
@@ -274,14 +274,15 @@ pub fn discover_project_artifacts(project_dir: &Path) -> Result<Vec<DiscoveredAr
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        let kind = path
+        let Some(kind) = path
             .strip_prefix(&root)
             .ok()
             .and_then(|p| p.components().next())
             .and_then(|c| c.as_os_str().to_str())
-            .unwrap_or("unknown")
-            .trim_end_matches('s')
-            .to_string();
+            .and_then(artifact_kind_from_dir)
+        else {
+            continue;
+        };
         out.push(DiscoveredArtifact {
             kind,
             path: path.to_string_lossy().into_owned(),
@@ -289,6 +290,15 @@ pub fn discover_project_artifacts(project_dir: &Path) -> Result<Vec<DiscoveredAr
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+fn artifact_kind_from_dir(component: &str) -> Option<ArtifactKind> {
+    match component {
+        "workflows" => Some(ArtifactKind::Workflow),
+        "packets" => Some(ArtifactKind::Packet),
+        "brofiles" => Some(ArtifactKind::Brofile),
+        _ => None,
+    }
 }
 
 fn artifact_name(kind: ArtifactKind, value: &Value) -> Option<String> {
@@ -454,6 +464,18 @@ mod tests {
         let found = discover_project_artifacts(dir.path()).unwrap();
 
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].kind, "workflow");
+        assert_eq!(found[0].kind, ArtifactKind::Workflow);
+    }
+
+    #[test]
+    fn project_artifact_discovery_skips_unknown_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join(".bbox").join("data").join("custom.json");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "{}").unwrap();
+
+        let found = discover_project_artifacts(dir.path()).unwrap();
+
+        assert!(found.is_empty());
     }
 }
