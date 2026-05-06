@@ -4786,7 +4786,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_agent_search",
-        description = "Search installed agents by query. Matches description and when_to_use; penalizes anti-pattern overlap. Returns ranked results with score, provenance, and match explanation."
+        description = "Search installed agents by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and matched anti-patterns."
     )]
     fn bro_agent_search(&self, Parameters(p): Parameters<AgentSearchParams>) -> CallToolResult {
         use orchestration::agents::registry::{AgentRegistry, SearchFilter};
@@ -4817,7 +4817,7 @@ Constraints:\n\
         let json_results: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "name": r.name,
                     "version": r.version,
                     "score": (r.score * 1000.0).round() / 1000.0,
@@ -4826,19 +4826,17 @@ Constraints:\n\
                     "anti_patterns": r.anti_patterns,
                     "cost_class": r.cost_class,
                     "provenance_kind": r.provenance_kind,
-                    "matched_anti_patterns": r.matched_anti_patterns,
-                })
+                });
+                if !exclude_ap {
+                    obj["matched_anti_patterns"] = serde_json::json!(r.matched_anti_patterns);
+                }
+                obj
             })
             .collect();
         let active_count = match reg.list(&orchestration::agents::registry::ListFilter::default())
         {
             Ok(list) => list.len(),
             Err(_) => 0,
-        };
-        let coverage = if active_count > 0 {
-            results.len() as f64 / active_count as f64
-        } else {
-            0.0
         };
         Self::ok_json(&serde_json::json!({
             "results": json_results,
@@ -4850,7 +4848,8 @@ Constraints:\n\
                 "vector_search_unavailable": true,
             },
             "vector_status": {
-                "coverage_ratio": (coverage * 100.0).round() / 100.0,
+                "coverage_ratio": 0.0,
+                "note": "keyword-only mode; agent embedding pipeline not yet built (AS-I2)",
             },
         }))
     }
