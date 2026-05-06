@@ -113,6 +113,22 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
         Some("js" | "jsx" | "mjs" | "cjs") => Some("javascript"),
         Some("c" | "h") => Some("c"),
         Some("cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx") => Some("cpp"),
+        Some("erl" | "hrl") => Some("erlang"),
+        Some("ex" | "exs") => Some("elixir"),
+        Some("rb") => Some("ruby"),
+        Some("ml" | "mli") => Some("ocaml"),
+        Some("hs") => Some("haskell"),
+        Some("swift") => Some("swift"),
+        Some("kt") => Some("kotlin"),
+        Some("scala") => Some("scala"),
+        Some("lua") => Some("lua"),
+        Some("sh" | "bash") => Some("bash"),
+        Some("json") => Some("json"),
+        Some("yaml" | "yml") => Some("yaml"),
+        Some("toml") => Some("toml"),
+        Some("html" | "htm") => Some("html"),
+        Some("css") => Some("css"),
+        Some("sql") => Some("sql"),
         _ => None,
     }
 }
@@ -402,5 +418,29 @@ impl Display for EntityRef {
                 .any(|chunk| chunk.content.contains("impl Display for EntityRef"))
         );
         assert!(chunks.iter().any(|chunk| chunk.symbol.is_some()));
+    }
+
+    #[test]
+    fn language_for_path_recognizes_pack_languages() {
+        for (path, language) in [
+            ("src/foo.erl", "erlang"),
+            ("lib/foo.ex", "elixir"),
+            ("lib/foo.rb", "ruby"),
+            ("src/foo.ml", "ocaml"),
+            ("src/foo.hs", "haskell"),
+            ("src/foo.swift", "swift"),
+            ("src/foo.kt", "kotlin"),
+            ("src/foo.scala", "scala"),
+            ("src/foo.lua", "lua"),
+            ("scripts/foo.sh", "bash"),
+            ("data/foo.json", "json"),
+            ("data/foo.yaml", "yaml"),
+            ("config/foo.toml", "toml"),
+            ("web/foo.html", "html"),
+            ("web/foo.css", "css"),
+            ("db/foo.sql", "sql"),
+        ] {
+            assert_eq!(language_for_path(Path::new(path)), Some(language));
+        }
     }
 }
