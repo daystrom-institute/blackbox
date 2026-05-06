@@ -650,10 +650,12 @@ pub fn classify_post_response(status: u16, attempt: u32) -> PostOutcome {
 ///
 /// `build_body(attempt)` is called per attempt so the body can
 /// carry the current retry_attempt stamp. Each POST is gated by
-/// a timeout to keep the 3-attempt budget inside Slack's ~3s ack window.
+/// `DAEMON_POST_TIMEOUT` (1s). Worst case: 3 attempts × 1s timeout +
+/// 1500ms sleep ≈ 4.5s total before ack/drop. Daemon is loopback, rarely
+/// slow; in-flight dedup catches Slack redeliveries.
 ///
-/// Returns `true` if the event was delivered (ack to Slack), `false`
-/// if exhausted (ack-and-drop).
+/// Returns `true` if the event was delivered (ack to Slack),
+/// `false` if exhausted (ack-and-drop).
 pub async fn post_to_daemon_with_retry(
     client: &reqwest::Client,
     daemon_url: &str,

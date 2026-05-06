@@ -18,6 +18,7 @@ ExecStart=%h/.local/bin/bro-slack \
   --log-level info
 Restart=on-failure
 RestartSec=3
+Environment=BBOX_PORT=7264
 WorkingDirectory=%h
 StandardOutput=journal
 StandardError=journal
