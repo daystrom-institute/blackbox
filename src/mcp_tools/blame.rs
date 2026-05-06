@@ -195,34 +195,53 @@ fn matching_anchors<'a>(
 }
 
 fn prior_read_edges<'a>(edge_index: &'a EdgeIndex, edit_edge: &Edge) -> Vec<&'a Edge> {
-    let Some((provider, session_id, edit_offset)) = transcript_source(&edit_edge.source) else {
+    let Some((provider, session_id, edit_offset, edit_event_idx)) =
+        transcript_source(&edit_edge.source)
+    else {
         return Vec::new();
     };
+    let min_event_idx = edit_event_idx.saturating_sub(20);
     let mut reads = edge_index
         .session_tool_call_edges(provider, session_id)
         .into_iter()
         .filter(|edge| edge.kind == "READ_FILE")
         .filter(|edge| {
-            transcript_source(&edge.source).is_some_and(|(read_provider, read_session, offset)| {
-                read_provider == provider && read_session == session_id && offset < edit_offset
-            })
+            transcript_source(&edge.source).is_some_and(
+                |(read_provider, read_session, offset, event_idx)| {
+                    read_provider == provider
+                        && read_session == session_id
+                        && offset < edit_offset
+                        && event_idx >= min_event_idx
+                        && event_idx <= edit_event_idx
+                },
+            )
         })
         .collect::<Vec<_>>();
-    reads.sort_by_key(|edge| transcript_source(&edge.source).map(|(_, _, offset)| offset));
-    reads.into_iter().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect()
+    reads.sort_by_key(|edge| {
+        transcript_source(&edge.source).map(|(_, _, offset, idx)| (idx, offset))
+    });
+    reads
+        .into_iter()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
-fn transcript_source(r: &EntityRef) -> Option<(&str, &str, u64)> {
+fn transcript_source(r: &EntityRef) -> Option<(&str, &str, u64, u32)> {
     let EntityRef::Transcript {
         provider,
         session_id,
         line_offset,
+        event_idx,
         ..
     } = r
     else {
         return None;
     };
-    Some((provider, session_id, *line_offset))
+    Some((provider, session_id, *line_offset, *event_idx))
 }
 
 fn session_from_edge(edge: &Edge) -> Option<EntityRef> {
@@ -442,6 +461,26 @@ mod tests {
         assert_eq!(read_before.kind, "READ_FILE");
     }
 
+    #[test]
+    fn prior_read_edges_are_bounded_to_twenty_turns() {
+        let edit = edit_edge_at_event("src/main.rs", 100, 100);
+        let stale_read = read_edge_at_event("src/stale.rs", 80, 79);
+        let recent_read = read_edge_at_event("src/recent.rs", 90, 90);
+        let index = EdgeIndex::from_edges_for_tests(vec![
+            edit.clone(),
+            stale_read,
+            recent_read.clone(),
+        ]);
+
+        let reads = prior_read_edges(&index, &edit);
+
+        assert_eq!(reads.len(), 1);
+        assert_eq!(
+            reads[0].metadata.get("anchor.file_path").map(String::as_str),
+            Some("src/recent.rs")
+        );
+    }
+
     fn edit_edge(path: &str) -> Edge {
         edit_edge_at(path, 10)
     }
@@ -450,8 +489,16 @@ mod tests {
         tool_edge("EDITED_FILE", path, "sess", line_offset)
     }
 
+    fn edit_edge_at_event(path: &str, line_offset: u64, event_idx: u32) -> Edge {
+        tool_edge_at_event("EDITED_FILE", path, "sess", line_offset, event_idx)
+    }
+
     fn read_edge_at(path: &str, line_offset: u64) -> Edge {
         read_edge_for_session(path, "sess", line_offset)
+    }
+
+    fn read_edge_at_event(path: &str, line_offset: u64, event_idx: u32) -> Edge {
+        tool_edge_at_event("READ_FILE", path, "sess", line_offset, event_idx)
     }
 
     fn read_edge_for_session(path: &str, session_id: &str, line_offset: u64) -> Edge {
@@ -459,6 +506,16 @@ mod tests {
     }
 
     fn tool_edge(kind: &str, path: &str, session_id: &str, line_offset: u64) -> Edge {
+        tool_edge_at_event(kind, path, session_id, line_offset, 0)
+    }
+
+    fn tool_edge_at_event(
+        kind: &str,
+        path: &str,
+        session_id: &str,
+        line_offset: u64,
+        event_idx: u32,
+    ) -> Edge {
         let mut metadata = BTreeMap::new();
         metadata.insert("anchor.commit_sha_at_edit".into(), "abc123".into());
         metadata.insert("anchor.file_path".into(), path.into());
@@ -467,7 +524,7 @@ mod tests {
                 provider: "claude".into(),
                 session_id: session_id.into(),
                 line_offset,
-                event_idx: 0,
+                event_idx,
             },
             kind: kind.into(),
             target: EntityRef::ProjectFile {
