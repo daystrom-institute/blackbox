@@ -91,6 +91,17 @@ pub enum OpKind {
     /// arc has to dispatch a bro to make every grounding call, which
     /// is both expensive and non-deterministic.
     McpCall,
+    /// Read vector partition metrics and expose max deleted-ratio state
+    /// for compaction-policy gates.
+    ReadVectorStatus,
+    /// Marker hook for pausing search traffic before a vector rebuild.
+    /// Search is in-process and rebuild reads WAL, so v1 is observable no-op.
+    QuiesceSearch,
+    /// Rebuild one vector partition's HNSW from WAL.
+    RebuildHnsw,
+    /// Marker hook for the atomic swap step. Vector rebuild already writes
+    /// derived files from the rebuilt in-memory partition, so v1 is no-op.
+    SwapAtomic,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -140,7 +151,48 @@ pub async fn execute_op(
         OpKind::HttpJson => exec_http_json(&rendered_args, hook.into_var.as_deref()).await,
         OpKind::FindFirst => exec_find_first(&rendered_args, hook.into_var.as_deref()),
         OpKind::McpCall => exec_mcp_call(&rendered_args, hook.into_var.as_deref(), ctx).await,
+        OpKind::ReadVectorStatus => {
+            exec_read_vector_status(&rendered_args, hook.into_var.as_deref())
+        }
+        OpKind::QuiesceSearch => Ok(OpEffect::None),
+        OpKind::RebuildHnsw => exec_rebuild_hnsw(&rendered_args),
+        OpKind::SwapAtomic => Ok(OpEffect::None),
     }
+}
+
+fn exec_read_vector_status(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let into = into_var.unwrap_or("vector_status");
+    let route_filter = args.get("route").and_then(|value| value.as_str());
+    let mut partitions = crate::vectors::metrics();
+    if let Some(route) = route_filter {
+        partitions.retain(|name, _| name == route);
+    }
+    let mut max_deleted_route = None::<String>;
+    let mut max_deleted_ratio = 0.0f32;
+    for (route, metrics) in &partitions {
+        if metrics.deleted_ratio >= max_deleted_ratio {
+            max_deleted_ratio = metrics.deleted_ratio;
+            max_deleted_route = Some(route.clone());
+        }
+    }
+    Ok(OpEffect::SetVar {
+        key: into.to_string(),
+        value: json!({
+            "partitions": partitions,
+            "max_deleted_route": max_deleted_route,
+            "max_deleted_ratio": max_deleted_ratio,
+        }),
+    })
+}
+
+fn exec_rebuild_hnsw(args: &Value) -> Result<OpEffect> {
+    let route = args
+        .get("route")
+        .and_then(|value| value.as_str())
+        .filter(|route| !route.trim().is_empty())
+        .ok_or_else(|| anyhow!("RebuildHnsw requires args.route"))?;
+    crate::vectors::rebuild(route)?;
+    Ok(OpEffect::None)
 }
 
 async fn exec_mcp_call(args: &Value, into_var: Option<&str>, ctx: &ArcContext) -> Result<OpEffect> {

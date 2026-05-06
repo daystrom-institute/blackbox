@@ -58,6 +58,21 @@ Operators who share notes across divergent branches should configure the repo
 with `git config notes.mergeStrategy union`. The daemon documents this merge
 strategy but does not write project git config automatically.
 
+## M2
+
+`embed-compaction-arc.json` documents the vector compaction lifecycle:
+read vector status, classify deleted-ratio with `embed/compaction-policy`,
+quiesce, rebuild HNSW from WAL, and swap. The concrete compaction mechanism is
+still `vectors::rebuild(route)`; the workflow is an observable arc around that
+existing rebuild path.
+
+The `read_vector_status` hook writes vector metrics into `vars.vector_status`
+and the gate packet reads `vars.vector_status.max_deleted_ratio`. This is the
+closest current workflow-engine shape to the design's "Decide against
+deleted_ratio" intent. The shipped cron spec is an example inlet; cron
+installation remains through the existing cron admin/MCP surface, while the
+workflow and packets install through the artifact catalog.
+
 ## S3
 
 - Code chunking uses `tree-sitter-language-pack` with runtime downloads

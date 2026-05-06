@@ -554,6 +554,8 @@ mod tests {
                 dims: 3,
                 wal_records: 1,
                 active_count: 1,
+                deleted_count: 0,
+                deleted_ratio: 0.0,
                 hnsw_rebuilds: 1,
                 hnsw: None,
             },

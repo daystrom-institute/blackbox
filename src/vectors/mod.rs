@@ -219,6 +219,8 @@ pub struct PartitionMetrics {
     pub dims: usize,
     pub wal_records: usize,
     pub active_count: usize,
+    pub deleted_count: usize,
+    pub deleted_ratio: f32,
     pub hnsw_rebuilds: usize,
     pub hnsw: Option<HnswMetricsSerde>,
 }
@@ -393,6 +395,17 @@ impl Partition {
     fn metrics(&self) -> PartitionMetrics {
         let dims = self.slab.dims();
         let active_count = self.slab.active_count();
+        let hnsw_metrics = self.hnsw.as_ref().map(|hnsw| hnsw.metrics());
+        let deleted_count = hnsw_metrics
+            .as_ref()
+            .map(|metrics| metrics.deleted_nodes)
+            .unwrap_or(0);
+        let denominator = active_count + deleted_count;
+        let deleted_ratio = if denominator == 0 {
+            0.0
+        } else {
+            deleted_count as f32 / denominator as f32
+        };
         PartitionMetrics {
             route: self.route.clone(),
             state: if active_count == 0 {
@@ -403,13 +416,16 @@ impl Partition {
             dims,
             wal_records: self.wal_records,
             active_count,
+            deleted_count,
+            deleted_ratio,
             hnsw_rebuilds: self.hnsw_rebuilds,
-            hnsw: self.hnsw.as_ref().map(|hnsw| hnsw.metrics().into()),
+            hnsw: hnsw_metrics.map(Into::into),
         }
     }
 
     fn flush_derived_files(&self) -> Result<()> {
         let options = HnswOptions::default();
+        let metrics = self.metrics();
         fs::create_dir_all(&self.path)?;
         fs::write(
             self.path.join("meta.json"),
@@ -419,6 +435,8 @@ impl Partition {
                 "dims": self.slab.dims(),
                 "wal_records": self.wal_records,
                 "active_count": self.slab.active_count(),
+                "deleted_count": metrics.deleted_count,
+                "deleted_ratio": metrics.deleted_ratio,
                 "m": options.m,
                 "ef_construction": options.ef_construction,
                 "ef_search": options.ef_search,
@@ -434,10 +452,7 @@ impl Partition {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )?;
-        fs::write(
-            self.path.join("graph.bin"),
-            serde_json::to_vec(&self.metrics().hnsw)?,
-        )?;
+        fs::write(self.path.join("graph.bin"), serde_json::to_vec(&metrics.hnsw)?)?;
         Ok(())
     }
 
@@ -551,6 +566,37 @@ mod tests {
         assert_eq!(empty.dims, 2);
         assert_eq!(empty.active_count, 0);
         assert_eq!(empty.state, PartitionState::Empty);
+    }
+
+    #[test]
+    fn rebuild_compacts_deleted_ordinals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        for idx in 0..10 {
+            let theta = idx as f32 * 0.01;
+            store
+                .upsert(
+                    "voyage-1024",
+                    &format!("id-{idx}"),
+                    &format!("hash-{idx}"),
+                    vec![theta.cos(), theta.sin()],
+                )
+                .unwrap();
+        }
+        for idx in 0..4 {
+            store.delete("voyage-1024", &format!("id-{idx}")).unwrap();
+        }
+
+        let before = store.metrics().remove("voyage-1024").unwrap();
+        assert_eq!(before.active_count, 6);
+        assert_eq!(before.deleted_count, 4);
+        assert!(before.deleted_ratio > 0.3);
+
+        store.rebuild("voyage-1024").unwrap();
+        let after = store.metrics().remove("voyage-1024").unwrap();
+        assert_eq!(after.active_count, 6);
+        assert_eq!(after.deleted_count, 0);
+        assert_eq!(after.deleted_ratio, 0.0);
     }
 
     #[test]

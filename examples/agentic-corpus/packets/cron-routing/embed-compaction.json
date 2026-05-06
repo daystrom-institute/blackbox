@@ -1,0 +1,24 @@
+{
+  "domain": "cron-routing/embed-compaction",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["start_arc", "ignore"],
+  "rules": [
+    {
+      "id": "nightly_embed_compaction_starts_arc",
+      "classification": "start_arc",
+      "antecedent": {
+        "op": "Eq",
+        "field": "cron_name",
+        "value": "embed-compaction-nightly"
+      },
+      "consequent": "{\"route\":\"start_arc\",\"workflow\":\"embed-compaction-arc\",\"initial_vars\":{}}"
+    },
+    {
+      "id": "ignore_unknown_cron",
+      "classification": "ignore",
+      "antecedent": { "op": "True" },
+      "consequent": "ignore"
+    }
+  ]
+}

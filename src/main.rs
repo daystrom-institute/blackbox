@@ -8238,6 +8238,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_install_wires_m2_compaction_arc_and_packets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/embed-compaction-arc.json"
+        ))
+        .unwrap();
+        let policy_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/embed/compaction-policy.json"
+        ))
+        .unwrap();
+        let cron_routing_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/cron-routing/embed-compaction.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/embed-compaction-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/embed/compaction-policy.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            policy_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/cron-routing/embed-compaction.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            cron_routing_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("embed-compaction-arc"));
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:embed/compaction-policy")
+            .is_ok());
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:cron-routing/embed-compaction")
+            .is_ok());
+    }
+
+    #[tokio::test]
     async fn artifact_supersession_deactivates_workflow_registry_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
