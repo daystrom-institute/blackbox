@@ -131,10 +131,10 @@ wide = "0.7"
 # Cron schedule parsing for the cron-inlet primitive (calendar-driven
 # tick → routing packet → arc dispatch).
 cron = "0.16"
+jsonschema = { version = "0.17", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
-jsonschema = { version = "0.17", default-features = false }
 
 [profile.release]
 opt-level = 3

@@ -67,6 +67,11 @@ pub struct TaskInner {
     /// tasks (workflow implementer, single-bro advisor) still surface
     /// in `bro tail` with a name instead of being anonymous.
     pub bro_label: Option<String>,
+    /// Agent attribution set by bro_agent_dispatch. Format:
+    /// `agent:<name>@v<version>`. Preserved even when record_task_to_bro
+    /// overwrites bro_label for team routing. Surfaced in bro_status /
+    /// bro_dashboard as agentLabel alongside broLabel.
+    pub agent_label: Option<String>,
     /// True when this task's terminal state is "the daemon killed it
     /// because the process restarted, but the underlying provider
     /// session_id is still valid on disk (rollout / session jsonl
@@ -169,6 +174,8 @@ struct PersistedTask {
     cwd: Option<String>,
     #[serde(default)]
     bro_label: Option<String>,
+    #[serde(default)]
+    agent_label: Option<String>,
     /// True when the previous daemon instance was running this task
     /// at restart and the underlying provider session_id is still
     /// recoverable on disk. Set during `TaskStore::load` when it
@@ -209,6 +216,7 @@ impl TaskStore {
                     exit_code: inner.exit_code,
                     cwd: inner.cwd.clone(),
                     bro_label: inner.bro_label.clone(),
+                    agent_label: inner.agent_label.clone(),
                     recoverable: inner.recoverable,
                 }
             })
@@ -268,6 +276,7 @@ impl TaskStore {
                     exit_code: rec.exit_code,
                     cwd: rec.cwd,
                     bro_label: rec.bro_label,
+                    agent_label: rec.agent_label,
                     recoverable: rec.recoverable,
                 }),
                 notify: Arc::new(Notify::new()),
@@ -642,6 +651,7 @@ pub fn spawn_task(
                     completed_at: Some(now_ms()),
                     exit_code: None,
                     bro_label: bro_label.clone(),
+                    agent_label: None,
                     recoverable: false,
                 }),
                 notify: Arc::new(Notify::new()),
@@ -672,6 +682,7 @@ pub fn spawn_task(
             exit_code: None,
             cwd: cwd.clone(),
             bro_label,
+            agent_label: None,
             recoverable: false,
         }),
         notify: Arc::new(Notify::new()),
@@ -1187,6 +1198,9 @@ pub fn task_result_json(task: &Task) -> Value {
     if let Some(ref label) = inner.bro_label {
         obj["broLabel"] = Value::String(label.clone());
     }
+    if let Some(ref label) = inner.agent_label {
+        obj["agentLabel"] = Value::String(label.clone());
+    }
     if inner.status == TaskStatus::Failed {
         if let Some(code) = inner.exit_code {
             obj["exitCode"] = Value::from(code);
@@ -1498,6 +1512,7 @@ mod tests {
                 exit_code: Some(0),
                 cwd: None,
                 bro_label: None,
+                agent_label: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -1530,6 +1545,7 @@ mod tests {
                 exit_code: Some(1),
                 cwd: None,
                 bro_label: None,
+                agent_label: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -1565,6 +1581,7 @@ mod tests {
             exit_code: None,
             cwd: None,
             bro_label: None,
+            agent_label: None,
             recoverable: false,
         };
 
@@ -1608,6 +1625,7 @@ mod tests {
             exit_code: None,
             cwd: None,
             bro_label: None,
+            agent_label: None,
             recoverable: false,
         };
 
@@ -1665,6 +1683,7 @@ mod async_tests {
                 exit_code: Some(0),
                 cwd: None,
                 bro_label: None,
+                agent_label: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -1694,6 +1713,7 @@ mod async_tests {
                 exit_code: None,
                 cwd: None,
                 bro_label: None,
+                agent_label: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -1736,6 +1756,7 @@ mod async_tests {
                 exit_code: None,
                 cwd: None,
                 bro_label: None,
+                agent_label: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),

@@ -3019,6 +3019,12 @@ impl BlackboxServer {
                 if let Some(name) = bro_name {
                     entry["bro"] = Value::String(name);
                 }
+                if let Some(ref label) = inner.bro_label {
+                    entry["broLabel"] = Value::String(label.clone());
+                }
+                if let Some(ref label) = inner.agent_label {
+                    entry["agentLabel"] = Value::String(label.clone());
+                }
                 (inner.started_at, entry)
             })
             .collect();
@@ -5043,32 +5049,31 @@ Constraints:\n\
             manifest.filter_overlay.as_ref(),
         );
 
-        // Args validation against schema
         if let Some(ref inputs) = manifest.inputs {
             if let Some(ref schema) = inputs.schema {
-                if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
-                    if let Some(obj) = p.args.as_object() {
-                        for field in required {
-                            if let Some(name) = field.as_str() {
-                                if !obj.contains_key(name) {
-                                    return Self::err_text(&format!(
-                                        "error.bad_input(code=missing_required_field): args missing required field '{name}'"
-                                    ));
-                                }
-                            }
-                        }
-                    } else if !required.is_empty() {
-                        return Self::err_text(
-                            "error.bad_input(code=invalid_args): args must be an object when schema has required fields",
-                        );
+                let compiled = match jsonschema::JSONSchema::options()
+                    .with_draft(jsonschema::Draft::Draft7)
+                    .compile(schema)
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Self::err_text(&format!(
+                            "error.internal(code=invalid_schema): manifest schema failed to compile: {e}"
+                        ))
                     }
-                }
-                if let Some(types) = schema.get("type").and_then(|t| t.as_str()) {
-                    if types == "object" && !p.args.is_object() && !p.args.is_null() {
-                        return Self::err_text(
-                            "error.bad_input(code=invalid_args): args must be an object per schema",
-                        );
-                    }
+                };
+                let args_to_validate = if p.args.is_null() {
+                    serde_json::json!({})
+                } else {
+                    p.args.clone()
+                };
+                let result = compiled.validate(&args_to_validate);
+                if let Err(errors) = result {
+                    let msgs: Vec<String> = errors.map(|e| e.to_string()).collect();
+                    return Self::err_text(&format!(
+                        "error.bad_input(code=schema_validation_failed): {}",
+                        msgs.join("; ")
+                    ));
                 }
             }
         }
@@ -5156,6 +5161,7 @@ Constraints:\n\
             self.state.tail_tx.clone(),
             Some(bro_label.clone()),
         );
+        task.inner.lock().agent_label = Some(bro_label.clone());
 
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
 
@@ -12223,8 +12229,57 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
         assert!(
-            text.contains("missing_required_field") && text.contains("focus"),
-            "should report missing required field: {text}"
+            text.contains("schema_validation_failed") && text.contains("focus"),
+            "should report schema validation failure for 'focus': {text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_args_type_mismatch_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "typed-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "typed-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with typed schema.",
+                    "brofile_inline": {"provider": "claude"},
+                    "inputs": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "diff": {"type": "string"}
+                            },
+                            "required": ["diff"],
+                        },
+                        "prompt_template": "Review {{diff}}."
+                    },
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "typed-agent".into(),
+            args: serde_json::json!({"diff": 123}),
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("schema_validation_failed"),
+            "should reject wrong type: {text}"
         );
     }
 
@@ -12268,6 +12323,121 @@ mod tests {
             label.as_deref(),
             Some("agent:labeled-agent@v3"),
             "bro_label should be stamped: {label:?}"
+        );
+        let agent_lbl = task.inner.lock().agent_label.clone();
+        assert_eq!(
+            agent_lbl.as_deref(),
+            Some("agent:labeled-agent@v3"),
+            "agent_label should be stamped: {agent_lbl:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_with_bro_preserves_agent_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "bro-dispatch.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "bro-dispatch-agent",
+                "version": 2,
+                "manifest": {
+                    "description": "Agent dispatched with bro=.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "bro-dispatch-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            bro: Some("some-bro".into()),
+            ambient: None,
+        })));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = body["task_id"].as_str().unwrap();
+        let task = server.state.task_store.read().get(task_id).unwrap();
+        let inner = task.inner.lock();
+        let bro_lbl = inner.bro_label.clone();
+        assert_eq!(
+            bro_lbl.as_deref(),
+            Some("some-bro"),
+            "bro_label should be the named bro: {bro_lbl:?}"
+        );
+        let agent_lbl = inner.agent_label.clone();
+        assert_eq!(
+            agent_lbl.as_deref(),
+            Some("agent:bro-dispatch-agent@v2"),
+            "agent_label should preserve agent attribution: {agent_lbl:?}"
+        );
+    }
+
+    #[test]
+    fn bro_dashboard_emits_agent_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "dash-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "dash-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent for dashboard test.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "dash-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            bro: None,
+            ambient: None,
+        })));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = body["task_id"].as_str().unwrap();
+
+        let dash = server.bro_dashboard(Parameters(DashboardParams {
+            limit: Some(20),
+            provider: None,
+            status: None,
+            team: None,
+        }));
+        let dash_body: serde_json::Value =
+            serde_json::from_str(&extract_text(&dash)).unwrap();
+        let tasks = dash_body["tasks"].as_array().unwrap();
+        let found = tasks.iter().find(|t| t["taskId"].as_str() == Some(task_id));
+        assert!(found.is_some(), "task should appear in dashboard");
+        let entry = found.unwrap();
+        assert_eq!(
+            entry["agentLabel"].as_str(),
+            Some("agent:dash-agent@v1"),
+            "dashboard entry should carry agentLabel: {entry}"
+        );
+        assert_eq!(
+            entry["broLabel"].as_str(),
+            Some("agent:dash-agent@v1"),
+            "dashboard entry should carry broLabel: {entry}"
         );
     }
 }
