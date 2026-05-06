@@ -4,9 +4,9 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, base_view, ensure_type, expected, next_hops, schema, truncate_label,
+    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
+    truncate_label,
 };
-use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
 
 pub struct AgentProvider;
@@ -20,7 +20,7 @@ impl InspectableEntityProvider for AgentProvider {
         matches!(r, EntityRef::Agent { .. })
     }
 
-    fn get_entity(&self, r: &EntityRef) -> Result<EntityView> {
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
         ensure_type(r, self.entity_type())?;
         let EntityRef::Agent { name, version } = r else {
             unreachable!();
@@ -28,7 +28,30 @@ impl InspectableEntityProvider for AgentProvider {
         let mut properties = BTreeMap::new();
         properties.insert("name".into(), name.clone());
         properties.insert("version".into(), version.to_string());
-        Ok(base_view(r, properties))
+        if let Some(state) = ctx.state() {
+            let catalog = state.artifacts.read();
+            if let Some(v) = catalog
+                .load_artifact_value(crate::artifacts::ArtifactKind::Agent, name)
+                .ok()
+                .flatten()
+            {
+                if let Some(manifest) = v.get("manifest").and_then(|m| m.as_object()) {
+                    if let Some(desc) = manifest.get("description").and_then(|d| d.as_str()) {
+                        properties.insert("description".into(), desc.to_string());
+                    }
+                    if let Some(wtu) = manifest.get("when_to_use").and_then(|w| w.as_array()) {
+                        properties.insert(
+                            "when_to_use".into(),
+                            wtu.iter()
+                                .filter_map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(empty_neighborhood_view(r, properties))
     }
 
     fn schema(&self) -> EntitySchemaView {
@@ -46,10 +69,6 @@ impl InspectableEntityProvider for AgentProvider {
         )
     }
 
-    fn forward_edges(&self, _r: &EntityRef) -> Vec<Edge> {
-        Vec::new()
-    }
-
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
         vec![
             expected("DERIVED_FROM", false),
@@ -65,7 +84,7 @@ impl InspectableEntityProvider for AgentProvider {
         next_hops(full_neighborhood, &["DERIVED_FROM", "SUPERSEDES"])
     }
 
-    fn compact_label(&self, r: &EntityRef) -> Option<String> {
+    fn compact_label(&self, _ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
         let EntityRef::Agent { name, version } = r else {
             return None;
         };
