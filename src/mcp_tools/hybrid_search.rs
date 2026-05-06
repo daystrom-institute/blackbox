@@ -87,7 +87,6 @@ pub fn hybrid_search(
     let fetch = DEFAULT_FETCH.max(limit * 4);
     let bm25_hits = index.hybrid_bm25_hits(query, fetch, p.doc_type.as_deref())?;
     let mut features = features_from_bm25(&bm25_hits);
-    enrich_knowledge_features(knowledge, &mut features);
 
     let mut lists = vec![RankedList {
         source: "bm25".into(),
@@ -125,6 +124,12 @@ pub fn hybrid_search(
     }
 
     let fused = rrf::fuse_rrf(&lists, RRF_K, fetch);
+    enrich_fused_features(
+        index,
+        knowledge,
+        fused.iter().map(|hit| hit.entity_id.as_str()),
+        &mut features,
+    )?;
     let now = Utc::now();
     let mut results = fused
         .into_iter()
@@ -308,10 +313,44 @@ fn enrich_knowledge_features(
         let Some(entry) = knowledge.entry(id) else {
             continue;
         };
+        if feature.doc_type.is_none() {
+            feature.doc_type = Some("knowledge".into());
+        }
         feature.approval = Some(format!("{:?}", entry.approval));
         feature.created_at = Some(entry.created_at.clone());
         feature.last_recalled = entry.last_recalled.clone();
         feature.recall_count = entry.recall_count.min(u64::from(u32::MAX)) as u32;
+    }
+}
+
+fn enrich_fused_features<'a>(
+    index: &TranscriptIndex,
+    knowledge: &Knowledge,
+    entity_ids: impl Iterator<Item = &'a str>,
+    features: &mut BTreeMap<String, RerankFeatures>,
+) -> Result<()> {
+    for entity_id in entity_ids {
+        if !features.contains_key(entity_id) {
+            let mut feature = index
+                .entity_properties(entity_id)?
+                .map(|properties| features_from_properties(&properties))
+                .unwrap_or_default();
+            if entity_id.starts_with("knowledge:") && feature.doc_type.is_none() {
+                feature.doc_type = Some("knowledge".into());
+            }
+            features.insert(entity_id.to_string(), feature);
+        }
+    }
+    enrich_knowledge_features(knowledge, features);
+    Ok(())
+}
+
+fn features_from_properties(properties: &BTreeMap<String, String>) -> RerankFeatures {
+    RerankFeatures {
+        doc_type: properties.get("doc_type").cloned(),
+        chunk_kind: properties.get("chunk_kind").cloned(),
+        role: properties.get("role").cloned(),
+        ..RerankFeatures::default()
     }
 }
 
@@ -381,6 +420,9 @@ fn sanitize_error(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge::{
+        Approval, Category, KnowledgeEntry, KnowledgeStore, Priority, Scope, Status,
+    };
     use crate::search::rrf::{FusedHit, RankedList};
 
     #[test]
@@ -448,5 +490,53 @@ mod tests {
             vector_ranked_lists("q", Some(&[1.0, 0.0]), 5, &partitions, &mut degraded).unwrap();
         assert!(lists.is_empty());
         assert!(degraded.skipped_partitions["route-a"].contains("do not match"));
+    }
+
+    #[test]
+    fn vector_only_knowledge_features_receive_approval_multiplier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("knowledge.json");
+        let store = KnowledgeStore {
+            version: 1,
+            entries: vec![KnowledgeEntry {
+                id: "vector-only".into(),
+                title: "Vector only".into(),
+                content: "semantic-only content".into(),
+                cluster: None,
+                variants: HashMap::new(),
+                category: Category::Memory,
+                scope: Scope::Project,
+                project: Some("/tmp/project".into()),
+                providers: Vec::new(),
+                priority: Priority::Standard,
+                weight: 100,
+                status: Status::Active,
+                approval: Approval::UserConfirmed,
+                render: true,
+                decay: true,
+                review_at: None,
+                supersedes: None,
+                rationale: None,
+                expires_at: None,
+                source: "test".into(),
+                created_at: "2026-05-05T00:00:00Z".into(),
+                updated_at: "2026-05-05T00:00:00Z".into(),
+                recall_count: 0,
+                last_recalled: None,
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        let knowledge = Knowledge::open(&path).unwrap();
+        let mut features = BTreeMap::from([(
+            "knowledge:vector-only".to_string(),
+            RerankFeatures::default(),
+        )]);
+
+        enrich_knowledge_features(&knowledge, &mut features);
+
+        let feature = &features["knowledge:vector-only"];
+        assert_eq!(feature.doc_type.as_deref(), Some("knowledge"));
+        assert_eq!(feature.approval.as_deref(), Some("UserConfirmed"));
+        assert_eq!(rerank::type_multiplier(feature), 1.35);
     }
 }
