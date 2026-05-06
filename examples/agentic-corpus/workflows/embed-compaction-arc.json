@@ -30,10 +30,9 @@
         "type": "branch",
         "cases": {
           "compact": "Quiesce",
-          "notify": "SurfaceToInbox",
-          "skip": "Skip"
+          "notify": "SurfaceToInbox"
         },
-        "default": "Skip"
+        "default": "Done"
       }
     },
     "Quiesce": {
@@ -99,7 +98,7 @@
       ],
       "next": { "type": "terminal" }
     },
-    "Skip": {
+    "Done": {
       "actor": "",
       "next": { "type": "terminal" }
     }
