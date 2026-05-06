@@ -408,76 +408,157 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
     let mut backoff = spec.retry_backoff;
     let mut rate_limiter = spec.rate_limit_per_min.and_then(TokenBucket::new);
     loop {
-        let batch = if retry_batch.is_empty() {
+        // Drain up to WORKER_CONCURRENCY batches and dispatch them in
+        // parallel. The retry path keeps single-batch semantics so we
+        // don't fan out a known-failing batch.
+        let batches = if !retry_batch.is_empty() {
+            vec![retry_batch.clone()]
+        } else {
+            let mut acc = Vec::with_capacity(WORKER_CONCURRENCY);
+            // First batch blocks for input; subsequent batches only
+            // contribute if pending has more work right away (so we
+            // don't add latency waiting for a second batch to fill).
             match collect_quiescent_batch(&mut rx, &mut pending, spec.debounce).await {
-                Some(batch) => batch,
+                Some(b) => acc.push(b),
                 None => return,
             }
-        } else {
-            retry_batch.clone()
-        };
-        if let Some(limiter) = &mut rate_limiter {
-            limiter.acquire(batch.len()).await;
-        }
-        let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
-        match spec.provider.embed_batch(&texts).await {
-            Ok(vectors) => {
-                if spec.persist_vectors {
-                    if let Err(err) = persist_vectors(&spec, &batch, vectors) {
-                        let sanitized = sanitize_error(&err);
-                        tracing::warn!(
-                            route = %spec.route,
-                            vector_route = %spec.vector_route,
-                            error = %sanitized,
-                            "embedding vector persistence failed; route will retry"
-                        );
-                        if !schedule_retry_or_drop(
-                            &spec,
-                            &mut retry_batch,
-                            &mut retry_attempts,
-                            &mut backoff,
-                            batch,
-                            &sanitized,
-                        )
-                        .await
-                        {
-                            backoff = spec.retry_backoff;
-                        }
-                        continue;
+            for _ in 1..WORKER_CONCURRENCY {
+                if pending.is_empty() {
+                    break;
+                }
+                let mut batch = Vec::new();
+                let mut bytes = 0usize;
+                while let Some(req) = pending.pop_front() {
+                    let req_bytes = req.text.len();
+                    if !batch.is_empty()
+                        && (batch.len() >= MAX_BATCH_DOCS
+                            || bytes + req_bytes > MAX_BATCH_BYTES)
+                    {
+                        pending.push_front(req);
+                        break;
+                    }
+                    bytes += req_bytes;
+                    batch.push(req);
+                    if batch.len() >= MAX_BATCH_DOCS {
+                        break;
                     }
                 }
-                tracing::debug!(
-                    route = %spec.route,
-                    vector_route = %spec.vector_route,
-                    vectors = batch.len(),
-                    dimensions = spec.provider.dimensions(),
-                    model = spec.provider.model_name(),
-                    "embedding vectors persisted"
-                );
-                mark_success(&spec.statuses, &spec.route, batch.len() as u64);
-                retry_batch.clear();
-                retry_attempts = 0;
-                backoff = spec.retry_backoff;
-            }
-            Err(err) => {
-                let sanitized = sanitize_error(&err);
-                tracing::warn!(
-                    route = %spec.route,
-                    error = %sanitized,
-                    "embedding batch failed; route will retry without affecting search"
-                );
-                if !schedule_retry_or_drop(
-                    &spec,
-                    &mut retry_batch,
-                    &mut retry_attempts,
-                    &mut backoff,
-                    batch,
-                    &sanitized,
-                )
-                .await
-                {
-                    backoff = spec.retry_backoff;
+                if !batch.is_empty() {
+                    acc.push(batch);
                 }
+            }
+            acc
+        };
+        // Sequential rate-limit acquire (one acquire per batch, total
+        // across all in-flight) — preserves the per-minute cap semantic
+        // even when we issue concurrent requests.
+        if let Some(limiter) = &mut rate_limiter {
+            for batch in &batches {
+                limiter.acquire(batch.len()).await;
+            }
+        }
+        // Dispatch all batches concurrently. Single-batch path (the common
+        // case after the queue drains) is identical to the prior behavior;
+        // the multi-batch path overlaps voyage HTTP latency.
+        let provider = &spec.provider;
+        let mut results: Vec<(Vec<EmbedRequest>, anyhow::Result<Vec<Vec<f32>>>)> = {
+            let futures = batches
+                .iter()
+                .map(|batch| {
+                    let texts = batch.iter().map(|req| req.text.clone()).collect::<Vec<_>>();
+                    async move { provider.embed_batch(&texts).await }
+                })
+                .collect::<Vec<_>>();
+            let outcomes = futures::future::join_all(futures).await;
+            batches.into_iter().zip(outcomes).collect()
+        };
+        // Process results sequentially (persist + retry-or-drop is not
+        // safe to run in parallel against the same WAL). Each batch is
+        // treated independently for retry decisions; we still mutate
+        // the worker-level retry/backoff state so a persistent failure
+        // backs off the route as a whole.
+        for (batch, result) in results.drain(..) {
+            process_batch_outcome(
+                &spec,
+                &mut retry_batch,
+                &mut retry_attempts,
+                &mut backoff,
+                batch,
+                result,
+            )
+            .await;
+        }
+    }
+}
+
+/// Per-batch outcome handler. Persists vectors on success, schedules
+/// retry/drop on failure. Mutates retry/backoff state on the worker so
+/// a sticky provider outage backs off the whole route.
+async fn process_batch_outcome(
+    spec: &WorkerSpec,
+    retry_batch: &mut Vec<EmbedRequest>,
+    retry_attempts: &mut u8,
+    backoff: &mut Duration,
+    batch: Vec<EmbedRequest>,
+    result: anyhow::Result<Vec<Vec<f32>>>,
+) {
+    match result {
+        Ok(vectors) => {
+            if spec.persist_vectors {
+                if let Err(err) = persist_vectors(spec, &batch, vectors) {
+                    let sanitized = sanitize_error(&err);
+                    tracing::warn!(
+                        route = %spec.route,
+                        vector_route = %spec.vector_route,
+                        error = %sanitized,
+                        "embedding vector persistence failed; route will retry"
+                    );
+                    if !schedule_retry_or_drop(
+                        spec,
+                        retry_batch,
+                        retry_attempts,
+                        backoff,
+                        batch,
+                        &sanitized,
+                    )
+                    .await
+                    {
+                        *backoff = spec.retry_backoff;
+                    }
+                    return;
+                }
+            }
+            tracing::debug!(
+                route = %spec.route,
+                vector_route = %spec.vector_route,
+                vectors = batch.len(),
+                dimensions = spec.provider.dimensions(),
+                model = spec.provider.model_name(),
+                "embedding vectors persisted"
+            );
+            mark_success(&spec.statuses, &spec.route, batch.len() as u64);
+            retry_batch.clear();
+            *retry_attempts = 0;
+            *backoff = spec.retry_backoff;
+        }
+        Err(err) => {
+            let sanitized = sanitize_error(&err);
+            tracing::warn!(
+                route = %spec.route,
+                error = %sanitized,
+                "embedding batch failed; route will retry without affecting search"
+            );
+            if !schedule_retry_or_drop(
+                spec,
+                retry_batch,
+                retry_attempts,
+                backoff,
+                batch,
+                &sanitized,
+            )
+            .await
+            {
+                *backoff = spec.retry_backoff;
             }
         }
     }
@@ -515,11 +596,21 @@ async fn schedule_retry_or_drop(
     }
 }
 
-// Voyage API caps: 128 docs/request and ~120k tokens/request. Cap batches at
-// 64 docs and ~80 KB of input bytes — keeps us comfortably under both limits
-// even when chunks approach MAX_CHUNK_BYTES.
-const MAX_BATCH_DOCS: usize = 64;
-const MAX_BATCH_BYTES: usize = 80 * 1024;
+// Voyage API caps: 128 docs/request and ~120k tokens/request. We pin the
+// per-batch document count to voyage's hard limit and cap bytes at 200 KB
+// (well under 120k tokens for typical text). The earlier 64/80KB defaults
+// were over-conservative — voyage's tier-1 plan allows 2000 RPM so a
+// single worker doing 128-doc batches sequentially uses < 5% of available
+// throughput.
+const MAX_BATCH_DOCS: usize = 128;
+const MAX_BATCH_BYTES: usize = 200 * 1024;
+// Per-worker concurrency: we dispatch multiple full batches in parallel
+// before awaiting any of them. With 4 in-flight batches at ~1.5s each =
+// ~2.7 batches/sec/worker = ~21 RPM/worker. Across 6 routes that's well
+// under voyage's 2000 RPM ceiling. If you raise this, also lower it
+// further for routes that share the same provider+model partition to
+// avoid lock contention on persist_vectors.
+const WORKER_CONCURRENCY: usize = 4;
 
 async fn collect_quiescent_batch(
     rx: &mut mpsc::UnboundedReceiver<WorkerCommand>,
