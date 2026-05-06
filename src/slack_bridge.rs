@@ -614,11 +614,13 @@ const RETRY_DELAYS: [Duration; 2] = [
     Duration::from_millis(500),
     Duration::from_millis(1000),
 ];
-/// Per-attempt timeout for daemon POST. Must be short enough that
-/// 3 attempts × (timeout + Retryable delay) stays inside Slack's
-/// ~3s ack window. The 3s cap allows ~1.5s of network RTT +
-/// daemon processing across 3 attempts.
-const DAEMON_POST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Per-attempt timeout for daemon POST. Worst-case: 3 attempts ×
+/// 1s timeout + 1500ms inter-attempt sleep ≈ 4.5s before ack/drop.
+/// This is over Slack's ~3s ack window, but the daemon is loopback
+/// and rarely slow; the in-flight dedup set catches redeliveries.
+/// Honest v1 tradeoff — tighten to 500ms (≈3s total) or drop to
+/// 2 attempts if this proves tight in practice.
+const DAEMON_POST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Outcome of a daemon POST attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -905,9 +907,17 @@ fn spawn_health_server(
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("health endpoint bind {addr}: {e:#}");
+                return;
+            }
+        };
         tracing::info!("health endpoint listening on http://{addr}/health");
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("health endpoint serve error: {e:#}");
+        }
     })
 }
 
@@ -1047,7 +1057,7 @@ async fn run_socket_loop(ws_url: &str, ctx: &BridgeContext<'_>) -> Result<Durati
             None => {
                 let elapsed = connected_at.elapsed();
                 tracing::info!(elapsed_secs = elapsed.as_secs(), "WebSocket stream ended; reconnecting");
-                return Err(anyhow!("WebSocket stream ended after {:.0}s", elapsed.as_secs()));
+                return Ok(elapsed);
             }
         };
 
@@ -1087,7 +1097,7 @@ async fn run_socket_loop(ws_url: &str, ctx: &BridgeContext<'_>) -> Result<Durati
             WsMessage::Close(_) => {
                 let elapsed = connected_at.elapsed();
                 tracing::info!(elapsed_secs = elapsed.as_secs(), "WebSocket close frame received; reconnecting");
-                return Err(anyhow!("WebSocket close frame received after {:.0}s", elapsed.as_secs()));
+                return Ok(elapsed);
             }
             WsMessage::Ping(data) => {
                 let _ = ws_write.send(WsMessage::Pong(data)).await;
@@ -1135,9 +1145,6 @@ async fn main() -> Result<()> {
     let _signing_secret = std::env::var(&args.signing_secret_env).ok();
     if _signing_secret.is_none() || _signing_secret.as_deref() == Some("") {
         tracing::info!("signing secret not set ({}); Events API signature verification inactive", args.signing_secret_env);
-    }
-    if args.health_port.is_some() {
-        tracing::warn!("--health-port is not yet implemented (v1 sidecar scope)");
     }
 
     tracing::info!(

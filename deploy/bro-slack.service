@@ -8,7 +8,7 @@ Type=simple
 ExecStart=%h/.local/bin/bro-slack \
   --self-user-id ${SLACK_SELF_USER_ID} \
   --self-bot-id ${SLACK_SELF_BOT_ID} \
-  --daemon-url http://127.0.0.1:${BBOX_PORT:-7264} \
+  --daemon-url http://127.0.0.1:${BBOX_PORT} \
   --webhook-name slack \
   --app-token-env SLACK_APP_TOKEN \
   --signing-secret-env SLACK_SIGNING_SECRET \
@@ -23,14 +23,25 @@ StandardOutput=journal
 StandardError=journal
 
 # ── Required environment ───────────────────────────────────────
-# SLACK_APP_TOKEN=xapp-1-...       (Socket Mode app-level token)
-# SLACK_SELF_USER_ID=U...          (bot's U-prefix user id)
-# SLACK_SELF_BOT_ID=B...           (bot's B-prefix bot id)
+# Set these in a drop-in at bro-slack.service.d/secrets.conf or
+# via `systemctl --user set-environment`:
+#
+#   SLACK_APP_TOKEN=xapp-1-...       (Socket Mode app-level token)
+#   SLACK_SELF_USER_ID=U...          (bot's U-prefix user id)
+#   SLACK_SELF_BOT_ID=B...           (bot's B-prefix bot id)
+#   BBOX_PORT=7264                   (daemon port, default 7264)
 #
 # ── Optional ───────────────────────────────────────────────────
-# SLACK_SIGNING_SECRET=...         (Events API signing secret; unused on Socket Mode path)
-# BRO_SLACK_SHARED_SECRET=...      (HMAC key for sidecar→daemon hop; also set in blackboxd env)
-# BBOX_PORT=7264                   (override daemon port)
+#   SLACK_SIGNING_SECRET=...         (Events API; unused on Socket Mode)
+#   BRO_SLACK_SHARED_SECRET=...      (HMAC key for sidecar→daemon; also
+#                                     set in blackboxd env)
+#
+# Drop-in example (~/.config/systemd/user/bro-slack.service.d/secrets.conf):
+#   [Service]
+#   Environment=SLACK_APP_TOKEN=xapp-1-...
+#   Environment=SLACK_SELF_USER_ID=U0BOTUSR0
+#   Environment=SLACK_SELF_BOT_ID=B0BOTBOT0
+#   Environment=BBOX_PORT=7264
 
 [Install]
 WantedBy=default.target
