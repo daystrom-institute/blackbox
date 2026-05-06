@@ -129,14 +129,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_hybrid_search",
         category: ToolCategory::Graph,
-        summary: "Hybrid BM25+vector+path-token search over typed entities. Returns mixed-modal seeds (code, docs, commits, knowledge, transcripts) ranked by RRF fusion, with per-file collapse and modal diversification so top-N covers distinct files and chunk_kinds. Pass `project=<path or project_id>` to scope project_file results to one repo. vector_weight=0.6 by default; set 0.0 for BM25-only, 1.0 for vector-only.",
+        summary: "Hybrid BM25+vector search over typed entities. vector_weight=0.6 by default; set 0.0 for BM25-only behavior, 1.0 for vector-only.",
         when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits — top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes.",
         example: Some(r#"bbox_hybrid_search(query="triad implementation", limit=10, project="/home/me/repos/erlang-test")"#),
     },
     ToolDoc {
         name: "bbox_discover_seed_entities",
         category: ToolCategory::Graph,
-        summary: "Hybrid search variant that emphasizes orientation: returns ranked seeds with their notable_edges (semantic-first prioritization) so you can pick the next inspect target without a separate call.",
+        summary: "Find seed entities with notable_edges; inspect before answering.",
         when_to_use: "Alternate Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`) — same blender as `bbox_hybrid_search` but with `notable_edges` rendered for each seed. Reach for it when the next step will be `bbox_inspect_entity` and you want pre-vetted hops.",
         example: Some(r#"bbox_discover_seed_entities(query="triad closure convergence test", limit=5)"#),
     },
@@ -1061,9 +1061,6 @@ pub fn render_markdown() -> String {
                     doc.name,
                     hot_summary(doc.summary)
                 ));
-                if !doc.when_to_use.is_empty() {
-                    out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
-                }
                 if let Some(ex) = doc.example {
                     out.push_str(&format!("  _Example:_ `{ex}`\n"));
                 }

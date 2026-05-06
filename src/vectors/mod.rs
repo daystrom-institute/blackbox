@@ -12,6 +12,8 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
+#[cfg(test)]
+use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use self::hnsw::{HnswIndex, HnswMetrics, HnswOptions, SearchHit};
@@ -24,6 +26,8 @@ static GLOBAL_STORE: OnceLock<Arc<VectorStore>> = OnceLock::new();
 
 #[cfg(test)]
 static TEST_GLOBAL_STORE: OnceLock<RwLock<Option<Arc<VectorStore>>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_GLOBAL_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[cfg(test)]
 fn test_global_store() -> &'static RwLock<Option<Arc<VectorStore>>> {
@@ -33,6 +37,7 @@ fn test_global_store() -> &'static RwLock<Option<Arc<VectorStore>>> {
 #[cfg(test)]
 pub struct TestGlobalStoreGuard {
     previous: Option<Arc<VectorStore>>,
+    _lock: MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
@@ -44,9 +49,13 @@ impl Drop for TestGlobalStoreGuard {
 
 #[cfg(test)]
 pub fn install_test_global(store: Arc<VectorStore>) -> TestGlobalStoreGuard {
+    let lock = TEST_GLOBAL_STORE_LOCK.get_or_init(|| Mutex::new(())).lock();
     let mut slot = test_global_store().write();
     let previous = slot.replace(store);
-    TestGlobalStoreGuard { previous }
+    TestGlobalStoreGuard {
+        previous,
+        _lock: lock,
+    }
 }
 
 pub fn install_global(store: Arc<VectorStore>) {

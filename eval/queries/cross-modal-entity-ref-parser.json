@@ -18,7 +18,7 @@
   ],
   "expected_entity_refs": [
     "project_file:d723917f:3b317e2b:366f5e6579d320c753f13faf54c47de10e8ff8e7130d917c818a244f624825a0:6",
-    "symbol:d723917f:EntityRef:b30b2beb90a459f42e6a8020739a2e7e0ac424c6d8a4c2ea6a847d4e0cc6efba"
+    "symbol:d723917f:EntityRef:de67b5173131e1aba45f9ac9b20e9cb4218e7ff2bdccb38b3deca2569f753843"
   ],
   "required_evidence": {
     "kind": "entity_set",

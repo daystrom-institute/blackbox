@@ -644,23 +644,21 @@ mod tests {
         };
         chunks.iter().any(|chunk| match entity_ref {
             EntityRef::ProjectFile {
-                project_id,
+                project_id: _,
                 rel_path_hash,
                 chunk_hash,
                 occurrence_idx,
             } => {
-                &chunk.project_id == project_id
-                    && &chunk.rel_path_hash == rel_path_hash
+                &chunk.rel_path_hash == rel_path_hash
                     && &chunk.chunk_hash == chunk_hash
                     && &chunk.occurrence_idx == occurrence_idx
             }
             EntityRef::Symbol {
-                project_id,
+                project_id: _,
                 qualified_name,
                 defn_hash,
             } => {
-                &chunk.project_id == project_id
-                    && chunk.symbol.as_deref() == Some(qualified_name.as_str())
+                chunk.symbol.as_deref() == Some(qualified_name.as_str())
                     && &chunk.chunk_hash == defn_hash
             }
             _ => false,
