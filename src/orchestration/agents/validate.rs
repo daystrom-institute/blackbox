@@ -30,14 +30,15 @@ fn json_type_label(v: &serde_json::Value) -> &'static str {
     }
 }
 
-pub struct InstallCtx<'a, F: Fn(&str) -> bool> {
+pub struct InstallCtx<'a, B: Fn(&str) -> bool, A: Fn(&str) -> bool> {
     pub adapter_registry: &'a AgentAdapterRegistry,
-    pub brofile_exists: F,
+    pub brofile_exists: B,
+    pub agent_exists: A,
 }
 
-pub fn validate_agent_install<F: Fn(&str) -> bool>(
+pub fn validate_agent_install<B: Fn(&str) -> bool, A: Fn(&str) -> bool>(
     value: &serde_json::Value,
-    ctx: &InstallCtx<'_, F>,
+    ctx: &InstallCtx<'_, B, A>,
 ) -> Result<(), ValidationError> {
     if !value.is_object() {
         return Err(ValidationError {
@@ -161,9 +162,9 @@ fn validate_brofile_xor(manifest: &AgentManifest) -> Result<(), ValidationError>
     }
 }
 
-fn lint_manifest<F: Fn(&str) -> bool>(
+fn lint_manifest<B: Fn(&str) -> bool, A: Fn(&str) -> bool>(
     manifest: &AgentManifest,
-    ctx: &InstallCtx<'_, F>,
+    ctx: &InstallCtx<'_, B, A>,
 ) -> Result<(), ValidationError> {
     validate_description_length(&manifest.description).map_err(|msg| ValidationError {
         step: "lint_description",
@@ -227,7 +228,7 @@ fn lint_manifest<F: Fn(&str) -> bool>(
     }
 
     if let Some(composition) = &manifest.composition {
-        validate_composition(composition)?;
+        validate_composition(composition, &ctx.agent_exists)?;
     }
 
     Ok(())
@@ -238,6 +239,7 @@ const FAN_OUT_AGGREGATOR_VARIANTS: &[&str] =
 
 fn validate_composition(
     composition: &super::types::AgentComposition,
+    agent_exists: &impl Fn(&str) -> bool,
 ) -> Result<(), ValidationError> {
     for name in &composition.chainable_after {
         if name.is_empty() {
@@ -245,6 +247,20 @@ fn validate_composition(
                 step: "lint_composition",
                 message: "composition.chainable_after contains an empty string".into(),
             });
+        }
+        if name.trim() != name {
+            return Err(ValidationError {
+                step: "lint_composition",
+                message: format!(
+                    "composition.chainable_after entry `{name}` must not have leading or trailing whitespace"
+                ),
+            });
+        }
+        if !agent_exists(name) {
+            tracing::warn!(
+                agent = name.as_str(),
+                "composition.chainable_after forward reference recorded during agent validation"
+            );
         }
     }
 
@@ -385,19 +401,23 @@ mod tests {
         }
     }
 
-    fn make_ctx(registry: &AgentAdapterRegistry) -> InstallCtx<'_, impl Fn(&str) -> bool> {
+    fn make_ctx(
+        registry: &AgentAdapterRegistry,
+    ) -> InstallCtx<'_, impl Fn(&str) -> bool, impl Fn(&str) -> bool> {
         InstallCtx {
             adapter_registry: registry,
             brofile_exists: |_name: &str| true,
+            agent_exists: |_name: &str| true,
         }
     }
 
     fn make_ctx_brofile_missing(
         registry: &AgentAdapterRegistry,
-    ) -> InstallCtx<'_, impl Fn(&str) -> bool> {
+    ) -> InstallCtx<'_, impl Fn(&str) -> bool, impl Fn(&str) -> bool> {
         InstallCtx {
             adapter_registry: registry,
             brofile_exists: |_name: &str| false,
+            agent_exists: |_name: &str| true,
         }
     }
 
@@ -817,6 +837,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_chainable_after_forward_reference() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = InstallCtx {
+            adapter_registry: &registry,
+            brofile_exists: |_name: &str| true,
+            agent_exists: |_name: &str| false,
+        };
+        let mut v = minimal_valid_agent();
+        v["manifest"]["composition"] = serde_json::json!({
+            "chainable_after": ["future-agent"],
+        });
+        validate_agent_install(&v, &ctx).unwrap();
+    }
+
+    #[test]
     fn rejects_empty_chainable_after_entry() {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx(&registry);
@@ -827,6 +862,19 @@ mod tests {
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_composition");
         assert!(err.message.contains("empty string"));
+    }
+
+    #[test]
+    fn rejects_whitespace_padded_chainable_after_entry() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["composition"] = serde_json::json!({
+            "chainable_after": [" analyzer"],
+        });
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "lint_composition");
+        assert!(err.message.contains("whitespace"));
     }
 
     #[test]
@@ -925,6 +973,7 @@ mod tests {
         let ctx = InstallCtx {
             adapter_registry: &registry,
             brofile_exists: |name: &str| name == "code-reviewer-persona",
+            agent_exists: |name: &str| name == "diff-narrator",
         };
         let src = include_str!("../../../examples/agents/code-reviewer.json");
         let v: serde_json::Value = serde_json::from_str(src)
@@ -951,6 +1000,7 @@ mod tests {
         let ctx = InstallCtx {
             adapter_registry: &registry,
             brofile_exists: |_name: &str| true,
+            agent_exists: |_name: &str| true,
         };
         let src = include_str!("../../../examples/agents/badgey.json");
         let v: serde_json::Value = serde_json::from_str(src)
@@ -1027,6 +1077,10 @@ mod tests {
                 adapter_registry: &registry,
                 brofile_exists: |name: &str| -> bool {
                     catalog.metadata_for(crate::artifacts::ArtifactKind::Brofile, name)
+                        .ok().flatten().is_some_and(|m| m.active)
+                },
+                agent_exists: |name: &str| -> bool {
+                    catalog.metadata_for(crate::artifacts::ArtifactKind::Agent, name)
                         .ok().flatten().is_some_and(|m| m.active)
                 },
             };

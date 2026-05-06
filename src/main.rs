@@ -7697,6 +7697,13 @@ async fn install_artifact_value(
                         .flatten()
                         .is_some_and(|m| m.active)
                 },
+                agent_exists: |name: &str| -> bool {
+                    catalog
+                        .metadata_for(artifacts::ArtifactKind::Agent, name)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.active)
+                },
             };
             orchestration::agents::validate::validate_agent_install(&value, &ctx)?;
             drop(catalog);

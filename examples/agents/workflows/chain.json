@@ -56,8 +56,7 @@
             "arguments": {
               "agent": "code-reviewer",
               "args": {
-                "diff": "${vars.diff}",
-                "context_refs": ["${vars.first_output.result}"]
+                "diff": "${vars.diff}\n\nDiff-narrator context:\n${vars.first_output.result}"
               }
             },
             "timeout_secs": 120

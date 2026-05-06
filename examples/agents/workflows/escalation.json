@@ -43,7 +43,7 @@
           "on_failure": "halt"
         }
       ],
-      "gate": "packet-escalation-judge",
+      "gate": "domain:agents/escalation-judge",
       "next": {
         "type": "branch",
         "cases": {

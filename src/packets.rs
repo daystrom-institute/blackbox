@@ -1485,8 +1485,8 @@ fn eval_predicate(
             needle,
             case_insensitive,
         } => {
-            let haystack = match entity.get(field) {
-                Some(serde_json::Value::String(s)) => s.as_str(),
+            let haystack = match entity_get_raw(entity, field) {
+                Some(serde_json::Value::String(s)) => s,
                 _ => return false,
             };
             if *case_insensitive {
@@ -5061,6 +5061,37 @@ mod tests {
             .clone();
         assert!(eval_predicate(&p, &yes1, &NoopResolver, 0));
         assert!(eval_predicate(&p, &yes2, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &no, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn string_contains_supports_dotted_fields() {
+        let p = Predicate::StringContains {
+            field: "vars.cheap_output.result".into(),
+            needle: "confidence-low".into(),
+            case_insensitive: true,
+        };
+        let yes = serde_json::json!({
+            "vars": {
+                "cheap_output": {
+                    "result": "Confidence-Low: needs a reviewer"
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let no = serde_json::json!({
+            "vars": {
+                "cheap_output": {
+                    "result": "looks sufficient"
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(eval_predicate(&p, &yes, &NoopResolver, 0));
         assert!(!eval_predicate(&p, &no, &NoopResolver, 0));
     }
 

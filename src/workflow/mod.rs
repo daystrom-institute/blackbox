@@ -1012,6 +1012,21 @@ mod tests {
             Some("code-reviewer"),
             "chain second agent should be code-reviewer"
         );
+        let r2_agent_args = r2_arguments
+            .get("args")
+            .and_then(|v| v.as_object())
+            .expect("RunSecond agent args");
+        assert!(
+            r2_agent_args
+                .get("diff")
+                .and_then(|v| v.as_str())
+                .is_some_and(|diff| diff.contains("${vars.first_output.result}")),
+            "RunSecond should feed diff-narrator output into code-reviewer prompt input"
+        );
+        assert!(
+            !r2_agent_args.contains_key("context_refs"),
+            "RunSecond should not pass context_refs that code-reviewer does not render"
+        );
         let r2_wait_args = run_second.on_enter[1]
             .args
             .as_object()
@@ -1095,7 +1110,10 @@ mod tests {
         let spec = load_workflow(src).unwrap();
         let cheap = spec.nodes.get("CheapAttempt").expect("CheapAttempt node");
         assert!(cheap.gate.is_some(), "CheapAttempt should have a gate packet");
-        assert_eq!(cheap.gate.as_deref(), Some("packet-escalation-judge"));
+        assert_eq!(
+            cheap.gate.as_deref(),
+            Some("domain:agents/escalation-judge")
+        );
         assert_eq!(cheap.on_enter.len(), 2, "should have dispatch + wait hooks");
         let dispatch_args = cheap.on_enter[0]
             .args
@@ -1161,5 +1179,56 @@ mod tests {
             spec.vars_schema.as_ref().is_some_and(|vs| vs.contains_key("expensive_output")),
             "vars_schema should include expensive_output for completed escalation wait"
         );
+    }
+
+    #[test]
+    fn agent_escalation_gate_packet_matches_workflow_domain() {
+        let workflow_src = include_str!("../../examples/agents/workflows/escalation.json");
+        let packet_src = include_str!("../../examples/agents/packets/escalation-judge.json");
+        let spec = load_workflow(workflow_src).unwrap();
+        let cheap = spec.nodes.get("CheapAttempt").expect("CheapAttempt node");
+        assert_eq!(
+            cheap.gate.as_deref(),
+            Some("domain:agents/escalation-judge")
+        );
+
+        let params: crate::packets::CompileParams = serde_json::from_str(packet_src).unwrap();
+        assert_eq!(params.domain, "agents/escalation-judge");
+        let tmp = tempfile::tempdir().unwrap();
+        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+        let compile_message = packets.compile(&params).unwrap();
+        let loaded = packets.load("domain:agents/escalation-judge").unwrap();
+        assert!(
+            compile_message.contains(&loaded.id),
+            "compile message should name loaded packet id: {compile_message}"
+        );
+
+        let escalate = crate::packets::apply(
+            &loaded,
+            &serde_json::json!({
+                "vars": {
+                    "cheap_output": {
+                        "result": "confidence-low: missing coverage"
+                    }
+                }
+            }),
+        )
+        .expect("confidence-low should escalate");
+        assert_eq!(escalate.classification, "escalate");
+        assert_eq!(escalate.consequent.to_json(), serde_json::json!("Escalate"));
+
+        let pass = crate::packets::apply(
+            &loaded,
+            &serde_json::json!({
+                "vars": {
+                    "cheap_output": {
+                        "result": "coverage is sufficient"
+                    }
+                }
+            }),
+        )
+        .expect("fallback should pass");
+        assert_eq!(pass.classification, "pass");
+        assert_eq!(pass.consequent.to_json(), serde_json::json!("Done"));
     }
 }

@@ -963,15 +963,18 @@ impl<'a> WorkflowRunner<'a> {
             NodeTransition::Goto { to } => Ok(to.clone()),
             NodeTransition::Fork { continue_to, .. } => Ok(continue_to.clone()),
             NodeTransition::Branch { cases, default, .. } => {
-                let verdict = self.last_verdict.as_deref().ok_or_else(|| {
-                    anyhow!(
+                let Some(verdict) = self.last_verdict.as_deref() else {
+                    if let Some(d) = default {
+                        return Ok(d.clone());
+                    }
+                    bail!(
                         "branch node '{current}' reached with no prior gate verdict — \
                          either the node has no `gate` packet spec, the gate fired \
                          but no rule matched (packet returned None), or the predecessor's \
                          transition didn't run a gate. Ensure the gate has a catchall \
                          fallback rule, or set `default` on the branch."
-                    )
-                })?;
+                    );
+                };
                 if let Some(target) = cases.get(verdict) {
                     return Ok(target.clone());
                 }
@@ -2299,6 +2302,32 @@ mod tests {
         assert_eq!(runner.next_node("Decide").unwrap(), "Fallback");
     }
 
+    #[test]
+    fn branch_with_default_handles_missing_verdict() {
+        let json = r#"{
+            "name": "t",
+            "version": 1,
+            "actors": {"a": {"kind": "executor", "brofile": "b"}},
+            "nodes": {
+                "Decide": {
+                    "actor": "a",
+                    "gate": "packet-12345678",
+                    "next": {
+                        "type": "branch",
+                        "cases": {"yes": "Yes"},
+                        "default": "Fallback"
+                    }
+                },
+                "Yes": {"actor": "a", "next": {"type": "terminal"}},
+                "Fallback": {"actor": "a", "next": {"type": "terminal"}}
+            },
+            "start": "Decide"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+        let runner = runner_for(&compiled);
+        assert_eq!(runner.next_node("Decide").unwrap(), "Fallback");
+    }
+
     fn runner_for(compiled: &CompiledWorkflow) -> DummyRunner {
         DummyRunner {
             compiled,
@@ -2331,10 +2360,12 @@ mod tests {
                 NodeTransition::Goto { to } => Ok(to.clone()),
                 NodeTransition::Fork { continue_to, .. } => Ok(continue_to.clone()),
                 NodeTransition::Branch { cases, default, .. } => {
-                    let verdict = self
-                        .last_verdict
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("branch '{current}' has no prior gate verdict"))?;
+                    let Some(verdict) = self.last_verdict.as_deref() else {
+                        if let Some(d) = default {
+                            return Ok(d.clone());
+                        }
+                        bail!("branch '{current}' has no prior gate verdict");
+                    };
                     if let Some(t) = cases.get(verdict) {
                         return Ok(t.clone());
                     }
