@@ -127,7 +127,16 @@ impl EdgeIndex {
     }
 
     fn insert(&mut self, edge: Edge, seen: &mut HashSet<Edge>) {
-        if !seen.insert(edge.clone()) {
+        // Dedupe on the logical edge identity (source, kind, target,
+        // provenance, confidence) — metadata varies per emission instance
+        // (anchor.byte_start, anchor.commit_sha_at_edit, etc.) so leaving it
+        // in the dedup key produces an N-way duplicate of the same logical
+        // relationship. Symptom: a session that wrote a file 7 times shows
+        // 7 identical EDITED_BY_SESSION edges in inspect/find_paths/notable.
+        // First emission wins for the metadata-bearing storage.
+        let mut key = edge.clone();
+        key.metadata.clear();
+        if !seen.insert(key) {
             return;
         }
         if edge.kind == "EDITED_FILE" {
@@ -367,6 +376,14 @@ impl EdgeIndex {
                 else {
                     continue;
                 };
+                // Skip the chunk[0] -> chunk[0] self-loop. While chunk[0]
+                // serves as the file proxy in the current schema (see
+                // deferred-thread #5), emitting it as both source and target
+                // adds noise to inspect/notable_edges without giving the
+                // agent any new information.
+                if source == file_target {
+                    continue;
+                }
                 self.insert(
                     exact_edge(
                         source,
@@ -377,35 +394,11 @@ impl EdgeIndex {
                     seen,
                 );
             }
-            for pair in chunks.windows(2) {
-                let Some(left) = pair[0]
-                    .entity_id
-                    .as_deref()
-                    .and_then(|entity| EntityRef::parse(entity).ok())
-                else {
-                    continue;
-                };
-                let Some(right) = pair[1]
-                    .entity_id
-                    .as_deref()
-                    .and_then(|entity| EntityRef::parse(entity).ok())
-                else {
-                    continue;
-                };
-                self.insert(
-                    exact_edge(
-                        left.clone(),
-                        "NEXT_CHUNK",
-                        right.clone(),
-                        EdgeProvenance::Derived,
-                    ),
-                    seen,
-                );
-                self.insert(
-                    exact_edge(right, "PREV_CHUNK", left, EdgeProvenance::Derived),
-                    seen,
-                );
-            }
+            // NEXT_SECTION is already projected by the chunker's derive_edges
+            // for every adjacent chunk pair. Emitting NEXT_CHUNK/PREV_CHUNK
+            // here duplicates the same relationship under different kinds and
+            // pollutes notable_edges (the user sees the same target twice
+            // under two kinds). Skip the redundant projection.
         }
     }
 

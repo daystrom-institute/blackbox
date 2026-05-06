@@ -77,16 +77,22 @@ impl InspectableEntityProvider for ProjectFileProvider {
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
         vec![
+            expected("CONTAINS_SYMBOL", false),
+            expected("DEFINED_IN", false),
             expected("CALLS", false),
             expected("CALLED_BY", false),
-            expected("CONTAINS_SYMBOL", false),
-            expected("IN_FILE", true),
+            expected("EDITED_FILE", false),
+            expected("READ_FILE", false),
             expected("EDITED_BY_SESSION", false),
             expected("EDITED_IN_COMMIT", false),
-            expected("NEXT_SECTION", false),
+            expected("COMMIT_TOUCHED_FILE", false),
+            expected("DESCRIBES", false),
             expected("LINKS_TO_FILE", false),
             expected("LINKS_TO_SECTION", false),
-            expected("DESCRIBES", false),
+            expected("IN_FILE", true),
+            expected("NEXT_SECTION", false),
+            expected("NEXT_CHUNK", false),
+            expected("PREV_CHUNK", false),
         ]
     }
 
@@ -95,19 +101,36 @@ impl InspectableEntityProvider for ProjectFileProvider {
         _entity: &EntityView,
         full_neighborhood: &Neighborhood,
     ) -> Vec<NextHop> {
+        // Order matters — `select_notable_edges` walks this list and picks the
+        // first PER_DIRECTION_EDGE_LIMIT matches. Keep semantic edges
+        // (provenance, symbol/call relationships) ahead of structural noise
+        // (IN_FILE self-proxy, NEXT_SECTION/NEXT_CHUNK siblings) so the seed
+        // surface tells the agent something actionable instead of "this chunk
+        // is in a file with other chunks". The structural kinds stay in the
+        // list as fallback when nothing semantic exists.
         next_hops(
             full_neighborhood,
             &[
+                // Symbol/call graph
+                "CONTAINS_SYMBOL",
+                "DEFINED_IN",
                 "CALLS",
                 "CALLED_BY",
-                "CONTAINS_SYMBOL",
-                "IN_FILE",
+                // Provenance: who touched this chunk and from where
+                "EDITED_FILE",
+                "READ_FILE",
                 "EDITED_BY_SESSION",
                 "EDITED_IN_COMMIT",
-                "NEXT_SECTION",
+                "COMMIT_TOUCHED_FILE",
+                // Semantic linking
+                "DESCRIBES",
                 "LINKS_TO_FILE",
                 "LINKS_TO_SECTION",
-                "DESCRIBES",
+                // Structural fallback
+                "IN_FILE",
+                "NEXT_SECTION",
+                "NEXT_CHUNK",
+                "PREV_CHUNK",
             ],
         )
     }

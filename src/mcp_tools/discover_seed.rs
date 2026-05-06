@@ -180,10 +180,15 @@ fn select_notable_edges(
     priority_set: &BTreeSet<&String>,
 ) -> Vec<NotableEdge> {
     let mut selected = Vec::new();
+    let mut seen = std::collections::HashSet::<(String, String)>::new();
     for family in priorities {
         for edge in edges.iter().filter(|edge| edge.kind == *family) {
             if selected.len() >= PER_DIRECTION_EDGE_LIMIT {
                 return selected;
+            }
+            let key = (edge.kind.clone(), edge.target.to_string());
+            if !seen.insert(key) {
+                continue;
             }
             selected.push(render_notable_edge(ctx, edge, direction));
         }
