@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::embed::{Bucket, EmbeddingProvider, EmbeddingRouter};
 use crate::embed_queue;
+use crate::entity_loader;
+use crate::entity_ref::EntityRef;
 use crate::index::{HybridBm25Hit, TranscriptIndex};
 use crate::knowledge::Knowledge;
+use crate::providers::ProviderContext;
 use crate::search::rerank::{self, RerankFeatures};
 use crate::search::rrf::{self, RankedHit, RankedList};
 use crate::vectors::{self, PartitionMetrics};
@@ -74,6 +77,7 @@ struct HybridDegraded {
 pub fn hybrid_search(
     index: &TranscriptIndex,
     knowledge: &Knowledge,
+    ctx: &ProviderContext<'_>,
     p: &HybridSearchParams,
 ) -> Result<String> {
     let query = p.query.trim();
@@ -124,11 +128,13 @@ pub fn hybrid_search(
     }
 
     let fused = rrf::fuse_rrf(&lists, RRF_K, fetch);
+    let mut loaded_properties = BTreeMap::new();
     enrich_fused_features(
         index,
         knowledge,
         fused.iter().map(|hit| hit.entity_id.as_str()),
         &mut features,
+        &mut loaded_properties,
     )?;
     let now = Utc::now();
     let mut results = fused
@@ -144,9 +150,12 @@ pub fn hybrid_search(
                 entity_id: hit.entity_id.clone(),
                 score,
                 base_score: hit.score,
-                label: bm25
-                    .and_then(|hit| hit.title.clone())
-                    .unwrap_or_else(|| compact_entity_label(&hit.entity_id)),
+                label: label_for_entity(
+                    ctx,
+                    &hit.entity_id,
+                    loaded_properties.get(&hit.entity_id),
+                    bm25.and_then(|hit| hit.title.as_deref()),
+                ),
                 doc_type: feature.doc_type,
                 chunk_kind: feature.chunk_kind,
                 role: feature.role,
@@ -328,17 +337,28 @@ fn enrich_fused_features<'a>(
     knowledge: &Knowledge,
     entity_ids: impl Iterator<Item = &'a str>,
     features: &mut BTreeMap<String, RerankFeatures>,
+    loaded_properties: &mut BTreeMap<String, BTreeMap<String, String>>,
 ) -> Result<()> {
     for entity_id in entity_ids {
         if !features.contains_key(entity_id) {
-            let mut feature = index
-                .entity_properties(entity_id)?
-                .map(|properties| features_from_properties(&properties))
+            let indexed_properties = index.entity_properties(entity_id)?;
+            let mut feature = indexed_properties
+                .as_ref()
+                .map(features_from_properties)
                 .unwrap_or_default();
+            if let Some(properties) = indexed_properties {
+                loaded_properties.insert(entity_id.to_string(), properties);
+            }
             if entity_id.starts_with("knowledge:") && feature.doc_type.is_none() {
                 feature.doc_type = Some("knowledge".into());
             }
             features.insert(entity_id.to_string(), feature);
+        }
+        if let Some(properties) = knowledge_properties(knowledge, entity_id) {
+            loaded_properties
+                .entry(entity_id.to_string())
+                .or_default()
+                .extend(properties);
         }
     }
     enrich_knowledge_features(knowledge, features);
@@ -352,6 +372,36 @@ fn features_from_properties(properties: &BTreeMap<String, String>) -> RerankFeat
         role: properties.get("role").cloned(),
         ..RerankFeatures::default()
     }
+}
+
+fn knowledge_properties(
+    knowledge: &Knowledge,
+    entity_id: &str,
+) -> Option<BTreeMap<String, String>> {
+    let id = entity_id.strip_prefix("knowledge:")?;
+    let entry = knowledge.entry(id)?;
+    let mut properties = BTreeMap::new();
+    properties.insert("title".into(), entry.title.clone());
+    properties.insert("doc_type".into(), "knowledge".into());
+    properties.insert("approval".into(), format!("{:?}", entry.approval));
+    properties.insert("created_at".into(), entry.created_at.clone());
+    if let Some(last_recalled) = &entry.last_recalled {
+        properties.insert("last_recalled".into(), last_recalled.clone());
+    }
+    Some(properties)
+}
+
+fn label_for_entity(
+    ctx: &ProviderContext<'_>,
+    entity_id: &str,
+    loaded: Option<&BTreeMap<String, String>>,
+    bm25_title: Option<&str>,
+) -> String {
+    EntityRef::parse(entity_id)
+        .ok()
+        .and_then(|r| entity_loader::compact_label(ctx, &r, loaded))
+        .or_else(|| bm25_title.map(str::to_string))
+        .unwrap_or_else(|| compact_entity_label(entity_id))
 }
 
 fn render_text(
@@ -538,5 +588,16 @@ mod tests {
         assert_eq!(feature.doc_type.as_deref(), Some("knowledge"));
         assert_eq!(feature.approval.as_deref(), Some("UserConfirmed"));
         assert_eq!(rerank::type_multiplier(feature), 1.35);
+    }
+
+    #[test]
+    fn label_for_entity_prefers_loaded_properties() {
+        let ctx = ProviderContext::empty_for_tests();
+        let loaded = BTreeMap::from([("title".into(), "Loaded Knowledge Title".into())]);
+
+        assert_eq!(
+            label_for_entity(&ctx, "knowledge:abc12345", Some(&loaded), None),
+            "Loaded Knowledge Title"
+        );
     }
 }

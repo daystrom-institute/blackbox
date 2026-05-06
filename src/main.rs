@@ -729,9 +729,11 @@ impl BlackboxServer {
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
             drop(idx);
+            let provider_ctx = ProviderContext::new(&self.state);
             mcp_tools::hybrid_search::hybrid_search(
                 &self.state.idx.read(),
                 &self.state.kb.read(),
+                &provider_ctx,
                 &p,
             )
         })

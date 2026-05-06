@@ -67,6 +67,7 @@ pub fn discover_seed_entities(
     let hybrid = hybrid_search::hybrid_search(
         index,
         knowledge,
+        ctx,
         &HybridSearchParams {
             query: p.query.clone(),
             limit: Some(limit),
