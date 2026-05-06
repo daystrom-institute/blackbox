@@ -149,7 +149,7 @@ score_one() {
     local raw_file="$4"
     local verdict_file="$5"
     python3 - "$manifest" "$strategy" "$trial" "$raw_file" "$verdict_file" "${EVAL_SYNTHETIC_REGRESSION:-0}" <<'PY'
-import json, pathlib, re, sys
+import json, os, pathlib, re, sys
 manifest_path, strategy, trial, raw_path, verdict_path, synthetic = sys.argv[1:]
 manifest = json.loads(pathlib.Path(manifest_path).read_text())
 raw = pathlib.Path(raw_path).read_text(errors="replace")
@@ -182,7 +182,8 @@ if not refs:
 refs = list(dict.fromkeys(str(ref).rstrip(".,;)") for ref in refs))
 
 expected = list(manifest.get("expected_entity_refs", []))
-if synthetic == "1" and manifest["id"] == sorted([manifest["id"]])[0]:
+first_id = os.environ.get("EVAL_SUITE_FIRST_ID", "")
+if synthetic == "1" and manifest["id"] == first_id:
     expected = ["knowledge:synthetic-regression-missing-ref"]
 strictness = manifest.get("pass_strictness", "any")
 if strictness == "all":
@@ -302,6 +303,15 @@ main() {
         echo "No manifests selected." >&2
         exit 1
     fi
+    local first_id=""
+    local manifest_id
+    for manifest in "${manifests[@]}"; do
+        manifest_id="$(basename "$manifest" .json)"
+        if [[ -z "$first_id" || "$manifest_id" < "$first_id" ]]; then
+            first_id="$manifest_id"
+        fi
+    done
+    export EVAL_SUITE_FIRST_ID="$first_id"
     echo "=== Agentic corpus eval: $TIMESTAMP ==="
     echo "MCP: $MCP_URL"
     echo "Strategies: $STRATEGIES  Manifests: ${#manifests[@]}  Trials: $TRIALS  Parallel: $PARALLEL"
