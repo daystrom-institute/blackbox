@@ -513,7 +513,55 @@ fn field_names(content: &str) -> Vec<String> {
 }
 
 const CALL_KEYWORDS: &[&str] = &[
-    "if", "for", "while", "loop", "match", "return", "sizeof", "switch", "catch", "fn",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "const",
+    "continue",
+    "def",
+    "defer",
+    "delete",
+    "do",
+    "else",
+    "finally",
+    "fn",
+    "for",
+    "from",
+    "function",
+    "go",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "is",
+    "lambda",
+    "let",
+    "loop",
+    "match",
+    "nameof",
+    "new",
+    "of",
+    "raise",
+    "return",
+    "select",
+    "sizeof",
+    "switch",
+    "then",
+    "throw",
+    "try",
+    "typeof",
+    "unless",
+    "using",
+    "var",
+    "when",
+    "where",
+    "while",
+    "with",
+    "yield",
 ];
 
 fn chunk_ref(chunk: &Chunk) -> EntityRef {
@@ -713,6 +761,14 @@ mod tests {
 
         assert!(edges.iter().any(|edge| edge.kind == "IMPLEMENTS_TRAIT"));
         assert!(!edges.iter().any(|edge| edge.kind == "IMPORTS"));
+    }
+
+    #[test]
+    fn call_names_skip_flow_control_keywords() {
+        let names = call_names("if (cond) { foo(); }");
+
+        assert!(!names.iter().any(|name| name == "if"));
+        assert!(names.iter().any(|name| name == "foo"));
     }
 
     #[test]
