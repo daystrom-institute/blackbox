@@ -411,7 +411,7 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(&digest[..4])
 }
 
-fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+pub(crate) fn canonical_input_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     if canonical.is_file() {
         Err(io::Error::new(

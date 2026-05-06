@@ -131,14 +131,7 @@ fn load_store(path: &Path) -> Result<ProjectStore> {
 }
 
 fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
-    let canonical = fs::canonicalize(path.as_ref())?;
-    if canonical.is_file() {
-        anyhow::bail!(
-            "project path must be a directory, not a file: {}",
-            canonical.display()
-        );
-    }
-    Ok(canonical)
+    Ok(entity_ref::canonical_input_path(path)?)
 }
 
 #[cfg(test)]
