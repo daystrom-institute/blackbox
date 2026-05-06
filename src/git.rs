@@ -158,6 +158,10 @@ pub(crate) fn changed_files_for_commit(root: &Path, sha: &str) -> Result<Vec<Str
 }
 
 pub(crate) fn head_fingerprint(root: &Path) -> Option<u64> {
+    // HACK: project-file reindex metadata only has `(mtime, size)`, so git
+    // history uses `mtime = 0` plus `size = HEAD fingerprint` as a synthetic
+    // source-file marker. A cleaner future shape is a parallel GitMeta map
+    // keyed by project_id instead of overloading FileMeta.size.
     current_head(root).map(|head| {
         let mut bytes = [0u8; 8];
         for (idx, byte) in head.as_bytes().iter().take(8).enumerate() {
