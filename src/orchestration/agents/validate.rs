@@ -879,4 +879,94 @@ mod tests {
             validate_agent_install(&v, &ctx).unwrap();
         }
     }
+
+    struct NamedAdapter(&'static str);
+
+    impl super::super::adapter::AgentDispatchAdapter for NamedAdapter {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn dispatch(
+            &self,
+            _manifest: &AgentManifest,
+            _args: serde_json::Value,
+            _ctx: super::super::adapter::DispatchContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            super::super::adapter::AgentDispatchResult,
+                            super::super::adapter::AgentDispatchError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async { Err(super::super::adapter::AgentDispatchError::AdapterFailed {
+                message: "not implemented".into(),
+            }) })
+        }
+    }
+
+    #[test]
+    fn reference_agent_diff_narrator_installs_cleanly() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let src = include_str!("../../../examples/agents/diff-narrator.json");
+        let v: serde_json::Value = serde_json::from_str(src)
+            .expect("diff-narrator.json parses");
+        validate_agent_install(&v, &ctx)
+            .expect("diff-narrator validates cleanly");
+    }
+
+    #[test]
+    fn reference_agent_code_reviewer_installs_with_brofile() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = InstallCtx {
+            adapter_registry: &registry,
+            brofile_exists: |name: &str| name == "code-reviewer-persona",
+        };
+        let src = include_str!("../../../examples/agents/code-reviewer.json");
+        let v: serde_json::Value = serde_json::from_str(src)
+            .expect("code-reviewer.json parses");
+        validate_agent_install(&v, &ctx)
+            .expect("code-reviewer validates cleanly");
+    }
+
+    #[test]
+    fn reference_agent_code_reviewer_fails_without_brofile() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx_brofile_missing(&registry);
+        let src = include_str!("../../../examples/agents/code-reviewer.json");
+        let v: serde_json::Value = serde_json::from_str(src)
+            .expect("code-reviewer.json parses");
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "brofile_resolution");
+    }
+
+    #[test]
+    fn reference_agent_badgey_installs_with_adapter() {
+        let mut registry = AgentAdapterRegistry::new();
+        registry.register(Arc::new(NamedAdapter("badgey")));
+        let ctx = InstallCtx {
+            adapter_registry: &registry,
+            brofile_exists: |_name: &str| true,
+        };
+        let src = include_str!("../../../examples/agents/badgey.json");
+        let v: serde_json::Value = serde_json::from_str(src)
+            .expect("badgey.json parses");
+        validate_agent_install(&v, &ctx)
+            .expect("badgey validates cleanly");
+    }
+
+    #[test]
+    fn reference_agent_badgey_fails_without_adapter() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let src = include_str!("../../../examples/agents/badgey.json");
+        let v: serde_json::Value = serde_json::from_str(src)
+            .expect("badgey.json parses");
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "lint_dispatch_adapter");
+    }
 }
