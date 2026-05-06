@@ -211,11 +211,19 @@ impl VectorStore {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PartitionMetrics {
     pub route: String,
+    pub state: PartitionState,
     pub dims: usize,
     pub wal_records: usize,
     pub active_count: usize,
     pub hnsw_rebuilds: usize,
     pub hnsw: Option<HnswMetricsSerde>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PartitionState {
+    Empty,
+    Active { dims: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -379,11 +387,18 @@ impl Partition {
     }
 
     fn metrics(&self) -> PartitionMetrics {
+        let dims = self.slab.dims();
+        let active_count = self.slab.active_count();
         PartitionMetrics {
             route: self.route.clone(),
-            dims: self.slab.dims(),
+            state: if active_count == 0 {
+                PartitionState::Empty
+            } else {
+                PartitionState::Active { dims }
+            },
+            dims,
             wal_records: self.wal_records,
-            active_count: self.slab.active_count(),
+            active_count,
             hnsw_rebuilds: self.hnsw_rebuilds,
             hnsw: self.hnsw.as_ref().map(|hnsw| hnsw.metrics().into()),
         }
@@ -512,6 +527,25 @@ mod tests {
             .expect("ollama WAL should read");
         assert!(voyage_records.last().unwrap().deleted_at.is_some());
         assert!(ollama_records.last().unwrap().deleted_at.is_some());
+    }
+
+    #[test]
+    fn partition_metrics_distinguish_empty_from_active_dimensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "same", "h1", vec![1.0, 0.0])
+            .unwrap();
+
+        let active = store.metrics().remove("voyage-1024").unwrap();
+        assert_eq!(active.dims, 2);
+        assert_eq!(active.state, PartitionState::Active { dims: 2 });
+
+        store.delete("voyage-1024", "same").unwrap();
+        let empty = store.metrics().remove("voyage-1024").unwrap();
+        assert_eq!(empty.dims, 2);
+        assert_eq!(empty.active_count, 0);
+        assert_eq!(empty.state, PartitionState::Empty);
     }
 
     #[test]
