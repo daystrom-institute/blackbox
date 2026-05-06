@@ -6,7 +6,6 @@ use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
-use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
 
 pub struct WhiteboardProvider;
@@ -47,10 +46,6 @@ impl InspectableEntityProvider for WhiteboardProvider {
             &["BOARD_FROM_ARC", "BOARD_REGISTERED_AGENT"],
             &["project", "phase"],
         )
-    }
-
-    fn forward_edges(&self, _r: &EntityRef) -> Vec<Edge> {
-        Vec::new()
     }
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {

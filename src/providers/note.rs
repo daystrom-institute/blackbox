@@ -6,7 +6,6 @@ use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
-use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
 
 pub struct NoteProvider;
@@ -67,10 +66,6 @@ impl InspectableEntityProvider for NoteProvider {
             &["NOTE_FROM_TASK", "NOTE_FROM_SESSION", "NOTE_IN_THREAD"],
             &["kind", "task_id", "session_id", "thread_id", "project"],
         )
-    }
-
-    fn forward_edges(&self, _r: &EntityRef) -> Vec<Edge> {
-        Vec::new()
     }
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {

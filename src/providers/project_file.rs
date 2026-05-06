@@ -6,7 +6,6 @@ use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
     NextHop, ProviderContext, base_view, ensure_type, expected, next_hops, schema, truncate_label,
 };
-use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
 
 pub struct ProjectFileProvider;
@@ -72,10 +71,6 @@ impl InspectableEntityProvider for ProjectFileProvider {
             ],
             &["project_id", "chunk_kind", "language"],
         )
-    }
-
-    fn forward_edges(&self, _r: &EntityRef) -> Vec<Edge> {
-        Vec::new()
     }
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {

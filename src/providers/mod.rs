@@ -85,7 +85,6 @@ pub trait InspectableEntityProvider: Send + Sync {
 
     fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView>;
     fn schema(&self) -> EntitySchemaView;
-    fn forward_edges(&self, r: &EntityRef) -> Vec<Edge>;
     fn expected_edge_families(&self, r: &EntityRef) -> Vec<EdgeFamilyExpectation>;
 
     fn recommended_next_hops(
