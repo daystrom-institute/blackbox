@@ -593,6 +593,7 @@ impl BlackboxServer {
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
             None,
+            None,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         if let Some(lease) = resume_lease {
@@ -2395,6 +2396,7 @@ impl BlackboxServer {
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
             None,
+            None,
         );
 
         // Register Gemini policy-file cleanup once the task terminates.
@@ -2520,6 +2522,7 @@ impl BlackboxServer {
             store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            None,
             None,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
@@ -2886,6 +2889,7 @@ impl BlackboxServer {
                         self.state.task_store.clone(),
                         self.state.tail_tx.clone(),
                         None,
+                        None,
                     );
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     release_resume_lease_when_done(t.clone(), resume_lease);
@@ -2929,6 +2933,7 @@ impl BlackboxServer {
                     store_dir.clone(),
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
+                    None,
                     None,
                 );
                 cleanup_policy_file_when_done(t.clone(), df.policy_file);
@@ -4894,7 +4899,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_agent_dispatch",
-        description = "Dispatch a registered agent for a focused task. Routes through manifest dispatch_adapter if set, otherwise resolves brofile, merges filters, expands prompt template, and spawns via the standard bro execution path."
+        description = "Dispatch a registered agent for a focused task. Routes through manifest dispatch_adapter if set, otherwise resolves brofile, merges filters, expands prompt template, and spawns via the standard bro execution path. Returns task_id, session, and agent attribution (agentLabel on the spawned task, preserved even when bro= routes to a named team member)."
     )]
     async fn bro_agent_dispatch(
         &self,
@@ -5052,7 +5057,7 @@ Constraints:\n\
         if let Some(ref inputs) = manifest.inputs {
             if let Some(ref schema) = inputs.schema {
                 let compiled = match jsonschema::JSONSchema::options()
-                    .with_draft(jsonschema::Draft::Draft7)
+                    .with_draft(jsonschema::Draft::Draft202012)
                     .compile(schema)
                 {
                     Ok(c) => c,
@@ -5160,8 +5165,8 @@ Constraints:\n\
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
             Some(bro_label.clone()),
+            Some(bro_label.clone()),
         );
-        task.inner.lock().agent_label = Some(bro_label.clone());
 
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
 
@@ -5883,6 +5888,7 @@ Next step: <one concrete steering suggestion>\n",
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
                     None,
+                    None,
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
                 release_resume_lease_when_done(task.clone(), resume_lease);
@@ -5940,6 +5946,7 @@ Next step: <one concrete steering suggestion>\n",
                     store_dir.clone(),
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
+                    None,
                     None,
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
@@ -12280,6 +12287,61 @@ mod tests {
         assert!(
             text.contains("schema_validation_failed"),
             "should reject wrong type: {text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_schema_202012_prefix_items_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "tuple-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "tuple-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with 2020-12 prefixItems schema.",
+                    "brofile_inline": {"provider": "claude"},
+                    "inputs": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "coords": {
+                                    "type": "array",
+                                    "prefixItems": [
+                                        {"type": "number"},
+                                        {"type": "number"}
+                                    ]
+                                }
+                            },
+                            "required": ["coords"],
+                        },
+                        "prompt_template": "Plot {{coords}}."
+                    },
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "tuple-agent".into(),
+            args: serde_json::json!({"coords": ["not-a-number", 2]}),
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("schema_validation_failed"),
+            "should reject via prefixItems: {text}"
         );
     }
 

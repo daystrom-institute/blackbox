@@ -590,6 +590,7 @@ pub fn spawn_task(
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     bro_label: Option<String>,
+    agent_label: Option<String>,
 ) -> Arc<Task> {
     let id = task_id;
 
@@ -650,8 +651,9 @@ pub fn spawn_task(
                     started_at: now_ms(),
                     completed_at: Some(now_ms()),
                     exit_code: None,
+                    cwd,
                     bro_label: bro_label.clone(),
-                    agent_label: None,
+                    agent_label: agent_label.clone(),
                     recoverable: false,
                 }),
                 notify: Arc::new(Notify::new()),
@@ -682,7 +684,7 @@ pub fn spawn_task(
             exit_code: None,
             cwd: cwd.clone(),
             bro_label,
-            agent_label: None,
+            agent_label,
             recoverable: false,
         }),
         notify: Arc::new(Notify::new()),
