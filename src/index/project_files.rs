@@ -545,6 +545,7 @@ fn short_hash(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunker::SourceFormatChunker;
     use crate::index::build_schema;
     use tantivy::schema::Field;
 
@@ -651,6 +652,45 @@ mod tests {
         assert!(edges.iter().any(|edge| edge.kind == "CALLS"));
         assert!(stats.call_edges >= 1);
         assert_eq!(stats.resolved_call_edges, stats.call_edges);
+    }
+
+    #[test]
+    fn json_chunk_hashes_survive_noncanonical_formatting() {
+        let project = ProjectRecord {
+            project_id: "proj1234".into(),
+            repo_id: Some("repo1234".into()),
+            canonical_path: "/tmp/repo".into(),
+            registered_at: "2026-05-05T17:30:00Z".into(),
+            is_git_repo: true,
+        };
+        let left = br#"
+        {
+          "b": 2,
+          "a": { "z": true }
+        }
+        "#;
+        let right = br#"{"a":{"z":true},"b":2}"#;
+
+        let left_chunks = crate::chunker::config::JsonChunker
+            .chunk(Path::new("config.json"), left)
+            .unwrap()
+            .0;
+        let right_chunks = crate::chunker::config::JsonChunker
+            .chunk(Path::new("config.json"), right)
+            .unwrap()
+            .0;
+        let left_chunks = finalize_chunks(&project, Path::new("config.json"), left_chunks);
+        let right_chunks = finalize_chunks(&project, Path::new("config.json"), right_chunks);
+        let left_hashes = left_chunks
+            .iter()
+            .map(|chunk| (chunk.content.clone(), chunk.chunk_hash.clone()))
+            .collect::<Vec<_>>();
+        let right_hashes = right_chunks
+            .iter()
+            .map(|chunk| (chunk.content.clone(), chunk.chunk_hash.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(left_hashes, right_hashes);
     }
 
     fn first_text(doc: &TantivyDocument, field: Field) -> String {
