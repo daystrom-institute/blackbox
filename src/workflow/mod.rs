@@ -774,6 +774,26 @@ mod tests {
                 "keystone-implementer-feedback-arc",
                 include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json"),
             ),
+            (
+                "agent-chain",
+                include_str!("../../examples/agents/workflows/chain.json"),
+            ),
+            (
+                "agent-fan-out",
+                include_str!("../../examples/agents/workflows/fan-out.json"),
+            ),
+            (
+                "agent-escalation",
+                include_str!("../../examples/agents/workflows/escalation.json"),
+            ),
+            (
+                "agent-eval-arc",
+                include_str!("../../examples/agents/workflows/agent-eval-arc.json"),
+            ),
+            (
+                "agent-cuing-eval-arc",
+                include_str!("../../examples/agents/workflows/agent-cuing-eval-arc.json"),
+            ),
         ];
 
         let mut failures: Vec<String> = Vec::new();
@@ -859,6 +879,26 @@ mod tests {
                 "keystone-implementer-feedback-arc",
                 include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json"),
             ),
+            (
+                "agent-chain",
+                include_str!("../../examples/agents/workflows/chain.json"),
+            ),
+            (
+                "agent-fan-out",
+                include_str!("../../examples/agents/workflows/fan-out.json"),
+            ),
+            (
+                "agent-escalation",
+                include_str!("../../examples/agents/workflows/escalation.json"),
+            ),
+            (
+                "agent-eval-arc",
+                include_str!("../../examples/agents/workflows/agent-eval-arc.json"),
+            ),
+            (
+                "agent-cuing-eval-arc",
+                include_str!("../../examples/agents/workflows/agent-cuing-eval-arc.json"),
+            ),
         ];
         for (name, src) in cases {
             let spec = load_workflow(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e:?}"));
@@ -883,5 +923,393 @@ mod tests {
             err.contains("branch case 'yes'") && err.contains("Ghost"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn agent_workflows_install_via_artifact_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = crate::artifacts::ArtifactCatalog::open(tmp.path().to_path_buf()).unwrap();
+        let cases: &[(&str, &str)] = &[
+            (
+                "agent-chain",
+                include_str!("../../examples/agents/workflows/chain.json"),
+            ),
+            (
+                "agent-fan-out",
+                include_str!("../../examples/agents/workflows/fan-out.json"),
+            ),
+            (
+                "agent-escalation",
+                include_str!("../../examples/agents/workflows/escalation.json"),
+            ),
+            (
+                "agent-eval-arc",
+                include_str!("../../examples/agents/workflows/agent-eval-arc.json"),
+            ),
+            (
+                "agent-cuing-eval-arc",
+                include_str!("../../examples/agents/workflows/agent-cuing-eval-arc.json"),
+            ),
+        ];
+        for (name, src) in cases {
+            let v: serde_json::Value = serde_json::from_str(src)
+                .unwrap_or_else(|e| panic!("{name}: JSON parse failed: {e}"));
+            catalog
+                .install_value(
+                    crate::artifacts::ArtifactKind::Workflow,
+                    format!("{name}.json"),
+                    &v,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{name}: artifact install failed: {e}"));
+        }
+        let rows = catalog
+            .list(&crate::artifacts::ArtifactListParams {
+                kind: Some(crate::artifacts::ArtifactKind::Workflow),
+                name: None,
+                include_superseded: false,
+            })
+            .unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"agent-chain"), "agent-chain not in catalog");
+        assert!(
+            names.contains(&"agent-fan-out"),
+            "agent-fan-out not in catalog"
+        );
+        assert!(
+            names.contains(&"agent-escalation"),
+            "agent-escalation not in catalog"
+        );
+        assert!(
+            names.contains(&"agent-eval-arc"),
+            "agent-eval-arc not in catalog"
+        );
+        assert!(
+            names.contains(&"agent-cuing-eval-arc"),
+            "agent-cuing-eval-arc not in catalog"
+        );
+    }
+
+    #[test]
+    fn agent_workflows_dry_run_produces_plan() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "agent-chain",
+                include_str!("../../examples/agents/workflows/chain.json"),
+            ),
+            (
+                "agent-fan-out",
+                include_str!("../../examples/agents/workflows/fan-out.json"),
+            ),
+            (
+                "agent-escalation",
+                include_str!("../../examples/agents/workflows/escalation.json"),
+            ),
+            (
+                "agent-eval-arc",
+                include_str!("../../examples/agents/workflows/agent-eval-arc.json"),
+            ),
+            (
+                "agent-cuing-eval-arc",
+                include_str!("../../examples/agents/workflows/agent-cuing-eval-arc.json"),
+            ),
+        ];
+        for (name, src) in cases {
+            let spec = load_workflow(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e:?}"));
+            let compiled =
+                compile(spec).unwrap_or_else(|e| panic!("{name}: compile failed: {e:?}"));
+            let result = engine::dry_run(&compiled);
+            assert_eq!(result.status, "dry_run", "{name}: dry_run status");
+            let plan = result.plan.unwrap_or_else(|| panic!("{name}: no plan"));
+            assert!(plan.contains(name), "{name}: plan missing workflow name");
+        }
+    }
+
+    #[test]
+    fn agent_chain_uses_dispatch_wait_pattern() {
+        let src = include_str!("../../examples/agents/workflows/chain.json");
+        let spec = load_workflow(src).unwrap();
+        let node = spec.nodes.get("RunFirst").expect("RunFirst node");
+        let ops = &node.on_enter;
+        assert_eq!(
+            ops.len(),
+            2,
+            "RunFirst should have 2 hooks: dispatch + wait"
+        );
+        assert!(matches!(ops[0].op, super::ops::OpKind::McpCall));
+        assert!(matches!(ops[1].op, super::ops::OpKind::McpCall));
+        let dispatch_args = ops[0].args.as_object().expect("dispatch args object");
+        assert_eq!(
+            dispatch_args.get("tool").and_then(|v| v.as_str()),
+            Some("bro_agent_dispatch")
+        );
+        let dispatch_arguments = dispatch_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("bro_agent_dispatch arguments");
+        assert_eq!(
+            dispatch_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("diff-narrator"),
+            "chain first agent should be diff-narrator"
+        );
+        let wait_args = ops[1].args.as_object().expect("wait args object");
+        assert_eq!(
+            wait_args.get("tool").and_then(|v| v.as_str()),
+            Some("bro_wait")
+        );
+        let wait_arguments = wait_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("bro_wait arguments");
+        assert!(
+            wait_arguments.get("task_id").is_some(),
+            "bro_wait should use task_id (snake_case), not taskId"
+        );
+        let run_second = spec.nodes.get("RunSecond").expect("RunSecond node");
+        assert_eq!(
+            run_second.on_enter.len(),
+            2,
+            "RunSecond should dispatch code-reviewer and wait"
+        );
+        let r2_args = run_second.on_enter[0]
+            .args
+            .as_object()
+            .expect("RunSecond dispatch args");
+        let r2_arguments = r2_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("RunSecond dispatch arguments");
+        assert_eq!(
+            r2_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("code-reviewer"),
+            "chain second agent should be code-reviewer"
+        );
+        let r2_agent_args = r2_arguments
+            .get("args")
+            .and_then(|v| v.as_object())
+            .expect("RunSecond agent args");
+        assert!(
+            r2_agent_args
+                .get("diff")
+                .and_then(|v| v.as_str())
+                .is_some_and(|diff| diff.contains("${vars.first_output.result}")),
+            "RunSecond should feed diff-narrator output into code-reviewer prompt input"
+        );
+        assert!(
+            !r2_agent_args.contains_key("context_refs"),
+            "RunSecond should not pass context_refs that code-reviewer does not render"
+        );
+        let r2_wait_args = run_second.on_enter[1]
+            .args
+            .as_object()
+            .expect("RunSecond wait args");
+        let r2_wait_arguments = r2_wait_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("RunSecond wait arguments");
+        assert!(
+            r2_wait_arguments.get("task_id").is_some(),
+            "RunSecond bro_wait should use task_id"
+        );
+        // All on_failure policies should be halt (not warn)
+        for (i, hook) in run_second.on_enter.iter().enumerate() {
+            assert_eq!(
+                hook.on_failure,
+                super::ops::OnFailure::Halt,
+                "RunSecond hook[{i}] should halt on failure"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_fan_out_uses_sequential_dispatch_wait_aggregate() {
+        let src = include_str!("../../examples/agents/workflows/fan-out.json");
+        let spec = load_workflow(src).unwrap();
+        let dispatch_both = spec.nodes.get("DispatchBoth").expect("DispatchBoth node");
+        assert_eq!(
+            dispatch_both.on_enter.len(),
+            2,
+            "DispatchBoth should dispatch two agents"
+        );
+        let left_args = dispatch_both.on_enter[0]
+            .args
+            .as_object()
+            .expect("left dispatch args");
+        let left_arguments = left_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("left dispatch arguments");
+        assert_eq!(
+            left_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("diff-narrator"),
+            "fan-out left should be diff-narrator"
+        );
+        let right_args = dispatch_both.on_enter[1]
+            .args
+            .as_object()
+            .expect("right dispatch args");
+        let right_arguments = right_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("right dispatch arguments");
+        assert_eq!(
+            right_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("code-reviewer"),
+            "fan-out right should be code-reviewer"
+        );
+        let wait_both = spec.nodes.get("WaitBoth").expect("WaitBoth node");
+        assert_eq!(
+            wait_both.on_enter.len(),
+            2,
+            "WaitBoth should wait for two tasks"
+        );
+        let w1_args = wait_both.on_enter[0].args.as_object().expect("wait args");
+        let w1_arguments = w1_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("wait arguments");
+        assert!(
+            w1_arguments.get("task_id").is_some(),
+            "bro_wait should use task_id (snake_case), not taskId"
+        );
+        let agg = spec.nodes.get("Aggregate").expect("Aggregate node");
+        assert!(
+            agg.prompt.as_deref().unwrap_or("").contains("left_output")
+                && agg.prompt.as_deref().unwrap_or("").contains("right_output"),
+            "Aggregate should reference both left_output and right_output"
+        );
+    }
+
+    #[test]
+    fn agent_escalation_uses_gate_branch() {
+        let src = include_str!("../../examples/agents/workflows/escalation.json");
+        let spec = load_workflow(src).unwrap();
+        let cheap = spec.nodes.get("CheapAttempt").expect("CheapAttempt node");
+        assert!(
+            cheap.gate.is_some(),
+            "CheapAttempt should have a gate packet"
+        );
+        assert_eq!(
+            cheap.gate.as_deref(),
+            Some("domain:agents/escalation-judge")
+        );
+        assert_eq!(cheap.on_enter.len(), 2, "should have dispatch + wait hooks");
+        let dispatch_args = cheap.on_enter[0].args.as_object().expect("dispatch args");
+        let dispatch_arguments = dispatch_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("dispatch arguments");
+        assert_eq!(
+            dispatch_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("diff-narrator"),
+            "escalation cheap agent should be diff-narrator"
+        );
+        let wait_args = cheap.on_enter[1].args.as_object().expect("wait args");
+        let wait_arguments = wait_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("wait arguments");
+        assert!(
+            wait_arguments.get("task_id").is_some(),
+            "bro_wait should use task_id (snake_case), not taskId"
+        );
+        match &cheap.next {
+            super::NodeTransition::Branch { cases, default, .. } => {
+                assert!(cases.contains_key("escalate"));
+                assert_eq!(cases.get("escalate").map(String::as_str), Some("Escalate"));
+                assert_eq!(default.as_deref(), Some("Done"));
+            }
+            other => panic!("CheapAttempt next should be Branch, got: {other:?}"),
+        }
+        let escalate = spec.nodes.get("Escalate").expect("Escalate node");
+        assert_eq!(
+            escalate.on_enter.len(),
+            2,
+            "Escalate should dispatch + wait"
+        );
+        let esc_args = escalate.on_enter[0]
+            .args
+            .as_object()
+            .expect("escalate dispatch args");
+        let esc_arguments = esc_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("escalate dispatch arguments");
+        assert_eq!(
+            esc_arguments.get("agent").and_then(|v| v.as_str()),
+            Some("code-reviewer"),
+            "escalation expensive agent should be code-reviewer"
+        );
+        let esc_wait_args = escalate.on_enter[1]
+            .args
+            .as_object()
+            .expect("escalate wait args");
+        let esc_wait_arguments = esc_wait_args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .expect("escalate wait arguments");
+        assert!(
+            esc_wait_arguments.get("task_id").is_some(),
+            "Escalate bro_wait should use task_id"
+        );
+        assert!(
+            spec.vars_schema
+                .as_ref()
+                .is_some_and(|vs| vs.contains_key("expensive_output")),
+            "vars_schema should include expensive_output for completed escalation wait"
+        );
+    }
+
+    #[test]
+    fn agent_escalation_gate_packet_matches_workflow_domain() {
+        let workflow_src = include_str!("../../examples/agents/workflows/escalation.json");
+        let packet_src = include_str!("../../examples/agents/packets/escalation-judge.json");
+        let spec = load_workflow(workflow_src).unwrap();
+        let cheap = spec.nodes.get("CheapAttempt").expect("CheapAttempt node");
+        assert_eq!(
+            cheap.gate.as_deref(),
+            Some("domain:agents/escalation-judge")
+        );
+
+        let params: crate::packets::CompileParams = serde_json::from_str(packet_src).unwrap();
+        assert_eq!(params.domain, "agents/escalation-judge");
+        let tmp = tempfile::tempdir().unwrap();
+        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+        let compile_message = packets.compile(&params).unwrap();
+        let loaded = packets.load("domain:agents/escalation-judge").unwrap();
+        assert!(
+            compile_message.contains(&loaded.id),
+            "compile message should name loaded packet id: {compile_message}"
+        );
+
+        let escalate = crate::packets::apply(
+            &loaded,
+            &serde_json::json!({
+                "vars": {
+                    "cheap_output": {
+                        "result": "confidence-low: missing coverage"
+                    }
+                }
+            }),
+        )
+        .expect("confidence-low should escalate");
+        assert_eq!(escalate.classification, "escalate");
+        assert_eq!(escalate.consequent.to_json(), serde_json::json!("Escalate"));
+
+        let pass = crate::packets::apply(
+            &loaded,
+            &serde_json::json!({
+                "vars": {
+                    "cheap_output": {
+                        "result": "coverage is sufficient"
+                    }
+                }
+            }),
+        )
+        .expect("fallback should pass");
+        assert_eq!(pass.classification, "pass");
+        assert_eq!(pass.consequent.to_json(), serde_json::json!("Done"));
     }
 }

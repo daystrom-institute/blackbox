@@ -645,11 +645,14 @@ Provider selection is determined by the brofile's declared provider
 their brofile_ref; multi-provider agents are a v2 question (see
 §9.2).
 
-Session attribution: the bbox `TaskInner` already carries a
-`bro_label` field. Agent dispatch encodes `bro_label =
-"agent:<name>@v<version>"`; `bro_status` and `bro_dashboard` parse
-this prefix to surface agent attribution. The encoding is the
-mechanical seam — no new metadata field required on TaskInner.
+Session attribution: the bbox `TaskInner` carries `bro_label` for
+routing attribution (`<team>::<member>` or bare brofile name) and
+`agent_label` for agent attribution (`agent:<name>@v<version>`).
+Agent dispatch sets both at construction time. `record_task_to_bro`
+may overwrite `bro_label` for team routing, but `agent_label` is
+immutable after construction. `bro_status` and `bro_dashboard`
+emit both `broLabel` and `agentLabel` so callers can distinguish
+agent-initiated tasks from direct dispatches.
 
 To resume from a stored handle:
 

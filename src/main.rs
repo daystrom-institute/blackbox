@@ -1,4 +1,10 @@
+#[cfg(test)]
+#[path = "../eval/agents/check.rs"]
+mod agent_eval_check;
 mod artifacts;
+#[cfg(test)]
+#[path = "../eval/badgey/check.rs"]
+mod badgey_eval_check;
 mod chunker;
 mod council;
 mod crons;
@@ -41,7 +47,7 @@ mod workflow;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
@@ -167,6 +173,15 @@ struct SharedState {
     /// state. Concurrent resumes on the same provider session race
     /// transcript writes and can fork/corrupt the session.
     resume_leases: Arc<orchestration::resume_lease::ResumeLeaseRegistry>,
+    /// Agent dispatch adapter registry. Initialized before artifact
+    /// catalog opens so AS-I1 validation can check dispatch_adapter
+    /// membership against the live registry.
+    agent_adapter_registry: Arc<RwLock<orchestration::agents::adapter::AgentAdapterRegistry>>,
+    /// Badgey wrapper state. W1 keeps the live badgey_id mapping in
+    /// memory; proposals and action journal are durable under BRO_STORE.
+    badgey_registry: Arc<orchestration::badgey::BadgeyRegistry>,
+    badgey_proposals: Arc<orchestration::badgey::ProposalStore>,
+    badgey_journal: Arc<orchestration::badgey::ActionJournal>,
 }
 
 const SIGNAL_LOG_CAP: usize = 200;
@@ -293,6 +308,8 @@ struct BlackboxServer {
     tool_router: ToolRouter<Self>,
 }
 
+static AGENT_QUERY_EMBED_CACHE: OnceLock<RwLock<BTreeMap<String, Vec<f32>>>> = OnceLock::new();
+
 impl BlackboxServer {
     const MCP_RESPONSE_CAP_BYTES: usize = 80 * 1024;
 
@@ -320,6 +337,154 @@ impl BlackboxServer {
         Ok(())
     }
 
+    fn inspect_extra_properties(
+        &self,
+        r: &crate::entity_ref::EntityRef,
+    ) -> anyhow::Result<Option<BTreeMap<String, String>>> {
+        use crate::entity_ref::EntityRef;
+        match r {
+            EntityRef::Knowledge { id } => Ok(self.state.kb.read().entry(id).map(|entry| {
+                let mut properties = BTreeMap::new();
+                properties.insert("id".into(), entry.id.clone());
+                properties.insert("title".into(), entry.title.clone());
+                properties.insert("content".into(), entry.content.clone());
+                properties.insert("category".into(), format!("{:?}", entry.category));
+                properties.insert("scope".into(), format!("{:?}", entry.scope));
+                properties.insert("status".into(), format!("{:?}", entry.status));
+                properties.insert("approval".into(), format!("{:?}", entry.approval));
+                if let Some(project) = &entry.project {
+                    properties.insert("project".into(), project.clone());
+                }
+                if let Some(supersedes) = &entry.supersedes {
+                    properties.insert("supersedes".into(), supersedes.clone());
+                }
+                properties
+            })),
+            EntityRef::Thread { thread_id } => Ok(self
+                .state
+                .threads
+                .read()
+                .all()
+                .iter()
+                .find(|thread| thread.id == *thread_id)
+                .map(|thread| {
+                    let mut properties = BTreeMap::new();
+                    properties.insert("thread_id".into(), thread.id.clone());
+                    properties.insert("topic".into(), thread.topic.clone());
+                    properties.insert("project".into(), thread.project.clone());
+                    properties.insert("status".into(), format!("{:?}", thread.status));
+                    if let Some(name) = &thread.name {
+                        properties.insert("name".into(), name.clone());
+                    }
+                    properties
+                })),
+            EntityRef::Note { note_id } => Ok(self
+                .state
+                .notes
+                .read()
+                .all()
+                .iter()
+                .find(|note| note.id == *note_id)
+                .map(|note| {
+                    let mut properties = BTreeMap::new();
+                    properties.insert("note_id".into(), note.id.clone());
+                    properties.insert("kind".into(), format!("{:?}", note.kind));
+                    properties.insert("body".into(), note.body.clone());
+                    properties.insert("created_at".into(), note.created_at.clone());
+                    if let Some(task_id) = &note.task_id {
+                        properties.insert("task_id".into(), task_id.clone());
+                    }
+                    if let Some(thread_id) = &note.thread_id {
+                        properties.insert("thread_id".into(), thread_id.clone());
+                    }
+                    properties
+                })),
+            EntityRef::Whiteboard { board_id } => {
+                Ok(self.state.whiteboards.get(board_id).map(|board| {
+                    let board = board.read();
+                    let mut properties = BTreeMap::new();
+                    properties.insert("board_id".into(), board.id.clone());
+                    properties.insert("topic".into(), board.topic.clone());
+                    properties.insert("project".into(), board.project.clone());
+                    properties.insert("phase".into(), format!("{:?}", board.phase));
+                    properties
+                }))
+            }
+            EntityRef::Brofile { name } => {
+                Ok(
+                    orch::brofile::list_brofiles("global", &self.state.store_dir, None)
+                        .into_iter()
+                        .find(|brofile| brofile.name == *name)
+                        .map(|brofile| {
+                            let mut properties = BTreeMap::new();
+                            properties.insert("name".into(), brofile.name);
+                            properties.insert("provider".into(), brofile.provider.as_str().into());
+                            if let Some(model) = brofile.model {
+                                properties.insert("model".into(), model);
+                            }
+                            if let Some(effort) = brofile.effort {
+                                properties.insert("effort".into(), effort);
+                            }
+                            properties
+                        }),
+                )
+            }
+            EntityRef::Agent { name, version } => {
+                let catalog = self.state.artifacts.read();
+                let meta = catalog
+                    .metadata_for(artifacts::ArtifactKind::Agent, name)
+                    .ok()
+                    .flatten();
+                let meta = match meta {
+                    Some(m) if m.active => m,
+                    _ => return Ok(None),
+                };
+                if meta.version != format!("{version}") {
+                    return Ok(None);
+                }
+                let artifact_value = catalog
+                    .load_artifact_value(artifacts::ArtifactKind::Agent, name)
+                    .ok()
+                    .flatten();
+                let mut properties = BTreeMap::new();
+                properties.insert("name".into(), name.clone());
+                properties.insert("version".into(), version.to_string());
+                if let Some(v) = &artifact_value {
+                    let manifest = v.get("manifest").unwrap_or(v);
+                    if let Some(desc) = manifest.get("description").and_then(|d| d.as_str()) {
+                        properties.insert("description".into(), desc.to_string());
+                    }
+                    if let Some(bro) = manifest.get("brofile_ref").and_then(|b| b.as_str()) {
+                        properties.insert("brofile_ref".into(), bro.to_string());
+                    }
+                    if let Some(wtu) = manifest.get("when_to_use").and_then(|w| w.as_array()) {
+                        properties.insert(
+                            "when_to_use".into(),
+                            wtu.iter()
+                                .filter_map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        );
+                    }
+                }
+                Ok(Some(properties))
+            }
+            _ => self.state.idx.read().entity_properties(&r.to_string()),
+        }
+    }
+
+    fn inspect_entity_exists(
+        &self,
+        r: &crate::entity_ref::EntityRef,
+        extra_properties: Option<&BTreeMap<String, String>>,
+    ) -> bool {
+        if extra_properties.is_some() {
+            return true;
+        }
+        let edge_index = self.state.edge_index.read();
+        !edge_index.forward_edges(r).is_empty() || !edge_index.reverse_edges(r).is_empty()
+    }
+
     fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
         let mut counts =
             mcp_tools::inspect::entity_type_count(&self.state.edge_index.read().known_refs());
@@ -328,6 +493,40 @@ impl BlackboxServer {
         counts.insert("note".into(), self.state.notes.read().all().len());
         counts.insert("whiteboard".into(), self.state.whiteboards.list_ids().len());
         counts
+    }
+
+    fn build_agent_schema_entries(&self) -> Vec<mcp_tools::describe_schema::AgentSchemaEntry> {
+        use orchestration::agents::registry::AgentRegistry;
+        let catalog = self.state.artifacts.read();
+        let registry = AgentRegistry::new(&catalog);
+        let filter = orchestration::agents::registry::ListFilter::default();
+        let Ok(summaries) = registry.list(&filter) else {
+            return Vec::new();
+        };
+        summaries
+            .into_iter()
+            .filter(|s| s.active)
+            .filter_map(|s| {
+                let (manifest, _) = registry.load_manifest_degraded(&s.name);
+                let manifest = manifest?;
+                let cost_str = match manifest.cost_class {
+                    orchestration::agents::types::AgentCostClass::Cheap => "cheap",
+                    orchestration::agents::types::AgentCostClass::Normal => "normal",
+                    orchestration::agents::types::AgentCostClass::Expensive => "expensive",
+                };
+                let example = format!("bro_agent_dispatch(agent=\"{}\", args={{...}})", s.name);
+                Some(mcp_tools::describe_schema::AgentSchemaEntry {
+                    name: s.name,
+                    version: s.version,
+                    description: manifest.description,
+                    when_to_use: manifest.when_to_use,
+                    anti_patterns: manifest.anti_patterns,
+                    cost_class: cost_str.to_string(),
+                    dispatch_adapter: manifest.dispatch_adapter,
+                    example_invocation: example,
+                })
+            })
+            .collect()
     }
 
     fn ambient_pin_block(
@@ -440,6 +639,8 @@ impl BlackboxServer {
             store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            None,
+            None,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         if let Some(lease) = resume_lease {
@@ -447,6 +648,1916 @@ impl BlackboxServer {
         }
         self.record_task_to_bro(brofile, &task);
         Ok(task)
+    }
+
+    fn badgey_parse_id(&self, raw: &str) -> Result<orchestration::badgey::types::BadgeyId, String> {
+        raw.parse()
+            .map_err(|e: String| format!("error.bad_input(code=invalid_badgey_id): {e}"))
+    }
+
+    fn badgey_thread_id_from_open_result(&self, result: &str) -> Result<String, String> {
+        let re = regex::Regex::new(r"Thread created: (thread-[0-9a-f]{8})")
+            .map_err(|e| format!("internal regex error: {e}"))?;
+        re.captures(result)
+            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+            .ok_or_else(|| format!("could not parse thread id from bbox_thread result: {result}"))
+    }
+
+    fn badgey_scope_bind(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        thread_id: &str,
+        scope: &orchestration::badgey::types::BadgeyScope,
+    ) -> String {
+        let brief = scope
+            .initial_brief
+            .as_deref()
+            .unwrap_or("general consultation");
+        let recent_proposals = self
+            .state
+            .badgey_proposals
+            .list_by_instance(id)
+            .map(|proposals| {
+                proposals
+                    .into_iter()
+                    .rev()
+                    .take(8)
+                    .map(|p| format!("{}:{:?}:{:?}", p.id, p.kind, p.state))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let queue_status = self
+            .state
+            .badgey_registry
+            .queue_status(id)
+            .ok()
+            .and_then(|status| serde_json::to_string(&status).ok())
+            .unwrap_or_else(|| "unregistered".to_string());
+        let recent_paths = self
+            .state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id))
+            .filter_map(|note| {
+                serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body).ok()
+            })
+            .filter_map(|event| match event {
+                orchestration::badgey::events::ThreadEvent::PathCached { id, summary, .. } => {
+                    Some(format!("{id}:{summary}"))
+                }
+                _ => None,
+            })
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let budget_extensions = self.badgey_budget_extensions(thread_id);
+        let budget_remaining = 50_000 + (budget_extensions * 50_000);
+        format!(
+            "[badgey-scope]\nbadgey_id: {id}\nthread_of_record: {thread_id}\nproject: {project}\ncurrent_time: {current_time}\nbrief: {brief}\nqueue: {queue_status}\nrecent_paths: {recent_paths}\nrecent_proposals: {recent_proposals}\nbudget_remaining: {budget_remaining}\n[/badgey-scope]\n",
+            current_time = util::now_iso(),
+            project = scope.project_id
+        )
+    }
+
+    fn badgey_write_event(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        event: orchestration::badgey::events::ThreadEvent,
+        task_id: Option<String>,
+    ) -> Result<String, String> {
+        let kind = event.note_kind().to_string();
+        let body = serde_json::to_string(&event)
+            .map_err(|e| format!("serializing badgey thread event: {e}"))?;
+        self.state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind,
+                body,
+                task_id,
+                session_id: Some(instance.provider_session_id.clone()),
+                project: Some(instance.scope.project_id.clone()),
+                thread_id: Some(instance.thread_of_record_id.clone()),
+                provider: Some(instance.provider.as_str().to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .map_err(|e| format!("writing badgey thread event: {e:#}"))
+    }
+
+    fn badgey_launch_exec(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        scope: &orchestration::badgey::types::BadgeyScope,
+        thread_id: &str,
+        bro_label: Option<String>,
+    ) -> Result<
+        (
+            Arc<orch::Task>,
+            Provider,
+            String,
+            orchestration::mcp::McpFilters,
+        ),
+        String,
+    > {
+        let store_dir = self.state.store_dir.clone();
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
+            self.resolve_exec_target(Some("badgey-persona"), None, Some(&scope.project_id))?;
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let session_id = "pending".to_string();
+        let scope_bind = self.badgey_scope_bind(id, thread_id, scope);
+        let prompt = format!(
+            "{}\nInitialize this Badgey consultation and answer the initial brief. Keep all durable observations in the thread of record.\n",
+            scope_bind
+        );
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
+            session_id: Some(session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: Some("badgey-persona".to_string()),
+            thread_id: Some(thread_id.to_string()),
+            work_item_id: Some(id.as_str().to_string()),
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                Some("badgey-persona"),
+                Some(session_id.as_str()),
+                Some(thread_id),
+                Some(id.as_str()),
+            ),
+            completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+            allow_recursion: false,
+            provider: Some(provider),
+        };
+        let final_prompt =
+            orch::apply_brofile_lens(&orch::apply_ambient(&prompt, &ambient_ctx), lens.as_deref());
+        let mut args = provider.build_exec_args(
+            &final_prompt,
+            &session_id,
+            cwd.as_deref(),
+            exec_opts.as_ref(),
+        );
+        let filters = brofile_filters.unwrap_or_default();
+        let dispatch_filters =
+            resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, Some(&filters));
+        let effective_filters = dispatch_filters.filters.clone();
+        args.extend(dispatch_filters.args);
+
+        let task = orch::spawn_task(
+            task_id,
+            provider,
+            args,
+            session_id.clone(),
+            cwd,
+            env_overrides,
+            store_dir,
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+            bro_label.clone(),
+            bro_label,
+        );
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        Ok((task, provider, session_id, effective_filters))
+    }
+
+    async fn badgey_wait_for_observed_session_id(
+        &self,
+        task: &Arc<orch::Task>,
+        timeout_seconds: f64,
+    ) -> Result<String, String> {
+        let wait = async {
+            loop {
+                {
+                    let inner = task.inner.lock();
+                    if inner.session_id != "pending" {
+                        return Ok(inner.session_id.clone());
+                    }
+                    if inner.status.is_terminal() {
+                        return Err(format!(
+                            "provider session id was not observed before task reached {:?}",
+                            inner.status
+                        ));
+                    }
+                }
+                tokio::select! {
+                    _ = task.notify.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs_f64(timeout_seconds), wait)
+            .await
+            .map_err(|_| {
+                "provider session id was not observed before Badgey registration timeout"
+                    .to_string()
+            })?
+    }
+
+    async fn badgey_exec_internal(
+        &self,
+        project_dir: Option<String>,
+        brief: Option<String>,
+        bro_label: Option<String>,
+    ) -> Result<Value, String> {
+        let project_id = project_dir
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        let id = orchestration::badgey::types::BadgeyId::new();
+        let scope = orchestration::badgey::types::BadgeyScope {
+            project_id: project_id.clone(),
+            initial_brief: brief.clone(),
+        };
+        let thread_result = self
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".to_string(),
+                name: Some(format!("badgey:{}", id.as_str())),
+                id: None,
+                topic: Some(format!(
+                    "Badgey consultation: {}",
+                    brief.as_deref().unwrap_or("general consultation")
+                )),
+                project: Some(project_id.clone()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: Some("Badgey thread of record".to_string()),
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".to_string()),
+            })
+            .map_err(|e| format!("opening badgey thread of record: {e:#}"))?;
+        let thread_id = self.badgey_thread_id_from_open_result(&thread_result)?;
+        let (task, provider, _initial_session_id, merged_filters) =
+            self.badgey_launch_exec(&id, &scope, &thread_id, bro_label)?;
+        let task_id = task.inner.lock().id.clone();
+        let session_id = match self.badgey_wait_for_observed_session_id(&task, 10.0).await {
+            Ok(session_id) => session_id,
+            Err(err) => {
+                let _ = self.state.notes.write().create(&notes::NoteParams {
+                    kind: "surprise".to_string(),
+                    body: json!({
+                        "event": "badgey_exec_unobserved_session",
+                        "badgey_id": id,
+                        "task_id": task_id,
+                        "reason": err,
+                    })
+                    .to_string(),
+                    task_id: Some(task_id),
+                    session_id: None,
+                    project: Some(project_id),
+                    thread_id: Some(thread_id),
+                    provider: Some(provider.as_str().to_string()),
+                    bro: Some("badgey".to_string()),
+                });
+                return Err(err);
+            }
+        };
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            scope.clone(),
+            provider,
+            session_id.clone(),
+            thread_id.clone(),
+        );
+        self.state
+            .badgey_registry
+            .register(instance.clone())
+            .map_err(|e| e.to_string())?;
+        let _ = self.state.threads.write().thread(&threads::ThreadParams {
+            action: "continue".to_string(),
+            name: None,
+            id: Some(thread_id.clone()),
+            topic: None,
+            project: None,
+            session_id: Some(session_id.clone()),
+            provider: Some(provider.as_str().to_string()),
+            session_name: Some("badgey".to_string()),
+            handoff_doc: None,
+            note: None,
+            target: None,
+            target_type: None,
+            edge: None,
+            promoted_to: None,
+            kind: None,
+        });
+        self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::Exec {
+                brofile_version: "badgey-persona".to_string(),
+                scope,
+                charter: brief.unwrap_or_else(|| "general consultation".to_string()),
+                provider,
+                provider_session_id: session_id.clone(),
+            },
+            Some(task_id.clone()),
+        )?;
+        Ok(json!({
+            "badgey_id": id,
+            "task_id": task_id,
+            "session_id": session_id,
+            "provider": provider,
+            "thread_id": thread_id,
+            "status": "running",
+            "resolved_brofile": "badgey-persona",
+            "merged_filters": merged_filters,
+        }))
+    }
+
+    async fn badgey_resume_internal(
+        &self,
+        badgey_id: &str,
+        prompt: &str,
+        timeout_seconds: Option<f64>,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::commands::{parse_command, WrapperCommand};
+
+        let id = self.badgey_parse_id(badgey_id)?;
+        match parse_command(prompt) {
+            Some(WrapperCommand::Dismiss) => {
+                return self
+                    .badgey_dismiss_internal(badgey_id, Some("wrapper command".to_string()));
+            }
+            Some(WrapperCommand::ApplyProposal(proposal_id)) => {
+                return self
+                    .badgey_apply_proposal_internal(&id, &proposal_id, false)
+                    .await;
+            }
+            Some(WrapperCommand::RetryApply(proposal_id)) => {
+                return self
+                    .badgey_apply_proposal_internal(&id, &proposal_id, true)
+                    .await;
+            }
+            Some(WrapperCommand::RejectProposal(proposal_id)) => {
+                return self.badgey_reject_proposal_internal(&id, &proposal_id);
+            }
+            Some(WrapperCommand::ExpandPath(path_id)) => {
+                let instance = self
+                    .state
+                    .badgey_registry
+                    .get(&id)
+                    .map_err(|e| e.to_string())?;
+                return match self.badgey_cached_path(&instance.thread_of_record_id, &path_id) {
+                    Some(orchestration::badgey::events::ThreadEvent::PathCached {
+                        id,
+                        nodes,
+                        edges,
+                        summary,
+                    }) => Ok(json!({
+                        "badgey_id": instance.id,
+                        "path_id": id,
+                        "status": "found",
+                        "nodes": nodes,
+                        "edges": edges,
+                        "summary": summary,
+                    })),
+                    _ => Ok(json!({
+                        "badgey_id": id,
+                        "path_id": path_id,
+                        "status": "not_found",
+                    })),
+                };
+            }
+            Some(WrapperCommand::BudgetExtend) => {
+                let instance = self
+                    .state
+                    .badgey_registry
+                    .get(&id)
+                    .map_err(|e| e.to_string())?;
+                self.badgey_action_result_note(
+                    &instance,
+                    &uuid::Uuid::new_v4().to_string(),
+                    "budget_extended",
+                    json!({"added_tokens": 50_000}),
+                )?;
+                return Ok(json!({
+                    "badgey_id": id,
+                    "status": "accepted",
+                    "budget": self.badgey_observability(&instance)["budget"].clone(),
+                }));
+            }
+            Some(WrapperCommand::RevertBrofileTo(version)) => {
+                let instance = self
+                    .state
+                    .badgey_registry
+                    .get(&id)
+                    .map_err(|e| e.to_string())?;
+                let proposal = self
+                    .state
+                    .badgey_proposals
+                    .create(
+                        &id,
+                        orchestration::badgey::types::ProposalKind::Brofile,
+                        json!({
+                            "action": "revert_brofile",
+                            "name": "badgey-persona",
+                            "version": version,
+                            "source": format!("artifact:brofile:badgey-persona@{version}"),
+                        }),
+                        Some(format!("revert-brofile:{version}")),
+                    )
+                    .map_err(|e| format!("creating brofile revert proposal: {e}"))?;
+                self.badgey_write_event(
+                    &instance,
+                    orchestration::badgey::events::ThreadEvent::ProposalEmitted {
+                        proposal_id: proposal.id.clone(),
+                        kind: proposal.kind,
+                        draft_ref: format!("badgey-persona@{version}"),
+                        state: proposal.state,
+                    },
+                    None,
+                )?;
+                return Ok(json!({
+                    "badgey_id": id,
+                    "version": version,
+                    "status": "proposal_created",
+                    "proposal_id": proposal.id,
+                }));
+            }
+            Some(WrapperCommand::TrustSubBro(label)) => {
+                let instance = self
+                    .state
+                    .badgey_registry
+                    .get(&id)
+                    .map_err(|e| e.to_string())?;
+                self.badgey_action_result_note(
+                    &instance,
+                    &uuid::Uuid::new_v4().to_string(),
+                    "subbro_trusted",
+                    json!({"label": label}),
+                )?;
+                return Ok(json!({
+                    "badgey_id": id,
+                    "sub_bro": label,
+                    "status": "recorded",
+                }));
+            }
+            None => {}
+        }
+        let instance = self
+            .state
+            .badgey_registry
+            .get(&id)
+            .map_err(|e| e.to_string())?;
+        if !instance.provider.supports_resume() {
+            return Err(format!("{} does not support resume", instance.provider));
+        }
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        self.state
+            .badgey_registry
+            .enqueue_resume(
+                &id,
+                orchestration::badgey::queue::PendingTurn {
+                    turn_id: turn_id.clone(),
+                    prompt: prompt.to_string(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let _permit = self
+            .state
+            .badgey_registry
+            .wait_for_resume_turn(&id, &turn_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let turn_start = util::now_iso();
+        let cwd = instance
+            .provider
+            .resolve_session_cwd(&instance.provider_session_id)
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| Some(instance.scope.project_id.clone()));
+        let (provider, _lens, exec_opts, env_overrides, _resolved_cwd, brofile_filters) =
+            self.resolve_exec_target(Some("badgey-persona"), None, cwd.as_deref())?;
+        let scope_bind =
+            self.badgey_scope_bind(&id, &instance.thread_of_record_id, &instance.scope);
+        let wrapped_user_prompt = format!("{scope_bind}\n{prompt}");
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
+            session_id: Some(instance.provider_session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: Some("badgey-persona".to_string()),
+            thread_id: Some(instance.thread_of_record_id.clone()),
+            work_item_id: Some(id.as_str().to_string()),
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                Some("badgey-persona"),
+                Some(instance.provider_session_id.as_str()),
+                Some(instance.thread_of_record_id.as_str()),
+                Some(id.as_str()),
+            ),
+            completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+            allow_recursion: false,
+            provider: Some(provider),
+        };
+        let final_prompt = orch::apply_ambient(&wrapped_user_prompt, &ambient_ctx);
+        let mut args = provider.build_resume_args(
+            &instance.provider_session_id,
+            &final_prompt,
+            exec_opts.as_ref(),
+        );
+        let dispatch_filters = resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            false,
+            &task_id,
+            brofile_filters.as_ref(),
+        );
+        let effective_filters = dispatch_filters.filters.clone();
+        args.extend(dispatch_filters.args);
+        let task = orch::spawn_task(
+            task_id.clone(),
+            provider,
+            args,
+            instance.provider_session_id.clone(),
+            cwd.clone(),
+            env_overrides,
+            self.state.store_dir.clone(),
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+            Some("badgey".to_string()),
+            Some("agent:badgey@v1".to_string()),
+        );
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        let completed = orch::wait_for_task_with_timeout(&task, timeout_seconds).await;
+        let result = if completed {
+            orch::task_result_json(&task)
+        } else {
+            orch::timeout_snapshot_json(&task)
+        };
+        let action_results = self
+            .badgey_post_process_turn(&instance, &turn_start)
+            .await?;
+        let refs_consumed = self.badgey_refs_consumed_from_result(&result);
+        self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::Turn {
+                turn_id: self.badgey_next_turn_id(&instance.thread_of_record_id),
+                mode: "answer".to_string(),
+                caller: orchestration::badgey::events::CallerRef {
+                    provider,
+                    session_id: instance.provider_session_id.clone(),
+                },
+                question: prompt.to_string(),
+                bundle_summary: result
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed")
+                    .to_string(),
+                refs_consumed,
+                proposals_emitted: action_results
+                    .iter()
+                    .filter_map(|value| {
+                        value
+                            .get("proposal_id")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    })
+                    .collect(),
+            },
+            Some(task_id.clone()),
+        )?;
+        Ok(json!({
+            "badgey_id": id,
+            "task_id": task_id,
+            "session_id": instance.provider_session_id,
+            "provider": provider,
+            "thread_id": instance.thread_of_record_id,
+            "result": result,
+            "actions": action_results,
+            "merged_filters": effective_filters,
+        }))
+    }
+
+    fn badgey_parse_proposal_kind(
+        &self,
+        value: &Value,
+    ) -> Result<orchestration::badgey::types::ProposalKind, String> {
+        let raw = value
+            .as_str()
+            .ok_or_else(|| "proposal kind must be a string".to_string())?;
+        let normalized = match raw.to_ascii_lowercase().replace('-', "_").as_str() {
+            "workflow" => "workflow",
+            "packet" => "packet",
+            "brofile" => "brofile",
+            "lens" => "lens",
+            "agent" => "agent",
+            "redispatch" | "re_dispatch" | "redispatch_task" => "redispatch_task",
+            "artifact_promotion" => "artifact_promotion",
+            other => return Err(format!("unknown proposal kind: {other}")),
+        };
+        serde_json::from_value(Value::String(normalized.to_string()))
+            .map_err(|e| format!("invalid proposal kind {raw}: {e}"))
+    }
+
+    fn badgey_artifact_kind_for_proposal(
+        &self,
+        kind: orchestration::badgey::types::ProposalKind,
+    ) -> Option<artifacts::ArtifactKind> {
+        use orchestration::badgey::types::ProposalKind;
+        match kind {
+            ProposalKind::Workflow => Some(artifacts::ArtifactKind::Workflow),
+            ProposalKind::Packet => Some(artifacts::ArtifactKind::Packet),
+            ProposalKind::Brofile | ProposalKind::Lens => Some(artifacts::ArtifactKind::Brofile),
+            ProposalKind::Agent => Some(artifacts::ArtifactKind::Agent),
+            ProposalKind::ArtifactPromotion | ProposalKind::RedispatchTask => None,
+        }
+    }
+
+    fn badgey_action_result_note(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        action_id: &str,
+        event: &str,
+        payload: Value,
+    ) -> Result<String, String> {
+        let mut body = serde_json::Map::new();
+        body.insert("event".to_string(), Value::String(event.to_string()));
+        body.insert(
+            "action_id".to_string(),
+            Value::String(action_id.to_string()),
+        );
+        body.insert("payload".to_string(), payload);
+        self.state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "learned".to_string(),
+                body: Value::Object(body).to_string(),
+                task_id: None,
+                session_id: Some(instance.provider_session_id.clone()),
+                project: Some(instance.scope.project_id.clone()),
+                thread_id: Some(instance.thread_of_record_id.clone()),
+                provider: Some(instance.provider.as_str().to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .map_err(|e| format!("writing badgey action result note: {e:#}"))
+    }
+
+    fn badgey_next_turn_id(&self, thread_id: &str) -> u64 {
+        self.state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id))
+            .filter_map(|note| {
+                serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body).ok()
+            })
+            .filter(|event| {
+                matches!(
+                    event,
+                    orchestration::badgey::events::ThreadEvent::Turn { .. }
+                )
+            })
+            .count() as u64
+            + 1
+    }
+
+    fn badgey_cached_path(
+        &self,
+        thread_id: &str,
+        path_id: &str,
+    ) -> Option<orchestration::badgey::events::ThreadEvent> {
+        self.state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id))
+            .filter_map(|note| {
+                serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body).ok()
+            })
+            .rev()
+            .find(|event| {
+                matches!(
+                    event,
+                    orchestration::badgey::events::ThreadEvent::PathCached { id, .. }
+                        if id == path_id
+                )
+            })
+    }
+
+    fn badgey_budget_extensions(&self, thread_id: &str) -> u64 {
+        self.state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id))
+            .filter_map(|note| serde_json::from_str::<Value>(&note.body).ok())
+            .filter(|body| body.get("event").and_then(Value::as_str) == Some("budget_extended"))
+            .count() as u64
+    }
+
+    fn badgey_observability(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+    ) -> Value {
+        let mut turns = 0u64;
+        let mut paths = 0u64;
+        let mut scouts = 0u64;
+        for note in self.state.notes.read().all() {
+            if note.thread_id.as_deref() != Some(instance.thread_of_record_id.as_str()) {
+                continue;
+            }
+            if let Ok(event) =
+                serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body)
+            {
+                match event {
+                    orchestration::badgey::events::ThreadEvent::Turn { .. } => turns += 1,
+                    orchestration::badgey::events::ThreadEvent::PathCached { .. } => paths += 1,
+                    orchestration::badgey::events::ThreadEvent::SubbroSpawned { .. } => scouts += 1,
+                    _ => {}
+                }
+            }
+        }
+        let proposals = self
+            .state
+            .badgey_proposals
+            .list_by_instance(&instance.id)
+            .unwrap_or_default();
+        let applied = proposals
+            .iter()
+            .filter(|proposal| {
+                proposal.state == orchestration::badgey::types::ProposalState::Applied
+            })
+            .count() as u64;
+        let rejected = proposals
+            .iter()
+            .filter(|proposal| {
+                proposal.state == orchestration::badgey::types::ProposalState::Failed
+            })
+            .count() as u64;
+        let total_decided = applied + rejected;
+        let accept_rate = if total_decided == 0 {
+            None
+        } else {
+            Some(applied as f64 / total_decided as f64)
+        };
+        let budget_extensions = self.badgey_budget_extensions(&instance.thread_of_record_id);
+        json!({
+            "turns": turns,
+            "cached_paths": paths,
+            "sub_bros": scouts,
+            "proposals_total": proposals.len(),
+            "proposals_applied": applied,
+            "proposals_rejected": rejected,
+            "accept_rate": accept_rate,
+            "budget": {
+                "base_tokens": 50_000,
+                "extension_count": budget_extensions,
+                "remaining": 50_000 + (budget_extensions * 50_000),
+            },
+            "learning_loop": {
+                "eligible": total_decided >= 5 && accept_rate.unwrap_or(0.0) >= 0.6,
+                "reason": "lens proposals remain user-gated; eligibility surfaces for Badgey to draft a brofile/lens proposal"
+            }
+        })
+    }
+
+    fn badgey_refs_consumed_from_result(&self, result: &Value) -> Vec<String> {
+        fn collect_strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+            match value {
+                Value::String(text) => out.push(text),
+                Value::Array(items) => {
+                    for item in items {
+                        collect_strings(item, out);
+                    }
+                }
+                Value::Object(map) => {
+                    for value in map.values() {
+                        collect_strings(value, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut refs = Vec::new();
+        let mut strings = Vec::new();
+        collect_strings(result, &mut strings);
+        for text in strings {
+            for raw in
+                text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ')' | '(' | '[' | ']'))
+            {
+                let token = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | '.' | ';' | ':'));
+                if token.starts_with("knowledge:")
+                    || token.starts_with("agent:")
+                    || token.starts_with("decision:")
+                    || token.starts_with("session:")
+                    || token.starts_with("transcript:")
+                    || token.starts_with("project_file:")
+                    || token.starts_with("symbol:")
+                    || token.starts_with("brofile:")
+                    || token.starts_with("whiteboard:")
+                    || token.starts_with("commit:")
+                    || token.starts_with("task:")
+                    || token.starts_with("bash_call:")
+                    || token.starts_with("domain:")
+                    || token.starts_with("artifact:")
+                    || token.starts_with("entity:")
+                    || token.starts_with("thread-")
+                    || token.starts_with("task-")
+                    || token.starts_with("note-")
+                {
+                    let candidate = token.to_string();
+                    if !refs.contains(&candidate) {
+                        refs.push(candidate);
+                    }
+                }
+                if refs.len() >= 20 {
+                    return refs;
+                }
+            }
+        }
+        refs
+    }
+
+    fn badgey_existing_audit_decision_id(
+        &self,
+        badgey_id: &str,
+        proposal_id: &str,
+    ) -> Option<String> {
+        let needle = format!("Badgey proposal {proposal_id} for {badgey_id} was applied.");
+        self.state
+            .kb
+            .read()
+            .all_entries()
+            .iter()
+            .find(|entry| entry.content == needle)
+            .map(|entry| entry.id.clone())
+    }
+
+    async fn badgey_post_process_turn(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        turn_start_iso: &str,
+    ) -> Result<Vec<Value>, String> {
+        let action_bodies: Vec<Value> = {
+            let notes = self.state.notes.read();
+            notes
+                .all()
+                .iter()
+                .filter(|note| {
+                    note.thread_id.as_deref() == Some(instance.thread_of_record_id.as_str())
+                })
+                .filter(|note| note.created_at.as_str() >= turn_start_iso)
+                .filter_map(|note| serde_json::from_str::<Value>(&note.body).ok())
+                .filter(|body| {
+                    body.get("event")
+                        .and_then(Value::as_str)
+                        .is_some_and(|event| {
+                            matches!(
+                                event,
+                                "bg-action-spawn-subbro"
+                                    | "bg-action-emit-proposal"
+                                    | "bg-action-escalate-dispute"
+                                    | "bg-action-extend-budget"
+                            )
+                        })
+                })
+                .collect()
+        };
+        let mut results = Vec::new();
+        for body in action_bodies {
+            match self.badgey_process_action(instance, body.clone()).await {
+                Ok(result) => results.push(result),
+                Err(reason) => results.push(self.badgey_fail_action_body(instance, body, reason)?),
+            }
+        }
+        Ok(results)
+    }
+
+    fn badgey_fail_action_body(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        body: Value,
+        reason: String,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::{ActionId, ActionJournalState};
+
+        let event = body
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or("bg-action-invalid")
+            .to_string();
+        let action_id_raw = body
+            .get("action_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{event} failed without action_id: {reason}"))?
+            .to_string();
+        let action_id: ActionId = action_id_raw.parse().map_err(|e| {
+            format!("invalid action_id {action_id_raw}: {e}; original error: {reason}")
+        })?;
+        let entry = self
+            .state
+            .badgey_journal
+            .record_seen(action_id.clone(), event.clone(), body)
+            .map_err(|e| format!("recording failed action journal: {e}"))?;
+        if !entry.state.is_terminal() {
+            let _ = self.state.badgey_journal.transition(
+                &action_id,
+                ActionJournalState::Seen,
+                ActionJournalState::Failed {
+                    reason: reason.clone(),
+                },
+                Some("action failed validation or dispatch".to_string()),
+            );
+        }
+        let payload = json!({"reason": reason});
+        self.badgey_action_result_note(
+            instance,
+            &action_id_raw,
+            "bg-action-failed",
+            payload.clone(),
+        )?;
+        Ok(json!({
+            "action_id": action_id_raw,
+            "event": event,
+            "status": "failed",
+            "payload": payload,
+        }))
+    }
+
+    async fn badgey_process_action(
+        &self,
+        instance: &orchestration::badgey::registry::BadgeyInstance,
+        body: Value,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::{ActionId, ActionJournalState};
+
+        let event = body
+            .get("event")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "badgey action missing event".to_string())?
+            .to_string();
+        let action_id_raw = body
+            .get("action_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{event} missing action_id"))?;
+        let action_id: ActionId = action_id_raw
+            .parse()
+            .map_err(|e| format!("invalid action_id {action_id_raw}: {e}"))?;
+        let entry = self
+            .state
+            .badgey_journal
+            .record_seen(action_id.clone(), event.clone(), body.clone())
+            .map_err(|e| format!("recording action journal: {e}"))?;
+        if entry.state.is_terminal() {
+            return Ok(json!({
+                "action_id": action_id_raw,
+                "event": event,
+                "status": "already_terminal",
+                "state": entry.state,
+            }));
+        }
+        if let ActionJournalState::Dispatching { task_id } = &entry.state {
+            if let Some(task) = self.state.task_store.read().get(task_id) {
+                let status = task.inner.lock().status;
+                if status.is_terminal() {
+                    let terminal_state = if status == orch::TaskStatus::Completed {
+                        ActionJournalState::Completed {
+                            result_ref: format!("task:{task_id}"),
+                        }
+                    } else {
+                        ActionJournalState::Failed {
+                            reason: format!("task {task_id} ended with {status:?}"),
+                        }
+                    };
+                    let _ = self.state.badgey_journal.transition(
+                        &action_id,
+                        entry.state.clone(),
+                        terminal_state,
+                        Some("reconciled existing dispatch".to_string()),
+                    );
+                }
+            }
+            return Ok(json!({
+                "action_id": action_id_raw,
+                "event": event,
+                "status": "dispatching",
+                "task_id": task_id,
+            }));
+        }
+
+        let mut completion_from = ActionJournalState::Seen;
+        let dispatch_result = match event.as_str() {
+            "bg-action-emit-proposal" => {
+                let kind_value = body
+                    .get("kind")
+                    .ok_or_else(|| "bg-action-emit-proposal missing kind".to_string())?;
+                let kind = self.badgey_parse_proposal_kind(kind_value)?;
+                let idempotency_key = body
+                    .get("idempotency_key")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| {
+                        (kind == orchestration::badgey::types::ProposalKind::RedispatchTask)
+                            .then(|| uuid::Uuid::new_v4().to_string())
+                    });
+                let mut draft = body
+                    .get("draft")
+                    .or_else(|| body.get("proposal"))
+                    .cloned()
+                    .ok_or_else(|| "bg-action-emit-proposal missing draft".to_string())?;
+                if kind == orchestration::badgey::types::ProposalKind::RedispatchTask
+                    && draft.get("task_id").is_none()
+                {
+                    if let Some(map) = draft.as_object_mut() {
+                        map.insert(
+                            "task_id".to_string(),
+                            Value::String(uuid::Uuid::new_v4().to_string()),
+                        );
+                    }
+                }
+                let proposal = self
+                    .state
+                    .badgey_proposals
+                    .create(&instance.id, kind, draft.clone(), idempotency_key)
+                    .map_err(|e| format!("creating badgey proposal: {e}"))?;
+                self.badgey_write_event(
+                    instance,
+                    orchestration::badgey::events::ThreadEvent::ProposalEmitted {
+                        proposal_id: proposal.id.clone(),
+                        kind,
+                        draft_ref: draft
+                            .get("source")
+                            .or_else(|| draft.get("draft_path"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("inline-draft")
+                            .to_string(),
+                        state: proposal.state,
+                    },
+                    None,
+                )?;
+                json!({
+                    "proposal_id": proposal.id,
+                    "kind": kind,
+                    "state": proposal.state,
+                })
+            }
+            "bg-action-spawn-subbro" => {
+                let charter = body
+                    .get("charter")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "bg-action-spawn-subbro missing charter".to_string())?;
+                let task_id = uuid::Uuid::new_v4().to_string();
+                let dispatching = ActionJournalState::Dispatching {
+                    task_id: task_id.clone(),
+                };
+                self.state
+                    .badgey_journal
+                    .transition(
+                        &action_id,
+                        ActionJournalState::Seen,
+                        dispatching.clone(),
+                        Some("privileged sub-bro dispatch reserved".to_string()),
+                    )
+                    .map_err(|e| format!("marking action dispatching: {e}"))?;
+                completion_from = dispatching.clone();
+                if let Err(err) = self.badgey_spawn_privileged_task(
+                    &task_id,
+                    "badgey-scout-persona",
+                    charter,
+                    &instance.scope.project_id,
+                    Some(instance.thread_of_record_id.as_str()),
+                    Some(instance.id.as_str()),
+                    Some("badgey-scout".to_string()),
+                ) {
+                    let _ = self.state.badgey_journal.transition(
+                        &action_id,
+                        dispatching,
+                        ActionJournalState::Failed {
+                            reason: err.clone(),
+                        },
+                        Some("privileged sub-bro dispatch failed".to_string()),
+                    );
+                    return Err(err);
+                }
+                self.badgey_write_event(
+                    instance,
+                    orchestration::badgey::events::ThreadEvent::SubbroSpawned {
+                        task_id: task_id.clone(),
+                        scout_id: body
+                            .get("scout_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("scout")
+                            .to_string(),
+                        charter: charter.to_string(),
+                    },
+                    Some(task_id.clone()),
+                )?;
+                json!({"task_id": task_id})
+            }
+            "bg-action-escalate-dispute" => {
+                self.badgey_write_event(
+                    instance,
+                    orchestration::badgey::events::ThreadEvent::DisputeEscalated {
+                        subbro_results: body
+                            .get("subbro_results")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default(),
+                    },
+                    None,
+                )?;
+                json!({"dispute": "escalated"})
+            }
+            "bg-action-extend-budget" => {
+                json!({"budget": "extended_advisory"})
+            }
+            _ => return Err(format!("unknown badgey action event: {event}")),
+        };
+
+        self.state
+            .badgey_journal
+            .transition(
+                &action_id,
+                completion_from,
+                ActionJournalState::Completed {
+                    result_ref: dispatch_result.to_string(),
+                },
+                Some("action completed".to_string()),
+            )
+            .map_err(|e| format!("completing action journal: {e}"))?;
+        self.badgey_action_result_note(
+            instance,
+            action_id_raw,
+            "bg-action-completed",
+            dispatch_result.clone(),
+        )?;
+        let mut result = dispatch_result;
+        result["action_id"] = Value::String(action_id_raw.to_string());
+        result["event"] = Value::String(event);
+        result["status"] = Value::String("completed".to_string());
+        Ok(result)
+    }
+
+    fn badgey_spawn_privileged_task(
+        &self,
+        task_id: &str,
+        brofile: &str,
+        prompt: &str,
+        project_dir: &str,
+        thread_id: Option<&str>,
+        work_item_id: Option<&str>,
+        label: Option<String>,
+    ) -> Result<Arc<orch::Task>, String> {
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
+            self.resolve_exec_target(Some(brofile), None, Some(project_dir))?;
+        let session_id = "pending".to_string();
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.to_string()),
+            session_id: Some(session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: Some(brofile.to_string()),
+            thread_id: thread_id.map(String::from),
+            work_item_id: work_item_id.map(String::from),
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                Some(brofile),
+                Some(session_id.as_str()),
+                thread_id,
+                work_item_id,
+            ),
+            completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+            allow_recursion: false,
+            provider: Some(provider),
+        };
+        let final_prompt =
+            orch::apply_brofile_lens(&orch::apply_ambient(prompt, &ambient_ctx), lens.as_deref());
+        let mut args = provider.build_exec_args(
+            &final_prompt,
+            &session_id,
+            cwd.as_deref(),
+            exec_opts.as_ref(),
+        );
+        let dispatch_filters = resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            false,
+            task_id,
+            brofile_filters.as_ref(),
+        );
+        args.extend(dispatch_filters.args);
+        let task = orch::spawn_with_pre_minted_id(
+            task_id.to_string(),
+            orch::SpawnTaskParams {
+                provider,
+                args,
+                session_id,
+                cwd,
+                env_overrides,
+                store_dir: self.state.store_dir.clone(),
+                task_store: self.state.task_store.clone(),
+                tail_tx: self.state.tail_tx.clone(),
+                bro_label: label.clone(),
+                agent_label: label,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        Ok(task)
+    }
+
+    async fn badgey_apply_proposal_internal(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        proposal_id: &str,
+        retry_failed: bool,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::{ProposalKind, ProposalState};
+
+        let instance = self
+            .state
+            .badgey_registry
+            .get(id)
+            .map_err(|e| e.to_string())?;
+        let proposal = self
+            .state
+            .badgey_proposals
+            .get(id, proposal_id)
+            .map_err(|e| format!("reading proposal: {e}"))?
+            .ok_or_else(|| format!("error.not_found: proposal {proposal_id}"))?;
+        match proposal.state {
+            ProposalState::Applied => {
+                return Ok(json!({
+                    "badgey_id": id,
+                    "proposal_id": proposal_id,
+                    "already_applied": true,
+                    "prior_task_id": proposal.applied_task_id,
+                }));
+            }
+            ProposalState::Applying => {
+                return Err("error.bad_input(code=already_in_progress)".to_string());
+            }
+            ProposalState::Failed if !retry_failed => {
+                return Err(format!(
+                    "error.bad_input(code=proposal_failed): retry with `retry apply {proposal_id}`"
+                ));
+            }
+            ProposalState::Pending | ProposalState::Failed => {}
+        }
+        let from = proposal.state;
+        let applying = self
+            .state
+            .badgey_proposals
+            .transition(
+                id,
+                proposal_id,
+                from,
+                ProposalState::Applying,
+                Some(if retry_failed {
+                    "retry apply requested".to_string()
+                } else {
+                    "apply requested".to_string()
+                }),
+            )
+            .map_err(|e| format!("transitioning proposal to applying: {e}"))?;
+
+        let apply_result = async {
+            if let Some(kind) = self.badgey_artifact_kind_for_proposal(applying.kind) {
+                let source = applying
+                    .draft
+                    .get("source")
+                    .or_else(|| applying.draft.get("draft_path"))
+                    .or_else(|| applying.draft.get("path"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "artifact proposal draft missing source/draft_path".to_string()
+                    })?;
+                let metadata = install_artifact_from_params(
+                    &self.state,
+                    ArtifactInstallParams {
+                        kind,
+                        source: source.to_string(),
+                        name: applying
+                            .draft
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        version: applying
+                            .draft
+                            .get("version")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        supersedes: applying
+                            .draft
+                            .get("supersedes")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                    },
+                )
+                .await
+                .map_err(|e| format!("installing artifact proposal: {e:#}"))?;
+                Ok(json!({
+                    "artifact_ref": format!("{:?}:{}@{}", kind, metadata.name, metadata.version),
+                    "metadata": metadata,
+                }))
+            } else if applying.kind == ProposalKind::RedispatchTask {
+                let prompt = applying
+                    .draft
+                    .get("prompt")
+                    .or_else(|| applying.draft.get("refined_charter"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "redispatch proposal missing prompt/refined_charter".to_string()
+                    })?;
+                if applying.idempotency_key.is_none() {
+                    return Err("redispatch proposal missing idempotency_key".to_string());
+                }
+                let task_id = applying
+                    .applied_task_id
+                    .clone()
+                    .or_else(|| {
+                        applying
+                            .draft
+                            .get("task_id")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    })
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                self.state
+                    .badgey_proposals
+                    .set_applied_task_id(id, proposal_id, task_id.clone())
+                    .map_err(|e| format!("recording redispatch task id: {e}"))?;
+                self.badgey_spawn_privileged_task(
+                    &task_id,
+                    "badgey-persona",
+                    prompt,
+                    &instance.scope.project_id,
+                    Some(instance.thread_of_record_id.as_str()),
+                    Some(id.as_str()),
+                    Some("badgey-redispatch".to_string()),
+                )?;
+                Ok(json!({"task_id": task_id}))
+            } else {
+                let kind = applying
+                    .draft
+                    .get("artifact_kind")
+                    .or_else(|| applying.draft.get("kind"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "artifact promotion draft missing artifact_kind".to_string())
+                    .and_then(|raw| match raw {
+                        "workflow" => Ok(artifacts::ArtifactKind::Workflow),
+                        "packet" => Ok(artifacts::ArtifactKind::Packet),
+                        "brofile" => Ok(artifacts::ArtifactKind::Brofile),
+                        "agent" => Ok(artifacts::ArtifactKind::Agent),
+                        other => Err(format!("unknown artifact promotion kind: {other}")),
+                    })?;
+                let source = applying
+                    .draft
+                    .get("source")
+                    .or_else(|| applying.draft.get("draft_path"))
+                    .or_else(|| applying.draft.get("path"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "artifact promotion draft missing source/draft_path".to_string()
+                    })?;
+                let metadata = install_artifact_from_params(
+                    &self.state,
+                    ArtifactInstallParams {
+                        kind,
+                        source: source.to_string(),
+                        name: applying
+                            .draft
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        version: applying
+                            .draft
+                            .get("version")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        supersedes: applying
+                            .draft
+                            .get("supersedes")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                    },
+                )
+                .await
+                .map_err(|e| format!("promoting artifact proposal: {e:#}"))?;
+                Ok(json!({
+                    "artifact_ref": format!("{:?}:{}@{}", kind, metadata.name, metadata.version),
+                    "metadata": metadata,
+                }))
+            }
+        }
+        .await;
+
+        match apply_result {
+            Ok(outcome) => {
+                let applied = self
+                    .state
+                    .badgey_proposals
+                    .transition(
+                        id,
+                        proposal_id,
+                        ProposalState::Applying,
+                        ProposalState::Applied,
+                        Some(outcome.to_string()),
+                    )
+                    .map_err(|e| format!("transitioning proposal to applied: {e}"))?;
+                let decide_id = if let Some(existing) =
+                    self.badgey_existing_audit_decision_id(id.as_str(), proposal_id)
+                {
+                    existing
+                } else {
+                    self.state
+                        .kb
+                        .write()
+                        .decide_result(
+                            &knowledge::DecideParams {
+                                content: format!(
+                                    "Badgey proposal {proposal_id} for {id} was applied."
+                                ),
+                                rationale: format!("User approved Badgey proposal {proposal_id}."),
+                                supersedes: applying
+                                    .draft
+                                    .get("audit_supersedes")
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                                title: Some(format!("Badgey proposal {proposal_id} applied")),
+                                scope: Some("project".to_string()),
+                                project: Some(instance.scope.project_id.clone()),
+                                priority: Some("standard".to_string()),
+                                render: Some(false),
+                            },
+                            false,
+                        )
+                        .map_err(|e| format!("writing proposal audit decision: {e:#}"))?
+                        .id
+                };
+                let artifact_ref = outcome
+                    .get("artifact_ref")
+                    .and_then(Value::as_str)
+                    .unwrap_or("task")
+                    .to_string();
+                self.badgey_write_event(
+                    &instance,
+                    orchestration::badgey::events::ThreadEvent::ProposalApplied {
+                        proposal_id: proposal_id.to_string(),
+                        artifact_ref,
+                        decide_id: decide_id.clone(),
+                    },
+                    applied.applied_task_id.clone(),
+                )?;
+                Ok(json!({
+                    "badgey_id": id,
+                    "proposal_id": proposal_id,
+                    "status": "applied",
+                    "proposal": applied,
+                    "outcome": outcome,
+                    "decide_id": decide_id,
+                }))
+            }
+            Err(err) => {
+                let _ = self.state.badgey_proposals.transition(
+                    id,
+                    proposal_id,
+                    ProposalState::Applying,
+                    ProposalState::Failed,
+                    Some(err.clone()),
+                );
+                Err(err)
+            }
+        }
+    }
+
+    fn badgey_reject_proposal_internal(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        proposal_id: &str,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::ProposalState;
+
+        let instance = self
+            .state
+            .badgey_registry
+            .get(id)
+            .map_err(|e| e.to_string())?;
+        let current = self
+            .state
+            .badgey_proposals
+            .get(id, proposal_id)
+            .map_err(|e| format!("reading proposal: {e}"))?
+            .ok_or_else(|| format!("error.not_found: proposal {proposal_id}"))?;
+        if current.state == ProposalState::Applied {
+            return Err("error.bad_input(code=already_applied)".to_string());
+        }
+        if current.state == ProposalState::Failed {
+            return Ok(json!({
+                "badgey_id": id,
+                "proposal_id": proposal_id,
+                "status": "already_rejected",
+            }));
+        }
+        let rejected = self
+            .state
+            .badgey_proposals
+            .transition(
+                id,
+                proposal_id,
+                current.state,
+                ProposalState::Failed,
+                Some("rejected by user".to_string()),
+            )
+            .map_err(|e| format!("rejecting proposal: {e}"))?;
+        self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::ProposalRejected {
+                proposal_id: proposal_id.to_string(),
+                reason: "rejected by user".to_string(),
+            },
+            None,
+        )?;
+        Ok(json!({
+            "badgey_id": id,
+            "proposal_id": proposal_id,
+            "status": "rejected",
+            "proposal": rejected,
+        }))
+    }
+
+    fn badgey_dismiss_internal(
+        &self,
+        badgey_id: &str,
+        reason: Option<String>,
+    ) -> Result<Value, String> {
+        let id = self.badgey_parse_id(badgey_id)?;
+        let instance = self
+            .state
+            .badgey_registry
+            .dismiss(&id)
+            .map_err(|e| e.to_string())?;
+        let reason = reason.unwrap_or_else(|| "dismissed by caller".to_string());
+        self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::Dismiss {
+                reason: reason.clone(),
+                summary: "Badgey instance dismissed; pending resume queue drained.".to_string(),
+            },
+            None,
+        )?;
+        let _ = self.state.threads.write().thread(&threads::ThreadParams {
+            action: "resolve".to_string(),
+            name: None,
+            id: Some(instance.thread_of_record_id.clone()),
+            topic: None,
+            project: None,
+            session_id: None,
+            provider: None,
+            session_name: None,
+            handoff_doc: None,
+            note: Some(reason),
+            target: None,
+            target_type: None,
+            edge: None,
+            promoted_to: None,
+            kind: None,
+        });
+        Ok(json!({
+            "badgey_id": id,
+            "status": "dismissed",
+            "thread_id": instance.thread_of_record_id,
+        }))
+    }
+
+    fn badgey_status_internal(&self, badgey_id: Option<&str>) -> Result<Value, String> {
+        if let Some(raw) = badgey_id {
+            let id = self.badgey_parse_id(raw)?;
+            let instance = self
+                .state
+                .badgey_registry
+                .get_including_dismissed(&id)
+                .map_err(|e| e.to_string())?;
+            let queue = self
+                .state
+                .badgey_registry
+                .queue_status(&id)
+                .map_err(|e| e.to_string())?;
+            let proposals = self
+                .state
+                .badgey_proposals
+                .list_by_instance(&id)
+                .map_err(|e| format!("listing proposals: {e:#}"))?;
+            return Ok(json!({
+                "instance": instance,
+                "queue": queue,
+                "proposals": proposals,
+                "observability": self.badgey_observability(&instance),
+            }));
+        }
+        self.badgey_list_internal(false)
+    }
+
+    fn badgey_list_internal(&self, include_dismissed: bool) -> Result<Value, String> {
+        let instances: Vec<_> = self
+            .state
+            .badgey_registry
+            .list()
+            .into_iter()
+            .filter(|instance| include_dismissed || !instance.is_dismissed())
+            .map(|instance| {
+                let queue = self.state.badgey_registry.queue_status(&instance.id).ok();
+                json!({
+                    "id": instance.id,
+                    "scope": instance.scope,
+                    "provider": instance.provider,
+                    "session_id": instance.provider_session_id,
+                    "thread_id": instance.thread_of_record_id,
+                    "dismissed": instance.is_dismissed(),
+                    "queue": queue,
+                })
+            })
+            .collect();
+        Ok(json!({ "instances": instances }))
+    }
+
+    fn badgey_collect_internal(
+        &self,
+        scout_id: Option<&str>,
+        badgey_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let instance = if let Some(raw) = badgey_id {
+            let id = self.badgey_parse_id(raw)?;
+            Some(
+                self.state
+                    .badgey_registry
+                    .get_including_dismissed(&id)
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        let thread_filter = instance.as_ref().map(|i| i.thread_of_record_id.as_str());
+        let matching_notes: Vec<_> = self
+            .state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| thread_filter.is_none() || note.thread_id.as_deref() == thread_filter)
+            .filter(|note| {
+                let body = serde_json::from_str::<Value>(&note.body).ok();
+                let event = body
+                    .as_ref()
+                    .and_then(|body| body.get("event"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                note.kind == notes::NoteKind::Done
+                    || matches!(
+                        event,
+                        "scout_dispatched" | "subbro_spawned" | "scout_done" | "subbro_done"
+                    )
+                    || event.starts_with("bg-action-spawn-subbro")
+            })
+            .filter(|note| {
+                let body = serde_json::from_str::<Value>(&note.body).unwrap_or_else(
+                    |_| json!({"kind": note.kind.clone(), "body": note.body.clone()}),
+                );
+                scout_id.is_none()
+                    || body.get("scout_id").and_then(Value::as_str) == scout_id
+                    || body
+                        .get("payload")
+                        .and_then(|p| p.get("scout_id"))
+                        .and_then(Value::as_str)
+                        == scout_id
+            })
+            .cloned()
+            .collect();
+        let events: Vec<Value> = matching_notes
+            .iter()
+            .map(|note| {
+                serde_json::from_str::<Value>(&note.body).unwrap_or_else(
+                    |_| json!({"kind": note.kind.clone(), "body": note.body.clone()}),
+                )
+            })
+            .collect();
+        let explicit_aggregate_done = matching_notes.iter().any(|note| {
+            serde_json::from_str::<Value>(&note.body)
+                .ok()
+                .and_then(|body| {
+                    body.get("event")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|event| matches!(event.as_str(), "scout_done" | "subbro_done"))
+        });
+        let spawned_task_ids: std::collections::HashSet<String> = events
+            .iter()
+            .filter(|body| body.get("event").and_then(Value::as_str) == Some("subbro_spawned"))
+            .filter_map(|body| {
+                body.get("task_id")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .collect();
+        let done_task_ids: std::collections::HashSet<String> = matching_notes
+            .iter()
+            .filter(|note| note.kind == notes::NoteKind::Done)
+            .filter_map(|note| note.task_id.clone())
+            .collect();
+        let done = explicit_aggregate_done
+            || (!spawned_task_ids.is_empty()
+                && spawned_task_ids
+                    .iter()
+                    .all(|task_id| done_task_ids.contains(task_id)))
+            || (spawned_task_ids.is_empty()
+                && matching_notes
+                    .iter()
+                    .any(|note| note.kind == notes::NoteKind::Done));
+        Ok(json!({
+            "status": if done { "done" } else { "still_walking" },
+            "scout_id": scout_id,
+            "badgey_id": badgey_id,
+            "events": events,
+        }))
+    }
+
+    fn badgey_triage_inbox_internal(
+        &self,
+        scope: Option<String>,
+        since: Option<String>,
+        badgey_id: Option<String>,
+    ) -> Result<Value, String> {
+        let project = scope
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        let stale_threads: Vec<Value> = self
+            .state
+            .threads
+            .read()
+            .all()
+            .iter()
+            .filter(|thread| project.is_empty() || thread.project == project)
+            .filter(|thread| {
+                since
+                    .as_deref()
+                    .is_none_or(|since| thread.last_activity.as_str() >= since)
+            })
+            .filter(|thread| !matches!(thread.status, threads::ThreadStatus::Resolved))
+            .take(20)
+            .map(|thread| {
+                json!({
+                    "thread_id": thread.id,
+                    "topic": thread.topic,
+                    "status": thread.status,
+                    "last_activity": thread.last_activity,
+                })
+            })
+            .collect();
+        let proposals: Vec<Value> = stale_threads
+            .iter()
+            .enumerate()
+            .map(|(idx, thread)| {
+                let stored = badgey_id
+                    .as_deref()
+                    .and_then(|raw| self.badgey_parse_id(raw).ok())
+                    .and_then(|id| {
+                        self.state
+                            .badgey_proposals
+                            .create(
+                                &id,
+                                orchestration::badgey::types::ProposalKind::RedispatchTask,
+                                json!({
+                                    "task_id": uuid::Uuid::new_v4().to_string(),
+                                    "prompt": format!(
+                                        "Review stale work item {} and either close it or issue a narrower follow-up charter.",
+                                        thread["thread_id"].as_str().unwrap_or("unknown")
+                                    ),
+                                    "source_thread_id": thread["thread_id"],
+                                    "source": "badgey_triage_inbox",
+                                }),
+                                thread["thread_id"]
+                                    .as_str()
+                                    .map(|thread_id| format!("triage:{thread_id}")),
+                            )
+                            .ok()
+                    });
+                json!({
+                    "id": stored
+                        .as_ref()
+                        .map(|proposal| proposal.id.clone())
+                        .unwrap_or_else(|| format!("triage-{}", idx + 1)),
+                    "kind": "redispatch_task",
+                    "subject": thread["thread_id"],
+                    "proposal": "Review stale work item and either close it or issue a narrower follow-up charter.",
+                    "stored": stored.is_some(),
+                    "apply_via": badgey_id
+                        .as_ref()
+                        .map(|id| format!("badgey_resume(id={id:?}, prompt=\"apply P-N\")")),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "scope": project,
+            "since": since,
+            "badgey_id": badgey_id,
+            "proposal_sheet": {
+                "proposals": proposals,
+                "source_threads": stale_threads,
+            }
+        }))
+    }
+
+    fn badgey_close_loops_internal(
+        &self,
+        window_days: Option<u64>,
+        project_dir: Option<String>,
+    ) -> Result<Value, String> {
+        let window_days = window_days.unwrap_or(14);
+        let cutoff_ms = orch::now_ms().saturating_sub(window_days.saturating_mul(86_400_000));
+        let mut notes = self.state.notes.read();
+        let done_task_ids: std::collections::HashSet<String> = notes
+            .all()
+            .iter()
+            .filter(|note| note.kind == notes::NoteKind::Done)
+            .filter_map(|note| note.task_id.clone())
+            .collect();
+        let tasks = self.state.task_store.read().all_tasks();
+        let mut classifications = Vec::new();
+        for task in tasks {
+            let inner = task.inner.lock();
+            if project_dir
+                .as_deref()
+                .is_some_and(|project| inner.cwd.as_deref() != Some(project))
+            {
+                continue;
+            }
+            if inner.started_at < cutoff_ms {
+                continue;
+            }
+            if done_task_ids.contains(&inner.id) {
+                continue;
+            }
+            let classification = match inner.status {
+                orch::TaskStatus::Failed | orch::TaskStatus::Cancelled => "crashed",
+                orch::TaskStatus::Running => "stalled",
+                orch::TaskStatus::Completed => "forgot_emit_done",
+            };
+            if classification == "forgot_emit_done" {
+                let already_noted = notes.all().iter().any(|note| {
+                    note.kind == notes::NoteKind::Learned
+                        && note.task_id.as_deref() == Some(inner.id.as_str())
+                        && note.body.contains("closer-suspected-completion")
+                });
+                if !already_noted {
+                    drop(notes);
+                    let _ = self.state.notes.write().create(&notes::NoteParams {
+                        kind: "learned".to_string(),
+                        body: json!({
+                            "event": "closer-suspected-completion",
+                            "task_id": inner.id.clone(),
+                            "contract": "default_completion_contract",
+                            "evidence_session": inner.session_id.clone(),
+                            "evidence_summary": inner.last_assistant_message.clone(),
+                            "synthesized_by": "badgey",
+                            "does_not_replace_executor_done": true,
+                        })
+                        .to_string(),
+                        task_id: Some(inner.id.clone()),
+                        session_id: Some(inner.session_id.clone()),
+                        project: inner.cwd.clone(),
+                        thread_id: None,
+                        provider: Some(inner.provider.as_str().to_string()),
+                        bro: inner.bro_label.clone(),
+                    });
+                    notes = self.state.notes.read();
+                }
+            }
+            classifications.push(json!({
+                "task_id": inner.id,
+                "session_id": inner.session_id,
+                "provider": inner.provider,
+                "classification": classification,
+                "does_not_replace_executor_done": true,
+            }));
+        }
+        Ok(json!({
+            "window_days": window_days,
+            "project_dir": project_dir,
+            "classifications": classifications,
+            "done_notes_synthesized": 0,
+        }))
     }
 
     /// Dispatch every member of an ensemble team with the same prompt,
@@ -709,6 +2820,308 @@ impl BlackboxServer {
     }
 }
 
+struct BadgeyAgentAdapter {
+    state: Arc<SharedState>,
+}
+
+impl orchestration::agents::adapter::AgentDispatchAdapter for BadgeyAgentAdapter {
+    fn name(&self) -> &'static str {
+        "badgey"
+    }
+
+    fn dispatch(
+        &self,
+        _manifest: &orchestration::agents::types::AgentManifest,
+        args: Value,
+        ctx: orchestration::agents::adapter::DispatchContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        orchestration::agents::adapter::AgentDispatchResult,
+                        orchestration::agents::adapter::AgentDispatchError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        let state = self.state.clone();
+        Box::pin(async move {
+            use orchestration::agents::adapter::{
+                AgentDispatchError, AgentDispatchResult, DispatchDegraded,
+            };
+            use orchestration::agents::types::{AgentRef, AgentSession, MergedFilters};
+
+            let server = BlackboxServer::new(state);
+            let project_dir = args
+                .get("project_dir")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or(ctx.project_dir);
+            let result = if let Some(badgey_id) = args.get("badgey_id").and_then(Value::as_str) {
+                let prompt = args
+                    .get("prompt")
+                    .or_else(|| args.get("question"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if prompt.trim().is_empty() {
+                    return Err(AgentDispatchError::BadInput {
+                        message: "badgey adapter resume requires args.prompt or args.question"
+                            .to_string(),
+                    });
+                }
+                server
+                    .badgey_resume_internal(badgey_id, prompt, None)
+                    .await
+                    .map_err(|message| AgentDispatchError::AdapterFailed { message })?
+            } else {
+                let brief = args
+                    .get("brief")
+                    .or_else(|| args.get("prompt"))
+                    .or_else(|| args.get("question"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                server
+                    .badgey_exec_internal(project_dir.clone(), brief, ctx.bro_label_prefix.clone())
+                    .await
+                    .map_err(|message| AgentDispatchError::AdapterFailed { message })?
+            };
+            let session_id = result
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let provider = result
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let task_id = result
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let degraded = result.get("degraded").map(|_| DispatchDegraded {
+                reasons: vec!["badgey reported degraded status".to_string()],
+            });
+            let merged_filters = result
+                .get("merged_filters")
+                .and_then(|value| serde_json::from_value::<MergedFilters>(value.clone()).ok())
+                .unwrap_or_default();
+            Ok(AgentDispatchResult {
+                session: AgentSession {
+                    session_id,
+                    provider,
+                    project_dir,
+                    agent: AgentRef {
+                        name: "badgey".to_string(),
+                        version: 1,
+                    },
+                    task_id,
+                },
+                resolved_brofile: Some("badgey-persona".to_string()),
+                merged_filters,
+                degraded,
+            })
+        })
+    }
+}
+
+fn restore_badgey_registry_from_notes(state: &Arc<SharedState>) {
+    let mut thread_badgey_ids: HashMap<String, orchestration::badgey::types::BadgeyId> =
+        HashMap::new();
+    for thread in state.threads.read().all() {
+        if let Some(name) = thread.name.as_deref() {
+            if let Some(raw) = name.strip_prefix("badgey:") {
+                if let Ok(id) = raw.parse() {
+                    thread_badgey_ids.insert(thread.id.clone(), id);
+                }
+            }
+        }
+    }
+
+    let mut latest_execs: HashMap<
+        orchestration::badgey::types::BadgeyId,
+        (
+            String,
+            String,
+            orchestration::badgey::types::BadgeyScope,
+            Provider,
+            String,
+        ),
+    > = HashMap::new();
+    let mut latest_dismissed: HashMap<orchestration::badgey::types::BadgeyId, String> =
+        HashMap::new();
+    for note in state.notes.read().all() {
+        let Some(thread_id) = note.thread_id.as_deref() else {
+            continue;
+        };
+        let Some(id) = thread_badgey_ids.get(thread_id).cloned() else {
+            continue;
+        };
+        let Ok(event) =
+            serde_json::from_str::<orchestration::badgey::events::ThreadEvent>(&note.body)
+        else {
+            continue;
+        };
+        match event {
+            orchestration::badgey::events::ThreadEvent::Exec {
+                scope,
+                provider,
+                provider_session_id,
+                ..
+            } => {
+                let replace = latest_execs
+                    .get(&id)
+                    .is_none_or(|(created_at, ..)| note.created_at > *created_at);
+                if replace {
+                    latest_execs.insert(
+                        id,
+                        (
+                            note.created_at.clone(),
+                            thread_id.to_string(),
+                            scope,
+                            provider,
+                            provider_session_id,
+                        ),
+                    );
+                }
+            }
+            orchestration::badgey::events::ThreadEvent::Dismiss { .. } => {
+                let replace = latest_dismissed
+                    .get(&id)
+                    .is_none_or(|created_at| note.created_at > *created_at);
+                if replace {
+                    latest_dismissed.insert(id, note.created_at.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    for (id, (exec_at, thread_id, scope, provider, provider_session_id)) in latest_execs {
+        if provider_session_id == "pending" {
+            let _ = state.notes.write().create(&notes::NoteParams {
+                kind: "surprise".to_string(),
+                body: json!({
+                    "event": "badgey_restore_skipped_unobserved_session",
+                    "badgey_id": id,
+                    "reason": "exec event had no observed provider session id"
+                })
+                .to_string(),
+                task_id: None,
+                session_id: None,
+                project: Some(scope.project_id),
+                thread_id: Some(thread_id),
+                provider: Some(provider.as_str().to_string()),
+                bro: Some("badgey".to_string()),
+            });
+            continue;
+        }
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            scope,
+            provider,
+            provider_session_id,
+            thread_id,
+        );
+        let _ = state.badgey_registry.register(instance);
+        if latest_dismissed
+            .get(&id)
+            .is_some_and(|dismissed_at| *dismissed_at > exec_at)
+        {
+            let _ = state.badgey_registry.dismiss(&id);
+        }
+    }
+}
+
+fn recover_badgey_non_terminal_state(state: &Arc<SharedState>) {
+    use orchestration::badgey::types::{ActionJournalState, ProposalState};
+
+    if let Ok(entries) = state.badgey_journal.list_non_terminal() {
+        for entry in entries {
+            match entry.state.clone() {
+                ActionJournalState::Seen => {
+                    let _ = state.badgey_journal.transition(
+                        &entry.action_id,
+                        ActionJournalState::Seen,
+                        ActionJournalState::Failed {
+                            reason: "daemon restart before action dispatch".to_string(),
+                        },
+                        Some("startup recovery failed un-dispatched action".to_string()),
+                    );
+                }
+                ActionJournalState::Dispatching { task_id } => {
+                    let terminal = state.task_store.read().get(&task_id).map(|task| {
+                        let inner = task.inner.lock();
+                        if inner.status == orch::TaskStatus::Completed {
+                            ActionJournalState::Completed {
+                                result_ref: format!("task:{task_id}"),
+                            }
+                        } else if inner.status.is_terminal() {
+                            ActionJournalState::Failed {
+                                reason: format!("task {task_id} ended with {:?}", inner.status),
+                            }
+                        } else {
+                            ActionJournalState::Dispatching {
+                                task_id: task_id.clone(),
+                            }
+                        }
+                    });
+                    let to = terminal.unwrap_or_else(|| ActionJournalState::Failed {
+                        reason: format!("dispatched task {task_id} not found after restart"),
+                    });
+                    if !matches!(to, ActionJournalState::Dispatching { .. }) {
+                        let _ = state.badgey_journal.transition(
+                            &entry.action_id,
+                            entry.state,
+                            to,
+                            Some("startup recovery reconciled dispatched action".to_string()),
+                        );
+                    }
+                }
+                ActionJournalState::Completed { .. } | ActionJournalState::Failed { .. } => {}
+            }
+        }
+    }
+
+    if let Ok(proposals) = state.badgey_proposals.list_non_terminal() {
+        for proposal in proposals {
+            if proposal.state != ProposalState::Applying {
+                continue;
+            }
+            let to = match proposal.applied_task_id.as_deref() {
+                Some(task_id) => state.task_store.read().get(task_id).map_or_else(
+                    || ProposalState::Failed,
+                    |task| {
+                        let status = task.inner.lock().status;
+                        if status == orch::TaskStatus::Completed {
+                            ProposalState::Applied
+                        } else if status.is_terminal() {
+                            ProposalState::Failed
+                        } else {
+                            ProposalState::Applying
+                        }
+                    },
+                ),
+                None => ProposalState::Failed,
+            };
+            if to != ProposalState::Applying {
+                let note = if to == ProposalState::Applied {
+                    "startup recovery observed applied task completion"
+                } else {
+                    "startup recovery failed orphaned applying proposal"
+                };
+                let _ = state.badgey_proposals.transition(
+                    &proposal.instance_id,
+                    &proposal.id,
+                    ProposalState::Applying,
+                    to,
+                    Some(note.to_string()),
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bbox tools (search, knowledge, threads)
 // ---------------------------------------------------------------------------
@@ -926,11 +3339,12 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_describe_schema",
-        description = "Catalog agentic-corpus entity types and edge families. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips."
+        description = "Catalog agentic-corpus entity types, edge families, and installed agents. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips. Also use for installed-agent discovery: the agents section lists name, version, description, when_to_use, anti_patterns, cost_class, and example invocation for every active agent, grouped by dispatch_adapter."
     )]
     fn bbox_describe_schema(&self) -> CallToolResult {
         Self::run("bbox_describe_schema", || {
-            mcp_tools::describe_schema::describe_schema(&self.describe_schema_counts())
+            let agents = self.build_agent_schema_entries();
+            mcp_tools::describe_schema::describe_schema(&self.describe_schema_counts(), &agents)
         })
     }
 
@@ -1066,7 +3480,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_artifact_install",
-        description = "Install a workflow, packet, or brofile artifact from a local JSON file path or http(s) URL into the versioned artifact catalog."
+        description = "Install a workflow, packet, brofile, or agent artifact from a local JSON file path or http(s) URL into the versioned artifact catalog."
     )]
     async fn bbox_artifact_install(
         &self,
@@ -1080,7 +3494,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_artifact_list",
-        description = "List installed workflow, packet, and brofile artifacts with version, source, active status, and supersession metadata."
+        description = "List installed workflow, packet, brofile, and agent artifacts with version, source, active status, and supersession metadata."
     )]
     fn bbox_artifact_list(&self, Parameters(p): Parameters<ArtifactListParams>) -> CallToolResult {
         Self::run("bbox_artifact_list", || {
@@ -1594,6 +4008,105 @@ struct ResumeParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyExecParams {
+    /// Project root / scope Badgey should consult against.
+    #[serde(default)]
+    project_dir: Option<String>,
+    /// Initial charter or question for the Badgey instance.
+    #[serde(default)]
+    brief: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyResumeParams {
+    /// Badgey instance id returned by badgey_exec.
+    badgey_id: String,
+    /// User turn, or a wrapper-direct command such as "dismiss".
+    prompt: String,
+    /// Max seconds to wait for the underlying provider turn.
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyAskParams {
+    /// Badgey instance id returned by badgey_exec.
+    badgey_id: String,
+    /// Question to ask the existing Badgey instance.
+    question: String,
+    /// Max seconds to wait for the underlying provider turn.
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyDismissParams {
+    /// Badgey instance id returned by badgey_exec.
+    badgey_id: String,
+    /// Optional close reason written to the thread of record.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyStatusParams {
+    /// Badgey instance id. If omitted, returns the active list summary.
+    #[serde(default)]
+    badgey_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyListParams {
+    /// Include dismissed instances. Default false.
+    #[serde(default)]
+    include_dismissed: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyScoutParams {
+    /// Badgey instance id returned by badgey_exec.
+    badgey_id: String,
+    /// Focused scout charter.
+    charter: String,
+    /// Max seconds to wait for the charter-authoring turn.
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyCollectParams {
+    /// Scout id to collect, or omit to list scout/sub-bro events for a Badgey instance.
+    #[serde(default)]
+    scout_id: Option<String>,
+    /// Badgey instance id returned by badgey_exec.
+    #[serde(default)]
+    badgey_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyTriageInboxParams {
+    /// Project path or registered scope. Defaults to current working directory.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Optional ISO timestamp lower bound.
+    #[serde(default)]
+    since: Option<String>,
+    /// Existing Badgey instance to attach proposal context to.
+    #[serde(default)]
+    badgey_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyCloseLoopsParams {
+    /// Window in days. Default 14.
+    #[serde(default)]
+    window_days: Option<u64>,
+    /// Optional project filter.
+    #[serde(default)]
+    project_dir: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct WaitParams {
     /// Task ID from exec or resume
     task_id: String,
@@ -1702,6 +4215,68 @@ struct PruneParams {
     /// Defaults to false — bro_prune is the explicit pruning verb.
     #[serde(default)]
     dry_run: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentListParams {
+    #[serde(default)]
+    include_superseded: Option<bool>,
+    #[serde(default)]
+    cost_class: Option<String>,
+    #[serde(default)]
+    provenance_kind: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentGetParams {
+    name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentDescribeParams {
+    agent: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentDispatchParams {
+    agent: String,
+    args: serde_json::Value,
+    #[serde(default)]
+    project_dir: Option<String>,
+    #[serde(default)]
+    bro: Option<String>,
+    #[serde(default)]
+    ambient: Option<serde_json::Value>,
+    #[serde(default)]
+    caller_provider: Option<String>,
+    #[serde(default)]
+    caller_session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentSearchParams {
+    query: String,
+    #[serde(default)]
+    limit: Option<u64>,
+    #[serde(default)]
+    cost_class: Option<String>,
+    #[serde(default)]
+    provenance_kind: Option<String>,
+    #[serde(default)]
+    exclude_anti_pattern_matches: Option<bool>,
+    #[serde(default)]
+    include_vectors: Option<bool>,
+    #[serde(default)]
+    query_vector: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentVectorPlan {
+    search: Option<orchestration::agents::registry::AgentVectorSearch>,
+    route: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1911,6 +4486,7 @@ struct DispatchFilters {
     args: Vec<String>,
     /// Tempfile path for Gemini policy cleanup; None for other providers.
     policy_file: Option<PathBuf>,
+    filters: orchestration::mcp::McpFilters,
 }
 
 /// Build a per-dispatch McpFilters overlay from a tool's allow/disallow
@@ -1999,7 +4575,11 @@ fn resolve_dispatch_filters(
         }
     }
 
-    DispatchFilters { args, policy_file }
+    DispatchFilters {
+        args,
+        policy_file,
+        filters: eff.filters,
+    }
 }
 
 /// Delete a Gemini policy tempfile once the associated task reaches a
@@ -2194,6 +4774,8 @@ impl BlackboxServer {
             store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            None,
+            None,
         );
 
         // Register Gemini policy-file cleanup once the task terminates.
@@ -2319,6 +4901,8 @@ impl BlackboxServer {
             store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
+            None,
+            None,
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task.clone(), resume_lease);
@@ -2333,6 +4917,162 @@ impl BlackboxServer {
             "sessionId": inner.session_id,
             "status": "running",
         }))
+    }
+
+    #[tool(
+        name = "badgey_exec",
+        description = "Start a Badgey consultant instance for a project scope and return its badgey_id, provider session, task, and thread-of-record ids."
+    )]
+    async fn badgey_exec(&self, Parameters(p): Parameters<BadgeyExecParams>) -> CallToolResult {
+        match self
+            .badgey_exec_internal(p.project_dir, p.brief, Some("agent:badgey@v1".to_string()))
+            .await
+        {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_resume",
+        description = "Send a turn to an existing Badgey instance. Mechanical commands such as `dismiss` are handled by the wrapper before provider resume."
+    )]
+    async fn badgey_resume(&self, Parameters(p): Parameters<BadgeyResumeParams>) -> CallToolResult {
+        match self
+            .badgey_resume_internal(&p.badgey_id, &p.prompt, p.timeout_seconds)
+            .await
+        {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_ask",
+        description = "Question-shaped alias for badgey_resume."
+    )]
+    async fn badgey_ask(&self, Parameters(p): Parameters<BadgeyAskParams>) -> CallToolResult {
+        match self
+            .badgey_resume_internal(&p.badgey_id, &p.question, p.timeout_seconds)
+            .await
+        {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_dismiss",
+        description = "Dismiss a Badgey instance, drain queued turns, write a dismiss event, and resolve its thread of record."
+    )]
+    fn badgey_dismiss(&self, Parameters(p): Parameters<BadgeyDismissParams>) -> CallToolResult {
+        match self.badgey_dismiss_internal(&p.badgey_id, p.reason) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_status",
+        description = "Inspect one Badgey instance, including queue status and proposals; without badgey_id, returns active instances."
+    )]
+    fn badgey_status(&self, Parameters(p): Parameters<BadgeyStatusParams>) -> CallToolResult {
+        match self.badgey_status_internal(p.badgey_id.as_deref()) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_list",
+        description = "List Badgey instances and their thread/session bindings."
+    )]
+    fn badgey_list(&self, Parameters(p): Parameters<BadgeyListParams>) -> CallToolResult {
+        match self.badgey_list_internal(p.include_dismissed.unwrap_or(false)) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_scout",
+        description = "Ask Badgey to author scout sub-charters for a focused question; wrapper post-processing dispatches emitted scout actions."
+    )]
+    async fn badgey_scout(&self, Parameters(p): Parameters<BadgeyScoutParams>) -> CallToolResult {
+        let id = match self.badgey_parse_id(&p.badgey_id) {
+            Ok(id) => id,
+            Err(err) => return Self::err_text(&err),
+        };
+        let instance = match self.state.badgey_registry.get(&id) {
+            Ok(instance) => instance,
+            Err(err) => return Self::err_text(&err.to_string()),
+        };
+        let scout_id = format!("scout-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        if let Err(err) = self.badgey_write_event(
+            &instance,
+            orchestration::badgey::events::ThreadEvent::ScoutDispatched {
+                scout_id: scout_id.clone(),
+                scout_thread_id: instance.thread_of_record_id.clone(),
+                charters: vec![p.charter.clone()],
+            },
+            None,
+        ) {
+            return Self::err_text(&err);
+        }
+        let prompt = format!(
+            "Scout mode. Use scout_id={scout_id}. Author wrapper-mediated sub-bro charters for this question and emit bg-action-spawn-subbro notes with this scout_id as needed.\n\nCharter: {}",
+            p.charter
+        );
+        match self
+            .badgey_resume_internal(&p.badgey_id, &prompt, p.timeout_seconds)
+            .await
+        {
+            Ok(mut value) => {
+                value["scout_id"] = Value::String(scout_id);
+                value["scout_thread_id"] = Value::String(instance.thread_of_record_id);
+                Self::ok_json(&value)
+            }
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_collect",
+        description = "Collect scout/sub-bro events for a Badgey instance or scout id."
+    )]
+    fn badgey_collect(&self, Parameters(p): Parameters<BadgeyCollectParams>) -> CallToolResult {
+        match self.badgey_collect_internal(p.scout_id.as_deref(), p.badgey_id.as_deref()) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_triage_inbox",
+        description = "Produce a Badgey-shaped inbox triage proposal sheet for stale/open work in a scope."
+    )]
+    fn badgey_triage_inbox(
+        &self,
+        Parameters(p): Parameters<BadgeyTriageInboxParams>,
+    ) -> CallToolResult {
+        match self.badgey_triage_inbox_internal(p.scope, p.since, p.badgey_id) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_close_loops",
+        description = "Classify dispatched tasks without done notes; never synthesizes executor done notes."
+    )]
+    fn badgey_close_loops(
+        &self,
+        Parameters(p): Parameters<BadgeyCloseLoopsParams>,
+    ) -> CallToolResult {
+        match self.badgey_close_loops_internal(p.window_days, p.project_dir) {
+            Ok(value) => Self::ok_json(&value),
+            Err(err) => Self::err_text(&err),
+        }
     }
 
     #[tool(
@@ -2683,6 +5423,8 @@ impl BlackboxServer {
                         store_dir.clone(),
                         self.state.task_store.clone(),
                         self.state.tail_tx.clone(),
+                        None,
+                        None,
                     );
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     release_resume_lease_when_done(t.clone(), resume_lease);
@@ -2726,6 +5468,8 @@ impl BlackboxServer {
                     store_dir.clone(),
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
+                    None,
+                    None,
                 );
                 cleanup_policy_file_when_done(t.clone(), df.policy_file);
                 updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
@@ -2778,6 +5522,17 @@ impl BlackboxServer {
                 )
             });
 
+        #[derive(Default)]
+        struct AgentDashboardMetrics {
+            dispatch_count: u64,
+            success_count: u64,
+            failure_count: u64,
+            elapsed_ms_total: u64,
+            elapsed_count: u64,
+            cost_usd_total: f64,
+        }
+
+        let mut agent_metrics: BTreeMap<String, AgentDashboardMetrics> = BTreeMap::new();
         let mut with_ts: Vec<(u64, Value)> = store
             .all_tasks()
             .iter()
@@ -2804,6 +5559,24 @@ impl BlackboxServer {
                 let inner = t.inner.lock();
                 let bro_name =
                     orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
+                if let Some(label) = inner.agent_label.as_ref() {
+                    let metrics = agent_metrics.entry(label.clone()).or_default();
+                    metrics.dispatch_count += 1;
+                    match inner.status {
+                        orch::TaskStatus::Completed => metrics.success_count += 1,
+                        orch::TaskStatus::Failed | orch::TaskStatus::Cancelled => {
+                            metrics.failure_count += 1;
+                        }
+                        orch::TaskStatus::Running => {}
+                    }
+                    if let Some(done) = inner.completed_at {
+                        metrics.elapsed_ms_total += done.saturating_sub(inner.started_at);
+                        metrics.elapsed_count += 1;
+                    }
+                    if let Some(cost) = inner.cost_usd {
+                        metrics.cost_usd_total += cost;
+                    }
+                }
                 let mut entry = json!({
                     "taskId": inner.id,
                     "provider": inner.provider,
@@ -2815,13 +5588,39 @@ impl BlackboxServer {
                 if let Some(name) = bro_name {
                     entry["bro"] = Value::String(name);
                 }
+                if let Some(ref label) = inner.bro_label {
+                    entry["broLabel"] = Value::String(label.clone());
+                }
+                if let Some(ref label) = inner.agent_label {
+                    entry["agentLabel"] = Value::String(label.clone());
+                }
                 (inner.started_at, entry)
             })
             .collect();
         with_ts.sort_by(|a, b| b.0.cmp(&a.0));
         let entries: Vec<Value> = with_ts.into_iter().take(limit).map(|(_, e)| e).collect();
+        let agents: BTreeMap<String, Value> = agent_metrics
+            .into_iter()
+            .map(|(label, metrics)| {
+                let avg_elapsed_ms = if metrics.elapsed_count == 0 {
+                    None
+                } else {
+                    Some(metrics.elapsed_ms_total / metrics.elapsed_count)
+                };
+                (
+                    label,
+                    json!({
+                        "dispatch_count": metrics.dispatch_count,
+                        "success_count": metrics.success_count,
+                        "failure_count": metrics.failure_count,
+                        "avg_elapsed_ms": avg_elapsed_ms,
+                        "cost_usd_total": (metrics.cost_usd_total * 10000.0).round() / 10000.0,
+                    }),
+                )
+            })
+            .collect();
 
-        Self::ok_json(&json!({"count": entries.len(), "tasks": entries}))
+        Self::ok_json(&json!({"count": entries.len(), "tasks": entries, "agents": agents}))
     }
 
     #[tool(
@@ -4320,6 +7119,770 @@ Constraints:\n\
     }
 
     #[tool(
+        name = "bro_agent_list",
+        description = "List installed agents from the registry. Optional filters for cost_class, provenance_kind, include_superseded, and limit."
+    )]
+    fn bro_agent_list(&self, Parameters(p): Parameters<AgentListParams>) -> CallToolResult {
+        use orchestration::agents::registry::{AgentRegistry, ListFilter};
+        use orchestration::agents::types::AgentCostClass;
+        let catalog = self.state.artifacts.read();
+        let reg = AgentRegistry::new(&catalog);
+        let cost_class = match p.cost_class.as_deref() {
+            Some(s) => {
+                let parsed: AgentCostClass =
+                    match serde_json::from_value(serde_json::Value::String(s.to_string())) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            return Self::err_text(&format!(
+                            "unknown cost_class: {s} (expected one of: cheap, normal, expensive)"
+                        ));
+                        }
+                    };
+                Some(parsed)
+            }
+            None => None,
+        };
+        let filter = ListFilter {
+            include_superseded: p.include_superseded.unwrap_or(false),
+            cost_class,
+            provenance_kind: p.provenance_kind,
+        };
+        match reg.list(&filter) {
+            Ok(summaries) => {
+                let capped = match p.limit {
+                    Some(n) => summaries.into_iter().take(n).collect::<Vec<_>>(),
+                    None => summaries,
+                };
+                Self::ok_json(&serde_json::json!({
+                    "agents": capped.iter().map(|s| {
+                        let mut m = serde_json::Map::from_iter([
+                            ("name".into(), serde_json::Value::String(s.name.clone())),
+                            ("version".into(), serde_json::Value::String(s.version.clone())),
+                            ("active".into(), serde_json::Value::Bool(s.active)),
+                            ("installed_at".into(), serde_json::Value::String(s.installed_at.clone())),
+                            ("embedding_pending".into(), match s.embedding_pending {
+                                Some(b) => serde_json::Value::Bool(b),
+                                None => serde_json::Value::Null,
+                            }),
+                        ]);
+                        if let Some(desc) = &s.description {
+                            m.insert("description".into(), serde_json::Value::String(desc.clone()));
+                        }
+                        if let Some(cc) = &s.cost_class {
+                            m.insert("cost_class".into(), serde_json::Value::String(cc.to_string()));
+                        }
+                        if let Some(pk) = &s.provenance_kind {
+                            m.insert("provenance_kind".into(), serde_json::Value::String(pk.clone()));
+                        }
+                        if !s.supersedes_chain.is_empty() {
+                            m.insert(
+                                "supersedes_chain".into(),
+                                serde_json::Value::Array(
+                                    s.supersedes_chain
+                                        .iter()
+                                        .map(|c| serde_json::Value::String(c.clone()))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        serde_json::Value::Object(m)
+                    }).collect::<Vec<_>>()
+                }))
+            }
+            Err(e) => Self::err_text(&format!("registry list failed: {e}")),
+        }
+    }
+
+    #[tool(
+        name = "bro_agent_get",
+        description = "Read full details for a single agent by name or agent-ref (name@vN or agent:name@vN). Returns manifest, metadata, and lifecycle state."
+    )]
+    fn bro_agent_get(&self, Parameters(p): Parameters<AgentGetParams>) -> CallToolResult {
+        use orchestration::agents::registry::AgentRegistry;
+        let catalog = self.state.artifacts.read();
+        let reg = AgentRegistry::new(&catalog);
+        match reg.get(&p.name) {
+            Ok(Some(rec)) => {
+                let mut m = serde_json::Map::from_iter([
+                    ("name".into(), serde_json::Value::String(rec.name)),
+                    ("version".into(), serde_json::Value::String(rec.version)),
+                    ("active".into(), serde_json::Value::Bool(rec.active)),
+                    (
+                        "installed_at".into(),
+                        serde_json::Value::String(rec.installed_at),
+                    ),
+                    ("source".into(), serde_json::Value::String(rec.source)),
+                ]);
+                if let Some(s) = rec.metadata.supersedes {
+                    m.insert("supersedes".into(), serde_json::Value::String(s));
+                }
+                if !rec.metadata.supersedes_chain.is_empty() {
+                    m.insert(
+                        "supersedes_chain".into(),
+                        serde_json::Value::Array(
+                            rec.metadata
+                                .supersedes_chain
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(s) = rec.metadata.superseded_by {
+                    m.insert("superseded_by".into(), serde_json::Value::String(s));
+                }
+                if let Some(parse_err) = rec.manifest_parse_error {
+                    m.insert(
+                        "manifest_parse_error".into(),
+                        serde_json::Value::String(parse_err),
+                    );
+                }
+                if let Some(manifest) = rec.manifest {
+                    m.insert(
+                        "manifest".into(),
+                        serde_json::to_value(manifest).unwrap_or_else(|e| {
+                            serde_json::Value::String(format!("<serialize error: {e}>"))
+                        }),
+                    );
+                }
+                Self::ok_json(&serde_json::Value::Object(m))
+            }
+            Ok(None) => Self::err_text(&format!("agent not found: {}", p.name)),
+            Err(e) => Self::err_text(&format!("registry get failed: {e}")),
+        }
+    }
+
+    fn expand_template(template: &str, args: &serde_json::Value) -> String {
+        let mut result = template.to_string();
+        if let Some(obj) = args.as_object() {
+            for (key, value) in obj {
+                let pattern = format!("{{{{{}}}}}", key);
+                let replacement = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                result = result.replace(&pattern, &replacement);
+            }
+        }
+        result
+    }
+
+    fn embed_agent_query(query: &str) -> anyhow::Result<Vec<f32>> {
+        let router = embed::EmbeddingRouter::load_default()?;
+        let route = router.route(embed::Bucket::AgentManifest, None)?;
+        let cache_key = format!("{}:{}:{}", route.provider_id, route.model, query);
+        let cache = AGENT_QUERY_EMBED_CACHE.get_or_init(|| RwLock::new(BTreeMap::new()));
+        if let Some(vector) = cache.read().get(&cache_key).cloned() {
+            return Ok(vector);
+        }
+        let provider = router.route_for(embed::Bucket::AgentManifest, None)?;
+        let texts = vec![query.to_string()];
+        let vectors = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tokio::task::block_in_place(|| handle.block_on(provider.embed_batch(&texts)))
+            }
+            Err(_) => {
+                let runtime = tokio::runtime::Runtime::new()?;
+                runtime.block_on(provider.embed_batch(&texts))
+            }
+        }?;
+        let vector = vectors
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("embedding provider returned no query vector"))?;
+        let mut guard = cache.write();
+        if guard.len() >= 256 {
+            if let Some(first) = guard.keys().next().cloned() {
+                guard.remove(&first);
+            }
+        }
+        guard.insert(cache_key, vector.clone());
+        Ok(vector)
+    }
+
+    fn extract_inline_filters(inline: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+        let filters = match inline.get("filters") {
+            Some(f) => f,
+            None => return (Vec::new(), Vec::new()),
+        };
+        let allow = filters
+            .get("allow")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let disallow = filters
+            .get("disallow")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (allow, disallow)
+    }
+
+    #[tool(
+        name = "bro_agent_describe",
+        description = "Full manifest + resolved brofile + merged filters for one agent. Returns the computed dispatch surface (deny-wins filter merge of brofile + overlay), brofile info, embedding status, and any warnings."
+    )]
+    fn bro_agent_describe(&self, Parameters(p): Parameters<AgentDescribeParams>) -> CallToolResult {
+        use orchestration::agents::registry::AgentRegistry;
+        use orchestration::agents::types::MergedFilters;
+        let catalog = self.state.artifacts.read();
+        let reg = AgentRegistry::new(&catalog);
+        let rec = match reg.get(&p.agent) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Self::err_text(&format!("agent not found: {}", p.agent)),
+            Err(e) => return Self::err_text(&format!("registry get failed: {e}")),
+        };
+        let manifest = match rec.manifest {
+            Some(m) => m,
+            None => {
+                return Self::ok_json(&serde_json::json!({
+                    "name": rec.name,
+                    "version": rec.version,
+                    "active": rec.active,
+                    "error": format!("manifest parse failed: {}", rec.manifest_parse_error.unwrap_or_default()),
+                }));
+            }
+        };
+
+        let mut warnings: Vec<String> = Vec::new();
+        let mut degraded = serde_json::Map::new();
+
+        let (brofile_kind, brofile_name, brofile_provider, brofile_body, base_allow, base_disallow) =
+            if let Some(ref br) = manifest.brofile_ref {
+                if let Ok(Some(meta)) = catalog.metadata_for(artifacts::ArtifactKind::Brofile, br) {
+                    if !meta.active {
+                        degraded.insert("manifest_stale".into(), serde_json::Value::Bool(true));
+                        warnings.push(format!(
+                            "brofile_ref '{br}' is superseded by {}; reinstall or upgrade the agent manifest",
+                            meta.superseded_by.unwrap_or_else(|| "unknown".into())
+                        ));
+                    }
+                }
+                let resolved =
+                    orchestration::brofile::resolve_brofile(br, &self.state.store_dir, None);
+                match resolved {
+                    Some(bf) => {
+                        let (ba, bd) = match &bf.filters {
+                            Some(f) => (f.allow.clone(), f.disallow.clone()),
+                            None => (Vec::new(), Vec::new()),
+                        };
+                        (
+                            "ref",
+                            br.clone(),
+                            Some(bf.provider.as_str().to_string()),
+                            Some(serde_json::to_value(&bf).unwrap_or(serde_json::Value::Null)),
+                            ba,
+                            bd,
+                        )
+                    }
+                    None => {
+                        warnings.push(format!(
+                            "brofile_ref '{br}' not found (global scope only; project-scoped brofiles not yet supported by describe)"
+                        ));
+                        ("ref", br.clone(), None, None, Vec::new(), Vec::new())
+                    }
+                }
+            } else if let Some(ref inline) = manifest.brofile_inline {
+                let prov = inline
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let (ba, bd) = Self::extract_inline_filters(inline);
+                (
+                    "inline",
+                    String::new(),
+                    Some(prov.to_string()),
+                    Some(inline.clone()),
+                    ba,
+                    bd,
+                )
+            } else {
+                warnings.push("manifest has neither brofile_ref nor brofile_inline".into());
+                ("none", String::new(), None, None, Vec::new(), Vec::new())
+            };
+
+        let merged = MergedFilters::merge(
+            &base_allow,
+            &base_disallow,
+            manifest.filter_overlay.as_ref(),
+        );
+
+        let embedding_status = match manifest.embedding {
+            Some(_) => "embedded",
+            None => "pending",
+        };
+        let install_warnings = rec
+            .metadata
+            .install_warnings
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>();
+
+        let mut result = serde_json::Map::from_iter([
+            ("name".into(), serde_json::Value::String(rec.name)),
+            ("version".into(), serde_json::Value::String(rec.version)),
+            ("active".into(), serde_json::Value::Bool(rec.active)),
+            (
+                "embedding_status".into(),
+                serde_json::Value::String(embedding_status.to_string()),
+            ),
+            (
+                "brofile_kind".into(),
+                serde_json::Value::String(brofile_kind.to_string()),
+            ),
+            (
+                "merged_filters".into(),
+                serde_json::to_value(&merged).unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "install_warnings".into(),
+                serde_json::Value::Array(install_warnings),
+            ),
+        ]);
+        if !brofile_name.is_empty() {
+            result.insert(
+                "brofile_name".into(),
+                serde_json::Value::String(brofile_name),
+            );
+        }
+        if let Some(provider) = brofile_provider {
+            result.insert(
+                "brofile_provider".into(),
+                serde_json::Value::String(provider),
+            );
+        }
+        if let Some(body) = brofile_body {
+            result.insert("brofile".into(), body);
+        }
+        if !warnings.is_empty() {
+            result.insert(
+                "warnings".into(),
+                serde_json::Value::Array(
+                    warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !degraded.is_empty() {
+            result.insert("degraded".into(), serde_json::Value::Object(degraded));
+        }
+        result.insert(
+            "manifest".into(),
+            serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
+        );
+        Self::ok_json(&serde_json::Value::Object(result))
+    }
+
+    #[tool(
+        name = "bro_agent_search",
+        description = "Search installed agents by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and matched anti-patterns."
+    )]
+    fn bro_agent_search(&self, Parameters(p): Parameters<AgentSearchParams>) -> CallToolResult {
+        use orchestration::agents::registry::{AgentRegistry, AgentVectorSearch, SearchFilter};
+        use orchestration::agents::types::AgentCostClass;
+        let query = p.query.trim();
+        if query.is_empty() {
+            return Self::err_text("query is required");
+        }
+        let limit = p.limit.unwrap_or(5).min(50) as usize;
+        let cost_class = match p.cost_class.as_deref() {
+            Some("cheap") => Some(AgentCostClass::Cheap),
+            Some("normal") => Some(AgentCostClass::Normal),
+            Some("expensive") => Some(AgentCostClass::Expensive),
+            Some(other) => return Self::err_text(&format!("invalid cost_class: {other}")),
+            None => None,
+        };
+        let filter = SearchFilter {
+            cost_class,
+            provenance_kind: p.provenance_kind,
+        };
+        let exclude_ap = p.exclude_anti_pattern_matches.unwrap_or(true);
+        let catalog = self.state.artifacts.read();
+        let reg = AgentRegistry::new(&catalog);
+        let active_agents = match reg.list(&orchestration::agents::registry::ListFilter::default())
+        {
+            Ok(list) => list,
+            Err(e) => return Self::err_text(&format!("registry list failed: {e}")),
+        };
+        let embedded_agents = active_agents
+            .iter()
+            .filter(|agent| agent.embedding_pending == Some(false))
+            .count();
+        let vector_plan = if p.include_vectors.unwrap_or(true) {
+            resolve_agent_vector_search(query, p.query_vector.as_deref())
+        } else {
+            AgentVectorPlan {
+                search: None,
+                route: None,
+                error: Some("vector search disabled by caller".into()),
+            }
+        };
+        let vector_search = vector_plan.search.as_ref().map(|search| AgentVectorSearch {
+            route: search.route.clone(),
+            query_vector: search.query_vector.clone(),
+        });
+        let results = match reg.search_with_vectors(
+            query,
+            limit,
+            &filter,
+            exclude_ap,
+            vector_search.as_ref(),
+        ) {
+            Ok(r) => r,
+            Err(e) => return Self::err_text(&format!("search failed: {e}")),
+        };
+        let json_results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                let mut obj = serde_json::json!({
+                    "name": r.name,
+                    "version": r.version,
+                    "score": (r.score * 1000.0).round() / 1000.0,
+                    "description": r.description,
+                    "when_to_use": r.when_to_use,
+                    "anti_patterns": r.anti_patterns,
+                    "cost_class": r.cost_class,
+                    "provenance_kind": r.provenance_kind,
+                    "sources": r.sources,
+                });
+                if !exclude_ap {
+                    obj["matched_anti_patterns"] = serde_json::json!(r.matched_anti_patterns);
+                }
+                obj
+            })
+            .collect();
+        let active_count = active_agents.len();
+        let vector_available = vector_plan.search.is_some();
+        let coverage_ratio = if active_count == 0 {
+            1.0
+        } else {
+            embedded_agents as f64 / active_count as f64
+        };
+        Self::ok_json(&serde_json::json!({
+            "results": json_results,
+            "search_mode": if vector_available { "hybrid" } else { "keyword" },
+            "total_matched": json_results.len(),
+            "active_agents": active_count,
+            "degraded": {
+                "embedding_pending": embedded_agents < active_count,
+                "vector_search_unavailable": !vector_available,
+                "vector_error": vector_plan.error,
+            },
+            "vector_status": {
+                "coverage_ratio": coverage_ratio,
+                "embedded_agents": embedded_agents,
+                "active_agents": active_count,
+                "route": vector_plan.route,
+            },
+        }))
+    }
+
+    #[tool(
+        name = "bro_agent_dispatch",
+        description = "Dispatch a registered agent for a focused task. Routes through manifest dispatch_adapter if set, otherwise resolves brofile, merges filters, expands prompt template, and spawns via the standard bro execution path. Returns task_id, session, and agent attribution (agentLabel on the spawned task, preserved even when bro= routes to a named team member)."
+    )]
+    async fn bro_agent_dispatch(
+        &self,
+        Parameters(p): Parameters<AgentDispatchParams>,
+    ) -> CallToolResult {
+        use orchestration::agents::adapter::DispatchContext;
+        use orchestration::agents::registry::AgentRegistry;
+        use orchestration::agents::types::{AgentRef, AgentSession, MergedFilters};
+
+        let (manifest, agent_ref, bro_label) = {
+            let catalog = self.state.artifacts.read();
+            let reg = AgentRegistry::new(&catalog);
+            let rec = match reg.get(&p.agent) {
+                Ok(Some(r)) => r,
+                Ok(None) => return Self::err_text(&format!("agent not found: {}", p.agent)),
+                Err(e) => return Self::err_text(&format!("registry get failed: {e}")),
+            };
+            let manifest = match rec.manifest {
+                Some(m) => m,
+                None => {
+                    return Self::err_text(&format!(
+                        "agent '{}' has unparseable manifest: {}",
+                        p.agent,
+                        rec.manifest_parse_error.unwrap_or_default()
+                    ));
+                }
+            };
+            if !rec.active {
+                return Self::err_text(&format!(
+                    "agent '{}' is not active (superseded or deactivated)",
+                    p.agent
+                ));
+            }
+            let agent_ref = AgentRef {
+                name: rec.name.clone(),
+                version: rec.version.parse::<u32>().unwrap_or(1),
+            };
+            let bro_label = format!("agent:{}@v{}", rec.name, rec.version);
+            (manifest, agent_ref, bro_label)
+        };
+
+        // Adapter path
+        if let Some(ref adapter_name) = manifest.dispatch_adapter {
+            let adapter = {
+                let adapter_registry = self.state.agent_adapter_registry.read();
+                match adapter_registry.get(adapter_name) {
+                    Some(a) => a,
+                    None => {
+                        return Self::err_text(&format!(
+                            "error.bad_input(code=adapter_unavailable): adapter '{}' not registered",
+                            adapter_name
+                        ));
+                    }
+                }
+            };
+            let ctx = DispatchContext {
+                project_dir: p.project_dir.clone(),
+                ambient: p
+                    .ambient
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok()),
+                bro_label_prefix: Some(bro_label),
+                caller_provider: p.caller_provider.clone(),
+                caller_session_id: p.caller_session_id.clone(),
+            };
+            match adapter.dispatch(&manifest, p.args, ctx).await {
+                Ok(result) => {
+                    let task_id = result.session.task_id.clone();
+                    return Self::ok_json(&serde_json::json!({
+                        "session": result.session,
+                        "task_id": task_id,
+                        "resolved_brofile": result.resolved_brofile,
+                        "merged_filters": result.merged_filters,
+                        "degraded": result.degraded,
+                    }));
+                }
+                Err(e) => return Self::err_text(&format!("{e}")),
+            }
+        }
+
+        // Direct path
+        let (provider, lens, brofile_name, base_allow, base_disallow, exec_opts, env_overrides) =
+            if let Some(ref br) = manifest.brofile_ref {
+                let bf = match orchestration::brofile::resolve_brofile(
+                    br,
+                    &self.state.store_dir,
+                    p.project_dir.as_deref(),
+                ) {
+                    Some(b) => b,
+                    None => {
+                        return Self::err_text(&format!("brofile_ref '{}' not found", br));
+                    }
+                };
+                let (ba, bd) = match &bf.filters {
+                    Some(f) => (f.allow.clone(), f.disallow.clone()),
+                    None => (Vec::new(), Vec::new()),
+                };
+                let env = orchestration::brofile::resolve_provider_env(
+                    bf.provider,
+                    bf.account.as_deref(),
+                    bf.model.as_deref(),
+                    &self.state.store_dir,
+                );
+                let opts = if bf.model.is_some() || bf.effort.is_some() {
+                    Some(ExecOpts {
+                        model: bf.model.clone(),
+                        effort: bf.effort.clone(),
+                    })
+                } else {
+                    None
+                };
+                (bf.provider, bf.lens, Some(br.clone()), ba, bd, opts, env)
+            } else if let Some(ref inline) = manifest.brofile_inline {
+                let prov_str = inline
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("claude");
+                let provider = match prov_str.parse::<orchestration::providers::Provider>() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return Self::err_text(&format!(
+                            "error.bad_input(code=unknown_provider): unknown provider in inline brofile: {prov_str}"
+                        ));
+                    }
+                };
+                let (ba, bd) = Self::extract_inline_filters(inline);
+                let env = orchestration::brofile::resolve_provider_env(
+                    provider,
+                    None,
+                    inline.get("model").and_then(|v| v.as_str()),
+                    &self.state.store_dir,
+                );
+                let opts = if inline.get("model").is_some() || inline.get("effort").is_some() {
+                    Some(ExecOpts {
+                        model: inline
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        effort: inline
+                            .get("effort")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                    })
+                } else {
+                    None
+                };
+                let lens = inline
+                    .get("lens")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                (provider, lens, None, ba, bd, opts, env)
+            } else {
+                return Self::err_text("manifest has neither brofile_ref nor brofile_inline");
+            };
+
+        let merged = MergedFilters::merge(
+            &base_allow,
+            &base_disallow,
+            manifest.filter_overlay.as_ref(),
+        );
+
+        if let Some(ref inputs) = manifest.inputs {
+            if let Some(ref schema) = inputs.schema {
+                let compiled = match jsonschema::JSONSchema::options()
+                    .with_draft(jsonschema::Draft::Draft202012)
+                    .compile(schema)
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Self::err_text(&format!(
+                            "error.internal(code=invalid_schema): manifest schema failed to compile: {e}"
+                        ));
+                    }
+                };
+                let args_to_validate = if p.args.is_null() {
+                    serde_json::json!({})
+                } else {
+                    p.args.clone()
+                };
+                let result = compiled.validate(&args_to_validate);
+                if let Err(errors) = result {
+                    let msgs: Vec<String> = errors.map(|e| e.to_string()).collect();
+                    return Self::err_text(&format!(
+                        "error.bad_input(code=schema_validation_failed): {}",
+                        msgs.join("; ")
+                    ));
+                }
+            }
+        }
+
+        let prompt = match &manifest.inputs {
+            Some(spec) => match &spec.prompt_template {
+                Some(tmpl) => Self::expand_template(tmpl, &p.args),
+                None => {
+                    if p.args.is_null() {
+                        String::new()
+                    } else {
+                        serde_json::to_string_pretty(&p.args).unwrap_or_default()
+                    }
+                }
+            },
+            None => {
+                if p.args.is_null() {
+                    String::new()
+                } else {
+                    serde_json::to_string_pretty(&p.args).unwrap_or_default()
+                }
+            }
+        };
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let session_id = if matches!(provider, Provider::Claude) {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            "pending".to_string()
+        };
+        let cwd = p.project_dir.clone();
+
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
+            session_id: Some(session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: p.bro.clone(),
+            thread_id: None,
+            work_item_id: None,
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                p.bro.as_deref(),
+                Some(session_id.as_str()),
+                None,
+                None,
+            ),
+            completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+            allow_recursion: false,
+            provider: Some(provider),
+        };
+        let final_prompt =
+            orch::apply_brofile_lens(&orch::apply_ambient(&prompt, &ambient_ctx), lens.as_deref());
+
+        let mut args = provider.build_exec_args(
+            &final_prompt,
+            &session_id,
+            cwd.as_deref(),
+            exec_opts.as_ref(),
+        );
+        let brofile_filters = orchestration::mcp::McpFilters {
+            allow: merged.allow.clone(),
+            disallow: merged.disallow.clone(),
+        };
+        let extra = combine_dispatch_filters(Some(&brofile_filters), None);
+        let dispatch_filters =
+            resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, extra.as_ref());
+        args.extend(dispatch_filters.args);
+
+        let task = orch::spawn_task(
+            task_id.clone(),
+            provider,
+            args,
+            session_id.clone(),
+            cwd,
+            env_overrides,
+            self.state.store_dir.clone(),
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+            Some(bro_label.clone()),
+            Some(bro_label.clone()),
+        );
+
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+
+        if let Some(bro_name) = &p.bro {
+            self.record_task_to_bro(bro_name, &task);
+        }
+
+        let agent_session = AgentSession {
+            session_id: session_id.clone(),
+            provider: provider.as_str().to_string(),
+            project_dir: p.project_dir.clone(),
+            agent: agent_ref,
+            task_id: Some(task_id.clone()),
+        };
+
+        Self::ok_json(&serde_json::json!({
+            "session": agent_session,
+            "task_id": task_id,
+            "resolved_brofile": brofile_name,
+            "merged_filters": merged,
+            "agentLabel": bro_label,
+        }))
+    }
+
+    #[tool(
         name = "bro_council_list",
         description = "List active and closed councils. Optional `project` filter narrows by project_dir."
     )]
@@ -5016,6 +8579,8 @@ Next step: <one concrete steering suggestion>\n",
                     store_dir.clone(),
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
+                    None,
+                    None,
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
                 release_resume_lease_when_done(task.clone(), resume_lease);
@@ -5073,6 +8638,8 @@ Next step: <one concrete steering suggestion>\n",
                     store_dir.clone(),
                     self.state.task_store.clone(),
                     self.state.tail_tx.clone(),
+                    None,
+                    None,
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
                 task
@@ -6738,8 +10305,13 @@ async fn install_artifact_from_params(
 async fn install_artifact_value(
     state: &Arc<SharedState>,
     p: ArtifactInstallParams,
-    value: Value,
+    mut value: Value,
 ) -> anyhow::Result<artifacts::ArtifactMetadata> {
+    let mut installed_agent: Option<(
+        orchestration::agents::types::AgentRef,
+        orchestration::agents::types::AgentManifest,
+        Vec<String>,
+    )> = None;
     match p.kind {
         artifacts::ArtifactKind::Workflow => {
             let spec: workflow::Workflow = serde_json::from_value(value.clone())?;
@@ -6764,8 +10336,62 @@ async fn install_artifact_value(
             let brofile: orchestration::brofile::Brofile = serde_json::from_value(value.clone())?;
             orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None);
         }
+        artifacts::ArtifactKind::Agent => {
+            if !value.is_object() {
+                anyhow::bail!("agent artifact must be a JSON object");
+            }
+            let adapter_registry = state.agent_adapter_registry.read();
+            let catalog = state.artifacts.read();
+            let ctx = orchestration::agents::validate::InstallCtx {
+                adapter_registry: &adapter_registry,
+                brofile_exists: |name: &str| -> bool {
+                    catalog
+                        .metadata_for(artifacts::ArtifactKind::Brofile, name)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.active)
+                },
+                agent_exists: |name: &str| -> bool {
+                    catalog
+                        .metadata_for(artifacts::ArtifactKind::Agent, name)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.active)
+                },
+            };
+            orchestration::agents::validate::validate_agent_install(&value, &ctx)?;
+            drop(catalog);
+            let manifest_value = value
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("agent artifact missing manifest"))?;
+            let mut manifest: orchestration::agents::types::AgentManifest =
+                serde_json::from_value(manifest_value)?;
+            let name = p
+                .name
+                .clone()
+                .or_else(|| {
+                    value
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| anyhow::anyhow!("agent artifact missing name"))?;
+            let version = p
+                .version
+                .clone()
+                .or_else(|| value.get("version").and_then(artifact_version_string))
+                .ok_or_else(|| anyhow::anyhow!("agent artifact missing version"))?
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("agent artifact version must parse as u32"))?;
+            let agent_ref = orchestration::agents::types::AgentRef { name, version };
+            manifest.embedding = Some(embed_queue::agent_manifest_embedding(&agent_ref, &manifest));
+            value["manifest"]["embedding"] = serde_json::to_value(&manifest.embedding)?;
+            let install_warnings = agent_install_warnings(state, &manifest);
+            installed_agent = Some((agent_ref, manifest, install_warnings));
+        }
     }
-    state
+    let mut meta = state
         .artifacts
         .write()
         .install_value(p.kind, p.source, &value, p.name, p.version, p.supersedes)
@@ -6774,7 +10400,123 @@ async fn install_artifact_value(
                 deactivate_artifact(state, meta.kind, prev)?;
             }
             Ok(meta)
-        })
+        })?;
+    if let Some((agent_ref, manifest, install_warnings)) = installed_agent {
+        if !install_warnings.is_empty() {
+            meta = state.artifacts.write().update_install_warnings(
+                artifacts::ArtifactKind::Agent,
+                &agent_ref.name,
+                install_warnings,
+            )?;
+        }
+        embed_queue::enqueue_agent_manifest(&agent_ref, &manifest);
+        persist_agent_provenance_edges(state, &agent_ref, &manifest)?;
+    }
+    Ok(meta)
+}
+
+fn agent_install_warnings(
+    state: &Arc<SharedState>,
+    manifest: &orchestration::agents::types::AgentManifest,
+) -> Vec<String> {
+    let Some(overlay) = manifest.filter_overlay.as_ref() else {
+        return Vec::new();
+    };
+    let (base_allow, base_disallow) = if let Some(brofile_ref) = manifest.brofile_ref.as_ref() {
+        let Some(brofile) =
+            orchestration::brofile::resolve_brofile(brofile_ref, &state.store_dir, None)
+        else {
+            return Vec::new();
+        };
+        match brofile.filters {
+            Some(filters) => (filters.allow, filters.disallow),
+            None => (Vec::new(), Vec::new()),
+        }
+    } else if let Some(inline) = manifest.brofile_inline.as_ref() {
+        BlackboxServer::extract_inline_filters(inline)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let mut warnings = Vec::new();
+    for allowed in &overlay.allow {
+        if base_disallow.contains(allowed) {
+            warnings.push(format!(
+                "filter_overlay.allow `{allowed}` is also disallowed by the base brofile; deny-wins merge keeps it disallowed"
+            ));
+        }
+    }
+    for disallowed in &overlay.disallow {
+        if base_allow.contains(disallowed) {
+            warnings.push(format!(
+                "filter_overlay.disallow `{disallowed}` overrides a base brofile allow entry"
+            ));
+        }
+    }
+    warnings
+}
+
+fn artifact_version_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn persist_agent_provenance_edges(
+    state: &Arc<SharedState>,
+    agent_ref: &orchestration::agents::types::AgentRef,
+    manifest: &orchestration::agents::types::AgentManifest,
+) -> anyhow::Result<()> {
+    use orchestration::agents::types::AgentProvenance;
+    let Some(AgentProvenance::Distilled {
+        evidence_session_ids,
+        created_from_threads,
+        ..
+    }) = manifest.provenance.as_ref()
+    else {
+        return Ok(());
+    };
+    let source = entity_ref::EntityRef::Agent {
+        name: agent_ref.name.clone(),
+        version: agent_ref.version,
+    };
+    let mut edges = Vec::new();
+    for session in evidence_session_ids {
+        let target = entity_ref::EntityRef::parse(session)?;
+        if !matches!(target, entity_ref::EntityRef::Session { .. }) {
+            anyhow::bail!("distilled agent evidence ref is not a session: {session}");
+        }
+        edges.push(agent_derived_from_edge(source.clone(), target));
+    }
+    for thread in created_from_threads {
+        let target = entity_ref::EntityRef::parse(thread)?;
+        if !matches!(target, entity_ref::EntityRef::Thread { .. }) {
+            anyhow::bail!("distilled agent thread ref is not a thread: {thread}");
+        }
+        edges.push(agent_derived_from_edge(source.clone(), target));
+    }
+    let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let written = edge_index::append_edges_dedup(&edges_dir, "agents", &edges)?;
+    if written > 0 {
+        rebuild_edge_index_from_shared(state, false);
+    }
+    Ok(())
+}
+
+fn agent_derived_from_edge(
+    source: entity_ref::EntityRef,
+    target: entity_ref::EntityRef,
+) -> edge_index::Edge {
+    edge_index::Edge {
+        source,
+        kind: "DERIVED_FROM".into(),
+        target,
+        provenance: chunker::EdgeProvenance::Explicit,
+        confidence: chunker::EdgeConfidence::Exact,
+        metadata: Default::default(),
+    }
 }
 
 fn deactivate_artifact(
@@ -6800,6 +10542,9 @@ fn deactivate_artifact(
         }
         artifacts::ArtifactKind::Brofile => {
             orchestration::brofile::delete_brofile(name, "global", &state.store_dir, None);
+        }
+        artifacts::ArtifactKind::Agent => {
+            // No separate registry to deactivate for agents (yet).
         }
     }
     Ok(())
@@ -7480,6 +11225,78 @@ async fn roster_handler(
     Ok(axum::Json(entries))
 }
 
+fn resolve_agent_vector_search(
+    query: &str,
+    supplied_query_vector: Option<&[f32]>,
+) -> AgentVectorPlan {
+    #[cfg(test)]
+    if supplied_query_vector.is_none() {
+        return AgentVectorPlan {
+            search: None,
+            route: None,
+            error: Some("live query embedding disabled in unit tests".into()),
+        };
+    }
+    let route = match embed::EmbeddingRouter::load_default()
+        .and_then(|router| router.route(embed::Bucket::AgentManifest, None))
+    {
+        Ok(route) => route.vector_route_id(),
+        Err(err) => {
+            return AgentVectorPlan {
+                search: None,
+                route: None,
+                error: Some(format!("agent_manifest route unavailable: {err}")),
+            };
+        }
+    };
+    let Some(metrics) = vectors::metrics().get(&route).cloned() else {
+        return AgentVectorPlan {
+            search: None,
+            route: Some(route),
+            error: Some("agent_manifest vector partition has no active records".into()),
+        };
+    };
+    if metrics.active_count == 0 {
+        return AgentVectorPlan {
+            search: None,
+            route: Some(route),
+            error: Some("agent_manifest vector partition has no active records".into()),
+        };
+    }
+    let query_vector = match supplied_query_vector {
+        Some(vector) => vector.to_vec(),
+        None => match BlackboxServer::embed_agent_query(query) {
+            Ok(vector) => vector,
+            Err(err) => {
+                return AgentVectorPlan {
+                    search: None,
+                    route: Some(route),
+                    error: Some(format!("agent_manifest query embedding failed: {err}")),
+                };
+            }
+        },
+    };
+    if query_vector.len() != metrics.dims {
+        return AgentVectorPlan {
+            search: None,
+            route: Some(route),
+            error: Some(format!(
+                "query vector dims {} do not match agent_manifest partition dims {}",
+                query_vector.len(),
+                metrics.dims
+            )),
+        };
+    }
+    AgentVectorPlan {
+        search: Some(orchestration::agents::registry::AgentVectorSearch {
+            route: route.clone(),
+            query_vector,
+        }),
+        route: Some(route),
+        error: None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tail SSE endpoint (outside MCP)
 // ---------------------------------------------------------------------------
@@ -7829,6 +11646,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Packets store: {}", packets_dir.join("packets").display());
 
     let artifacts_dir = util::blackbox_artifacts_dir(&home);
+    let agent_adapter_registry = Arc::new(RwLock::new(
+        orchestration::agents::adapter::AgentAdapterRegistry::new(),
+    ));
     let artifacts_store = artifacts::ArtifactCatalog::open(&artifacts_dir)?;
     tracing::info!("Artifact catalog: {}", artifacts_store.root().display());
 
@@ -7842,6 +11662,12 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(86_400_000u64);
     let task_store = TaskStore::load(&store_dir, task_ttl);
+    let badgey_proposals = Arc::new(orchestration::badgey::ProposalStore::new(
+        store_dir.clone(),
+    )?);
+    let badgey_journal = Arc::new(orchestration::badgey::ActionJournal::new(
+        store_dir.clone(),
+    )?);
 
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);
 
@@ -7903,7 +11729,19 @@ async fn main() -> anyhow::Result<()> {
         arc_cancel_tokens: RwLock::new(HashMap::new()),
         councils: Arc::new(council::CouncilRegistry::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
+        agent_adapter_registry: agent_adapter_registry.clone(),
+        badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),
+        badgey_proposals,
+        badgey_journal,
     });
+    shared
+        .agent_adapter_registry
+        .write()
+        .register(Arc::new(BadgeyAgentAdapter {
+            state: shared.clone(),
+        }));
+    restore_badgey_registry_from_notes(&shared);
+    recover_badgey_non_terminal_state(&shared);
     std::thread::Builder::new()
         .name("blackbox-vectors-warmup".into())
         .spawn(|| {
@@ -8352,6 +12190,16 @@ mod tests {
             arc_cancel_tokens: RwLock::new(HashMap::new()),
             councils: Arc::new(council::CouncilRegistry::new()),
             resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
+            agent_adapter_registry: Arc::new(RwLock::new(
+                orchestration::agents::adapter::AgentAdapterRegistry::new(),
+            )),
+            badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),
+            badgey_proposals: Arc::new(
+                orchestration::badgey::ProposalStore::new(tmp.path().join("bro")).unwrap(),
+            ),
+            badgey_journal: Arc::new(
+                orchestration::badgey::ActionJournal::new(tmp.path().join("bro")).unwrap(),
+            ),
         });
         BlackboxServer::new(state)
     }
@@ -8371,6 +12219,52 @@ mod tests {
             &tmp.path().join("bro"),
             None,
         );
+    }
+
+    fn save_badgey_test_brofile(tmp: &tempfile::TempDir) {
+        orchestration::brofile::save_brofile(
+            &orchestration::brofile::Brofile {
+                name: "badgey-persona".to_string(),
+                provider: Provider::Codex,
+                account: None,
+                lens: Some("Badgey test lens".to_string()),
+                model: None,
+                effort: None,
+                filters: Some(orchestration::mcp::McpFilters {
+                    allow: Vec::new(),
+                    disallow: vec!["mcp__blackbox__bro_*".to_string()],
+                }),
+            },
+            "global",
+            &tmp.path().join("bro"),
+            None,
+        );
+    }
+
+    fn fake_codex_bin(tmp: &tempfile::TempDir, session_id: &str) -> String {
+        let path = tmp.path().join("fake-codex");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                serde_json::json!({
+                    "type": "thread.started",
+                    "thread_id": session_id,
+                })
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    async fn codex_bin_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
     }
 
     #[tokio::test]
@@ -8431,6 +12325,7 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: None,
                 name: None,
+                include_superseded: false,
             })
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -8471,6 +12366,7 @@ mod tests {
             .list(&ArtifactListParams {
                 kind: Some(artifacts::ArtifactKind::Workflow),
                 name: Some("project-bootstrap-arc".into()),
+                include_superseded: false,
             })
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -8656,17 +12552,14 @@ mod tests {
         assert_eq!(result.status, "completed");
         assert_eq!(result.vars.get("rebuild_started"), Some(&Value::Bool(true)));
         assert_eq!(result.vars.get("swapped"), Some(&Value::Bool(true)));
-        assert!(result
-            .events
-            .iter()
-            .any(
-                |event| event.get("kind").and_then(Value::as_str) == Some("gate_applied")
-                    && event
-                        .get("data")
-                        .and_then(|data| data.get("verdict"))
-                        .and_then(Value::as_str)
-                        == Some("compact")
-            ));
+        assert!(result.events.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("gate_applied")
+                && event
+                    .get("data")
+                    .and_then(|data| data.get("verdict"))
+                    .and_then(Value::as_str)
+                    == Some("compact")
+        }));
         let after = vector_store.metrics().remove(route).unwrap();
         assert_eq!(after.active_count, 6);
         assert_eq!(after.deleted_count, 0);
@@ -9342,6 +13235,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_artifact_install_list_supersede_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let agent_v1 = serde_json::json!({
+            "kind": "agent",
+            "name": "test-reviewer",
+            "version": 1,
+            "manifest": {
+                "description": "Reviews code for correctness.",
+                "when_to_use": ["after writing code"],
+                "brofile_inline": {"provider": "claude", "lens": "reviewer"}
+            }
+        });
+        let agent_v2 = serde_json::json!({
+            "kind": "agent",
+            "name": "test-reviewer-v2",
+            "version": 2,
+            "supersedes": "test-reviewer",
+            "manifest": {
+                "description": "Reviews code with style checks.",
+                "when_to_use": ["after writing code"],
+                "brofile_inline": {"provider": "claude", "lens": "reviewer"}
+            }
+        });
+
+        let meta1 = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "agent-v1.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            agent_v1,
+        )
+        .await
+        .unwrap();
+        assert!(meta1.active);
+
+        let meta2 = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "agent-v2.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            agent_v2,
+        )
+        .await
+        .unwrap();
+        assert!(meta2.active);
+        assert_eq!(meta2.supersedes_chain, vec!["test-reviewer"]);
+
+        let rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: Some(artifacts::ArtifactKind::Agent),
+                name: None,
+                include_superseded: false,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "test-reviewer-v2");
+
+        let all_rows = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: Some(artifacts::ArtifactKind::Agent),
+                name: None,
+                include_superseded: true,
+            })
+            .unwrap();
+        assert_eq!(all_rows.len(), 2);
+        let old = all_rows.iter().find(|r| r.name == "test-reviewer").unwrap();
+        assert!(!old.active);
+        assert_eq!(old.superseded_by.as_deref(), Some("test-reviewer-v2"));
+
+        let rows_all = server
+            .state
+            .artifacts
+            .read()
+            .list(&ArtifactListParams {
+                kind: None,
+                name: None,
+                include_superseded: true,
+            })
+            .unwrap();
+        assert_eq!(rows_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn agent_artifact_rejects_non_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let result = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "bad.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!("not an object"),
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("JSON object"),
+            "expected 'JSON object' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn read_artifact_source_rejects_oversized_http_response() {
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
@@ -9980,5 +13995,2803 @@ mod tests {
             nag_system.is_none(),
             "system-generated entries must be exempt from the nag: {nag_system:?}"
         );
+    }
+
+    fn seed_test_agent(
+        catalog: &artifacts::ArtifactCatalog,
+        file_name: &str,
+        name: &str,
+        version: u64,
+        cost_class: Option<&str>,
+    ) {
+        let mut manifest = serde_json::json!({
+            "description": format!("Test agent {name}."),
+            "when_to_use": ["when testing"],
+            "brofile_inline": {"provider": "claude"},
+        });
+        if let Some(cc) = cost_class {
+            manifest["cost_class"] = serde_json::json!(cc);
+        }
+        catalog
+            .install_value(
+                artifacts::ArtifactKind::Agent,
+                file_name.into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": name,
+                    "version": version,
+                    "manifest": manifest,
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    fn extract_text(result: &CallToolResult) -> String {
+        let wire = serde_json::to_value(result).unwrap();
+        wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn badgey_lifecycle_tools_write_thread_events() {
+        let _env_guard = codex_bin_test_guard().await;
+        let prior_bin = std::env::var("CODEX_BIN").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test"));
+        save_badgey_test_brofile(&tmp);
+        let server = test_server(&tmp);
+
+        let exec = server
+            .badgey_exec(Parameters(BadgeyExecParams {
+                project_dir: Some(tmp.path().to_string_lossy().into_owned()),
+                brief: Some("answer graph questions".to_string()),
+            }))
+            .await;
+        assert_ne!(exec.is_error, Some(true), "{}", extract_text(&exec));
+        let exec_body: Value = serde_json::from_str(&extract_text(&exec)).unwrap();
+        let badgey_id = exec_body["badgey_id"].as_str().unwrap().to_string();
+        let task_id = exec_body["task_id"].as_str().unwrap().to_string();
+        let thread_id = exec_body["thread_id"].as_str().unwrap().to_string();
+        assert_eq!(exec_body["session_id"], "codex-session-test");
+        assert!(server.state.task_store.read().get(&task_id).is_some());
+
+        let resume = server
+            .badgey_resume(Parameters(BadgeyResumeParams {
+                badgey_id: badgey_id.clone(),
+                prompt: "ping".to_string(),
+                timeout_seconds: Some(2.0),
+            }))
+            .await;
+        assert_ne!(resume.is_error, Some(true), "{}", extract_text(&resume));
+
+        let dismiss = server.badgey_dismiss(Parameters(BadgeyDismissParams {
+            badgey_id: badgey_id.clone(),
+            reason: Some("done".to_string()),
+        }));
+        assert_ne!(dismiss.is_error, Some(true), "{}", extract_text(&dismiss));
+
+        let notes = server.state.notes.read();
+        let bodies: Vec<_> = notes
+            .all()
+            .iter()
+            .filter(|note| note.thread_id.as_deref() == Some(thread_id.as_str()))
+            .map(|note| note.body.as_str())
+            .collect();
+        assert!(bodies.iter().any(|body| body.contains(r#""event":"exec""#)
+            && body.contains(r#""provider_session_id":"codex-session-test""#)));
+        assert!(bodies.iter().any(|body| body.contains(r#""event":"turn""#)));
+        assert!(bodies
+            .iter()
+            .any(|body| body.contains(r#""event":"dismiss""#)));
+
+        match prior_bin {
+            Some(value) => std::env::set_var("CODEX_BIN", value),
+            None => std::env::remove_var("CODEX_BIN"),
+        }
+    }
+
+    #[tokio::test]
+    async fn badgey_agent_dispatch_routes_through_wrapper_adapter() {
+        let _env_guard = codex_bin_test_guard().await;
+        let prior_bin = std::env::var("CODEX_BIN").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test"));
+        save_badgey_test_brofile(&tmp);
+        let server = test_server(&tmp);
+        server
+            .state
+            .agent_adapter_registry
+            .write()
+            .register(std::sync::Arc::new(BadgeyAgentAdapter {
+                state: server.state.clone(),
+            }));
+        server
+            .state
+            .artifacts
+            .read()
+            .install_value(
+                artifacts::ArtifactKind::Agent,
+                "badgey.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "badgey",
+                    "version": 1,
+                    "manifest": {
+                        "description": "Badgey test agent.",
+                        "dispatch_adapter": "badgey",
+                        "brofile_ref": "badgey-persona"
+                    }
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = server
+            .bro_agent_dispatch(Parameters(AgentDispatchParams {
+                agent: "badgey".into(),
+                args: serde_json::json!({"prompt": "advise"}),
+                project_dir: Some(tmp.path().to_string_lossy().into_owned()),
+                bro: None,
+                ambient: None,
+                caller_provider: None,
+                caller_session_id: None,
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
+        let body: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["session"]["provider"], "codex");
+        assert_eq!(body["session"]["session_id"], "codex-session-test");
+        assert_eq!(body["resolved_brofile"], "badgey-persona");
+        assert_eq!(
+            body["merged_filters"]["disallow"][0],
+            "mcp__blackbox__bro_*"
+        );
+        assert_eq!(server.state.badgey_registry.list().len(), 1);
+
+        match prior_bin {
+            Some(value) => std::env::set_var("CODEX_BIN", value),
+            None => std::env::remove_var("CODEX_BIN"),
+        }
+    }
+
+    #[tokio::test]
+    async fn badgey_post_processor_records_emit_proposal_actions_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-3".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server
+            .state
+            .badgey_registry
+            .register(instance.clone())
+            .unwrap();
+        let action_id = uuid::Uuid::new_v4().to_string();
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "followup".to_string(),
+                body: serde_json::json!({
+                    "event": "bg-action-emit-proposal",
+                    "action_id": action_id,
+                    "kind": "agent",
+                    "draft": {"source": "draft-agent.json", "name": "draft-agent"}
+                })
+                .to_string(),
+                task_id: None,
+                session_id: Some("codex-session-3".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                thread_id: Some("thread-00000001".to_string()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .unwrap();
+
+        let results = server
+            .badgey_post_process_turn(&instance, "1970-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["proposal_id"], "P-1");
+        let proposals = server.state.badgey_proposals.list_by_instance(&id).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].kind,
+            orchestration::badgey::types::ProposalKind::Agent
+        );
+        assert!(matches!(
+            server
+                .state
+                .badgey_journal
+                .list_non_terminal()
+                .unwrap()
+                .as_slice(),
+            []
+        ));
+
+        let replay = server
+            .badgey_post_process_turn(&instance, "1970-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(
+            server
+                .state
+                .badgey_proposals
+                .list_by_instance(&id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn badgey_post_processor_marks_bad_actions_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-4".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server
+            .state
+            .badgey_registry
+            .register(instance.clone())
+            .unwrap();
+        let action_id = uuid::Uuid::new_v4().to_string();
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "followup".to_string(),
+                body: serde_json::json!({
+                    "event": "bg-action-emit-proposal",
+                    "action_id": action_id,
+                    "draft": {"source": "missing-kind.json"}
+                })
+                .to_string(),
+                task_id: None,
+                session_id: Some("codex-session-4".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                thread_id: Some("thread-00000001".to_string()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .unwrap();
+
+        let results = server
+            .badgey_post_process_turn(&instance, "1970-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(results[0]["status"], "failed");
+        let failure_notes: Vec<_> = server
+            .state
+            .notes
+            .read()
+            .all()
+            .iter()
+            .filter(|note| note.body.contains("bg-action-failed"))
+            .cloned()
+            .collect();
+        assert_eq!(failure_notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn badgey_apply_and_reject_commands_update_proposal_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-5".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server.state.badgey_registry.register(instance).unwrap();
+        let draft_path = tmp.path().join("new-bro.json");
+        std::fs::write(
+            &draft_path,
+            serde_json::json!({
+                "name": "new-bro",
+                "version": 1,
+                "provider": "codex"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let apply_proposal = server
+            .state
+            .badgey_proposals
+            .create(
+                &id,
+                orchestration::badgey::types::ProposalKind::Brofile,
+                serde_json::json!({"source": draft_path.to_string_lossy()}),
+                None,
+            )
+            .unwrap();
+        let reject_proposal = server
+            .state
+            .badgey_proposals
+            .create(
+                &id,
+                orchestration::badgey::types::ProposalKind::Agent,
+                serde_json::json!({"source": "not-used.json"}),
+                None,
+            )
+            .unwrap();
+
+        let apply = server
+            .badgey_resume(Parameters(BadgeyResumeParams {
+                badgey_id: id.to_string(),
+                prompt: format!("apply {}", apply_proposal.id),
+                timeout_seconds: None,
+            }))
+            .await;
+        assert_ne!(apply.is_error, Some(true), "{}", extract_text(&apply));
+        assert!(
+            orchestration::brofile::resolve_brofile("new-bro", &tmp.path().join("bro"), None)
+                .is_some()
+        );
+        assert_eq!(
+            server
+                .state
+                .badgey_proposals
+                .get(&id, &apply_proposal.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            orchestration::badgey::types::ProposalState::Applied
+        );
+
+        let reject = server
+            .badgey_resume(Parameters(BadgeyResumeParams {
+                badgey_id: id.to_string(),
+                prompt: format!("reject {}", reject_proposal.id),
+                timeout_seconds: None,
+            }))
+            .await;
+        assert_ne!(reject.is_error, Some(true), "{}", extract_text(&reject));
+        assert_eq!(
+            server
+                .state
+                .badgey_proposals
+                .get(&id, &reject_proposal.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            orchestration::badgey::types::ProposalState::Failed
+        );
+    }
+
+    #[test]
+    fn badgey_restart_replay_restores_registry_from_thread_notes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
+        let thread_result = server
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".to_string(),
+                name: Some(format!("badgey:{id}")),
+                id: None,
+                topic: Some("Badgey replay".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".to_string()),
+            })
+            .unwrap();
+        let thread_id = server
+            .badgey_thread_id_from_open_result(&thread_result)
+            .unwrap();
+        let scope = orchestration::badgey::types::BadgeyScope {
+            project_id: tmp.path().to_string_lossy().into_owned(),
+            initial_brief: Some("replay".to_string()),
+        };
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "learned".to_string(),
+                body: serde_json::to_string(&orchestration::badgey::events::ThreadEvent::Exec {
+                    brofile_version: "badgey-persona".to_string(),
+                    scope: scope.clone(),
+                    charter: "replay".to_string(),
+                    provider: Provider::Codex,
+                    provider_session_id: "codex-session-6".to_string(),
+                })
+                .unwrap(),
+                task_id: None,
+                session_id: Some("codex-session-6".to_string()),
+                project: Some(scope.project_id.clone()),
+                thread_id: Some(thread_id.clone()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .unwrap();
+
+        restore_badgey_registry_from_notes(&server.state);
+        let restored = server.state.badgey_registry.get(&id).unwrap();
+        assert_eq!(restored.thread_of_record_id, thread_id);
+        assert_eq!(restored.provider_session_id, "codex-session-6");
+    }
+
+    #[test]
+    fn badgey_restart_replay_skips_unobserved_pending_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
+        let thread_result = server
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".to_string(),
+                name: Some(format!("badgey:{id}")),
+                id: None,
+                topic: Some("Badgey pending replay".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".to_string()),
+            })
+            .unwrap();
+        let thread_id = server
+            .badgey_thread_id_from_open_result(&thread_result)
+            .unwrap();
+        let scope = orchestration::badgey::types::BadgeyScope {
+            project_id: tmp.path().to_string_lossy().into_owned(),
+            initial_brief: Some("pending replay".to_string()),
+        };
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "learned".to_string(),
+                body: serde_json::to_string(&orchestration::badgey::events::ThreadEvent::Exec {
+                    brofile_version: "badgey-persona".to_string(),
+                    scope: scope.clone(),
+                    charter: "pending replay".to_string(),
+                    provider: Provider::Codex,
+                    provider_session_id: "pending".to_string(),
+                })
+                .unwrap(),
+                task_id: None,
+                session_id: None,
+                project: Some(scope.project_id.clone()),
+                thread_id: Some(thread_id),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey".to_string()),
+            })
+            .unwrap();
+
+        restore_badgey_registry_from_notes(&server.state);
+        assert!(server.state.badgey_registry.get(&id).is_err());
+        assert!(server.state.notes.read().all().iter().any(|note| note.kind
+            == notes::NoteKind::Surprise
+            && note
+                .body
+                .contains("badgey_restore_skipped_unobserved_session")));
+    }
+
+    #[test]
+    fn badgey_collect_waits_for_done_note_after_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-7".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server
+            .state
+            .badgey_registry
+            .register(instance.clone())
+            .unwrap();
+        server
+            .badgey_write_event(
+                &instance,
+                orchestration::badgey::events::ThreadEvent::SubbroSpawned {
+                    task_id: "task-1".to_string(),
+                    scout_id: "scout-1".to_string(),
+                    charter: "look".to_string(),
+                },
+                Some("task-1".to_string()),
+            )
+            .unwrap();
+        server
+            .badgey_write_event(
+                &instance,
+                orchestration::badgey::events::ThreadEvent::SubbroSpawned {
+                    task_id: "task-2".to_string(),
+                    scout_id: "scout-1".to_string(),
+                    charter: "compare".to_string(),
+                },
+                Some("task-2".to_string()),
+            )
+            .unwrap();
+
+        let walking = server
+            .badgey_collect_internal(Some("scout-1"), Some(id.as_str()))
+            .unwrap();
+        assert_eq!(walking["status"], "still_walking");
+
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "done".to_string(),
+                body: serde_json::json!({
+                    "scout_id": "scout-1",
+                    "verdict": "found",
+                    "summary": "done"
+                })
+                .to_string(),
+                task_id: Some("task-1".to_string()),
+                session_id: Some("codex-session-7".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                thread_id: Some("thread-00000001".to_string()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey-scout".to_string()),
+            })
+            .unwrap();
+        let done = server
+            .badgey_collect_internal(Some("scout-1"), Some(id.as_str()))
+            .unwrap();
+        assert_eq!(done["status"], "still_walking");
+
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "done".to_string(),
+                body: serde_json::json!({
+                    "scout_id": "scout-1",
+                    "verdict": "found",
+                    "summary": "done 2"
+                })
+                .to_string(),
+                task_id: Some("task-2".to_string()),
+                session_id: Some("codex-session-7".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                thread_id: Some("thread-00000001".to_string()),
+                provider: Some("codex".to_string()),
+                bro: Some("badgey-scout".to_string()),
+            })
+            .unwrap();
+        let done = server
+            .badgey_collect_internal(Some("scout-1"), Some(id.as_str()))
+            .unwrap();
+        assert_eq!(done["status"], "done");
+    }
+
+    #[test]
+    fn badgey_triage_attached_to_instance_stores_redispatch_proposals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
+        let instance = orchestration::badgey::registry::BadgeyInstance::new(
+            id.clone(),
+            orchestration::badgey::types::BadgeyScope {
+                project_id: tmp.path().to_string_lossy().into_owned(),
+                initial_brief: None,
+            },
+            Provider::Codex,
+            "codex-session-8".to_string(),
+            "thread-00000001".to_string(),
+        );
+        server.state.badgey_registry.register(instance).unwrap();
+        let thread_result = server
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".to_string(),
+                name: Some("stale-work".to_string()),
+                id: None,
+                topic: Some("stale work".to_string()),
+                project: Some(tmp.path().to_string_lossy().into_owned()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".to_string()),
+            })
+            .unwrap();
+        let thread_id = server
+            .badgey_thread_id_from_open_result(&thread_result)
+            .unwrap();
+
+        let triage = server
+            .badgey_triage_inbox_internal(
+                Some(tmp.path().to_string_lossy().into_owned()),
+                None,
+                Some(id.to_string()),
+            )
+            .unwrap();
+        assert_eq!(triage["proposal_sheet"]["proposals"][0]["stored"], true);
+        let proposals = server.state.badgey_proposals.list_by_instance(&id).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].kind,
+            orchestration::badgey::types::ProposalKind::RedispatchTask
+        );
+        assert_eq!(
+            proposals[0].idempotency_key.as_deref(),
+            Some(format!("triage:{thread_id}").as_str())
+        );
+    }
+
+    #[test]
+    fn badgey_startup_recovery_fails_orphaned_non_terminal_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let action_id = orchestration::badgey::types::ActionId::new_v4();
+        server
+            .state
+            .badgey_journal
+            .record_seen(
+                action_id.clone(),
+                "bg-action-spawn-subbro".to_string(),
+                serde_json::json!({"event": "bg-action-spawn-subbro"}),
+            )
+            .unwrap();
+        let id: orchestration::badgey::types::BadgeyId = "bg-0123abcd-4567ef89".parse().unwrap();
+        let proposal = server
+            .state
+            .badgey_proposals
+            .create(
+                &id,
+                orchestration::badgey::types::ProposalKind::RedispatchTask,
+                serde_json::json!({"prompt": "retry"}),
+                Some("redispatch-task-1".to_string()),
+            )
+            .unwrap();
+        server
+            .state
+            .badgey_proposals
+            .transition(
+                &id,
+                &proposal.id,
+                orchestration::badgey::types::ProposalState::Pending,
+                orchestration::badgey::types::ProposalState::Applying,
+                None,
+            )
+            .unwrap();
+
+        recover_badgey_non_terminal_state(&server.state);
+        assert!(matches!(
+            server
+                .state
+                .badgey_journal
+                .get(&action_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            orchestration::badgey::types::ActionJournalState::Failed { .. }
+        ));
+        assert_eq!(
+            server
+                .state
+                .badgey_proposals
+                .get(&id, &proposal.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            orchestration::badgey::types::ProposalState::Failed
+        );
+    }
+
+    #[test]
+    fn bro_agent_list_output_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            1,
+            Some("expensive"),
+        );
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "writer.json",
+            "writer",
+            2,
+            Some("cheap"),
+        );
+
+        let result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: None,
+            provenance_kind: None,
+            limit: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let agents = body["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 2);
+
+        let reviewer = agents.iter().find(|a| a["name"] == "reviewer").unwrap();
+        assert_eq!(reviewer["version"], "1");
+        assert_eq!(reviewer["active"], true);
+        assert_eq!(reviewer["cost_class"], "expensive");
+        assert_eq!(reviewer["embedding_pending"], true);
+
+        let writer = agents.iter().find(|a| a["name"] == "writer").unwrap();
+        assert_eq!(writer["version"], "2");
+        assert_eq!(writer["cost_class"], "cheap");
+    }
+
+    #[test]
+    fn bro_agent_list_invalid_cost_class_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: Some("notavalidclass".into()),
+            provenance_kind: None,
+            limit: None,
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("unknown cost_class"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_get_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            3,
+            None,
+        );
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "reviewer".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["name"], "reviewer");
+        assert_eq!(body["version"], "3");
+        assert_eq!(body["active"], true);
+        assert!(body["manifest"].is_object());
+    }
+
+    #[test]
+    fn bro_agent_get_missing_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "nonexistent".into(),
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("agent not found"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_get_pinned_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            5,
+            None,
+        );
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "reviewer@v5".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["version"], "5");
+    }
+
+    #[test]
+    fn bro_agent_get_invalid_ref_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams { name: "@v2".into() }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("requires a name"), "got: {text}");
+    }
+
+    fn seed_test_agent_with_provenance(
+        catalog: &artifacts::ArtifactCatalog,
+        file_name: &str,
+        name: &str,
+        version: u64,
+        provenance: serde_json::Value,
+    ) {
+        let manifest = serde_json::json!({
+            "description": format!("Agent {name} with provenance."),
+            "when_to_use": ["when testing"],
+            "brofile_inline": {"provider": "claude"},
+            "provenance": provenance,
+        });
+        catalog
+            .install_value(
+                artifacts::ArtifactKind::Agent,
+                file_name.into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": name,
+                    "version": version,
+                    "manifest": manifest,
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn bro_agent_list_limit_caps_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        seed_test_agent(cat, "a1.json", "alpha", 1, None);
+        seed_test_agent(cat, "a2.json", "beta", 1, None);
+        seed_test_agent(cat, "a3.json", "gamma", 1, None);
+
+        let result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: None,
+            provenance_kind: None,
+            limit: Some(2),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["agents"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn bro_agent_list_provenance_kind_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        seed_test_agent(cat, "hand.json", "handmade", 1, None);
+        seed_test_agent_with_provenance(
+            cat,
+            "distilled.json",
+            "distilled",
+            1,
+            serde_json::json!({"kind": "distilled", "distilled_by": "badgey-01", "evidence_session_ids": [], "created_from_threads": [], "accept_count": 5, "reject_count": 0}),
+        );
+
+        let result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: None,
+            provenance_kind: Some("distilled".into()),
+            limit: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let agents = body["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["name"], "distilled");
+    }
+
+    #[test]
+    fn bro_agent_get_pinned_version_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            5,
+            None,
+        );
+
+        let result = server.bro_agent_get(Parameters(AgentGetParams {
+            name: "reviewer@v4".into(),
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("agent not found"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_list_include_superseded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        seed_test_agent(cat, "old-agent.json", "old-agent", 1, None);
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "new-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "new-agent",
+                "version": 1,
+                "supersedes": "old-agent",
+                "manifest": {
+                    "description": "Replacement for old-agent.",
+                    "when_to_use": ["when testing"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            Some("old-agent".into()),
+        )
+        .unwrap();
+
+        let default_result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: None,
+            provenance_kind: None,
+            limit: None,
+        }));
+        assert_ne!(default_result.is_error, Some(true));
+        let default_body: serde_json::Value =
+            serde_json::from_str(&extract_text(&default_result)).unwrap();
+        let default_agents = default_body["agents"].as_array().unwrap();
+        let default_names: Vec<&str> = default_agents
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !default_names.contains(&"old-agent"),
+            "superseded agent should be excluded by default: {default_names:?}"
+        );
+        assert!(
+            default_names.contains(&"new-agent"),
+            "active agent should be included: {default_names:?}"
+        );
+
+        let with_superseded = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: Some(true),
+            cost_class: None,
+            provenance_kind: None,
+            limit: None,
+        }));
+        assert_ne!(with_superseded.is_error, Some(true));
+        let all_body: serde_json::Value =
+            serde_json::from_str(&extract_text(&with_superseded)).unwrap();
+        let all_agents = all_body["agents"].as_array().unwrap();
+        let all_names: Vec<&str> = all_agents
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            all_names.contains(&"old-agent"),
+            "superseded agent should appear with include_superseded=true: {all_names:?}"
+        );
+        let old = all_agents
+            .iter()
+            .find(|a| a["name"] == "old-agent")
+            .unwrap();
+        assert_eq!(old["active"], false);
+    }
+
+    #[test]
+    fn bro_agent_describe_inline_brofile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            1,
+            Some("normal"),
+        );
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "reviewer".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["name"], "reviewer");
+        assert_eq!(body["version"], "1");
+        assert_eq!(body["active"], true);
+        assert_eq!(body["brofile_kind"], "inline");
+        assert_eq!(body["brofile_provider"], "claude");
+        assert_eq!(body["embedding_status"], "pending");
+        assert!(body["manifest"].is_object());
+        assert!(body["merged_filters"].is_object());
+        assert!(body["brofile"].is_object());
+        assert_eq!(body["brofile"]["provider"], "claude");
+        assert!(body["install_warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bro_agent_describe_inline_brofile_filters_in_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        let manifest = serde_json::json!({
+            "description": "Agent with inline brofile filters.",
+            "when_to_use": ["when testing"],
+            "brofile_inline": {
+                "provider": "claude",
+                "filters": {
+                    "allow": ["mcp__blackbox__bbox_search"],
+                    "disallow": ["mcp__blackbox__bro_exec"]
+                }
+            },
+        });
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "inline-filtered.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "inline-filtered",
+                "version": 1,
+                "manifest": manifest,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "inline-filtered".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let allow = body["merged_filters"]["allow"].as_array().unwrap();
+        let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
+        assert!(
+            allow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
+            "inline allow should appear in merged: {allow:?}"
+        );
+        assert!(
+            disallow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
+            "inline disallow should appear in merged: {disallow:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_describe_missing_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "nonexistent".into(),
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("agent not found"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_describe_deny_wins_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        let manifest = serde_json::json!({
+            "description": "Agent where overlay allows what brofile denies.",
+            "when_to_use": ["when testing"],
+            "brofile_inline": {
+                "provider": "claude",
+                "filters": {
+                    "allow": ["mcp__blackbox__bbox_search"],
+                    "disallow": ["mcp__blackbox__bro_exec", "mcp__blackbox__bbox_cite"]
+                }
+            },
+            "filter_overlay": {
+                "allow": ["mcp__blackbox__bro_exec", "mcp__blackbox__bbox_cite"],
+                "disallow": []
+            },
+        });
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "conflict.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "conflict",
+                "version": 1,
+                "manifest": manifest,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "conflict".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let allow = body["merged_filters"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        let disallow = body["merged_filters"]["disallow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !allow.contains(&"mcp__blackbox__bro_exec"),
+            "overlay allow should be stripped by deny-wins: {allow:?}"
+        );
+        assert!(
+            !allow.contains(&"mcp__blackbox__bbox_cite"),
+            "overlay allow for cite should be stripped by deny-wins: {allow:?}"
+        );
+        assert!(
+            allow.contains(&"mcp__blackbox__bbox_search"),
+            "non-conflicting allow should survive: {allow:?}"
+        );
+        assert!(
+            disallow.contains(&"mcp__blackbox__bro_exec"),
+            "disallow should win: {disallow:?}"
+        );
+        assert!(
+            disallow.contains(&"mcp__blackbox__bbox_cite"),
+            "disallow should win for cite too: {disallow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_install_records_filter_conflict_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "kind": "agent",
+                "name": "warning-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent where overlay conflicts are recorded.",
+                    "when_to_use": ["when testing filter warnings"],
+                    "brofile_inline": {
+                        "provider": "claude",
+                        "filters": {
+                            "allow": ["Read"],
+                            "disallow": ["Bash"]
+                        }
+                    },
+                    "filter_overlay": {
+                        "allow": ["Bash"],
+                        "disallow": ["Read"]
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "warning-agent".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let warnings = body["install_warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("Bash"))),
+            "allow/disallow conflict warning missing: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("Read"))),
+            "disallow/allow conflict warning missing: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_describe_brofile_ref_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        use orchestration::brofile::Brofile;
+        use orchestration::mcp::McpFilters;
+        use orchestration::providers::Provider;
+        let bf = Brofile {
+            name: "auditor".into(),
+            provider: Provider::Claude,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: Some(McpFilters {
+                allow: vec![
+                    "mcp__blackbox__bbox_search".into(),
+                    "mcp__blackbox__bbox_cite".into(),
+                ],
+                disallow: vec!["mcp__blackbox__bro_exec".into()],
+            }),
+        };
+        orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
+        let manifest = serde_json::json!({
+            "description": "Agent referencing a saved brofile.",
+            "when_to_use": ["when auditing"],
+            "brofile_ref": "auditor",
+        });
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "auditor-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "auditor-agent",
+                "version": 1,
+                "manifest": manifest,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "auditor-agent".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["brofile_kind"], "ref");
+        assert_eq!(body["brofile_name"], "auditor");
+        assert_eq!(body["brofile_provider"], "claude");
+        assert!(body["brofile"].is_object());
+        assert_eq!(body["brofile"]["name"], "auditor");
+        assert_eq!(body["brofile"]["provider"], "claude");
+        let allow = body["merged_filters"]["allow"].as_array().unwrap();
+        let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
+        assert!(
+            allow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
+            "brofile allow in merged: {allow:?}"
+        );
+        assert!(
+            disallow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
+            "brofile disallow in merged: {disallow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bro_agent_describe_flags_stale_brofile_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "name": "review-persona",
+                "version": 1,
+                "provider": "claude",
+                "lens": "Review code."
+            }),
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "kind": "agent",
+                "name": "stale-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with a brofile ref that will become stale.",
+                    "when_to_use": ["when testing stale refs"],
+                    "brofile_ref": "review-persona"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "name": "review-persona-v2",
+                "version": 2,
+                "supersedes": "review-persona",
+                "provider": "claude",
+                "lens": "Review code better."
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "stale-agent".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["degraded"]["manifest_stale"].as_bool(), Some(true));
+        assert!(
+            body["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|text| text.contains("review-persona-v2"))),
+            "expected stale warning: {body}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_describe_degraded_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "broken.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "broken",
+                "version": 1,
+                "manifest": 42,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "broken".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["name"], "broken");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("manifest parse failed"));
+    }
+
+    #[test]
+    fn bro_agent_search_result_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "reviewer.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "code-reviewer",
+                "version": 1,
+                "manifest": {
+                    "description": "Reviews pull requests for code quality and security.",
+                    "when_to_use": ["when you need a PR reviewed"],
+                    "anti_patterns": ["reviewing your own code"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "review pull request security".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["search_mode"], "keyword");
+        assert!(body["results"].is_array());
+        assert!(body["total_matched"].as_u64().unwrap() > 0);
+        assert!(body["active_agents"].as_u64().unwrap() > 0);
+        assert!(body["degraded"]["embedding_pending"].as_bool().unwrap());
+        assert!(body["vector_status"]["coverage_ratio"].is_number());
+        let first = &body["results"][0];
+        assert_eq!(first["name"], "code-reviewer");
+        assert!(first["score"].as_f64().unwrap() > 0.0);
+        assert!(first["description"].is_string());
+        assert!(first["when_to_use"].is_array());
+        assert!(first["anti_patterns"].is_array());
+    }
+
+    #[test]
+    fn bro_agent_search_uses_agent_manifest_vectors_when_available() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let vector_store =
+            std::sync::Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+        let _guard = vectors::install_test_global(vector_store.clone());
+        let route = embed::EmbeddingRouter::default()
+            .route(embed::Bucket::AgentManifest, None)
+            .unwrap()
+            .vector_route_id();
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "semantic-reviewer.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "semantic-reviewer",
+                "version": 1,
+                "manifest": {
+                    "description": "Reviews change sets with semantic ranking.",
+                    "when_to_use": ["when a vector query should find this agent"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let agent = orchestration::agents::types::AgentRef {
+            name: "semantic-reviewer".into(),
+            version: 1,
+        };
+        vector_store
+            .upsert(
+                &route,
+                &embed_queue::agent_component_entity_id(
+                    &agent,
+                    embed_queue::AgentManifestComponent::Primary,
+                ),
+                "h1",
+                vec![1.0, 0.0, 0.0],
+            )
+            .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "orthogonal words".into(),
+            limit: Some(5),
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+            include_vectors: Some(true),
+            query_vector: Some(vec![1.0, 0.0, 0.0]),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["search_mode"], "hybrid");
+        let first = &body["results"][0];
+        assert_eq!(first["name"], "semantic-reviewer");
+        assert!(first["sources"]["vector_primary"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn agent_install_stamps_embeddings_and_distilled_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let artifact = serde_json::json!({
+            "kind": "agent",
+            "name": "distilled-reviewer",
+            "version": 1,
+            "manifest": {
+                "description": "Reviews recurring code patterns.",
+                "when_to_use": ["when recurring review work appears"],
+                "anti_patterns": ["one-off typo fixes"],
+                "brofile_inline": {"provider": "claude"},
+                "provenance": {
+                    "kind": "distilled",
+                    "distilled_by": "badgey-01",
+                    "evidence_session_ids": ["session:claude:sess-1"],
+                    "created_from_threads": ["thread:thread-abc"],
+                    "accept_count": 1,
+                    "reject_count": 0
+                }
+            }
+        });
+        rt.block_on(install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "distilled-reviewer.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            artifact,
+        ))
+        .unwrap();
+
+        let stored = server
+            .state
+            .artifacts
+            .read()
+            .load_artifact_value(artifacts::ArtifactKind::Agent, "distilled-reviewer")
+            .unwrap()
+            .unwrap();
+        let embedding = &stored["manifest"]["embedding"];
+        assert_eq!(
+            embedding["components"]["primary"],
+            "agent_embed:distilled-reviewer:v1:primary"
+        );
+        assert_eq!(
+            embedding["components"]["when_to_use"],
+            "agent_embed:distilled-reviewer:v1:when_to_use"
+        );
+        assert_eq!(
+            embedding["components"]["anti_patterns"],
+            "agent_embed:distilled-reviewer:v1:anti_patterns"
+        );
+
+        let agent_ref = entity_ref::EntityRef::Agent {
+            name: "distilled-reviewer".into(),
+            version: 1,
+        };
+        let edge_index = server.state.edge_index.read();
+        let edges = edge_index.forward_edges_filtered(&agent_ref, &["DERIVED_FROM"]);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|edge| {
+            edge.target
+                == entity_ref::EntityRef::Session {
+                    provider: "claude".into(),
+                    session_id: "sess-1".into(),
+                }
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge.target
+                == entity_ref::EntityRef::Thread {
+                    thread_id: "thread-abc".into(),
+                }
+        }));
+    }
+
+    #[test]
+    fn bro_agent_search_limit_caps_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        for i in 0..5 {
+            cat.install_value(
+                artifacts::ArtifactKind::Agent,
+                format!("agent{i}.json"),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": format!("search-agent-{i}"),
+                    "version": 1,
+                    "manifest": {
+                        "description": format!("Agent {i} for testing search functionality."),
+                        "when_to_use": ["when testing search"],
+                        "brofile_inline": {"provider": "claude"},
+                    },
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "testing search".into(),
+            limit: Some(2),
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert!(body["results"].as_array().unwrap().len() <= 2);
+    }
+
+    #[test]
+    fn bro_agent_search_empty_query_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "  ".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("query is required"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_search_default_excludes_anti_pattern_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "ap-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "deploy-bot",
+                "version": 1,
+                "manifest": {
+                    "description": "Deploys code to production.",
+                    "when_to_use": ["when deploying to production"],
+                    "anti_patterns": ["deploying untested code"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "deploy untested code".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let results = body["results"].as_array().unwrap();
+        assert!(
+            results.is_empty(),
+            "anti-pattern match should be excluded by default: {results:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_search_include_anti_pattern_returns_matched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "ap-agent2.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "deploy-bot-2",
+                "version": 1,
+                "manifest": {
+                    "description": "Deploys code to production safely.",
+                    "when_to_use": ["when deploying to production"],
+                    "anti_patterns": ["deploying untested code"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "deploy untested code".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: Some(false),
+            include_vectors: None,
+            query_vector: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let results = body["results"].as_array().unwrap();
+        assert!(
+            !results.is_empty(),
+            "should return result when exclude=false"
+        );
+        let matched_ap = results[0]["matched_anti_patterns"].as_array().unwrap();
+        assert!(
+            matched_ap
+                .iter()
+                .any(|v| v.as_str().unwrap().contains("untested")),
+            "matched_anti_patterns should include the matching anti-pattern: {matched_ap:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_search_inactive_agents_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "active.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "active-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "An active search test agent.",
+                    "when_to_use": ["when testing"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "retired-v1.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "retired-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "A retired search test agent.",
+                    "when_to_use": ["when testing"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "replacement-v2.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "retired-agent",
+                "version": 2,
+                "manifest": {
+                    "description": "An active replacement search test agent.",
+                    "when_to_use": ["when testing"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            Some("retired-agent".to_string()),
+        )
+        .unwrap();
+
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "search test agent".into(),
+            limit: None,
+            cost_class: None,
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let results = body["results"].as_array().unwrap();
+        let retired_entries: Vec<_> = results
+            .iter()
+            .filter(|r| r["name"].as_str() == Some("retired-agent"))
+            .collect();
+        assert_eq!(
+            retired_entries.len(),
+            1,
+            "only v2 of retired-agent should appear"
+        );
+        assert_eq!(retired_entries[0]["version"], "2");
+        assert!(
+            results
+                .iter()
+                .any(|r| r["name"].as_str() == Some("active-agent")),
+            "active-agent should appear: {results:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_search_invalid_cost_class_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let result = server.bro_agent_search(Parameters(AgentSearchParams {
+            query: "test".into(),
+            limit: None,
+            cost_class: Some("invalid".into()),
+            provenance_kind: None,
+            exclude_anti_pattern_matches: None,
+            include_vectors: None,
+            query_vector: None,
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("invalid cost_class"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_dispatch_agent_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "nonexistent".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("agent not found"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_dispatch_inactive_agent_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "v1.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "inactive-dispatch",
+                "version": 1,
+                "manifest": {
+                    "description": "Test agent.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "v2.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "inactive-dispatch",
+                "version": 2,
+                "manifest": {
+                    "description": "Replacement.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            Some("inactive-dispatch".to_string()),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "inactive-dispatch@v1".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("not active") || text.contains("agent not found"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_adapter_unavailable_hard_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "badgey.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "badgey-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Badgey agent.",
+                    "dispatch_adapter": "badgey",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "badgey-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("adapter_unavailable"),
+            "should hard-fail with adapter_unavailable: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bro_agent_dispatch_noop_adapter_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "noop-dispatch.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "noop-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Noop test agent.",
+                    "dispatch_adapter": "noop",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        struct NoopAdapter;
+        impl orchestration::agents::adapter::AgentDispatchAdapter for NoopAdapter {
+            fn name(&self) -> &'static str {
+                "noop"
+            }
+            fn dispatch(
+                &self,
+                _manifest: &orchestration::agents::types::AgentManifest,
+                _args: serde_json::Value,
+                ctx: orchestration::agents::adapter::DispatchContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                orchestration::agents::adapter::AgentDispatchResult,
+                                orchestration::agents::adapter::AgentDispatchError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let caller_provider = ctx.caller_provider.clone().unwrap_or_default();
+                let caller_session_id = ctx.caller_session_id.clone().unwrap_or_default();
+                Box::pin(async move {
+                    Ok(orchestration::agents::adapter::AgentDispatchResult {
+                        session: orchestration::agents::types::AgentSession {
+                            session_id: format!("{caller_provider}/{caller_session_id}"),
+                            provider: "test".into(),
+                            project_dir: None,
+                            agent: orchestration::agents::types::AgentRef {
+                                name: "noop-agent".into(),
+                                version: 1,
+                            },
+                            task_id: Some("test-task-456".into()),
+                        },
+                        resolved_brofile: None,
+                        merged_filters: orchestration::agents::types::MergedFilters::default(),
+                        degraded: None,
+                    })
+                })
+            }
+        }
+        server
+            .state
+            .agent_adapter_registry
+            .write()
+            .register(std::sync::Arc::new(NoopAdapter));
+
+        let result = server
+            .bro_agent_dispatch(Parameters(AgentDispatchParams {
+                agent: "noop-agent".into(),
+                args: serde_json::json!({"prompt": "hello"}),
+                project_dir: None,
+                bro: None,
+                ambient: None,
+                caller_provider: Some("claude".into()),
+                caller_session_id: Some("caller-session-789".into()),
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["session"]["session_id"], "claude/caller-session-789");
+        assert_eq!(body["task_id"], "test-task-456");
+    }
+
+    #[tokio::test]
+    async fn bro_agent_dispatch_handle_shape_reference_agent_noop_adapter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let mut diff_narrator: serde_json::Value =
+            serde_json::from_str(include_str!("../examples/agents/diff-narrator.json")).unwrap();
+        diff_narrator["manifest"]["dispatch_adapter"] = serde_json::json!("noop-ref");
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "diff-narrator-ref.json".into(),
+            &diff_narrator,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        struct RefNoopAdapter;
+        impl orchestration::agents::adapter::AgentDispatchAdapter for RefNoopAdapter {
+            fn name(&self) -> &'static str {
+                "noop-ref"
+            }
+            fn dispatch(
+                &self,
+                manifest: &orchestration::agents::types::AgentManifest,
+                _args: serde_json::Value,
+                ctx: orchestration::agents::adapter::DispatchContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                orchestration::agents::adapter::AgentDispatchResult,
+                                orchestration::agents::adapter::AgentDispatchError,
+                            >,
+                        > + Send,
+                >,
+            > {
+                let description = manifest.description.clone();
+                Box::pin(async move {
+                    Ok(orchestration::agents::adapter::AgentDispatchResult {
+                        session: orchestration::agents::types::AgentSession {
+                            session_id: format!("ref-session-{description}"),
+                            provider: "stub-provider".into(),
+                            project_dir: ctx.project_dir.clone(),
+                            agent: orchestration::agents::types::AgentRef {
+                                name: "diff-narrator".into(),
+                                version: 1,
+                            },
+                            task_id: Some(format!("ref-task-{description}")),
+                        },
+                        resolved_brofile: Some("diff-narrator-inline-brofile".into()),
+                        merged_filters: orchestration::agents::types::MergedFilters {
+                            allow: vec!["mcp__blackbox__bbox_*".into()],
+                            disallow: vec![],
+                        },
+                        degraded: None,
+                    })
+                })
+            }
+        }
+        server
+            .state
+            .agent_adapter_registry
+            .write()
+            .register(std::sync::Arc::new(RefNoopAdapter));
+
+        let result = server
+            .bro_agent_dispatch(Parameters(AgentDispatchParams {
+                agent: "diff-narrator".into(),
+                args: serde_json::json!({"diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new"}),
+                project_dir: Some("/tmp/test".into()),
+                bro: None,
+                ambient: None,
+                caller_provider: None,
+                caller_session_id: None,
+            }))
+            .await;
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "bro_agent_dispatch should succeed: {}",
+            extract_text(&result)
+        );
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+
+        // Verify handle shape: every field the agent-system.md 5.3 contract requires
+        assert!(body["session"].is_object(), "should have session object");
+        assert!(
+            body["session"]["session_id"].is_string(),
+            "session.session_id must be a string"
+        );
+        assert!(
+            !body["session"]["session_id"].as_str().unwrap().is_empty(),
+            "session_id must be non-empty"
+        );
+        assert_eq!(
+            body["session"]["provider"], "stub-provider",
+            "session.provider should match adapter output"
+        );
+        assert_eq!(
+            body["session"]["project_dir"], "/tmp/test",
+            "session.project_dir should echo DispatchContext"
+        );
+        assert!(
+            body["session"]["agent"].is_object(),
+            "session.agent must be an object"
+        );
+        assert_eq!(
+            body["session"]["agent"]["name"], "diff-narrator",
+            "agent.name should be diff-narrator"
+        );
+        assert_eq!(
+            body["session"]["agent"]["version"], 1,
+            "agent.version should be 1"
+        );
+        assert!(
+            body["session"]["task_id"].is_string(),
+            "session.task_id must be a string"
+        );
+        assert!(
+            !body["session"]["task_id"].as_str().unwrap().is_empty(),
+            "session.task_id must be non-empty"
+        );
+        assert!(
+            body["task_id"].is_string(),
+            "top-level task_id must be a string"
+        );
+        assert!(
+            !body["task_id"].as_str().unwrap().is_empty(),
+            "top-level task_id must be non-empty"
+        );
+        assert_eq!(
+            body["task_id"], body["session"]["task_id"],
+            "top-level task_id should match session.task_id"
+        );
+        assert!(
+            body["resolved_brofile"].is_string(),
+            "resolved_brofile should be present"
+        );
+        assert!(
+            body["merged_filters"].is_object(),
+            "merged_filters should be an object"
+        );
+        assert!(
+            body["degraded"].is_null(),
+            "degraded should be null for successful dispatch"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_unparseable_manifest_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "broken-dispatch.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "broken-dispatch",
+                "version": 1,
+                "manifest": 42,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "broken-dispatch".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("unparseable manifest"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_dispatch_no_brofile_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "no-brofile.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "no-brofile-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent without brofile.",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "no-brofile-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("neither brofile_ref nor brofile_inline"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn expand_template_substitutes_args() {
+        let tmpl = "Review {{diff}} for {{focus}} issues.";
+        let args = serde_json::json!({"diff": "abc123", "focus": "security"});
+        let result = BlackboxServer::expand_template(tmpl, &args);
+        assert_eq!(result, "Review abc123 for security issues.");
+    }
+
+    #[test]
+    fn bro_agent_dispatch_invalid_inline_provider_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "bad-prov.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "bad-provider-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with bad provider.",
+                    "brofile_inline": {"provider": "nonexistent_provider_xyz"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "bad-provider-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("unknown_provider") && text.contains("nonexistent_provider_xyz"),
+            "should report unknown provider: {text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_args_validation_missing_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "schema-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "schema-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with input schema.",
+                    "brofile_inline": {"provider": "claude"},
+                    "inputs": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["diff", "focus"],
+                        },
+                        "prompt_template": "Review {{diff}} for {{focus}} issues."
+                    },
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "schema-agent".into(),
+            args: serde_json::json!({"diff": "abc123"}),
+            project_dir: None,
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("schema_validation_failed") && text.contains("focus"),
+            "should report schema validation failure for 'focus': {text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_args_type_mismatch_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "typed-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "typed-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with typed schema.",
+                    "brofile_inline": {"provider": "claude"},
+                    "inputs": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "diff": {"type": "string"}
+                            },
+                            "required": ["diff"],
+                        },
+                        "prompt_template": "Review {{diff}}."
+                    },
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "typed-agent".into(),
+            args: serde_json::json!({"diff": 123}),
+            project_dir: None,
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("schema_validation_failed"),
+            "should reject wrong type: {text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_schema_202012_prefix_items_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "tuple-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "tuple-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with 2020-12 prefixItems schema.",
+                    "brofile_inline": {"provider": "claude"},
+                    "inputs": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "coords": {
+                                    "type": "array",
+                                    "prefixItems": [
+                                        {"type": "number"},
+                                        {"type": "number"}
+                                    ]
+                                }
+                            },
+                            "required": ["coords"],
+                        },
+                        "prompt_template": "Plot {{coords}}."
+                    },
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "tuple-agent".into(),
+            args: serde_json::json!({"coords": ["not-a-number", 2]}),
+            project_dir: None,
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("schema_validation_failed"),
+            "should reject via prefixItems: {text}"
+        );
+    }
+
+    #[test]
+    fn bbox_describe_schema_includes_installed_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "schema-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "schema-tester",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent for schema test.",
+                    "when_to_use": ["use when testing schema"],
+                    "anti_patterns": ["do not use in prod"],
+                    "brofile_inline": {"provider": "claude"},
+                    "cost_class": "normal",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "badgey-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "badgey-agent",
+                "version": 3,
+                "manifest": {
+                    "description": "Badgey-backed agent.",
+                    "brofile_inline": {"provider": "claude"},
+                    "cost_class": "cheap",
+                    "dispatch_adapter": "badgey",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        drop(cat);
+
+        let result = server.bbox_describe_schema();
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let agents = body["agents"].as_array().expect("agents array");
+        assert_eq!(agents.len(), 2);
+        let schema_tester = agents
+            .iter()
+            .find(|a| a["name"] == "schema-tester")
+            .unwrap();
+        assert_eq!(schema_tester["version"].as_str(), Some("1"));
+        assert_eq!(schema_tester["cost_class"].as_str(), Some("normal"));
+        assert_eq!(schema_tester["when_to_use"].as_array().unwrap().len(), 1);
+        assert_eq!(schema_tester["anti_patterns"].as_array().unwrap().len(), 1);
+        assert!(schema_tester["dispatch_adapter"].is_null());
+
+        let badgey = agents.iter().find(|a| a["name"] == "badgey-agent").unwrap();
+        assert_eq!(badgey["dispatch_adapter"].as_str(), Some("badgey"));
+        assert_eq!(
+            badgey["when_to_use"]
+                .as_array()
+                .expect("when_to_use always present"),
+            &Vec::<serde_json::Value>::new(),
+            "badgey-agent has empty when_to_use but field must be present"
+        );
+        assert_eq!(
+            badgey["anti_patterns"]
+                .as_array()
+                .expect("anti_patterns always present"),
+            &Vec::<serde_json::Value>::new(),
+            "badgey-agent has empty anti_patterns but field must be present"
+        );
+
+        let by_adapter = body["agents_by_dispatch_adapter"]
+            .as_object()
+            .expect("agents_by_dispatch_adapter object");
+        assert_eq!(by_adapter["direct"].as_array().unwrap().len(), 1);
+        assert_eq!(by_adapter["badgey"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bro_agent_dispatch_bro_label_stamped_on_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "labeled.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "labeled-agent",
+                "version": 3,
+                "manifest": {
+                    "description": "Agent whose bro_label should be stamped.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "labeled-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(
+            body["agentLabel"].as_str(),
+            Some("agent:labeled-agent@v3"),
+            "response should carry agentLabel: {body}"
+        );
+        let task_id = body["task_id"].as_str().unwrap();
+        let task = server.state.task_store.read().get(task_id).unwrap();
+        let label = task.inner.lock().bro_label.clone();
+        assert_eq!(
+            label.as_deref(),
+            Some("agent:labeled-agent@v3"),
+            "bro_label should be stamped: {label:?}"
+        );
+        let agent_lbl = task.inner.lock().agent_label.clone();
+        assert_eq!(
+            agent_lbl.as_deref(),
+            Some("agent:labeled-agent@v3"),
+            "agent_label should be stamped: {agent_lbl:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_with_bro_preserves_agent_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "bro-dispatch.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "bro-dispatch-agent",
+                "version": 2,
+                "manifest": {
+                    "description": "Agent dispatched with bro=.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "bro-dispatch-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            bro: Some("some-bro".into()),
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = body["task_id"].as_str().unwrap();
+        let task = server.state.task_store.read().get(task_id).unwrap();
+        let inner = task.inner.lock();
+        let bro_lbl = inner.bro_label.clone();
+        assert_eq!(
+            bro_lbl.as_deref(),
+            Some("some-bro"),
+            "bro_label should be the named bro: {bro_lbl:?}"
+        );
+        let agent_lbl = inner.agent_label.clone();
+        assert_eq!(
+            agent_lbl.as_deref(),
+            Some("agent:bro-dispatch-agent@v2"),
+            "agent_label should preserve agent attribution: {agent_lbl:?}"
+        );
+    }
+
+    #[test]
+    fn bro_dashboard_emits_agent_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "dash-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "dash-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent for dashboard test.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "dash-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+        })));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = body["task_id"].as_str().unwrap();
+
+        let dash = server.bro_dashboard(Parameters(DashboardParams {
+            limit: Some(20),
+            provider: None,
+            status: None,
+            team: None,
+        }));
+        let dash_body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+        let tasks = dash_body["tasks"].as_array().unwrap();
+        let found = tasks.iter().find(|t| t["taskId"].as_str() == Some(task_id));
+        assert!(found.is_some(), "task should appear in dashboard");
+        let entry = found.unwrap();
+        assert_eq!(
+            entry["agentLabel"].as_str(),
+            Some("agent:dash-agent@v1"),
+            "dashboard entry should carry agentLabel: {entry}"
+        );
+        assert_eq!(
+            entry["broLabel"].as_str(),
+            Some("agent:dash-agent@v1"),
+            "dashboard entry should carry broLabel: {entry}"
+        );
+        let agent_metrics = &dash_body["agents"]["agent:dash-agent@v1"];
+        assert_eq!(agent_metrics["dispatch_count"].as_u64(), Some(1));
+        assert_eq!(agent_metrics["success_count"].as_u64(), Some(0));
+        assert_eq!(agent_metrics["failure_count"].as_u64(), Some(0));
     }
 }

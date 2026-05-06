@@ -1,0 +1,79 @@
+{
+  "kind": "agent",
+  "name": "code-reviewer",
+  "version": 1,
+  "manifest": {
+    "description": "Reviews code diffs for security, correctness, and style violations with structured severity-tagged findings.",
+    "when_to_use": [
+      "after writing or modifying code, before committing",
+      "when the user explicitly asks for a code review",
+      "on pull request creation or update"
+    ],
+    "anti_patterns": [
+      "do not use for one-line typo fixes",
+      "do not use for greenfield design discussions",
+      "do not use when the user only wants formatting changes"
+    ],
+    "brofile_ref": "code-reviewer-persona",
+    "filter_overlay": {
+      "allow": ["mcp__blackbox__bbox_*", "Read", "Grep", "Glob"],
+      "disallow": ["Bash"]
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "diff": {
+            "type": "string",
+            "description": "Unified diff to review"
+          },
+          "context_refs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional file paths for additional context"
+          }
+        },
+        "required": ["diff"]
+      },
+      "prompt_template": "Review the following diff:\n\n{{diff}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "verdict": { "enum": ["approve", "revise", "reject"] },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "severity": { "enum": ["critical", "high", "medium", "low"] },
+                "file": { "type": "string" },
+                "line": { "type": "integer" },
+                "message": { "type": "string" }
+              },
+              "required": ["severity", "message"]
+            }
+          },
+          "citations": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["verdict", "findings"]
+      },
+      "evidence_density": "high"
+    },
+    "composition": {
+      "chainable_after": ["diff-narrator"],
+      "parallel_safe": true,
+      "fan_out_aggregator": "vote-majority"
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-reference",
+      "created_at": "2026-05-06T12:00:00Z"
+    }
+  }
+}

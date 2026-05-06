@@ -43,10 +43,11 @@ pub enum Bucket {
     GitMessage,
     Notes,
     Threads,
+    AgentManifest,
 }
 
 impl Bucket {
-    pub const ALL: [Bucket; 7] = [
+    pub const ALL: [Bucket; 8] = [
         Bucket::Knowledge,
         Bucket::Code,
         Bucket::Docs,
@@ -54,6 +55,7 @@ impl Bucket {
         Bucket::GitMessage,
         Bucket::Notes,
         Bucket::Threads,
+        Bucket::AgentManifest,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -65,6 +67,7 @@ impl Bucket {
             Self::GitMessage => "git_message",
             Self::Notes => "notes",
             Self::Threads => "threads",
+            Self::AgentManifest => "agent_manifest",
         }
     }
 }
@@ -144,6 +147,7 @@ pub struct RoutesConfig {
     pub git_message: Option<String>,
     pub notes: Option<String>,
     pub threads: Option<String>,
+    pub agent_manifest: Option<String>,
     #[serde(default)]
     pub per_project: BTreeMap<String, BucketRoutes>,
 }
@@ -157,6 +161,7 @@ pub struct BucketRoutes {
     pub git_message: Option<String>,
     pub notes: Option<String>,
     pub threads: Option<String>,
+    pub agent_manifest: Option<String>,
 }
 
 impl BucketRoutes {
@@ -169,6 +174,7 @@ impl BucketRoutes {
             Bucket::GitMessage => self.git_message.as_deref(),
             Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
+            Bucket::AgentManifest => self.agent_manifest.as_deref(),
         }
     }
 }
@@ -183,6 +189,7 @@ impl RoutesConfig {
             Bucket::GitMessage => self.git_message.as_deref(),
             Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
+            Bucket::AgentManifest => self.agent_manifest.as_deref(),
         }
     }
 }
@@ -272,6 +279,93 @@ impl EmbeddingRouter {
 
 pub fn route_for(bucket: Bucket, project_id: Option<&str>) -> Result<Box<dyn EmbeddingProvider>> {
     EmbeddingRouter::load_default()?.route_for(bucket, project_id)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClusterId {
+    pub id: String,
+    pub members: Vec<EntityRef>,
+}
+
+pub(crate) fn embed_iterate_internal(
+    bucket: &str,
+    project_id: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<impl Iterator<Item = (EntityRef, Vec<f32>)>> {
+    let route = internal_bucket_route(bucket, project_id)?;
+    let rows = crate::vectors::iter_active(&route, since)?
+        .filter_map(|entry| {
+            vector_entity_ref(&entry.entity_id).map(|entity| (entity, entry.vector))
+        })
+        .collect::<Vec<_>>();
+    Ok(rows.into_iter())
+}
+
+pub(crate) fn cluster_neighbors_within(
+    bucket: &str,
+    project_id: &str,
+    similarity_threshold: f32,
+) -> Result<Vec<ClusterId>> {
+    let route = internal_bucket_route(bucket, project_id)?;
+    let clusters = crate::vectors::cluster_neighbors_within_route(&route, similarity_threshold)?
+        .into_iter()
+        .filter_map(|cluster| {
+            let members = cluster
+                .members
+                .iter()
+                .filter_map(|raw| vector_entity_ref(raw))
+                .collect::<Vec<_>>();
+            if members.len() < 2 {
+                None
+            } else {
+                Some(ClusterId {
+                    id: cluster.id,
+                    members,
+                })
+            }
+        })
+        .collect();
+    Ok(clusters)
+}
+
+fn internal_bucket_route(bucket: &str, project_id: &str) -> Result<String> {
+    let bucket = bucket_from_str(bucket)?;
+    let project = if project_id.trim().is_empty() {
+        None
+    } else {
+        Some(project_id.trim())
+    };
+    Ok(EmbeddingRouter::load_default()?
+        .route(bucket, project)?
+        .vector_route_id())
+}
+
+fn bucket_from_str(bucket: &str) -> Result<Bucket> {
+    let bucket = bucket.trim();
+    Bucket::ALL
+        .iter()
+        .copied()
+        .find(|candidate| candidate.as_str() == bucket)
+        .with_context(|| {
+            format!(
+                "unknown embedding bucket `{bucket}`; expected one of: {}",
+                Bucket::ALL
+                    .iter()
+                    .map(|candidate| candidate.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn vector_entity_ref(raw: &str) -> Option<EntityRef> {
+    if let Some((agent, _component)) = crate::embed_queue::parse_agent_component_entity_id(raw) {
+        return Some(EntityRef::Agent {
+            name: agent.name,
+            version: agent.version,
+        });
+    }
+    EntityRef::parse(raw).ok()
 }
 
 pub fn config_path() -> PathBuf {
@@ -367,6 +461,34 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
         })
 }
 
+fn count_reembed_entities(state: &Arc<SharedState>, buckets: &[Bucket]) -> Result<usize> {
+    let knowledge_count = if buckets.contains(&Bucket::Knowledge) {
+        state.kb.read().all_entries().len()
+    } else {
+        0
+    };
+    let note_count = if buckets.contains(&Bucket::Notes) {
+        state.notes.read().all().len()
+    } else {
+        0
+    };
+    let agent_count = if buckets.contains(&Bucket::AgentManifest) {
+        count_agent_manifest_components(state)?
+    } else {
+        0
+    };
+    let doc_types = reembed_index_doc_types(buckets);
+    let docs = if !doc_types.is_empty() {
+        state
+            .idx
+            .read()
+            .embedding_source_docs_for_doc_types(&doc_types, None)?
+    } else {
+        Vec::new()
+    };
+    Ok(knowledge_count + note_count + agent_count + count_reembed_index_docs(buckets, &docs))
+}
+
 fn enqueue_reembed_routes(
     state: &Arc<SharedState>,
     buckets: &[Bucket],
@@ -402,6 +524,13 @@ fn enqueue_reembed_routes(
             enqueued += 1;
         }
     }
+    if buckets.contains(&Bucket::AgentManifest) {
+        let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
+        enqueued += enqueue_agent_manifest_artifacts(state, remaining)?;
+        if limit_reached(max_entities, enqueued) {
+            return Ok(enqueued);
+        }
+    }
     let doc_types = reembed_index_doc_types(buckets);
     if !doc_types.is_empty() {
         let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
@@ -410,6 +539,70 @@ fn enqueue_reembed_routes(
             .read()
             .embedding_source_docs_for_doc_types(&doc_types, remaining)?;
         enqueued += enqueue_reembed_index_docs(buckets, &docs, remaining);
+    }
+    Ok(enqueued)
+}
+
+fn count_agent_manifest_components(state: &Arc<SharedState>) -> Result<usize> {
+    let catalog = state.artifacts.read();
+    let entries = catalog.list(&crate::artifacts::ArtifactListParams {
+        kind: Some(crate::artifacts::ArtifactKind::Agent),
+        name: None,
+        include_superseded: true,
+    })?;
+    let mut count = 0usize;
+    for entry in entries {
+        let Some(value) =
+            catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
+        else {
+            continue;
+        };
+        let manifest_value = value.get("manifest").unwrap_or(&value);
+        let Ok(manifest) = serde_json::from_value::<
+            crate::orchestration::agents::types::AgentManifest,
+        >(manifest_value.clone()) else {
+            continue;
+        };
+        count += crate::embed_queue::agent_manifest_component_count(&manifest);
+    }
+    Ok(count)
+}
+
+fn enqueue_agent_manifest_artifacts(
+    state: &Arc<SharedState>,
+    max_entities: Option<usize>,
+) -> Result<usize> {
+    let catalog = state.artifacts.read();
+    let entries = catalog.list(&crate::artifacts::ArtifactListParams {
+        kind: Some(crate::artifacts::ArtifactKind::Agent),
+        name: None,
+        include_superseded: true,
+    })?;
+    let mut enqueued = 0usize;
+    for entry in entries {
+        if limit_reached(max_entities, enqueued) {
+            break;
+        }
+        let Some(value) =
+            catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
+        else {
+            continue;
+        };
+        let manifest_value = value.get("manifest").unwrap_or(&value);
+        let Ok(manifest) = serde_json::from_value::<
+            crate::orchestration::agents::types::AgentManifest,
+        >(manifest_value.clone()) else {
+            continue;
+        };
+        let Ok(version) = entry.version.parse::<u32>() else {
+            continue;
+        };
+        let agent = crate::orchestration::agents::types::AgentRef {
+            name: entry.name,
+            version,
+        };
+        enqueued += crate::embed_queue::agent_manifest_component_count(&manifest);
+        crate::embed_queue::enqueue_agent_manifest(&agent, &manifest);
     }
     Ok(enqueued)
 }
@@ -466,7 +659,7 @@ fn enqueue_reembed_index_docs(
                 crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content);
                 enqueued += 1;
             }
-            Bucket::Knowledge | Bucket::Notes | Bucket::Threads => {}
+            Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => {}
         }
     }
     enqueued
@@ -657,6 +850,49 @@ threads = "ollama"
     }
 
     #[test]
+    fn embed_iterate_internal_respects_since_and_entity_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::vectors::VectorStore::open(dir.path()).unwrap());
+        let _guard = crate::vectors::install_test_global(store.clone());
+        let route = EmbeddingRouter::default()
+            .route(Bucket::Transcripts, None)
+            .unwrap()
+            .vector_route_id();
+        store
+            .upsert(
+                &route,
+                "transcript:claude:old-session:1:0",
+                "old",
+                vec![1.0, 0.0],
+            )
+            .unwrap();
+        let cutoff = chrono::Utc::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .upsert(
+                &route,
+                "transcript:claude:new-session:2:0",
+                "new",
+                vec![0.0, 1.0],
+            )
+            .unwrap();
+
+        let rows = embed_iterate_internal("transcripts", "", Some(cutoff))
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].0,
+            EntityRef::Transcript {
+                provider: "claude".into(),
+                session_id: "new-session".into(),
+                line_offset: 2,
+                event_idx: 0,
+            }
+        );
+    }
+
+    #[test]
     fn reembed_index_doc_types_only_selects_needed_sources() {
         assert_eq!(
             reembed_index_doc_types(&[Bucket::Knowledge]),
@@ -669,6 +905,52 @@ threads = "ollama"
         assert_eq!(
             reembed_index_doc_types(&[Bucket::Code, Bucket::Docs, Bucket::GitMessage]),
             vec!["project_file", "commit"]
+        );
+    }
+
+    #[test]
+    fn cluster_neighbors_within_returns_bounded_entity_clusters() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::vectors::VectorStore::open(dir.path()).unwrap());
+        let _guard = crate::vectors::install_test_global(store.clone());
+        let route = EmbeddingRouter::default()
+            .route(Bucket::AgentManifest, None)
+            .unwrap()
+            .vector_route_id();
+        store
+            .upsert(
+                &route,
+                "agent_embed:reviewer:v1:primary",
+                "a",
+                vec![1.0, 0.0],
+            )
+            .unwrap();
+        store
+            .upsert(
+                &route,
+                "agent_embed:copywriter:v1:primary",
+                "b",
+                vec![1.0, 0.0],
+            )
+            .unwrap();
+        store
+            .upsert(&route, "agent_embed:writer:v1:primary", "c", vec![0.0, 1.0])
+            .unwrap();
+
+        let clusters = cluster_neighbors_within("agent_manifest", "", 0.99).unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(
+            clusters[0].members,
+            vec![
+                EntityRef::Agent {
+                    name: "copywriter".into(),
+                    version: 1,
+                },
+                EntityRef::Agent {
+                    name: "reviewer".into(),
+                    version: 1,
+                }
+            ]
         );
     }
 }

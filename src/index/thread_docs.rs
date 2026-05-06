@@ -192,10 +192,7 @@ mod tests {
         };
         let doc = build_thread_doc(&thread, Path::new("/tmp/threads.json"), fields);
         assert_eq!(first_text(&doc, fields.doc_type), "thread");
-        assert_eq!(
-            first_text(&doc, fields.entity_id),
-            "thread:thread-abc12345"
-        );
+        assert_eq!(first_text(&doc, fields.entity_id), "thread:thread-abc12345");
         let content = first_text(&doc, fields.content);
         assert!(content.contains("handoff marker"));
         assert!(content.contains("inline note marker"));

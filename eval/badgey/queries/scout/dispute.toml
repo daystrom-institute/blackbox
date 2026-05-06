@@ -1,0 +1,11 @@
+id = "badgey-scout-003"
+mode = "scout"
+query = "Scout for contradictory evidence before Badgey escalates a dispute."
+required_entity_refs = ["knowledge:badgey-disputes"]
+required_citation_kinds = ["knowledge"]
+narrative_must_contain = ["contradictory", "dispute"]
+
+[[required_path_edges]]
+from = "knowledge:badgey-disputes"
+edge = "CONTRADICTS"
+to = "thread:badgey-dispute"

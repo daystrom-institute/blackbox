@@ -8,6 +8,8 @@ pub struct SlabEntry {
     pub entity_id: String,
     pub content_hash: String,
     pub vector: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upserted_at: Option<String>,
     pub active: bool,
 }
 
@@ -104,6 +106,21 @@ impl VectorSlab {
         content_hash: &str,
         vector: Vec<f32>,
     ) -> Result<bool> {
+        self.upsert_at(
+            entity_id,
+            content_hash,
+            vector,
+            Some(chrono::Utc::now().to_rfc3339()),
+        )
+    }
+
+    pub fn upsert_at(
+        &mut self,
+        entity_id: &str,
+        content_hash: &str,
+        vector: Vec<f32>,
+        upserted_at: Option<String>,
+    ) -> Result<bool> {
         if self.dims == 0 {
             self.dims = vector.len();
         }
@@ -129,6 +146,7 @@ impl VectorSlab {
             entity_id: entity_id.to_string(),
             content_hash: content_hash.to_string(),
             vector,
+            upserted_at,
             active: true,
         });
         self.active_index.insert(entity_id.to_string(), new_idx);

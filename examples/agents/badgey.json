@@ -1,0 +1,42 @@
+{
+  "kind": "agent",
+  "name": "badgey",
+  "version": 1,
+  "_contract": "dispatch_adapter 'badgey' owns lifecycle; the inline brofile below serves as identity/documentation/fallback-persona and is NOT used for direct dispatch when the adapter is registered.",
+  "manifest": {
+    "description": "Consultant-flavored agent that proposes knowledge entries, brofile lenses, rule packets, workflow arcs, and agent manifests distilled from recurring patterns in the transcript corpus.",
+    "when_to_use": [
+      "when you want the system to learn from recurring task patterns",
+      "for periodic knowledge maintenance and distillation",
+      "to propose new agents based on observed workflows"
+    ],
+    "anti_patterns": [
+      "do not use for one-off tasks that don't recur",
+      "do not use when you need immediate synchronous results",
+      "badgey is long-running and asynchronous by design"
+    ],
+    "brofile_inline": {
+      "_note": "documentation persona — adapter dispatch (badgey) takes precedence when registered",
+      "provider": "claude",
+      "model": "sonnet-4.6",
+      "effort": "medium",
+      "lens": "You are badgey, a consultant-flavored agent. You observe recurring patterns across transcript sessions, distill them into reusable artifacts (knowledge entries, brofile lenses, rule packets, workflows, agent manifests), and propose them for user approval."
+    },
+    "dispatch_adapter": "badgey",
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "prompt": { "type": "string" },
+          "badgey_id": { "type": "string" }
+        }
+      }
+    },
+    "cost_class": "expensive",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-reference",
+      "created_at": "2026-05-06T12:00:00Z"
+    }
+  }
+}

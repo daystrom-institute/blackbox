@@ -1,0 +1,36 @@
+{
+  "name": "agent-cuing-eval-arc",
+  "version": 1,
+  "actors": {},
+  "start": "CueAgent",
+  "vars_schema": {
+    "agent": { "kind": "string", "required": true },
+    "prompt": { "kind": "string", "required": true },
+    "dispatch_handle": { "kind": "any" }
+  },
+  "nodes": {
+    "CueAgent": {
+      "prompt": "Dispatch the selected agent with a cuing prompt and return the task handle.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "${vars.agent}",
+              "args": {
+                "prompt": "${vars.prompt}",
+                "diff": "${vars.prompt}"
+              }
+            },
+            "timeout_secs": 60
+          },
+          "into_var": "dispatch_handle",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

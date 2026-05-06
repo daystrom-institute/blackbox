@@ -1,0 +1,11 @@
+id = "badgey-scout-001"
+mode = "scout"
+query = "Scout two alternative paths that could explain a stale decision."
+required_entity_refs = ["knowledge:badgey-scout"]
+required_citation_kinds = ["knowledge"]
+narrative_must_contain = ["scout", "path"]
+
+[[required_path_edges]]
+from = "knowledge:badgey-scout"
+edge = "DESCRIBES"
+to = "agent:badgey-scout"

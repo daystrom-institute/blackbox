@@ -1,0 +1,24 @@
+{
+  "suite": "agent-cuing",
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "anti-pattern-one-line-typo",
+      "query": "review this one-line typo fix",
+      "agent": "code-reviewer",
+      "expect": "excluded_by_default"
+    },
+    {
+      "id": "chain-diff-narrator-to-reviewer",
+      "query": "first narrate this diff, then review it",
+      "workflow": "agent-chain",
+      "expect": "chainable_after_resolved"
+    },
+    {
+      "id": "badgey-async-cue",
+      "query": "watch for recurring task patterns and propose reusable artifacts later",
+      "agent": "badgey",
+      "expect": "async_adapter_candidate"
+    }
+  ]
+}

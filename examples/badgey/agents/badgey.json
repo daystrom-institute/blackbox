@@ -1,0 +1,55 @@
+{
+  "kind": "agent",
+  "name": "badgey",
+  "version": 1,
+  "manifest": {
+    "description": "Long-lived agentic-corpus consultant that answers, teaches, scouts, and proposes durable workflow, packet, brofile, lens, and agent artifacts from corpus evidence.",
+    "when_to_use": [
+      "when a caller needs help navigating the agentic corpus with evidence bundles",
+      "when a caller wants a teach-mode walkthrough of seed, inspect, traverse, and bundle",
+      "when recurring transcript patterns should become proposed knowledge, brofiles, packets, workflows, or agents"
+    ],
+    "anti_patterns": [
+      "do not use for a direct bbox_* lookup the caller already knows how to perform",
+      "do not use for one-off implementation tasks that do not need corpus navigation",
+      "do not use to apply proposals without explicit user approval"
+    ],
+    "brofile_ref": "badgey-persona",
+    "filter_overlay": {
+      "disallow": ["mcp__blackbox__bro_*"]
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "prompt": { "type": "string" },
+          "badgey_id": { "type": "string" },
+          "mode": { "enum": ["answer", "teach", "scout"] }
+        }
+      },
+      "prompt_template": "{{prompt}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "badgey_id": { "type": "string" },
+          "session_id": { "type": "string" },
+          "mode": { "enum": ["answer", "teach", "scout"] },
+          "entity_refs": { "type": "array", "items": { "type": "string" } },
+          "path_ids": { "type": "array", "items": { "type": "string" } },
+          "proposals": { "type": "array", "items": { "type": "string" } },
+          "degraded": { "type": "object" }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "cost_class": "expensive",
+    "dispatch_adapter": "badgey",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-reference",
+      "created_at": "2026-05-06T12:00:00Z"
+    }
+  }
+}

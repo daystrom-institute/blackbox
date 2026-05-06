@@ -129,14 +129,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_hybrid_search",
         category: ToolCategory::Graph,
-        summary: "Hybrid BM25+vector+path-token search over typed entities. Returns mixed-modal seeds (code, docs, commits, knowledge, transcripts) ranked by RRF fusion, with per-file collapse and modal diversification so top-N covers distinct files and chunk_kinds. Pass `project=<path or project_id>` to scope project_file results to one repo. vector_weight=0.6 by default; set 0.0 for BM25-only, 1.0 for vector-only.",
+        summary: "Hybrid BM25+vector search over typed entities. vector_weight=0.6 by default; set 0.0 for BM25-only behavior, 1.0 for vector-only.",
         when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits — top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes.",
         example: Some(r#"bbox_hybrid_search(query="triad implementation", limit=10, project="/home/me/repos/erlang-test")"#),
     },
     ToolDoc {
         name: "bbox_discover_seed_entities",
         category: ToolCategory::Graph,
-        summary: "Hybrid search variant that emphasizes orientation: returns ranked seeds with their notable_edges (semantic-first prioritization) so you can pick the next inspect target without a separate call.",
+        summary: "Find seed entities with notable_edges; inspect before answering.",
         when_to_use: "Alternate Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`) — same blender as `bbox_hybrid_search` but with `notable_edges` rendered for each seed. Reach for it when the next step will be `bbox_inspect_entity` and you want pre-vetted hops.",
         example: Some(r#"bbox_discover_seed_entities(query="triad closure convergence test", limit=5)"#),
     },
@@ -223,8 +223,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_describe_schema",
         category: ToolCategory::Graph,
-        summary: "Catalog agentic-corpus entity types and edge families. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips.",
-        when_to_use: "Step 1 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use once per session for orientation; cache the schema mentally. Returns 12 entity types + 7 edge families with population counts.",
+        summary: "Catalog agentic-corpus entity types, edge families, and installed agents. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips. Also use for installed-agent discovery: the agents section lists name, version, description, when_to_use, anti_patterns, cost_class, and example invocation for every active agent, grouped by dispatch_adapter.",
+        when_to_use: "Step 1 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use once per session for orientation; cache the schema mentally. Also use before `bbox_inspect_entity`, `bbox_find_paths`, or evidence bundling when you need graph vocabulary, edge filters, or installed-agent discovery.",
         example: Some("bbox_describe_schema()"),
     },
     ToolDoc {
@@ -429,8 +429,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_install",
         category: ToolCategory::Artifacts,
-        summary: "Install a workflow, packet, or brofile artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
-        when_to_use: "Use for producer-side artifacts shipped under examples/agentic-corpus or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, or brofile registry, then records version/source/supersession metadata in the catalog.",
+        summary: "Install a workflow, packet, brofile, or agent artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
+        when_to_use: "Use for producer-side artifacts shipped under examples/agentic-corpus or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, or brofile registry (agent artifacts receive basic JSON validation), then records version/source/supersession metadata in the catalog.",
         example: Some(
             r#"bbox_artifact_install(kind="workflow", source="examples/agentic-corpus/workflows/schema-migration-arc.json")"#,
         ),
@@ -438,7 +438,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_list",
         category: ToolCategory::Artifacts,
-        summary: "List installed workflow, packet, and brofile artifacts with version, source, active status, and supersession metadata.",
+        summary: "List installed workflow, packet, brofile, and agent artifacts with version, source, active status, and supersession metadata.",
         when_to_use: "Inventory check before installing or superseding producer machinery. Use kind/name filters to inspect a specific artifact family.",
         example: Some(r#"bbox_artifact_list(kind="packet")"#),
     },
@@ -446,7 +446,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_artifact_supersede",
         category: ToolCategory::Artifacts,
         summary: "Mark one installed artifact superseded by another artifact of the same kind.",
-        when_to_use: "Use when a customized workflow/packet/brofile replaces an installed version but you want the old version retained for audit.",
+        when_to_use: "Use when a customized workflow/packet/brofile/agent replaces an installed version but you want the old version retained for audit.",
         example: Some(
             r#"bbox_artifact_supersede(kind="workflow", name="auto-digest-arc", superseded_by="auto-digest-arc-v2")"#,
         ),
@@ -520,6 +520,76 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(
             r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#,
         ),
+    },
+    ToolDoc {
+        name: "badgey_exec",
+        category: ToolCategory::Orchestration,
+        summary: "Start a Badgey consultant instance for a project scope and return its badgey_id, provider session, task, and thread-of-record ids.",
+        when_to_use: "Use when you want Badgey to consult over a project with continuity. The wrapper opens a work-item thread, dispatches the badgey brofile, and owns the session mapping. Use `badgey_resume` or `badgey_ask` for follow-up turns.",
+        example: Some(r#"badgey_exec(project_dir="/repo/x", brief="help me navigate the agent graph work")"#),
+    },
+    ToolDoc {
+        name: "badgey_resume",
+        category: ToolCategory::Orchestration,
+        summary: "Send a turn to an existing Badgey instance. Mechanical commands such as `dismiss` are handled by the wrapper before provider resume.",
+        when_to_use: "Use for any follow-up where Badgey should keep its thread-of-record context. Calls are serialized per badgey_id so concurrent callers do not corrupt the provider session.",
+        example: Some(r#"badgey_resume(badgey_id="bg-0123abcd-4567ef89", prompt="teach me why this edge matters")"#),
+    },
+    ToolDoc {
+        name: "badgey_ask",
+        category: ToolCategory::Orchestration,
+        summary: "Question-shaped alias for badgey_resume.",
+        when_to_use: "Use when the caller is asking a direct question of an existing Badgey instance and you prefer `question` over `prompt` in the request shape.",
+        example: Some(r#"badgey_ask(badgey_id="bg-0123abcd-4567ef89", question="what should I inspect next?")"#),
+    },
+    ToolDoc {
+        name: "badgey_dismiss",
+        category: ToolCategory::Orchestration,
+        summary: "Dismiss a Badgey instance, drain queued turns, write a dismiss event, and resolve its thread of record.",
+        when_to_use: "Use when a Badgey consultation is done or should stop accepting turns. After dismissal, new resumes for that badgey_id fail with instance_dismissed.",
+        example: Some(r#"badgey_dismiss(badgey_id="bg-0123abcd-4567ef89", reason="work complete")"#),
+    },
+    ToolDoc {
+        name: "badgey_status",
+        category: ToolCategory::Orchestration,
+        summary: "Inspect one Badgey instance, including queue status and proposals; without badgey_id, returns active instances.",
+        when_to_use: "Use to debug a Badgey consultation, see queue depth, inspect provider/session/thread bindings, or check proposal state before applying.",
+        example: Some(r#"badgey_status(badgey_id="bg-0123abcd-4567ef89")"#),
+    },
+    ToolDoc {
+        name: "badgey_list",
+        category: ToolCategory::Orchestration,
+        summary: "List Badgey instances and their thread/session bindings.",
+        when_to_use: "Use when you need to find active Badgey instances or include dismissed records for audit.",
+        example: Some(r#"badgey_list(include_dismissed=true)"#),
+    },
+    ToolDoc {
+        name: "badgey_scout",
+        category: ToolCategory::Orchestration,
+        summary: "Ask Badgey to author scout sub-charters for a focused question; wrapper post-processing dispatches emitted scout actions.",
+        when_to_use: "Use for bounded fan-out investigation when Badgey should decompose one question into focused scout turns without exposing bro_exec to the Badgey provider session.",
+        example: Some(r#"badgey_scout(badgey_id="bg-0123abcd-4567ef89", charter="compare these two graph paths")"#),
+    },
+    ToolDoc {
+        name: "badgey_collect",
+        category: ToolCategory::Orchestration,
+        summary: "Collect scout/sub-bro events for a Badgey instance or scout id.",
+        when_to_use: "Use after badgey_scout or bg-action-spawn-subbro processing to see whether scout work is still walking or has produced dispatch records.",
+        example: Some(r#"badgey_collect(badgey_id="bg-0123abcd-4567ef89")"#),
+    },
+    ToolDoc {
+        name: "badgey_triage_inbox",
+        category: ToolCategory::Orchestration,
+        summary: "Produce a Badgey-shaped inbox triage proposal sheet for stale/open work in a scope.",
+        when_to_use: "Use for morning-brief triage. The result is a proposal-sheet shape; applying concrete actions still goes through Badgey's proposal gate.",
+        example: Some(r#"badgey_triage_inbox(scope="/repo/x")"#),
+    },
+    ToolDoc {
+        name: "badgey_close_loops",
+        category: ToolCategory::Orchestration,
+        summary: "Classify dispatched tasks without done notes; never synthesizes executor done notes.",
+        when_to_use: "Use for completion-contract audits. Results may identify suspected completions, crashes, or stalls, but the tool does not write kind=done on behalf of executors.",
+        example: Some(r#"badgey_close_loops(window_days=14, project_dir="/repo/x")"#),
     },
     ToolDoc {
         name: "bro_wait",
@@ -740,6 +810,42 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "List installed workflow specs by id.",
         when_to_use: "Inventory check — what workflows can routing verdicts target on this daemon?",
         example: Some("bro_workflow_list()"),
+    },
+    // ── Agents ──────────────────────────────────────────────────
+    ToolDoc {
+        name: "bro_agent_list",
+        category: ToolCategory::Orchestration,
+        summary: "List installed agents from the registry. Optional filters for cost_class, provenance_kind, include_superseded, and limit.",
+        when_to_use: "Discover what agents are available for dispatch, composition, or review. Filter by cost_class to find cheap/expensive agents; use include_superseded=true to see version history.",
+        example: Some(r#"bro_agent_list(include_superseded=true)"#),
+    },
+    ToolDoc {
+        name: "bro_agent_get",
+        category: ToolCategory::Orchestration,
+        summary: "Read full details for a single agent by name or agent-ref (name@vN or agent:name@vN). Returns manifest, metadata, and lifecycle state.",
+        when_to_use: "Inspect a specific agent's manifest (brofile config, filter overlay, inputs/outputs, composition constraints) before dispatching or composing it into a pipeline.",
+        example: Some(r#"bro_agent_get(name="reviewer")"#),
+    },
+    ToolDoc {
+        name: "bro_agent_describe",
+        category: ToolCategory::Orchestration,
+        summary: "Full manifest + resolved brofile + merged filters for one agent. Returns the computed dispatch surface (deny-wins filter merge of brofile + overlay), brofile info, embedding status, and any warnings.",
+        when_to_use: "Pre-dispatch inspection: understand the full computed tool surface an agent will have at runtime, including which brofile it resolves to and whether filters from the brofile and manifest overlay conflict. Use before bro_agent_dispatch to preview the dispatch plan.",
+        example: Some(r#"bro_agent_describe(agent="code-reviewer")"#),
+    },
+    ToolDoc {
+        name: "bro_agent_search",
+        category: ToolCategory::Orchestration,
+        summary: "Search installed agents by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and matched anti-patterns.",
+        when_to_use: "Discovery: find agents relevant to a task before dispatching. Call with the task description to get ranked candidates. Set exclude_anti_pattern_matches=false to see all matches including anti-pattern hits (useful for review). Filter by cost_class or provenance_kind to narrow results.",
+        example: Some(r#"bro_agent_search(query="review pull request for security issues", limit=3)"#),
+    },
+    ToolDoc {
+        name: "bro_agent_dispatch",
+        category: ToolCategory::Orchestration,
+        summary: "Dispatch a registered agent for a focused task. Routes through manifest dispatch_adapter if set, otherwise resolves brofile, merges filters, expands prompt template, and spawns via the standard bro execution path. Returns task_id, session, and agent attribution (agentLabel on the spawned task, preserved even when bro= routes to a named team member).",
+        when_to_use: "Dispatching an agent after discovery via bro_agent_search. Returns (task_id, session) — resume with bro_resume, status with bro_status. Prefer over hand-rolling a brofile + bro_exec when the task matches an agent's description and when_to_use. Anti-pattern: do not dispatch when the agent's manifest declares one of your task's properties as an anti_pattern.",
+        example: Some(r#"bro_agent_dispatch(agent="code-reviewer", args={"diff": "..."})"#),
     },
     // ── Whiteboards ─────────────────────────────────────────────
     ToolDoc {
@@ -1025,9 +1131,6 @@ pub fn render_markdown() -> String {
                     doc.name,
                     hot_summary(doc.summary)
                 ));
-                if !doc.when_to_use.is_empty() {
-                    out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
-                }
                 if let Some(ex) = doc.example {
                     out.push_str(&format!("  _Example:_ `{ex}`\n"));
                 }
@@ -1264,7 +1367,11 @@ mod tests {
             let name = extract_string_arg(body, "name");
             let desc = extract_string_arg(body, "description");
             if let (Some(n), Some(d)) = (name, desc) {
-                if n.starts_with("bbox_") || n.starts_with("bro_") || n.starts_with("whiteboard_") {
+                if n.starts_with("bbox_")
+                    || n.starts_with("bro_")
+                    || n.starts_with("badgey_")
+                    || n.starts_with("whiteboard_")
+                {
                     out.push((n, d));
                 }
             }

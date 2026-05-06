@@ -1,0 +1,61 @@
+{
+  "kind": "agent",
+  "name": "diff-narrator",
+  "version": 1,
+  "manifest": {
+    "description": "Produces a human-readable narrative summary of a diff, explaining what changed and why, suitable as context for downstream review agents.",
+    "when_to_use": [
+      "before code review to provide narrative context",
+      "when summarizing a branch's changes for a pull request description",
+      "as a chain step preceding code-reviewer"
+    ],
+    "anti_patterns": [
+      "do not use for single-file trivial changes",
+      "do not use when the user wants line-by-line review comments"
+    ],
+    "brofile_inline": {
+      "provider": "claude",
+      "model": "haiku-4.5",
+      "effort": "low",
+      "lens": "You narrate code changes. Given a diff, produce a concise summary of what changed and the apparent intent. Group changes by theme. Do not evaluate correctness or style — only describe what the diff does."
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "diff": {
+            "type": "string",
+            "description": "Unified diff to narrate"
+          }
+        },
+        "required": ["diff"]
+      },
+      "prompt_template": "Narrate the following diff:\n\n{{diff}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "narrative": { "type": "string" },
+          "themes": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["narrative"]
+      },
+      "evidence_density": "low"
+    },
+    "composition": {
+      "chainable_after": [],
+      "parallel_safe": true,
+      "fan_out_aggregator": "ensemble-merge"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-reference",
+      "created_at": "2026-05-06T12:00:00Z"
+    }
+  }
+}

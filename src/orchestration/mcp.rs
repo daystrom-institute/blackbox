@@ -1332,6 +1332,8 @@ mod tests {
     fn write_gemini_policy_file_roundtrip() {
         // Override HOME so the write doesn't touch the user's real dir.
         let tmp = tempdir().unwrap();
+        let _guard = crate::util::test_env_lock();
+        let prior = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
         let filters = McpFilters {
             disallow: vec!["mcp__blackbox__bro_*".into()],
@@ -1344,19 +1346,31 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("[[rule]]"));
         assert!(content.contains("bro_exec"));
+        match prior {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
     fn write_gemini_policy_file_none_when_no_filters() {
         let tmp = tempdir().unwrap();
+        let _guard = crate::util::test_env_lock();
+        let prior = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
         let filters = McpFilters::default();
         assert!(write_gemini_policy_file("t", &filters).unwrap().is_none());
+        match prior {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
     fn write_gemini_policy_file_none_when_only_non_blackbox_patterns() {
         let tmp = tempdir().unwrap();
+        let _guard = crate::util::test_env_lock();
+        let prior = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
         let filters = McpFilters {
             disallow: vec!["Edit".into()],
@@ -1364,5 +1378,9 @@ mod tests {
         };
         // Non-blackbox patterns → no rule block → no file written.
         assert!(write_gemini_policy_file("t", &filters).unwrap().is_none());
+        match prior {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

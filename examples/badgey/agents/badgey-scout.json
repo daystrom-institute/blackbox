@@ -1,0 +1,53 @@
+{
+  "kind": "agent",
+  "name": "badgey-scout",
+  "version": 1,
+  "manifest": {
+    "description": "Internal Badgey scout surface for one-question graph investigations. The Badgey wrapper dispatches this brofile directly; generic callers should use badgey instead.",
+    "when_to_use": [
+      "internal Badgey wrapper scout dispatch",
+      "one focused corpus investigation with a structured done note"
+    ],
+    "anti_patterns": [
+      "do not dispatch directly from generic callers",
+      "do not use for multi-turn consulting",
+      "do not use for spawning other agents"
+    ],
+    "brofile_ref": "badgey-scout-persona",
+    "filter_overlay": {
+      "disallow": ["mcp__blackbox__bro_*"]
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "scout_id": { "type": "string" },
+          "charter": { "type": "string" },
+          "expected_return": { "type": "string" }
+        },
+        "required": ["charter"]
+      },
+      "prompt_template": "{{charter}}\n\nExpected return: {{expected_return}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "verdict": { "enum": ["found", "not_found", "blocked", "disputed"] },
+          "evidence_refs": { "type": "array", "items": { "type": "string" } },
+          "path_ids": { "type": "array", "items": { "type": "string" } },
+          "summary": { "type": "string" },
+          "residual_risk": { "type": "string" }
+        },
+        "required": ["verdict", "summary"]
+      },
+      "evidence_density": "high"
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-reference",
+      "created_at": "2026-05-06T12:00:00Z"
+    }
+  }
+}

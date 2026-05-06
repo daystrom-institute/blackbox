@@ -1,0 +1,10 @@
+{
+  "name": "badgey-triage-daily",
+  "schedule": "0 0 6 * * *",
+  "payload": {
+    "tool": "badgey_triage_inbox",
+    "arguments": {}
+  },
+  "concurrency": 1,
+  "routing_packet": "domain:badgey/cron-routing"
+}
