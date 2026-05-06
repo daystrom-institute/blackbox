@@ -23,6 +23,16 @@ pub(super) struct ProjectIndexStats {
     pub indexed_docs: u64,
     pub skipped: u64,
     pub emitted_edges: u64,
+    pub call_edges: u64,
+    pub resolved_call_edges: u64,
+}
+
+struct PendingProjectFile {
+    path_str: String,
+    absolute_path: PathBuf,
+    mtime: u64,
+    size: u64,
+    chunks: Vec<Chunk>,
 }
 
 pub(super) fn scan_registered_project_files(
@@ -71,6 +81,9 @@ pub(crate) fn build_project_file_doc(
     doc.add_text(f.doc_type, "project_file");
     doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
     doc.add_text(f.content, &chunk.content);
+    if chunk.chunk_kind == "code_block" {
+        doc.add_text(f.code_content, &chunk.content);
+    }
     doc.add_text(f.session_id, "");
     doc.add_text(f.account, "project_file");
     doc.add_text(f.project, &project.canonical_path);
@@ -83,6 +96,12 @@ pub(crate) fn build_project_file_doc(
     doc.add_text(f.entity_id, &entity_id);
     if let Some(language) = &chunk.language {
         doc.add_text(f.language, language);
+    }
+    if let Some(symbol) = &chunk.symbol {
+        doc.add_text(f.symbol, symbol);
+    }
+    if let Some(symbol_exact) = &chunk.symbol_exact {
+        doc.add_text(f.symbol_exact, symbol_exact);
     }
     if let Some(repo_id) = &project.repo_id {
         doc.add_text(f.repo_id, repo_id);
@@ -104,6 +123,7 @@ fn index_project(
     let registry = chunker::default_registry();
     let commit_sha = current_head(root);
     let mut files = Vec::new();
+    let mut pending = Vec::new();
     scan_project_files(root, &mut files)?;
     for (path_str, mtime, size) in files {
         if let Some(prev) = meta.get(path_str.as_str()) {
@@ -139,14 +159,40 @@ fn index_project(
             .with_context(|| format!("chunking {} as {}", path.display(), format.format_id()))?;
         let rel_path = path.strip_prefix(root).unwrap_or(&path);
         let chunks = finalize_chunks(project, rel_path, chunks);
-        let edges = derive_edges(&chunks, edges);
-        for bounded in bound_chunks(&chunks) {
-            let doc = build_project_file_doc(&bounded, project, &path, commit_sha.as_deref(), f);
+        let bounded_chunks = bound_chunks(&chunks);
+        let edges = derive_edges(&bounded_chunks, edges);
+        stats.emitted_edges += edges.len() as u64;
+        pending.push(PendingProjectFile {
+            path_str,
+            absolute_path: path,
+            mtime,
+            size,
+            chunks: bounded_chunks,
+        });
+    }
+
+    let symbol_table = build_symbol_table(&pending);
+    for file in pending {
+        let code_edges = derive_code_edges(&file.chunks, &symbol_table, stats);
+        stats.emitted_edges += code_edges.len() as u64;
+        for chunk in file.chunks {
+            let doc = build_project_file_doc(
+                &chunk,
+                project,
+                &file.absolute_path,
+                commit_sha.as_deref(),
+                f,
+            );
             writer.add_document(doc)?;
             stats.indexed_docs += 1;
         }
-        stats.emitted_edges += edges.len() as u64;
-        meta.insert(path_str, FileMeta { mtime, size });
+        meta.insert(
+            file.path_str,
+            FileMeta {
+                mtime: file.mtime,
+                size: file.size,
+            },
+        );
         stats.indexed_files += 1;
     }
     Ok(())
@@ -196,7 +242,7 @@ fn is_supported_text_path(path: &Path) -> bool {
         Some(
             "md" | "markdown" | "mdown" | "json" | "toml" | "yaml" | "yml" | "txt" | "text" | "log"
         )
-    )
+    ) || crate::chunker::code::language_for_path(path).is_some()
 }
 
 fn finalize_chunks(project: &ProjectRecord, rel_path: &Path, chunks: Vec<Chunk>) -> Vec<Chunk> {
@@ -278,6 +324,210 @@ fn derive_edges(chunks: &[Chunk], mut edges: Vec<Edge>) -> Vec<Edge> {
     edges
 }
 
+fn build_symbol_table(files: &[PendingProjectFile]) -> HashMap<String, EntityRef> {
+    let mut symbols = HashMap::new();
+    for chunk in files.iter().flat_map(|file| file.chunks.iter()) {
+        if chunk.chunk_kind != "code_block" {
+            continue;
+        }
+        let Some(qualified_name) = &chunk.symbol else {
+            continue;
+        };
+        let symbol = symbol_ref(chunk, qualified_name);
+        symbols
+            .entry(qualified_name.clone())
+            .or_insert(symbol.clone());
+        if let Some(bare) = &chunk.symbol_exact {
+            symbols.entry(bare.clone()).or_insert(symbol);
+        }
+    }
+    symbols
+}
+
+fn derive_code_edges(
+    chunks: &[Chunk],
+    symbols: &HashMap<String, EntityRef>,
+    stats: &mut ProjectIndexStats,
+) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    for chunk in chunks
+        .iter()
+        .filter(|chunk| chunk.chunk_kind == "code_block")
+    {
+        let file_ref = chunk_ref(chunk);
+        if let Some(qualified_name) = &chunk.symbol {
+            let symbol = symbol_ref(chunk, qualified_name);
+            edges.push(edge(
+                symbol.clone(),
+                "DEFINED_IN",
+                file_ref.clone(),
+                EdgeConfidence::Exact,
+            ));
+            edges.push(edge(
+                file_ref.clone(),
+                "CONTAINS_SYMBOL",
+                symbol.clone(),
+                EdgeConfidence::Exact,
+            ));
+            edges.extend(derive_has_field_edges(chunk, &symbol));
+            edges.extend(derive_impl_trait_edges(chunk, &symbol));
+            for callee in call_names(&chunk.content) {
+                if let Some(target) = symbols.get(&callee) {
+                    edges.push(edge(
+                        symbol.clone(),
+                        "CALLS",
+                        target.clone(),
+                        EdgeConfidence::Heuristic,
+                    ));
+                    stats.call_edges += 1;
+                    stats.resolved_call_edges += 1;
+                }
+            }
+            for type_name in type_names(&chunk.content) {
+                if let Some(target) = symbols.get(&type_name) {
+                    edges.push(edge(
+                        symbol.clone(),
+                        "USES_TYPE",
+                        target.clone(),
+                        EdgeConfidence::Heuristic,
+                    ));
+                }
+            }
+        }
+        for import in import_names(&chunk.content) {
+            edges.push(edge(
+                file_ref.clone(),
+                "IMPORTS",
+                external_symbol_ref(chunk, &import),
+                EdgeConfidence::Heuristic,
+            ));
+        }
+    }
+    edges
+}
+
+fn edge(source: EntityRef, kind: &str, target: EntityRef, confidence: EdgeConfidence) -> Edge {
+    Edge {
+        source,
+        kind: kind.to_string(),
+        target,
+        provenance: EdgeProvenance::Derived,
+        confidence,
+    }
+}
+
+fn symbol_ref(chunk: &Chunk, qualified_name: &str) -> EntityRef {
+    EntityRef::Symbol {
+        project_id: chunk.project_id.clone(),
+        qualified_name: qualified_name.to_string(),
+        defn_hash: chunk.chunk_hash.clone(),
+    }
+}
+
+fn external_symbol_ref(chunk: &Chunk, qualified_name: &str) -> EntityRef {
+    EntityRef::Symbol {
+        project_id: chunk.project_id.clone(),
+        qualified_name: qualified_name.to_string(),
+        defn_hash: full_hash(qualified_name.as_bytes()),
+    }
+}
+
+fn derive_has_field_edges(chunk: &Chunk, source: &EntityRef) -> Vec<Edge> {
+    let Some(struct_name) = &chunk.symbol else {
+        return Vec::new();
+    };
+    if !chunk.content.contains("struct ") {
+        return Vec::new();
+    }
+    field_names(&chunk.content)
+        .into_iter()
+        .map(|field| {
+            edge(
+                source.clone(),
+                "HAS_FIELD",
+                external_symbol_ref(chunk, &format!("{struct_name}::{field}")),
+                EdgeConfidence::Heuristic,
+            )
+        })
+        .collect()
+}
+
+fn derive_impl_trait_edges(chunk: &Chunk, source: &EntityRef) -> Vec<Edge> {
+    let header = chunk.content.split('{').next().unwrap_or_default().trim();
+    let Some(rest) = header.strip_prefix("impl ") else {
+        return Vec::new();
+    };
+    let Some((trait_name, _target)) = rest.split_once(" for ") else {
+        return Vec::new();
+    };
+    vec![edge(
+        source.clone(),
+        "IMPLEMENTS_TRAIT",
+        external_symbol_ref(chunk, trait_name.trim()),
+        EdgeConfidence::Heuristic,
+    )]
+}
+
+fn call_names(content: &str) -> Vec<String> {
+    let call_pattern = regex::Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap();
+    call_pattern
+        .captures_iter(content)
+        .filter_map(|capture| capture.get(1).map(|name| name.as_str()))
+        .filter(|name| !CALL_KEYWORDS.contains(name))
+        .map(str::to_string)
+        .collect()
+}
+
+fn type_names(content: &str) -> Vec<String> {
+    let type_pattern = regex::Regex::new(r"\b([A-Z][A-Za-z0-9_]{2,})\b").unwrap();
+    type_pattern
+        .captures_iter(content)
+        .filter_map(|capture| capture.get(1).map(|name| name.as_str().to_string()))
+        .collect()
+}
+
+fn import_names(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("use ")
+                .or_else(|| trimmed.strip_prefix("import "))
+                .or_else(|| trimmed.strip_prefix("using "))
+                .or_else(|| trimmed.strip_prefix("from "))
+                .map(|rest| rest.trim_end_matches(';').trim().to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn field_names(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || !trimmed.contains(':') {
+                return None;
+            }
+            let left = trimmed.split(':').next()?.trim();
+            let name = left.split_whitespace().last()?.trim_start_matches("pub ");
+            if name
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+const CALL_KEYWORDS: &[&str] = &[
+    "if", "for", "while", "loop", "match", "return", "sizeof", "switch", "catch", "fn",
+];
+
 fn chunk_ref(chunk: &Chunk) -> EntityRef {
     EntityRef::ProjectFile {
         project_id: chunk.project_id.clone(),
@@ -347,6 +597,8 @@ mod tests {
             chunk_hash: "f".repeat(64),
             occurrence_idx: 0,
             language: Some("md".into()),
+            symbol: None,
+            symbol_exact: None,
             content: "agentic-corpus design".into(),
             byte_start: 10,
             byte_end: 32,
@@ -369,6 +621,67 @@ mod tests {
             first_text(&doc, fields.entity_id),
             format!("project_file:proj1234:abcd1234:{}:0", "f".repeat(64))
         );
+    }
+
+    #[test]
+    fn tier_a_call_edges_resolve_against_symbol_table() {
+        let project = ProjectRecord {
+            project_id: "proj1234".into(),
+            repo_id: Some("repo1234".into()),
+            canonical_path: "/tmp/repo".into(),
+            registered_at: "2026-05-05T17:30:00Z".into(),
+            is_git_repo: true,
+        };
+        let chunks = finalize_chunks(
+            &project,
+            Path::new("src/lib.rs"),
+            vec![
+                crate::chunker::placeholder_chunk(
+                    Path::new("src/lib.rs"),
+                    "code_block",
+                    Some("rust"),
+                    "fn helper() {}",
+                    0,
+                    14,
+                    0,
+                ),
+                crate::chunker::placeholder_chunk(
+                    Path::new("src/lib.rs"),
+                    "code_block",
+                    Some("rust"),
+                    "fn caller() { helper(); }",
+                    15,
+                    39,
+                    1,
+                ),
+            ],
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut chunk)| {
+            if idx == 0 {
+                chunk.symbol = Some("helper".into());
+                chunk.symbol_exact = Some("helper".into());
+            } else {
+                chunk.symbol = Some("caller".into());
+                chunk.symbol_exact = Some("caller".into());
+            }
+            chunk
+        })
+        .collect::<Vec<_>>();
+        let pending = vec![PendingProjectFile {
+            path_str: "/tmp/repo/src/lib.rs".into(),
+            absolute_path: PathBuf::from("/tmp/repo/src/lib.rs"),
+            mtime: 1,
+            size: 39,
+            chunks,
+        }];
+        let symbols = build_symbol_table(&pending);
+        let mut stats = ProjectIndexStats::default();
+        let edges = derive_code_edges(&pending[0].chunks, &symbols, &mut stats);
+        assert!(edges.iter().any(|edge| edge.kind == "CALLS"));
+        assert!(stats.call_edges >= 1);
+        assert_eq!(stats.resolved_call_edges, stats.call_edges);
     }
 
     fn first_text(doc: &TantivyDocument, field: Field) -> String {

@@ -20,3 +20,12 @@
 - Workflows, packets, and brofiles installed through the artifact catalog are
   copied under `$BLACKBOX_STATE_DIR/artifacts/<kind>/<name>.json` with
   `<kind>/<name>/metadata.json` tracking install source and supersession state.
+
+## S3
+
+- Code chunking uses `tree-sitter-language-pack` with runtime downloads
+  disabled. The repo cargo config sets
+  `TSLP_LANGUAGES=rust,python,csharp,java,go,typescript,javascript,c,cpp` so the
+  supported parsers are statically compiled into the daemon where parser
+  sources are present; direct tree-sitter grammar crates provide the same
+  no-download parser subset as a fallback.

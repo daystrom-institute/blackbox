@@ -1,3 +1,4 @@
+pub mod code;
 pub mod config;
 pub mod markdown;
 pub mod text;
@@ -20,6 +21,8 @@ pub struct Chunk {
     pub chunk_hash: String,
     pub occurrence_idx: u32,
     pub language: Option<String>,
+    pub symbol: Option<String>,
+    pub symbol_exact: Option<String>,
     pub content: String,
     pub byte_start: u64,
     pub byte_end: u64,
@@ -58,6 +61,7 @@ pub trait SourceFormatChunker: Send + Sync {
 
 pub fn default_registry() -> Vec<Box<dyn SourceFormatChunker>> {
     vec![
+        Box::new(code::CodeChunker),
         Box::new(markdown::MarkdownChunker),
         Box::new(config::JsonChunker),
         Box::new(config::TomlChunker),
@@ -83,6 +87,8 @@ pub(crate) fn placeholder_chunk(
         chunk_hash: String::new(),
         occurrence_idx,
         language: language.map(str::to_string),
+        symbol: None,
+        symbol_exact: None,
         content: content.into(),
         byte_start,
         byte_end,

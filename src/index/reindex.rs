@@ -249,6 +249,8 @@ fn try_background_reindex(
     if project_stats.emitted_edges > 0 {
         tracing::debug!(
             emitted_edges = project_stats.emitted_edges,
+            call_edges = project_stats.call_edges,
+            resolved_call_edges = project_stats.resolved_call_edges,
             "auto-reindex: accumulated project-file edges"
         );
     }

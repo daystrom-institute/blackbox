@@ -185,8 +185,15 @@ impl TranscriptIndex {
         let searcher = self.reader.searcher();
 
         // Parse the user's text query against content + project fields
-        let mut qp =
-            QueryParser::for_index(&self.index, vec![self.fields.content, self.fields.project]);
+        let mut qp = QueryParser::for_index(
+            &self.index,
+            vec![
+                self.fields.content,
+                self.fields.project,
+                self.fields.code_content,
+                self.fields.symbol,
+            ],
+        );
         if matches!(mode, TranscriptSearchMode::Fulltext) {
             qp.set_conjunction_by_default();
         }
@@ -1302,6 +1309,14 @@ impl TranscriptIndex {
             &mut writer,
             &mut meta,
         )?;
+        if project_stats.emitted_edges > 0 {
+            tracing::debug!(
+                emitted_edges = project_stats.emitted_edges,
+                call_edges = project_stats.call_edges,
+                resolved_call_edges = project_stats.resolved_call_edges,
+                "manual reindex: accumulated project-file edges"
+            );
+        }
         indexed_files += project_stats.indexed_files;
         indexed_docs += project_stats.indexed_docs;
         skipped += project_stats.skipped;
@@ -1359,7 +1374,7 @@ mod agentic_project_file_tests {
     use crate::projects::ProjectRegistry;
 
     #[test]
-    fn registered_project_markdown_is_searchable_without_rust_source_chunks() {
+    fn registered_project_markdown_and_rust_source_are_searchable() {
         let dir = tempfile::tempdir().unwrap();
         let projects_path = dir.path().join("projects.json");
         let mut projects = ProjectRegistry::open(&projects_path).unwrap();
@@ -1383,7 +1398,7 @@ mod agentic_project_file_tests {
                 project: None,
                 role: None,
                 include_subagents: None,
-                limit: Some(10),
+                limit: Some(100),
                 exclude_self: None,
             })
             .unwrap();
@@ -1397,13 +1412,27 @@ mod agentic_project_file_tests {
                 project: None,
                 role: None,
                 include_subagents: None,
-                limit: Some(10),
+                limit: Some(100),
                 exclude_self: None,
             })
             .unwrap();
         assert!(trait_hits.contains("design/agentic-corpus.md"));
         let chunker_source = format!("{}/src/chunker/mod.rs", env!("CARGO_MANIFEST_DIR"));
-        assert!(!trait_hits.contains(&format!("File: {chunker_source}")));
+        assert!(trait_hits.contains(&format!("File: {chunker_source}")));
+
+        let display_hits = index
+            .search(&SearchParams {
+                query: "impl Display for EntityRef".into(),
+                mode: Some("fulltext".into()),
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(100),
+                exclude_self: None,
+            })
+            .unwrap();
+        assert!(display_hits.contains("src/entity_ref.rs"));
 
         let rerun = index.build_index(false).unwrap();
         assert!(rerun.contains("skipped"));

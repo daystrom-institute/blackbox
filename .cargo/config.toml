@@ -1,0 +1,2 @@
+[env]
+TSLP_LANGUAGES = { value = "rust,python,csharp,java,go,typescript,javascript,c,cpp", force = true }
