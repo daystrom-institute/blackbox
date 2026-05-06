@@ -942,7 +942,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_blame",
-        description = "Trace a code line to the commit and bbox conversation that produced it."
+        description = "Walk back from a code line to the conversation that produced it. Two modes: 1. Anchor-matching: the line's git blame commit matches a bbox-tracked tool-call anchor, returning the full session/brofile/arc/trigger chain. 2. Git-only fallback: no bbox anchor matches, returning git blame author info only, marked as non-bbox. Use this when you want to understand WHY a line exists, not just WHO wrote it."
     )]
     fn bbox_blame(&self, Parameters(p): Parameters<BlameParams>) -> CallToolResult {
         Self::run("bbox_blame", || {
