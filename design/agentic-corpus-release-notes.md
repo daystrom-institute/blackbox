@@ -35,3 +35,15 @@
 - EdgeIndex memory model: dedup uses full `Edge` structs as `HashSet` keys.
   This is fine at current corpus scale, but needs rework if edge count crosses
   roughly 5M; revisit when corpora actually exceed that scale.
+
+## E3
+
+- VectorStore still exposes process-global module functions via `OnceLock` for
+  daemon wiring convenience. Tests and direct callers can use explicit
+  `VectorStore::open`; a future cleanup should pass `&VectorStore` through the
+  embedding queue and search layers and keep the singleton at the daemon
+  boundary.
+- HNSW metrics currently report node counts, dimensions, max level, entry
+  point, and neighbor references. They do not yet report health diagnostics
+  such as average neighbor degree, layer distribution, or disconnected-node
+  counts; add those before relying on vector metrics for production tuning.
