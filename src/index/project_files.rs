@@ -308,19 +308,8 @@ fn derive_edges(chunks: &[Chunk], mut edges: Vec<Edge>) -> Vec<Edge> {
             confidence: EdgeConfidence::Exact,
         });
     }
-    for chunk in chunks {
-        if chunk.chunk_kind == "doc_section" {
-            for kind in crate::chunker::markdown::markdown_edge_kinds(&chunk.content) {
-                edges.push(Edge {
-                    source: chunk_ref(chunk),
-                    kind: kind.to_string(),
-                    target: chunk_ref(chunk),
-                    provenance: EdgeProvenance::Derived,
-                    confidence: EdgeConfidence::Heuristic,
-                });
-            }
-        }
-    }
+    // TODO(S4+): emit LINKS_TO_FILE/SECTION + EMBEDS_CODE_FENCE with resolved
+    // targets when EdgeIndex provides chunk lookup by (file, hash).
     edges
 }
 
