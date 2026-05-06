@@ -475,8 +475,7 @@ pub(super) fn index_directory_standalone(
             let line_offset = offset;
             offset += line.len() as u64 + 1;
 
-            for (event_idx, event) in parser::parse_transcript_line(&line).into_iter().enumerate()
-            {
+            for (event_idx, event) in parser::parse_transcript_line(&line).into_iter().enumerate() {
                 if let Err(err) =
                     tool_edges.emit_event_edges(&event, account_name, line_offset, event_idx as u32)
                 {

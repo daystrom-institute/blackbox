@@ -233,11 +233,7 @@ fn indexable_commit_message(message: &str) -> String {
     while !message.is_char_boundary(end) {
         end -= 1;
     }
-    format!(
-        "{}{}",
-        &message[..end],
-        TRUNCATED_COMMIT_MESSAGE_SUFFIX
-    )
+    format!("{}{}", &message[..end], TRUNCATED_COMMIT_MESSAGE_SUFFIX)
 }
 
 fn load_git_meta(path: &Path) -> Result<GitIngestMeta> {
@@ -287,7 +283,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::index::{FileMeta, build_schema, register_code_tokenizer};
+    use crate::index::{build_schema, register_code_tokenizer, FileMeta};
 
     fn project() -> ProjectRecord {
         ProjectRecord {
@@ -356,10 +352,7 @@ mod tests {
         let content = text(&doc, fields.content);
         assert!(content.len() <= MAX_COMMIT_MESSAGE_BYTES);
         assert!(content.ends_with(TRUNCATED_COMMIT_MESSAGE_SUFFIX));
-        assert_eq!(
-            text(&doc, fields.chunk_hash),
-            commit_message_hash(&content)
-        );
+        assert_eq!(text(&doc, fields.chunk_hash), commit_message_hash(&content));
     }
 
     #[test]

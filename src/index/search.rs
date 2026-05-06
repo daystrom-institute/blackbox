@@ -1553,9 +1553,10 @@ fn single_symbol_token(query: &str) -> Option<String> {
     if trimmed.contains(char::is_whitespace) {
         return None;
     }
-    if trimmed.chars().any(|c| {
-        !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.' && c != ':'
-    }) {
+    if trimmed
+        .chars()
+        .any(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.' && c != ':')
+    {
         return None;
     }
     if trimmed.eq_ignore_ascii_case("AND")
@@ -1580,7 +1581,9 @@ fn count_tool_call_edges(edges_dir: &Path) -> u64 {
         .filter(|line| {
             serde_json::from_str::<crate::edge_index::Edge>(line)
                 .ok()
-                .is_some_and(|edge| matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE" | "RAN_BASH"))
+                .is_some_and(|edge| {
+                    matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE" | "RAN_BASH")
+                })
         })
         .count() as u64
 }

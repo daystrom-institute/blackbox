@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rmcp::schemars;
@@ -431,8 +431,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
                 while let Some(req) = pending.pop_front() {
                     let req_bytes = req.text.len();
                     if !batch.is_empty()
-                        && (batch.len() >= MAX_BATCH_DOCS
-                            || bytes + req_bytes > MAX_BATCH_BYTES)
+                        && (batch.len() >= MAX_BATCH_DOCS || bytes + req_bytes > MAX_BATCH_BYTES)
                     {
                         pending.push_front(req);
                         break;
@@ -637,7 +636,9 @@ async fn collect_quiescent_batch(
     let mut bytes = 0usize;
     while let Some(req) = pending.pop_front() {
         let req_bytes = req.text.len();
-        if !batch.is_empty() && (batch.len() >= MAX_BATCH_DOCS || bytes + req_bytes > MAX_BATCH_BYTES) {
+        if !batch.is_empty()
+            && (batch.len() >= MAX_BATCH_DOCS || bytes + req_bytes > MAX_BATCH_BYTES)
+        {
             pending.push_front(req);
             break;
         }
@@ -919,12 +920,10 @@ mod tests {
         assert!(!status.available);
         assert_eq!(status.queue_depth, 0);
         assert_eq!(status.retried_count, u64::from(MAX_BATCH_RETRIES));
-        assert!(
-            status
-                .last_error
-                .unwrap()
-                .contains("dropped after 3 retries")
-        );
+        assert!(status
+            .last_error
+            .unwrap()
+            .contains("dropped after 3 retries"));
         queue.shutdown();
     }
 

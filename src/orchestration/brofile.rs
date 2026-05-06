@@ -247,6 +247,21 @@ fn build_opencode_config(provider: Provider, model: Option<&str>) -> Value {
         }
     });
 
+    // OpenCode does NOT follow Claude Code's `@import` syntax in
+    // AGENTS.md/CLAUDE.md — those references stay as plain text. Wire
+    // BLACKBOX.md (the provider-neutral global memory file) explicitly
+    // via the `instructions` config field, which opencode reads, fetches,
+    // and merges into the system prompt at the `Instructions from: <path>`
+    // header. Existing files are added to the `instructions` array; missing
+    // files are silently skipped by opencode (`fs.glob` returns `[]`).
+    if let Some(home) = dirs::home_dir() {
+        let blackbox_md = crate::util::blackbox_global_common_md_path(&home);
+        if blackbox_md.exists() {
+            config["instructions"] =
+                serde_json::json!([blackbox_md.to_string_lossy().into_owned()]);
+        }
+    }
+
     if let Some(url) = super::providers::transient_blackbox_url() {
         config["mcp"] = serde_json::json!({
             super::providers::transient_blackbox_name(): {
@@ -696,6 +711,38 @@ mod tests {
             Some("deepseek/deepseek-chat")
         );
         assert!(config.get("provider").is_none());
+    }
+
+    #[test]
+    fn test_build_opencode_config_includes_blackbox_md_in_instructions() {
+        let home = temp_store();
+        let blackbox_dir = home.path().join(".blackbox");
+        fs::create_dir_all(&blackbox_dir).unwrap();
+        let blackbox_md = blackbox_dir.join("BLACKBOX.md");
+        fs::write(&blackbox_md, "# global guidance").unwrap();
+
+        let config =
+            with_fake_home(home.path(), || build_opencode_config(Provider::Glm, None));
+        let instructions = config
+            .get("instructions")
+            .and_then(Value::as_array)
+            .expect("instructions should be present when BLACKBOX.md exists");
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(
+            instructions[0].as_str(),
+            Some(blackbox_md.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn test_build_opencode_config_omits_instructions_when_blackbox_md_missing() {
+        let home = temp_store();
+        let config =
+            with_fake_home(home.path(), || build_opencode_config(Provider::Glm, None));
+        assert!(
+            config.get("instructions").is_none(),
+            "instructions field should be absent when BLACKBOX.md does not exist"
+        );
     }
 
     #[test]

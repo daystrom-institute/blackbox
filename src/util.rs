@@ -82,6 +82,16 @@ pub fn blackbox_artifacts_dir(home: &Path) -> PathBuf {
     env_path("BLACKBOX_ARTIFACTS_DIR").unwrap_or_else(|| blackbox_state_dir(home).join("artifacts"))
 }
 
+/// Provider-neutral global memory file. Lives under `~/.blackbox/`
+/// (parallel to `~/.codex/`, `~/.gemini/`) — *not* `~/.claude-shared/`,
+/// which is claude-specific multi-account state. Each provider's global
+/// memory file `@imports` (or, for opencode, lists in its `instructions`
+/// config) this path so they share one canonical body of guidance.
+pub fn blackbox_global_common_md_path(home: &Path) -> PathBuf {
+    env_path("BLACKBOX_GLOBAL_COMMON_MD")
+        .unwrap_or_else(|| home.join(".blackbox").join("BLACKBOX.md"))
+}
+
 pub fn bro_home_dir(home: &Path) -> PathBuf {
     env_path("BRO_HOME").unwrap_or_else(|| blackbox_state_dir(home).join("bro"))
 }
@@ -146,6 +156,14 @@ pub fn migrate_legacy_defaults(home: &Path) -> anyhow::Result<Vec<String>> {
         let new = bro_home_dir(home);
         if migrate_legacy_path(&old, &new)? {
             moved.push(format!("bro-home: {} -> {}", old.display(), new.display()));
+        }
+    }
+
+    if env_path("BLACKBOX_GLOBAL_COMMON_MD").is_none() {
+        let old = home.join(".claude-shared").join("BLACKBOX.md");
+        let new = blackbox_global_common_md_path(home);
+        if migrate_legacy_path(&old, &new)? {
+            moved.push(format!("blackbox-md: {} -> {}", old.display(), new.display()));
         }
     }
 

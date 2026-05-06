@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use super::{ReindexConfig, project_files};
+use super::{project_files, ReindexConfig};
 use crate::chunker::{EdgeConfidence, EdgeProvenance};
 use crate::edge_index::Edge;
 use crate::entity_ref::EntityRef;
@@ -56,7 +56,8 @@ impl ToolEdgeContext {
         let Some(raw_path) = parser::tool_call_file_path(tool_call) else {
             return Ok(0);
         };
-        let Some((project, root, absolute_path)) = self.resolve_project_path(event, raw_path) else {
+        let Some((project, root, absolute_path)) = self.resolve_project_path(event, raw_path)
+        else {
             tracing::debug!(
                 path = raw_path,
                 cwd = event.cwd.as_deref().unwrap_or(""),
@@ -72,8 +73,12 @@ impl ToolEdgeContext {
             }
         };
         let byte_range = byte_range_for_tool(tool_call, &bytes);
-        let Some(target) =
-            project_files::resolve_current_chunk_entity(project, &root, &absolute_path, byte_range)?
+        let Some(target) = project_files::resolve_current_chunk_entity(
+            project,
+            &root,
+            &absolute_path,
+            byte_range,
+        )?
         else {
             tracing::debug!(path = %absolute_path.display(), "skipping tool-call edge; current chunk target unresolved");
             return Ok(0);
@@ -202,19 +207,13 @@ fn anchor_metadata(
         metadata.insert("anchor.byte_start".to_string(), start.to_string());
         metadata.insert("anchor.byte_end".to_string(), end.to_string());
     }
-    metadata.insert(
-        "anchor.content_hash_at_edit".to_string(),
-        sha256_hex(bytes),
-    );
+    metadata.insert("anchor.content_hash_at_edit".to_string(), sha256_hex(bytes));
     if let Some(commit_sha) = crate::git::current_head(root) {
         metadata.insert("anchor.commit_sha_at_edit".to_string(), commit_sha);
     }
     metadata.insert(
         "anchor.edit_timestamp".to_string(),
-        event
-            .timestamp
-            .clone()
-            .unwrap_or_else(crate::util::now_iso),
+        event.timestamp.clone().unwrap_or_else(crate::util::now_iso),
     );
     metadata.insert("tool.name".to_string(), tool_call.name.clone());
     if let Some(id) = &tool_call.tool_use_id {
@@ -233,10 +232,7 @@ fn bash_metadata(
     metadata.insert("anchor.project_id".to_string(), project.project_id.clone());
     metadata.insert(
         "anchor.edit_timestamp".to_string(),
-        event
-            .timestamp
-            .clone()
-            .unwrap_or_else(crate::util::now_iso),
+        event.timestamp.clone().unwrap_or_else(crate::util::now_iso),
     );
     metadata.insert("tool.name".to_string(), tool_call.name.clone());
     if let Some(id) = &tool_call.tool_use_id {
@@ -245,7 +241,10 @@ fn bash_metadata(
     if let Some(cwd) = &event.cwd {
         metadata.insert("cwd".to_string(), cwd.clone());
     }
-    metadata.insert("turn_source_line_offset".to_string(), line_offset.to_string());
+    metadata.insert(
+        "turn_source_line_offset".to_string(),
+        line_offset.to_string(),
+    );
     if let Some(command) = parser::tool_call_command(tool_call) {
         metadata.insert("command".to_string(), command.to_string());
     }
