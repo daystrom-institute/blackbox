@@ -8314,6 +8314,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let brofile_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/brofiles/digest-extractor.json"
+        ))
+        .unwrap();
+        let trust_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/bro-trust/per-brofile.json"
+        ))
+        .unwrap();
+        let quality_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/auto-digest/entry-quality.json"
+        ))
+        .unwrap();
+        let routing_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/packets/auto-digest/task-completed-routing.json"
+        ))
+        .unwrap();
+        let workflow_value: Value = serde_json::from_str(include_str!(
+            "../examples/agentic-corpus/workflows/auto-digest-arc.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "examples/agentic-corpus/brofiles/digest-extractor.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            brofile_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/bro-trust/per-brofile.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            trust_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/auto-digest/entry-quality.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            quality_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "examples/agentic-corpus/packets/auto-digest/task-completed-routing.json"
+                    .into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            routing_value,
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Workflow,
+                source: "examples/agentic-corpus/workflows/auto-digest-arc.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_value,
+        )
+        .await
+        .unwrap();
+
+        assert!(server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("auto-digest-arc"));
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:auto-digest/entry-quality")
+            .is_ok());
+        assert!(server
+            .state
+            .packets
+            .read()
+            .load("domain:auto-digest/task-completed-routing")
+            .is_ok());
+        assert!(orchestration::brofile::resolve_brofile(
+            "digest-extractor",
+            &server.state.store_dir,
+            None
+        )
+        .is_some());
+
+        let cases: Value =
+            serde_json::from_str(include_str!("../eval/audit/auto-digest/cases.json")).unwrap();
+        let cases = cases.as_array().unwrap();
+        let packet_store = server.state.packets.read();
+        let packet = packet_store
+            .load("domain:auto-digest/entry-quality")
+            .unwrap();
+        let mut matched = 0usize;
+        for case in cases {
+            let prediction = packets::apply_with(&packet, &case["proposal"], &*packet_store)
+                .unwrap_or_else(|| panic!("case {} produced no verdict", case["id"]));
+            if prediction.classification == case["expected_verdict"].as_str().unwrap() {
+                matched += 1;
+            }
+        }
+        assert!(
+            matched >= 18,
+            "auto-digest audit fidelity {matched}/{} below gate",
+            cases.len()
+        );
+        assert_eq!(matched, cases.len());
+    }
+
+    #[tokio::test]
     async fn artifact_supersession_deactivates_workflow_registry_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);

@@ -102,6 +102,16 @@ pub enum OpKind {
     /// Marker hook for the atomic swap step. Vector rebuild already writes
     /// derived files from the rebuilt in-memory partition, so v1 is no-op.
     SwapAtomic,
+    /// Load a transcript session through bbox_messages for auto-digest arcs.
+    ReadSession,
+    /// Validate auto-digest candidate JSON shape before packet gating.
+    ValidateSchema,
+    /// Apply an auto-digest candidate through the knowledge MCP tools.
+    ApplyEntry,
+    /// Surface an auto-digest candidate for operator review.
+    SurfaceToInbox,
+    /// Record an auto-digest rejection.
+    LogReject,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -157,7 +167,235 @@ pub async fn execute_op(
         OpKind::QuiesceSearch => Ok(OpEffect::None),
         OpKind::RebuildHnsw => exec_rebuild_hnsw(&rendered_args),
         OpKind::SwapAtomic => Ok(OpEffect::None),
+        OpKind::ReadSession => {
+            exec_read_session(&rendered_args, hook.into_var.as_deref(), ctx).await
+        }
+        OpKind::ValidateSchema => exec_validate_schema(&rendered_args, hook.into_var.as_deref()),
+        OpKind::ApplyEntry => {
+            exec_apply_entry(&rendered_args, hook.into_var.as_deref(), ctx).await
+        }
+        OpKind::SurfaceToInbox => exec_surface_to_inbox(&rendered_args, ctx).await,
+        OpKind::LogReject => exec_log_reject(&rendered_args, ctx).await,
     }
+}
+
+async fn exec_read_session(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let session_id = args
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("ReadSession requires args.session_id"))?;
+    let limit = args
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(200);
+    let result = call_blackbox_tool(
+        "bbox_messages",
+        json!({
+            "session_id": session_id,
+            "limit": limit,
+            "max_content_length": 12000u64,
+        }),
+        ctx,
+    )
+    .await?;
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("session").to_string(),
+        value: result,
+    })
+}
+
+fn exec_validate_schema(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let input = args
+        .get("from")
+        .ok_or_else(|| anyhow!("ValidateSchema requires args.from"))?;
+    let candidate = first_candidate(input)
+        .ok_or_else(|| anyhow!("ValidateSchema requires a candidate object or candidates array"))?;
+    let required = [
+        "title",
+        "content",
+        "category",
+        "scope",
+        "source_session",
+        "source_query",
+        "justification",
+        "suggested_approval",
+    ];
+    for field in required {
+        if candidate.get(field).and_then(Value::as_str).is_none() {
+            bail!("ValidateSchema candidate missing string field '{field}'");
+        }
+    }
+    let source_files = candidate
+        .get("source_files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("ValidateSchema candidate missing source_files array"))?;
+    if source_files.iter().any(|value| value.as_str().is_none()) {
+        bail!("ValidateSchema source_files must contain only strings");
+    }
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("candidate").to_string(),
+        value: Value::Object(candidate.clone()),
+    })
+}
+
+async fn exec_apply_entry(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let candidate = first_candidate(
+        args.get("from")
+            .ok_or_else(|| anyhow!("ApplyEntry requires args.from"))?,
+    )
+    .ok_or_else(|| anyhow!("ApplyEntry requires a candidate object or candidates array"))?;
+    let category = candidate
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("memory");
+    let title = candidate.get("title").and_then(Value::as_str);
+    let content = candidate
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("ApplyEntry candidate missing content"))?;
+    let scope = candidate
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("project");
+    let project = candidate
+        .get("project")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| ctx.meta.project_dir.clone());
+    let mut arguments = Map::new();
+    arguments.insert("content".into(), Value::String(content.to_string()));
+    if let Some(title) = title {
+        arguments.insert("title".into(), Value::String(title.to_string()));
+    }
+    arguments.insert("scope".into(), Value::String(scope.to_string()));
+    if let Some(project) = project {
+        arguments.insert("project".into(), Value::String(project));
+    }
+    let tool = match category {
+        "decision" => {
+            arguments.insert(
+                "rationale".into(),
+                Value::String(
+                    candidate
+                        .get("justification")
+                        .and_then(Value::as_str)
+                        .unwrap_or("auto-digest candidate")
+                        .to_string(),
+                ),
+            );
+            arguments.insert("render".into(), Value::Bool(false));
+            "bbox_decide"
+        }
+        "convention" | "workflow" => {
+            arguments.insert("category".into(), Value::String(category.to_string()));
+            "bbox_learn"
+        }
+        _ => {
+            arguments.insert("category".into(), Value::String(category.to_string()));
+            "bbox_remember"
+        }
+    };
+    let result = call_blackbox_tool(tool, Value::Object(arguments), ctx).await?;
+    Ok(OpEffect::SetVar {
+        key: into_var.unwrap_or("applied_entry").to_string(),
+        value: result,
+    })
+}
+
+async fn exec_surface_to_inbox(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
+    let candidate = first_candidate(
+        args.get("from")
+            .ok_or_else(|| anyhow!("SurfaceToInbox requires args.from"))?,
+    )
+    .ok_or_else(|| anyhow!("SurfaceToInbox requires a candidate object or candidates array"))?;
+    let title = candidate
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("(untitled)");
+    call_blackbox_tool(
+        "bbox_note",
+        json!({
+            "kind": "followup",
+            "project": ctx.meta.project_dir,
+            "body": format!("Auto-digest candidate held for review: {title}")
+        }),
+        ctx,
+    )
+    .await?;
+    Ok(OpEffect::None)
+}
+
+async fn exec_log_reject(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
+    let candidate = first_candidate(
+        args.get("from")
+            .ok_or_else(|| anyhow!("LogReject requires args.from"))?,
+    )
+    .ok_or_else(|| anyhow!("LogReject requires a candidate object or candidates array"))?;
+    let title = candidate
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("(untitled)");
+    call_blackbox_tool(
+        "bbox_note",
+        json!({
+            "kind": "learned",
+            "project": ctx.meta.project_dir,
+            "body": format!("Auto-digest candidate rejected by entry-quality gate: {title}")
+        }),
+        ctx,
+    )
+    .await?;
+    Ok(OpEffect::None)
+}
+
+async fn call_blackbox_tool(tool: &str, arguments: Value, ctx: &ArcContext) -> Result<Value> {
+    let arguments = arguments
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("blackbox tool arguments must be an object"))?;
+    crate::mcp_client::call_tool(
+        "blackbox",
+        tool,
+        arguments,
+        300,
+        ctx.meta.project_dir.as_deref(),
+        ctx.meta
+            .worktree
+            .as_deref()
+            .or(ctx.meta.project_dir.as_deref()),
+    )
+    .await
+    .map_err(|e| anyhow!("McpCall 'blackbox.{tool}': {e}"))
+}
+
+fn first_candidate(value: &Value) -> Option<&Map<String, Value>> {
+    if let Some(obj) = value.as_object() {
+        if let Some(candidate) = obj.get("candidate").and_then(Value::as_object) {
+            return Some(candidate);
+        }
+        if let Some(candidate) = obj
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_object)
+        {
+            return Some(candidate);
+        }
+        return Some(obj);
+    }
+    value
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(Value::as_object)
 }
 
 fn exec_read_vector_status(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {

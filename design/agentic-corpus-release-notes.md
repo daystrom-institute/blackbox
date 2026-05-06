@@ -84,6 +84,23 @@ deleted_ratio" intent. The shipped cron spec is an example inlet; cron
 installation remains through the existing cron admin/MCP surface, while the
 workflow and packets install through the artifact catalog.
 
+## M3
+
+`auto-digest-arc.json` is the first agentic-corpus workflow that dispatches an
+LLM from the bbox workflow engine itself: the `ProposeEntries` node runs the
+`digest-extractor` brofile and expects strict JSON candidates. Hook ops then
+parse and validate the candidate shape, gate it through
+`auto-digest/entry-quality`, and either apply it through the knowledge MCP
+tools, surface it to the side-channel inbox, or log a rejection note.
+
+The `task-completed` routing signal is not emitted by the `bro_exec` finalize
+path yet. The installed `auto-digest/task-completed-routing` packet is ready to
+start the arc for any `task-completed` event, but for v1 trigger
+`auto-digest-arc` manually with `bro_orchestrate_run` or the workflow admin
+surface and seed `source_session`, `task_kind`, and `daily_count` in initial
+vars. A later phase should emit the completion signal from bro task
+finalization and route it into this installed workflow.
+
 ## S3
 
 - Code chunking uses `tree-sitter-language-pack` with runtime downloads

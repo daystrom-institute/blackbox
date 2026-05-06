@@ -1,0 +1,107 @@
+{
+  "name": "auto-digest-arc",
+  "version": 1,
+  "policy_packet": "domain:workflow-policy/arc-budget",
+  "vars_schema": {
+    "source_session": { "kind": "string" },
+    "task_kind": { "kind": "string" },
+    "daily_count": { "kind": "int" },
+    "session": { "kind": "any" },
+    "proposed_entries": { "kind": "object" },
+    "candidate": { "kind": "object" },
+    "applied_entry": { "kind": "any" }
+  },
+  "actors": {
+    "digest": {
+      "kind": "executor",
+      "brofile": "digest-extractor",
+      "durable": false
+    }
+  },
+  "start": "Setup",
+  "nodes": {
+    "Setup": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "read_session",
+          "args": {
+            "session_id": "${vars.source_session}",
+            "limit": 200
+          },
+          "into_var": "session",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "goto", "to": "ProposeEntries" }
+    },
+    "ProposeEntries": {
+      "actor": "digest",
+      "prompt": "Read the session transcript for session_id=${vars.source_session}. Use vars.session when present; if it is unavailable, call bbox_messages for that session. Extract durable knowledge candidates only. Output strict JSON only: {\"candidates\":[{\"title\":\"...\",\"content\":\"...\",\"category\":\"memory\",\"scope\":\"project\",\"source_session\":\"${vars.source_session}\",\"source_files\":[\"...\"],\"source_query\":\"...\",\"justification\":\"...\",\"suggested_approval\":\"auto_apply\",\"rendered\":false,\"daily_count\":${vars.daily_count},\"brofile\":\"digest-extractor\"}]}. Skip ephemeral task constraints and anything that would not remain true a year from now with current arcs complete.",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${ProposeEntries.output}" },
+          "into_var": "proposed_entries"
+        }
+      ],
+      "next": { "type": "goto", "to": "Validate" }
+    },
+    "Validate": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "validate_schema",
+          "args": { "from": "${vars.proposed_entries}" },
+          "into_var": "candidate"
+        }
+      ],
+      "next": { "type": "goto", "to": "QualityGate" }
+    },
+    "QualityGate": {
+      "actor": "",
+      "gate": "domain:auto-digest/entry-quality",
+      "prompt": "candidate=${vars.candidate.title} rendered=${vars.candidate.rendered} daily_count=${vars.candidate.daily_count}",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "auto_apply": "ApplyEntries",
+          "hold_for_review": "SurfaceToInbox",
+          "reject": "LogReject"
+        },
+        "default": "SurfaceToInbox"
+      }
+    },
+    "ApplyEntries": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "apply_entry",
+          "args": { "from": "${vars.candidate}" },
+          "into_var": "applied_entry"
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "SurfaceToInbox": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "surface_to_inbox",
+          "args": { "from": "${vars.candidate}" }
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "LogReject": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "log_reject",
+          "args": { "from": "${vars.candidate}" }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

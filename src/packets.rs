@@ -2580,9 +2580,9 @@ fn unwrap_jsonish(v: &mut serde_json::Value) {
     }
 }
 
-/// Accept `packet-<8hex>` or bare `<8hex>`.
+/// Accept `packet-<8hex>`, `domain:<name>`, or bare `<8hex>`.
 fn normalize_id(id: &str) -> String {
-    if id.starts_with("packet-") {
+    if id.starts_with("packet-") || id.starts_with("domain:") {
         id.to_string()
     } else {
         format!("packet-{id}")

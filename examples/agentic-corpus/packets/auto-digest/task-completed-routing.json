@@ -1,0 +1,28 @@
+{
+  "domain": "auto-digest/task-completed-routing",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["start_arc", "ignore"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "start_auto_digest_on_task_completed",
+      "classification": "start_arc",
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "signal", "value": "task-completed" },
+          { "op": "Eq", "field": "event_type", "value": "task-completed" },
+          { "op": "Eq", "field": "kind", "value": "task-completed" }
+        ]
+      },
+      "consequent": "{\"route\":\"start_arc\",\"workflow\":\"auto-digest-arc\",\"initial_vars\":{\"source_session\":\"${session_id}\",\"task_kind\":\"${task_kind}\",\"daily_count\":0}}"
+    },
+    {
+      "id": "ignore_unknown_task_event",
+      "classification": "ignore",
+      "antecedent": { "op": "True" },
+      "consequent": "ignore"
+    }
+  ]
+}

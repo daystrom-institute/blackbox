@@ -1,0 +1,102 @@
+{
+  "domain": "auto-digest/entry-quality",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["reject", "hold_for_review", "auto_apply"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "hold_rendered_entries",
+      "classification": "hold_for_review",
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "rendered", "value": true },
+          { "op": "Eq", "field": "vars.candidate.rendered", "value": true }
+        ]
+      },
+      "consequent": "hold_for_review"
+    },
+    {
+      "id": "reject_missing_source_session",
+      "classification": "reject",
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "IsNull", "field": "source_session" },
+          { "op": "IsNull", "field": "vars.candidate.source_session" },
+          {
+            "op": "All",
+            "args": [
+              { "op": "IsMissing", "field": "source_session" },
+              { "op": "IsMissing", "field": "vars.candidate.source_session" }
+            ]
+          }
+        ]
+      },
+      "consequent": "reject"
+    },
+    {
+      "id": "reject_missing_source_query",
+      "classification": "reject",
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "IsNull", "field": "source_query" },
+          { "op": "IsNull", "field": "vars.candidate.source_query" },
+          {
+            "op": "All",
+            "args": [
+              { "op": "IsMissing", "field": "source_query" },
+              { "op": "IsMissing", "field": "vars.candidate.source_query" }
+            ]
+          }
+        ]
+      },
+      "consequent": "reject"
+    },
+    {
+      "id": "reject_missing_source_files",
+      "classification": "reject",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "CountCmp", "path": "source_files[*]", "compare": "eq", "value": 0 },
+          { "op": "CountCmp", "path": "vars.candidate.source_files[*]", "compare": "eq", "value": 0 }
+        ]
+      },
+      "consequent": "reject"
+    },
+    {
+      "id": "hold_untrusted_brofile",
+      "classification": "hold_for_review",
+      "antecedent": {
+        "op": "Not",
+        "arg": {
+          "op": "Apply",
+          "packet_id": "domain:bro-trust/per-brofile",
+          "expect": ["trusted"]
+        }
+      },
+      "consequent": "hold_for_review"
+    },
+    {
+      "id": "auto_apply_nonrendered_under_daily_cap",
+      "classification": "auto_apply",
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Lt", "field": "daily_count", "value": 50 },
+          { "op": "Lt", "field": "vars.candidate.daily_count", "value": 50 }
+        ]
+      },
+      "consequent": "auto_apply"
+    },
+    {
+      "id": "hold_default",
+      "classification": "hold_for_review",
+      "antecedent": { "op": "True" },
+      "consequent": "hold_for_review"
+    }
+  ]
+}
