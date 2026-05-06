@@ -103,7 +103,12 @@ impl ProjectRegistry {
             fs::create_dir_all(parent)?;
         }
         let raw = serde_json::to_string_pretty(&self.store)?;
-        let tmp = self.path.with_extension("json.tmp");
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("projects.json");
+        let tmp = self.path.with_file_name(format!("{file_name}.tmp"));
         let mut file =
             fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         file.write_all(raw.as_bytes())?;
