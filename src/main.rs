@@ -1879,6 +1879,18 @@ struct AgentDescribeParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentDispatchParams {
+    agent: String,
+    args: serde_json::Value,
+    #[serde(default)]
+    project_dir: Option<String>,
+    #[serde(default)]
+    bro: Option<String>,
+    #[serde(default)]
+    ambient: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct AgentSearchParams {
     query: String,
     #[serde(default)]
@@ -4624,6 +4636,21 @@ Constraints:\n\
         }
     }
 
+    fn expand_template(template: &str, args: &serde_json::Value) -> String {
+        let mut result = template.to_string();
+        if let Some(obj) = args.as_object() {
+            for (key, value) in obj {
+                let pattern = format!("{{{{{}}}}}", key);
+                let replacement = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                result = result.replace(&pattern, &replacement);
+            }
+        }
+        result
+    }
+
     fn extract_inline_filters(inline: &serde_json::Value) -> (Vec<String>, Vec<String>) {
         let filters = match inline.get("filters") {
             Some(f) => f,
@@ -4851,6 +4878,255 @@ Constraints:\n\
                 "coverage_ratio": 0.0,
                 "note": "keyword-only mode; agent embedding pipeline not yet built (AS-I2)",
             },
+        }))
+    }
+
+    #[tool(
+        name = "bro_agent_dispatch",
+        description = "Dispatch a registered agent for a focused task. Routes through manifest dispatch_adapter if set, otherwise resolves brofile, merges filters, expands prompt template, and spawns via the standard bro execution path."
+    )]
+    async fn bro_agent_dispatch(
+        &self,
+        Parameters(p): Parameters<AgentDispatchParams>,
+    ) -> CallToolResult {
+        use orchestration::agents::adapter::{
+            AgentAdapterRegistry, AgentDispatchAdapter, DispatchContext,
+        };
+        use orchestration::agents::registry::AgentRegistry;
+        use orchestration::agents::types::{AgentRef, AgentSession, MergedFilters};
+
+        let (manifest, agent_ref, bro_label) = {
+            let catalog = self.state.artifacts.read();
+            let reg = AgentRegistry::new(&catalog);
+            let rec = match reg.get(&p.agent) {
+                Ok(Some(r)) => r,
+                Ok(None) => return Self::err_text(&format!("agent not found: {}", p.agent)),
+                Err(e) => return Self::err_text(&format!("registry get failed: {e}")),
+            };
+            let manifest = match rec.manifest {
+                Some(m) => m,
+                None => {
+                    return Self::err_text(&format!(
+                        "agent '{}' has unparseable manifest: {}",
+                        p.agent,
+                        rec.manifest_parse_error.unwrap_or_default()
+                    ));
+                }
+            };
+            if !rec.active {
+                return Self::err_text(&format!(
+                    "agent '{}' is not active (superseded or deactivated)",
+                    p.agent
+                ));
+            }
+            let agent_ref = AgentRef {
+                name: rec.name.clone(),
+                version: rec.version.parse::<u32>().unwrap_or(1),
+            };
+            let bro_label = format!("agent:{}@v{}", rec.name, rec.version);
+            (manifest, agent_ref, bro_label)
+        };
+
+        // Adapter path
+        if let Some(ref adapter_name) = manifest.dispatch_adapter {
+            let adapter = {
+                let adapter_registry = self.state.agent_adapter_registry.read();
+                match adapter_registry.get(adapter_name) {
+                    Some(a) => a,
+                    None => {
+                        return Self::err_text(&format!(
+                            "error.bad_input(code=adapter_unavailable): adapter '{}' not registered",
+                            adapter_name
+                        ));
+                    }
+                }
+            };
+            let ctx = DispatchContext {
+                project_dir: p.project_dir.clone(),
+                ambient: p.ambient.as_ref().and_then(|v| serde_json::to_string(v).ok()),
+                bro_label_prefix: Some(bro_label),
+                caller_provider: None,
+                caller_session_id: None,
+            };
+            match adapter.dispatch(&manifest, p.args, ctx).await {
+                Ok(result) => {
+                    return Self::ok_json(&serde_json::json!({
+                        "session": result.session,
+                        "task_id": result.session.task_id,
+                        "resolved_brofile": result.resolved_brofile,
+                        "merged_filters": result.merged_filters,
+                        "degraded": result.degraded,
+                    }));
+                }
+                Err(e) => return Self::err_text(&format!("{e}")),
+            }
+        }
+
+        // Direct path
+        let (provider, brofile_name, base_allow, base_disallow, exec_opts, env_overrides) =
+            if let Some(ref br) = manifest.brofile_ref {
+                let bf = match orchestration::brofile::resolve_brofile(
+                    br,
+                    &self.state.store_dir,
+                    p.project_dir.as_deref(),
+                ) {
+                    Some(b) => b,
+                    None => {
+                        return Self::err_text(&format!(
+                            "brofile_ref '{}' not found",
+                            br
+                        ));
+                    }
+                };
+                let (ba, bd) = match &bf.filters {
+                    Some(f) => (f.allow.clone(), f.disallow.clone()),
+                    None => (Vec::new(), Vec::new()),
+                };
+                let env = orchestration::brofile::resolve_provider_env(
+                    bf.provider,
+                    bf.account.as_deref(),
+                    bf.model.as_deref(),
+                    &self.state.store_dir,
+                );
+                let opts = if bf.model.is_some() || bf.effort.is_some() {
+                    Some(ExecOpts {
+                        model: bf.model.clone(),
+                        effort: bf.effort.clone(),
+                    })
+                } else {
+                    None
+                };
+                (bf.provider, Some(br.clone()), ba, bd, opts, env)
+            } else if let Some(ref inline) = manifest.brofile_inline {
+                let prov_str = inline
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("claude");
+                let provider = prov_str
+                    .parse::<orchestration::providers::Provider>()
+                    .map_err(|_| format!("unknown provider in inline brofile: {prov_str}"))
+                    .unwrap_or(orchestration::providers::Provider::Claude);
+                let (ba, bd) = Self::extract_inline_filters(inline);
+                let env = orchestration::brofile::resolve_provider_env(
+                    provider,
+                    None,
+                    inline.get("model").and_then(|v| v.as_str()),
+                    &self.state.store_dir,
+                );
+                let opts = if inline.get("model").is_some() || inline.get("effort").is_some() {
+                    Some(ExecOpts {
+                        model: inline.get("model").and_then(|v| v.as_str()).map(String::from),
+                        effort: inline.get("effort").and_then(|v| v.as_str()).map(String::from),
+                    })
+                } else {
+                    None
+                };
+                (provider, None, ba, bd, opts, env)
+            } else {
+                return Self::err_text("manifest has neither brofile_ref nor brofile_inline");
+            };
+
+        let merged = MergedFilters::merge(
+            &base_allow,
+            &base_disallow,
+            manifest.filter_overlay.as_ref(),
+        );
+
+        let prompt = match &manifest.inputs {
+            Some(spec) => match &spec.prompt_template {
+                Some(tmpl) => Self::expand_template(tmpl, &p.args),
+                None => {
+                    if p.args.is_null() {
+                        String::new()
+                    } else {
+                        serde_json::to_string_pretty(&p.args).unwrap_or_default()
+                    }
+                }
+            },
+            None => {
+                if p.args.is_null() {
+                    String::new()
+                } else {
+                    serde_json::to_string_pretty(&p.args).unwrap_or_default()
+                }
+            }
+        };
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cwd = p.project_dir.clone();
+
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
+            session_id: Some(session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: p.bro.clone(),
+            thread_id: None,
+            work_item_id: None,
+            pin_block: self.ambient_pin_block(
+                cwd.as_deref(),
+                p.bro.as_deref(),
+                Some(session_id.as_str()),
+                None,
+                None,
+            ),
+            completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
+            allow_recursion: false,
+            provider: Some(provider),
+        };
+        let final_prompt = orch::apply_ambient(&prompt, &ambient_ctx);
+
+        let mut args = provider.build_exec_args(
+            &final_prompt,
+            &session_id,
+            cwd.as_deref(),
+            exec_opts.as_ref(),
+        );
+        let brofile_filters = orchestration::mcp::McpFilters {
+            allow: merged.allow.clone(),
+            disallow: merged.disallow.clone(),
+        };
+        let extra = combine_dispatch_filters(Some(&brofile_filters), None);
+        let dispatch_filters = resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            false,
+            &task_id,
+            extra.as_ref(),
+        );
+        args.extend(dispatch_filters.args);
+
+        let task = orch::spawn_task(
+            task_id.clone(),
+            provider,
+            args,
+            session_id.clone(),
+            cwd,
+            env_overrides,
+            self.state.store_dir.clone(),
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+        );
+
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+
+        if let Some(bro_name) = &p.bro {
+            self.record_task_to_bro(bro_name, &task);
+        }
+
+        let agent_session = AgentSession {
+            session_id: session_id.clone(),
+            provider: provider.as_str().to_string(),
+            project_dir: p.project_dir.clone(),
+            agent: agent_ref,
+            task_id: Some(task_id.clone()),
+        };
+
+        Self::ok_json(&serde_json::json!({
+            "session": agent_session,
+            "task_id": task_id,
+            "resolved_brofile": brofile_name,
+            "merged_filters": merged,
         }))
     }
 
@@ -11558,5 +11834,261 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
         assert!(text.contains("invalid cost_class"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_dispatch_agent_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "nonexistent".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("agent not found"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_dispatch_inactive_agent_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "v1.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "inactive-dispatch",
+                "version": 1,
+                "manifest": {
+                    "description": "Test agent.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "v2.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "inactive-dispatch",
+                "version": 2,
+                "manifest": {
+                    "description": "Replacement.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            Some("inactive-dispatch".to_string()),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "inactive-dispatch@v1".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("not active") || text.contains("agent not found"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_dispatch_adapter_unavailable_hard_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "badgey.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "badgey-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Badgey agent.",
+                    "dispatch_adapter": "badgey",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "badgey-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(
+            text.contains("adapter_unavailable"),
+            "should hard-fail with adapter_unavailable: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bro_agent_dispatch_noop_adapter_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "noop-dispatch.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "noop-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Noop test agent.",
+                    "dispatch_adapter": "noop",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        struct NoopAdapter;
+        impl orchestration::agents::adapter::AgentDispatchAdapter for NoopAdapter {
+            fn name(&self) -> &'static str { "noop" }
+            fn dispatch(
+                &self,
+                _manifest: &orchestration::agents::types::AgentManifest,
+                _args: serde_json::Value,
+                _ctx: orchestration::agents::adapter::DispatchContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<orchestration::agents::adapter::AgentDispatchResult, orchestration::agents::adapter::AgentDispatchError>> + Send + '_>> {
+                Box::pin(async {
+                    Ok(orchestration::agents::adapter::AgentDispatchResult {
+                        session: orchestration::agents::types::AgentSession {
+                            session_id: "test-session-123".into(),
+                            provider: "test".into(),
+                            project_dir: None,
+                            agent: orchestration::agents::types::AgentRef {
+                                name: "noop-agent".into(),
+                                version: 1,
+                            },
+                            task_id: Some("test-task-456".into()),
+                        },
+                        resolved_brofile: None,
+                        merged_filters: orchestration::agents::types::MergedFilters::default(),
+                        degraded: None,
+                    })
+                })
+            }
+        }
+        server.state.agent_adapter_registry.write().register(std::sync::Arc::new(NoopAdapter));
+
+        let result = server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "noop-agent".into(),
+            args: serde_json::json!({"prompt": "hello"}),
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })).await;
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["session"]["session_id"], "test-session-123");
+        assert_eq!(body["task_id"], "test-task-456");
+    }
+
+    #[test]
+    fn bro_agent_dispatch_unparseable_manifest_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "broken-dispatch.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "broken-dispatch",
+                "version": 1,
+                "manifest": 42,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "broken-dispatch".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("unparseable manifest"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_dispatch_no_brofile_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "no-brofile.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "no-brofile-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent without brofile.",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "no-brofile-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: None,
+            bro: None,
+            ambient: None,
+        })));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("neither brofile_ref nor brofile_inline"), "got: {text}");
+    }
+
+    #[test]
+    fn expand_template_substitutes_args() {
+        let tmpl = "Review {{diff}} for {{focus}} issues.";
+        let args = serde_json::json!({"diff": "abc123", "focus": "security"});
+        let result = BlackboxServer::expand_template(tmpl, &args);
+        assert_eq!(result, "Review abc123 for security issues.");
     }
 }

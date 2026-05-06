@@ -3,6 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use super::types::{AgentFilterOverlay, AgentManifest, AgentSession, MergedFilters};
 
 // ---------------------------------------------------------------------------
@@ -22,7 +24,7 @@ pub struct DispatchContext {
 // DispatchDegraded
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchDegraded {
     pub reasons: Vec<String>,
 }

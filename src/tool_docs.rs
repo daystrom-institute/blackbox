@@ -770,6 +770,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Discovery: find agents relevant to a task before dispatching. Call with the task description to get ranked candidates. Set exclude_anti_pattern_matches=false to see all matches including anti-pattern hits (useful for review). Filter by cost_class or provenance_kind to narrow results.",
         example: Some(r#"bro_agent_search(query="review pull request for security issues", limit=3)"#),
     },
+    ToolDoc {
+        name: "bro_agent_dispatch",
+        category: ToolCategory::Orchestration,
+        summary: "Dispatch a registered agent for a focused task. Routes through manifest dispatch_adapter if set, otherwise resolves brofile, merges filters, expands prompt template, and spawns via the standard bro execution path.",
+        when_to_use: "Dispatching an agent after discovery via bro_agent_search. Returns (task_id, session) — resume with bro_resume, status with bro_status. Prefer over hand-rolling a brofile + bro_exec when the task matches an agent's description and when_to_use. Anti-pattern: do not dispatch when the agent's manifest declares one of your task's properties as an anti_pattern.",
+        example: Some(r#"bro_agent_dispatch(agent="code-reviewer", args={"diff": "..."})"#),
+    },
     // ── Whiteboards ─────────────────────────────────────────────
     ToolDoc {
         name: "whiteboard_open",
