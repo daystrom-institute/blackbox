@@ -774,6 +774,18 @@ mod tests {
                 "keystone-implementer-feedback-arc",
                 include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json"),
             ),
+            (
+                "agent-chain",
+                include_str!("../../examples/agents/workflows/chain.json"),
+            ),
+            (
+                "agent-fan-out",
+                include_str!("../../examples/agents/workflows/fan-out.json"),
+            ),
+            (
+                "agent-escalation",
+                include_str!("../../examples/agents/workflows/escalation.json"),
+            ),
         ];
 
         let mut failures: Vec<String> = Vec::new();
@@ -858,6 +870,18 @@ mod tests {
             (
                 "keystone-implementer-feedback-arc",
                 include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json"),
+            ),
+            (
+                "agent-chain",
+                include_str!("../../examples/agents/workflows/chain.json"),
+            ),
+            (
+                "agent-fan-out",
+                include_str!("../../examples/agents/workflows/fan-out.json"),
+            ),
+            (
+                "agent-escalation",
+                include_str!("../../examples/agents/workflows/escalation.json"),
             ),
         ];
         for (name, src) in cases {

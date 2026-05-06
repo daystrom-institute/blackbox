@@ -2,33 +2,66 @@
   "name": "agent-chain",
   "version": 1,
   "actors": {
-    "first": {
-      "kind": "executor",
-      "brofile": "probe-haiku"
-    },
-    "second": {
+    "placeholder": {
       "kind": "executor",
       "brofile": "probe-haiku"
     }
   },
-  "start": "First",
-  "nodes": {
-    "First": {
-      "actor": "first",
-      "prompt": "Analyze the following input and produce a structured summary. Input: ${initial_args.input}. Output exactly one paragraph summary, no preamble.",
-      "next": { "type": "goto", "to": "Second" }
-    },
-    "Second": {
-      "actor": "second",
-      "prompt": "Based on this summary, produce actionable recommendations.\n\nSummary: ${First.output}\n\nList exactly 3 recommendations, numbered. No preamble.",
-      "next": { "type": "terminal" }
-    }
-  },
+  "start": "DispatchFirst",
   "vars_schema": {
-    "type": "object",
-    "required": ["input"],
-    "properties": {
-      "input": { "type": "string" }
+    "input": { "kind": "string", "required": true },
+    "first_dispatch": { "kind": "any" },
+    "first_result": { "kind": "any" },
+    "second_dispatch": { "kind": "any" }
+  },
+  "nodes": {
+    "DispatchFirst": {
+      "actor": "placeholder",
+      "prompt": "Chain step 1 dispatched.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "first-agent",
+              "args": { "input": "${vars.input}" }
+            },
+            "timeout_secs": 120
+          },
+          "into_var": "first_dispatch",
+          "on_failure": "halt"
+        },
+        {
+          "op": "parse_json",
+          "args": { "source": "${vars.first_dispatch}" },
+          "into_var": "first_result",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "DispatchSecond" }
+    },
+    "DispatchSecond": {
+      "actor": "placeholder",
+      "prompt": "Chain step 2 dispatched.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "second-agent",
+              "args": { "input": "${vars.first_result.output}" }
+            },
+            "timeout_secs": 120
+          },
+          "into_var": "second_dispatch",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "terminal" }
     }
   }
 }

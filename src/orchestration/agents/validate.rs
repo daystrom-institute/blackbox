@@ -249,11 +249,16 @@ fn validate_composition(
     }
 
     if let Some(ref aggregator) = composition.fan_out_aggregator {
-        if !FAN_OUT_AGGREGATOR_VARIANTS.contains(&aggregator.as_str()) {
+        let is_builtin = FAN_OUT_AGGREGATOR_VARIANTS.contains(&aggregator.as_str());
+        let is_well_formed_node_id = !aggregator.is_empty()
+            && aggregator
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ':');
+        if !is_builtin && !is_well_formed_node_id {
             return Err(ValidationError {
                 step: "lint_composition",
                 message: format!(
-                    "composition.fan_out_aggregator must be one of {:?}, got `{aggregator}`",
+                    "composition.fan_out_aggregator must be one of {:?} or a well-formed node identifier (alphanumeric, '-', '_', ':'), got `{aggregator}`",
                     FAN_OUT_AGGREGATOR_VARIANTS
                 ),
             });
@@ -830,12 +835,36 @@ mod tests {
         let ctx = make_ctx(&registry);
         let mut v = minimal_valid_agent();
         v["manifest"]["composition"] = serde_json::json!({
-            "fan_out_aggregator": "invalid-mode",
+            "fan_out_aggregator": "has spaces in it",
         });
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_composition");
         assert!(err.message.contains("fan_out_aggregator"));
-        assert!(err.message.contains("vote-majority"));
+        assert!(err.message.contains("well-formed"));
+    }
+
+    #[test]
+    fn accepts_custom_node_id_as_aggregator() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["composition"] = serde_json::json!({
+            "fan_out_aggregator": "my-custom-aggregator-node",
+        });
+        validate_agent_install(&v, &ctx).unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_aggregator() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["composition"] = serde_json::json!({
+            "fan_out_aggregator": "",
+        });
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "lint_composition");
+        assert!(err.message.contains("fan_out_aggregator"));
     }
 
     #[test]

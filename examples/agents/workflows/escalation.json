@@ -2,42 +2,75 @@
   "name": "agent-escalation",
   "version": 1,
   "actors": {
-    "cheap": {
-      "kind": "executor",
-      "brofile": "probe-haiku"
-    },
-    "expensive": {
+    "placeholder": {
       "kind": "executor",
       "brofile": "probe-haiku"
     }
   },
   "start": "CheapAttempt",
+  "vars_schema": {
+    "prompt": { "kind": "string", "required": true },
+    "cheap_dispatch": { "kind": "any" },
+    "expensive_dispatch": { "kind": "any" }
+  },
   "nodes": {
     "CheapAttempt": {
-      "actor": "cheap",
-      "prompt": "Answer the following question concisely. If you are not confident in your answer, start your response with 'UNCERTAIN:'.\n\n${initial_args.prompt}",
+      "actor": "placeholder",
+      "prompt": "Attempt the task cheaply: ${vars.prompt}",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "cheap-agent",
+              "args": { "prompt": "${vars.prompt}" }
+            },
+            "timeout_secs": 60
+          },
+          "into_var": "cheap_dispatch",
+          "on_failure": "halt"
+        }
+      ],
+      "gate": "packet-escalation-judge",
       "next": {
         "type": "branch",
-        "default": { "type": "terminal" },
-        "branches": [
-          {
-            "match": { "field": "output", "pattern": "^UNCERTAIN:" },
-            "then": { "type": "goto", "to": "Escalate" }
-          }
-        ]
+        "cases": {
+          "escalate": "Escalate",
+          "flag": "Escalate"
+        },
+        "default": "Done"
       }
     },
     "Escalate": {
-      "actor": "expensive",
-      "prompt": "A cheaper agent was uncertain about this question. Provide a thorough, confident answer.\n\nOriginal question: ${initial_args.prompt}\n\nCheaper agent's uncertain response: ${CheapAttempt.output}\n\nProvide a definitive answer. No preamble.",
+      "actor": "placeholder",
+      "prompt": "Escalating to expensive agent with context from cheap attempt.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "expensive-agent",
+              "args": {
+                "prompt": "${vars.prompt}",
+                "context": "Cheap agent result: ${vars.cheap_dispatch}"
+              }
+            },
+            "timeout_secs": 120
+          },
+          "into_var": "expensive_dispatch",
+          "on_failure": "halt"
+        }
+      ],
       "next": { "type": "terminal" }
-    }
-  },
-  "vars_schema": {
-    "type": "object",
-    "required": ["prompt"],
-    "properties": {
-      "prompt": { "type": "string" }
+    },
+    "Done": {
+      "actor": "placeholder",
+      "prompt": "Cheap agent was sufficient. Result: ${vars.cheap_dispatch}",
+      "next": { "type": "terminal" }
     }
   }
 }
