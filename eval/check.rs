@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
@@ -128,6 +131,10 @@ pub const MANIFEST_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+static CHECKER_MANIFESTS: OnceLock<Result<Vec<EvalQueryManifest>, String>> = OnceLock::new();
+#[cfg(test)]
+static MANIFEST_PARSE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalQueryManifest {
     pub id: String,
@@ -247,6 +254,8 @@ pub fn load_manifests() -> Result<Vec<EvalQueryManifest>, serde_json::Error> {
 }
 
 fn load_manifest(name: &str, raw: &str) -> Result<EvalQueryManifest, serde_json::Error> {
+    #[cfg(test)]
+    MANIFEST_PARSE_COUNT.fetch_add(1, Ordering::SeqCst);
     let manifest = serde_json::from_str::<EvalQueryManifest>(raw)?;
     for locator in &manifest.target_locators {
         if EntityType::from_prefix(&locator.entity_type_hint).is_none() {
@@ -321,9 +330,9 @@ fn expected_ref_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>
 }
 
 fn expected_refs_for_checker(name: &str) -> Result<(Vec<EntityRef>, PassStrictness), String> {
-    let manifests = load_manifests().map_err(|err| err.to_string())?;
+    let manifests = cached_manifests()?;
     let Some(manifest) = manifests
-        .into_iter()
+        .iter()
         .find(|manifest| manifest.pass_classifier == name)
     else {
         return Err(format!("unknown checker {name}"));
@@ -334,6 +343,14 @@ fn expected_refs_for_checker(name: &str) -> Result<(Vec<EntityRef>, PassStrictne
         .map(|raw| EntityRef::parse(raw).map_err(|err| err.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     Ok((expected, manifest.pass_strictness))
+}
+
+fn cached_manifests() -> Result<&'static [EvalQueryManifest], String> {
+    CHECKER_MANIFESTS
+        .get_or_init(|| load_manifests().map_err(|err| err.to_string()))
+        .as_ref()
+        .map(Vec::as_slice)
+        .map_err(Clone::clone)
 }
 
 macro_rules! stub_checker {
@@ -516,6 +533,30 @@ mod tests {
             .find(|manifest| manifest.query_class == QueryClass::ExactSymbol)
             .expect("exact-symbol manifest exists");
         assert_eq!(exact.pass_strictness, PassStrictness::Any);
+    }
+
+    #[test]
+    fn checker_manifest_lookup_uses_cached_parse_result() {
+        let checker = checker_by_name("check_exact_symbol_knowledge_store").unwrap();
+        let manifests = load_manifests().unwrap();
+        let expected = parsed_expected(
+            manifests
+                .iter()
+                .find(|manifest| manifest.pass_classifier == "check_exact_symbol_knowledge_store")
+                .unwrap(),
+        );
+        let after_fixture_load = MANIFEST_PARSE_COUNT.load(Ordering::SeqCst);
+
+        for _ in 0..90 {
+            let (passed, messages) = checker(&expected);
+            assert!(passed, "{messages:?}");
+        }
+
+        let after_checkers = MANIFEST_PARSE_COUNT.load(Ordering::SeqCst);
+        assert!(
+            after_checkers - after_fixture_load <= MANIFEST_SOURCES.len(),
+            "checker cache should parse the manifest set at most once"
+        );
     }
 
     #[test]
