@@ -595,6 +595,24 @@ impl BlackboxServer {
         self.state.cancel_arc(arc_id)
     }
 
+    fn rebuild_edge_index_from_stores(&self) {
+        let edges_dir = edge_index::edges_dir_from_bro_store(&self.state.store_dir);
+        let idx = self.state.idx.read();
+        let kb = self.state.kb.read();
+        let threads = self.state.threads.read();
+        let notes = self.state.notes.read();
+        let task_store = self.state.task_store.read();
+        let rebuilt = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+            index: &idx,
+            knowledge: &kb,
+            threads: &threads,
+            notes: &notes,
+            task_store: &task_store,
+            edges_dir,
+        });
+        *self.state.edge_index.write() = rebuilt;
+    }
+
     /// Resolve a workflow by registry id (set via `bro_workflow_install`
     /// or restored from disk on startup). Returns a clone so the caller
     /// can mutate locally without affecting the registry.
@@ -692,6 +710,7 @@ use mcp_tools::discover_seed::DiscoverSeedParams;
 use mcp_tools::find_paths::FindPathsParams;
 use mcp_tools::hybrid_search::HybridSearchParams;
 use mcp_tools::inspect::InspectEntityParams;
+use mcp_tools::provenance::ProvenanceParams;
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
     apply_with as apply_packet_with, packet_matches_query, packet_summary,
@@ -939,6 +958,46 @@ impl BlackboxServer {
     }
 
     #[tool(
+        name = "bbox_provenance_export",
+        description = "Write bbox provenance git notes for commits with tracked tool-call anchors."
+    )]
+    fn bbox_provenance_export(
+        &self,
+        Parameters(p): Parameters<ProvenanceParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_provenance_export", || {
+            let projects = self.state.projects.read().list();
+            mcp_tools::provenance::export_provenance(
+                &p,
+                &self.state.edge_index.read(),
+                &projects,
+            )
+        })
+    }
+
+    #[tool(
+        name = "bbox_provenance_import",
+        description = "Read bbox provenance git notes and replay them into the local EdgeIndex sidecar."
+    )]
+    fn bbox_provenance_import(
+        &self,
+        Parameters(p): Parameters<ProvenanceParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_provenance_import", || {
+            let projects = self.state.projects.read().list();
+            let edges_dir = edge_index::edges_dir_from_bro_store(&self.state.store_dir);
+            let edges_imported =
+                mcp_tools::provenance::import_provenance_to_edges_dir(&p, &projects, &edges_dir)?;
+            self.rebuild_edge_index_from_stores();
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "edges_imported": edges_imported,
+                "notes_ref": crate::git::notes_ref("provenance"),
+            }))?)
+        })
+    }
+
+    #[tool(
         name = "bbox_project_register",
         description = "Register a project directory for agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. Triggers the project-bootstrap-arc which walks the project, chunks files, writes to the index, and emits structural edges. project_id is derived from the canonicalized realpath and is per-machine; not portable across hosts. repo_id is null for non-git projects; for git projects it derives from the first-commit SHA (with remote-URL fallback for shallow clones), so it survives clones. Use bbox_project_list to inspect registered projects."
     )]
@@ -948,6 +1007,16 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_project_register", || {
             let record = self.state.projects.write().register_path(&p.path)?;
+            let edges_dir = edge_index::edges_dir_from_bro_store(&self.state.store_dir);
+            let provenance_params = ProvenanceParams {
+                project_id: Some(record.project_id.clone()),
+            };
+            mcp_tools::provenance::import_provenance_to_edges_dir(
+                &provenance_params,
+                std::slice::from_ref(&record),
+                &edges_dir,
+            )?;
+            self.rebuild_edge_index_from_stores();
             trigger_project_bootstrap_arc(self.state.clone(), record.clone());
             self.state
                 .idx

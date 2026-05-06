@@ -43,6 +43,21 @@ project, no backfill happens; only future tool calls produce edges.
 Future improvement: a `bbox_project_register` post-step that walks transcripts
 and backfills tool-call edges for the newly registered project.
 
+## G2
+
+Cross-machine provenance is serialized as git notes under
+`refs/notes/<namespace>/provenance`. The namespace defaults to `bbox` and can
+be changed with `BBOX_GIT_NOTES_NAMESPACE`, for example `bbox-dev` or
+`bbox-prod` in multi-instance setups.
+
+`bbox_provenance_export` writes note JSON for commits that have tracked
+tool-call anchors. `bbox_provenance_import` reads those notes and replays the
+tool-call edges into the local EdgeIndex sidecar after a clone or fetch.
+
+Operators who share notes across divergent branches should configure the repo
+with `git config notes.mergeStrategy union`. The daemon documents this merge
+strategy but does not write project git config automatically.
+
 ## S3
 
 - Code chunking uses `tree-sitter-language-pack` with runtime downloads

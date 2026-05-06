@@ -252,6 +252,20 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use for WHY-this-line-exists questions.",
         example: None,
     },
+    ToolDoc {
+        name: "bbox_provenance_export",
+        category: ToolCategory::Graph,
+        summary: "Write bbox provenance git notes for commits with tracked tool-call anchors.",
+        when_to_use: "Use after committing bbox-tracked edits when provenance should travel with git history.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_provenance_import",
+        category: ToolCategory::Graph,
+        summary: "Read bbox provenance git notes and replay them into the local EdgeIndex sidecar.",
+        when_to_use: "Use after fetching or cloning bbox git notes from another machine.",
+        example: None,
+    },
     // ── Projects ─────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_project_register",
@@ -983,7 +997,9 @@ pub fn render_markdown() -> String {
                     doc.name,
                     hot_summary(doc.summary)
                 ));
-                out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
+                if !doc.when_to_use.is_empty() {
+                    out.push_str(&format!("  _When to use:_ {}\n", doc.when_to_use));
+                }
                 if let Some(ex) = doc.example {
                     out.push_str(&format!("  _Example:_ `{ex}`\n"));
                 }
@@ -1000,7 +1016,7 @@ pub fn render_markdown() -> String {
 }
 
 fn hot_summary(summary: &'static str) -> Cow<'static, str> {
-    const MAX_SUMMARY_BYTES: usize = 20;
+    const MAX_SUMMARY_BYTES: usize = 12;
     if summary.len() <= MAX_SUMMARY_BYTES {
         return Cow::Borrowed(summary);
     }

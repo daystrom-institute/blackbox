@@ -642,3 +642,12 @@ pub use search::{
     CiteParams, ContextParams, HybridBm25Hit, MessagesParams, ReindexParams, SearchParams,
     SessionParams, SessionsListParams, TopicsParams,
 };
+
+pub(crate) fn resolve_current_project_chunk_entity(
+    project: &crate::projects::ProjectRecord,
+    root: &Path,
+    absolute_path: &Path,
+    byte_range: Option<(u64, u64)>,
+) -> Result<Option<crate::entity_ref::EntityRef>> {
+    project_files::resolve_current_chunk_entity(project, root, absolute_path, byte_range)
+}

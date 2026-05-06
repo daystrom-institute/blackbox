@@ -5,3 +5,4 @@ pub mod discover_seed;
 pub mod find_paths;
 pub mod hybrid_search;
 pub mod inspect;
+pub mod provenance;

@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result};
 
@@ -126,8 +127,7 @@ fn is_ancestor_of_head(root: &Path, since: &str) -> bool {
         since.to_string(),
         "HEAD".to_string(),
     ];
-    let Some(merge_base) =
-        git_output_strings(root, &merge_base_args, "checking git ancestry")
+    let Some(merge_base) = git_output_strings(root, &merge_base_args, "checking git ancestry")
     else {
         return false;
     };
@@ -163,6 +163,77 @@ pub(crate) fn changed_files_for_commit(root: &Path, sha: &str) -> Result<Vec<Str
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
+        .collect())
+}
+
+pub(crate) fn notes_namespace() -> String {
+    std::env::var("BBOX_GIT_NOTES_NAMESPACE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "bbox".to_string())
+}
+
+pub(crate) fn notes_ref(kind: &str) -> String {
+    format!("refs/notes/{}/{}", notes_namespace(), kind)
+}
+
+pub(crate) fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str) -> Result<()> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["notes", "--ref", notes_ref, "add", "-f", "-F", "-", commit])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning git notes add in {}", root.display()))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(body.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git notes add failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn show_note(root: &Path, notes_ref: &str, commit: &str) -> Result<Option<String>> {
+    let Some(output) = git_output(
+        root,
+        &["notes", "--ref", notes_ref, "show", commit],
+        "showing git note",
+    ) else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8(output.stdout)?))
+}
+
+pub(crate) fn list_notes(root: &Path, notes_ref: &str) -> Result<Vec<(String, String)>> {
+    let Some(output) = git_output(
+        root,
+        &["notes", "--ref", notes_ref, "list"],
+        "listing git notes",
+    ) else {
+        return Ok(Vec::new());
+    };
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let raw = String::from_utf8(output.stdout)?;
+    Ok(raw
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let note_sha = parts.next()?;
+            let commit_sha = parts.next()?;
+            Some((note_sha.to_string(), commit_sha.to_string()))
+        })
         .collect())
 }
 
@@ -339,7 +410,10 @@ mod tests {
         assert_eq!(blame.commit_sha, "abc123");
         assert_eq!(blame.author, "Ada Lovelace");
         assert_eq!(blame.rel_path, "src/main.rs");
-        assert_eq!(blame.author_time.as_deref(), Some("2023-11-14T22:13:20+00:00"));
+        assert_eq!(
+            blame.author_time.as_deref(),
+            Some("2023-11-14T22:13:20+00:00")
+        );
     }
 
     #[test]
@@ -361,6 +435,27 @@ mod tests {
         let commits = commit_log(repo.path(), Some(&old_head)).unwrap();
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].message, "new root");
+    }
+
+    #[test]
+    fn git_notes_write_show_and_list_round_trip() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init"]);
+        run_git(repo.path(), &["config", "user.name", "Test User"]);
+        run_git(repo.path(), &["config", "user.email", "test@example.test"]);
+        std::fs::write(repo.path().join("README.md"), "one\n").unwrap();
+        run_git(repo.path(), &["add", "README.md"]);
+        run_git(repo.path(), &["commit", "-m", "note target"]);
+        let head = current_head(repo.path()).unwrap();
+        let notes_ref = "refs/notes/bbox-test/provenance";
+
+        write_note(repo.path(), notes_ref, &head, "{\"ok\":true}\n").unwrap();
+
+        assert_eq!(
+            show_note(repo.path(), notes_ref, &head).unwrap().as_deref(),
+            Some("{\"ok\":true}\n")
+        );
+        assert_eq!(list_notes(repo.path(), notes_ref).unwrap().len(), 1);
     }
 
     fn run_git(root: &Path, args: &[&str]) {
