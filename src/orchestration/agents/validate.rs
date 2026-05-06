@@ -19,6 +19,17 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+fn json_type_label(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 pub struct InstallCtx<'a, F: Fn(&str) -> bool> {
     pub adapter_registry: &'a AgentAdapterRegistry,
     pub brofile_exists: F,
@@ -80,13 +91,25 @@ pub fn validate_agent_install<F: Fn(&str) -> bool>(
         }
     }
 
-    if let Some(supersedes) = value.get("supersedes").and_then(|v| v.as_str()) {
-        if supersedes.is_empty() {
-            return Err(ValidationError {
-                step: "shape",
-                message: "agent artifact `supersedes` must be a non-empty string if present"
-                    .into(),
-            });
+    if let Some(supersedes_val) = value.get("supersedes") {
+        match supersedes_val {
+            serde_json::Value::String(s) if !s.is_empty() => {}
+            serde_json::Value::String(_) => {
+                return Err(ValidationError {
+                    step: "shape",
+                    message: "agent artifact `supersedes` must be a non-empty string if present"
+                        .into(),
+                });
+            }
+            other => {
+                return Err(ValidationError {
+                    step: "shape",
+                    message: format!(
+                        "agent artifact `supersedes` must be a string, got {}",
+                        json_type_label(other)
+                    ),
+                });
+            }
         }
     }
 
@@ -675,6 +698,29 @@ mod tests {
         let mut v = minimal_valid_agent();
         v["supersedes"] = serde_json::json!("previous-version");
         validate_agent_install(&v, &ctx).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_string_supersedes() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["supersedes"] = serde_json::json!(42);
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "shape");
+        assert!(err.message.contains("supersedes"));
+        assert!(err.message.contains("string"));
+    }
+
+    #[test]
+    fn rejects_boolean_supersedes() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["supersedes"] = serde_json::json!(true);
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "shape");
+        assert!(err.message.contains("supersedes"));
     }
 
     #[test]

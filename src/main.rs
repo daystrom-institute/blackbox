@@ -4495,9 +4495,16 @@ Constraints:\n\
         use orchestration::agents::types::AgentCostClass;
         let catalog = self.state.artifacts.read();
         let reg = AgentRegistry::new(&catalog);
-        let cost_class = p.cost_class.as_deref().and_then(|s| {
-            serde_json::from_value::<AgentCostClass>(serde_json::Value::String(s.to_string())).ok()
-        });
+        let cost_class = match p.cost_class.as_deref() {
+            Some(s) => {
+                let parsed: AgentCostClass = match serde_json::from_value(serde_json::Value::String(s.to_string())) {
+                    Ok(c) => c,
+                    Err(_) => return Self::err_text(&format!("unknown cost_class: {s} (expected one of: cheap, normal, expensive)")),
+                };
+                Some(parsed)
+            }
+            None => None,
+        };
         let filter = ListFilter {
             include_superseded: p.include_superseded.unwrap_or(false),
             cost_class,
@@ -4505,17 +4512,33 @@ Constraints:\n\
         };
         match reg.list(&filter) {
             Ok(summaries) => Self::ok_json(&serde_json::json!({
-                "agents": summaries.iter().map(|s| serde_json::json!({
-                    "name": s.name,
-                    "version": s.version,
-                    "active": s.active,
-                    "description": s.description,
-                    "cost_class": s.cost_class.as_ref().map(|c| serde_json::to_value(c).unwrap()),
-                    "provenance_kind": s.provenance_kind,
-                    "installed_at": s.installed_at,
-                    "supersedes_chain": s.supersedes_chain,
-                    "embedding_pending": s.embedding_pending,
-                })).collect::<Vec<_>>()
+                "agents": summaries.iter().map(|s| {
+                    let mut m = serde_json::Map::from_iter([
+                        ("name".into(), serde_json::Value::String(s.name.clone())),
+                        ("version".into(), serde_json::Value::String(s.version.clone())),
+                        ("active".into(), serde_json::Value::Bool(s.active)),
+                        ("installed_at".into(), serde_json::Value::String(s.installed_at.clone())),
+                        ("embedding_pending".into(), match s.embedding_pending {
+                            Some(b) => serde_json::Value::Bool(b),
+                            None => serde_json::Value::Null,
+                        }),
+                    ]);
+                    if let Some(desc) = &s.description {
+                        m.insert("description".into(), serde_json::Value::String(desc.clone()));
+                    }
+                    if let Some(cc) = &s.cost_class {
+                        m.insert("cost_class".into(), serde_json::Value::String(cc.to_string()));
+                    }
+                    if let Some(pk) = &s.provenance_kind {
+                        m.insert("provenance_kind".into(), serde_json::Value::String(pk.clone()));
+                    }
+                    if !s.supersedes_chain.is_empty() {
+                        m.insert("supersedes_chain".into(), serde_json::Value::Array(
+                            s.supersedes_chain.iter().map(|c| serde_json::Value::String(c.clone())).collect()
+                        ));
+                    }
+                    serde_json::Value::Object(m)
+                }).collect::<Vec<_>>()
             })),
             Err(e) => Self::err_text(&format!("registry list failed: {e}")),
         }
@@ -4530,17 +4553,35 @@ Constraints:\n\
         let catalog = self.state.artifacts.read();
         let reg = AgentRegistry::new(&catalog);
         match reg.get(&p.name) {
-            Ok(Some(rec)) => Self::ok_json(&serde_json::json!({
-                "name": rec.name,
-                "version": rec.version,
-                "active": rec.active,
-                "installed_at": rec.installed_at,
-                "source": rec.source,
-                "supersedes": rec.metadata.supersedes,
-                "supersedes_chain": rec.metadata.supersedes_chain,
-                "superseded_by": rec.metadata.superseded_by,
-                "manifest": rec.manifest.as_ref().map(|m| serde_json::to_value(m).unwrap()),
-            })),
+            Ok(Some(rec)) => {
+                let mut m = serde_json::Map::from_iter([
+                    ("name".into(), serde_json::Value::String(rec.name)),
+                    ("version".into(), serde_json::Value::String(rec.version)),
+                    ("active".into(), serde_json::Value::Bool(rec.active)),
+                    ("installed_at".into(), serde_json::Value::String(rec.installed_at)),
+                    ("source".into(), serde_json::Value::String(rec.source)),
+                ]);
+                if let Some(s) = rec.metadata.supersedes {
+                    m.insert("supersedes".into(), serde_json::Value::String(s));
+                }
+                if !rec.metadata.supersedes_chain.is_empty() {
+                    m.insert("supersedes_chain".into(), serde_json::Value::Array(
+                        rec.metadata.supersedes_chain.into_iter().map(serde_json::Value::String).collect()
+                    ));
+                }
+                if let Some(s) = rec.metadata.superseded_by {
+                    m.insert("superseded_by".into(), serde_json::Value::String(s));
+                }
+                if let Some(parse_err) = rec.manifest_parse_error {
+                    m.insert("manifest_parse_error".into(), serde_json::Value::String(parse_err));
+                }
+                if let Some(manifest) = rec.manifest {
+                    m.insert("manifest".into(), serde_json::to_value(manifest).unwrap_or_else(|e| {
+                        serde_json::Value::String(format!("<serialize error: {e}>"))
+                    }));
+                }
+                Self::ok_json(&serde_json::Value::Object(m))
+            }
             Ok(None) => Self::err_text(&format!("agent not found: {}", p.name)),
             Err(e) => Self::err_text(&format!("registry get failed: {e}")),
         }

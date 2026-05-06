@@ -39,6 +39,9 @@ impl InspectableEntityProvider for AgentProvider {
                     if let Some(desc) = manifest.get("description").and_then(|d| d.as_str()) {
                         properties.insert("description".into(), desc.to_string());
                     }
+                    if let Some(bro) = manifest.get("brofile_ref").and_then(|b| b.as_str()) {
+                        properties.insert("brofile_ref".into(), bro.to_string());
+                    }
                     if let Some(wtu) = manifest.get("when_to_use").and_then(|w| w.as_array()) {
                         properties.insert(
                             "when_to_use".into(),
