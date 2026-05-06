@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use super::adapter::AgentAdapterRegistry;
 use super::types::{
@@ -35,6 +35,14 @@ pub fn validate_agent_install<F: Fn(&str) -> bool>(
         });
     }
 
+    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind != "agent" {
+        return Err(ValidationError {
+            step: "shape",
+            message: format!("agent artifact must have `kind: \"agent\"`, got `{kind}`"),
+        });
+    }
+
     let name = value
         .get("name")
         .and_then(|v| v.as_str())
@@ -46,29 +54,55 @@ pub fn validate_agent_install<F: Fn(&str) -> bool>(
         });
     }
 
-    let version = value.get("version");
-    if version.is_none_or(|v| !v.is_number()) {
-        return Err(ValidationError {
-            step: "shape",
-            message: "agent artifact missing or invalid `version` (must be a number)".into(),
-        });
-    }
-    if let Some(v) = version.and_then(|v| v.as_u64()) {
-        if v == 0 {
+    let version_val = value.get("version");
+    match version_val {
+        None => {
             return Err(ValidationError {
                 step: "shape",
-                message: "agent artifact `version` must be > 0".into(),
+                message: "agent artifact missing required field `version`".into(),
+            });
+        }
+        Some(v) => {
+            if !v.is_u64() {
+                return Err(ValidationError {
+                    step: "shape",
+                    message: format!(
+                        "agent artifact `version` must be a positive integer, got `{v}`"
+                    ),
+                });
+            }
+            if v.as_u64() == Some(0) {
+                return Err(ValidationError {
+                    step: "shape",
+                    message: "agent artifact `version` must be > 0".into(),
+                });
+            }
+        }
+    }
+
+    if let Some(supersedes) = value.get("supersedes").and_then(|v| v.as_str()) {
+        if supersedes.is_empty() {
+            return Err(ValidationError {
+                step: "shape",
+                message: "agent artifact `supersedes` must be a non-empty string if present"
+                    .into(),
             });
         }
     }
 
-    let manifest_value = value.get("manifest");
-    let manifest_data = match manifest_value {
-        Some(v) => v,
-        None => value,
-    };
+    let manifest_value = value.get("manifest").ok_or_else(|| ValidationError {
+        step: "shape",
+        message: "agent artifact missing required field `manifest` (canonical wrapper required)"
+            .into(),
+    })?;
+    if !manifest_value.is_object() {
+        return Err(ValidationError {
+            step: "manifest_deserialize",
+            message: "`manifest` must be a JSON object".into(),
+        });
+    }
 
-    let manifest: AgentManifest = serde_json::from_value(manifest_data.clone()).map_err(|e| {
+    let manifest: AgentManifest = serde_json::from_value(manifest_value.clone()).map_err(|e| {
         ValidationError {
             step: "manifest_deserialize",
             message: format!("failed to parse manifest: {e}"),
@@ -124,12 +158,12 @@ fn lint_manifest<F: Fn(&str) -> bool>(
 
     for item in &manifest.anti_patterns {
         if item.len() > 200 {
+            let preview: String = item.chars().take(50).collect();
             return Err(ValidationError {
                 step: "lint_anti_patterns",
                 message: format!(
-                    "anti_pattern item too long ({} chars, max 200): {}...",
+                    "anti_pattern item too long ({} chars, max 200): {preview}...",
                     item.len(),
-                    &item[..50]
                 ),
             });
         }
@@ -137,12 +171,12 @@ fn lint_manifest<F: Fn(&str) -> bool>(
 
     for item in &manifest.when_to_use {
         if item.len() > 200 {
+            let preview: String = item.chars().take(50).collect();
             return Err(ValidationError {
                 step: "lint_when_to_use",
                 message: format!(
-                    "when_to_use item too long ({} chars, max 200): {}...",
+                    "when_to_use item too long ({} chars, max 200): {preview}...",
                     item.len(),
-                    &item[..50]
                 ),
             });
         }
@@ -209,16 +243,22 @@ fn lint_filter_overlay(overlay: &Option<AgentFilterOverlay>) -> Result<(), Valid
     };
     let all_patterns: Vec<&str> = ov.allow.iter().chain(ov.disallow.iter()).map(|s| s.as_str()).collect();
     for pat in &all_patterns {
-        if pat.is_empty() {
+        if pat.trim().is_empty() {
             return Err(ValidationError {
                 step: "lint_filter_overlay",
-                message: "filter pattern must not be empty".into(),
+                message: "filter pattern must not be empty or whitespace".into(),
             });
         }
         if pat.starts_with('-') {
             return Err(ValidationError {
                 step: "lint_filter_overlay",
                 message: format!("filter pattern must not start with '-': {pat}"),
+            });
+        }
+        if pat.contains(' ') {
+            return Err(ValidationError {
+                step: "lint_filter_overlay",
+                message: format!("filter pattern must not contain spaces: {pat}"),
             });
         }
     }
@@ -300,6 +340,7 @@ mod tests {
 
     fn minimal_valid_agent() -> serde_json::Value {
         serde_json::json!({
+            "kind": "agent",
             "name": "test-agent",
             "version": 1,
             "manifest": {
@@ -518,6 +559,7 @@ mod tests {
         registry.register(Arc::new(NoopAdapter));
         let ctx = make_ctx(&registry);
         let v = serde_json::json!({
+            "kind": "agent",
             "name": "full-reviewer",
             "version": 2,
             "supersedes": "full-reviewer",
@@ -555,17 +597,98 @@ mod tests {
     }
 
     #[test]
-    fn manifest_at_top_level_when_no_manifest_key() {
+    fn rejects_missing_manifest_key() {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx(&registry);
         let v = serde_json::json!({
+            "kind": "agent",
             "name": "flat-agent",
             "version": 1,
             "description": "A flat agent without nested manifest.",
             "when_to_use": ["when testing"],
             "brofile_inline": {"provider": "claude"}
         });
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "shape");
+        assert!(err.message.contains("manifest"));
+    }
+
+    #[test]
+    fn rejects_wrong_kind() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["kind"] = serde_json::json!("packet");
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "shape");
+        assert!(err.message.contains("kind"));
+    }
+
+    #[test]
+    fn rejects_missing_kind() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v.as_object_mut().unwrap().remove("kind");
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "shape");
+        assert!(err.message.contains("kind"));
+    }
+
+    #[test]
+    fn rejects_float_version() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["version"] = serde_json::json!(1.5);
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "shape");
+        assert!(err.message.contains("positive integer"));
+    }
+
+    #[test]
+    fn rejects_negative_version() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["version"] = serde_json::json!(-1);
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "shape");
+        assert!(err.message.contains("positive integer"));
+    }
+
+    #[test]
+    fn rejects_empty_supersedes() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["supersedes"] = serde_json::json!("");
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "shape");
+        assert!(err.message.contains("supersedes"));
+    }
+
+    #[test]
+    fn accepts_valid_supersedes() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["supersedes"] = serde_json::json!("previous-version");
         validate_agent_install(&v, &ctx).unwrap();
+    }
+
+    #[test]
+    fn rejects_filter_pattern_with_spaces() {
+        let registry = AgentAdapterRegistry::new();
+        let ctx = make_ctx(&registry);
+        let mut v = minimal_valid_agent();
+        v["manifest"]["filter_overlay"] = serde_json::json!({
+            "allow": ["not a pattern"],
+            "disallow": []
+        });
+        let err = validate_agent_install(&v, &ctx).unwrap_err();
+        assert_eq!(err.step, "lint_filter_overlay");
+        assert!(err.message.contains("spaces"));
     }
 
     #[test]

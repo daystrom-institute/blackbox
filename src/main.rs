@@ -1857,6 +1857,21 @@ struct PruneParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentListParams {
+    #[serde(default)]
+    include_superseded: Option<bool>,
+    #[serde(default)]
+    cost_class: Option<String>,
+    #[serde(default)]
+    provenance_kind: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct AgentGetParams {
+    name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct BrofileParams {
     /// Operation: create, list, get, delete, set_account, list_accounts,
     /// set_provider_default, get_provider_default, list_provider_defaults,
@@ -4469,6 +4484,66 @@ Constraints:\n\
         let map = self.state.workflow_registry.read();
         let names: Vec<String> = map.keys().cloned().collect();
         Self::ok_json(&serde_json::json!({"workflows": names}))
+    }
+
+    #[tool(
+        name = "bro_agent_list",
+        description = "List installed agents from the registry. Optional filters for cost_class, provenance_kind, and include_superseded."
+    )]
+    fn bro_agent_list(&self, Parameters(p): Parameters<AgentListParams>) -> CallToolResult {
+        use orchestration::agents::registry::{AgentRegistry, ListFilter};
+        use orchestration::agents::types::AgentCostClass;
+        let catalog = self.state.artifacts.read();
+        let reg = AgentRegistry::new(&catalog);
+        let cost_class = p.cost_class.as_deref().and_then(|s| {
+            serde_json::from_value::<AgentCostClass>(serde_json::Value::String(s.to_string())).ok()
+        });
+        let filter = ListFilter {
+            include_superseded: p.include_superseded.unwrap_or(false),
+            cost_class,
+            provenance_kind: p.provenance_kind,
+        };
+        match reg.list(&filter) {
+            Ok(summaries) => Self::ok_json(&serde_json::json!({
+                "agents": summaries.iter().map(|s| serde_json::json!({
+                    "name": s.name,
+                    "version": s.version,
+                    "active": s.active,
+                    "description": s.description,
+                    "cost_class": s.cost_class.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+                    "provenance_kind": s.provenance_kind,
+                    "installed_at": s.installed_at,
+                    "supersedes_chain": s.supersedes_chain,
+                    "embedding_pending": s.embedding_pending,
+                })).collect::<Vec<_>>()
+            })),
+            Err(e) => Self::err_text(&format!("registry list failed: {e}")),
+        }
+    }
+
+    #[tool(
+        name = "bro_agent_get",
+        description = "Read full details for a single agent by name or agent-ref (name@vN or agent:name@vN). Returns manifest, metadata, and lifecycle state."
+    )]
+    fn bro_agent_get(&self, Parameters(p): Parameters<AgentGetParams>) -> CallToolResult {
+        use orchestration::agents::registry::AgentRegistry;
+        let catalog = self.state.artifacts.read();
+        let reg = AgentRegistry::new(&catalog);
+        match reg.get(&p.name) {
+            Ok(Some(rec)) => Self::ok_json(&serde_json::json!({
+                "name": rec.name,
+                "version": rec.version,
+                "active": rec.active,
+                "installed_at": rec.installed_at,
+                "source": rec.source,
+                "supersedes": rec.metadata.supersedes,
+                "supersedes_chain": rec.metadata.supersedes_chain,
+                "superseded_by": rec.metadata.superseded_by,
+                "manifest": rec.manifest.as_ref().map(|m| serde_json::to_value(m).unwrap()),
+            })),
+            Ok(None) => Self::err_text(&format!("agent not found: {}", p.name)),
+            Err(e) => Self::err_text(&format!("registry get failed: {e}")),
+        }
     }
 
     #[tool(

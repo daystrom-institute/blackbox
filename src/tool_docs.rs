@@ -741,6 +741,21 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Inventory check — what workflows can routing verdicts target on this daemon?",
         example: Some("bro_workflow_list()"),
     },
+    // ── Agents ──────────────────────────────────────────────────
+    ToolDoc {
+        name: "bro_agent_list",
+        category: ToolCategory::Orchestration,
+        summary: "List installed agents from the registry. Optional filters for cost_class, provenance_kind, and include_superseded.",
+        when_to_use: "Discover what agents are available for dispatch, composition, or review. Filter by cost_class to find cheap/expensive agents; use include_superseded=true to see version history.",
+        example: Some(r#"bro_agent_list(include_superseded=true)"#),
+    },
+    ToolDoc {
+        name: "bro_agent_get",
+        category: ToolCategory::Orchestration,
+        summary: "Read full details for a single agent by name or agent-ref (name@vN or agent:name@vN). Returns manifest, metadata, and lifecycle state.",
+        when_to_use: "Inspect a specific agent's manifest (brofile config, filter overlay, inputs/outputs, composition constraints) before dispatching or composing it into a pipeline.",
+        example: Some(r#"bro_agent_get(name="reviewer")"#),
+    },
     // ── Whiteboards ─────────────────────────────────────────────
     ToolDoc {
         name: "whiteboard_open",
