@@ -4611,6 +4611,32 @@ Constraints:\n\
         }
     }
 
+    fn extract_inline_filters(inline: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+        let filters = match inline.get("filters") {
+            Some(f) => f,
+            None => return (Vec::new(), Vec::new()),
+        };
+        let allow = filters
+            .get("allow")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let disallow = filters
+            .get("disallow")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (allow, disallow)
+    }
+
     #[tool(
         name = "bro_agent_describe",
         description = "Full manifest + resolved brofile + merged filters for one agent. Returns the computed dispatch surface (deny-wins filter merge of brofile + overlay), brofile info, embedding status, and any warnings."
@@ -4642,40 +4668,54 @@ Constraints:\n\
 
         let mut warnings: Vec<String> = Vec::new();
 
-        let (brofile_kind, brofile_name, brofile_provider) = if let Some(ref br) = manifest.brofile_ref {
-            let bf = orchestration::brofile::list_brofiles("global", &self.state.store_dir, None)
-                .into_iter()
-                .find(|b| b.name == *br);
-            match bf {
-                Some(b) => ("ref", br.clone(), Some(b.provider.as_str().to_string())),
-                None => {
-                    warnings.push(format!("brofile_ref '{br}' not found in global brofile store"));
-                    ("ref", br.clone(), None)
+        let (brofile_kind, brofile_name, brofile_provider, brofile_body, base_allow, base_disallow) =
+            if let Some(ref br) = manifest.brofile_ref {
+                let resolved = orchestration::brofile::resolve_brofile(
+                    br,
+                    &self.state.store_dir,
+                    None,
+                );
+                match resolved {
+                    Some(bf) => {
+                        let (ba, bd) = match &bf.filters {
+                            Some(f) => (f.allow.clone(), f.disallow.clone()),
+                            None => (Vec::new(), Vec::new()),
+                        };
+                        (
+                            "ref",
+                            br.clone(),
+                            Some(bf.provider.as_str().to_string()),
+                            Some(serde_json::to_value(&bf).unwrap_or(serde_json::Value::Null)),
+                            ba,
+                            bd,
+                        )
+                    }
+                    None => {
+                        warnings.push(format!(
+                            "brofile_ref '{br}' not found (global scope only; project-scoped brofiles not yet supported by describe)"
+                        ));
+                        ("ref", br.clone(), None, None, Vec::new(), Vec::new())
+                    }
                 }
-            }
-        } else if manifest.brofile_inline.is_some() {
-            let inline = manifest.brofile_inline.as_ref().unwrap();
-            let prov = inline
-                .get("provider")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            ("inline", String::new(), Some(prov.to_string()))
-        } else {
-            warnings.push("manifest has neither brofile_ref nor brofile_inline".into());
-            ("none", String::new(), None)
-        };
+            } else if let Some(ref inline) = manifest.brofile_inline {
+                let prov = inline
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let (ba, bd) = Self::extract_inline_filters(inline);
+                (
+                    "inline",
+                    String::new(),
+                    Some(prov.to_string()),
+                    Some(inline.clone()),
+                    ba,
+                    bd,
+                )
+            } else {
+                warnings.push("manifest has neither brofile_ref nor brofile_inline".into());
+                ("none", String::new(), None, None, Vec::new(), Vec::new())
+            };
 
-        let (base_allow, base_disallow) = if let Some(ref br) = manifest.brofile_ref {
-            let bf = orchestration::brofile::list_brofiles("global", &self.state.store_dir, None)
-                .into_iter()
-                .find(|b| b.name == *br);
-            match bf.and_then(|b| b.filters) {
-                Some(f) => (f.allow, f.disallow),
-                None => (Vec::new(), Vec::new()),
-            }
-        } else {
-            (Vec::new(), Vec::new())
-        };
         let merged = MergedFilters::merge(&base_allow, &base_disallow, manifest.filter_overlay.as_ref());
 
         let embedding_status = match manifest.embedding {
@@ -4699,12 +4739,19 @@ Constraints:\n\
                 "merged_filters".into(),
                 serde_json::to_value(&merged).unwrap_or(serde_json::Value::Null),
             ),
+            (
+                "install_warnings".into(),
+                serde_json::Value::Array(Vec::new()),
+            ),
         ]);
         if !brofile_name.is_empty() {
             result.insert("brofile_name".into(), serde_json::Value::String(brofile_name));
         }
         if let Some(provider) = brofile_provider {
             result.insert("brofile_provider".into(), serde_json::Value::String(provider));
+        }
+        if let Some(body) = brofile_body {
+            result.insert("brofile".into(), body);
         }
         if !warnings.is_empty() {
             result.insert(
@@ -10901,6 +10948,58 @@ mod tests {
         assert_eq!(body["embedding_status"], "pending");
         assert!(body["manifest"].is_object());
         assert!(body["merged_filters"].is_object());
+        assert!(body["brofile"].is_object());
+        assert_eq!(body["brofile"]["provider"], "claude");
+        assert!(body["install_warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bro_agent_describe_inline_brofile_filters_in_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        let manifest = serde_json::json!({
+            "description": "Agent with inline brofile filters.",
+            "when_to_use": ["when testing"],
+            "brofile_inline": {
+                "provider": "claude",
+                "filters": {
+                    "allow": ["mcp__blackbox__bbox_search"],
+                    "disallow": ["mcp__blackbox__bro_exec"]
+                }
+            },
+        });
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "inline-filtered.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "inline-filtered",
+                "version": 1,
+                "manifest": manifest,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "inline-filtered".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        let allow = body["merged_filters"]["allow"].as_array().unwrap();
+        let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
+        assert!(
+            allow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
+            "inline allow should appear in merged: {allow:?}"
+        );
+        assert!(
+            disallow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
+            "inline disallow should appear in merged: {disallow:?}"
+        );
     }
 
     #[test]
@@ -10917,25 +11016,31 @@ mod tests {
     }
 
     #[test]
-    fn bro_agent_describe_filter_merge_deny_wins() {
+    fn bro_agent_describe_deny_wins_conflict() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         let cat = &server.state.artifacts.read();
-        let mut manifest = serde_json::json!({
-            "description": "Agent with filter overlay.",
+        let manifest = serde_json::json!({
+            "description": "Agent where overlay allows what brofile denies.",
             "when_to_use": ["when testing"],
-            "brofile_inline": {"provider": "claude"},
+            "brofile_inline": {
+                "provider": "claude",
+                "filters": {
+                    "allow": ["mcp__blackbox__bbox_search"],
+                    "disallow": ["mcp__blackbox__bro_exec", "mcp__blackbox__bbox_cite"]
+                }
+            },
             "filter_overlay": {
-                "allow": ["mcp__blackbox__bbox_search", "mcp__blackbox__bbox_cite"],
-                "disallow": ["mcp__blackbox__bro_exec"]
+                "allow": ["mcp__blackbox__bro_exec", "mcp__blackbox__bbox_cite"],
+                "disallow": []
             },
         });
         cat.install_value(
             artifacts::ArtifactKind::Agent,
-            "filtered.json".into(),
+            "conflict.json".into(),
             &serde_json::json!({
                 "kind": "agent",
-                "name": "filtered",
+                "name": "conflict",
                 "version": 1,
                 "manifest": manifest,
             }),
@@ -10946,21 +11051,110 @@ mod tests {
         .unwrap();
 
         let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
-            agent: "filtered".into(),
+            agent: "conflict".into(),
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value =
             serde_json::from_str(&extract_text(&result)).unwrap();
-        let mf = &body["merged_filters"];
-        let allow = mf["allow"].as_array().unwrap();
-        let disallow = mf["disallow"].as_array().unwrap();
+        let allow = body["merged_filters"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        let disallow = body["merged_filters"]["disallow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !allow.contains(&"mcp__blackbox__bro_exec"),
+            "overlay allow should be stripped by deny-wins: {allow:?}"
+        );
+        assert!(
+            !allow.contains(&"mcp__blackbox__bbox_cite"),
+            "overlay allow for cite should be stripped by deny-wins: {allow:?}"
+        );
+        assert!(
+            allow.contains(&"mcp__blackbox__bbox_search"),
+            "non-conflicting allow should survive: {allow:?}"
+        );
+        assert!(
+            disallow.contains(&"mcp__blackbox__bro_exec"),
+            "disallow should win: {disallow:?}"
+        );
+        assert!(
+            disallow.contains(&"mcp__blackbox__bbox_cite"),
+            "disallow should win for cite too: {disallow:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_describe_brofile_ref_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        use orchestration::brofile::Brofile;
+        use orchestration::mcp::McpFilters;
+        use orchestration::providers::Provider;
+        let bf = Brofile {
+            name: "auditor".into(),
+            provider: Provider::Claude,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: Some(McpFilters {
+                allow: vec![
+                    "mcp__blackbox__bbox_search".into(),
+                    "mcp__blackbox__bbox_cite".into(),
+                ],
+                disallow: vec!["mcp__blackbox__bro_exec".into()],
+            }),
+        };
+        orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
+        let manifest = serde_json::json!({
+            "description": "Agent referencing a saved brofile.",
+            "when_to_use": ["when auditing"],
+            "brofile_ref": "auditor",
+        });
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "auditor-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "auditor-agent",
+                "version": 1,
+                "manifest": manifest,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "auditor-agent".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value =
+            serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["brofile_kind"], "ref");
+        assert_eq!(body["brofile_name"], "auditor");
+        assert_eq!(body["brofile_provider"], "claude");
+        assert!(body["brofile"].is_object());
+        assert_eq!(body["brofile"]["name"], "auditor");
+        assert_eq!(body["brofile"]["provider"], "claude");
+        let allow = body["merged_filters"]["allow"].as_array().unwrap();
+        let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
         assert!(
             allow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
-            "overlay allow should be in merged: {allow:?}"
+            "brofile allow in merged: {allow:?}"
         );
         assert!(
             disallow.iter().any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
-            "overlay disallow should be in merged: {disallow:?}"
+            "brofile disallow in merged: {disallow:?}"
         );
     }
 

@@ -141,7 +141,25 @@ impl MergedFilters {
             allow.extend_from_slice(&ov.allow);
             disallow.extend_from_slice(&ov.disallow);
         }
-        Self { allow, disallow }
+        let mut seen_deny = std::collections::HashSet::new();
+        let mut deduped_disallow = Vec::new();
+        for p in &disallow {
+            if seen_deny.insert(p.clone()) {
+                deduped_disallow.push(p.clone());
+            }
+        }
+        let mut deduped_allow = Vec::new();
+        let mut seen_allow = std::collections::HashSet::new();
+        for p in &allow {
+            if seen_deny.contains(p) || !seen_allow.insert(p.clone()) {
+                continue;
+            }
+            deduped_allow.push(p.clone());
+        }
+        Self {
+            allow: deduped_allow,
+            disallow: deduped_disallow,
+        }
     }
 }
 
