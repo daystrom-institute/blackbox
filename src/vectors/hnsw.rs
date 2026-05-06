@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_against_brute_force_10k() {
+    fn donor_recall_parity_1000() {
         let corpus = clustered_vectors(1_000, 32, 20, 42);
         let queries = daystrom_queries(25, 32, 99);
         let index = HnswIndex::build(corpus.clone(), HnswOptions::default()).unwrap();
