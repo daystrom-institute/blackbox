@@ -477,13 +477,12 @@ fn count_reembed_entities(state: &Arc<SharedState>, buckets: &[Bucket]) -> Resul
     } else {
         0
     };
-    let docs = if buckets.iter().any(|bucket| {
-        matches!(
-            bucket,
-            Bucket::Code | Bucket::Docs | Bucket::Transcripts | Bucket::GitMessage
-        )
-    }) {
-        state.idx.read().embedding_source_docs()?
+    let doc_types = reembed_index_doc_types(buckets);
+    let docs = if !doc_types.is_empty() {
+        state
+            .idx
+            .read()
+            .embedding_source_docs_for_doc_types(&doc_types, None)?
     } else {
         Vec::new()
     };
