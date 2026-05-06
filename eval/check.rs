@@ -234,11 +234,23 @@ fn load_manifest(name: &str, raw: &str) -> Result<EvalQueryManifest, serde_json:
         if EntityType::from_prefix(&locator.entity_type_hint).is_none() {
             return Err(serde_json::Error::custom(format!(
                 "{name}: invalid entity_type_hint `{}` in locator `{}`",
-                locator.entity_type_hint, locator.description
+                locator.entity_type_hint,
+                truncate_locator_description(&locator.description)
             )));
         }
     }
     Ok(manifest)
+}
+
+fn truncate_locator_description(description: &str) -> String {
+    const LIMIT: usize = 80;
+    let mut chars = description.chars();
+    let truncated: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 fn default_stub_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>) {
@@ -359,5 +371,18 @@ mod tests {
 
         assert!(err.to_string().contains("invalid entity_type_hint"));
         assert!(err.to_string().contains("smbol"));
+    }
+
+    #[test]
+    fn invalid_hint_error_truncates_long_locator_description() {
+        let mut value: serde_json::Value = serde_json::from_str(MANIFEST_SOURCES[0].1).unwrap();
+        value["target_locators"][0]["entity_type_hint"] = "smbol".into();
+        value["target_locators"][0]["description"] = "x".repeat(120).into();
+        let raw = serde_json::to_string(&value).unwrap();
+
+        let err = load_manifest("bogus-hint", &raw).unwrap_err().to_string();
+
+        assert!(err.contains(&"x".repeat(80)));
+        assert!(!err.contains(&"x".repeat(120)));
     }
 }
