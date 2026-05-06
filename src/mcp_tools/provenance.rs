@@ -121,15 +121,24 @@ pub(crate) fn import_provenance_to_edges_dir(
             let Some(raw) = crate::git::show_note(root, &notes_ref, &commit)? else {
                 continue;
             };
-            let Ok(note) = serde_json::from_str::<GitProvenanceNote>(&raw) else {
-                continue;
-            };
-            let edges = edges_from_note(project, root, &note)?;
-            edges_imported += edges.len() as u64;
-            crate::edge_index::append_edges(edges_dir, &project.project_id, &edges)?;
+            for raw_note in split_note_documents(&raw) {
+                let Ok(note) = serde_json::from_str::<GitProvenanceNote>(raw_note) else {
+                    continue;
+                };
+                let edges = edges_from_note(project, root, &note)?;
+                edges_imported += edges.len() as u64;
+                crate::edge_index::append_edges(edges_dir, &project.project_id, &edges)?;
+            }
         }
     }
     Ok(edges_imported)
+}
+
+fn split_note_documents(raw: &str) -> Vec<&str> {
+    raw.split(crate::git::NOTE_DOCUMENT_SEPARATOR)
+        .map(str::trim)
+        .filter(|doc| !doc.is_empty())
+        .collect()
 }
 
 fn project_map<'a>(
@@ -326,6 +335,19 @@ mod tests {
         let parsed: GitProvenanceNote = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(parsed, note);
+    }
+
+    #[test]
+    fn split_note_documents_accepts_appended_git_notes() {
+        let raw = format!(
+            "{{\"commit\":\"a\"}}\n{}\n{{\"commit\":\"b\"}}\n",
+            crate::git::NOTE_DOCUMENT_SEPARATOR
+        );
+
+        assert_eq!(
+            split_note_documents(&raw),
+            vec!["{\"commit\":\"a\"}", "{\"commit\":\"b\"}"]
+        );
     }
 
     #[test]

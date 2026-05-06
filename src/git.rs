@@ -173,6 +173,8 @@ pub(crate) fn notes_namespace() -> String {
         .unwrap_or_else(|| "bbox".to_string())
 }
 
+pub(crate) const NOTE_DOCUMENT_SEPARATOR: &str = "--bbox-note-separator--";
+
 pub(crate) fn notes_ref(kind: &str) -> String {
     format!("refs/notes/{}/{}", notes_namespace(), kind)
 }
@@ -181,18 +183,27 @@ pub(crate) fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str)
     let mut child = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["notes", "--ref", notes_ref, "add", "-f", "-F", "-", commit])
+        .args([
+            "notes",
+            "--ref",
+            notes_ref,
+            "append",
+            &format!("--separator={NOTE_DOCUMENT_SEPARATOR}"),
+            "-F",
+            "-",
+            commit,
+        ])
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawning git notes add in {}", root.display()))?;
+        .with_context(|| format!("spawning git notes append in {}", root.display()))?;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(body.as_bytes())?;
     }
     let output = child.wait_with_output()?;
     if !output.status.success() {
         anyhow::bail!(
-            "git notes add failed in {}: {}",
+            "git notes append failed in {}: {}",
             root.display(),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -450,11 +461,12 @@ mod tests {
         let notes_ref = "refs/notes/bbox-test/provenance";
 
         write_note(repo.path(), notes_ref, &head, "{\"ok\":true}\n").unwrap();
+        write_note(repo.path(), notes_ref, &head, "{\"again\":true}\n").unwrap();
 
-        assert_eq!(
-            show_note(repo.path(), notes_ref, &head).unwrap().as_deref(),
-            Some("{\"ok\":true}\n")
-        );
+        let note = show_note(repo.path(), notes_ref, &head).unwrap().unwrap();
+        assert!(note.contains("{\"ok\":true}"));
+        assert!(note.contains(NOTE_DOCUMENT_SEPARATOR));
+        assert!(note.contains("{\"again\":true}"));
         assert_eq!(list_notes(repo.path(), notes_ref).unwrap().len(), 1);
     }
 
