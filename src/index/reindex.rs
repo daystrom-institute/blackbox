@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 use super::helpers::*;
 use super::knowledge_docs;
 use super::project_files;
+use super::tool_edges::ToolEdgeContext;
 use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::entity_ref;
 use crate::parser;
@@ -184,6 +185,7 @@ fn try_background_reindex(
     let mut indexed_files = 0u64;
     let mut indexed_docs = 0u64;
     let mut skipped = 0u64;
+    let tool_edges = ToolEdgeContext::from_config(config)?;
 
     for (account_name, root) in &config.roots {
         let projects_dir = root.join("projects");
@@ -197,6 +199,7 @@ fn try_background_reindex(
                 &mut indexed_files,
                 &mut indexed_docs,
                 &mut skipped,
+                &tool_edges,
             )?;
         }
         let history = root.join("history.jsonl");
@@ -210,6 +213,7 @@ fn try_background_reindex(
                 &mut indexed_files,
                 &mut indexed_docs,
                 &mut skipped,
+                &tool_edges,
             )?;
         }
     }
@@ -225,6 +229,7 @@ fn try_background_reindex(
                 &mut indexed_files,
                 &mut indexed_docs,
                 &mut skipped,
+                &tool_edges,
             )?;
         }
         let history = codex_root.join("history.jsonl");
@@ -237,6 +242,7 @@ fn try_background_reindex(
                 &mut indexed_files,
                 &mut indexed_docs,
                 &mut skipped,
+                &tool_edges,
             )?;
         }
     }
@@ -412,6 +418,7 @@ pub(super) fn index_directory_standalone(
     indexed_files: &mut u64,
     indexed_docs: &mut u64,
     skipped: &mut u64,
+    tool_edges: &ToolEdgeContext,
 ) -> Result<()> {
     for entry in WalkDir::new(dir)
         .follow_links(true)
@@ -459,7 +466,13 @@ pub(super) fn index_directory_standalone(
             let line_offset = offset;
             offset += line.len() as u64 + 1;
 
-            for event in parser::parse_transcript_line(&line) {
+            for (event_idx, event) in parser::parse_transcript_line(&line).into_iter().enumerate()
+            {
+                if let Err(err) =
+                    tool_edges.emit_event_edges(&event, account_name, line_offset, event_idx as u32)
+                {
+                    tracing::debug!(error = %err, "failed to emit transcript tool-call edge");
+                }
                 let is_sub = event.is_subagent || is_subagent;
                 let doc = build_transcript_doc(
                     &event,
@@ -501,6 +514,7 @@ pub(super) fn index_history_standalone(
     indexed_files: &mut u64,
     indexed_docs: &mut u64,
     skipped: &mut u64,
+    tool_edges: &ToolEdgeContext,
 ) -> Result<()> {
     let path_str = history.to_string_lossy().to_string();
     let file_meta = fs::metadata(history)?;
@@ -524,7 +538,12 @@ pub(super) fn index_history_standalone(
         };
         let line_offset = offset;
         offset += line.len() as u64 + 1;
-        for event in parser::parse_history_line(&line) {
+        for (event_idx, event) in parser::parse_history_line(&line).into_iter().enumerate() {
+            if let Err(err) =
+                tool_edges.emit_event_edges(&event, account_name, line_offset, event_idx as u32)
+            {
+                tracing::debug!(error = %err, "failed to emit history tool-call edge");
+            }
             let doc =
                 event_to_doc_standalone(&event, account_name, &path_str, line_offset, false, f);
             writer.add_document(doc)?;
@@ -542,6 +561,7 @@ pub(super) fn index_history_standalone(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn index_codex_directory_standalone(
     sessions_dir: &Path,
     f: FieldHandles,
@@ -550,6 +570,7 @@ pub(super) fn index_codex_directory_standalone(
     indexed_files: &mut u64,
     indexed_docs: &mut u64,
     skipped: &mut u64,
+    tool_edges: &ToolEdgeContext,
 ) -> Result<()> {
     for entry in WalkDir::new(sessions_dir)
         .follow_links(true)
@@ -596,9 +617,17 @@ pub(super) fn index_codex_directory_standalone(
             };
             let line_offset = offset;
             offset += line.len() as u64 + 1;
-            for mut event in parser::parse_codex_line(&line, &session_id) {
+            for (event_idx, mut event) in parser::parse_codex_line(&line, &session_id)
+                .into_iter()
+                .enumerate()
+            {
                 if event.cwd.is_none() {
                     event.cwd = cwd.clone();
+                }
+                if let Err(err) =
+                    tool_edges.emit_event_edges(&event, "codex", line_offset, event_idx as u32)
+                {
+                    tracing::debug!(error = %err, "failed to emit codex tool-call edge");
                 }
                 let doc =
                     event_to_doc_standalone(&event, "codex", &path_str, line_offset, false, f);
@@ -623,6 +652,7 @@ pub(super) fn index_codex_directory_standalone(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn index_codex_history_standalone(
     history: &Path,
     f: FieldHandles,
@@ -631,6 +661,7 @@ pub(super) fn index_codex_history_standalone(
     indexed_files: &mut u64,
     indexed_docs: &mut u64,
     skipped: &mut u64,
+    tool_edges: &ToolEdgeContext,
 ) -> Result<()> {
     let path_str = history.to_string_lossy().to_string();
     let file_meta = fs::metadata(history)?;
@@ -654,7 +685,15 @@ pub(super) fn index_codex_history_standalone(
         };
         let line_offset = offset;
         offset += line.len() as u64 + 1;
-        for event in parser::parse_codex_history_line(&line) {
+        for (event_idx, event) in parser::parse_codex_history_line(&line)
+            .into_iter()
+            .enumerate()
+        {
+            if let Err(err) =
+                tool_edges.emit_event_edges(&event, "codex", line_offset, event_idx as u32)
+            {
+                tracing::debug!(error = %err, "failed to emit codex history tool-call edge");
+            }
             let doc = event_to_doc_standalone(&event, "codex", &path_str, line_offset, false, f);
             writer.add_document(doc)?;
             *indexed_docs += 1;
@@ -703,6 +742,7 @@ mod tests {
             is_subagent: false,
             agent_slug: None,
             cwd: None,
+            tool_call: None,
         };
 
         let doc = event_to_doc_standalone(&event, "codex", "/tmp/session.jsonl", 0, false, fields);

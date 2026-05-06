@@ -351,12 +351,22 @@ impl EdgeIndex {
                     continue;
                 }
                 match serde_json::from_str::<Edge>(&line) {
-                    Ok(edge) => self.insert(edge, seen),
+                    Ok(edge) => {
+                        self.insert_sidecar_edge(edge, seen);
+                    }
                     Err(err) => {
                         tracing::warn!(path = %path.display(), error = %err, "failed to parse edge sidecar line");
                     }
                 }
             }
+        }
+    }
+
+    fn insert_sidecar_edge(&mut self, edge: Edge, seen: &mut HashSet<Edge>) {
+        let derived = derived_tool_projection(&edge);
+        self.insert(edge, seen);
+        if let Some(edge) = derived {
+            self.insert(edge, seen);
         }
     }
 }
@@ -399,6 +409,45 @@ pub(crate) fn append_project_edges(
         file.write_all(b"\n")?;
     }
     Ok(())
+}
+
+pub(crate) fn append_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
+    if edges.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(edges_dir)?;
+    let path = edges_dir.join(format!("{project_id}.jsonl"));
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    for edge in edges {
+        serde_json::to_writer(&mut file, edge)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn derived_tool_projection(edge: &Edge) -> Option<Edge> {
+    if edge.kind != "EDITED_FILE" {
+        return None;
+    }
+    let EntityRef::Transcript {
+        provider,
+        session_id,
+        ..
+    } = &edge.source
+    else {
+        return None;
+    };
+    Some(Edge {
+        source: edge.target.clone(),
+        kind: "EDITED_BY_SESSION".to_string(),
+        target: EntityRef::Session {
+            provider: provider.clone(),
+            session_id: session_id.clone(),
+        },
+        provenance: EdgeProvenance::Derived,
+        confidence: EdgeConfidence::Exact,
+        metadata: edge.metadata.clone(),
+    })
 }
 
 fn exact_edge(
@@ -476,5 +525,45 @@ mod tests {
 
         assert_eq!(index.forward_edges(&source).len(), 1);
         assert_eq!(index.reverse_edges(&target).len(), 1);
+    }
+
+    #[test]
+    fn edited_file_sidecar_projects_session_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = EntityRef::Transcript {
+            provider: "claude".into(),
+            session_id: "sess-1".into(),
+            line_offset: 42,
+            event_idx: 0,
+        };
+        let file = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let edge = Edge {
+            source: transcript,
+            kind: "EDITED_FILE".into(),
+            target: file.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata: BTreeMap::new(),
+        };
+        append_edges(dir.path(), "proj1234", &[edge]).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), &mut seen);
+
+        assert!(index
+            .forward_edges(&file)
+            .iter()
+            .any(|edge| edge.kind == "EDITED_BY_SESSION"
+                && edge.target
+                    == (EntityRef::Session {
+                        provider: "claude".into(),
+                        session_id: "sess-1".into(),
+                    })));
     }
 }

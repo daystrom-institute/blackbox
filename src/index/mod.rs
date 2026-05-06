@@ -630,6 +630,7 @@ mod knowledge_docs;
 mod project_files;
 mod reindex;
 mod search;
+mod tool_edges;
 
 pub use helpers::find_session_file;
 pub(crate) use knowledge_docs::{knowledge_chunk_hash, knowledge_entity_id};

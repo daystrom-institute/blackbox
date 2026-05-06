@@ -24,6 +24,7 @@ pub enum MessageRole {
 }
 
 /// A single searchable unit extracted from a JSONL transcript event.
+#[derive(Debug, Clone)]
 pub struct ParsedEvent {
     pub role: MessageRole,
     pub content: String,
@@ -33,6 +34,23 @@ pub struct ParsedEvent {
     pub is_subagent: bool,
     pub agent_slug: Option<String>,
     pub cwd: Option<String>,
+    pub tool_call: Option<ToolCallInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallKind {
+    Read,
+    Write,
+    Edit,
+    Bash,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCallInfo {
+    pub kind: ToolCallKind,
+    pub name: String,
+    pub tool_use_id: Option<String>,
+    pub input: Value,
 }
 
 const MAX_CONTENT_LEN: usize = 12_000;
@@ -128,8 +146,55 @@ impl TranscriptEvent {
             is_subagent: self.is_subagent,
             agent_slug: self.agent_slug.clone(),
             cwd: self.cwd.clone(),
+            tool_call: match &self.detail {
+                EventDetail::ToolUse {
+                    name,
+                    tool_use_id,
+                    input,
+                    ..
+                } => tool_call_info(name, tool_use_id.clone(), input.clone()),
+                _ => None,
+            },
         })
     }
+}
+
+pub fn tool_call_info(
+    name: &str,
+    tool_use_id: Option<String>,
+    input: Value,
+) -> Option<ToolCallInfo> {
+    let kind = match name {
+        "Read" | "read" => ToolCallKind::Read,
+        "Write" | "write" => ToolCallKind::Write,
+        "Edit" | "edit" => ToolCallKind::Edit,
+        "Bash" | "bash" | "shell" => ToolCallKind::Bash,
+        _ => return None,
+    };
+    Some(ToolCallInfo {
+        kind,
+        name: name.to_string(),
+        tool_use_id,
+        input,
+    })
+}
+
+pub fn tool_call_file_path(info: &ToolCallInfo) -> Option<&str> {
+    match info.kind {
+        ToolCallKind::Read | ToolCallKind::Write | ToolCallKind::Edit => info
+            .input
+            .get("file_path")
+            .or_else(|| info.input.get("path"))
+            .and_then(|value| value.as_str()),
+        ToolCallKind::Bash => None,
+    }
+}
+
+pub fn tool_call_command(info: &ToolCallInfo) -> Option<&str> {
+    if info.kind != ToolCallKind::Bash {
+        return None;
+    }
+    info.input.get("command").and_then(|value| value.as_str())
 }
 
 /// Best-effort extraction of a human-readable "what is this tool doing"
@@ -1183,6 +1248,7 @@ pub fn parse_history_line(line: &str) -> Vec<ParsedEvent> {
         is_subagent: false,
         agent_slug: None,
         cwd: project,
+        tool_call: None,
     }]
 }
 
@@ -1263,7 +1329,16 @@ fn parse_assistant_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent
                 let tool_name = block["name"].as_str().unwrap_or("unknown");
                 let input_str = serde_json::to_string(&block["input"]).unwrap_or_default();
                 let content = format!("tool:{} {}", tool_name, truncate(&input_str));
-                events.push(make_event(MessageRole::ToolUse, &content, base));
+                events.push(make_tool_event(
+                    MessageRole::ToolUse,
+                    &content,
+                    base,
+                    tool_call_info(
+                        tool_name,
+                        block["id"].as_str().map(String::from),
+                        block["input"].clone(),
+                    ),
+                ));
             }
             _ => {}
         }
@@ -1351,10 +1426,15 @@ pub fn parse_codex_line(line: &str, session_id: &str) -> Vec<ParsedEvent> {
                 "function_call" => {
                     let name = payload["name"].as_str().unwrap_or("unknown");
                     let args = payload["arguments"].as_str().unwrap_or("{}");
-                    vec![make_event(
+                    vec![make_tool_event(
                         MessageRole::ToolUse,
                         &truncate(&format!("tool:{} {}", name, args)),
                         &base,
+                        tool_call_info(
+                            name,
+                            payload["call_id"].as_str().map(String::from),
+                            serde_json::from_str(args).unwrap_or(Value::Null),
+                        ),
                     )]
                 }
                 "function_call_output" => {
@@ -1412,6 +1492,7 @@ pub fn parse_codex_history_line(line: &str) -> Vec<ParsedEvent> {
         is_subagent: false,
         agent_slug: None,
         cwd: None,
+        tool_call: None,
     }]
 }
 
@@ -1472,6 +1553,15 @@ fn parse_codex_content_blocks(
 }
 
 fn make_event(role: MessageRole, content: &str, base: &EventBase) -> ParsedEvent {
+    make_tool_event(role, content, base, None)
+}
+
+fn make_tool_event(
+    role: MessageRole,
+    content: &str,
+    base: &EventBase,
+    tool_call: Option<ToolCallInfo>,
+) -> ParsedEvent {
     ParsedEvent {
         role,
         content: content.to_string(),
@@ -1481,6 +1571,7 @@ fn make_event(role: MessageRole, content: &str, base: &EventBase) -> ParsedEvent
         is_subagent: base.is_subagent,
         agent_slug: base.agent_slug.clone(),
         cwd: base.cwd.clone(),
+        tool_call,
     }
 }
 
@@ -1700,6 +1791,57 @@ mod tests {
         let events = parse_gemini_file_rich(&raw);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].detail, EventDetail::Text { .. }));
+    }
+
+    #[test]
+    fn claude_tool_use_preserves_tool_call_payload() {
+        let line = serde_json::json!({
+            "type": "assistant",
+            "sessionId": "sess-1",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Edit",
+                    "input": {
+                        "file_path": "/tmp/demo.rs",
+                        "old_string": "before",
+                        "new_string": "after"
+                    }
+                }]
+            }
+        })
+        .to_string();
+
+        let events = parse_transcript_line(&line);
+
+        assert_eq!(events.len(), 1);
+        let tool_call = events[0].tool_call.as_ref().unwrap();
+        assert_eq!(tool_call.kind, ToolCallKind::Edit);
+        assert_eq!(tool_call.tool_use_id.as_deref(), Some("toolu_1"));
+        assert_eq!(tool_call_file_path(tool_call), Some("/tmp/demo.rs"));
+    }
+
+    #[test]
+    fn codex_function_call_preserves_tool_call_payload() {
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Bash",
+                "arguments": "{\"command\":\"cargo test\"}"
+            }
+        })
+        .to_string();
+
+        let events = parse_codex_line(&line, "sess-2");
+
+        assert_eq!(events.len(), 1);
+        let tool_call = events[0].tool_call.as_ref().unwrap();
+        assert_eq!(tool_call.kind, ToolCallKind::Bash);
+        assert_eq!(tool_call.tool_use_id.as_deref(), Some("call_1"));
+        assert_eq!(tool_call_command(tool_call), Some("cargo test"));
     }
 
     #[test]

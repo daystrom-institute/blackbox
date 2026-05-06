@@ -137,6 +137,45 @@ pub(crate) fn build_project_file_doc(
     doc
 }
 
+pub(crate) fn resolve_current_chunk_entity(
+    project: &ProjectRecord,
+    root: &Path,
+    absolute_path: &Path,
+    byte_range: Option<(u64, u64)>,
+) -> Result<Option<EntityRef>> {
+    let bytes = match fs::read(absolute_path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    if is_binary(&bytes) {
+        return Ok(None);
+    }
+    let registry = chunker::default_registry();
+    let sniff_len = bytes.len().min(4096);
+    let Some(format) = registry
+        .iter()
+        .find(|chunker| chunker.claims(absolute_path, &bytes[..sniff_len]))
+    else {
+        return Ok(None);
+    };
+    let (chunks, _edges) = format.chunk(absolute_path, &bytes)?;
+    let rel_path = absolute_path.strip_prefix(root).unwrap_or(absolute_path);
+    let chunks = bound_chunks(&finalize_chunks(project, rel_path, chunks));
+    let selected = byte_range
+        .and_then(|(start, _end)| {
+            chunks
+                .iter()
+                .find(|chunk| chunk.byte_start <= start && start <= chunk.byte_end)
+        })
+        .or_else(|| chunks.first());
+    Ok(selected.map(|chunk| EntityRef::ProjectFile {
+        project_id: chunk.project_id.clone(),
+        rel_path_hash: chunk.rel_path_hash.clone(),
+        chunk_hash: chunk.chunk_hash.clone(),
+        occurrence_idx: chunk.occurrence_idx,
+    }))
+}
+
 fn index_project(
     project: &ProjectRecord,
     root: &Path,
