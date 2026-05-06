@@ -16,7 +16,7 @@
     "badgey": {
       "kind": "executor",
       "brofile": "badgey-slack",
-      "durable": true
+      "durable": false
     }
   },
   "start": "Dispatch",
