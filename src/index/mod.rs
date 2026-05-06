@@ -6,7 +6,8 @@ use std::time::Instant;
 use anyhow::Result;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tantivy::query::TermQuery;
+use tantivy::collector::{Count, TopDocs};
+use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
@@ -266,16 +267,40 @@ impl TranscriptIndex {
         Ok(docs)
     }
 
-    pub(crate) fn embedding_source_docs(&self) -> Result<Vec<EmbeddingSourceDoc>> {
+    pub(crate) fn embedding_source_docs_for_doc_types(
+        &self,
+        doc_types: &[&str],
+    ) -> Result<Vec<EmbeddingSourceDoc>> {
+        if doc_types.is_empty() {
+            return Ok(Vec::new());
+        }
         let searcher = self.reader.searcher();
-        let limit = searcher.num_docs() as usize;
+        let query: Box<dyn Query> = if doc_types.len() == 1 {
+            Box::new(TermQuery::new(
+                Term::from_field_text(self.fields.doc_type, doc_types[0]),
+                IndexRecordOption::Basic,
+            ))
+        } else {
+            Box::new(BooleanQuery::new(
+                doc_types
+                    .iter()
+                    .map(|doc_type| {
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(self.fields.doc_type, doc_type),
+                                IndexRecordOption::Basic,
+                            )) as Box<dyn Query>,
+                        )
+                    })
+                    .collect(),
+            ))
+        };
+        let limit = searcher.search(&*query, &Count)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let top_docs = searcher.search(
-            &tantivy::query::AllQuery,
-            &tantivy::collector::TopDocs::with_limit(limit),
-        )?;
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit))?;
         let mut docs = Vec::with_capacity(top_docs.len());
         for (_score, addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(addr)?;

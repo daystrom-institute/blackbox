@@ -302,11 +302,17 @@ impl RouteDimensionTracker {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReembedParams {
     pub route: String,
+    #[serde(default)]
+    pub include_transcripts: bool,
 }
 
 pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<String> {
     let buckets = buckets_for_reembed_route(&p.route)?;
-    let count = count_reembed_entities(&state, &buckets)?;
+    if buckets.contains(&Bucket::Transcripts) && !p.include_transcripts {
+        bail!(
+            "transcript re-embed is intentionally guarded because it reads the transcript corpus; rerun with include_transcripts=true only when you explicitly want that heavy rebuild"
+        );
+    }
     let route = p.route.trim().to_string();
     tokio::spawn(async move {
         match enqueue_reembed_routes(&state, &buckets) {
@@ -321,7 +327,7 @@ pub fn reembed_start(p: &ReembedParams, state: Arc<SharedState>) -> Result<Strin
     Ok(serde_json::to_string_pretty(&json!({
         "status": "ok",
         "route": p.route,
-        "message": format!("rebuild started: {count} entities enqueued"),
+        "message": "rebuild queue refill started; final enqueue count will be logged",
     }))?)
 }
 
@@ -350,30 +356,6 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
         })
 }
 
-fn count_reembed_entities(state: &Arc<SharedState>, buckets: &[Bucket]) -> Result<usize> {
-    let knowledge_count = if buckets.contains(&Bucket::Knowledge) {
-        state.kb.read().all_entries().len()
-    } else {
-        0
-    };
-    let note_count = if buckets.contains(&Bucket::Notes) {
-        state.notes.read().all().len()
-    } else {
-        0
-    };
-    let docs = if buckets.iter().any(|bucket| {
-        matches!(
-            bucket,
-            Bucket::Code | Bucket::Docs | Bucket::Transcripts | Bucket::GitMessage
-        )
-    }) {
-        state.idx.read().embedding_source_docs()?
-    } else {
-        Vec::new()
-    };
-    Ok(knowledge_count + note_count + count_reembed_index_docs(buckets, &docs))
-}
-
 fn enqueue_reembed_routes(state: &Arc<SharedState>, buckets: &[Bucket]) -> Result<usize> {
     let mut enqueued = 0usize;
     if buckets.contains(&Bucket::Knowledge) {
@@ -390,13 +372,12 @@ fn enqueue_reembed_routes(state: &Arc<SharedState>, buckets: &[Bucket]) -> Resul
             enqueued += 1;
         }
     }
-    if buckets.iter().any(|bucket| {
-        matches!(
-            bucket,
-            Bucket::Code | Bucket::Docs | Bucket::Transcripts | Bucket::GitMessage
-        )
-    }) {
-        let docs = state.idx.read().embedding_source_docs()?;
+    let doc_types = reembed_index_doc_types(buckets);
+    if !doc_types.is_empty() {
+        let docs = state
+            .idx
+            .read()
+            .embedding_source_docs_for_doc_types(&doc_types)?;
         enqueued += enqueue_reembed_index_docs(buckets, &docs);
     }
     Ok(enqueued)
@@ -451,6 +432,20 @@ fn enqueue_reembed_index_docs(buckets: &[Bucket], docs: &[EmbeddingSourceDoc]) -
         }
     }
     enqueued
+}
+
+fn reembed_index_doc_types(buckets: &[Bucket]) -> Vec<&'static str> {
+    let mut doc_types = Vec::new();
+    if buckets.contains(&Bucket::Code) || buckets.contains(&Bucket::Docs) {
+        doc_types.push("project_file");
+    }
+    if buckets.contains(&Bucket::Transcripts) {
+        doc_types.push("transcript");
+    }
+    if buckets.contains(&Bucket::GitMessage) {
+        doc_types.push("commit");
+    }
+    doc_types
 }
 
 fn reembed_index_doc_bucket(doc: &EmbeddingSourceDoc) -> Option<Bucket> {
@@ -573,5 +568,21 @@ code = "ollama"
     fn reembed_empty_index_doc_enumeration_counts_zero() {
         assert_eq!(count_reembed_index_docs(&[Bucket::Code], &[]), 0);
         assert_eq!(count_reembed_index_docs(&Bucket::ALL, &[]), 0);
+    }
+
+    #[test]
+    fn reembed_index_doc_types_only_selects_needed_sources() {
+        assert_eq!(
+            reembed_index_doc_types(&[Bucket::Knowledge]),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            reembed_index_doc_types(&[Bucket::Code]),
+            vec!["project_file"]
+        );
+        assert_eq!(
+            reembed_index_doc_types(&[Bucket::Code, Bucket::Docs, Bucket::GitMessage]),
+            vec!["project_file", "commit"]
+        );
     }
 }

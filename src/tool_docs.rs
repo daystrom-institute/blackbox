@@ -179,7 +179,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_reembed",
         category: ToolCategory::Transcripts,
         summary: "Request an embedding rebuild for a configured route.",
-        when_to_use: "Use after changing embedding routes or provider dimensions. E3 performs the rebuild.",
+        when_to_use: "Use after changing embedding routes or provider dimensions. E3 performs the rebuild. Transcript rebuilds require include_transcripts=true because they read the transcript corpus.",
         example: None,
     },
     ToolDoc {
