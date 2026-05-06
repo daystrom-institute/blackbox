@@ -14,6 +14,7 @@ use super::{Bucket, EmbeddingProvider, EmbeddingRouter};
 const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_BATCH_RETRIES: u8 = 3;
 
 type ProviderSpec = (String, Arc<dyn EmbeddingProvider>, Option<u32>, String);
 
@@ -31,6 +32,7 @@ pub struct RouteStatus {
     pub available: bool,
     pub indexed_count: u64,
     pub queue_depth: u64,
+    pub retried_count: u64,
     pub last_error: Option<String>,
     pub coverage_ratio: Option<f32>,
 }
@@ -41,6 +43,7 @@ impl Default for RouteStatus {
             available: true,
             indexed_count: 0,
             queue_depth: 0,
+            retried_count: 0,
             last_error: None,
             coverage_ratio: None,
         }
@@ -386,6 +389,7 @@ impl EmbedQueueHandle {
 async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCommand>) {
     let mut pending = VecDeque::new();
     let mut retry_batch = Vec::new();
+    let mut retry_attempts = 0_u8;
     let mut backoff = spec.retry_backoff;
     loop {
         let batch = if retry_batch.is_empty() {
@@ -409,10 +413,18 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
                             error = %sanitized,
                             "embedding vector persistence failed; route will retry"
                         );
-                        mark_error(&spec.statuses, &spec.route, &sanitized);
-                        retry_batch = batch;
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+                        if !schedule_retry_or_drop(
+                            &spec,
+                            &mut retry_batch,
+                            &mut retry_attempts,
+                            &mut backoff,
+                            batch,
+                            &sanitized,
+                        )
+                        .await
+                        {
+                            backoff = spec.retry_backoff;
+                        }
                         continue;
                     }
                 }
@@ -426,6 +438,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
                 );
                 mark_success(&spec.statuses, &spec.route, batch.len() as u64);
                 retry_batch.clear();
+                retry_attempts = 0;
                 backoff = spec.retry_backoff;
             }
             Err(err) => {
@@ -435,12 +448,52 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
                     error = %sanitized,
                     "embedding batch failed; route will retry without affecting search"
                 );
-                mark_error(&spec.statuses, &spec.route, &sanitized);
-                retry_batch = batch;
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+                if !schedule_retry_or_drop(
+                    &spec,
+                    &mut retry_batch,
+                    &mut retry_attempts,
+                    &mut backoff,
+                    batch,
+                    &sanitized,
+                )
+                .await
+                {
+                    backoff = spec.retry_backoff;
+                }
             }
         }
+    }
+}
+
+async fn schedule_retry_or_drop(
+    spec: &WorkerSpec,
+    retry_batch: &mut Vec<EmbedRequest>,
+    retry_attempts: &mut u8,
+    backoff: &mut Duration,
+    batch: Vec<EmbedRequest>,
+    error: &str,
+) -> bool {
+    *retry_attempts = retry_attempts.saturating_add(1);
+    mark_retry(&spec.statuses, &spec.route);
+    if *retry_attempts >= MAX_BATCH_RETRIES {
+        let dropped = batch.len() as u64;
+        let message = format!("embedding batch dropped after {MAX_BATCH_RETRIES} retries: {error}");
+        tracing::warn!(
+            route = %spec.route,
+            vector_route = %spec.vector_route,
+            dropped,
+            "embedding batch dropped after retry limit"
+        );
+        mark_dropped(&spec.statuses, &spec.route, dropped, &message);
+        retry_batch.clear();
+        *retry_attempts = 0;
+        false
+    } else {
+        retry_batch.clear();
+        retry_batch.extend(batch);
+        tokio::time::sleep(*backoff).await;
+        *backoff = (*backoff * 2).min(MAX_RETRY_BACKOFF);
+        true
     }
 }
 
@@ -518,6 +571,25 @@ fn mark_success(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, c
     status.indexed_count = status.indexed_count.saturating_add(count);
     status.queue_depth = status.queue_depth.saturating_sub(count);
     status.last_error = None;
+}
+
+fn mark_retry(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str) {
+    let mut statuses = statuses.write();
+    let status = statuses.entry(route.to_string()).or_default();
+    status.retried_count = status.retried_count.saturating_add(1);
+}
+
+fn mark_dropped(
+    statuses: &RwLock<BTreeMap<String, RouteStatus>>,
+    route: &str,
+    count: u64,
+    message: &str,
+) {
+    let mut statuses = statuses.write();
+    let status = statuses.entry(route.to_string()).or_default();
+    status.available = false;
+    status.queue_depth = status.queue_depth.saturating_sub(count);
+    status.last_error = Some(message.to_string());
 }
 
 fn mark_error(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, message: &str) {
@@ -641,18 +713,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_outage_keeps_route_backed_up_without_panic() {
+    async fn provider_outage_drops_batch_after_retry_limit() {
         let queue = EmbedQueueHandle::from_providers_for_test(
             vec![("code", Arc::new(MockProvider::failing()))],
             Duration::from_millis(10),
-            Duration::from_millis(20),
+            Duration::from_millis(10),
         );
         assert!(queue.enqueue(request(Bucket::Code, "a", "h1")));
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
         let status = queue.status().routes["code"].clone();
         assert!(!status.available);
-        assert_eq!(status.queue_depth, 1);
-        assert!(status.last_error.unwrap().contains("provider unavailable"));
+        assert_eq!(status.queue_depth, 0);
+        assert_eq!(status.retried_count, u64::from(MAX_BATCH_RETRIES));
+        assert!(
+            status
+                .last_error
+                .unwrap()
+                .contains("dropped after 3 retries")
+        );
         queue.shutdown();
     }
 
