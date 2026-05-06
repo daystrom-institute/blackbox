@@ -77,18 +77,33 @@ fn spawn_periodic_flusher(store: Arc<VectorStore>) {
                         continue;
                     }
                     let mut p = partition.write();
-                    if let Err(err) = p.flush_derived_files() {
-                        tracing::warn!(
-                            route = %p.route,
-                            error = %err,
-                            "vector partition periodic flush failed; will retry"
-                        );
-                    } else {
-                        tracing::debug!(
-                            route = %p.route,
-                            wal_records = p.wal_records,
-                            "vector partition derived files flushed"
-                        );
+                    let active = p.slab.active_count();
+                    let dims = p.slab.dims();
+                    let est_bytes = active.saturating_mul(dims).saturating_mul(4);
+                    let started = std::time::Instant::now();
+                    let result = p.flush_derived_files();
+                    let elapsed_ms = started.elapsed().as_millis();
+                    match result {
+                        Ok(()) => {
+                            // Logged at INFO so users can correlate disk load
+                            // with bbox flushes. Each line is one slab.bin
+                            // rewrite of `est_bytes` MB.
+                            tracing::info!(
+                                route = %p.route,
+                                wal_records = p.wal_records,
+                                active_count = active,
+                                slab_bytes = est_bytes,
+                                elapsed_ms,
+                                "vector partition derived files flushed"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                route = %p.route,
+                                error = %err,
+                                "vector partition periodic flush failed; will retry"
+                            );
+                        }
                     }
                 }
             }

@@ -8110,9 +8110,9 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             // Wait for either Ctrl-C (interactive) or SIGTERM (systemd
-            // stop). Without the SIGTERM branch, `systemctl stop` skips
-            // the per-partition force-flush below and the next start
-            // pays a full WAL replay to rebuild derived files.
+            // stop). Without the SIGTERM branch, `systemctl stop` would
+            // not signal graceful shutdown and would rely on the
+            // TimeoutStopSec SIGKILL.
             #[cfg(unix)]
             {
                 let mut sigterm =
@@ -8133,12 +8133,34 @@ async fn main() -> anyhow::Result<()> {
 
     // Persist tasks on shutdown
     shared.task_store.read().persist(&store_dir);
-    // Force-flush every vector partition's derived files so the next
-    // start can avoid a full WAL replay. The throttled per-batch upsert
-    // path may have left up to FLUSH_MIN_RECORDS new records unwritten;
-    // this catches them.
-    if let Err(err) = vectors::global().flush_all() {
-        tracing::warn!(error = %err, "vector partition force-flush on shutdown failed");
+    // Best-effort vector-partition force-flush with a short timeout.
+    // The earlier unconditional `vectors::global().flush_all()` could
+    // block here for tens of seconds if any embed worker was holding a
+    // partition write lock for a mid-flight voyage batch — long enough
+    // to push systemd past TimeoutStopSec=90 and trigger SIGKILL,
+    // which is worse than just leaving the WAL to replay on next start.
+    // Spawn it on a thread + join with a short cap; if it doesn't
+    // finish in time, drop on the floor and exit cleanly. The next
+    // daemon start runs `rebuild_from_wal` which is correct (the WAL
+    // was sync'd per batch) just slow.
+    let flush_handle = std::thread::spawn(|| vectors::global().flush_all());
+    let flush_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < flush_deadline {
+        if flush_handle.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if flush_handle.is_finished() {
+        if let Err(err) = flush_handle.join().expect("flush thread panic") {
+            tracing::warn!(error = %err, "vector partition force-flush on shutdown failed");
+        }
+    } else {
+        tracing::warn!(
+            "vector partition force-flush on shutdown timed out after 5s; \
+             next start will rebuild derived files from WAL"
+        );
+        // Detach; the OS reaps it when the process exits.
     }
     tracing::info!("blackboxd shut down");
     Ok(())
