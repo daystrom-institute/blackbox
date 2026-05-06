@@ -37,7 +37,7 @@ use parking_lot::RwLock;
 use axum::extract::{Query, State as AxumState};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use futures::stream::Stream;
+use futures::{stream::Stream, StreamExt};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, IntoContents, ServerCapabilities, ServerInfo};
@@ -6261,12 +6261,44 @@ async fn admin_packet_compile(
 }
 
 async fn read_artifact_source(source: &str) -> anyhow::Result<Value> {
+    const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
     let raw = if source.starts_with("http://") || source.starts_with("https://") {
-        reqwest::get(source)
-            .await?
-            .error_for_status()?
-            .text()
-            .await?
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()?;
+        let response = client.get(source).send().await?.error_for_status()?;
+        let scheme = response.url().scheme();
+        if scheme != "http" && scheme != "https" {
+            anyhow::bail!("artifact source redirected to unsupported scheme `{scheme}`");
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !(content_type.contains("application/json")
+            || content_type.contains("text/json")
+            || content_type.contains("text/plain"))
+        {
+            anyhow::bail!("artifact source content-type must be JSON or text/plain");
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_ARTIFACT_BYTES as u64)
+        {
+            anyhow::bail!("artifact source too large; limit is {MAX_ARTIFACT_BYTES} bytes");
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len() + chunk.len() > MAX_ARTIFACT_BYTES {
+                anyhow::bail!("artifact source too large; limit is {MAX_ARTIFACT_BYTES} bytes");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        String::from_utf8(bytes)?
     } else {
         std::fs::read_to_string(source)?
     };
@@ -7829,6 +7861,33 @@ mod tests {
             .join("workflows")
             .join("workflow-a.json")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn read_artifact_source_rejects_oversized_http_response() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: 1048577\r\n",
+                "\r\n",
+                "{}"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let err = read_artifact_source(&format!("http://{addr}/artifact.json"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("too large"), "got: {err}");
     }
 
     #[test]
