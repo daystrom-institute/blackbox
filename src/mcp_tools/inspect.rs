@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::edge_index::{Edge, EdgeIndex};
+use crate::entity_loader;
 use crate::entity_ref::EntityRef;
 use crate::providers::{self, EntityView, Neighborhood, ProviderContext};
 
@@ -117,7 +118,7 @@ pub fn inspect_entity(
     let per_type_limit = p.per_type_limit.unwrap_or(5);
     let edge_filter = parse_edge_filter(p.edge_types.as_deref());
     let provider = providers::provider_for(r.entity_type());
-    let mut entity = match provider.get_entity(ctx, r) {
+    let mut entity = match entity_loader::load(ctx, r) {
         Ok(entity) => entity,
         Err(_) => return Ok(not_found(r, similar_refs(edge_index, r))),
     };

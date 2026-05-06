@@ -4,6 +4,7 @@ mod council;
 mod crons;
 mod edge_index;
 mod embed_queue;
+mod entity_loader;
 pub mod entity_ref;
 #[cfg(test)]
 #[path = "../eval/check.rs"]

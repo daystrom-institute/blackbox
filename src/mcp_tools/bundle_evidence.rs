@@ -6,10 +6,11 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::edge_index::EdgeIndex;
+use crate::entity_loader;
 use crate::entity_ref::EntityRef;
 use crate::mcp_tools::find_paths::{render_node, render_path};
 use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache};
-use crate::providers::{self, ProviderContext};
+use crate::providers::ProviderContext;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BundleEvidenceParams {
@@ -30,8 +31,7 @@ pub fn bundle_evidence(
             Ok(r) => r,
             Err(err) => return Ok(bad_input("entity_refs", err.to_string())),
         };
-        let provider = providers::provider_for(r.entity_type());
-        let view = match provider.get_entity(ctx, &r) {
+        let view = match entity_loader::load(ctx, &r) {
             Ok(view) => view,
             Err(err) => {
                 return Ok(not_found(&r, err.to_string()));
