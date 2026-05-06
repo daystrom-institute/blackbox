@@ -4490,7 +4490,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_agent_list",
-        description = "List installed agents from the registry. Optional filters for cost_class, provenance_kind, and include_superseded."
+        description = "List installed agents from the registry. Optional filters for cost_class, provenance_kind, include_superseded, and limit."
     )]
     fn bro_agent_list(&self, Parameters(p): Parameters<AgentListParams>) -> CallToolResult {
         use orchestration::agents::registry::{AgentRegistry, ListFilter};
@@ -4499,10 +4499,15 @@ Constraints:\n\
         let reg = AgentRegistry::new(&catalog);
         let cost_class = match p.cost_class.as_deref() {
             Some(s) => {
-                let parsed: AgentCostClass = match serde_json::from_value(serde_json::Value::String(s.to_string())) {
-                    Ok(c) => c,
-                    Err(_) => return Self::err_text(&format!("unknown cost_class: {s} (expected one of: cheap, normal, expensive)")),
-                };
+                let parsed: AgentCostClass =
+                    match serde_json::from_value(serde_json::Value::String(s.to_string())) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            return Self::err_text(&format!(
+                                "unknown cost_class: {s} (expected one of: cheap, normal, expensive)"
+                            ))
+                        }
+                    };
                 Some(parsed)
             }
             None => None,
@@ -4519,34 +4524,40 @@ Constraints:\n\
                     None => summaries,
                 };
                 Self::ok_json(&serde_json::json!({
-                "agents": capped.iter().map(|s| {
-                    let mut m = serde_json::Map::from_iter([
-                        ("name".into(), serde_json::Value::String(s.name.clone())),
-                        ("version".into(), serde_json::Value::String(s.version.clone())),
-                        ("active".into(), serde_json::Value::Bool(s.active)),
-                        ("installed_at".into(), serde_json::Value::String(s.installed_at.clone())),
-                        ("embedding_pending".into(), match s.embedding_pending {
-                            Some(b) => serde_json::Value::Bool(b),
-                            None => serde_json::Value::Null,
-                        }),
-                    ]);
-                    if let Some(desc) = &s.description {
-                        m.insert("description".into(), serde_json::Value::String(desc.clone()));
-                    }
-                    if let Some(cc) = &s.cost_class {
-                        m.insert("cost_class".into(), serde_json::Value::String(cc.to_string()));
-                    }
-                    if let Some(pk) = &s.provenance_kind {
-                        m.insert("provenance_kind".into(), serde_json::Value::String(pk.clone()));
-                    }
-                    if !s.supersedes_chain.is_empty() {
-                        m.insert("supersedes_chain".into(), serde_json::Value::Array(
-                            s.supersedes_chain.iter().map(|c| serde_json::Value::String(c.clone())).collect()
-                        ));
-                    }
-                    serde_json::Value::Object(m)
-                }).collect::<Vec<_>>()
-            }))
+                    "agents": capped.iter().map(|s| {
+                        let mut m = serde_json::Map::from_iter([
+                            ("name".into(), serde_json::Value::String(s.name.clone())),
+                            ("version".into(), serde_json::Value::String(s.version.clone())),
+                            ("active".into(), serde_json::Value::Bool(s.active)),
+                            ("installed_at".into(), serde_json::Value::String(s.installed_at.clone())),
+                            ("embedding_pending".into(), match s.embedding_pending {
+                                Some(b) => serde_json::Value::Bool(b),
+                                None => serde_json::Value::Null,
+                            }),
+                        ]);
+                        if let Some(desc) = &s.description {
+                            m.insert("description".into(), serde_json::Value::String(desc.clone()));
+                        }
+                        if let Some(cc) = &s.cost_class {
+                            m.insert("cost_class".into(), serde_json::Value::String(cc.to_string()));
+                        }
+                        if let Some(pk) = &s.provenance_kind {
+                            m.insert("provenance_kind".into(), serde_json::Value::String(pk.clone()));
+                        }
+                        if !s.supersedes_chain.is_empty() {
+                            m.insert(
+                                "supersedes_chain".into(),
+                                serde_json::Value::Array(
+                                    s.supersedes_chain
+                                        .iter()
+                                        .map(|c| serde_json::Value::String(c.clone()))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        serde_json::Value::Object(m)
+                    }).collect::<Vec<_>>()
+                }))
             }
             Err(e) => Self::err_text(&format!("registry list failed: {e}")),
         }
@@ -10673,5 +10684,76 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let text = extract_text(&result);
         assert!(text.contains("agent not found"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_list_include_superseded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        seed_test_agent(cat, "old-agent.json", "old-agent", 1, None);
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "new-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "new-agent",
+                "version": 1,
+                "supersedes": "old-agent",
+                "manifest": {
+                    "description": "Replacement for old-agent.",
+                    "when_to_use": ["when testing"],
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            Some("old-agent".into()),
+        )
+        .unwrap();
+
+        let default_result = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: None,
+            cost_class: None,
+            provenance_kind: None,
+            limit: None,
+        }));
+        assert_ne!(default_result.is_error, Some(true));
+        let default_body: serde_json::Value =
+            serde_json::from_str(&extract_text(&default_result)).unwrap();
+        let default_agents = default_body["agents"].as_array().unwrap();
+        let default_names: Vec<&str> = default_agents
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !default_names.contains(&"old-agent"),
+            "superseded agent should be excluded by default: {default_names:?}"
+        );
+        assert!(
+            default_names.contains(&"new-agent"),
+            "active agent should be included: {default_names:?}"
+        );
+
+        let with_superseded = server.bro_agent_list(Parameters(AgentListParams {
+            include_superseded: Some(true),
+            cost_class: None,
+            provenance_kind: None,
+            limit: None,
+        }));
+        assert_ne!(with_superseded.is_error, Some(true));
+        let all_body: serde_json::Value =
+            serde_json::from_str(&extract_text(&with_superseded)).unwrap();
+        let all_agents = all_body["agents"].as_array().unwrap();
+        let all_names: Vec<&str> = all_agents
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            all_names.contains(&"old-agent"),
+            "superseded agent should appear with include_superseded=true: {all_names:?}"
+        );
+        let old = all_agents.iter().find(|a| a["name"] == "old-agent").unwrap();
+        assert_eq!(old["active"], false);
     }
 }

@@ -745,7 +745,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_agent_list",
         category: ToolCategory::Orchestration,
-        summary: "List installed agents from the registry. Optional filters for cost_class, provenance_kind, and include_superseded.",
+        summary: "List installed agents from the registry. Optional filters for cost_class, provenance_kind, include_superseded, and limit.",
         when_to_use: "Discover what agents are available for dispatch, composition, or review. Filter by cost_class to find cheap/expensive agents; use include_superseded=true to see version history.",
         example: Some(r#"bro_agent_list(include_superseded=true)"#),
     },
