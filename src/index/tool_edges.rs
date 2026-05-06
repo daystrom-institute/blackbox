@@ -94,6 +94,9 @@ impl ToolEdgeContext {
             .to_string(),
             target,
             provenance: EdgeProvenance::Explicit,
+            // The target points at the current chunk containing the byte range
+            // when transcripts are reindexed. The historical identity lives in
+            // anchor.* metadata and is resolved by bbox_blame via git blame.
             confidence: EdgeConfidence::Heuristic,
             metadata: anchor_metadata(
                 event,
