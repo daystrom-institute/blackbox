@@ -9,6 +9,9 @@
       "knowledge_hint": "9d05efad"
     }
   ],
+  "expected_entity_refs": [
+    "knowledge:9d05efad"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "KNOWLEDGE_FROM_SESSION"

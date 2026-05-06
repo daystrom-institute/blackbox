@@ -9,6 +9,9 @@
       "transcript_hint": "Voyage embeddings agentic corpus"
     }
   ],
+  "expected_entity_refs": [
+    "transcript:claude:77fd9166-5c96-4b01-a864-baa40c16a6a8:189206:0"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "IN_SESSION"

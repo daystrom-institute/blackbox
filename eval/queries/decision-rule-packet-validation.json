@@ -9,6 +9,9 @@
       "knowledge_hint": "7ee3f895"
     }
   ],
+  "expected_entity_refs": [
+    "knowledge:7ee3f895"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "KNOWLEDGE_FROM_SESSION"

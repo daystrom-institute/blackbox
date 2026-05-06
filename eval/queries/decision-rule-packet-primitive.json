@@ -9,6 +9,9 @@
       "knowledge_hint": "154fd624"
     }
   ],
+  "expected_entity_refs": [
+    "knowledge:154fd624"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "SUPERSEDES"

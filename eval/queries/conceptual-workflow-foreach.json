@@ -9,6 +9,9 @@
       "path_hint": "design/agentic-corpus.md"
     }
   ],
+  "expected_entity_refs": [
+    "project_file:d723917f:3b317e2b:3e768b4d16b66baaac582f742feff881e066493b0c2ea2eb0f12cc7794ec350e:16"
+  ],
   "required_evidence": {
     "kind": "path",
     "value": {

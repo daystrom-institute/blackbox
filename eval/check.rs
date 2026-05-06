@@ -134,6 +134,8 @@ pub struct EvalQueryManifest {
     pub query_class: QueryClass,
     pub query: String,
     pub target_locators: Vec<TargetLocator>,
+    #[serde(default)]
+    pub expected_entity_refs: Vec<String>,
     pub required_evidence: RequiredEvidence,
     pub forbidden_stale_answers: Vec<String>,
     pub pass_classifier: String,
@@ -254,13 +256,56 @@ fn truncate_locator_description(description: &str) -> String {
 }
 
 fn default_stub_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>) {
-    (
-        false,
-        vec![format!(
-            "{name} is an F2a stub; F2b will resolve expected entity refs and implement assertions (collected={})",
-            collected.len()
-        )],
-    )
+    expected_ref_check(name, collected)
+}
+
+fn expected_ref_check(name: &str, collected: &[EntityRef]) -> (bool, Vec<String>) {
+    let expected = match expected_refs_for_checker(name) {
+        Ok(expected) => expected,
+        Err(err) => return (false, vec![err]),
+    };
+    if expected.is_empty() {
+        return (
+            false,
+            vec![format!("{name} has no expected_entity_refs materialized")],
+        );
+    }
+    let matched = expected.iter().any(|expected| collected.contains(expected));
+    if matched {
+        (true, vec![format!("{name} matched an expected entity ref")])
+    } else {
+        (
+            false,
+            vec![format!(
+                "{name} expected one of [{}], collected [{}]",
+                expected
+                    .iter()
+                    .map(EntityRef::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                collected
+                    .iter()
+                    .map(EntityRef::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )],
+        )
+    }
+}
+
+fn expected_refs_for_checker(name: &str) -> Result<Vec<EntityRef>, String> {
+    let manifests = load_manifests().map_err(|err| err.to_string())?;
+    let Some(manifest) = manifests
+        .into_iter()
+        .find(|manifest| manifest.pass_classifier == name)
+    else {
+        return Err(format!("unknown checker {name}"));
+    };
+    manifest
+        .expected_entity_refs
+        .iter()
+        .map(|raw| EntityRef::parse(raw).map_err(|err| err.to_string()))
+        .collect()
 }
 
 macro_rules! stub_checker {
@@ -305,6 +350,9 @@ stub_checker!(check_cross_modal_notes_side_channel);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn all_30_manifests_parse_and_round_trip() {
@@ -331,6 +379,11 @@ mod tests {
                 manifest.id
             );
             assert!(
+                !manifest.expected_entity_refs.is_empty(),
+                "missing expected_entity_refs in {}",
+                manifest.id
+            );
+            assert!(
                 checker_by_name(&manifest.pass_classifier).is_some(),
                 "unknown checker {} in {}",
                 manifest.pass_classifier,
@@ -351,6 +404,49 @@ mod tests {
             QueryClass::CrossModalCodeProse,
         ] {
             assert_eq!(class_counts.get(&class).copied(), Some(6), "{class:?}");
+        }
+    }
+
+    #[test]
+    fn all_30_manifests_have_resolvable_expected_refs() {
+        let manifests = load_manifests().expect("all eval manifests parse");
+        for manifest in &manifests {
+            for raw in &manifest.expected_entity_refs {
+                let entity_ref = EntityRef::parse(raw).unwrap_or_else(|err| {
+                    panic!("{} invalid expected ref {raw}: {err}", manifest.id)
+                });
+                assert!(
+                    expected_ref_resolves(manifest, &entity_ref),
+                    "{} expected ref does not resolve through its locators: {raw}",
+                    manifest.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checkers_pass_when_expected_refs_are_collected() {
+        let manifests = load_manifests().expect("all eval manifests parse");
+        for manifest in &manifests {
+            let checker = checker_by_name(&manifest.pass_classifier)
+                .unwrap_or_else(|| panic!("missing checker {}", manifest.pass_classifier));
+            let collected = manifest
+                .expected_entity_refs
+                .iter()
+                .map(|raw| {
+                    EntityRef::parse(raw).unwrap_or_else(|err| {
+                        panic!("{} invalid expected ref {raw}: {err}", manifest.id)
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let (passed, messages) = checker(&collected);
+
+            assert!(
+                passed,
+                "{} checker should pass with oracle refs: {:?}",
+                manifest.id, messages
+            );
         }
     }
 
@@ -384,5 +480,243 @@ mod tests {
 
         assert!(err.contains(&"x".repeat(80)));
         assert!(!err.contains(&"x".repeat(120)));
+    }
+
+    fn expected_ref_resolves(manifest: &EvalQueryManifest, entity_ref: &EntityRef) -> bool {
+        match entity_ref {
+            EntityRef::Knowledge { id } => manifest.target_locators.iter().any(|locator| {
+                locator.entity_type_hint == "knowledge"
+                    && locator.knowledge_hint.as_deref() == Some(id.as_str())
+            }),
+            EntityRef::ProjectFile { .. } | EntityRef::Symbol { .. } => manifest
+                .target_locators
+                .iter()
+                .filter(|locator| {
+                    matches!(locator.entity_type_hint.as_str(), "project_file" | "symbol")
+                })
+                .any(|locator| locator_resolves_source_ref(locator, entity_ref)),
+            EntityRef::Transcript {
+                provider,
+                session_id,
+                line_offset,
+                ..
+            } => manifest
+                .target_locators
+                .iter()
+                .filter(|locator| locator.entity_type_hint == "transcript")
+                .any(|locator| {
+                    transcript_ref_matches_locator(
+                        provider,
+                        session_id,
+                        *line_offset,
+                        locator.transcript_hint.as_deref().unwrap_or_default(),
+                    )
+                }),
+            EntityRef::Commit { repo_id, sha } => manifest
+                .target_locators
+                .iter()
+                .filter(|locator| locator.entity_type_hint == "commit")
+                .any(|locator| {
+                    locator
+                        .transcript_hint
+                        .as_deref()
+                        .is_some_and(|hint| sha.starts_with(hint))
+                        || !repo_id.is_empty() && !sha.is_empty()
+                }),
+            _ => true,
+        }
+    }
+
+    fn locator_resolves_source_ref(locator: &TargetLocator, entity_ref: &EntityRef) -> bool {
+        let Some(path_hint) = &locator.path_hint else {
+            return false;
+        };
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(path_hint);
+        let Ok(chunks) = chunks_for_path(&path, Path::new(path_hint)) else {
+            return false;
+        };
+        chunks.iter().any(|chunk| match entity_ref {
+            EntityRef::ProjectFile {
+                project_id,
+                rel_path_hash,
+                chunk_hash,
+                occurrence_idx,
+            } => {
+                &chunk.project_id == project_id
+                    && &chunk.rel_path_hash == rel_path_hash
+                    && &chunk.chunk_hash == chunk_hash
+                    && &chunk.occurrence_idx == occurrence_idx
+            }
+            EntityRef::Symbol {
+                project_id,
+                qualified_name,
+                defn_hash,
+            } => {
+                &chunk.project_id == project_id
+                    && chunk.symbol.as_deref() == Some(qualified_name.as_str())
+                    && &chunk.chunk_hash == defn_hash
+            }
+            _ => false,
+        })
+    }
+
+    fn chunks_for_path(
+        abs_path: &Path,
+        rel_path: &Path,
+    ) -> anyhow::Result<Vec<crate::chunker::Chunk>> {
+        let bytes = fs::read(abs_path)?;
+        let sniff_len = bytes.len().min(4096);
+        let mut chunks = Vec::new();
+        for chunker in crate::chunker::default_registry() {
+            if !chunker.claims(rel_path, &bytes[..sniff_len]) {
+                continue;
+            }
+            chunks = chunker.chunk(rel_path, &bytes)?.0;
+            break;
+        }
+        let project_id = project_id();
+        let rel_path_hash = short_hash(rel_path.to_string_lossy().as_bytes());
+        Ok(bound_chunks(
+            chunks
+                .into_iter()
+                .enumerate()
+                .map(|(idx, mut chunk)| {
+                    chunk.project_id.clone_from(&project_id);
+                    chunk.file_path = rel_path.to_path_buf();
+                    chunk.rel_path_hash.clone_from(&rel_path_hash);
+                    chunk.chunk_hash = full_hash(chunk.content.as_bytes());
+                    chunk.occurrence_idx = idx as u32;
+                    chunk
+                })
+                .collect::<Vec<_>>()
+                .as_slice(),
+        ))
+    }
+
+    fn bound_chunks(chunks: &[crate::chunker::Chunk]) -> Vec<crate::chunker::Chunk> {
+        chunks
+            .iter()
+            .flat_map(|chunk| {
+                if chunk.content.len() <= crate::chunker::MAX_CHUNK_BYTES {
+                    return vec![chunk.clone()];
+                }
+                let mut out = Vec::new();
+                let mut start = 0usize;
+                while start < chunk.content.len() {
+                    let mut end =
+                        (start + crate::chunker::MAX_CHUNK_BYTES).min(chunk.content.len());
+                    while !chunk.content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let mut split = chunk.clone();
+                    split.content = chunk.content[start..end].to_string();
+                    split.byte_start = chunk.byte_start + start as u64;
+                    split.byte_end = chunk.byte_start + end as u64;
+                    split.chunk_hash = full_hash(split.content.as_bytes());
+                    split.occurrence_idx = out.len() as u32;
+                    out.push(split);
+                    start = end;
+                }
+                out
+            })
+            .enumerate()
+            .map(|(idx, mut chunk)| {
+                chunk.occurrence_idx = idx as u32;
+                chunk
+            })
+            .collect()
+    }
+
+    fn transcript_ref_matches_locator(
+        provider: &str,
+        session_id: &str,
+        line_offset: u64,
+        hint: &str,
+    ) -> bool {
+        let Some(path) = transcript_path(provider, session_id) else {
+            return false;
+        };
+        let Ok(bytes) = fs::read(&path) else {
+            return false;
+        };
+        let offset = line_offset as usize;
+        if offset >= bytes.len() || (offset > 0 && bytes[offset - 1] != b'\n') {
+            return false;
+        }
+        let end = bytes[offset..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|idx| offset + idx)
+            .unwrap_or(bytes.len());
+        let line = String::from_utf8_lossy(&bytes[offset..end]).to_lowercase();
+        hint.split_whitespace()
+            .filter(|term| term.len() > 3)
+            .any(|term| line.contains(&term.to_lowercase()))
+    }
+
+    fn transcript_path(provider: &str, session_id: &str) -> Option<PathBuf> {
+        let mut homes = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            homes.push(home);
+        }
+        let fixture_home = PathBuf::from("/home/invidious");
+        if !homes.iter().any(|home| home == &fixture_home) {
+            homes.push(fixture_home);
+        }
+
+        for home in homes {
+            let candidates = if provider == "codex" {
+                vec![home.join(".codex").join("sessions")]
+            } else if provider == "claude" {
+                vec![home.join(".claude").join("projects")]
+            } else {
+                vec![home.join(format!(".claude-{provider}")).join("projects")]
+            };
+            for root in candidates {
+                if let Ok(Some(found)) = find_transcript(&root, session_id) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    fn find_transcript(root: &Path, session_id: &str) -> std::io::Result<Option<PathBuf>> {
+        if !root.exists() {
+            return Ok(None);
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                if let Some(found) = find_transcript(&path, session_id)? {
+                    return Ok(Some(found));
+                }
+            } else if path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem == session_id)
+            {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
+    fn project_id() -> String {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .expect("repo root canonicalizes");
+        short_hash(root.to_string_lossy().as_bytes())
+    }
+
+    fn short_hash(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        hex::encode(&digest[..4])
+    }
+
+    fn full_hash(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        hex::encode(digest)
     }
 }

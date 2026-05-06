@@ -9,6 +9,9 @@
       "transcript_hint": "thread-cba8bfa1 workflow foreach"
     }
   ],
+  "expected_entity_refs": [
+    "transcript:claude:2ba56297-c7b1-438c-b108-0a2cfd4fe4d9:2439857:0"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "IN_SESSION"

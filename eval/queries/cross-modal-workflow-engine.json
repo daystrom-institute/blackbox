@@ -14,6 +14,10 @@
       "path_hint": "src/workflow/mod.rs"
     }
   ],
+  "expected_entity_refs": [
+    "knowledge:sm-workflow-orchestration",
+    "project_file:d723917f:996d1a96:26f263b1f71582d9413f8b712b8541f33868fe13a82c7278ab81040d7c41767a:8"
+  ],
   "required_evidence": {
     "kind": "entity_set",
     "value": [

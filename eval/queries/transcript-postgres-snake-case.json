@@ -9,6 +9,9 @@
       "transcript_hint": "Postgres columns use snake_case"
     }
   ],
+  "expected_entity_refs": [
+    "transcript:claude:0142cece-dfc1-4e7d-8cce-7b6079454ef0:1954884:0"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "IN_SESSION"

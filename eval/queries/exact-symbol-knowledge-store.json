@@ -10,6 +10,9 @@
       "symbol_hint": "KnowledgeStore"
     }
   ],
+  "expected_entity_refs": [
+    "symbol:d723917f:KnowledgeStore:3867906959e7ff9c5c0c893d30ba43ea2663089aec664a3da19dffca6dd0df0d"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "DEFINED_IN"

@@ -14,6 +14,10 @@
       "path_hint": "src/notes.rs"
     }
   ],
+  "expected_entity_refs": [
+    "knowledge:sm-side-channel-notes",
+    "project_file:d723917f:f989c02c:1e6c1fae19ac463b78e68371585b035d1cd5be7c9b980f6b75b5865776a65ab0:45"
+  ],
   "required_evidence": {
     "kind": "entity_set",
     "value": [

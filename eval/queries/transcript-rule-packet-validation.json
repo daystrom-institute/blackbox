@@ -9,6 +9,9 @@
       "transcript_hint": "Rule-packet system validated"
     }
   ],
+  "expected_entity_refs": [
+    "transcript:account3:9379b238-cc15-4223-8d51-a4bffa4fb327:23533583:0"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "IN_SESSION"

@@ -9,6 +9,9 @@
       "knowledge_hint": "sm-render-lifecycle"
     }
   ],
+  "expected_entity_refs": [
+    "knowledge:sm-render-lifecycle"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "REFERENCES"

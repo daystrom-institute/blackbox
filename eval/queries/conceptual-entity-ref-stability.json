@@ -9,6 +9,9 @@
       "path_hint": "design/agentic-corpus.md"
     }
   ],
+  "expected_entity_refs": [
+    "project_file:d723917f:3b317e2b:366f5e6579d320c753f13faf54c47de10e8ff8e7130d917c818a244f624825a0:6"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "NEXT_SECTION"

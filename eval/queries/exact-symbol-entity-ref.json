@@ -10,6 +10,9 @@
       "symbol_hint": "EntityRef"
     }
   ],
+  "expected_entity_refs": [
+    "symbol:d723917f:EntityRef:b30b2beb90a459f42e6a8020739a2e7e0ac424c6d8a4c2ea6a847d4e0cc6efba"
+  ],
   "required_evidence": {
     "kind": "edge_family",
     "value": "DEFINED_IN"
