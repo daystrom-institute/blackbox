@@ -7892,9 +7892,18 @@ async fn main() -> anyhow::Result<()> {
         councils: Arc::new(council::CouncilRegistry::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
     });
-    vectors::install_global(Arc::new(vectors::VectorStore::open(
-        vectors::default_vectors_dir(),
-    )?));
+    std::thread::Builder::new()
+        .name("blackbox-vectors-warmup".into())
+        .spawn(|| {
+            let started = std::time::Instant::now();
+            let store = vectors::global();
+            tracing::info!(
+                partitions = store.partition_count(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "vector store warmed"
+            );
+        })
+        .map_err(|e| anyhow::anyhow!("spawning vector store warmup thread: {e}"))?;
     embed_queue::install_contradiction_threshold(tier0_cosine_threshold_from_env());
     embed_queue::install_contradiction_state(shared.clone());
     embed_queue::install(embed::queue::EmbedQueueHandle::start_default());

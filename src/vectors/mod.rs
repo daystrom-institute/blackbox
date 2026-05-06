@@ -119,9 +119,11 @@ pub fn global() -> Arc<VectorStore> {
 
     GLOBAL_STORE
         .get_or_init(|| {
-            Arc::new(
+            let store = Arc::new(
                 VectorStore::open(default_vectors_dir()).expect("default vector store should open"),
-            )
+            );
+            spawn_periodic_flusher(store.clone());
+            store
         })
         .clone()
 }
