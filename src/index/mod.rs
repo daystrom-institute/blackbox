@@ -77,6 +77,7 @@ pub struct ReindexConfig {
     pub meta_path: PathBuf,
     pub projects_path: PathBuf,
     pub knowledge_path: PathBuf,
+    pub threads_path: PathBuf,
 }
 
 pub struct TranscriptIndex {
@@ -140,6 +141,7 @@ impl TranscriptIndex {
         codex_root: Option<PathBuf>,
         projects_path: PathBuf,
         knowledge_path: PathBuf,
+        threads_path: PathBuf,
     ) -> Result<Self> {
         reset_index_on_schema_mismatch(index_path)?;
         let meta_path = index_path.join("_meta.json");
@@ -173,6 +175,7 @@ impl TranscriptIndex {
             meta_path,
             projects_path,
             knowledge_path,
+            threads_path,
         };
 
         Ok(Self {
@@ -217,6 +220,21 @@ impl TranscriptIndex {
 
     pub(crate) fn delete_knowledge_entry(&mut self, entry_id: &str) -> Result<()> {
         knowledge_docs::delete_knowledge_entry(&self.index, self.fields, entry_id)?;
+        self.reader.reload()?;
+        *self.stats_cache.lock() = None;
+        Ok(())
+    }
+
+    pub(crate) fn index_threads_store(
+        &mut self,
+        threads: &crate::threads::Threads,
+    ) -> Result<()> {
+        thread_docs::upsert_threads_store(
+            &self.index,
+            self.fields,
+            &self.config.threads_path,
+            threads,
+        )?;
         self.reader.reload()?;
         *self.stats_cache.lock() = None;
         Ok(())
@@ -558,6 +576,7 @@ mod tests {
             None,
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
         )
         .unwrap();
 
@@ -579,6 +598,7 @@ mod tests {
             None,
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
         )
         .unwrap();
 
@@ -597,6 +617,7 @@ mod tests {
             None,
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
         )
         .unwrap();
         let project = crate::projects::ProjectRecord {
@@ -658,6 +679,7 @@ mod tests {
             None,
             dir.path().join("projects.json"),
             knowledge_path.clone(),
+            dir.path().join("threads.json"),
         )
         .unwrap();
         let entry = crate::knowledge::KnowledgeEntry {
@@ -731,6 +753,7 @@ mod knowledge_docs;
 mod project_files;
 mod reindex;
 mod search;
+mod thread_docs;
 mod tool_edges;
 
 pub use helpers::find_session_file;

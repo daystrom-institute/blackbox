@@ -1608,6 +1608,7 @@ mod agentic_project_file_tests {
             None,
             projects_path,
             dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
         )
         .unwrap();
         let msg = index.build_index(false).unwrap();
@@ -1688,6 +1689,7 @@ mod agentic_project_file_tests {
             None,
             dir.path().join("projects.json"),
             knowledge_path,
+            dir.path().join("threads.json"),
         )
         .unwrap();
         index.build_index(false).unwrap();
@@ -1740,6 +1742,7 @@ mod agentic_project_file_tests {
             None,
             projects_path,
             dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
         )
         .unwrap();
         index.build_index(false).unwrap();

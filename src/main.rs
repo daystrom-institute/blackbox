@@ -1349,6 +1349,14 @@ impl BlackboxServer {
         Self::run("bbox_thread", || {
             let result = { self.state.threads.write().thread(&p) }?;
             if p.action != "get" {
+                if let Err(err) = self
+                    .state
+                    .idx
+                    .write()
+                    .index_threads_store(&self.state.threads.read())
+                {
+                    tracing::warn!(error = %err, "thread index sync failed after bbox_thread mutation");
+                }
                 self.rebuild_edge_index_from_stores();
             }
             Ok(result)
@@ -7740,12 +7748,14 @@ async fn main() -> anyhow::Result<()> {
 
     let projects_path = util::blackbox_projects_path(&home);
     let kb_path = util::blackbox_knowledge_path(&home);
-    let idx = TranscriptIndex::open_or_create(
+    let th_path = util::blackbox_threads_path(&home);
+    let mut idx = TranscriptIndex::open_or_create(
         &index_path,
         roots,
         codex_root,
         projects_path.clone(),
         kb_path.clone(),
+        th_path.clone(),
     )?;
     let projects_store = ProjectRegistry::open(&projects_path)?;
     tracing::info!("Project registry: {}", projects_path.display());
@@ -7800,9 +7810,11 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::debug!("gemini policy sweep: {e:#}"),
     }
 
-    let th_path = util::blackbox_threads_path(&home);
     let th = Threads::open(&th_path)?;
     tracing::info!("Thread store: {}", th_path.display());
+    if let Err(err) = idx.index_threads_store(&th) {
+        tracing::warn!(error = %err, "thread index sync failed; will retry on next reindex cycle");
+    }
 
     let notes_path = util::blackbox_notes_path(&home);
     let notes_store = Notes::open(&notes_path)?;
@@ -8300,6 +8312,7 @@ mod tests {
             None,
             tmp.path().join("projects.json"),
             tmp.path().join("knowledge.json"),
+            tmp.path().join("threads.json"),
         )
         .unwrap();
         let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
