@@ -738,7 +738,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_register",
-        description = "Register a project directory for agentic-corpus indexing."
+        description = "Register a project directory for agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. Triggers the project-bootstrap-arc which walks the project, chunks files, writes to the index, and emits structural edges. project_id is derived from the canonicalized realpath and is per-machine; not portable across hosts. repo_id is null for non-git projects; for git projects it derives from the first-commit SHA (with remote-URL fallback for shallow clones), so it survives clones. Use bbox_project_list to inspect registered projects."
     )]
     fn bbox_project_register(
         &self,
@@ -757,7 +757,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_list",
-        description = "List registered project roots."
+        description = "List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered."
     )]
     fn bbox_project_list(&self) -> CallToolResult {
         Self::ok_json(
