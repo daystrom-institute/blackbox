@@ -13,7 +13,7 @@
   "actors": {
     "badgey": {
       "kind": "executor",
-      "brofile": "badgey-slack",
+      "brofile": "badgey-persona",
       "durable": false
     }
   },
@@ -21,7 +21,7 @@
   "nodes": {
     "Answer": {
       "actor": "badgey",
-      "prompt": "[scope]\nbright\nblackboard\n\nSlack user @${vars.bbox_user} mentioned you in channel ${vars.channel}:\n\n${vars.text}\n\nReply concisely. Use Slack-compatible mrkdwn formatting. For multi-paragraph replies, the response will be posted as a threaded reply in Slack.",
+      "prompt": "[scope]\nbright\nblackboard\n\nSlack user @${vars.bbox_user} mentioned you in channel ${vars.channel}:\n\n${vars.text}\n\nReply with a concise corpus-grounded answer. Use Slack mrkdwn (bold via *, italics via _, code spans via `, fenced blocks via ```, links via <url|label>) — NOT GitHub Markdown headings or tables. Cite entity refs inline like `(knowledge:abc12345)` or `(commit:repo:sha)` so users can paste them back. The response is posted as a threaded reply.",
       "next": { "type": "goto", "to": "PostReply" }
     },
     "PostReply": {

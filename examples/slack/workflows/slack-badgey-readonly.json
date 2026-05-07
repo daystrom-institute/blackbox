@@ -14,7 +14,7 @@
   "actors": {
     "badgey": {
       "kind": "executor",
-      "brofile": "badgey-slack",
+      "brofile": "badgey-persona",
       "durable": false
     }
   },
@@ -22,7 +22,7 @@
   "nodes": {
     "Answer": {
       "actor": "badgey",
-      "prompt": "[scope]\nbright\nblackboard\n\nSlack user @${vars.bbox_user} (read-only / anonymous) asked in channel ${vars.channel}:\n\n${vars.text}\n\nYou have read-only access. Answer the query if it's informational (status, explain, inbox). If the user asks for a destructive action or dispatch, reply: \"Insufficient scope — your workspace admin can grant dispatch access via `~/.bro/slack-identities.json`. Use `/bbox status` or `/bbox inbox` for read-only commands.\" Use Slack-compatible mrkdwn.",
+      "prompt": "[scope]\nbright\nblackboard\n\nSlack user @${vars.bbox_user} (read-only / anonymous) asked in channel ${vars.channel}:\n\n${vars.text}\n\nYou have read-only access. Answer informational queries (tell-me-about, provenance, history, rationale, audit). If the user asks for a destructive action, dispatch, or proposal application, reply: \"Insufficient scope — your workspace admin can grant dispatch access via `~/.bro/slack-identities.json`. Use `/bbox status` or `/bbox inbox` for read-only commands.\" Reply in Slack mrkdwn (bold via *, italics via _, code spans via `, fenced blocks via ```, links via <url|label>) — NOT GitHub Markdown. Cite entity refs inline like `(knowledge:abc12345)` so users can paste them back.",
       "next": { "type": "goto", "to": "PostReply" }
     },
     "PostReply": {
