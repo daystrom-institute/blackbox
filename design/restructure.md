@@ -1,7 +1,7 @@
 # Restructure Proposal: Crate Topology
 
 Date: 2026-05-05
-Status: proposal
+Status: proposal, baseline refreshed 2026-05-07
 
 ## Problem
 
@@ -9,12 +9,12 @@ The crate has two god files and no library target:
 
 | File | Lines | Role |
 |------|-------|------|
-| `src/main.rs` | 8,842 | Everything except `main()`: 83 `#[tool]` handlers, HTTP routes, progress notifications, app state, tests |
-| `src/packets.rs` | 6,322 | Complete rule engine: AST, compiler, evaluator, fidelity auditor, self-heal scanner — plus a 3,411-line `#[cfg(test)]` block |
+| `src/main.rs` | 17,127 | Everything except `main()`: 109 named `#[tool]` handlers, Badgey wrapper glue, HTTP routes, progress notifications, app state, bootstrap, tests |
+| `src/packets.rs` | 6,353 | Complete rule engine: AST, compiler, evaluator, fidelity auditor, self-heal scanner — plus a 3,443-line `#[cfg(test)]` block |
 
-`Cargo.toml` has three `[[bin]]` targets and no `[lib]`. `bro` and `bro-irc` cannot import shared types from the daemon (they use HTTP/SSE today; the gain from a `[lib]` is shared DTOs and small helpers, not direct daemon-state access — see Benefits). Integration tests are impossible without running the full binary. IDE navigation is hostile (`main.rs:5252` is meaningless).
+`Cargo.toml` has four `[[bin]]` targets (`blackboxd`, `bro`, `bro-irc`, `bro-slack`) and no `[lib]`. The sidecars cannot import shared types from the daemon (they use HTTP/SSE today; the gain from a `[lib]` is shared DTOs and small helpers, not direct daemon-state access — see Benefits). Integration tests are impossible without running the full binary. IDE navigation is hostile (`main.rs:5252` is meaningless).
 
-Routing-related concerns are already partially split: `src/routing.rs`, `src/webhooks.rs`, `src/pollers.rs`, `src/crons.rs`, and `src/workflow/wait.rs` exist as separate files. `src/mcp_tools/` already contains `describe_schema.rs` and `inspect.rs` (helpers extracted from handlers, not handlers themselves). The remaining concentration is in `main.rs`'s middle section (progress / dispatch glue) plus the `BlackboxServer` god-impl with its 83 handlers.
+Routing-related concerns are already partially split: `src/routing.rs`, `src/webhooks.rs`, `src/pollers.rs`, `src/crons.rs`, and `src/workflow/wait.rs` exist as separate files. `src/mcp_tools/` already contains the agentic graph helper set (hybrid search, seed discovery, inspect, find paths, bundle evidence, blame, provenance, describe schema). The remaining concentration is in `main.rs`: a huge `BlackboxServer` god-impl, Badgey wrapper state machine glue, tool handlers, web route handlers, bootstrap, and a 4.5K-line test module.
 
 ## Current main.rs Breakdown
 
@@ -22,23 +22,25 @@ The file uses `// ---` section dividers. Verified ranges from the actual file:
 
 | Lines | Size | Content |
 |-------|------|---------|
-| 1–70 | 70 | `mod` declarations + imports |
-| 72–279 | 208 | Shared state (`SharedState` struct + impl) |
-| 282–774 | 493 | MCP Server Handler (`BlackboxServer` struct + plumbing) |
-| 777–1381 | 605 | `bbox_*` tools (search, knowledge, threads, packets, etc.) — `#[tool_router(router = bbox_tools)]` impl block |
-| 1384–1692 | 309 | `bro_*` tools (orchestration) — `#[tool_router(router = bro_tools)]` impl block |
-| 1695–4612 | **2,918** | Progress notifications — MCP `progressToken` plumbing for blocking waits + dispatch glue |
-| 4615–5413 | 799 | Helper methods on `BlackboxServer` |
-| 5418–5424 | 7 | `ServerHandler` impl — trivial; just `get_info` returning capabilities |
-| 5430–7208 | **1,779** | HTTP route code (Bro roster endpoint, admin endpoints) — **mislabeled as ServerHandler in earlier version of this doc** |
-| 7211–7370 | 160 | Tail SSE endpoint |
-| 7373–8842 | 1,470 | `main()` + `#[cfg(test)]` module |
+| 1–87 | 87 | `mod` declarations + imports |
+| 89–316 | 228 | Shared state (`SharedState`, `ArcSnapshot`, signal/webhook event structs) |
+| 318–3184 | **2,867** | `BlackboxServer` struct + helper methods + Badgey wrapper internals / adapter / restore-recovery helpers |
+| 3186–4051 | 866 | `bbox_*` tools — `#[tool_router(router = bbox_tools)]` impl block |
+| 4053–4557 | 505 | `bro_*` / Badgey / workflow / whiteboard parameter structs and support DTOs |
+| 4559–4831 | 273 | Progress notifications — MCP `progressToken` plumbing for blocking waits |
+| 4833–8637 | **3,805** | `bro_*`, `badgey_*`, `whiteboard_*`, `bro_agent_*`, `bro_council_*`, workflow/webhook/cron/poller/arc tools — `#[tool_router(router = bro_tools)]` impl block |
+| 8639–9449 | 811 | Helper methods on `BlackboxServer` |
+| 9451–9461 | 11 | `ServerHandler` impl — trivial; just `get_info` returning capabilities |
+| 9463–11741 | **2,279** | HTTP route code: Bro roster, IRC/admin/orchestrate/webhook route helpers, signal dispatch helpers |
+| 11743–11903 | 161 | Tail SSE endpoint |
+| 11905–12592 | 688 | `main()` / daemon bootstrap |
+| 12594–17127 | **4,534** | `#[cfg(test)] mod tests` |
 
-The largest concentration is the **2,918-line progress/dispatch middle block**. The 1,779-line block at 5430–7208 is HTTP-route code (axum route handlers + helpers), not the `ServerHandler` trait impl (which is a 7-line stub via `#[tool_handler(router = self.tool_router)]` at 5419 doing the macro-driven JSON dispatch). Treat the 1,779 block as web-route extraction (→ `server/routes.rs`), not handler-router extraction.
+The largest concentrations now are the **3,805-line bro-side tool block**, the **2,867-line `BlackboxServer` / Badgey helper block**, the **2,279-line HTTP route block**, and the **4,534-line test module**. Progress-token plumbing is small enough to extract cleanly, but it is no longer the dominant middle block. Treat the HTTP block as web-route extraction (→ `server/routes.rs` / `server/admin.rs` / `server/orchestrate.rs` as needed), not handler-router extraction.
 
 ## Current packets.rs Breakdown
 
-A flat 6,322-line file. Lines 1–2,910 are non-test code; lines 2,911–6,322 (3,411 lines) are a single `#[cfg(test)] mod tests` block. Non-test breakdown (approximate):
+A flat 6,353-line file. Lines 1–2,910 are non-test code; lines 2,911–6,353 (3,443 lines) are a single `#[cfg(test)] mod tests` block. Non-test breakdown (approximate):
 
 - MCP parameter structs (~200 lines)
 - Predicate AST types and parsing (~700 lines)
@@ -52,11 +54,11 @@ A flat 6,322-line file. Lines 1–2,910 are non-test code; lines 2,911–6,322 (
 
 **Internal dependencies (matters for split order):** `ast.rs` is a leaf; `compile.rs` consumes `ast.rs`; `apply.rs` consumes both `ast.rs` and `compile.rs`; `audit.rs` consumes `apply.rs`; the store + events + scanner consume the evaluator. Split bottom-up: `ast.rs` → `compile.rs` → `apply.rs` → `audit.rs` → `scanner.rs` → store/events. `coerce.rs` is independent and can move first.
 
-**Test relocation:** the 3,411-line test block contains tests for every layer (AST parsing, compile, apply, audit, scanner). It cannot be wholesale-moved to one location. Per layer, extract its tests into a `#[cfg(test)] mod tests` inside the new sub-module. Shared fixtures (test rule sets, sample entities, helpers) factor into `packets/test_support.rs` (gated `#[cfg(test)]`) and the per-module test blocks `use super::test_support::*`.
+**Test relocation:** the 3,443-line test block contains tests for every layer (AST parsing, compile, apply, audit, scanner). It cannot be wholesale-moved to one location. Per layer, extract its tests into a `#[cfg(test)] mod tests` inside the new sub-module. Shared fixtures (test rule sets, sample entities, helpers) factor into `packets/test_support.rs` (gated `#[cfg(test)]`) and the per-module test blocks `use super::test_support::*`.
 
 ## Proposed Structure
 
-Already-split modules (kept as-is): `src/routing.rs`, `src/webhooks.rs`, `src/pollers.rs`, `src/crons.rs`, `src/workflow/`, `src/orchestration/`, `src/index/`, `src/chunker/`, `src/council/`, `src/providers/`, `src/system_memory/`, `src/mcp_tools/` (currently holds `describe_schema.rs` + `inspect.rs` helpers).
+Already-split modules (kept as-is): `src/routing.rs`, `src/webhooks.rs`, `src/pollers.rs`, `src/crons.rs`, `src/workflow/`, `src/orchestration/`, `src/index/`, `src/chunker/`, `src/council/`, `src/providers/`, `src/system_memory/`, `src/mcp_tools/`, `src/search/`, `src/vectors/`, `src/embed/`.
 
 Net additions: `src/lib.rs`, `src/server/`, `src/tools/`, and converting `src/packets.rs` → `src/packets/` directory.
 
@@ -72,10 +74,11 @@ src/
                                 # bind axum, run.
   cli.rs                        # Unchanged ([[bin]] target for `bro`)
   irc_bridge.rs                 # Unchanged ([[bin]] target for `bro-irc`)
+  slack_bridge.rs               # Unchanged ([[bin]] target for `bro-slack`)
 
   server/                       # NEW. Owns BlackboxServer + small
                                 # subsystems. NOT a god-module — see §5
-                                # for why the 1695-4612 middle block
+                                # for why the large current main.rs blocks
                                 # splits across multiple targets.
     mod.rs                      # BlackboxServer struct + new() constructor
                                 # that sums all tools/<domain>::*_tools()
@@ -83,10 +86,14 @@ src/
                                 # tiny ServerHandler impl (7 lines, just
                                 # `get_info`) — no need for its own file.
     state.rs                    # SharedState struct + impl + build_app_state()
-                                # (extracted from main.rs lines 72-279)
+                                # (extracted from main.rs lines 89-316)
     progress.rs                 # MCP progress-token plumbing for blocking
                                 # waits — self-contained subsystem
-                                # extracted from the 1695-4612 middle block
+                                # extracted from lines 4559-4831.
+    badgey.rs                   # Badgey wrapper internals that are not
+                                # the public badgey_* tool handlers:
+                                # scope bind, post-process actions,
+                                # proposal apply/reject/dismiss, restore.
     dispatch.rs                 # Free functions: dispatch_routed_event,
                                 # validate_workflow_capabilities, related
                                 # helpers. Referenced by sibling files
@@ -94,21 +101,32 @@ src/
                                 # council/*) via crate::* — re-exported
                                 # from lib.rs for ergonomics.
     routes.rs                   # Axum HTTP route handlers (Bro roster
-                                # endpoint + admin endpoints; extracted
-                                # from main.rs lines 5430-7208).
-    tail.rs                     # SSE /tail endpoint (lines 7211-7370).
+                                # endpoint, IRC/admin/orchestrate/webhook
+                                # helpers; extracted from lines 9463-11741).
+    tail.rs                     # SSE /tail endpoint (lines 11743-11903).
                                 # Optional — fold into routes.rs if small.
 
   tools/                        # NEW. One file per tool domain.
     mod.rs                      # `pub mod` declarations + shared param
                                 # types if any
-    bbox_search.rs              # bbox_search, bbox_cite, bbox_session,
-                                # bbox_sessions_list, bbox_stats,
-                                # bbox_context, bbox_topics
+    bbox_search.rs              # bbox_search, bbox_cite, bbox_context,
+                                # bbox_session, bbox_messages, bbox_topics,
+                                # bbox_sessions_list, bbox_stats
+    bbox_graph.rs               # bbox_hybrid_search,
+                                # bbox_discover_seed_entities,
+                                # bbox_inspect_entity, bbox_describe_schema,
+                                # bbox_find_paths, bbox_bundle_evidence,
+                                # bbox_blame
+    bbox_projects.rs            # bbox_project_register,
+                                # bbox_project_rename, bbox_project_list
+    bbox_provenance.rs          # bbox_provenance_export/import
+    bbox_embeddings.rs          # bbox_reembed, bbox_embed_status
+    bbox_artifacts.rs           # bbox_artifact_install/list/supersede
     bbox_knowledge.rs           # bbox_learn, bbox_remember, bbox_decide,
                                 # bbox_knowledge, bbox_review, bbox_render,
-                                # bbox_forget, bbox_lint
-    bbox_threads.rs             # bbox_thread, bbox_thread_list, bbox_messages
+                                # bbox_knowledge_link, bbox_forget,
+                                # bbox_lint
+    bbox_threads.rs             # bbox_thread, bbox_thread_list
     bbox_notes.rs               # bbox_note, bbox_notes, bbox_note_resolve
     bbox_packets.rs             # bbox_compile, bbox_apply, bbox_audit,
                                 # bbox_packet_list, bbox_packet_events,
@@ -118,7 +136,12 @@ src/
     bbox_bootstrap.rs           # bbox_bootstrap, bbox_absorb, bbox_reindex
     bro_exec.rs                 # bro_exec, bro_resume, bro_status, bro_wait,
                                 # bro_cancel, bro_when_all, bro_when_any
-    bro_team.rs                 # bro_team, bro_broadcast, bro_dashboard
+    badgey.rs                   # badgey_exec, badgey_resume, badgey_ask,
+                                # badgey_dismiss, badgey_status, badgey_list,
+                                # badgey_scout, badgey_collect,
+                                # badgey_triage_inbox, badgey_close_loops
+    bro_team.rs                 # bro_team, bro_broadcast, bro_dashboard,
+                                # bro_brofile
     bro_webhook.rs              # bro_webhook_install, bro_webhook_list,
                                 # bro_webhook_replay, bro_webhook_deliveries
     bro_cron.rs                 # bro_cron_install, bro_cron_list,
@@ -127,7 +150,12 @@ src/
     bro_orchestrate.rs          # bro_orchestrate_run, bro_orchestrate_author,
                                 # bro_workflow_install, bro_workflow_list
     bro_arc.rs                  # bro_arc_status, bro_arc_signal,
-                                # bro_arc_cancel
+                                # bro_arc_cancel, bro_signals
+    bro_agents.rs               # bro_agent_list/get/describe/search/dispatch
+    bro_slack.rs                # bro_slack_bind
+    whiteboard.rs               # whiteboard_open/register/post/state/
+                                # annotate/vote/transition/conflicts/
+                                # summarize/archive
     bro_council.rs              # bro_council_list, bro_council_open,
                                 # bro_council_posts
     bro_mcp.rs                  # bro_mcp
@@ -149,7 +177,7 @@ src/
   webhooks.rs                   # Existing — keep as-is.
   pollers.rs                    # Existing — keep as-is.
   crons.rs                      # Existing — keep as-is.
-  mcp_tools/                    # Existing — keep as-is (helpers).
+  mcp_tools/                    # Existing — keep as-is (agentic graph helpers).
 
   workflow/                     # Existing directory — fine as-is.
   orchestration/                # Existing directory — fine as-is.
@@ -162,7 +190,8 @@ src/
   tool_docs.rs                 # ~1.3K lines — fine.
   render.rs, entity_ref.rs, util.rs, artifacts.rs, edge_index.rs,
   inbox.rs, pins.rs, projects.rs, query.rs, git.rs, mcp_client.rs,
-  embed_queue.rs, whiteboards.rs, council_tui.rs   # All existing siblings.
+  embed_queue.rs, whiteboards.rs, council_tui.rs,
+  slack_thread_store.rs, slack_channel_bindings.rs # All existing siblings.
 ```
 
 **Rename mechanics for `packets.rs` → `packets/`:**
@@ -196,9 +225,13 @@ path = "src/cli.rs"
 [[bin]]
 name = "bro-irc"
 path = "src/irc_bridge.rs"
+
+[[bin]]
+name = "bro-slack"
+path = "src/slack_bridge.rs"
 ```
 
-All three binaries depend on the lib. `src/lib.rs` declares the modules; the binaries `use blackbox::*` instead of declaring their own `mod foo;`:
+All four binaries depend on the lib. `src/lib.rs` declares the modules; the binaries `use blackbox::*` instead of declaring their own `mod foo;`:
 
 ```rust
 // src/lib.rs
@@ -225,7 +258,7 @@ This is a textual transformation, not a code move. The Rust compiler treats the 
 
 ### 2. `main.rs` shrinks to ~100 lines
 
-Only: parse CLI args, call `server::build_app_state()`, bind the axum router, spawn the MCP listener. The current 8,675 lines is everything *except* main.
+Only: initialize logging, call `server::run()` / `server::build_app_state()`, bind the axum router, spawn the MCP listener, and handle graceful shutdown. The current 17K-line file is mostly everything *except* main.
 
 ```rust
 use blackbox::server;
@@ -242,9 +275,9 @@ async fn main() {
 
 ### 3. One tool domain per file
 
-The 83 `#[tool]` handlers cluster by prefix into ~20 domain files of 150–500 lines each. (Naming note: file granularity is by *domain prefix*, not by single tool — e.g., `tools/bro_exec.rs` covers the seven `bro_exec`/`bro_resume`/`bro_status`/`bro_wait`/`bro_cancel`/`bro_when_all`/`bro_when_any` tools that share the dispatch surface.)
+The 109 named `#[tool]` handlers cluster by prefix into domain files. (Naming note: file granularity is by *domain prefix*, not by single tool — e.g., `tools/bro_exec.rs` covers `bro_exec`/`bro_resume`/`bro_status`/`bro_wait`/`bro_cancel`/`bro_when_all`/`bro_when_any`; `tools/badgey.rs` covers the Badgey consultant wrapper surface.)
 
-**rmcp macro mechanics (load-bearing):** the `#[tool_router(router = NAME)]` macro generates a router function from each annotated `impl` block. Multiple `impl` blocks can each carry their own router, and `ToolRouter<Self>` instances combine via `+`. The codebase already does this — `main.rs` has `#[tool_router(router = bbox_tools)]` at line 798 and `#[tool_router(router = bro_tools)]` at line 1922, combined as `Self::bbox_tools() + Self::bro_tools()` in the constructor.
+**rmcp macro mechanics (load-bearing):** the `#[tool_router(router = NAME)]` macro generates a router function from each annotated `impl` block. Multiple `impl` blocks can each carry their own router, and `ToolRouter<Self>` instances combine via `+`. The codebase already does this — `main.rs` has `#[tool_router(router = bbox_tools)]` at line 3216 and `#[tool_router(router = bro_tools)]` at line 4833, combined as `Self::bbox_tools() + Self::bro_tools()` in the constructor.
 
 Splitting handlers across files therefore means: each `tools/<domain>.rs` declares its own `impl BlackboxServer` block annotated with `#[tool_router(router = <domain>_tools)]`, and the constructor sums them all:
 
@@ -259,11 +292,16 @@ fn new(state: SharedState) -> Self {
             + Self::bbox_threads_tools()
             + Self::bbox_notes_tools()
             + Self::bbox_packets_tools()
+            + Self::bbox_graph_tools()
             + Self::bbox_inbox_tools()
             + Self::bbox_pins_tools()
             + Self::bbox_bootstrap_tools()
+            + Self::bbox_artifacts_tools()
             + Self::bro_exec_tools()
+            + Self::badgey_tools()
             + Self::bro_team_tools()
+            + Self::bro_agents_tools()
+            + Self::whiteboard_tools()
             // ... etc
             ,
     }
@@ -301,33 +339,42 @@ Each sub-module has a clear boundary:
 - `coerce.rs` — `coerce_stringified_params()`
 - `events.rs` — `PacketEvent`, event logging
 
-### 5. The 2,918-line middle block (1695–4612) → split by domain, NOT wholesale
+### 5. Large `main.rs` blocks → split by domain, NOT wholesale
 
-Routing is **already partly split**: `src/routing.rs`, `src/webhooks.rs`, `src/pollers.rs`, `src/crons.rs`, and `src/workflow/wait.rs` exist. The remaining concentration in `main.rs` is the lines 1695–4612 block labeled "Progress notifications".
+Routing is **already partly split**: `src/routing.rs`, `src/webhooks.rs`, `src/pollers.rs`, `src/crons.rs`, and `src/workflow/wait.rs` exist. The remaining concentration in `main.rs` is spread across the `BlackboxServer` helper block, the two rmcp tool-router impl blocks, HTTP route helpers, bootstrap, and tests.
 
-The label undersells what's there. The block is *not* a single coherent dispatch concern — it includes:
+The old "progress notifications" label no longer describes the real concentration. Today the large blocks are:
+
+- `BlackboxServer` helpers + Badgey internals (lines 318–3184)
+- `bbox_tools` router impl (lines 3216–4051)
+- `bro_tools` router impl (lines 4833–8637)
+- HTTP/admin/orchestrate/webhook route helpers (lines 9463–11741)
+- bottom test module (lines 12594–17127)
+
+They are not one coherent dispatch concern. They include:
 - MCP progress-token plumbing for blocking waits
-- bro tool handlers (some that didn't end up under the `bro_tools` impl block at 1384–1692)
-- whiteboard tool handlers
+- bro and Badgey tool handlers
+- whiteboard, council, agent-manifest, Slack binding, workflow, webhook, poller, cron, and arc-signal tool handlers
 - workflow validation params + helpers
-- parser helpers
+- parser / workflow authoring helpers
 - `dispatch_routed_event` and `validate_workflow_capabilities` (load-bearing free functions referenced from siblings: `crons.rs`, `pollers.rs`, `workflow/engine.rs`, `council/*` all `use crate::dispatch_routed_event`).
 
 Wholesale extraction to one `server/dispatch.rs` would create a new god-file and conflict with the per-domain `tools/*` extraction in §3.
 
 **Correct split**: address subranges separately by what they actually are.
 
-- **bro / whiteboard tool handlers in this block** → move to the appropriate `tools/<domain>.rs` files in step 3 of the migration path. They join the existing `bro_tools` and (new) `whiteboard_tools` `#[tool_router]` impls.
+- **Tool handlers** → move to the appropriate `tools/<domain>.rs` files in step 3 of the migration path. Split `bbox_*`, `bro_*`, `badgey_*`, `whiteboard_*`, and `bro_agent_*` surfaces into separate `#[tool_router]` impls.
 - **Progress-token plumbing** → `src/server/progress.rs`. This is a self-contained subsystem (channels + correlation + token lifecycle).
+- **Badgey wrapper internals** → `src/server/badgey.rs` (or `src/orchestration/badgey/wrapper.rs` if the dependency direction is cleaned up first). Keep public `badgey_*` handlers in `tools/badgey.rs`.
 - **`dispatch_routed_event` + `validate_workflow_capabilities` + related free functions** → `src/server/dispatch.rs`. These are referenced from siblings via `crate::dispatch_routed_event`; once the lib reparenting (migration step 1) is done, those references resolve via `crate::server::dispatch::dispatch_routed_event` (re-exportable via `pub use` in lib.rs for ergonomics).
 - **Workflow / parser helpers** → relocate to `workflow/` and `parser/` (or alongside `parser.rs` as a module split) where they actually belong.
-- **HTTP route handlers** at 5430–7208 → `src/server/routes.rs` (already called out in §17 corrected breakdown).
+- **HTTP route handlers** at 9463–11741 → `src/server/routes.rs` / `src/server/admin.rs` / `src/server/orchestrate.rs` depending on the extracted size.
 
-Split *during* the per-domain tools extraction (step 3 of the migration path), not as a separate phase. This avoids the trap of extracting a 2,918-line god-file, then re-splitting it.
+Split *during* the per-domain tools extraction (step 3 of the migration path), not as a separate phase. This avoids the trap of extracting a new god-file, then re-splitting it.
 
 ### 6. Tests relocate
 
-The 1,471-line `#[cfg(test)]` block at the bottom of `main.rs` splits:
+The 4,534-line `#[cfg(test)]` block at the bottom of `main.rs` splits:
 - Unit tests → `#[cfg(test)] mod tests` inside their now-small domain files
 - Integration tests → `tests/` directory, using `blackbox::` imports from the new lib
 
@@ -335,13 +382,13 @@ The 1,471-line `#[cfg(test)]` block at the bottom of `main.rs` splits:
 
 | Concern | Before | After |
 |---------|--------|-------|
-| Incremental review surface | 400-line diff in 8.8K-line file | 400-line diff in 400-line file |
+| Incremental review surface | 400-line diff in 17K-line file | 400-line diff in 400-line file |
 | IDE navigation | `main.rs:5252` is meaningless | `tools/bbox_search.rs:47` is self-locating |
-| `bro` / `bro-irc` reuse target | Each duplicates DTOs as ad-hoc serde structs | Shared `blackbox` crate types: tool param/response DTOs, `EntityRef`, `AgentSession`, etc. (Note: `bro` and `bro-irc` are HTTP/SSE clients today; direct daemon-state access stays out of reach since shared state is daemon-owned. The reuse target is shared types and small helpers, not direct call-through.) |
+| `bro` / `bro-irc` / `bro-slack` reuse target | Each duplicates DTOs as ad-hoc serde structs | Shared `blackbox` crate types: tool param/response DTOs, `EntityRef`, `AgentSession`, Slack binding DTOs, etc. (Note: sidecars are HTTP/SSE clients today; direct daemon-state access stays out of reach since shared state is daemon-owned. The reuse target is shared types and small helpers, not direct call-through.) |
 | Integration testing | Impossible without full binary | `tests/` directory with `use blackbox::*` reaches lib API |
-| Parallel crate compilation | None (single binary crate) | lib + 3 bins can compile in parallel; bins link against the lib unit |
-| New contributor orientation | Read 8.8K lines to find anything | File names match domain names |
-| Compile-time impact | Single 8.8K compilation unit | Smaller compilation units, but rmcp's `#[tool_router]` and `#[tool_handler]` macro expansions still require the enclosing crate-unit's typecheck. The expected gain is *incremental locality* (rust-analyzer responsiveness, smaller blast radius for typo-fix rebuilds), not a per-file recompile model. |
+| Parallel crate compilation | None (single binary crate) | lib + 4 bins can compile in parallel; bins link against the lib unit |
+| New contributor orientation | Read 17K lines to find anything | File names match domain names |
+| Compile-time impact | Single 17K compilation unit | Smaller compilation units, but rmcp's `#[tool_router]` and `#[tool_handler]` macro expansions still require the enclosing crate-unit's typecheck. The expected gain is *incremental locality* (rust-analyzer responsiveness, smaller blast radius for typo-fix rebuilds), not a per-file recompile model. |
 
 ## Migration Path
 
@@ -349,7 +396,7 @@ Each step is `cargo build && cargo test`-verified; no step is allowed to leave t
 
 **Two structural constraints shape the migration order:**
 
-1. **Rust orphan rule on inherent impls.** Once `BlackboxServer` lives in the lib crate, the binary crate cannot add `impl BlackboxServer { ... }` blocks. The 83-tool concentration on `BlackboxServer` therefore must move to the lib crate at the same time as the type itself, OR all `#[tool_router(...)]` impl blocks must be relocated to lib-owned files first while `BlackboxServer` is still in main.rs (the impl-then-type order).
+1. **Rust orphan rule on inherent impls.** Once `BlackboxServer` lives in the lib crate, the binary crate cannot add `impl BlackboxServer { ... }` blocks. The 109-tool concentration on `BlackboxServer` therefore must move to the lib crate at the same time as the type itself, OR all `#[tool_router(...)]` impl blocks must be relocated to lib-owned files first while `BlackboxServer` is still in main.rs (the impl-then-type order).
 2. **Sibling cross-references.** Files like `crons.rs`, `pollers.rs`, `workflow/engine.rs`, `council/*` reference symbols inline in `main.rs` — `crate::SharedState`, `crate::BlackboxServer`, `crate::dispatch_routed_event`, `crate::validate_workflow_capabilities`. Once a sibling becomes lib-owned (`pub mod foo;` in lib.rs), its `crate::*` references resolve against the LIB crate. Those symbols must therefore exist in the lib at that moment, not still-inline in the binary.
 
 The combined constraint: **either reparent everything from binary to lib in one mechanical step, then split within the lib, OR leave shared symbols (SharedState, BlackboxServer, dispatch_routed_event, etc.) inline in main.rs and don't move sibling `mod` declarations until they're extracted.**
@@ -359,7 +406,7 @@ This skeleton picks the first path — one upfront reparenting, then incremental
 1. **Reparent the crate from binary-owned to lib-owned (the one big-but-mechanical move).**
    - Add the `[lib]` stanza to `Cargo.toml`.
    - Create `src/lib.rs`. Transfer EVERY `mod foo;` declaration from `main.rs` to `lib.rs`, declared as `pub mod foo;`.
-   - Move ALL inline content from `main.rs` into the lib: `SharedState` struct, `BlackboxServer` struct + every `impl BlackboxServer { ... }` block (the two big `#[tool_router]` blocks at 798/1922, the helpers block at 4615, the ServerHandler impl at 5418, the HTTP route handlers at 5430), the progress-token plumbing, the dispatch free functions (`dispatch_routed_event`, `validate_workflow_capabilities`), the Tail SSE endpoint. Drop them all into a single new `src/server/mod.rs` for now (a temporary god-module within the lib — to be split in subsequent steps).
+   - Move ALL inline content from `main.rs` into the lib: `SharedState` struct, `BlackboxServer` struct + every `impl BlackboxServer { ... }` block (the two big `#[tool_router]` blocks at 3216/4833, the helper blocks, the Badgey wrapper internals, the ServerHandler impl at 9455, the HTTP route handlers at 9463), the progress-token plumbing, the dispatch free functions (`dispatch_routed_event`, `validate_workflow_capabilities`), the Tail SSE endpoint. Drop them all into a single new `src/server/mod.rs` for now (a temporary god-module within the lib — to be split in subsequent steps).
    - `main.rs` shrinks to: `use blackbox::server; #[tokio::main] async fn main() { server::run().await }` plus a `pub async fn run()` in `lib::server` that does the bootstrap (existing main body).
    - **Sibling `crate::SharedState` etc. references now resolve correctly** because the symbols are in the lib crate.
    - `cargo build && cargo test`. This is one large commit because it's an atomic ownership transfer; subsequent steps are small and incremental.
@@ -370,7 +417,7 @@ This skeleton picks the first path — one upfront reparenting, then incremental
    - `cargo test`.
 
 3. **Extract progress-token plumbing into `src/server/progress.rs`.**
-   - Self-contained subsystem; pulls cleanly out of the 1695–4612 middle block.
+   - Self-contained subsystem; pulls cleanly out of the current 4559–4831 block.
    - Add `pub mod progress;` in `server/mod.rs`.
    - `cargo test`.
 
@@ -380,10 +427,10 @@ This skeleton picks the first path — one upfront reparenting, then incremental
    - Update `BlackboxServer::new` (in `server/mod.rs`) to add `+ Self::<domain>_tools()` to the router sum.
    - `cargo test`.
    - The orphan rule is fine here: `BlackboxServer` and the impl block both live in the lib crate, just in different modules of the same crate.
-   - When all 83 handlers are moved, the two original `#[tool_router]` blocks in `server/mod.rs` (relocated from main.rs in step 1) are empty and can be deleted.
+   - When all 109 handlers are moved, the two original `#[tool_router]` blocks in `server/mod.rs` (relocated from main.rs in step 1) are empty and can be deleted.
 
-5. **Extract HTTP route handlers (lines 5430–7208 from the original main.rs, now in `server/mod.rs`) into `src/server/routes.rs`.**
-   - Bro roster endpoint + admin endpoints.
+5. **Extract HTTP route handlers (lines 9463–11741 from the original main.rs, now in `server/mod.rs`) into `src/server/routes.rs` / `src/server/admin.rs` / `src/server/orchestrate.rs`.**
+   - Bro roster endpoint, IRC bridge endpoints, admin endpoints, orchestrate endpoints, webhook/replay endpoints.
    - `cargo test`.
 
 6. **Extract Tail SSE into `src/server/tail.rs` (or fold into `routes.rs`).**
