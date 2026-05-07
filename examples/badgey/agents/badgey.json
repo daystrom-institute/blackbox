@@ -1,18 +1,25 @@
 {
   "kind": "agent",
   "name": "badgey",
-  "version": 1,
+  "version": 3,
   "manifest": {
-    "description": "Long-lived agentic-corpus consultant that answers, teaches, scouts, and proposes durable workflow, packet, brofile, lens, and agent artifacts from corpus evidence.",
+    "description": "Long-lived corpus consultant that traces provenance and decision history across the typed entity graph, walks DERIVED_FROM and SUPERSEDES chains to explain why and where things came from, investigates threads, sessions, knowledge, commits, and tool-call traces, and distills recurring transcript patterns into proposed durable artifacts (knowledge, brofiles, packets, workflows, lenses, agents) — every claim cited against round-trippable entity refs.",
     "when_to_use": [
-      "when a caller needs help navigating the agentic corpus with evidence bundles",
-      "when a caller wants a teach-mode walkthrough of seed, inspect, traverse, and bundle",
-      "when recurring transcript patterns should become proposed knowledge, brofiles, packets, workflows, or agents"
+      "tell me about this — provide an evidence-cited overview of any entity, decision, file, commit, or topic by walking the connected graph",
+      "trace the provenance, history, or rationale of a decision, commit, file, design, or claim — explain why it exists and where it came from",
+      "investigate which threads, sessions, knowledge entries, or notes are connected to a topic — show the chain, not the assertion",
+      "audit whether a claim is supported by the corpus — verify it, surface contradictions, walk supersession chains, identify stale or superseded knowledge",
+      "compare alternative paths, designs, or decisions and surface the grounded reasoning rather than a hand-wavy summary",
+      "where did this code, decision, configuration, or claim come from — find the originating session, thread, commit, or knowledge entry that produced it",
+      "distill recurring transcript patterns into a proposed reusable workflow, packet, brofile, lens, agent, or knowledge entry with the supporting evidence bundle attached",
+      "navigate the agentic corpus graph (seed via hybrid_search, inspect entities, find_paths, bundle evidence) when a single bbox_* call is not enough",
+      "teach mode: walk a caller through the seed → inspect → traverse → bundle loop on their own corpus and end with next_time_skip_badgey_when"
     ],
     "anti_patterns": [
-      "do not use for a direct bbox_* lookup the caller already knows how to perform",
-      "do not use for one-off implementation tasks that do not need corpus navigation",
-      "do not use to apply proposals without explicit user approval"
+      "do not use for one-off code generation, edits, refactors, or bug fixes — 'write me a function', 'give me the code', 'implement this', 'fix this' — none require corpus evidence",
+      "do not use for direct bbox_* primitive lookups the caller can run themselves — 'just call bbox_search for X', 'run bbox_inspect_entity on Y', 'list the threads'",
+      "do not auto-apply Badgey-proposed artifacts — application requires explicit user approval each turn, and the apply path runs through the wrapper, not Badgey directly",
+      "do not use as a write-through proxy for bbox_remember, bbox_decide, or bbox_learn — those are direct knowledge-store surfaces; Badgey synthesizes evidence-grounded proposals, it is not a CRUD shim"
     ],
     "brofile_ref": "badgey-persona",
     "filter_overlay": {
@@ -22,9 +29,9 @@
       "schema": {
         "type": "object",
         "properties": {
-          "prompt": { "type": "string" },
-          "badgey_id": { "type": "string" },
-          "mode": { "enum": ["answer", "teach", "scout"] }
+          "prompt": {"type": "string"},
+          "badgey_id": {"type": "string"},
+          "mode": {"enum": ["answer", "teach", "scout"]}
         }
       },
       "prompt_template": "{{prompt}}"
@@ -33,13 +40,13 @@
       "schema": {
         "type": "object",
         "properties": {
-          "badgey_id": { "type": "string" },
-          "session_id": { "type": "string" },
-          "mode": { "enum": ["answer", "teach", "scout"] },
-          "entity_refs": { "type": "array", "items": { "type": "string" } },
-          "path_ids": { "type": "array", "items": { "type": "string" } },
-          "proposals": { "type": "array", "items": { "type": "string" } },
-          "degraded": { "type": "object" }
+          "badgey_id": {"type": "string"},
+          "session_id": {"type": "string"},
+          "mode": {"enum": ["answer", "teach", "scout"]},
+          "entity_refs": {"type": "array", "items": {"type": "string"}},
+          "path_ids": {"type": "array", "items": {"type": "string"}},
+          "proposals": {"type": "array", "items": {"type": "string"}},
+          "degraded": {"type": "object"}
         }
       },
       "evidence_density": "high"
