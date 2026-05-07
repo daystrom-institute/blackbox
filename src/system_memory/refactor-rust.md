@@ -15,6 +15,9 @@ Rust is the first writable backend.
   `bbox_refactor_plan(kind="add_rust_mod_decl")` and
   `bbox_refactor_plan(kind="add_rust_use_decl")`.
 - Apply: supported with `bbox_refactor_apply(confirm=true)`.
+- Compound run: supported with `bbox_refactor_run(confirm=true)` for ordered
+  primitive plans, with rollback across primitive-plan file writes if a later
+  plan step fails.
 - Semantic rename: not supported by blackbox yet; use rust-analyzer, compiler
   feedback, or manual edits after inspection.
 - Import repair: not automatic; use `cargo fmt`, `cargo check`, `cargo clippy`,
@@ -39,6 +42,14 @@ Writable plan kinds:
   declarations. Optional `visibility` supports `pub` and `pub(crate)`.
 - `add_rust_use_decl`: add `use <use_path>;`, `pub use <use_path>;`, or
   `pub(crate) use <use_path>;` after existing top-level use declarations.
+
+Compound run steps:
+
+- `{"op":"plan", ...}`: accepts the same arguments as `bbox_refactor_plan`.
+  If `project_dir` is omitted in the step, the run-level `project_dir` is used.
+
+Run Rust validation commands outside `bbox_refactor_run` until a separate
+generic validation/profile surface exists.
 
 Supported top-level item kinds include:
 

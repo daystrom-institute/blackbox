@@ -3589,7 +3589,7 @@ use packets::{
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
     PacketListParams,
 };
-use refactor::{RefactorApplyParams, RefactorPlanParams, RefactorStatusParams};
+use refactor::{RefactorApplyParams, RefactorPlanParams, RefactorRunParams, RefactorStatusParams};
 use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
@@ -3993,6 +3993,17 @@ impl BlackboxServer {
         Self::run("bbox_refactor_apply", || {
             let projects = self.state.projects.read().list();
             refactor::apply(&p, &projects)
+        })
+    }
+
+    #[tool(
+        name = "bbox_refactor_run",
+        description = "Compose primitive refactor plans into one transactional run with rollback across touched files."
+    )]
+    fn bbox_refactor_run(&self, Parameters(p): Parameters<RefactorRunParams>) -> CallToolResult {
+        Self::run("bbox_refactor_run", || {
+            let projects = self.state.projects.read().list();
+            refactor::run(&p, &projects)
         })
     }
 

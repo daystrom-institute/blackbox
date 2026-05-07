@@ -320,6 +320,13 @@ bbox_refactor_plan(kind="add_rust_use_decl", source="src/lib.rs", use_path="serv
         when_to_use: "Use only after reviewing a bbox_refactor_plan result. Requires confirm=true; refuses stale file hashes and validates rewritten Rust before writing. Paths must live under registered projects unless allow_unregistered_paths=true is explicitly set for a disposable practice worktree or isolated smoke test.",
         example: Some(r#"bbox_refactor_apply(plan=<plan-json>, confirm=true, allow_unregistered_paths=true)"#),
     },
+    ToolDoc {
+        name: "bbox_refactor_run",
+        category: ToolCategory::Refactor,
+        summary: "Compose primitive refactor plans into one transactional run with rollback across touched files.",
+        when_to_use: "Use when a restructuring move needs several bbox_refactor_plan primitives to succeed or fail together, such as extract handlers, add a module declaration, then wire a router sum. V1 executes primitive plan steps sequentially against the live projected state when confirm=true, snapshots touched files before first write, rejects initially dirty files unless allow_dirty_worktree=true, and rolls back primitive-plan writes if any later plan step fails. Language-specific validation commands belong in language memories or a separate validation surface, not in this generic runner.",
+        example: Some(r#"bbox_refactor_run(title="extract refactor tools", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"extract_rust_impl_methods","source":"src/main.rs","target":"src/refactor_tools.rs","item_names":["bbox_refactor_status"],"item_kinds":["impl_method"],"impl_name":"impl BlackboxServer","router_name":"refactor_tools","router_export_name":"router","target_prelude":"use super::*;"},{"op":"plan","kind":"add_rust_mod_decl","source":"src/main.rs","module_name":"refactor_tools"}])"#),
+    },
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_learn",

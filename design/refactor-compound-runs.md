@@ -58,18 +58,15 @@ bbox_refactor_run(
       "kind": "add_rust_router_to_sum",
       "source": "src/main.rs",
       "router_call": "refactor_tools::router()"
-    },
-    { "op": "command", "argv": ["cargo", "fmt", "--all"] },
-    { "op": "command", "argv": ["cargo", "check", "--package", "my-crate"] }
+    }
   ]
 )
 ```
 
 Recommendation: make this a separate MCP surface, not another
-`bbox_refactor_plan(kind=...)` variant. Compound runs have lifecycle, command
-execution, resumability, and diagnostics that are different from a single
-primitive plan. Keep primitive plans small and pure; let the runner compose
-them.
+`bbox_refactor_plan(kind=...)` variant. Compound runs have lifecycle,
+resumability, and diagnostics that are different from a single primitive plan.
+Keep primitive plans small and pure; let the runner compose them.
 
 This is about tool shape, not exposure policy. Tool exposure should follow the
 planned MCP-surfaces model: the daemon can expose `bbox_refactor_run*` only on
@@ -87,7 +84,7 @@ Initial tools:
 
 The runner should not replace primitive plans. It should compose them and
 preserve each step's reviewability. The output is a compound plan with step
-metadata, merged file edits, validation commands, expected touched files, and a
+metadata, merged file edits, expected touched files, rollback scope, and a
 diagnostic trail.
 
 ## Execution Model
@@ -96,8 +93,8 @@ diagnostic trail.
 
 - `dry_run=true`: generate every planned edit against an in-memory projected
   filesystem, do not write files, and report the merged plan.
-- `confirm=true`: apply the whole run transactionally, run validations, and
-  rollback all touched files if a required validation fails.
+- `confirm=true`: apply the whole run transactionally and rollback all touched
+  files if a required step fails.
 
 The projected filesystem matters. Step 2 must plan against the result of step 1,
 not against stale disk. Without projection, multi-step runs force callers to
@@ -153,8 +150,8 @@ struct RefactorRunPlan {
 ```
 
 The first implementation can be strict: all primitive plans must be Rust plans,
-commands must be allowlisted, and all writes must remain under either registered
-projects or `allow_unregistered_paths=true` practice roots.
+and all writes must remain under either registered projects or
+`allow_unregistered_paths=true` practice roots.
 
 ## Transaction Semantics
 
@@ -164,15 +161,14 @@ default:
 1. Build phase:
    - resolve all paths
    - create a sibling or `/tmp` git worktree from the starting commit
-   - set `CARGO_TARGET_DIR` to a shared cache directory
    - generate primitive plans against a projected filesystem
    - apply each step sequentially inside the temporary worktree
    - reject overlapping edits within each step
    - record original hashes
 
 2. Apply phase:
-   - run parse validation, formatters, compiler checks, tests, LSP actions, and
-     import repair inside the temporary worktree
+   - run parse validation and any generic validation/profile steps attached by
+     future surfaces inside the temporary worktree
    - if any required gate fails, delete the temporary worktree and return the
      structured failure
    - if all gates pass, compute the validated diff from the temporary worktree
@@ -182,22 +178,16 @@ default:
 
 This makes rollback mostly mechanical: failed runs delete the temporary
 worktree, and the live tree is not mutated until a validated final diff exists.
-It also gives cargo, rust-analyzer, formatters, and import fixers a real
-filesystem instead of a partial in-memory projection.
+It also gives language servers, formatters, compilers, and import fixers a real
+filesystem instead of a partial in-memory projection when those generic
+validation/profile surfaces exist.
 
-Commands like `cargo fmt` mutate files. In temporary-worktree mode, command
-mutations become part of the final validated diff. In in-place fallback mode,
-the runner must snapshot every file that a command may mutate. That fallback can
-require `command.touches` for commands that write:
-
-```json
-{ "op": "command", "argv": ["cargo", "fmt", "--all"], "touches": ["src/**/*.rs"] }
-```
-
-If `touches` is omitted in in-place mode, a command is read-only by contract.
-Violations are detected by checking dirty files before and after the command and
-treated as a failed validation. Glob expansion must be capped and fail closed if
-the touched set is too large.
+Command execution should not be hardcoded into the generic compound runner.
+Language memories can describe Rust `cargo`, TypeScript `npm`/`tsc`, C#
+`dotnet`, Go `go test`, and similar validation profiles, but the generic runner
+should only know how to compose refactor steps and transaction boundaries. A
+future validation surface can attach command/profile steps with declared
+read/write sets.
 
 Compound runs do not commit. They leave a validated worktree diff for the user
 or orchestrator to commit at an explicit milestone.
@@ -358,34 +348,24 @@ The first useful version does not need LSP. It should implement:
 
 - `bbox_refactor_run` with `dry_run`, `confirm`, `allow_dirty_worktree`, and
   `allow_unregistered_paths`
-- primitive-plan steps for existing Rust plan kinds
+- primitive-plan steps for existing plan kinds
 - projected filesystem planning
 - sequential per-step edit composition
-- command steps for allowlisted command shapes:
-  - `cargo fmt` with formatting-only flags
-  - `cargo check` with project-scoped package/target flags
-  - `cargo test` with project-scoped package/target/filter flags
-  - `cargo clippy` with project-scoped package/target flags
-  - no `--manifest-path` outside `project_dir`
-  - no shell invocation; argv is structured, not a string
 - temporary-worktree execution and validated diff replay
-- structured command failure capture
 - no resume yet
 - no diagnostic-to-repair suggestions yet
 
-Repo-specific invocations such as `cargo test --bin blackboxd` are practice-run
-examples, not hardcoded allowlist entries.
-
 The benchmark fixtures for compound runs should be scenarios, not isolated
-single-op tests. A useful fixture exercises at least two primitive plan steps
-plus one validation command so projection, sequential edit composition, and
-rollback all have something real to prove.
+single-op tests. A useful fixture exercises at least two primitive plan steps so
+projection, sequential edit composition, and rollback all have something real to
+prove.
 
 Then add:
 
+- generic validation/profile surface with declared read/write sets
 - rust-analyzer-backed `lsp_rename`
 - rust-analyzer-backed import repair
-- cargo diagnostic parsing into structured diagnostics
+- language-specific diagnostic parsing into structured diagnostics
 
 ## Open Questions
 

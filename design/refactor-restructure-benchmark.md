@@ -26,13 +26,13 @@ file names or tool prefixes, it does not count.
 |---|---|---|---|
 | Add `[lib]` target to `Cargo.toml` | TOML table insertion/update with idempotent key checks | none | `edit_toml_manifest` or generic structured-config edit |
 | Create `src/lib.rs` from `mod` declarations in `main.rs` | extract/copy module declarations; transform copied declarations to `pub mod`; create file | partial: `add_rust_mod_decl` can create new declarations with visibility | batch module-declaration extraction/copy; existing declaration visibility rewrite |
-| Delete `mod foo;` from `main.rs` after lib reparent | syntactic deletion of selected top-level `mod_item`s | covered with `delete_rust_items` | compound transaction integration |
+| Delete `mod foo;` from `main.rs` after lib reparent | syntactic deletion of selected top-level `mod_item`s | covered with `delete_rust_items`; can participate in `bbox_refactor_run` | none for top-level declarations |
 | Rewrite binary crate references from `crate::foo` to `blackbox::foo` where needed | semantic path rewrite across crate boundary | none | rust-analyzer/workspace reference rewrite plus compiler diagnostics |
 | Move inline `SharedState`, `BlackboxServer`, impls, routes, tests to `server/mod.rs` | top-level item extraction; impl extraction; route/helper extraction; test block extraction | partial: top-level + impl method extraction | nested module/test extraction, multi-item grouping, visibility/import repair |
 | Shrink `main.rs` to bootstrap only | create replacement file from selected retained functions/imports | none | file rewrite plan from template + import pruning |
 | Split one tool domain per `tools/<domain>.rs` | extract selected `#[tool]` impl methods; create router helper; add module decl; wire router sum | strong for current Rust tool pattern | compound run wrapper; grouping by attribute/name prefix |
 | Move parameter structs with tool handlers | extract top-level structs near selected methods by type usage | partial: top-level item extraction by exact names | symbol dependency discovery from method signatures |
-| Update `BlackboxServer::new` router sum | insert router call into `tool_router:` field initializer | covered | needs compound transaction integration |
+| Update `BlackboxServer::new` router sum | insert router call into `tool_router:` field initializer | covered; can participate in `bbox_refactor_run` | none for existing router-sum shape |
 | Move file-local helper functions with a domain | dependency closure over selected handlers | none | call graph / reference extraction via rust-analyzer |
 | Move per-domain tests next to code | test discovery and relocation | none | test-to-symbol association and nested `#[cfg(test)]` module editing |
 | Convert `src/packets.rs` to `src/packets/mod.rs` | git/file move; update module layout; preserve module identity | none | transactional file move/rename op |
@@ -41,8 +41,8 @@ file names or tool prefixes, it does not count.
 | Re-export moved symbols for compatibility | add `pub use` statements | covered with `add_rust_use_decl` | semantic choice of re-export path still manual/LSP-assisted |
 | Split HTTP routes into route modules | extract functions/structs + update route builder references | partial for top-level functions | reference rewrite, import repair, path update |
 | Move free functions referenced from siblings | extract functions and update `crate::...` paths or add re-exports | partial for extraction | LSP find refs/rename; `pub use` insertion |
-| Run format/check/test after every step | command validation in transaction | none in MCP surface | compound run command steps |
-| Rollback across multi-step refactor | transaction across several primitive plans + commands | apply is per-plan transactional | compound run transaction |
+| Run format/check/test after every step | command validation in transaction | none in generic MCP surface | generic validation/profile surface; language memories can name cargo/npm/dotnet/etc. commands |
+| Rollback across multi-step refactor | transaction across several primitive plans + validations | partial: `bbox_refactor_run` snapshots primitive-plan file writes and rolls back on required plan-step failure | temp-worktree validated diff mode; validation-step integration |
 | Optimize imports after moves | semantic import organize/prune | none | rust-analyzer organize imports / code actions |
 | Symbolic rename/reference rewrite | workspace-safe semantic rename | none | LSP-backed `lsp_rename` |
 
@@ -95,9 +95,16 @@ file names or tool prefixes, it does not count.
   - structured TOML edits for `[lib]`, `[[bin]]`, dependencies, workspace
     members
 - `compound_run`
-  - compose primitive plans, command validations, LSP steps, and rollback
+  - compose primitive plans and rollback
+  - V1 implemented as `bbox_refactor_run` for primitive plans, with live
+    sequential planning and rollback across primitive-plan file writes
+  - validation and LSP steps should attach through generic extension points,
+    not Rust-specific command handling
 - `command_validation`
-  - allowlisted commands with declared mutating globs
+  - future generic validation/profile surface
+  - language memories should provide profile details for cargo, npm, dotnet,
+    go, pytest, etc.
+  - declared mutating globs remain future work
 - `diagnostic_parse`
   - parse cargo/rustc diagnostics into structured file/range/code messages
 
@@ -105,9 +112,10 @@ file names or tool prefixes, it does not count.
 
 1. **Compound run MVP**
    - compose existing Rust primitive plans
-   - projected filesystem planning
-   - command gates for `cargo fmt`, `cargo check`, `cargo test`
-   - rollback across all touched files
+   - live sequential planning against the written result of prior steps
+   - rollback across primitive-plan touched files
+   - future: generic validation profiles, temp-worktree projection, mutating
+     formatter capture, LSP steps
 
 2. **Deletion and declaration batching**
    - `delete_rust_items` for top-level items and impl methods is covered

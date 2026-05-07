@@ -34,7 +34,7 @@ pub struct RefactorStatusParams {
     pub include_attributes: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
     /// Plan kind. Supports Rust extraction, deletion, declaration insertion,
     /// and router-sum updates.
@@ -98,6 +98,34 @@ pub struct RefactorApplyParams {
     /// Use true only for disposable practice worktrees or isolated smoke tests.
     #[serde(default)]
     pub allow_unregistered_paths: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RefactorRunParams {
+    /// Human-readable compound run title.
+    pub title: String,
+    /// Project root used for relative paths.
+    pub project_dir: String,
+    /// Ordered primitive-plan steps.
+    pub steps: Vec<RefactorRunStep>,
+    /// Must be true to write files. Otherwise returns a plan-only report.
+    #[serde(default)]
+    pub confirm: Option<bool>,
+    /// Default false. When false, refuses initially dirty files touched by primitive plans.
+    #[serde(default)]
+    pub allow_dirty_worktree: Option<bool>,
+    /// Default false. When false, refuses paths outside registered projects.
+    #[serde(default)]
+    pub allow_unregistered_paths: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RefactorRunStep {
+    Plan {
+        #[serde(flatten)]
+        params: RefactorPlanParams,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -195,6 +223,37 @@ pub struct RefactorApplyResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RefactorRunResponse {
+    pub status: String,
+    pub title: String,
+    pub dry_run: bool,
+    pub steps: Vec<RefactorRunStepReport>,
+    pub files_written: Vec<String>,
+    pub rolled_back: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollback_errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RefactorRunStepReport {
+    pub index: usize,
+    pub op: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validations: Vec<ParseValidationResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ParseValidationResult {
     pub path: String,
     pub has_error: bool,
@@ -390,6 +449,231 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
         error: None,
         rollback_errors: Vec::new(),
     })?)
+}
+
+pub fn run(p: &RefactorRunParams, projects: &[ProjectRecord]) -> Result<String> {
+    let project_dir = resolve_path(None, &p.project_dir)?;
+    if !project_dir.is_dir() {
+        bail!(
+            "project_dir must be an existing directory: {}",
+            project_dir.display()
+        );
+    }
+    let confirmed = p.confirm == Some(true);
+    let mut snapshots: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let mut snapshot_paths: HashSet<PathBuf> = HashSet::new();
+    let mut reports = Vec::new();
+    let mut files_written = Vec::new();
+
+    for (idx, step) in p.steps.iter().enumerate() {
+        match step {
+            RefactorRunStep::Plan { params } => {
+                let mut step_params = params.clone();
+                if step_params.project_dir.is_none() {
+                    step_params.project_dir = Some(path_string(&project_dir));
+                }
+                let plan_text = match plan(&step_params) {
+                    Ok(plan_text) => plan_text,
+                    Err(err) => {
+                        let rollback_errors = restore_snapshots(&snapshots);
+                        return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                            status: "step_failed".to_string(),
+                            title: p.title.clone(),
+                            dry_run: !confirmed,
+                            steps: append_report(
+                                reports,
+                                RefactorRunStepReport {
+                                    index: idx,
+                                    op: "plan".to_string(),
+                                    status: "plan_failed".to_string(),
+                                    kind: Some(step_params.kind),
+                                    title: None,
+                                    files: Vec::new(),
+                                    validations: Vec::new(),
+                                    error: Some(err.to_string()),
+                                },
+                            ),
+                            files_written,
+                            rolled_back: rollback_errors.is_empty(),
+                            error: Some(err.to_string()),
+                            rollback_errors,
+                        })?);
+                    }
+                };
+                let plan_value: serde_json::Value = serde_json::from_str(&plan_text)?;
+                let refactor_plan: RefactorPlan = serde_json::from_value(plan_value.clone())?;
+                validate_plan_shape(&refactor_plan)?;
+                let step_files = refactor_plan
+                    .edits
+                    .iter()
+                    .map(|edit| edit.path.clone())
+                    .collect::<Vec<_>>();
+
+                if confirmed {
+                    for edit in &refactor_plan.edits {
+                        let path = PathBuf::from(&edit.path);
+                        if p.allow_unregistered_paths != Some(true) {
+                            if let Err(err) = ensure_path_in_registered_project(&path, projects) {
+                                let rollback_errors = restore_snapshots(&snapshots);
+                                return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                                    status: "step_failed".to_string(),
+                                    title: p.title.clone(),
+                                    dry_run: false,
+                                    steps: reports,
+                                    files_written,
+                                    rolled_back: rollback_errors.is_empty(),
+                                    error: Some(err.to_string()),
+                                    rollback_errors,
+                                })?);
+                            }
+                        }
+                        if !snapshot_paths.contains(&path) {
+                            if p.allow_dirty_worktree != Some(true) {
+                                if let Err(err) = ensure_git_clean_for_path(&path) {
+                                    let rollback_errors = restore_snapshots(&snapshots);
+                                    return Ok(serde_json::to_string_pretty(
+                                        &RefactorRunResponse {
+                                            status: "step_failed".to_string(),
+                                            title: p.title.clone(),
+                                            dry_run: false,
+                                            steps: reports,
+                                            files_written,
+                                            rolled_back: rollback_errors.is_empty(),
+                                            error: Some(err.to_string()),
+                                            rollback_errors,
+                                        },
+                                    )?);
+                                }
+                            }
+                            let original = match fs::read(&path) {
+                                Ok(bytes) => Some(bytes),
+                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                                Err(err) => {
+                                    let rollback_errors = restore_snapshots(&snapshots);
+                                    return Ok(serde_json::to_string_pretty(
+                                        &RefactorRunResponse {
+                                            status: "step_failed".to_string(),
+                                            title: p.title.clone(),
+                                            dry_run: false,
+                                            steps: reports,
+                                            files_written,
+                                            rolled_back: rollback_errors.is_empty(),
+                                            error: Some(format!(
+                                                "failed to read {}: {err}",
+                                                path.display()
+                                            )),
+                                            rollback_errors,
+                                        },
+                                    )?);
+                                }
+                            };
+                            snapshot_paths.insert(path.clone());
+                            snapshots.push((path, original));
+                        }
+                    }
+
+                    let apply_text = match apply(
+                        &RefactorApplyParams {
+                            plan: plan_value,
+                            confirm: Some(true),
+                            allow_dirty_worktree: Some(true),
+                            allow_unregistered_paths: p.allow_unregistered_paths,
+                        },
+                        projects,
+                    ) {
+                        Ok(apply_text) => apply_text,
+                        Err(err) => {
+                            let rollback_errors = restore_snapshots(&snapshots);
+                            return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                                status: "step_failed".to_string(),
+                                title: p.title.clone(),
+                                dry_run: false,
+                                steps: reports,
+                                files_written,
+                                rolled_back: rollback_errors.is_empty(),
+                                error: Some(err.to_string()),
+                                rollback_errors,
+                            })?);
+                        }
+                    };
+                    let apply_response: RefactorApplyResponse =
+                        match serde_json::from_str(&apply_text) {
+                            Ok(response) => response,
+                            Err(err) => {
+                                let rollback_errors = restore_snapshots(&snapshots);
+                                return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                                    status: "step_failed".to_string(),
+                                    title: p.title.clone(),
+                                    dry_run: false,
+                                    steps: reports,
+                                    files_written,
+                                    rolled_back: rollback_errors.is_empty(),
+                                    error: Some(err.to_string()),
+                                    rollback_errors,
+                                })?);
+                            }
+                        };
+                    let status = apply_response.status.clone();
+                    let validations = apply_response.validations.clone();
+                    let step_written = apply_response.files_written.clone();
+                    files_written.extend(step_written.iter().cloned());
+                    reports.push(RefactorRunStepReport {
+                        index: idx,
+                        op: "plan".to_string(),
+                        status: status.clone(),
+                        kind: Some(refactor_plan.kind),
+                        title: Some(refactor_plan.title),
+                        files: step_written,
+                        validations,
+                        error: apply_response.error.clone(),
+                    });
+                    if status != "ok" {
+                        let rollback_errors = restore_snapshots(&snapshots);
+                        return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                            status: "step_failed".to_string(),
+                            title: p.title.clone(),
+                            dry_run: false,
+                            steps: reports,
+                            files_written,
+                            rolled_back: rollback_errors.is_empty(),
+                            error: apply_response.error,
+                            rollback_errors,
+                        })?);
+                    }
+                } else {
+                    reports.push(RefactorRunStepReport {
+                        index: idx,
+                        op: "plan".to_string(),
+                        status: "planned".to_string(),
+                        kind: Some(refactor_plan.kind),
+                        title: Some(refactor_plan.title),
+                        files: step_files,
+                        validations: Vec::new(),
+                        error: None,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+        status: if confirmed { "ok" } else { "planned" }.to_string(),
+        title: p.title.clone(),
+        dry_run: !confirmed,
+        steps: reports,
+        files_written,
+        rolled_back: false,
+        error: None,
+        rollback_errors: Vec::new(),
+    })?)
+}
+
+fn append_report(
+    mut reports: Vec<RefactorRunStepReport>,
+    report: RefactorRunStepReport,
+) -> Vec<RefactorRunStepReport> {
+    reports.push(report);
+    reports
 }
 
 fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> {
@@ -1695,6 +1979,24 @@ fn validate_plan_shape(plan: &RefactorPlan) -> Result<()> {
     Ok(())
 }
 
+fn restore_snapshots(snapshots: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (path, original) in snapshots.iter().rev() {
+        let result = match original {
+            Some(bytes) => write_atomic(path, bytes),
+            None => match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err).with_context(|| format!("removing {}", path.display())),
+            },
+        };
+        if let Err(err) = result {
+            errors.push(format!("{}: {err:#}", path.display()));
+        }
+    }
+    errors
+}
+
 fn ensure_non_overlapping(edits: &[TextEdit]) -> Result<()> {
     let mut ranges = edits
         .iter()
@@ -2681,6 +2983,198 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("cannot mix impl_method"));
+    }
+
+    #[test]
+    fn refactor_run_applies_sequential_plan_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "add then delete module declaration".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "add_rust_mod_decl".into(),
+                            source: "lib.rs".into(),
+                            target: None,
+                            item_names: None,
+                            item_kinds: None,
+                            impl_name: None,
+                            module_name: Some("newmod".into()),
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            project_dir: None,
+                        },
+                    },
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "delete_rust_items".into(),
+                            source: "lib.rs".into(),
+                            target: None,
+                            item_names: Some(vec!["newmod".into()]),
+                            item_kinds: Some(vec!["mod_item".into()]),
+                            impl_name: None,
+                            module_name: None,
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            project_dir: None,
+                        },
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "ok");
+        assert_eq!(run_response.steps.len(), 2);
+        assert!(run_response.steps.iter().all(|step| step.status == "ok"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
+    }
+
+    #[test]
+    fn refactor_run_rolls_back_when_later_plan_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "rollback failed compound run".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "add_rust_mod_decl".into(),
+                            source: "lib.rs".into(),
+                            target: None,
+                            item_names: None,
+                            item_kinds: None,
+                            impl_name: None,
+                            module_name: Some("newmod".into()),
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            project_dir: None,
+                        },
+                    },
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "delete_rust_items".into(),
+                            source: "lib.rs".into(),
+                            target: None,
+                            item_names: Some(vec!["missing_mod".into()]),
+                            item_kinds: Some(vec!["mod_item".into()]),
+                            impl_name: None,
+                            module_name: None,
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            project_dir: None,
+                        },
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "step_failed");
+        assert!(run_response.rolled_back);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
+    }
+
+    #[test]
+    fn refactor_run_rolls_back_when_later_path_is_out_of_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        let outside = outside_dir.path().join("outside.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+        fs::write(&outside, "mod outside_mod;\n").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "rollback out of scope step".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "add_rust_mod_decl".into(),
+                            source: "lib.rs".into(),
+                            target: None,
+                            item_names: None,
+                            item_kinds: None,
+                            impl_name: None,
+                            module_name: Some("newmod".into()),
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            project_dir: None,
+                        },
+                    },
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "delete_rust_items".into(),
+                            source: path_string(&outside),
+                            target: None,
+                            item_names: Some(vec!["outside_mod".into()]),
+                            item_kinds: Some(vec!["mod_item".into()]),
+                            impl_name: None,
+                            module_name: None,
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            project_dir: None,
+                        },
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "step_failed");
+        assert!(run_response.rolled_back);
+        assert!(run_response
+            .error
+            .unwrap()
+            .contains("outside registered projects"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "mod outside_mod;\n");
     }
 
     #[test]
