@@ -12,12 +12,12 @@
     {
       "description": "The Rust packet evaluator and compiler implementation.",
       "entity_type_hint": "project_file",
-      "path_hint": "src/packets.rs"
+      "path_hint": "src/packets/mod.rs"
     }
   ],
   "expected_entity_refs": [
     "knowledge:sm-rule-packets",
-    "project_file:d723917f:c4453102:e7e1c91d986cf6841a36d7101f858eb54313d94b287bc54fa238d28dbd1a2a67:8"
+    "project_file:d723917f:a1d21fdd:e7e1c91d986cf6841a36d7101f858eb54313d94b287bc54fa238d28dbd1a2a67:8"
   ],
   "required_evidence": {
     "kind": "entity_set",
