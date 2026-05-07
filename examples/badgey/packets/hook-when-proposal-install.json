@@ -1,26 +1,16 @@
 {
-  "domain": "hook-when/apply-failed",
-  "version": 3,
+  "domain": "hook-when/proposal-install",
+  "version": 1,
   "scope": "global",
   "classification_lattice": ["allow", "deny"],
   "rules": [
     {
-      "id": "allow_when_begin_rejected",
+      "id": "allow_when_begin_outcome_install",
       "classification": "allow",
       "antecedent": {
         "op": "Eq",
         "field": "vars.begin_response.outcome",
-        "value": "rejected"
-      },
-      "consequent": "allow"
-    },
-    {
-      "id": "allow_when_complete_returned_failed",
-      "classification": "allow",
-      "antecedent": {
-        "op": "Eq",
-        "field": "vars.complete_response.status",
-        "value": "failed"
+        "value": "install"
       },
       "consequent": "allow"
     },

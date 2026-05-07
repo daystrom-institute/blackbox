@@ -1,24 +1,36 @@
 {
   "name": "badgey-apply-proposal-arc",
-  "version": 1,
+  "version": 3,
   "vars_schema": {
-    "team_id": { "kind": "string", "required": true },
-    "channel_id": { "kind": "string", "required": true },
-    "item_ts": { "kind": "string", "required": true },
-    "user": { "kind": "string" },
-    "bbox_user": { "kind": "string" },
-    "link_response": { "kind": "object" },
-    "instance_id": { "kind": "string" },
-    "proposal_id": { "kind": "string" },
-    "apply_response": { "kind": "object" },
-    "summary_text": { "kind": "string" }
+    "team_id":          { "kind": "string", "required": true },
+    "channel_id":       { "kind": "string", "required": true },
+    "item_ts":          { "kind": "string", "required": true },
+    "user":             { "kind": "string" },
+    "bbox_user":        { "kind": "string" },
+    "link_response":    { "kind": "object" },
+    "instance_id":      { "kind": "string" },
+    "proposal_id":      { "kind": "string" },
+    "begin_response":   { "kind": "object" },
+    "install_response": { "kind": "object" },
+    "complete_response":{ "kind": "object" },
+    "artifact_ref":     { "kind": "string" },
+    "primary_message":  { "kind": "string" },
+    "bro_section":      { "kind": "string" },
+    "status_word":      { "kind": "string" },
+    "summary_text":     { "kind": "string" }
   },
-  "actors": {},
+  "actors": {
+    "redispatcher": {
+      "kind": "executor",
+      "brofile": "badgey-persona",
+      "durable": false
+    }
+  },
   "start": "LookupLink",
   "nodes": {
     "LookupLink": {
       "actor": "",
-      "prompt": "Resolve the reacted-to message back to its SlackProposalLink. If not a posted proposal, downstream nodes no-op via the slack-proposal-found gate.",
+      "prompt": "Resolve the reacted-to message back to its SlackProposalLink. Subsequent nodes gate on slack-proposal-found so non-proposal reactions terminate cleanly.",
       "on_enter": [
         {
           "op": "mcp_call",
@@ -34,14 +46,7 @@
           },
           "into_var": "link_response",
           "on_failure": "halt"
-        }
-      ],
-      "next": { "type": "goto", "to": "Apply" }
-    },
-    "Apply": {
-      "actor": "",
-      "prompt": "Bind link fields to top-level vars; show in-progress thinking status + hourglass reaction; run apply.",
-      "on_enter": [
+        },
         {
           "op": "set_var",
           "args": { "key": "instance_id", "value": "${vars.link_response.link.instance_id}" },
@@ -51,7 +56,42 @@
           "op": "set_var",
           "args": { "key": "proposal_id", "value": "${vars.link_response.link.proposal_id}" },
           "when": "domain:hook-when/slack-proposal-found"
+        }
+      ],
+      "next": { "type": "goto", "to": "Begin" }
+    },
+    "Begin": {
+      "actor": "",
+      "prompt": "Phase 1: state-machine transition Pending|Failed → Applying. Returns dispatch params (`outcome=redispatch|install`) or short-circuits (`outcome=already_applied|rejected`).",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_proposal_begin_apply",
+            "arguments": {
+              "badgey_id": "${vars.instance_id}",
+              "proposal_id": "${vars.proposal_id}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "begin_response",
+          "when": "domain:hook-when/slack-proposal-found",
+          "on_failure": "halt"
         },
+        {
+          "op": "set_meta",
+          "args": { "key": "project_dir", "value": "${vars.begin_response.project_dir}" },
+          "when": "domain:hook-when/proposal-redispatch",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "goto", "to": "Ack" }
+    },
+    "Ack": {
+      "actor": "",
+      "prompt": "Acknowledge with :rocket: + thinking status. The rocket is permanent — survives the final badge as a 'we received your tap' marker.",
+      "on_enter": [
         {
           "op": "http_json",
           "args": {
@@ -63,7 +103,7 @@
             },
             "body": {
               "channel": "${vars.channel_id}",
-              "name": "hourglass_flowing_sand",
+              "name": "rocket",
               "timestamp": "${vars.item_ts}"
             },
             "expect_status": [200]
@@ -89,20 +129,131 @@
           },
           "when": "domain:hook-when/slack-proposal-found",
           "on_failure": "warn"
+        }
+      ],
+      "gate": "domain:hook-route/proposal-kind",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "redispatch": "Dispatch",
+          "install":    "Install",
+          "skip":       "PostOutcome"
+        }
+      }
+    },
+    "Dispatch": {
+      "actor": "redispatcher",
+      "actor_failure": "continue",
+      "prompt": "${vars.begin_response.prompt}",
+      "on_enter": [
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/reactions.add",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel_id}",
+              "name": "hourglass_flowing_sand",
+              "timestamp": "${vars.item_ts}"
+            },
+            "expect_status": [200]
+          },
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "goto", "to": "Complete" }
+    },
+    "Install": {
+      "actor": "",
+      "prompt": "Install artifact via bbox_artifact_install with the source/kind returned from Begin.",
+      "on_enter": [
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/reactions.add",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel_id}",
+              "name": "hourglass_flowing_sand",
+              "timestamp": "${vars.item_ts}"
+            },
+            "expect_status": [200]
+          },
+          "on_failure": "warn"
         },
         {
           "op": "mcp_call",
           "args": {
             "server": "blackbox",
-            "tool": "badgey_apply_proposal",
+            "tool": "bbox_artifact_install",
+            "arguments": {
+              "kind": "${vars.begin_response.artifact_kind}",
+              "source": "${vars.begin_response.source}",
+              "name": "${vars.begin_response.name}",
+              "version": "${vars.begin_response.version}",
+              "supersedes": "${vars.begin_response.supersedes}"
+            },
+            "timeout_secs": 60
+          },
+          "into_var": "install_response",
+          "on_failure": "warn"
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "artifact_ref",
+            "value": "${vars.install_response.kind}:${vars.install_response.name}@${vars.install_response.version}"
+          }
+        }
+      ],
+      "next": { "type": "goto", "to": "Complete" }
+    },
+    "Complete": {
+      "actor": "",
+      "prompt": "Phase 2: complete_apply with the actor's outcome (redispatch path) or success+artifact_ref (install path).",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_proposal_complete_apply",
             "arguments": {
               "badgey_id": "${vars.instance_id}",
-              "proposal_id": "${vars.proposal_id}"
+              "proposal_id": "${vars.proposal_id}",
+              "outcome": "${actor_results.Dispatch.status}",
+              "task_id": "${actor_results.Dispatch.taskId}",
+              "summary": "${actor_results.Dispatch.result}"
             },
-            "timeout_secs": 1800
+            "timeout_secs": 30
           },
-          "into_var": "apply_response",
-          "when": "domain:hook-when/slack-proposal-found",
+          "into_var": "complete_response",
+          "when": "domain:hook-when/proposal-redispatch",
+          "on_failure": "warn"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_proposal_complete_apply",
+            "arguments": {
+              "badgey_id": "${vars.instance_id}",
+              "proposal_id": "${vars.proposal_id}",
+              "outcome": "completed",
+              "artifact_ref": "${vars.artifact_ref}",
+              "summary": "Installed ${vars.artifact_ref}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "complete_response",
+          "when": "domain:hook-when/proposal-install",
           "on_failure": "warn"
         }
       ],
@@ -110,7 +261,7 @@
     },
     "PostOutcome": {
       "actor": "",
-      "prompt": "Remove hourglass, add success/fail badge, clear thinking status, post threaded summary.",
+      "prompt": "Remove hourglass, add success/fail badge based on the actual task outcome (begin short-circuit or complete_apply verdict), post threaded summary, clear thinking status.",
       "on_enter": [
         {
           "op": "http_json",
@@ -171,9 +322,37 @@
         },
         {
           "op": "set_var",
+          "args": { "key": "status_word", "value": "succeeded" },
+          "when": "domain:hook-when/apply-succeeded"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "status_word", "value": "failed" },
+          "when": "domain:hook-when/apply-failed"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "primary_message", "value": "${vars.begin_response.summary}" }
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "primary_message", "value": "${vars.complete_response.summary}" },
+          "when": "domain:hook-when/complete-ran"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "bro_section", "value": "" }
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "bro_section", "value": "\n\n> ${actor_results.Dispatch.result}" },
+          "when": "domain:hook-when/dispatch-ran"
+        },
+        {
+          "op": "set_var",
           "args": {
             "key": "summary_text",
-            "value": "*${vars.apply_response.status}* | ${vars.proposal_id}\n\n${vars.apply_response.summary}\n\n_(applied via Slack reaction by <@${vars.user}>)_"
+            "value": "*${vars.status_word}* | ${vars.proposal_id}\n\n${vars.primary_message}${vars.bro_section}\n\n_(applied via Slack reaction by <@${vars.user}>)_"
           },
           "when": "domain:hook-when/slack-proposal-found"
         },
