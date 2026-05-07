@@ -14,7 +14,7 @@
     "badgey": {
       "kind": "executor",
       "brofile": "badgey-persona",
-      "durable": false
+      "durable": true
     }
   },
   "start": "SetThinkingStatus",
