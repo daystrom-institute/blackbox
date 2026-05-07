@@ -4519,6 +4519,47 @@ struct BroSlackBindParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct EnsureBadgeyForChannelParams {
+    /// Slack workspace id (T-prefix). Required.
+    team_id: String,
+    /// Slack channel id (C-prefix). Required. Must already have a
+    /// binding via `bro_slack_bind action=bind`.
+    channel_id: String,
+    /// Optional override for the project scope. When absent the bound
+    /// project_dir is used. Useful for one-off triage calls against a
+    /// project the channel isn't bound to yet.
+    #[serde(default)]
+    scope_override: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct SlackProposalLinkRecordParams {
+    /// Slack workspace id (T-prefix).
+    team_id: String,
+    /// Slack channel id (C-prefix) the proposal was posted to.
+    channel_id: String,
+    /// Slack message ts of the posted proposal. Doubles as thread
+    /// root for in-thread replies.
+    msg_ts: String,
+    /// BadgeyProposalStore id of the proposal this Slack message
+    /// represents.
+    proposal_id: String,
+    /// Optional BadgeyInstance id (`bg-<8hex>-<8hex>`) that owns the
+    /// proposal. Required for the apply/refine hook to resolve back
+    /// to a real `(BadgeyId, proposal_id)` pair.
+    #[serde(default)]
+    instance_id: Option<String>,
+    /// Optional bro/Claude session id of the agent that authored the
+    /// proposal, for thread-reply refinement loops.
+    #[serde(default)]
+    authoring_session_id: Option<String>,
+    /// Project this proposal scopes to. Stored on the link record so
+    /// consumers don't need a second lookup against the channel
+    /// binding.
+    project_dir: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct TeamParams {
     /// Operation: save_template, list_templates, delete_template, create, list, dissolve, roster
     action: String,
@@ -6439,6 +6480,147 @@ impl BlackboxServer {
                 }
             }
             other => Self::err_text(&format!("Unknown bro_slack_bind action: {other}")),
+        }
+    }
+
+    #[tool(
+        name = "badgey_ensure_for_channel",
+        description = "Get-or-create the system Badgey instance that authors triage briefs for a Slack-bound project. Reads the (team_id, channel_id) binding to resolve the project scope, looks up the binding's badgey_id; if absent or the instance has been dismissed, exec a fresh Badgey instance, persist its id back on the binding, and return it. Used by the per-channel triage workflow's EnsureInstance node."
+    )]
+    async fn badgey_ensure_for_channel(
+        &self,
+        Parameters(p): Parameters<EnsureBadgeyForChannelParams>,
+    ) -> CallToolResult {
+        if p.team_id.trim().is_empty() {
+            return Self::err_text("team_id is required");
+        }
+        if p.channel_id.trim().is_empty() {
+            return Self::err_text("channel_id is required");
+        }
+        let binding = match self
+            .state
+            .slack_channel_bindings
+            .lookup(&p.team_id, &p.channel_id)
+        {
+            Some(b) => b,
+            None => {
+                return Self::err_text(&format!(
+                    "no binding for team={} channel={} — run bro_slack_bind first",
+                    p.team_id, p.channel_id
+                ));
+            }
+        };
+        let scope = p
+            .scope_override
+            .clone()
+            .unwrap_or_else(|| binding.project_dir.clone());
+
+        // Resume existing instance when present + still active.
+        if let Some(ref bid) = binding.badgey_id {
+            if let Ok(parsed) = bid.parse::<orchestration::badgey::types::BadgeyId>() {
+                match self.state.badgey_registry.get(&parsed) {
+                    Ok(instance) => {
+                        return Self::ok_json(&json!({
+                            "badgey_id": bid,
+                            "thread_id": instance.thread_of_record_id,
+                            "project_id": instance.scope.project_id,
+                            "session_id": instance.provider_session_id,
+                            "created": false,
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            badgey_id = %bid,
+                            "ensure_badgey_for_channel: stored badgey unusable ({e}) — creating fresh"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Create a new instance and persist its id back on the binding.
+        let initial_brief = format!(
+            "Slack daily-brief triage agent for #{} (project: {}). \
+             Operate in triage + corpus-mining mode: classify stale work-items, \
+             score graph-edge meatiness, dispatch focused scouts when warranted, \
+             and synthesize structured proposals for review.",
+            binding
+                .channel_name
+                .as_deref()
+                .unwrap_or(&p.channel_id),
+            scope,
+        );
+        let exec_result = match self
+            .badgey_exec_internal(
+                Some(scope.clone()),
+                Some(initial_brief),
+                Some(format!("badgey-slack-{}", p.channel_id)),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return Self::err_text(&format!("badgey_exec failed: {e}")),
+        };
+        let new_badgey_id = match exec_result.get("badgey_id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return Self::err_text("badgey_exec didn't return a badgey_id"),
+        };
+        if let Err(e) = self.state.slack_channel_bindings.set_badgey_id(
+            &p.team_id,
+            &p.channel_id,
+            Some(new_badgey_id.clone()),
+        ) {
+            tracing::warn!(
+                badgey_id = %new_badgey_id,
+                "ensure_badgey_for_channel: persisting badgey_id on binding failed: {e}"
+            );
+        }
+        Self::ok_json(&json!({
+            "badgey_id": new_badgey_id,
+            "thread_id": exec_result.get("thread_id"),
+            "project_id": exec_result.get("project_id"),
+            "session_id": exec_result.get("session_id"),
+            "task_id": exec_result.get("task_id"),
+            "created": true,
+        }))
+    }
+
+    #[tool(
+        name = "bro_slack_link_record",
+        description = "Record a SlackProposalLink mapping a posted Slack message back to its BadgeyProposal. Called by the per-channel triage workflow's emit-proposal subworkflow after chat.postMessage so inbound reactions/replies can resolve back to (BadgeyId, proposal_id) and the apply/refine hooks fire."
+    )]
+    fn bro_slack_link_record(
+        &self,
+        Parameters(p): Parameters<SlackProposalLinkRecordParams>,
+    ) -> CallToolResult {
+        if p.team_id.trim().is_empty()
+            || p.channel_id.trim().is_empty()
+            || p.msg_ts.trim().is_empty()
+            || p.proposal_id.trim().is_empty()
+            || p.project_dir.trim().is_empty()
+        {
+            return Self::err_text(
+                "team_id, channel_id, msg_ts, proposal_id, and project_dir are all required",
+            );
+        }
+        let link = slack_proposal_links::SlackProposalLink {
+            team_id: p.team_id,
+            channel_id: p.channel_id,
+            msg_ts: p.msg_ts.clone(),
+            proposal_id: p.proposal_id.clone(),
+            instance_id: p.instance_id,
+            authoring_session_id: p.authoring_session_id,
+            version: 1,
+            project_dir: p.project_dir,
+            posted_at: util::now_iso(),
+        };
+        match self.state.slack_proposal_links.record(link) {
+            Ok(()) => Self::ok_json(&json!({
+                "recorded": true,
+                "msg_ts": p.msg_ts,
+                "proposal_id": p.proposal_id,
+            })),
+            Err(e) => Self::err_text(&format!("recording slack proposal link failed: {e}")),
         }
     }
 

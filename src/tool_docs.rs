@@ -725,6 +725,24 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bro_slack_bind(action="bind", team_id="T0123ABCD", channel_id="C0123XYZ", channel_name="transcript-search", project="/home/me/repos/transcript-search")"#,
         ),
     },
+    ToolDoc {
+        name: "badgey_ensure_for_channel",
+        category: ToolCategory::Orchestration,
+        summary: "Get-or-create the system Badgey instance that authors triage briefs for a Slack-bound project. Reads the (team_id, channel_id) binding to resolve the project scope, looks up the binding's badgey_id; if absent or the instance has been dismissed, exec a fresh Badgey instance, persist its id back on the binding, and return it. Used by the per-channel triage workflow's EnsureInstance node.",
+        when_to_use: "Called from the per-channel triage workflow's first node. Requires a binding via `bro_slack_bind action=bind`. Idempotent — re-calling against an active instance returns the existing id with `created=false`.",
+        example: Some(
+            r#"badgey_ensure_for_channel(team_id="T0123ABCD", channel_id="C0123XYZ")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bro_slack_link_record",
+        category: ToolCategory::Orchestration,
+        summary: "Record a SlackProposalLink mapping a posted Slack message back to its BadgeyProposal. Called by the per-channel triage workflow's emit-proposal subworkflow after chat.postMessage so inbound reactions/replies can resolve back to (BadgeyId, proposal_id) and the apply/refine hooks fire.",
+        when_to_use: "Workflow node hook after a successful chat.postMessage. Pass the msg_ts from the Slack response, the BadgeyProposal id, the BadgeyInstance id (so the apply hook resolves it), and the project_dir scope.",
+        example: Some(
+            r#"bro_slack_link_record(team_id="T0123ABCD", channel_id="C0123XYZ", msg_ts="1778179224.543499", proposal_id="P-3", instance_id="bg-deadbeef-cafef00d", project_dir="/repo/x")"#,
+        ),
+    },
     // ── Workflows ────────────────────────────────────────────────────
     ToolDoc {
         name: "bro_orchestrate_author",
