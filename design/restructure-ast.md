@@ -150,6 +150,7 @@ Grounding:
 
 ```text
 bbox_refactor_status(file="src/packets.rs", project_dir=<worktree>, limit=120)
+exact read eval/queries/cross-modal-rule-packets.json
 ```
 
 Plan shape:
@@ -161,11 +162,21 @@ bbox_refactor_run(
   confirm=true,
   steps=[
     {"op":"plan","kind":"move_file","source":"src/packets.rs","target":"src/packets/mod.rs"},
+    {"op":"plan","kind":"replace_text","source":"eval/queries/cross-modal-rule-packets.json","old_text":"\"path_hint\": \"src/packets.rs\"","new_text":"\"path_hint\": \"src/packets/mod.rs\""},
+    {"op":"plan","kind":"replace_text","source":"eval/queries/cross-modal-rule-packets.json","old_text":"project_file:d723917f:c4453102:e7e1c91d986cf6841a36d7101f858eb54313d94b287bc54fa238d28dbd1a2a67:8","new_text":"project_file:d723917f:a1d21fdd:e7e1c91d986cf6841a36d7101f858eb54313d94b287bc54fa238d28dbd1a2a67:8"},
     {"op":"command","command":"cargo","args":["fmt"],"touches":["src/packets/mod.rs"],"required":true},
     {"op":"command","command":"cargo","args":["test","--bin","blackboxd"],"required":true}
   ]
 )
 ```
+
+Notes:
+
+- The manifest updates are literal metadata repairs for a hard-coded eval
+  fixture. Do not generalize them into symbolic rename behavior.
+- The replacement `a1d21fdd` is the first 8 hex chars of
+  `sha256("src/packets/mod.rs")`, matching the project-file relative path hash
+  logic in `eval/check.rs`.
 
 Checkpoint: pause.
 
