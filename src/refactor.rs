@@ -14,6 +14,25 @@ use tree_sitter::{Node, Tree};
 use crate::chunker::code::{language_for_path, parser_for_language};
 use crate::projects::ProjectRecord;
 
+const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
+    "BBOX_PORT",
+    "BRO_PORT",
+    "BLACKBOX_MCP_NAME",
+    "BLACKBOX_MCP_URL",
+    "BLACKBOX_STATE_DIR",
+    "BLACKBOX_KNOWLEDGE_PATH",
+    "BLACKBOX_THREADS_PATH",
+    "BLACKBOX_NOTES_PATH",
+    "BLACKBOX_GLOBAL_CLAUDE_MD",
+    "BLACKBOX_GLOBAL_CODEX_MD",
+    "BLACKBOX_GLOBAL_GEMINI_MD",
+    "BLACKBOX_BACKUP_DIR",
+    "BRO_HOME",
+    "TRANSCRIPT_SEARCH_ROOTS",
+    "TRANSCRIPT_SEARCH_CODEX_ROOT",
+    "TRANSCRIPT_SEARCH_INDEX_PATH",
+];
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RefactorStatusParams {
     /// Source file to inspect. Relative paths resolve against project_dir or cwd.
@@ -899,19 +918,18 @@ fn run_validation_command(
         Some(cwd) => resolve_path(Some(&path_string(project_dir)), cwd)?,
         None => project_dir.to_path_buf(),
     };
-    let output = Command::new(command)
-        .args(args)
-        .current_dir(&working_dir)
-        .env_remove("BLACKBOX_MCP_NAME")
-        .env_remove("BLACKBOX_MCP_URL")
-        .output()
-        .with_context(|| {
-            format!(
-                "running validation command `{}` in {}",
-                command_display(command, args),
-                working_dir.display()
-            )
-        })?;
+    let mut cmd = Command::new(command);
+    cmd.args(args).current_dir(&working_dir);
+    for key in BLACKBOX_SERVICE_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    let output = cmd.output().with_context(|| {
+        format!(
+            "running validation command `{}` in {}",
+            command_display(command, args),
+            working_dir.display()
+        )
+    })?;
     if output.status.success() {
         return Ok(CommandStepResult {
             success: true,

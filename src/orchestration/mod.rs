@@ -20,6 +20,25 @@ use tokio::sync::Notify;
 
 use providers::{EventSink, Provider, Usage};
 
+const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
+    "BBOX_PORT",
+    "BRO_PORT",
+    "BLACKBOX_MCP_NAME",
+    "BLACKBOX_MCP_URL",
+    "BLACKBOX_STATE_DIR",
+    "BLACKBOX_KNOWLEDGE_PATH",
+    "BLACKBOX_THREADS_PATH",
+    "BLACKBOX_NOTES_PATH",
+    "BLACKBOX_GLOBAL_CLAUDE_MD",
+    "BLACKBOX_GLOBAL_CODEX_MD",
+    "BLACKBOX_GLOBAL_GEMINI_MD",
+    "BLACKBOX_BACKUP_DIR",
+    "BRO_HOME",
+    "TRANSCRIPT_SEARCH_ROOTS",
+    "TRANSCRIPT_SEARCH_CODEX_ROOT",
+    "TRANSCRIPT_SEARCH_INDEX_PATH",
+];
+
 // ---------------------------------------------------------------------------
 // Task
 // ---------------------------------------------------------------------------
@@ -926,8 +945,9 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             cmd.env(k, v);
         }
     }
-    cmd.env_remove("BLACKBOX_MCP_NAME")
-        .env_remove("BLACKBOX_MCP_URL");
+    for key in BLACKBOX_SERVICE_ENV_VARS {
+        cmd.env_remove(key);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
