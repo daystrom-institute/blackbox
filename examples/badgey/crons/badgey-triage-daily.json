@@ -2,10 +2,7 @@
   "name": "badgey-triage-daily",
   "schedule": "0 0 8 * * *",
   "tz": "Local",
-  "payload": {
-    "tool": "badgey_triage_inbox",
-    "arguments": {}
-  },
+  "payload": {},
   "concurrency": 1,
   "routing_packet": "domain:badgey/cron-routing"
 }

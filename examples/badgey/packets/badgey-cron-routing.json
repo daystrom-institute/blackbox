@@ -13,7 +13,7 @@
         "field": "cron_name",
         "value": "badgey-triage-daily"
       },
-      "consequent": "{\"route\":\"start_arc\",\"workflow\":\"badgey-eval-arc\",\"initial_vars\":{}}",
+      "consequent": "{\"route\":\"start_arc\",\"workflow\":\"badgey-triage-fanout-arc\",\"initial_vars\":{}}",
       "confidence": 0.95
     },
     {

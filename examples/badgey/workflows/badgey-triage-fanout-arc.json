@@ -1,0 +1,45 @@
+{
+  "name": "badgey-triage-fanout-arc",
+  "version": 1,
+  "vars_schema": {
+    "bindings_response": { "kind": "object" },
+    "channel_results": { "kind": "array" }
+  },
+  "actors": {},
+  "start": "ListBindings",
+  "nodes": {
+    "ListBindings": {
+      "actor": "",
+      "prompt": "Read every Slack channel binding. Each will get its own per-channel triage subworkflow.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_slack_bind",
+            "arguments": { "action": "list" },
+            "timeout_secs": 10
+          },
+          "into_var": "bindings_response",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "ForeachBinding" }
+    },
+    "ForeachBinding": {
+      "actor": "",
+      "prompt": "Run badgey-triage-channel-arc once per binding. Bounded parallelism — two channels at a time keeps token usage and Slack rate limits in check while still finishing within the 45min cron timeout for typical bindings counts.",
+      "foreach": {
+        "items": "${vars.bindings_response.bindings}",
+        "as_var": "binding",
+        "subworkflow_ref": "badgey-triage-channel-arc",
+        "imports": [],
+        "exports": [],
+        "parallelism": 2,
+        "on_item_failure": "continue",
+        "collect": { "into_var": "channel_results" }
+      },
+      "next": { "type": "terminal" }
+    }
+  }
+}
