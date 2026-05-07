@@ -4269,6 +4269,20 @@ struct BadgeyTriageInboxParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyProposalsListParams {
+    /// Badgey instance id (`bg-<8hex>-<8hex>`) whose proposals to list.
+    badgey_id: String,
+    /// Optional ISO timestamp lower bound on `created_at`. Returns
+    /// proposals at or after this moment.
+    #[serde(default)]
+    since: Option<String>,
+    /// When true, exclude terminal-state proposals (Applied / Failed).
+    /// Defaults to false (returns all states).
+    #[serde(default)]
+    only_pending: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct BadgeyCloseLoopsParams {
     /// Window in days. Default 14.
     #[serde(default)]
@@ -5478,6 +5492,41 @@ impl BlackboxServer {
             Ok(value) => Self::ok_json(&value),
             Err(err) => Self::err_text(&err),
         }
+    }
+
+    #[tool(
+        name = "badgey_proposals_list",
+        description = "List BadgeyProposal records owned by an instance. Returns full proposal objects (id, kind, state, draft, created_at, updated_at, events, applied_task_id) sorted by proposal_id number. Optional `since` filter (ISO timestamp) restricts to proposals created at or after that moment — useful for reading proposals emitted by the most recent Badgey turn. Used by the per-channel triage workflow's ForeachPostProposal node to iterate proposals freshly emitted by the synthesis turn."
+    )]
+    fn badgey_proposals_list(
+        &self,
+        Parameters(p): Parameters<BadgeyProposalsListParams>,
+    ) -> CallToolResult {
+        let id = match self.badgey_parse_id(&p.badgey_id) {
+            Ok(parsed) => parsed,
+            Err(e) => return Self::err_text(&e),
+        };
+        let proposals = match self.state.badgey_proposals.list_by_instance(&id) {
+            Ok(v) => v,
+            Err(e) => return Self::err_text(&format!("listing proposals: {e}")),
+        };
+        let filtered: Vec<_> = proposals
+            .into_iter()
+            .filter(|proposal| {
+                p.since
+                    .as_deref()
+                    .is_none_or(|since| proposal.created_at.as_str() >= since)
+            })
+            .filter(|proposal| {
+                p.only_pending != Some(true) || !proposal.is_terminal()
+            })
+            .collect();
+        Self::ok_json(&json!({
+            "badgey_id": p.badgey_id,
+            "since": p.since,
+            "count": filtered.len(),
+            "proposals": filtered,
+        }))
     }
 
     #[tool(

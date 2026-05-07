@@ -1,0 +1,166 @@
+{
+  "name": "badgey-triage-channel-arc",
+  "version": 1,
+  "vars_schema": {
+    "binding": { "kind": "object", "required": true },
+    "team_id": { "kind": "string" },
+    "channel_id": { "kind": "string" },
+    "channel_name": { "kind": "string" },
+    "project_dir": { "kind": "string" },
+    "instance": { "kind": "object" },
+    "badgey_id": { "kind": "string" },
+    "triage_started_at": { "kind": "string" },
+    "triage_response": { "kind": "object" },
+    "triage_data": { "kind": "object" },
+    "scout_charters": { "kind": "array" },
+    "scout_findings": { "kind": "array" },
+    "synthesis_started_at": { "kind": "string" },
+    "synthesis_response": { "kind": "object" },
+    "proposals_response": { "kind": "object" }
+  },
+  "actors": {},
+  "start": "ExtractBinding",
+  "nodes": {
+    "ExtractBinding": {
+      "actor": "",
+      "prompt": "Extract per-binding fields into top-level vars for templating ergonomics downstream.",
+      "on_enter": [
+        { "op": "set_var", "args": { "key": "team_id", "value": "${vars.binding.team_id}" } },
+        { "op": "set_var", "args": { "key": "channel_id", "value": "${vars.binding.channel_id}" } },
+        { "op": "set_var", "args": { "key": "channel_name", "value": "${vars.binding.channel_name}" } },
+        { "op": "set_var", "args": { "key": "project_dir", "value": "${vars.binding.project_dir}" } }
+      ],
+      "next": { "type": "goto", "to": "EnsureInstance" }
+    },
+    "EnsureInstance": {
+      "actor": "",
+      "prompt": "Get-or-create the system Badgey instance for this (project, channel) pair.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_ensure_for_channel",
+            "arguments": {
+              "team_id": "${vars.team_id}",
+              "channel_id": "${vars.channel_id}"
+            },
+            "timeout_secs": 60
+          },
+          "into_var": "instance",
+          "on_failure": "halt"
+        },
+        { "op": "set_var", "args": { "key": "badgey_id", "value": "${vars.instance.badgey_id}" } }
+      ],
+      "next": { "type": "goto", "to": "TriageTurn" }
+    },
+    "TriageTurn": {
+      "actor": "",
+      "prompt": "Resume Badgey with the triage charter — corpus walk + meatiness scoring + scout-charter emission.",
+      "on_enter": [
+        { "op": "set_var", "args": { "key": "triage_started_at", "value": "${meta.now}" } },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_resume",
+            "arguments": {
+              "badgey_id": "${vars.badgey_id}",
+              "prompt": "DAILY-BRIEF TRIAGE TURN — ${vars.channel_name} (project ${vars.project_dir}).\n\nProtocol:\n1. Walk the corpus to find candidate items needing attention:\n   - bbox_inbox(project=\"${vars.project_dir}\", stale_days=3) — unresolved disputes/blocked/surprises, deferred followups, stale threads, failed bro tasks.\n   - bbox_thread_list(project=\"${vars.project_dir}\", status=\"active\", min_idle_days=3).\n   - bbox_notes(project=\"${vars.project_dir}\", kind=\"blocked\", resolution=\"unresolved\") — also try kind=dispute, kind=surprise.\n2. Score each candidate's meatiness by graph weight:\n   - bbox_inspect_entity to count attached notes / commits / sessions / tool calls.\n   - High edge density = substantive work worth a focused investigation.\n   - Low-meatiness items (one-line TODO, no follow-on activity) → skip.\n3. Pick the top 3-5 most meaty items.\n4. For each picked item, author a single focused investigation question for a sub-agent — narrow enough that a scout can answer it in one walk and return a structured `done` note.\n\nREPLY SHAPE (strict JSON, no preamble or trailing prose):\n```json\n{\n  \"scout_charters\": [\n    {\n      \"scout_id\": \"scout-<short-uuid>\",\n      \"subject_ref\": \"<entity_ref>\",\n      \"charter\": \"<one focused question>\"\n    }\n  ],\n  \"skipped\": [\"<entity_ref>\"],\n  \"notes\": \"<one-line summary of the triage walk>\"\n}\n```\n\nDo NOT use bg-action-spawn-subbro this turn — the parent workflow will dispatch scouts via foreach. If nothing meaty enough exists today (slow day), return scout_charters=[]; the parent workflow will switch to dream/explore mode.",
+              "timeout_seconds": 600
+            },
+            "timeout_secs": 660
+          },
+          "into_var": "triage_response",
+          "on_failure": "halt"
+        },
+        {
+          "op": "parse_json",
+          "args": { "from": "${vars.triage_response.result.result}" },
+          "into_var": "triage_data"
+        },
+        { "op": "set_var", "args": { "key": "scout_charters", "value": "${vars.triage_data.scout_charters}" } }
+      ],
+      "next": { "type": "goto", "to": "ForeachScout" }
+    },
+    "ForeachScout": {
+      "actor": "",
+      "prompt": "Dispatch each scout charter as a parallel sub-bro. Foreach iterates 0 times when empty (clean slate), in which case synthesis switches to dream mode.",
+      "foreach": {
+        "items": "${vars.scout_charters}",
+        "as_var": "charter_item",
+        "subworkflow_ref": "badgey-scout-arc",
+        "imports": ["project_dir"],
+        "import_renames": {
+          "charter": "charter_item.charter",
+          "scout_id": "charter_item.scout_id"
+        },
+        "exports": ["done_note"],
+        "parallelism": 3,
+        "on_item_failure": "collect_then_halt",
+        "collect": { "into_var": "scout_findings" }
+      },
+      "next": { "type": "goto", "to": "SynthesisTurn" }
+    },
+    "SynthesisTurn": {
+      "actor": "",
+      "prompt": "Resume Badgey to synthesize proposals from scout findings (or fall back to dream/explore mode on a clean slate).",
+      "on_enter": [
+        { "op": "set_var", "args": { "key": "synthesis_started_at", "value": "${meta.now}" } },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_resume",
+            "arguments": {
+              "badgey_id": "${vars.badgey_id}",
+              "prompt": "SCOUTS COMPLETE — synthesis turn for ${vars.channel_name}.\n\nScout findings (one per dispatched charter):\n```json\n${vars.scout_findings}\n```\n\nFor each meaty finding (verdict=found and surfaced concrete blockers/causes/proposals), emit a `bg-action-emit-proposal` note with:\n- `kind`: one of `redispatch_task` / `artifact_promotion` / `workflow_install` / `agent_install` / `packet_install` (pick what fits the proposal shape).\n- `draft`: full draft body matching the kind's schema. Always include `root_cause`, `proposal`, `blast_radius`, and `draft_artifact_ref` so the Slack-emit subworkflow can render them. Omit only if genuinely n/a.\n- `idempotency_key`: stable across retries; default uuid is fine.\n\nIf scout_findings is empty (clean-slate day): switch to **dream/explore** mode. Mine the corpus for non-triage proposals worth surfacing — workflow extraction candidates (recurring tool sequences worth promoting), brofile patterns from past dispatches, knowledge gaps, agent extraction (specialist roles emerging from session shapes). Emit those via the same bg-action-emit-proposal notes. Stay grounded — every proposal needs a concrete evidence_refs trail.\n\nIf nothing actionable in either mode: emit nothing. The brief stays empty today; that's the correct outcome.\n\nReply concisely (one paragraph) describing what you found and chose to emit.",
+              "timeout_seconds": 900
+            },
+            "timeout_secs": 960
+          },
+          "into_var": "synthesis_response",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "ListProposals" }
+    },
+    "ListProposals": {
+      "actor": "",
+      "prompt": "Read the proposals Badgey emitted this synthesis turn.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_proposals_list",
+            "arguments": {
+              "badgey_id": "${vars.badgey_id}",
+              "since": "${vars.synthesis_started_at}",
+              "only_pending": true
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "proposals_response",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "ForeachPostProposal" }
+    },
+    "ForeachPostProposal": {
+      "actor": "",
+      "prompt": "Post each proposal to Slack. Foreach iterates 0 times when empty (silent day = no spam).",
+      "foreach": {
+        "items": "${vars.proposals_response.proposals}",
+        "as_var": "proposal",
+        "subworkflow_ref": "badgey-slack-emit-proposal-arc",
+        "imports": ["team_id", "channel_id", "channel_name", "project_dir", "badgey_id"],
+        "exports": [],
+        "parallelism": 1,
+        "on_item_failure": "continue",
+        "collect": { "into_var": "post_results" }
+      },
+      "next": { "type": "terminal" }
+    }
+  }
+}

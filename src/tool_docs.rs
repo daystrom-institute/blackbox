@@ -726,6 +726,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
+        name: "badgey_proposals_list",
+        category: ToolCategory::Orchestration,
+        summary: "List BadgeyProposal records owned by an instance. Returns full proposal objects (id, kind, state, draft, created_at, updated_at, events, applied_task_id) sorted by proposal_id number. Optional `since` filter (ISO timestamp) restricts to proposals created at or after that moment — useful for reading proposals emitted by the most recent Badgey turn. Used by the per-channel triage workflow's ForeachPostProposal node to iterate proposals freshly emitted by the synthesis turn.",
+        when_to_use: "Workflow node that needs the full proposal record (draft fields, state, etc.) — `badgey_resume` only returns proposal_id list, not the bodies. Pair with `since` set to the synthesis-turn start timestamp to scope to just-emitted proposals.",
+        example: Some(
+            r#"badgey_proposals_list(badgey_id="bg-deadbeef-cafef00d", since="2026-05-07T08:00:00Z", only_pending=true)"#,
+        ),
+    },
+    ToolDoc {
         name: "badgey_ensure_for_channel",
         category: ToolCategory::Orchestration,
         summary: "Get-or-create the system Badgey instance that authors triage briefs for a Slack-bound project. Reads the (team_id, channel_id) binding to resolve the project scope, looks up the binding's badgey_id; if absent or the instance has been dismissed, exec a fresh Badgey instance, persist its id back on the binding, and return it. Used by the per-channel triage workflow's EnsureInstance node.",
