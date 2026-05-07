@@ -243,9 +243,7 @@ mod tests {
         assert!(!store
             .set_badgey_id("T01", "C01", Some("bg-deadbeef-cafef00d".into()))
             .unwrap());
-        store
-            .bind(sample("T01", "C01", "ts", "/repo/x"))
-            .unwrap();
+        store.bind(sample("T01", "C01", "ts", "/repo/x")).unwrap();
         assert!(store
             .set_badgey_id("T01", "C01", Some("bg-deadbeef-cafef00d".into()))
             .unwrap());

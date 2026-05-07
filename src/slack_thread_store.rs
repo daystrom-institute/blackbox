@@ -38,10 +38,9 @@ impl SlackThreadStore {
     pub fn open(store_dir: &Path) -> Result<Self> {
         let path = store_dir.join(STORE_FILE);
         let data = if path.exists() {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", path.display()))?
+            let raw =
+                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
         } else {
             StoreData::default()
         };

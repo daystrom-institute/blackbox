@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -927,12 +927,10 @@ mod tests {
         let parsed: RefactorStatus = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed.language, "rust");
         assert_eq!(parsed.parse.error_nodes, 0);
-        assert!(
-            parsed
-                .items
-                .iter()
-                .any(|item| item.kind == "struct_item" && item.name.as_deref() == Some("Thing"))
-        );
+        assert!(parsed
+            .items
+            .iter()
+            .any(|item| item.kind == "struct_item" && item.name.as_deref() == Some("Thing")));
         assert!(parsed.items.iter().any(|item| {
             item.attributes
                 .iter()
@@ -994,12 +992,10 @@ mod tests {
         let parsed: RefactorStatus = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed.language, "typescript");
         assert_eq!(parsed.parse.error_nodes, 0);
-        assert!(
-            parsed
-                .items
-                .iter()
-                .any(|item| item.kind.contains("export") || item.name.as_deref() == Some("helper"))
-        );
+        assert!(parsed
+            .items
+            .iter()
+            .any(|item| item.kind.contains("export") || item.name.as_deref() == Some("helper")));
     }
 
     #[test]

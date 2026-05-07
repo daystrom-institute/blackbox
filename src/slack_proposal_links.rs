@@ -107,10 +107,9 @@ impl SlackProposalLinks {
     pub fn open(store_dir: &Path) -> Result<Self> {
         let path = store_dir.join(STORE_FILE);
         let data = if path.exists() {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", path.display()))?
+            let raw =
+                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
         } else {
             StoreData::default()
         };
@@ -162,8 +161,7 @@ impl SlackProposalLinks {
             link.version = 1;
         }
         let key = compose_key(&link.team_id, &link.channel_id, &link.msg_ts);
-        let proposal_key =
-            compose_proposal_key(&link.team_id, &link.channel_id, &link.proposal_id);
+        let proposal_key = compose_proposal_key(&link.team_id, &link.channel_id, &link.proposal_id);
         {
             let mut data = self.inner.write();
             data.by_proposal.remove(&proposal_key);
@@ -242,11 +240,7 @@ impl SlackProposalLinks {
     /// Rewrite project_dir on every link that matched the old path.
     /// Returns the number of records updated. Persists once at the end
     /// if anything changed.
-    pub fn rename_project_refs(
-        &self,
-        old_project: &str,
-        new_project: &str,
-    ) -> Result<usize> {
+    pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Result<usize> {
         let mut updated = 0usize;
         {
             let mut data = self.inner.write();
@@ -341,14 +335,20 @@ mod tests {
         assert_eq!(got.proposal_id, "prop-abc");
         assert_eq!(got.version, 1);
         assert_eq!(
-            store.lookup_by_proposal("T01", "C01", "prop-abc").unwrap().msg_ts,
+            store
+                .lookup_by_proposal("T01", "C01", "prop-abc")
+                .unwrap()
+                .msg_ts,
             "ts1"
         );
         // Reopen — survives.
         drop(store);
         let store = SlackProposalLinks::open(dir.path()).unwrap();
         assert_eq!(
-            store.lookup_by_proposal("T01", "C01", "prop-abc").unwrap().msg_ts,
+            store
+                .lookup_by_proposal("T01", "C01", "prop-abc")
+                .unwrap()
+                .msg_ts,
             "ts1"
         );
     }
@@ -357,23 +357,11 @@ mod tests {
     fn version_bump_only_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let store = SlackProposalLinks::open(dir.path()).unwrap();
-        assert!(store
-            .bump_version("T01", "C01", "ts1")
-            .unwrap()
-            .is_none());
+        assert!(store.bump_version("T01", "C01", "ts1").unwrap().is_none());
         store.record(sample("ts1", "prop-abc", None)).unwrap();
-        assert_eq!(
-            store.bump_version("T01", "C01", "ts1").unwrap(),
-            Some(2)
-        );
-        assert_eq!(
-            store.bump_version("T01", "C01", "ts1").unwrap(),
-            Some(3)
-        );
-        assert_eq!(
-            store.lookup_by_msg("T01", "C01", "ts1").unwrap().version,
-            3
-        );
+        assert_eq!(store.bump_version("T01", "C01", "ts1").unwrap(), Some(2));
+        assert_eq!(store.bump_version("T01", "C01", "ts1").unwrap(), Some(3));
+        assert_eq!(store.lookup_by_msg("T01", "C01", "ts1").unwrap().version, 3);
     }
 
     #[test]

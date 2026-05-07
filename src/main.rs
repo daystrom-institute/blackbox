@@ -4657,14 +4657,8 @@ async fn try_slack_proposal_signal_hook(
     if thread_ts.is_empty() {
         return;
     }
-    let team_id = entity
-        .get("team_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let channel_id = entity
-        .get("channel")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let team_id = entity.get("team_id").and_then(|v| v.as_str()).unwrap_or("");
+    let channel_id = entity.get("channel").and_then(|v| v.as_str()).unwrap_or("");
     if team_id.is_empty() || channel_id.is_empty() {
         return;
     }
@@ -6366,8 +6360,9 @@ impl BlackboxServer {
                 // an already-active channel doesn't orphan its system
                 // BadgeyInstance. The instance lifecycle is unbind-only;
                 // rebind updates project/name/path in place.
-                let prior_badgey_id =
-                    store.lookup(&team_id, &channel_id).and_then(|b| b.badgey_id);
+                let prior_badgey_id = store
+                    .lookup(&team_id, &channel_id)
+                    .and_then(|b| b.badgey_id);
                 let binding = slack_channel_bindings::ChannelBinding {
                     team_id: team_id.clone(),
                     channel_id: channel_id.clone(),
@@ -6403,8 +6398,8 @@ impl BlackboxServer {
                         // is logged but doesn't fail the unbind.
                         let mut dismissed_badgey: Option<String> = None;
                         if let Some(ref bid) = prior.badgey_id {
-                            if let Ok(parsed) = bid
-                                .parse::<orchestration::badgey::types::BadgeyId>()
+                            if let Ok(parsed) =
+                                bid.parse::<orchestration::badgey::types::BadgeyId>()
                             {
                                 match self.state.badgey_registry.dismiss(&parsed) {
                                     Ok(_) => dismissed_badgey = Some(bid.clone()),
@@ -10609,8 +10604,7 @@ async fn dispatch_verdict(
             // once §6.3 sub-bro authoring stores proposals under a
             // registered BadgeyInstance.
             if matches!(signal.as_str(), "proposal-approved" | "proposal-clarify")
-                && resolved.get("status").and_then(|v| v.as_str())
-                    == Some("no_matching_wait")
+                && resolved.get("status").and_then(|v| v.as_str()) == Some("no_matching_wait")
             {
                 try_slack_proposal_signal_hook(&signal, &state, &correlate, &entity).await;
             }
@@ -13370,13 +13364,8 @@ mod tests {
             "user": "Ualice",
         });
         std::env::remove_var("SLACK_BOT_TOKEN");
-        try_slack_proposal_signal_hook(
-            "proposal-approved",
-            &server.state,
-            &correlate,
-            &entity,
-        )
-        .await;
+        try_slack_proposal_signal_hook("proposal-approved", &server.state, &correlate, &entity)
+            .await;
         // Nothing to assert beyond "did not panic" — but make a
         // sanity probe on the link store size to confirm we didn't
         // accidentally insert anything.

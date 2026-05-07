@@ -592,14 +592,13 @@ fn parse_versioned(input: &str) -> Result<(String, Option<String>)> {
 /// matching. Kept tight (high-frequency function words only) so domain
 /// terms still match. Length<3 tokens are filtered separately.
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "you", "are", "but", "with", "that", "this", "from",
-    "into", "your", "they", "them", "their", "there", "when", "what", "which",
-    "while", "would", "could", "should", "have", "has", "had", "was", "were",
-    "been", "being", "will", "shall", "can", "may", "not", "use", "using",
-    "use's", "yes", "no", "off", "any", "all", "some", "more", "most",
-    "much", "many", "few", "such", "very", "just", "only", "than", "then",
-    "now", "how", "why", "where", "who", "whom", "whose", "its", "his",
-    "her", "him", "she", "out", "our", "ours", "owns", "own", "via", "per",
+    "the", "and", "for", "you", "are", "but", "with", "that", "this", "from", "into", "your",
+    "they", "them", "their", "there", "when", "what", "which", "while", "would", "could", "should",
+    "have", "has", "had", "was", "were", "been", "being", "will", "shall", "can", "may", "not",
+    "use", "using", "use's", "yes", "no", "off", "any", "all", "some", "more", "most", "much",
+    "many", "few", "such", "very", "just", "only", "than", "then", "now", "how", "why", "where",
+    "who", "whom", "whose", "its", "his", "her", "him", "she", "out", "our", "ours", "owns", "own",
+    "via", "per",
 ];
 
 fn token_match(query_term: &str, target_token: &str) -> bool {

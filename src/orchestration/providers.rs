@@ -1172,9 +1172,7 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
                                 continue;
                             }
                             append_block_separator(&mut sink.last_assistant_message);
-                            let buf = sink
-                                .last_assistant_message
-                                .get_or_insert_with(String::new);
+                            let buf = sink.last_assistant_message.get_or_insert_with(String::new);
                             buf.push_str(text);
                         }
                     }
@@ -2458,9 +2456,15 @@ mod tests {
             session_id: None,
         };
         Provider::Claude.parse_event(&hook_started, &mut sink);
-        assert_eq!(sink.session_id, None, "hook_started must not set session_id");
+        assert_eq!(
+            sink.session_id, None,
+            "hook_started must not set session_id"
+        );
         Provider::Claude.parse_event(&hook_response, &mut sink);
-        assert_eq!(sink.session_id, None, "hook_response must not set session_id");
+        assert_eq!(
+            sink.session_id, None,
+            "hook_response must not set session_id"
+        );
         Provider::Claude.parse_event(&init, &mut sink);
         assert_eq!(
             sink.session_id.as_deref(),
