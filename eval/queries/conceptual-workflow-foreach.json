@@ -10,7 +10,7 @@
     }
   ],
   "expected_entity_refs": [
-    "project_file:d723917f:3b317e2b:787918832e25a66fea227dc08e38a2fe6cb60fbcbc04ee595b9377abbbaa14d0:12"
+    "project_file:d723917f:3b317e2b:1a5c6e7d2b39b86f4313f0ec6b6a8f074321c62ce82e81b8c596fe7002918026:12"
   ],
   "required_evidence": {
     "kind": "path",

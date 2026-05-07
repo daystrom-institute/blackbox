@@ -1013,9 +1013,9 @@ Implementation status:
 2. Landed: sequential `foreach` runtime; `halt` and `collect_then_halt` behave
    equivalently while effective parallelism is 1.
 3. Landed: `matrix` expansion into the shared `foreach` runtime path.
-4. Remaining: bounded parallel fanout scheduler. The schema accepts
-   `parallelism`, but the current runtime records `effective_parallelism = 1`
-   until the scheduler can keep the workflow future `Send` for Axum/MCP.
+4. Landed: bounded parallel fanout scheduler. Child arcs run on owned worker
+   runtimes with parent-cancel-token chaining so the MCP handler remains a
+   pollable task launcher rather than the owner of the full workflow lifetime.
 
 Adjacent primitives considered while the hood was open:
 
@@ -1267,11 +1267,12 @@ multi-run orchestration problem, not just a local loop over test cases.
    search surface has no per-turn budget today. Three options: accept soft
    prompt-only budget, limit per-tool via response-size cap, write a
    per-MCP-session tool-call counter in Rust. Decision pending eval signal.
-2. **Workflow fanout parallel scheduler.** `foreach`/`matrix` schema,
-   validation, sequential runtime, failure collection, cancellation
-   propagation into child arcs, and matrix expansion are implemented. Remaining
-   work: bounded parallel scheduling that preserves the `Send` future required
-   by Axum/MCP handlers.
+2. **Workflow task lifecycle.** `bro_orchestrate_run` now mirrors
+   `bro_exec`/`bro_status`/`bro_wait`: it launches a pollable workflow task by
+   default and only blocks with `await_completion=true`. Remaining design
+   question: how much of the HTTP `/orchestrate` surface should also switch
+   from blocking responses to task-first responses versus keeping `/stream`
+   for streaming callers.
 3. **Multimodal embedding model selection.** When PDF figures, Excel charts,
    or standalone images become a measured eval gap, evaluate
    `voyage-multimodal-3` vs CLIP vs open alternatives. Until then, text-only

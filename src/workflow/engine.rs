@@ -155,6 +155,32 @@ pub async fn run_workflow_with_initial_vars(
     .await
 }
 
+/// Same as [`run_workflow_with_initial_vars`] but with a caller-minted
+/// arc id. Used by async MCP orchestration so the returned task can
+/// expose a stable arc id immediately.
+pub async fn run_workflow_with_initial_vars_and_arc_id(
+    server: &BlackboxServer,
+    compiled: &CompiledWorkflow,
+    project_dir: Option<String>,
+    max_steps: Option<usize>,
+    initial_vars: Map<String, Value>,
+    arc_id: String,
+) -> WorkflowRunResult {
+    run_workflow_at_depth_with_cancel(
+        server,
+        compiled,
+        project_dir,
+        max_steps,
+        0,
+        HashMap::new(),
+        initial_vars,
+        None,
+        None,
+        Some(arc_id),
+    )
+    .await
+}
+
 /// Streaming variant: runs the workflow while forwarding every
 /// `log_event` to the provided sender. The final `WorkflowRunResult`
 /// is still returned synchronously so the HTTP handler can emit it
@@ -183,8 +209,53 @@ pub async fn run_workflow_streaming_with_vars(
     compiled: &CompiledWorkflow,
     project_dir: Option<String>,
     max_steps: Option<usize>,
+    initial_vars: Map<String, Value>,
+    event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
+) -> WorkflowRunResult {
+    run_workflow_streaming_with_vars_inner(
+        server,
+        compiled,
+        project_dir,
+        max_steps,
+        initial_vars,
+        event_sink,
+        None,
+    )
+    .await
+}
+
+/// Streaming variant with a caller-minted arc id. Used by async MCP
+/// orchestration so `bro_orchestrate_run` can return a pollable
+/// `arcId` immediately and still stream events into the backing task.
+pub async fn run_workflow_streaming_with_vars_and_arc_id(
+    server: &BlackboxServer,
+    compiled: &CompiledWorkflow,
+    project_dir: Option<String>,
+    max_steps: Option<usize>,
+    initial_vars: Map<String, Value>,
+    event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
+    arc_id: String,
+) -> WorkflowRunResult {
+    run_workflow_streaming_with_vars_inner(
+        server,
+        compiled,
+        project_dir,
+        max_steps,
+        initial_vars,
+        event_sink,
+        Some(arc_id),
+    )
+    .await
+}
+
+async fn run_workflow_streaming_with_vars_inner(
+    server: &BlackboxServer,
+    compiled: &CompiledWorkflow,
+    project_dir: Option<String>,
+    max_steps: Option<usize>,
     mut initial_vars: Map<String, Value>,
     event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
+    arc_id_override: Option<String>,
 ) -> WorkflowRunResult {
     let actor_session_seeds = extract_actor_session_seeds(&mut initial_vars);
     let mut runner = WorkflowRunner::new(
@@ -194,6 +265,7 @@ pub async fn run_workflow_streaming_with_vars(
         max_steps.unwrap_or(50),
         0,
         None,
+        arc_id_override,
     );
     runner.event_sink = Some(event_sink);
     for (actor, session) in actor_session_seeds {
@@ -339,6 +411,7 @@ pub async fn run_workflow_at_depth(
         initial_vars,
         parent_arc_id,
         None,
+        None,
     )
     .await
 }
@@ -355,6 +428,7 @@ async fn run_workflow_at_depth_with_cancel(
     mut initial_vars: Map<String, Value>,
     parent_arc_id: Option<String>,
     parent_cancel_token: Option<CancellationToken>,
+    arc_id_override: Option<String>,
 ) -> WorkflowRunResult {
     let actor_session_seeds = extract_actor_session_seeds(&mut initial_vars);
     if composition_depth > MAX_COMPOSITION_DEPTH {
@@ -378,6 +452,7 @@ async fn run_workflow_at_depth_with_cancel(
         max_steps.unwrap_or(50),
         composition_depth,
         parent_cancel_token.as_ref(),
+        arc_id_override,
     );
     runner.node_outputs = seed_outputs.clone();
     for (actor, session) in actor_session_seeds {
@@ -623,8 +698,10 @@ impl<'a> WorkflowRunner<'a> {
         max_steps: usize,
         composition_depth: u32,
         parent_cancel_token: Option<&CancellationToken>,
+        arc_id_override: Option<String>,
     ) -> Self {
-        let arc_id = format!("arc-{}", uuid::Uuid::new_v4().simple());
+        let arc_id =
+            arc_id_override.unwrap_or_else(|| format!("arc-{}", uuid::Uuid::new_v4().simple()));
         let ctx = ArcContext::new(ArcMeta {
             arc_id: arc_id.clone(),
             workflow_name: compiled.spec.name.clone(),
@@ -1563,6 +1640,11 @@ impl<'a> WorkflowRunner<'a> {
         let seed_outputs = self.node_outputs.clone();
         let project_dir = self.project_dir.clone();
         let parent_arc_id = self.ctx.meta.arc_id.clone();
+        let group_cancel = self.cancel_token.child_token();
+        let effective_parallelism = runtime.parallelism.max(1).min(MAX_FOREACH_PARALLELISM);
+        let mut joinset = tokio::task::JoinSet::new();
+        let mut next_to_start = 0usize;
+        let mut stop_new_dispatch = false;
 
         self.log_event(
             "fanout_begin",
@@ -1571,45 +1653,83 @@ impl<'a> WorkflowRunner<'a> {
                 "kind": runtime.kind,
                 "items": total,
                 "parallelism": runtime.parallelism,
-                // TODO(thread-cba8bfa1): replace with the bounded
-                // scheduler's computed parallelism once the fanout
-                // future remains Send under Axum/MCP.
-                "effective_parallelism": 1,
+                "effective_parallelism": effective_parallelism,
                 "collect_into": runtime.collect_into,
                 "on_item_failure": runtime.failure_policy,
             }),
         );
 
-        for plan in plans.iter().cloned() {
+        while next_to_start < total || !joinset.is_empty() {
             if self.cancel_token.is_cancelled() {
+                group_cancel.cancel();
                 bail!("arc cancelled");
             }
-            if first_failure.is_some()
-                && !matches!(runtime.failure_policy, ItemFailurePolicy::Continue)
+
+            while !stop_new_dispatch
+                && next_to_start < total
+                && joinset.len() < effective_parallelism
             {
-                results[plan.index] = Some(fanout_skipped_value(plan.index, &plan));
-                continue;
+                let plan = plans[next_to_start].clone();
+                self.log_event(
+                    "fanout_item_start",
+                    json!({
+                        "node": node_id,
+                        "index": plan.index,
+                        "key": plan.key,
+                    }),
+                );
+                let state = self.server.state.clone();
+                let compiled_for_child = compiled.clone();
+                let project_dir_for_child = project_dir.clone();
+                let seed_outputs_for_child = seed_outputs.clone();
+                let parent_arc_id_for_child = parent_arc_id.clone();
+                let cancel_for_child = group_cancel.clone();
+                let exports_for_child = runtime.exports.clone();
+                joinset.spawn_blocking(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    let Ok(runtime) = runtime else {
+                        return FanoutChildOutcome {
+                            index: plan.index,
+                            key: plan.key,
+                            item: plan.item,
+                            status: "error".into(),
+                            exports: Map::new(),
+                            outputs: Map::new(),
+                            arc_id: String::new(),
+                            arc_thread_id: None,
+                            error: Some("failed to build fanout child runtime".into()),
+                        };
+                    };
+                    runtime.block_on(run_fanout_child_owned(
+                        state,
+                        compiled_for_child,
+                        project_dir_for_child,
+                        child_depth,
+                        seed_outputs_for_child,
+                        parent_arc_id_for_child,
+                        cancel_for_child,
+                        plan,
+                        exports_for_child,
+                    ))
+                });
+                next_to_start += 1;
             }
-            self.log_event(
-                "fanout_item_start",
-                json!({
-                    "node": node_id,
-                    "index": plan.index,
-                    "key": plan.key,
-                }),
-            );
-            let outcome = run_fanout_child(
-                self.server,
-                compiled.clone(),
-                project_dir.clone(),
-                child_depth,
-                seed_outputs.clone(),
-                parent_arc_id.clone(),
-                self.cancel_token.clone(),
-                plan,
-                runtime.exports.clone(),
-            )
-            .await;
+
+            if joinset.is_empty() {
+                break;
+            }
+            let outcome = match joinset.join_next().await {
+                Some(Ok(outcome)) => outcome,
+                Some(Err(err)) => {
+                    first_failure.get_or_insert_with(|| format!("fanout child task join: {err}"));
+                    stop_new_dispatch = true;
+                    group_cancel.cancel();
+                    continue;
+                }
+                None => break,
+            };
             let failed = outcome.is_failure();
             let failure_msg = outcome
                 .error
@@ -1636,6 +1756,18 @@ impl<'a> WorkflowRunner<'a> {
                 && !matches!(runtime.failure_policy, ItemFailurePolicy::Continue)
             {
                 first_failure = Some(failure_msg);
+                stop_new_dispatch = true;
+                if matches!(runtime.failure_policy, ItemFailurePolicy::Halt) {
+                    group_cancel.cancel();
+                }
+            }
+        }
+
+        if stop_new_dispatch {
+            for idx in next_to_start..total {
+                if results[idx].is_none() {
+                    results[idx] = Some(fanout_skipped_value(idx, &plans[idx]));
+                }
             }
         }
 
@@ -2316,6 +2448,7 @@ impl<'a> WorkflowRunner<'a> {
             initial_vars,
             Some(parent_arc_id),
             Some(self.cancel_token.clone()),
+            None,
         ))
         .await;
 
@@ -2679,6 +2812,32 @@ impl<'a> WorkflowRunner<'a> {
     }
 }
 
+async fn run_fanout_child_owned(
+    state: Arc<crate::SharedState>,
+    compiled: CompiledWorkflow,
+    project_dir: Option<String>,
+    child_depth: u32,
+    seed_outputs: HashMap<String, String>,
+    parent_arc_id: String,
+    parent_cancel_token: CancellationToken,
+    plan: FanoutChildPlan,
+    exports: Vec<String>,
+) -> FanoutChildOutcome {
+    let server = BlackboxServer::new(state);
+    run_fanout_child(
+        &server,
+        compiled,
+        project_dir,
+        child_depth,
+        seed_outputs,
+        parent_arc_id,
+        parent_cancel_token,
+        plan,
+        exports,
+    )
+    .await
+}
+
 async fn run_fanout_child(
     server: &BlackboxServer,
     compiled: CompiledWorkflow,
@@ -2700,6 +2859,7 @@ async fn run_fanout_child(
         plan.initial_vars,
         Some(parent_arc_id),
         Some(parent_cancel_token),
+        None,
     ))
     .await;
 

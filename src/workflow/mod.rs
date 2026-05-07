@@ -18,7 +18,8 @@ pub mod wait;
 
 pub use engine::{
     run_workflow, run_workflow_streaming, run_workflow_streaming_with_vars,
-    run_workflow_with_initial_vars, WorkflowRunResult,
+    run_workflow_streaming_with_vars_and_arc_id, run_workflow_with_initial_vars,
+    run_workflow_with_initial_vars_and_arc_id, WorkflowRunResult,
 };
 pub use schema::{
     load_workflow, ActorKind, ActorSpec, BranchSelector, ForeachCollect, ForeachSpec, GateMode,
