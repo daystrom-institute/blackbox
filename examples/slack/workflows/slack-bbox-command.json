@@ -23,7 +23,7 @@
   "nodes": {
     "Dispatch": {
       "actor": "badgey",
-      "prompt": "[scope]\nbright\nblackboard\n\nSlack user @${vars.bbox_user} ran `/bbox ${vars.text}` in channel ${vars.channel}.\n\nYou have full dispatch access. Interpret the command text and take appropriate action:\n\n- `status [arc_id]` → report recent arcs or a specific one\n- `inbox` → summarize the user's bbox_inbox\n- `triage` → kick a badgey-triage workflow for ${vars.bbox_user}\n- `<free-text question>` → answer as badgey-ask\n- `cosession start` → guide the user through starting a cosession\n\nReply concisely as a plain-text reply. The response will be posted to Slack via the response_url deferred-reply pattern.",
+      "prompt": "Slack user @${vars.bbox_user} ran `/bbox ${vars.text}` in channel ${vars.channel}.\n\nYou have full dispatch access. Interpret the command text and take appropriate action:\n\n- `status [arc_id]` → report recent arcs or a specific one\n- `inbox` → summarize the user's bbox_inbox\n- `triage` → kick a badgey-triage workflow for ${vars.bbox_user}\n- `<free-text question>` → answer as badgey-ask\n- `cosession start` → guide the user through starting a cosession\n\nReply concisely as a plain-text reply. The response will be posted to Slack via the response_url deferred-reply pattern.",
       "next": { "type": "goto", "to": "PostReply" }
     },
     "PostReply": {
