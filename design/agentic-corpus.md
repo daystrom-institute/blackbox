@@ -71,8 +71,8 @@ and stops; the calling LLM (or operator) can act on it manually.
   RRF hybrid formula, contradiction-detection tiers, canonical-entity-id
   fusion bug. Lift the formulas; skip the lens-scoped retrieval machinery.
 - **daystrom-mk2 / `spikes/run-agentic-eval.sh`** — shell-script harness
-  pattern. Adapt as the eval-matrix runner (avoids needing a workflow
-  engine `foreach` primitive in v1).
+  pattern. Use as the bootstrap eval-matrix runner until workflow
+  `foreach`/`matrix` runtime support is complete.
 - **erlang-test / `apps/substrate/native/substrate_native/src/{hnsw,fts,db,distance}.rs`** —
   per-kind tantivy + custom HNSW (1233 LoC), SIMD cosine via `wide::f32x8`,
   `m=32 / ef_construction=200 / ef_search=200`. Rust storage donor.
@@ -986,9 +986,44 @@ nightly-eval-arc
 ```
 
 The shell-script approach (adapted from `daystrom-mk2/spikes/run-agentic-eval.sh`)
-sidesteps the missing workflow-engine `foreach` primitive (tracked in
-bbox_thread `thread-cba8bfa1`). When the engine grows `foreach`, this arc
-collapses to native workflow.
+is the bootstrap runner. Once workflow `foreach`/`matrix` runtime support
+lands, `Setup` can materialize the query manifest and `RunSuite` can become a
+native fanout node instead of shelling out per query.
+
+### 12.8 Workflow fanout primitive
+
+Accepted in bbox_thread `thread-cba8bfa1`: workflow fanout belongs on
+`NodeSpec` as a node body, not on `NodeTransition`.
+
+- `foreach` runs one child subworkflow per materialized item.
+- `matrix` is Cartesian-product sugar that materializes axis objects and then
+  enters the same execution path as `foreach`.
+- Each fanout node binds `as_var`, optional `index_as`, optional rendered
+  `key`, child `imports` / `import_renames`, child terminal `exports`, bounded
+  `parallelism`, `collect.into_var`, and `on_item_failure`.
+- `on_item_failure` is `halt | collect_then_halt | continue`. `halt` is
+  fail-fast and cancels in-flight siblings when parallel runtime support exists.
+  `collect_then_halt` stops new dispatch, drains already-started siblings,
+  records their item results, then fails the parent node. `continue` keeps
+  dispatching siblings and records both successes and failures.
+
+Implementation status:
+
+1. Landed: schema and validation, including inline child workflow validation.
+2. Landed: sequential `foreach` runtime; `halt` and `collect_then_halt` behave
+   equivalently while effective parallelism is 1.
+3. Landed: `matrix` expansion into the shared `foreach` runtime path.
+4. Remaining: bounded parallel fanout scheduler. The schema accepts
+   `parallelism`, but the current runtime records `effective_parallelism = 1`
+   until the scheduler can keep the workflow future `Send` for Axum/MCP.
+
+Adjacent primitives considered while the hood was open:
+
+| Candidate | Decision | Correct host |
+|---|---|---|
+| `reduce` / aggregate node primitive | Defer as a node primitive. Fanout should collect structured item results; aggregate classification belongs outside fanout. | HookOp `AggregateArray` plus packet-AST selectors such as `CountWhere` / `AnyMatch`. |
+| Post-expansion policy-packet gate | Defer. Policy packets already run at workflow boundaries once counts exist; fanout should not embed a second packet gate. | Length-aware templating (`|length`) or a `CountArray` HookOp feeding existing `policy_packet` gates. |
+| `map_result` parent adapter | Defer until a concrete third-party child-workflow adapter case appears. | Child-owned `on_arc_exit` for workflows we control; a later parent-side adapter only if needed. |
 
 ## 13. Packet catalog
 
@@ -1166,17 +1201,17 @@ Per query:
 - Agentic must beat search-only by ≥ 10pp.
 - Static hybrid must beat search-only by ≥ 10pp to ship as a default.
 
-### 16.4 Harness shape — shell script
+### 16.4 Harness shape — shell script, then native fanout
 
 Adapted from `daystrom-mk2/spikes/run-agentic-eval.sh`. Iterates the query
 suite, dispatches a stock LLM with the bbox tools attached against
 blackboxd-dev over HTTP MCP. Per-query JSON verdict; aggregate scoreboard.
 Run nightly via cron-inlet workflow (§12.7).
 
-The shell-script approach sidesteps the missing workflow-engine `foreach`
-primitive (tracked in bbox_thread `thread-cba8bfa1`). The harness is a
-script (not a workflow) because workflows are for multi-actor protocols, not
-"loop over a list of test cases."
+The shell-script approach remains useful as a bootstrap harness and a plain
+CLI escape hatch. Native workflow fanout (§12.8) is the intended long-term
+shape for the nightly suite because the eval matrix has become a first-class
+multi-run orchestration problem, not just a local loop over test cases.
 
 ## 17. Observability
 
@@ -1232,9 +1267,11 @@ script (not a workflow) because workflows are for multi-actor protocols, not
    search surface has no per-turn budget today. Three options: accept soft
    prompt-only budget, limit per-tool via response-size cap, write a
    per-MCP-session tool-call counter in Rust. Decision pending eval signal.
-2. **Workflow `foreach` engine primitive.** Tracked in bbox_thread
-   `thread-cba8bfa1`. Eval matrix uses shell-script workaround for now;
-   re-evaluate priority once a second use case surfaces.
+2. **Workflow fanout parallel scheduler.** `foreach`/`matrix` schema,
+   validation, sequential runtime, failure collection, cancellation
+   propagation into child arcs, and matrix expansion are implemented. Remaining
+   work: bounded parallel scheduling that preserves the `Send` future required
+   by Axum/MCP handlers.
 3. **Multimodal embedding model selection.** When PDF figures, Excel charts,
    or standalone images become a measured eval gap, evaluate
    `voyage-multimodal-3` vs CLIP vs open alternatives. Until then, text-only

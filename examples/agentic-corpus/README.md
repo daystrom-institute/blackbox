@@ -119,7 +119,8 @@ primitives that are still deferred:
 - `auto-digest-arc` → needs the `task-completed` signal which `bro_exec`
   doesn't emit yet (tracked in `thread-3cfbf9e0`).
 - `auto-edge-arc` → processes ONE candidate per invocation; full batch
-  needs the `foreach` workflow primitive (tracked in `thread-cba8bfa1`).
+  should be rewritten onto native workflow fanout (tracked in
+  `thread-cba8bfa1`).
 - `nightly-eval-arc` → workflow gates can't consume subprocess stdout
   yet; arc records that the harness ran but can't route on actual drift
   (tracked in `thread-3cfbf9e0`).

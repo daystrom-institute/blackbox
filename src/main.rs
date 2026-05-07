@@ -269,6 +269,21 @@ impl SharedState {
         token
     }
 
+    /// Register a cancel token that is chained to a parent token.
+    /// Cancelling the parent trips the child, while the child still
+    /// remains addressable directly through `cancel_arc`.
+    pub fn register_arc_cancel_token_child(
+        &self,
+        arc_id: &str,
+        parent: &CancellationToken,
+    ) -> CancellationToken {
+        let token = parent.child_token();
+        self.arc_cancel_tokens
+            .write()
+            .insert(arc_id.to_string(), token.clone());
+        token
+    }
+
     /// Drop the cancel token for an arc that's reached terminal
     /// state. Called from the runner's exit path so the map doesn't
     /// grow unbounded across daemon uptime.
@@ -2741,6 +2756,17 @@ impl BlackboxServer {
     /// between node iterations and inside Wait suspensions.
     pub fn register_arc_cancel_token(&self, arc_id: &str) -> CancellationToken {
         self.state.register_arc_cancel_token(arc_id)
+    }
+
+    /// Register an arc cancel token chained to a parent arc/group
+    /// token. Used by nested workflows so cancellation propagates
+    /// down the composition tree.
+    pub fn register_arc_cancel_token_child(
+        &self,
+        arc_id: &str,
+        parent: &CancellationToken,
+    ) -> CancellationToken {
+        self.state.register_arc_cancel_token_child(arc_id, parent)
     }
 
     /// Drop the arc's cancel token. Called by the runner at terminus.
@@ -14111,6 +14137,221 @@ mod tests {
         );
         assert!(past_ceiling.events.is_empty());
         assert!(past_ceiling.arc_thread_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_foreach_runtime_collects_child_exports() {
+        use crate::workflow::{compile, engine, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let json = r#"{
+            "name": "foreach-runtime",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "parent": {"kind": "string"},
+                "results": {"kind": "array"}
+            },
+            "nodes": {
+                "Each": {
+                    "actor": "",
+                    "foreach": {
+                        "items": ["a", "b"],
+                        "as_var": "item",
+                        "index_as": "idx",
+                        "key": "${vars.item}-${vars.idx}",
+                        "imports": ["parent"],
+                        "exports": ["summary"],
+                        "collect": {"into_var": "results"},
+                        "subworkflow": {
+                            "name": "foreach-child",
+                            "version": 1,
+                            "actors": {},
+                            "vars_schema": {
+                                "item": {"kind": "string"},
+                                "idx": {"kind": "int"},
+                                "parent": {"kind": "string"},
+                                "summary": {"kind": "object"}
+                            },
+                            "nodes": {
+                                "Make": {
+                                    "actor": "",
+                                    "on_enter": [{
+                                        "op": "set_var",
+                                        "args": {
+                                            "key": "summary",
+                                            "value": {
+                                                "item": "${vars.item}",
+                                                "idx": "${vars.idx}",
+                                                "parent": "${vars.parent}"
+                                            }
+                                        }
+                                    }],
+                                    "next": {"type": "terminal"}
+                                }
+                            },
+                            "start": "Make"
+                        }
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Each"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+        let mut vars = serde_json::Map::new();
+        vars.insert("parent".into(), Value::String("p0".into()));
+        let result =
+            engine::run_workflow_with_initial_vars(&server, &compiled, None, Some(20), vars).await;
+
+        assert_eq!(result.status, "completed", "events: {:?}", result.events);
+        let rows = result
+            .vars
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("results array");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["status"], "completed");
+        assert_eq!(rows[0]["key"], "a-0");
+        assert_eq!(rows[0]["exports"]["summary"]["item"], "a");
+        assert_eq!(rows[1]["exports"]["summary"]["idx"], 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_matrix_runtime_expands_axes_through_fanout() {
+        use crate::workflow::{compile, engine, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let json = r#"{
+            "name": "matrix-runtime",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "queries": {"kind": "array"},
+                "results": {"kind": "array"}
+            },
+            "nodes": {
+                "Grid": {
+                    "actor": "",
+                    "matrix": {
+                        "axes": [
+                            {"name": "query", "values": "${vars.queries}"},
+                            {"name": "strategy", "values": ["search", "agentic"]}
+                        ],
+                        "as_var": "case",
+                        "index_as": "idx",
+                        "key": "${vars.case.query}/${vars.case.strategy}",
+                        "exports": ["summary"],
+                        "parallelism": 2,
+                        "collect": {"into_var": "results"},
+                        "subworkflow": {
+                            "name": "matrix-child",
+                            "version": 1,
+                            "actors": {},
+                            "vars_schema": {
+                                "case": {"kind": "object"},
+                                "idx": {"kind": "int"},
+                                "summary": {"kind": "object"}
+                            },
+                            "nodes": {
+                                "Make": {
+                                    "actor": "",
+                                    "on_enter": [{
+                                        "op": "set_var",
+                                        "args": {
+                                            "key": "summary",
+                                            "value": {
+                                                "query": "${vars.case.query}",
+                                                "strategy": "${vars.case.strategy}",
+                                                "idx": "${vars.idx}"
+                                            }
+                                        }
+                                    }],
+                                    "next": {"type": "terminal"}
+                                }
+                            },
+                            "start": "Make"
+                        }
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Grid"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+        let mut vars = serde_json::Map::new();
+        vars.insert("queries".into(), serde_json::json!(["q1", "q2"]));
+        let result =
+            engine::run_workflow_with_initial_vars(&server, &compiled, None, Some(20), vars).await;
+
+        assert_eq!(result.status, "completed", "events: {:?}", result.events);
+        let rows = result
+            .vars
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("results array");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["key"], "q1/search");
+        assert_eq!(rows[1]["key"], "q1/agentic");
+        assert_eq!(rows[2]["key"], "q2/search");
+        assert_eq!(rows[3]["exports"]["summary"]["strategy"], "agentic");
+    }
+
+    #[tokio::test]
+    async fn workflow_foreach_continue_collects_item_failures() {
+        use crate::workflow::{compile, engine, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let json = r#"{
+            "name": "foreach-continue",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "results": {"kind": "array"}
+            },
+            "nodes": {
+                "Each": {
+                    "actor": "",
+                    "foreach": {
+                        "items": ["a", "b"],
+                        "as_var": "item",
+                        "exports": ["missing"],
+                        "on_item_failure": "continue",
+                        "collect": {"into_var": "results"},
+                        "subworkflow": {
+                            "name": "bad-child",
+                            "version": 1,
+                            "actors": {},
+                            "vars_schema": {
+                                "item": {"kind": "string"},
+                                "missing": {"kind": "string"}
+                            },
+                            "nodes": {
+                                "NoExport": {"actor": "", "next": {"type": "terminal"}}
+                            },
+                            "start": "NoExport"
+                        }
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Each"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+        let result = engine::run_workflow(&server, &compiled, None, Some(20)).await;
+
+        assert_eq!(result.status, "completed", "events: {:?}", result.events);
+        let rows = result
+            .vars
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("results array");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["status"] == "error"));
+        assert!(rows[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("did not export declared key"));
     }
 
     #[tokio::test]
