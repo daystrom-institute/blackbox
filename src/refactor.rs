@@ -24,7 +24,8 @@ pub struct RefactorStatusParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
-    /// Plan kind. Supports "extract_rust_items" and "extract_rust_impl_methods".
+    /// Plan kind. Supports "extract_rust_items", "extract_rust_impl_methods",
+    /// and "add_rust_router_to_sum".
     pub kind: String,
     /// Source Rust file. Relative paths resolve against project_dir or cwd.
     pub source: String,
@@ -207,8 +208,9 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
     match p.kind.as_str() {
         "extract_rust_items" => plan_extract_rust_items(p),
         "extract_rust_impl_methods" => plan_extract_rust_impl_methods(p),
+        "add_rust_router_to_sum" => plan_add_rust_router_to_sum(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, add_rust_router_to_sum"
         ),
     }
 }
@@ -585,6 +587,58 @@ fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let router_name = p
+        .router_name
+        .as_deref()
+        .ok_or_else(|| anyhow!("router_name is required for add_rust_router_to_sum"))?;
+    validate_rust_identifier(router_name, "router_name")?;
+
+    let parsed = parse_rust_file(&source_path)?;
+    let field = find_rust_field_initializer(&parsed, "tool_router")
+        .ok_or_else(|| anyhow!("no `tool_router:` field initializer found"))?;
+    let field_text = parsed
+        .source
+        .get(field.start_byte()..field.end_byte())
+        .ok_or_else(|| anyhow!("invalid tool_router field range"))?;
+    let router_call = format!("Self::{router_name}()");
+    if field_text.contains(&router_call) {
+        bail!("tool_router already contains {router_call}");
+    }
+    let expr_end = rust_field_value_end(&parsed.source, field)
+        .ok_or_else(|| anyhow!("could not locate tool_router expression end"))?;
+
+    let edit = TextEdit {
+        byte_start: expr_end,
+        byte_end: expr_end,
+        replacement: format!(" + {router_call}"),
+    };
+    let plan = RefactorPlan {
+        title: format!(
+            "add Rust router {router_name} to tool_router sum in {}",
+            path_string(&source_path)
+        ),
+        kind: "add_rust_router_to_sum".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: vec![edit],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: Vec::new(),
+        leftovers: vec![format!("existing tool_router field: {}", field_text.trim())],
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
 fn rust_impl_methods_target_edits(
     target_path: &Path,
     target_source: &str,
@@ -654,6 +708,64 @@ fn rust_impl_methods_target_edits(
     ])
 }
 
+fn find_rust_field_initializer<'a>(
+    parsed: &'a ParsedSource,
+    field_name: &str,
+) -> Option<Node<'a>> {
+    find_node(parsed.tree.root_node(), |node| {
+        node.kind() == "field_initializer"
+            && rust_field_initializer_name(node, &parsed.source).as_deref() == Some(field_name)
+    })
+}
+
+fn find_node<'tree>(
+    root: Node<'tree>,
+    mut predicate: impl FnMut(Node<'tree>) -> bool,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if predicate(node) {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    None
+}
+
+fn rust_field_initializer_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("field"))
+        .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+        .map(str::to_string)
+        .or_else(|| {
+            node.utf8_text(source.as_bytes())
+                .ok()
+                .and_then(|text| text.split(':').next())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn rust_field_value_end(source: &str, node: Node<'_>) -> Option<usize> {
+    if let Some(value) = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("body"))
+    {
+        return Some(value.end_byte());
+    }
+    let text = source.get(node.start_byte()..node.end_byte())?;
+    let colon = text.find(':')?;
+    let mut end = node.end_byte();
+    let value = &text[colon + 1..];
+    let trimmed_len = value.trim_end().len();
+    end -= value.len().saturating_sub(trimmed_len);
+    Some(end)
+}
+
 fn rust_prelude_present(target_source: &str, prelude: &str) -> bool {
     let prelude = prelude.trim();
     if prelude.contains('\n') {
@@ -673,6 +785,16 @@ fn rust_prelude_insert_byte(target_source: &str) -> usize {
         let line = &target_source[idx..line_end];
         let trimmed = line.trim();
         let is_shebang = idx == 0 && trimmed.starts_with("#!") && !trimmed.starts_with("#![");
+        if trimmed.starts_with("/*!") {
+            let Some(close) = target_source[idx..].find("*/") else {
+                return target_source.len();
+            };
+            idx += close + 2;
+            while idx < bytes.len() && matches!(bytes[idx], b'\n' | b'\r') {
+                idx += 1;
+            }
+            continue;
+        }
         let is_inner = trimmed.starts_with("#![") || trimmed.starts_with("//!");
         if trimmed.is_empty() || is_shebang || is_inner {
             idx = line_end;
@@ -1699,6 +1821,49 @@ mod tests {
     }
 
     #[test]
+    fn extract_impl_methods_inserts_prelude_after_inner_block_doc() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("tools.rs");
+        fs::write(
+            &source,
+            "struct BlackboxServer;\n\nimpl BlackboxServer {\n    fn move_me(&self) {}\n}\n",
+        )
+        .unwrap();
+        fs::write(&target, "/*!\nmodule docs\n*/\n\npub fn helper() {}\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl BlackboxServer".into()),
+            router_name: None,
+            target_prelude: Some("use super::*;".into()),
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .starts_with("/*!\nmodule docs\n*/\n\nuse super::*;")
+        );
+    }
+
+    #[test]
     fn extract_impl_methods_handles_generic_impl_header() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
@@ -1786,6 +1951,73 @@ mod tests {
             err.to_string()
                 .contains("only supports item_kinds impl_method")
         );
+    }
+
+    #[test]
+    fn add_rust_router_to_sum_appends_router_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        fs::write(
+            &source,
+            "struct Server { tool_router: usize }\nimpl Server {\n    fn new() -> Self {\n        Self {\n            tool_router: Self::bbox_tools() + Self::bro_tools(),\n        }\n    }\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "add_rust_router_to_sum".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            router_name: Some("search_tools".into()),
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let source_text = fs::read_to_string(&source).unwrap();
+        assert!(
+            source_text.contains(
+                "tool_router: Self::bbox_tools() + Self::bro_tools() + Self::search_tools(),"
+            )
+        );
+    }
+
+    #[test]
+    fn add_rust_router_to_sum_rejects_duplicate_router() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        fs::write(
+            &source,
+            "struct Server { tool_router: usize }\nimpl Server { fn new() -> Self { Self { tool_router: Self::bbox_tools() + Self::search_tools(), } } }\n",
+        )
+        .unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "add_rust_router_to_sum".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            router_name: Some("search_tools".into()),
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("already contains"));
     }
 
     #[test]

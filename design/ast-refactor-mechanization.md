@@ -248,6 +248,8 @@ Current Rust writable plan kinds:
   of creating another sibling impl. The `#[tool_router(router = name)]` shape is
   intentionally coupled to the current `rmcp` macro syntax used by
   `BlackboxServer`; future macro changes require updating this generator.
+- `add_rust_router_to_sum`: append `+ Self::<router_name>()` to a Rust
+  `tool_router:` field initializer so generated tool routers become reachable.
 
 ## Tree-Sitter Recipes
 
@@ -334,8 +336,8 @@ Tool extraction can be made mostly mechanical:
 
 The implemented `extract_rust_impl_methods` primitive covers the method move and
 target wrapper generation, including appending into an existing matching target
-impl for repeated extraction waves. It deliberately does not update module
-declarations, imports, DTO/helper moves, or the server router sum; those are
+impl for repeated extraction waves. `add_rust_router_to_sum` covers the router
+constructor wiring. Module declarations, imports, and DTO/helper moves remain
 separate mechanical steps that must be planned explicitly so the agent can
 review the blast radius.
 

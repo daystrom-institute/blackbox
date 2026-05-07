@@ -9,7 +9,8 @@ Rust is the first writable backend.
 
 - Inspect: supported with `bbox_refactor_status`.
 - Plan: supported with `bbox_refactor_plan(kind="extract_rust_items")` and
-  `bbox_refactor_plan(kind="extract_rust_impl_methods")`.
+  `bbox_refactor_plan(kind="extract_rust_impl_methods")` and
+  `bbox_refactor_plan(kind="add_rust_router_to_sum")`.
 - Apply: supported with `bbox_refactor_apply(confirm=true)`.
 - Semantic rename: not supported by blackbox yet; use rust-analyzer, compiler
   feedback, or manual edits after inspection.
@@ -24,6 +25,8 @@ Writable plan kinds:
 - `extract_rust_impl_methods`: move named methods out of one `impl` block into
   another file, preserving method attributes and optionally generating a
   `#[tool_router(router = name)]` wrapper around the moved methods.
+- `add_rust_router_to_sum`: append `+ Self::<router_name>()` to a Rust
+  `tool_router:` field initializer if that router call is not already present.
 
 Supported top-level item kinds include:
 
@@ -100,6 +103,17 @@ target file when it is not already present, after any shebang, crate-level inner
 attributes, and crate-level inner doc comments.
 If the existing target impl has a different router name, the plan creates a
 separate sibling router wrapper rather than merging into the wrong router.
+
+After extracting a new tool-domain impl, wire it into the server router sum:
+
+```text
+bbox_refactor_plan(
+  kind="add_rust_router_to_sum",
+  source="src/main.rs",
+  router_name="search_tools",
+  project_dir="/absolute/project/root"
+)
+```
 
 3. Apply only after review:
 
