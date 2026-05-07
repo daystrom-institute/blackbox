@@ -1,0 +1,23 @@
+{
+  "domain": "hook-when/slack-proposal-found",
+  "scope": "global",
+  "classification_lattice": ["allow", "deny"],
+  "rules": [
+    {
+      "id": "allow_when_link_found",
+      "classification": "allow",
+      "antecedent": {
+        "op": "Eq",
+        "field": "vars.link_response.found",
+        "value": true
+      },
+      "consequent": "allow"
+    },
+    {
+      "id": "fallback_deny",
+      "classification": "deny",
+      "antecedent": { "op": "True" },
+      "consequent": "deny"
+    }
+  ]
+}

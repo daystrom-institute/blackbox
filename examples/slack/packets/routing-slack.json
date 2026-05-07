@@ -42,8 +42,8 @@
       "consequent": "{\"route\":\"start_arc\",\"workflow\":\"slack-badgey-readonly\",\"initial_vars\":{}}"
     },
     {
-      "id": "signal_proposal_approved_on_check",
-      "classification": "signal_arc",
+      "id": "approve_starts_apply_arc",
+      "classification": "start_arc",
       "antecedent": {
         "op": "All",
         "args": [
@@ -51,7 +51,7 @@
           { "op": "Eq", "field": "reaction", "value": "white_check_mark" }
         ]
       },
-      "consequent": "{\"route\":\"signal_arc\",\"signal\":\"proposal-approved\",\"correlate\":{\"thread_ts\":\"${entity.item_ts}\"}}"
+      "consequent": "{\"route\":\"start_arc\",\"workflow\":\"badgey-apply-proposal-arc\",\"initial_vars\":{\"team_id\":\"${entity.team_id}\",\"channel_id\":\"${entity.channel}\",\"item_ts\":\"${entity.item_ts}\",\"user\":\"${entity.user}\",\"bbox_user\":\"${entity.bbox_user}\"}}"
     },
     {
       "id": "signal_proposal_clarify_on_thread_reply",

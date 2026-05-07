@@ -1,0 +1,223 @@
+{
+  "name": "badgey-apply-proposal-arc",
+  "version": 1,
+  "vars_schema": {
+    "team_id": { "kind": "string", "required": true },
+    "channel_id": { "kind": "string", "required": true },
+    "item_ts": { "kind": "string", "required": true },
+    "user": { "kind": "string" },
+    "bbox_user": { "kind": "string" },
+    "link_response": { "kind": "object" },
+    "instance_id": { "kind": "string" },
+    "proposal_id": { "kind": "string" },
+    "apply_response": { "kind": "object" },
+    "summary_text": { "kind": "string" }
+  },
+  "actors": {},
+  "start": "LookupLink",
+  "nodes": {
+    "LookupLink": {
+      "actor": "",
+      "prompt": "Resolve the reacted-to message back to its SlackProposalLink. If not a posted proposal, downstream nodes no-op via the slack-proposal-found gate.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_slack_link_lookup",
+            "arguments": {
+              "team_id": "${vars.team_id}",
+              "channel_id": "${vars.channel_id}",
+              "msg_ts": "${vars.item_ts}"
+            },
+            "timeout_secs": 10
+          },
+          "into_var": "link_response",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "Apply" }
+    },
+    "Apply": {
+      "actor": "",
+      "prompt": "Bind link fields to top-level vars; show in-progress thinking status + hourglass reaction; run apply.",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": { "key": "instance_id", "value": "${vars.link_response.link.instance_id}" },
+          "when": "domain:hook-when/slack-proposal-found"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "proposal_id", "value": "${vars.link_response.link.proposal_id}" },
+          "when": "domain:hook-when/slack-proposal-found"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/reactions.add",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel_id}",
+              "name": "hourglass_flowing_sand",
+              "timestamp": "${vars.item_ts}"
+            },
+            "expect_status": [200]
+          },
+          "when": "domain:hook-when/slack-proposal-found",
+          "on_failure": "warn"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/assistant.threads.setStatus",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel_id": "${vars.channel_id}",
+              "thread_ts": "${vars.item_ts}",
+              "status": "applying ${vars.proposal_id}..."
+            },
+            "expect_status": [200]
+          },
+          "when": "domain:hook-when/slack-proposal-found",
+          "on_failure": "warn"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "badgey_apply_proposal",
+            "arguments": {
+              "badgey_id": "${vars.instance_id}",
+              "proposal_id": "${vars.proposal_id}"
+            },
+            "timeout_secs": 1800
+          },
+          "into_var": "apply_response",
+          "when": "domain:hook-when/slack-proposal-found",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "goto", "to": "PostOutcome" }
+    },
+    "PostOutcome": {
+      "actor": "",
+      "prompt": "Remove hourglass, add success/fail badge, clear thinking status, post threaded summary.",
+      "on_enter": [
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/reactions.remove",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel_id}",
+              "name": "hourglass_flowing_sand",
+              "timestamp": "${vars.item_ts}"
+            },
+            "expect_status": [200]
+          },
+          "when": "domain:hook-when/slack-proposal-found",
+          "on_failure": "warn"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/reactions.add",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel_id}",
+              "name": "large_green_circle",
+              "timestamp": "${vars.item_ts}"
+            },
+            "expect_status": [200]
+          },
+          "when": "domain:hook-when/apply-succeeded",
+          "on_failure": "warn"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/reactions.add",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel_id}",
+              "name": "red_circle",
+              "timestamp": "${vars.item_ts}"
+            },
+            "expect_status": [200]
+          },
+          "when": "domain:hook-when/apply-failed",
+          "on_failure": "warn"
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "summary_text",
+            "value": "*${vars.apply_response.status}* | ${vars.proposal_id}\n\n${vars.apply_response.error}\n\n_(applied via Slack reaction by <@${vars.user}>)_"
+          },
+          "when": "domain:hook-when/slack-proposal-found"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/chat.postMessage",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel_id}",
+              "thread_ts": "${vars.item_ts}",
+              "text": "${vars.summary_text}",
+              "mrkdwn": true
+            },
+            "expect_status": [200]
+          },
+          "when": "domain:hook-when/slack-proposal-found",
+          "on_failure": "warn"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/assistant.threads.setStatus",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel_id": "${vars.channel_id}",
+              "thread_ts": "${vars.item_ts}",
+              "status": ""
+            },
+            "expect_status": [200]
+          },
+          "when": "domain:hook-when/slack-proposal-found",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

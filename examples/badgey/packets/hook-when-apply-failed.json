@@ -1,0 +1,25 @@
+{
+  "domain": "hook-when/apply-failed",
+  "scope": "global",
+  "classification_lattice": ["allow", "deny"],
+  "rules": [
+    {
+      "id": "allow_when_status_failed_or_missing",
+      "classification": "allow",
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.apply_response.status", "value": "failed" },
+          { "op": "Eq", "field": "vars.apply_response.status", "value": "bad_input" }
+        ]
+      },
+      "consequent": "allow"
+    },
+    {
+      "id": "fallback_deny",
+      "classification": "deny",
+      "antecedent": { "op": "True" },
+      "consequent": "deny"
+    }
+  ]
+}

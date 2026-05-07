@@ -744,6 +744,24 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
+        name: "bro_slack_link_lookup",
+        category: ToolCategory::Orchestration,
+        summary: "Resolve a Slack message ts back to its SlackProposalLink (proposal_id, instance_id, project_dir, version, posted_at). Used by the apply/refine workflows that fire on `:white_check_mark:` reactions and in-thread replies — they need the (BadgeyId, proposal_id) pair from the link to call badgey_apply_proposal or bro_resume. Returns {found: false} for messages that aren't a posted proposal (e.g. random check on an unrelated message) so workflows can no-op cleanly.",
+        when_to_use: "First node of badgey-apply-proposal-arc and badgey-clarify-arc — branch on `found` to either continue (proposal exists) or terminate cleanly (random reaction/reply on a non-proposal message).",
+        example: Some(
+            r#"bro_slack_link_lookup(team_id="T0123ABCD", channel_id="C0123XYZ", msg_ts="1778179224.543499")"#,
+        ),
+    },
+    ToolDoc {
+        name: "badgey_apply_proposal",
+        category: ToolCategory::Orchestration,
+        summary: "Apply a stored BadgeyProposal — drives the wrapper's full apply path: state-machine transition (Pending/Failed → Applying), kind-specific dispatch (artifact_promotion → bbox_artifact_install; redispatch_task → spawn_privileged_task with the proposal's prompt; workflow_install/agent_install/packet_install → matching artifact install), record applied_task_id, transition (Applying → Applied | Failed). Returns the apply result with status. Used by badgey-apply-proposal-arc when a Slack approval reaction fires.",
+        when_to_use: "Workflow node hook that runs after a Slack approval reaction has been resolved to a (BadgeyId, proposal_id) pair via bro_slack_link_lookup. Pass `retry_failed=true` only when explicitly retrying a proposal in Failed state — default rejects retries.",
+        example: Some(
+            r#"badgey_apply_proposal(badgey_id="bg-deadbeef-cafef00d", proposal_id="P-3")"#,
+        ),
+    },
+    ToolDoc {
         name: "bro_slack_link_record",
         category: ToolCategory::Orchestration,
         summary: "Record a SlackProposalLink mapping a posted Slack message back to its BadgeyProposal. Called by the per-channel triage workflow's emit-proposal subworkflow after chat.postMessage so inbound reactions/replies can resolve back to (BadgeyId, proposal_id) and the apply/refine hooks fire.",

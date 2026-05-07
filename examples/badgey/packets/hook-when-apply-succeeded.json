@@ -1,0 +1,25 @@
+{
+  "domain": "hook-when/apply-succeeded",
+  "scope": "global",
+  "classification_lattice": ["allow", "deny"],
+  "rules": [
+    {
+      "id": "allow_when_status_applied",
+      "classification": "allow",
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.apply_response.status", "value": "applied" },
+          { "op": "Eq", "field": "vars.apply_response.status", "value": "already_applied" }
+        ]
+      },
+      "consequent": "allow"
+    },
+    {
+      "id": "fallback_deny",
+      "classification": "deny",
+      "antecedent": { "op": "True" },
+      "consequent": "deny"
+    }
+  ]
+}

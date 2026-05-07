@@ -1751,6 +1751,7 @@ impl BlackboxServer {
                     proposal_field.cloned().unwrap()
                 } else {
                     let synthesized: Map<String, Value> = [
+                        "headline",
                         "root_cause",
                         "proposal",
                         "blast_radius",
@@ -4590,6 +4591,30 @@ struct EnsureBadgeyForChannelParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct SlackProposalLinkLookupParams {
+    /// Slack workspace id (T-prefix).
+    team_id: String,
+    /// Slack channel id (C-prefix) the proposal was posted in.
+    channel_id: String,
+    /// Slack message ts of the posted proposal (== reaction's item_ts
+    /// or thread reply's thread_ts).
+    msg_ts: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyApplyProposalParams {
+    /// Badgey instance id (`bg-<8hex>-<8hex>`) that owns the
+    /// proposal.
+    badgey_id: String,
+    /// Proposal id within that instance (e.g. `P-3`).
+    proposal_id: String,
+    /// When true, retry a proposal currently in Failed state.
+    /// Default false — unretried Failed proposals are rejected.
+    #[serde(default)]
+    retry_failed: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct SlackProposalLinkRecordParams {
     /// Slack workspace id (T-prefix).
     team_id: String,
@@ -6713,6 +6738,85 @@ impl BlackboxServer {
                 "proposal_id": p.proposal_id,
             })),
             Err(e) => Self::err_text(&format!("recording slack proposal link failed: {e}")),
+        }
+    }
+
+    #[tool(
+        name = "bro_slack_link_lookup",
+        description = "Resolve a Slack message ts back to its SlackProposalLink (proposal_id, instance_id, project_dir, version, posted_at). Used by the apply/refine workflows that fire on `:white_check_mark:` reactions and in-thread replies — they need the (BadgeyId, proposal_id) pair from the link to call badgey_apply_proposal or bro_resume. Returns {found: false} for messages that aren't a posted proposal (e.g. random check on an unrelated message) so workflows can no-op cleanly."
+    )]
+    fn bro_slack_link_lookup(
+        &self,
+        Parameters(p): Parameters<SlackProposalLinkLookupParams>,
+    ) -> CallToolResult {
+        if p.team_id.trim().is_empty()
+            || p.channel_id.trim().is_empty()
+            || p.msg_ts.trim().is_empty()
+        {
+            return Self::err_text("team_id, channel_id, and msg_ts are all required");
+        }
+        match self
+            .state
+            .slack_proposal_links
+            .lookup_by_msg(&p.team_id, &p.channel_id, &p.msg_ts)
+        {
+            Some(link) => Self::ok_json(&json!({"found": true, "link": link})),
+            None => Self::ok_json(&json!({"found": false})),
+        }
+    }
+
+    #[tool(
+        name = "badgey_apply_proposal",
+        description = "Apply a stored BadgeyProposal — drives the wrapper's full apply path: state-machine transition (Pending/Failed → Applying), kind-specific dispatch (artifact_promotion → bbox_artifact_install; redispatch_task → spawn_privileged_task with the proposal's prompt; workflow_install/agent_install/packet_install → matching artifact install), record applied_task_id, transition (Applying → Applied | Failed). Returns the apply result with status. Used by badgey-apply-proposal-arc when a Slack approval reaction fires."
+    )]
+    async fn badgey_apply_proposal(
+        &self,
+        Parameters(p): Parameters<BadgeyApplyProposalParams>,
+    ) -> CallToolResult {
+        // Always return Ok with an explicit `status` field so workflow
+        // gates can branch cleanly without distinguishing between
+        // tool-call failure (op-level Err) and apply-path failure
+        // (proposal-level rejection). status is one of:
+        //   "applied"         — fresh apply succeeded
+        //   "already_applied" — proposal was already in Applied state
+        //   "failed"          — apply path raised (returns `error` field)
+        //   "bad_input"       — badgey_id couldn't parse (returns `error`)
+        let id = match self.badgey_parse_id(&p.badgey_id) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return Self::ok_json(
+                    &json!({"status": "bad_input", "error": e, "badgey_id": p.badgey_id}),
+                );
+            }
+        };
+        let result = self
+            .badgey_apply_proposal_internal(
+                &id,
+                &p.proposal_id,
+                p.retry_failed.unwrap_or(false),
+            )
+            .await;
+        match result {
+            Ok(mut value) => {
+                if value.get("status").is_none() {
+                    let status = if value
+                        .get("already_applied")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        "already_applied"
+                    } else {
+                        "applied"
+                    };
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("status".into(), Value::String(status.into()));
+                    }
+                }
+                Self::ok_json(&value)
+            }
+            Err(e) => Self::ok_json(
+                &json!({"status": "failed", "error": e, "badgey_id": p.badgey_id, "proposal_id": p.proposal_id}),
+            ),
         }
     }
 
