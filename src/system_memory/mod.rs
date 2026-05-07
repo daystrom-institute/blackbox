@@ -207,6 +207,13 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
             "go",
             "c",
             "cpp",
+            "sm-refactor-rust",
+            "sm-refactor-typescript",
+            "sm-refactor-csharp",
+            "sm-refactor-python",
+            "sm-refactor-java",
+            "sm-refactor-go",
+            "sm-refactor-c-cpp",
         ],
         content: include_str!("refactor.md"),
     },
@@ -279,6 +286,102 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
             "dotnet",
         ],
         content: include_str!("refactor-csharp.md"),
+    },
+    SystemMemory {
+        id: "sm-refactor-python",
+        title: "Python refactor mechanization — tree-sitter inventory and Pyright/Rope validation workflow",
+        tags: &[
+            "refactor",
+            "refactoring",
+            "mechanization",
+            "restructure",
+            "python",
+            "py",
+            "pyright",
+            "jedi",
+            "rope",
+            "ruff",
+            "pytest",
+            "tree-sitter",
+            "bbox_refactor_status",
+            "symbol",
+            "rename",
+            "move",
+            "extract",
+        ],
+        content: include_str!("refactor-python.md"),
+    },
+    SystemMemory {
+        id: "sm-refactor-java",
+        title: "Java refactor mechanization — tree-sitter inventory and JDT validation workflow",
+        tags: &[
+            "refactor",
+            "refactoring",
+            "mechanization",
+            "restructure",
+            "java",
+            "jdt",
+            "intellij",
+            "eclipse",
+            "maven",
+            "gradle",
+            "tree-sitter",
+            "bbox_refactor_status",
+            "symbol",
+            "rename",
+            "move",
+            "extract",
+        ],
+        content: include_str!("refactor-java.md"),
+    },
+    SystemMemory {
+        id: "sm-refactor-go",
+        title: "Go refactor mechanization — tree-sitter inventory and gopls validation workflow",
+        tags: &[
+            "refactor",
+            "refactoring",
+            "mechanization",
+            "restructure",
+            "go",
+            "golang",
+            "gopls",
+            "gofmt",
+            "goimports",
+            "go-test",
+            "tree-sitter",
+            "bbox_refactor_status",
+            "symbol",
+            "rename",
+            "move",
+            "extract",
+        ],
+        content: include_str!("refactor-go.md"),
+    },
+    SystemMemory {
+        id: "sm-refactor-c-cpp",
+        title: "C and C++ refactor mechanization — tree-sitter inventory and clang validation workflow",
+        tags: &[
+            "refactor",
+            "refactoring",
+            "mechanization",
+            "restructure",
+            "c",
+            "cpp",
+            "c++",
+            "clangd",
+            "clang-rename",
+            "clang-tidy",
+            "clang-format",
+            "cmake",
+            "ninja",
+            "tree-sitter",
+            "bbox_refactor_status",
+            "symbol",
+            "rename",
+            "move",
+            "extract",
+        ],
+        content: include_str!("refactor-c-cpp.md"),
     },
     SystemMemory {
         id: "sm-side-channel-notes",
@@ -661,6 +764,18 @@ mod tests {
 
         let csharp_hits = search(Some("csharp refactor roslyn"));
         assert!(csharp_hits.iter().any(|m| m.id == "sm-refactor-csharp"));
+
+        let python_hits = search(Some("python refactor pyright"));
+        assert!(python_hits.iter().any(|m| m.id == "sm-refactor-python"));
+
+        let java_hits = search(Some("java refactor jdt"));
+        assert!(java_hits.iter().any(|m| m.id == "sm-refactor-java"));
+
+        let go_hits = search(Some("go refactor gopls"));
+        assert!(go_hits.iter().any(|m| m.id == "sm-refactor-go"));
+
+        let cpp_hits = search(Some("cpp refactor clangd"));
+        assert!(cpp_hits.iter().any(|m| m.id == "sm-refactor-c-cpp"));
     }
 
     #[test]
