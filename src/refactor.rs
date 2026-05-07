@@ -24,19 +24,30 @@ pub struct RefactorStatusParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
-    /// Plan kind. V1 supports "extract_rust_items".
+    /// Plan kind. Supports "extract_rust_items" and "extract_rust_impl_methods".
     pub kind: String,
     /// Source Rust file. Relative paths resolve against project_dir or cwd.
     pub source: String,
-    /// Target Rust file for extracted items. Required for extract_rust_items.
+    /// Target Rust file for extracted items. Required for writable plan kinds.
     #[serde(default)]
     pub target: Option<String>,
-    /// Item names to extract. Names are exact for named items; impl blocks use their header.
+    /// Item names to extract. Names are exact; extract_rust_impl_methods uses method names.
     #[serde(default)]
     pub item_names: Option<Vec<String>>,
     /// Optional item kinds, e.g. function_item, struct_item, impl_item.
     #[serde(default)]
     pub item_kinds: Option<Vec<String>>,
+    /// Optional exact impl header filter for extract_rust_impl_methods,
+    /// e.g. "impl BlackboxServer".
+    #[serde(default)]
+    pub impl_name: Option<String>,
+    /// Optional router name for extract_rust_impl_methods. When present, the
+    /// generated target wrapper is annotated as #[tool_router(router = name)].
+    #[serde(default)]
+    pub router_name: Option<String>,
+    /// Optional text inserted before the generated target wrapper.
+    #[serde(default)]
+    pub target_prelude: Option<String>,
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
@@ -159,12 +170,25 @@ struct ParsedSource {
     tree: Tree,
 }
 
+#[derive(Debug, Clone)]
+struct RustImplMethod {
+    impl_name: String,
+    impl_byte_start: usize,
+    item: SyntaxItem,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TargetImplInsertion {
+    byte: usize,
+    body_is_empty: bool,
+}
+
 pub fn status(p: &RefactorStatusParams) -> Result<String> {
     let path = resolve_path(p.project_dir.as_deref(), &p.file)?;
     let parsed = parse_source_file(&path)?;
     let report = parse_report(parsed.tree.root_node());
     let items = if parsed.language == "rust" {
-        rust_items(&parsed)
+        rust_status_items(&parsed)
     } else {
         generic_top_level_items(&parsed)
     };
@@ -182,7 +206,10 @@ pub fn status(p: &RefactorStatusParams) -> Result<String> {
 pub fn plan(p: &RefactorPlanParams) -> Result<String> {
     match p.kind.as_str() {
         "extract_rust_items" => plan_extract_rust_items(p),
-        other => bail!("unsupported refactor plan kind `{other}`; supported: extract_rust_items"),
+        "extract_rust_impl_methods" => plan_extract_rust_impl_methods(p),
+        other => bail!(
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods"
+        ),
     }
 }
 
@@ -413,6 +440,396 @@ fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let target_path = p
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("target is required for extract_rust_impl_methods"))
+        .and_then(|target| resolve_path(p.project_dir.as_deref(), target))?;
+    if source_path == target_path {
+        bail!("source and target must be different files");
+    }
+    if let Some(router_name) = p.router_name.as_deref() {
+        validate_rust_identifier(router_name, "router_name")?;
+    }
+    if let Some(kinds) = p.item_kinds.as_deref() {
+        if !kinds.iter().all(|kind| kind == "impl_method") {
+            bail!("extract_rust_impl_methods only supports item_kinds impl_method");
+        }
+    }
+
+    let names = p
+        .item_names
+        .as_deref()
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| anyhow!("item_names is required for extract_rust_impl_methods"))?;
+
+    let parsed = parse_rust_file(&source_path)?;
+    let methods = rust_impl_methods(&parsed);
+    let candidates = methods
+        .iter()
+        .filter(|method| {
+            p.impl_name
+                .as_deref()
+                .is_none_or(|impl_name| method.impl_name == impl_name)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        if let Some(impl_name) = p.impl_name.as_deref() {
+            bail!("no impl block matching `{impl_name}` found");
+        }
+        bail!("no Rust impl methods found");
+    }
+
+    let mut selected = Vec::new();
+    for expected in names {
+        let matches = candidates
+            .iter()
+            .copied()
+            .filter(|method| method.item.name.as_deref() == Some(expected.as_str()))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => bail!("requested impl method `{expected}` was not found"),
+            [method] => selected.push((*method).clone()),
+            _ => bail!(
+                "requested impl method `{expected}` matched multiple impl blocks; pass impl_name"
+            ),
+        }
+    }
+
+    let impl_starts = selected
+        .iter()
+        .map(|method| method.impl_byte_start)
+        .collect::<HashSet<_>>();
+    if impl_starts.len() > 1 {
+        bail!("extract_rust_impl_methods can only extract methods from one impl block per plan");
+    }
+
+    let selected_ids = selected
+        .iter()
+        .map(|method| method.item.plan_local_id.clone())
+        .collect::<HashSet<_>>();
+    let leftovers = methods
+        .iter()
+        .filter(|method| !selected_ids.contains(&method.item.plan_local_id))
+        .map(|method| {
+            format!(
+                "impl_method {} in {} bytes {}..{}",
+                method.item.name.as_deref().unwrap_or("(unnamed)"),
+                method.impl_name,
+                method.item.byte_start,
+                method.item.byte_end
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let target_source = fs::read_to_string(&target_path).unwrap_or_default();
+    let target_edits = rust_impl_methods_target_edits(
+        &target_path,
+        &target_source,
+        p.target_prelude.as_deref(),
+        p.router_name.as_deref(),
+        &selected[0].impl_name,
+        &parsed.source,
+        &selected,
+    )?;
+
+    let source_edits = selected
+        .iter()
+        .map(|method| TextEdit {
+            byte_start: method.item.leading_trivia_start,
+            byte_end: method.item.trailing_trivia_end,
+            replacement: String::new(),
+        })
+        .collect::<Vec<_>>();
+    ensure_non_overlapping(&source_edits)?;
+
+    let plan = RefactorPlan {
+        title: format!(
+            "extract {} Rust impl method(s) from {} to {}",
+            selected.len(),
+            path_string(&source_path),
+            path_string(&target_path)
+        ),
+        kind: "extract_rust_impl_methods".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        edits: vec![
+            FileEdit {
+                path: path_string(&source_path),
+                original_sha256: sha256_hex(parsed.source.as_bytes()),
+                edits: source_edits,
+            },
+            FileEdit {
+                path: path_string(&target_path),
+                original_sha256: sha256_hex(target_source.as_bytes()),
+                edits: target_edits,
+            },
+        ],
+        validations: vec![
+            ValidationStep::TreeSitterNoErrors {
+                path: path_string(&source_path),
+                byte_range: None,
+            },
+            ValidationStep::TreeSitterNoErrors {
+                path: path_string(&target_path),
+                byte_range: None,
+            },
+        ],
+        items: selected.into_iter().map(|method| method.item).collect(),
+        leftovers,
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn rust_impl_methods_target_edits(
+    target_path: &Path,
+    target_source: &str,
+    target_prelude: Option<&str>,
+    router_name: Option<&str>,
+    impl_name: &str,
+    source: &str,
+    selected: &[RustImplMethod],
+) -> Result<Vec<TextEdit>> {
+    if let Some(insertion) =
+        existing_target_impl_insert_byte(target_path, target_source, impl_name, router_name)?
+    {
+        let mut replacement = String::new();
+        if !insertion.body_is_empty {
+            replacement.push('\n');
+        }
+        replacement.push_str(&rust_impl_methods_block(source, selected)?);
+        return Ok(vec![TextEdit {
+            byte_start: insertion.byte,
+            byte_end: insertion.byte,
+            replacement,
+        }]);
+    }
+
+    let wrapper =
+        rust_impl_methods_target_wrapper(target_source, router_name, impl_name, source, selected)?;
+    let Some(prelude) = target_prelude
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .filter(|text| !rust_prelude_present(target_source, text))
+    else {
+        return Ok(vec![TextEdit {
+            byte_start: target_source.len(),
+            byte_end: target_source.len(),
+            replacement: wrapper,
+        }]);
+    };
+
+    if target_source.trim().is_empty() {
+        return Ok(vec![TextEdit {
+            byte_start: 0,
+            byte_end: 0,
+            replacement: format!("{prelude}\n\n{wrapper}"),
+        }]);
+    }
+
+    let prelude_insert = rust_prelude_insert_byte(target_source);
+    if prelude_insert == target_source.len() {
+        return Ok(vec![TextEdit {
+            byte_start: target_source.len(),
+            byte_end: target_source.len(),
+            replacement: format!("{prelude}\n\n{wrapper}"),
+        }]);
+    }
+
+    Ok(vec![
+        TextEdit {
+            byte_start: prelude_insert,
+            byte_end: prelude_insert,
+            replacement: format!("{prelude}\n\n"),
+        },
+        TextEdit {
+            byte_start: target_source.len(),
+            byte_end: target_source.len(),
+            replacement: wrapper,
+        },
+    ])
+}
+
+fn rust_prelude_present(target_source: &str, prelude: &str) -> bool {
+    let prelude = prelude.trim();
+    if prelude.contains('\n') {
+        return target_source.contains(prelude);
+    }
+    target_source.lines().any(|line| line.trim() == prelude)
+}
+
+fn rust_prelude_insert_byte(target_source: &str) -> usize {
+    let bytes = target_source.as_bytes();
+    let mut idx = 0usize;
+    while idx < target_source.len() {
+        let line_end = target_source[idx..]
+            .find('\n')
+            .map(|offset| idx + offset + 1)
+            .unwrap_or(target_source.len());
+        let line = &target_source[idx..line_end];
+        let trimmed = line.trim();
+        let is_shebang = idx == 0 && trimmed.starts_with("#!") && !trimmed.starts_with("#![");
+        let is_inner = trimmed.starts_with("#![") || trimmed.starts_with("//!");
+        if trimmed.is_empty() || is_shebang || is_inner {
+            idx = line_end;
+            continue;
+        }
+        break;
+    }
+    while idx < bytes.len() && matches!(bytes[idx], b'\n' | b'\r') {
+        idx += 1;
+    }
+    idx
+}
+
+fn existing_target_impl_insert_byte(
+    target_path: &Path,
+    target_source: &str,
+    impl_name: &str,
+    router_name: Option<&str>,
+) -> Result<Option<TargetImplInsertion>> {
+    if target_source.trim().is_empty() {
+        return Ok(None);
+    }
+    let tree = parse_source("rust", target_source)
+        .with_context(|| format!("parsing target {}", target_path.display()))?;
+    let parsed = ParsedSource {
+        path: target_path.to_path_buf(),
+        language: "rust",
+        source: target_source.to_string(),
+        tree,
+    };
+    let root = parsed.tree.root_node();
+    let mut cursor = root.walk();
+    for impl_node in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "impl_item")
+    {
+        let Some(name) = item_name(impl_node, &parsed.source, parsed.language) else {
+            continue;
+        };
+        if name != impl_name {
+            continue;
+        }
+        if !router_matches(&parsed, impl_node, router_name) {
+            continue;
+        }
+        let Some(body) = impl_declaration_list(impl_node) else {
+            continue;
+        };
+        let close = parsed
+            .source
+            .get(body.start_byte()..body.end_byte())
+            .and_then(|text| text.rfind('}').map(|offset| body.start_byte() + offset))
+            .ok_or_else(|| anyhow!("matching target impl has no closing brace"))?;
+        return Ok(Some(TargetImplInsertion {
+            byte: close,
+            body_is_empty: parsed.source[body.start_byte() + 1..close].trim().is_empty(),
+        }));
+    }
+    Ok(None)
+}
+
+fn router_matches(parsed: &ParsedSource, impl_node: Node<'_>, router_name: Option<&str>) -> bool {
+    let Some(router_name) = router_name else {
+        return true;
+    };
+    let leading = leading_trivia_start(&parsed.source, impl_node);
+    let exact_router = format!("router={router_name}");
+    attached_attributes(&parsed.source, leading, impl_node.start_byte())
+        .iter()
+        .map(|attr| {
+            attr.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        })
+        .any(|attr| {
+            let router_arg = attr.contains(&format!("{exact_router})"))
+                || attr.contains(&format!("{exact_router},"));
+            attr.contains("tool_router") && router_arg
+        })
+}
+
+fn impl_declaration_list(impl_node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = impl_node.walk();
+    let body = impl_node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "declaration_list");
+    body
+}
+
+fn rust_impl_methods_target_wrapper(
+    target_source: &str,
+    router_name: Option<&str>,
+    impl_name: &str,
+    source: &str,
+    selected: &[RustImplMethod],
+) -> Result<String> {
+    let mut wrapper = String::new();
+    if let Some(router_name) = router_name {
+        wrapper.push_str("#[tool_router(router = ");
+        wrapper.push_str(router_name);
+        wrapper.push_str(")]\n");
+    }
+    wrapper.push_str(impl_name);
+    wrapper.push_str(" {\n");
+    wrapper.push_str(&rust_impl_methods_block(source, selected)?);
+    wrapper.push_str("}\n");
+
+    if target_source.trim().is_empty() {
+        Ok(wrapper)
+    } else {
+        Ok(format!(
+            "{}{}",
+            if target_source.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            },
+            wrapper
+        ))
+    }
+}
+
+fn rust_impl_methods_block(source: &str, selected: &[RustImplMethod]) -> Result<String> {
+    let mut block = String::new();
+    for (idx, method) in selected.iter().enumerate() {
+        let text = source
+            .get(method.item.leading_trivia_start..method.item.byte_end)
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid impl method range for {}",
+                    method.item.plan_local_id
+                )
+            })?
+            .trim_matches('\n');
+        if idx > 0 {
+            block.push('\n');
+        }
+        block.push_str(text);
+        block.push('\n');
+    }
+    Ok(block)
+}
+
+fn validate_rust_identifier(value: &str, field: &str) -> Result<()> {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        bail!("{field} must not be empty");
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        bail!("{field} must be a Rust identifier");
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        bail!("{field} must be a Rust identifier");
+    }
+    Ok(())
+}
+
 fn resolve_path(project_dir: Option<&str>, path: &str) -> Result<PathBuf> {
     let path = PathBuf::from(path);
     let full = if path.is_absolute() {
@@ -463,6 +880,46 @@ fn rust_items(parsed: &ParsedSource) -> Vec<SyntaxItem> {
         .collect()
 }
 
+fn rust_status_items(parsed: &ParsedSource) -> Vec<SyntaxItem> {
+    let mut items = rust_items(parsed);
+    items.extend(
+        rust_impl_methods(parsed)
+            .into_iter()
+            .map(|method| method.item),
+    );
+    items
+}
+
+fn rust_impl_methods(parsed: &ParsedSource) -> Vec<RustImplMethod> {
+    let root = parsed.tree.root_node();
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .filter(|node| node.kind() == "impl_item")
+        .flat_map(|impl_node| rust_impl_methods_in(parsed, impl_node))
+        .collect()
+}
+
+fn rust_impl_methods_in(parsed: &ParsedSource, impl_node: Node<'_>) -> Vec<RustImplMethod> {
+    let impl_name = item_name(impl_node, &parsed.source, parsed.language)
+        .unwrap_or_else(|| "(unnamed impl)".to_string());
+    let mut cursor = impl_node.walk();
+    impl_node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "declaration_list")
+        .flat_map(|body| {
+            let mut body_cursor = body.walk();
+            body.named_children(&mut body_cursor)
+                .filter(|member| member.kind() == "function_item")
+                .map(|member| RustImplMethod {
+                    impl_name: impl_name.clone(),
+                    impl_byte_start: impl_node.start_byte(),
+                    item: syntax_item_with_kind(parsed, member, "impl_method"),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn generic_top_level_items(parsed: &ParsedSource) -> Vec<SyntaxItem> {
     let root = parsed.tree.root_node();
     let mut cursor = root.walk();
@@ -472,6 +929,10 @@ fn generic_top_level_items(parsed: &ParsedSource) -> Vec<SyntaxItem> {
 }
 
 fn syntax_item(parsed: &ParsedSource, node: Node<'_>) -> SyntaxItem {
+    syntax_item_with_kind(parsed, node, node.kind())
+}
+
+fn syntax_item_with_kind(parsed: &ParsedSource, node: Node<'_>, kind: &str) -> SyntaxItem {
     let name = item_name(node, &parsed.source, parsed.language);
     let leading_trivia_start = leading_trivia_start(&parsed.source, node);
     let trailing_trivia_end = trailing_trivia_end(&parsed.source, node.end_byte());
@@ -485,10 +946,10 @@ fn syntax_item(parsed: &ParsedSource, node: Node<'_>) -> SyntaxItem {
             path_string(&parsed.path),
             node.start_byte(),
             node.end_byte(),
-            node.kind(),
+            kind,
             display_name
         ),
-        kind: node.kind().to_string(),
+        kind: kind.to_string(),
         name,
         byte_start: node.start_byte(),
         byte_end: node.end_byte(),
@@ -939,6 +1400,35 @@ mod tests {
     }
 
     #[test]
+    fn status_lists_rust_impl_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rs");
+        fs::write(
+            &path,
+            "struct Server;\n\nimpl Server {\n    #[tool(description = \"x\")]\n    fn find(&self) {}\n}\n",
+        )
+        .unwrap();
+
+        let text = status(&RefactorStatusParams {
+            file: path_string(&path),
+            project_dir: None,
+        })
+        .unwrap();
+        let parsed: RefactorStatus = serde_json::from_str(&text).unwrap();
+        let method = parsed
+            .items
+            .iter()
+            .find(|item| item.kind == "impl_method" && item.name.as_deref() == Some("find"))
+            .expect("impl method should be listed");
+        assert!(
+            method
+                .attributes
+                .iter()
+                .any(|attr| attr == "#[tool(description = \"x\")]")
+        );
+    }
+
+    #[test]
     fn multiline_rust_attribute_moves_with_item() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
@@ -955,6 +1445,9 @@ mod tests {
             target: Some(path_string(&target)),
             item_names: Some(vec!["MoveMe".into()]),
             item_kinds: Some(vec!["struct_item".into()]),
+            impl_name: None,
+            router_name: None,
+            target_prelude: None,
             project_dir: None,
         })
         .unwrap();
@@ -976,6 +1469,323 @@ mod tests {
         let source_text = fs::read_to_string(&source).unwrap();
         assert!(!source_text.contains("#[derive("));
         assert!(source_text.contains("fn keep()"));
+    }
+
+    #[test]
+    fn extract_impl_methods_wraps_target_router_and_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("tools.rs");
+        fs::write(
+            &source,
+            "struct BlackboxServer;\n\n#[tool_router(router = old_tools)]\nimpl BlackboxServer {\n    #[tool(description = \"move\")]\n    fn move_me(&self) -> usize {\n        1\n    }\n\n    fn keep(&self) -> usize {\n        2\n    }\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl BlackboxServer".into()),
+            router_name: Some("moved_tools".into()),
+            target_prelude: Some("use super::*;".into()),
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let source_text = fs::read_to_string(&source).unwrap();
+        assert!(!source_text.contains("fn move_me"));
+        assert!(source_text.contains("fn keep"));
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.contains("use super::*;"));
+        assert!(target_text.contains("#[tool_router(router = moved_tools)]"));
+        assert!(target_text.contains("#[tool(description = \"move\")]"));
+        assert!(target_text.contains("impl BlackboxServer"));
+        assert!(target_text.contains("fn move_me"));
+    }
+
+    #[test]
+    fn extract_impl_methods_appends_to_existing_target_impl() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("tools.rs");
+        fs::write(
+            &source,
+            "struct BlackboxServer;\n\nimpl BlackboxServer {\n    fn move_me(&self) -> usize {\n        1\n    }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &target,
+            "use super::*;\n\n#[tool_router(router = moved_tools)]\nimpl BlackboxServer {\n    fn already_here(&self) {}\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl BlackboxServer".into()),
+            router_name: Some("moved_tools".into()),
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert_eq!(target_text.matches("impl BlackboxServer").count(), 1);
+        assert!(target_text.contains("fn already_here"));
+        assert!(target_text.contains("fn move_me"));
+    }
+
+    #[test]
+    fn extract_impl_methods_does_not_merge_different_router_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("tools.rs");
+        fs::write(
+            &source,
+            "struct BlackboxServer;\n\nimpl BlackboxServer {\n    fn move_me(&self) {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &target,
+            "#[tool_router(router = search_tools_extra)]\nimpl BlackboxServer {\n    fn already_here(&self) {}\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl BlackboxServer".into()),
+            router_name: Some("search_tools".into()),
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert_eq!(target_text.matches("impl BlackboxServer").count(), 2);
+        assert!(target_text.contains("#[tool_router(router = search_tools)]"));
+    }
+
+    #[test]
+    fn extract_impl_methods_inserts_prelude_at_top_of_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("tools.rs");
+        fs::write(
+            &source,
+            "struct BlackboxServer;\n\nimpl BlackboxServer {\n    fn move_me(&self) {}\n}\n",
+        )
+        .unwrap();
+        fs::write(&target, "pub fn helper() {}\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl BlackboxServer".into()),
+            router_name: None,
+            target_prelude: Some("use super::*;".into()),
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.starts_with("use super::*;\n\npub fn helper()"));
+        assert!(target_text.contains("impl BlackboxServer"));
+    }
+
+    #[test]
+    fn extract_impl_methods_inserts_prelude_after_inner_attrs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("tools.rs");
+        fs::write(
+            &source,
+            "struct BlackboxServer;\n\nimpl BlackboxServer {\n    fn move_me(&self) {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &target,
+            "#![allow(dead_code)]\n//! module docs\n\n// use super::*;\npub fn helper() {}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl BlackboxServer".into()),
+            router_name: None,
+            target_prelude: Some("use super::*;".into()),
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.starts_with("#![allow(dead_code)]\n//! module docs\n\nuse super::*;"));
+        assert_eq!(target_text.matches("use super::*;").count(), 2);
+    }
+
+    #[test]
+    fn extract_impl_methods_handles_generic_impl_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        let target = dir.path().join("moved.rs");
+        fs::write(
+            &source,
+            "struct Boxed<T>(T);\n\nimpl<T> Boxed<T>\nwhere\n    T: Clone,\n{\n    fn clone_inner(&self) -> T {\n        self.0.clone()\n    }\n}\n",
+        )
+        .unwrap();
+
+        let header = "impl<T> Boxed<T> where T: Clone,";
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["clone_inner".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some(header.into()),
+            router_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert!(fs::read_to_string(&target).unwrap().contains(header));
+    }
+
+    #[test]
+    fn extract_impl_method_requires_impl_filter_when_method_name_is_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        let target = dir.path().join("moved.rs");
+        fs::write(
+            &source,
+            "struct A;\nstruct B;\nimpl A { fn same(&self) {} }\nimpl B { fn same(&self) {} }\n",
+        )
+        .unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["same".into()]),
+            item_kinds: None,
+            impl_name: None,
+            router_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("matched multiple impl blocks"));
+    }
+
+    #[test]
+    fn extract_impl_method_rejects_misleading_function_item_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        let target = dir.path().join("moved.rs");
+        fs::write(&source, "struct A;\nimpl A { fn method(&self) {} }\n").unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["method".into()]),
+            item_kinds: Some(vec!["function_item".into()]),
+            impl_name: Some("impl A".into()),
+            router_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only supports item_kinds impl_method")
+        );
     }
 
     #[test]
@@ -1011,6 +1821,9 @@ mod tests {
             target: Some(path_string(&target)),
             item_names: Some(vec!["move_me".into()]),
             item_kinds: None,
+            impl_name: None,
+            router_name: None,
+            target_prelude: None,
             project_dir: None,
         })
         .unwrap();

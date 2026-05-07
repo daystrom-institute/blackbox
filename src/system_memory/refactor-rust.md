@@ -8,7 +8,8 @@ blackbox refactor tools.
 Rust is the first writable backend.
 
 - Inspect: supported with `bbox_refactor_status`.
-- Plan: supported with `bbox_refactor_plan(kind="extract_rust_items")`.
+- Plan: supported with `bbox_refactor_plan(kind="extract_rust_items")` and
+  `bbox_refactor_plan(kind="extract_rust_impl_methods")`.
 - Apply: supported with `bbox_refactor_apply(confirm=true)`.
 - Semantic rename: not supported by blackbox yet; use rust-analyzer, compiler
   feedback, or manual edits after inspection.
@@ -20,6 +21,9 @@ Tree-sitter language: `rust`.
 Writable plan kinds:
 
 - `extract_rust_items`: move named top-level Rust items from one file to another.
+- `extract_rust_impl_methods`: move named methods out of one `impl` block into
+  another file, preserving method attributes and optionally generating a
+  `#[tool_router(router = name)]` wrapper around the moved methods.
 
 Supported top-level item kinds include:
 
@@ -47,7 +51,8 @@ bbox_refactor_status(
 ```
 
 Copy exact `name` and `kind` values from the returned `items`. For `impl_item`,
-the name is the impl header, not a type identifier.
+the name is the impl header, not a type identifier. Rust status also includes
+`impl_method` entries for methods directly inside impl bodies.
 
 2. Create a dry-run move plan:
 
@@ -65,6 +70,36 @@ bbox_refactor_plan(
 The plan records absolute file paths, original SHA-256 hashes, non-overlapping
 byte edits, selected items, leftovers, and tree-sitter validation steps. Review
 it before apply.
+
+For methods inside a server/tool impl, use the impl-method plan:
+
+```text
+bbox_refactor_plan(
+  kind="extract_rust_impl_methods",
+  source="src/main.rs",
+  target="src/tools/search.rs",
+  item_names=["bbox_search", "bbox_browse"],
+  item_kinds=["impl_method"],
+  impl_name="impl BlackboxServer",
+  router_name="search_tools",
+  target_prelude="use super::*;",
+  project_dir="/absolute/project/root"
+)
+```
+
+If `router_name` is present, the target wrapper is generated as
+`#[tool_router(router = search_tools)] impl BlackboxServer { ... }`. This
+mechanizes the syntax move only. You still need to wire the generated router
+into the server constructor, add module declarations, fix imports/visibility,
+and run the Rust toolchain.
+
+If the target already has a matching `impl` block with the same `router_name`,
+the moved methods are appended inside that existing impl. Otherwise the plan
+creates a new wrapper. `target_prelude` is inserted near the top of a non-empty
+target file when it is not already present, after any shebang, crate-level inner
+attributes, and crate-level inner doc comments.
+If the existing target impl has a different router name, the plan creates a
+separate sibling router wrapper rather than merging into the wrong router.
 
 3. Apply only after review:
 
@@ -98,6 +133,9 @@ Use a narrower test command when the changed package has a clearer local test.
 - Moving an item can require module declarations, `pub` visibility changes,
   import cleanup, or call-site path edits. The current refactor tools do not
   do that automatically.
+- Plain `//` comments above a method are not treated as owned method trivia
+  unless attached to an attribute/doc block. Convert durable method comments to
+  rustdoc before moving when the comment must follow the method.
 - For symbolic rename, require an LSP-backed or compiler-verified workflow.
 - For broad autonomous restructuring, use a durable bro plus reviewer loop; the
   refactor tools supply mechanical edits, not architectural judgment.
