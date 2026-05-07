@@ -356,12 +356,19 @@ impl<'a> AgentRegistry<'a> {
             let vector_positive = component_scores.primary.max(component_scores.when_to_use);
 
             let mut matched_anti_patterns = Vec::new();
-            for (i, ap) in manifest.anti_patterns.iter().enumerate() {
-                let ap_l = ap.to_lowercase();
-                if query_terms.iter().any(|t| ap_l.contains(t)) {
+            for ap in &manifest.anti_patterns {
+                let ap_tokens = tokenize_for_match(ap);
+                let any_hit = query_terms.iter().any(|qt| {
+                    let qt = qt.trim();
+                    if qt.len() < 3 || STOPWORDS.contains(&qt) {
+                        return false;
+                    }
+                    let qt_lc = qt.to_lowercase();
+                    ap_tokens.iter().any(|t| token_match(&qt_lc, t))
+                });
+                if any_hit {
                     matched_anti_patterns.push(ap.clone());
                 }
-                let _ = i;
             }
 
             if positive_score == 0.0 && vector_positive == 0.0 {
@@ -1126,6 +1133,84 @@ mod tests {
         assert!(score > 0.0, "should have positive score: {score}");
         let zero = text_relevance(&["xyz"], "unrelated text", &[]);
         assert_eq!(zero, 0.0);
+    }
+
+    #[test]
+    fn matched_anti_patterns_uses_filtered_tokens() {
+        // Earlier reporting used raw split_whitespace query tokens
+        // and a substring contains() check, so any anti-pattern
+        // containing common short words like "use" or "of" looked
+        // matched against any query — including queries that
+        // shared zero domain tokens with the anti-pattern. The
+        // filter logic itself was correct (it used the tokenized
+        // anti_score), but the surfaced matched_anti_patterns list
+        // was noise. Use the same tokenization/stem-prefix rules so
+        // the surfaced list reflects real matches.
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = setup_catalog(&dir);
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "match-test.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "match-test",
+                    "version": 1,
+                    "manifest": {
+                        "description": "test agent for matched_anti_patterns reporting",
+                        "when_to_use": ["when running the matched-AP unit test"],
+                        "anti_patterns": [
+                            "do not use for one-off code generation tasks",
+                            "do not auto-apply proposals without explicit user approval"
+                        ],
+                        "brofile_inline": {"provider": "claude"},
+                    },
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let registry = AgentRegistry::new(&catalog);
+
+        // Query that scores positive against the agent (so it isn't
+        // bailed out by the early "no signal" filter) but shares no
+        // domain tokens with either anti-pattern. Earlier behavior:
+        // matched_anti_patterns surfaced both APs anyway because
+        // common short words like "use" / "of" inside the AP text
+        // substring-matched any query. Filtered tokenization should
+        // surface neither.
+        let results = registry
+            .search(
+                "running the unit test on this reporting agent",
+                5,
+                &SearchFilter::default(),
+                false,
+            )
+            .unwrap();
+        let row = results.iter().find(|r| r.name == "match-test").unwrap();
+        assert!(
+            row.matched_anti_patterns.is_empty(),
+            "expected no AP matches for query with no domain overlap, got: {:?}",
+            row.matched_anti_patterns
+        );
+
+        // Query that hits a real domain token in AP1 must surface that AP only.
+        let results = registry
+            .search(
+                "write code generation reporting agent",
+                5,
+                &SearchFilter::default(),
+                false,
+            )
+            .unwrap();
+        let row = results.iter().find(|r| r.name == "match-test").unwrap();
+        assert_eq!(
+            row.matched_anti_patterns,
+            vec!["do not use for one-off code generation tasks".to_string()],
+            "expected only the code-generation AP, got: {:?}",
+            row.matched_anti_patterns
+        );
     }
 
     #[test]
