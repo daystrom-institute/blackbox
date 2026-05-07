@@ -90,6 +90,7 @@ bbox_refactor_plan(
   item_kinds=["impl_method"],
   impl_name="impl BlackboxServer",
   router_name="search_tools",
+  router_export_name="router",
   target_prelude="use super::*;",
   project_dir="/absolute/project/root"
 )
@@ -97,9 +98,14 @@ bbox_refactor_plan(
 
 If `router_name` is present, the target wrapper is generated as
 `#[tool_router(router = search_tools)] impl BlackboxServer { ... }`. This
-mechanizes the syntax move only. You still need to wire the generated router
-into the server constructor, add module declarations, fix imports/visibility,
-and run the Rust toolchain.
+mechanizes the syntax move only. If `router_export_name` is also present, the
+target file gets a helper such as
+`pub(super) fn router() -> ToolRouter<BlackboxServer>` that calls the private
+generated associated router from inside the same module. This is needed when the
+new router impl lives in a child module.
+
+You still need to wire the generated router into the server constructor, add
+module declarations, fix imports/visibility, and run the Rust toolchain.
 
 If the target already has a matching `impl` block with the same `router_name`,
 the moved methods are appended inside that existing impl. Otherwise the plan
@@ -115,10 +121,13 @@ After extracting a new tool-domain impl, wire it into the server router sum:
 bbox_refactor_plan(
   kind="add_rust_router_to_sum",
   source="src/main.rs",
-  router_name="search_tools",
+  router_call="search_tools::router()",
   project_dir="/absolute/project/root"
 )
 ```
+
+Use `router_name="search_tools"` instead when the router impl remains in the
+same module as the constructor and `Self::search_tools()` is visible.
 
 3. Apply only after review:
 

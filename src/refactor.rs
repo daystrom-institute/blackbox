@@ -58,6 +58,14 @@ pub struct RefactorPlanParams {
     /// generated target wrapper is annotated as #[tool_router(router = name)].
     #[serde(default)]
     pub router_name: Option<String>,
+    /// Optional explicit router call for add_rust_router_to_sum, e.g.
+    /// "refactor_tools::router()". Defaults to "Self::<router_name>()".
+    #[serde(default)]
+    pub router_call: Option<String>,
+    /// Optional helper function name generated before a new router wrapper.
+    /// Use with router_name when extracting tool impls into a child module.
+    #[serde(default)]
+    pub router_export_name: Option<String>,
     /// Optional text inserted before the generated target wrapper.
     #[serde(default)]
     pub target_prelude: Option<String>,
@@ -504,6 +512,12 @@ fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<String> {
     if let Some(router_name) = p.router_name.as_deref() {
         validate_rust_identifier(router_name, "router_name")?;
     }
+    if let Some(export_name) = p.router_export_name.as_deref() {
+        validate_rust_identifier(export_name, "router_export_name")?;
+        if p.router_name.is_none() {
+            bail!("router_export_name requires router_name");
+        }
+    }
     if let Some(kinds) = p.item_kinds.as_deref() {
         if !kinds.iter().all(|kind| kind == "impl_method") {
             bail!("extract_rust_impl_methods only supports item_kinds impl_method");
@@ -581,6 +595,7 @@ fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<String> {
         &target_source,
         p.target_prelude.as_deref(),
         p.router_name.as_deref(),
+        p.router_export_name.as_deref(),
         &selected[0].impl_name,
         &parsed.source,
         &selected,
@@ -638,11 +653,17 @@ fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<String> {
 
 fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
-    let router_name = p
-        .router_name
-        .as_deref()
-        .ok_or_else(|| anyhow!("router_name is required for add_rust_router_to_sum"))?;
-    validate_rust_identifier(router_name, "router_name")?;
+    let router_call = if let Some(router_call) = p.router_call.as_deref() {
+        validate_rust_router_call(router_call, "router_call")?;
+        router_call.to_string()
+    } else {
+        let router_name = p
+            .router_name
+            .as_deref()
+            .ok_or_else(|| anyhow!("router_name is required for add_rust_router_to_sum"))?;
+        validate_rust_identifier(router_name, "router_name")?;
+        format!("Self::{router_name}()")
+    };
 
     let parsed = parse_rust_file(&source_path)?;
     let field = find_rust_field_initializer(&parsed, "tool_router")
@@ -651,7 +672,6 @@ fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<String> {
         .source
         .get(field.start_byte()..field.end_byte())
         .ok_or_else(|| anyhow!("invalid tool_router field range"))?;
-    let router_call = format!("Self::{router_name}()");
     if field_text.contains(&router_call) {
         bail!("tool_router already contains {router_call}");
     }
@@ -665,7 +685,7 @@ fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<String> {
     };
     let plan = RefactorPlan {
         title: format!(
-            "add Rust router {router_name} to tool_router sum in {}",
+            "add Rust router call {router_call} to tool_router sum in {}",
             path_string(&source_path)
         ),
         kind: "add_rust_router_to_sum".to_string(),
@@ -693,6 +713,7 @@ fn rust_impl_methods_target_edits(
     target_source: &str,
     target_prelude: Option<&str>,
     router_name: Option<&str>,
+    router_export_name: Option<&str>,
     impl_name: &str,
     source: &str,
     selected: &[RustImplMethod],
@@ -712,8 +733,14 @@ fn rust_impl_methods_target_edits(
         }]);
     }
 
-    let wrapper =
-        rust_impl_methods_target_wrapper(target_source, router_name, impl_name, source, selected)?;
+    let wrapper = rust_impl_methods_target_wrapper(
+        target_source,
+        router_name,
+        router_export_name,
+        impl_name,
+        source,
+        selected,
+    )?;
     let Some(prelude) = target_prelude
         .map(str::trim)
         .filter(|text| !text.is_empty())
@@ -935,11 +962,21 @@ fn impl_declaration_list(impl_node: Node<'_>) -> Option<Node<'_>> {
 fn rust_impl_methods_target_wrapper(
     target_source: &str,
     router_name: Option<&str>,
+    router_export_name: Option<&str>,
     impl_name: &str,
     source: &str,
     selected: &[RustImplMethod],
 ) -> Result<String> {
     let mut wrapper = String::new();
+    if let Some(export_name) = router_export_name {
+        let router_name =
+            router_name.ok_or_else(|| anyhow!("router_export_name requires router_name"))?;
+        wrapper.push_str("pub(super) fn ");
+        wrapper.push_str(export_name);
+        wrapper.push_str("() -> ToolRouter<BlackboxServer> {\n    BlackboxServer::");
+        wrapper.push_str(router_name);
+        wrapper.push_str("()\n}\n\n");
+    }
     if let Some(router_name) = router_name {
         wrapper.push_str("#[tool_router(router = ");
         wrapper.push_str(router_name);
@@ -996,6 +1033,22 @@ fn validate_rust_identifier(value: &str, field: &str) -> Result<()> {
     }
     if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
         bail!("{field} must be a Rust identifier");
+    }
+    Ok(())
+}
+
+fn validate_rust_router_call(value: &str, field: &str) -> Result<()> {
+    if value.trim() != value {
+        bail!("{field} must not have leading or trailing whitespace");
+    }
+    let Some(path) = value.strip_suffix("()") else {
+        bail!("{field} must be a zero-argument Rust path call");
+    };
+    if path.is_empty() {
+        bail!("{field} must be a zero-argument Rust path call");
+    }
+    for segment in path.split("::") {
+        validate_rust_identifier(segment, field)?;
     }
     Ok(())
 }
@@ -1623,6 +1676,8 @@ mod tests {
             item_kinds: Some(vec!["struct_item".into()]),
             impl_name: None,
             router_name: None,
+            router_call: None,
+            router_export_name: None,
             target_prelude: None,
             project_dir: None,
         })
@@ -1667,6 +1722,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             router_name: Some("moved_tools".into()),
+            router_call: None,
+            router_export_name: None,
             target_prelude: Some("use super::*;".into()),
             project_dir: None,
         })
@@ -1698,6 +1755,51 @@ mod tests {
     }
 
     #[test]
+    fn extract_impl_methods_can_generate_router_export_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("tools.rs");
+        fs::write(
+            &source,
+            "struct BlackboxServer;\n\nimpl BlackboxServer {\n    fn move_me(&self) -> usize {\n        1\n    }\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl BlackboxServer".into()),
+            router_name: Some("moved_tools".into()),
+            router_call: None,
+            router_export_name: Some("router".into()),
+            target_prelude: Some("use super::*;".into()),
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.contains("pub(super) fn router() -> ToolRouter<BlackboxServer>"));
+        assert!(target_text.contains("BlackboxServer::moved_tools()"));
+        assert!(target_text.contains("#[tool_router(router = moved_tools)]"));
+    }
+
+    #[test]
     fn extract_impl_methods_appends_to_existing_target_impl() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -1721,6 +1823,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             router_name: Some("moved_tools".into()),
+            router_call: None,
+            router_export_name: None,
             target_prelude: None,
             project_dir: None,
         })
@@ -1769,6 +1873,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             router_name: Some("search_tools".into()),
+            router_call: None,
+            router_export_name: None,
             target_prelude: None,
             project_dir: None,
         })
@@ -1811,6 +1917,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             router_name: None,
+            router_call: None,
+            router_export_name: None,
             target_prelude: Some("use super::*;".into()),
             project_dir: None,
         })
@@ -1857,6 +1965,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             router_name: None,
+            router_call: None,
+            router_export_name: None,
             target_prelude: Some("use super::*;".into()),
             project_dir: None,
         })
@@ -1900,6 +2010,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             router_name: None,
+            router_call: None,
+            router_export_name: None,
             target_prelude: Some("use super::*;".into()),
             project_dir: None,
         })
@@ -1942,6 +2054,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some(header.into()),
             router_name: None,
+            router_call: None,
+            router_export_name: None,
             target_prelude: None,
             project_dir: None,
         })
@@ -1981,6 +2095,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             router_name: None,
+            router_call: None,
+            router_export_name: None,
             target_prelude: None,
             project_dir: None,
         })
@@ -2003,6 +2119,8 @@ mod tests {
             item_kinds: Some(vec!["function_item".into()]),
             impl_name: Some("impl A".into()),
             router_name: None,
+            router_call: None,
+            router_export_name: None,
             target_prelude: None,
             project_dir: None,
         })
@@ -2030,6 +2148,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             router_name: Some("search_tools".into()),
+            router_call: None,
+            router_export_name: None,
             target_prelude: None,
             project_dir: None,
         })
@@ -2054,6 +2174,49 @@ mod tests {
     }
 
     #[test]
+    fn add_rust_router_to_sum_accepts_module_router_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        fs::write(
+            &source,
+            "struct Server { tool_router: usize }\nimpl Server {\n    fn new() -> Self {\n        Self {\n            tool_router: Self::bbox_tools() + Self::bro_tools(),\n        }\n    }\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "add_rust_router_to_sum".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            router_name: None,
+            router_call: Some("refactor_tools::router()".into()),
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let source_text = fs::read_to_string(&source).unwrap();
+        assert!(source_text.contains(
+            "tool_router: Self::bbox_tools() + Self::bro_tools() + refactor_tools::router(),"
+        ));
+    }
+
+    #[test]
     fn add_rust_router_to_sum_rejects_duplicate_router() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -2071,6 +2234,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             router_name: Some("search_tools".into()),
+            router_call: None,
+            router_export_name: None,
             target_prelude: None,
             project_dir: None,
         })
@@ -2117,6 +2282,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             router_name: None,
+            router_call: None,
+            router_export_name: None,
             target_prelude: None,
             project_dir: None,
         })
