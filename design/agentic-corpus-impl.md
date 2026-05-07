@@ -623,8 +623,8 @@ Nightly cron arc invokes the harness.
   cron-triggered.
 - `examples/agentic-corpus/packets/eval/drift-policy.json` — `stable |
   drift_minor | drift_major`.
-- `bbox_thread(thread-cba8bfa1)` cross-references the `foreach` engine
-  follow-up.
+- `bbox_thread(thread-cba8bfa1)` cross-references the native
+  `foreach`/`matrix` workflow fanout follow-up.
 
 **Gates.**
 - Suite runs end-to-end against blackboxd-dev.

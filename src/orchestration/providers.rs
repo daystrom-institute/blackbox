@@ -21,6 +21,7 @@ pub enum Provider {
     Copilot,
     Vibe,
     Gemini,
+    Workflow,
 }
 
 /// Capability tag advertised by providers and required by workflow
@@ -94,6 +95,7 @@ impl Provider {
             Provider::Copilot => &[ToolUse, Resume],
             Provider::Gemini => &[Vision, ToolUse],
             Provider::Vibe => &[],
+            Provider::Workflow => &[],
         };
         v.iter().copied().collect()
     }
@@ -108,6 +110,7 @@ impl Provider {
             Provider::Copilot => "copilot",
             Provider::Vibe => "vibe",
             Provider::Gemini => "gemini",
+            Provider::Workflow => "workflow",
         }
     }
 
@@ -125,6 +128,7 @@ impl Provider {
             Provider::Copilot => std::env::var("COPILOT_BIN").unwrap_or_else(|_| "gh".into()),
             Provider::Vibe => std::env::var("VIBE_BIN").unwrap_or_else(|_| "vibe".into()),
             Provider::Gemini => std::env::var("GEMINI_BIN").unwrap_or_else(|_| "gemini".into()),
+            Provider::Workflow => "workflow".into(),
         }
     }
 
@@ -164,6 +168,7 @@ impl Provider {
             Provider::Copilot => COPILOT_MODELS,
             Provider::Vibe => VIBE_MODELS,
             Provider::Gemini => GEMINI_MODELS,
+            Provider::Workflow => &[],
         }
     }
 
@@ -374,6 +379,7 @@ impl Provider {
                 }
                 args
             }
+            Provider::Workflow => Vec::new(),
         }
     }
 
@@ -387,7 +393,7 @@ impl Provider {
             Provider::Glm | Provider::Deepseek | Provider::Inception => None,
             Provider::Codex => resolve_codex_session_cwd(session_id),
             Provider::Gemini => resolve_gemini_session_cwd(session_id),
-            Provider::Copilot | Provider::Vibe => None,
+            Provider::Copilot | Provider::Vibe | Provider::Workflow => None,
         }
     }
 
@@ -507,6 +513,7 @@ impl Provider {
                 }
                 args
             }
+            Provider::Workflow => Vec::new(),
         }
     }
 }
@@ -659,7 +666,7 @@ impl Provider {
                 args.extend([name.into(), url.into()]);
                 Some(args)
             }
-            Provider::Vibe => None,
+            Provider::Vibe | Provider::Workflow => None,
         }
     }
 
@@ -717,7 +724,7 @@ impl Provider {
                     name.into(),
                 ])
             }
-            Provider::Vibe => None,
+            Provider::Vibe | Provider::Workflow => None,
         }
     }
 
@@ -734,7 +741,7 @@ impl Provider {
             ]),
             Provider::Codex => Some(vec!["mcp".into(), "list".into()]),
             Provider::Gemini => Some(vec!["mcp".into(), "list".into()]),
-            Provider::Vibe => None,
+            Provider::Vibe | Provider::Workflow => None,
         }
     }
 
@@ -826,7 +833,7 @@ impl Provider {
             // so the caller knows whether to bother generating at all.
             Provider::Gemini => {}
             // Vibe has no MCP at all.
-            Provider::Vibe => {}
+            Provider::Vibe | Provider::Workflow => {}
         }
         args
     }
@@ -1060,6 +1067,7 @@ impl Provider {
             Provider::Copilot => parse_copilot_event(evt, sink),
             Provider::Vibe => parse_vibe_event(evt, sink),
             Provider::Gemini => parse_gemini_event(evt, sink),
+            Provider::Workflow => {}
         }
     }
 

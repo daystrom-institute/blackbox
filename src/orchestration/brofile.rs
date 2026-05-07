@@ -338,7 +338,8 @@ fn synthesized_account_env_for_home(
         | Provider::Deepseek
         | Provider::Inception
         | Provider::Gemini
-        | Provider::Vibe => return None,
+        | Provider::Vibe
+        | Provider::Workflow => return None,
     };
 
     Some(HashMap::from([(

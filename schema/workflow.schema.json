@@ -97,8 +97,99 @@
           "items": { "type": "string" },
           "description": "Names of nodes whose in-flight outputs must be joined before this node's body runs (explicit fan-in for fork → join patterns)."
         },
+        "foreach":         { "$ref": "#/definitions/ForeachSpec" },
+        "matrix":          { "$ref": "#/definitions/MatrixSpec" },
         "next": { "$ref": "#/definitions/NodeTransition" }
       }
+    },
+
+    "ForeachSpec": {
+      "type": "object",
+      "required": ["items", "as_var", "collect"],
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["subworkflow"], "not": { "required": ["subworkflow_ref"] } },
+        { "required": ["subworkflow_ref"], "not": { "required": ["subworkflow"] } }
+      ],
+      "properties": {
+        "items": {
+          "description": "JSON value resolved at dispatch through ArcContext templating. Must resolve to an array.",
+          "type": ["array", "object", "string", "number", "integer", "boolean", "null"]
+        },
+        "as_var":           { "type": "string", "minLength": 1 },
+        "index_as":         { "type": ["string", "null"], "minLength": 1 },
+        "key":              { "type": ["string", "null"] },
+        "subworkflow":      { "$ref": "#" },
+        "subworkflow_ref":  { "type": ["string", "null"] },
+        "imports":          { "type": "array", "items": { "type": "string" } },
+        "exports":          { "type": "array", "items": { "type": "string" } },
+        "import_renames":   {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "parallelism":      { "type": ["integer", "null"], "minimum": 1, "maximum": 16 },
+        "collect":          { "$ref": "#/definitions/ForeachCollect" },
+        "on_item_failure":  { "$ref": "#/definitions/ItemFailurePolicy" }
+      }
+    },
+
+    "MatrixSpec": {
+      "type": "object",
+      "required": ["axes", "as_var", "collect"],
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["subworkflow"], "not": { "required": ["subworkflow_ref"] } },
+        { "required": ["subworkflow_ref"], "not": { "required": ["subworkflow"] } }
+      ],
+      "properties": {
+        "axes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/MatrixAxis" }
+        },
+        "as_var":           { "type": "string", "minLength": 1 },
+        "index_as":         { "type": ["string", "null"], "minLength": 1 },
+        "key":              { "type": ["string", "null"] },
+        "subworkflow":      { "$ref": "#" },
+        "subworkflow_ref":  { "type": ["string", "null"] },
+        "imports":          { "type": "array", "items": { "type": "string" } },
+        "exports":          { "type": "array", "items": { "type": "string" } },
+        "import_renames":   {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "parallelism":      { "type": ["integer", "null"], "minimum": 1, "maximum": 16 },
+        "collect":          { "$ref": "#/definitions/ForeachCollect" },
+        "on_item_failure":  { "$ref": "#/definitions/ItemFailurePolicy" }
+      }
+    },
+
+    "MatrixAxis": {
+      "type": "object",
+      "required": ["name", "values"],
+      "additionalProperties": false,
+      "properties": {
+        "name":   { "type": "string", "minLength": 1 },
+        "values": {
+          "description": "JSON value resolved at dispatch through ArcContext templating. Must resolve to an array.",
+          "type": ["array", "object", "string", "number", "integer", "boolean", "null"]
+        }
+      }
+    },
+
+    "ForeachCollect": {
+      "type": "object",
+      "required": ["into_var"],
+      "additionalProperties": false,
+      "properties": {
+        "into_var": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "ItemFailurePolicy": {
+      "type": "string",
+      "enum": ["halt", "collect_then_halt", "continue"],
+      "default": "halt"
     },
 
     "NodeTransition": {

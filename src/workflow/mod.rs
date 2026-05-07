@@ -18,21 +18,26 @@ pub mod wait;
 
 pub use engine::{
     run_workflow, run_workflow_streaming, run_workflow_streaming_with_vars,
-    run_workflow_with_initial_vars, WorkflowRunResult,
+    run_workflow_streaming_with_vars_and_arc_id, run_workflow_with_initial_vars,
+    run_workflow_with_initial_vars_and_arc_id, WorkflowRunResult,
 };
 pub use schema::{
-    load_workflow, ActorKind, ActorSpec, BranchSelector, GateMode, NodeMode, NodeTransition,
-    Workflow,
+    load_workflow, ActorKind, ActorSpec, BranchSelector, ForeachCollect, ForeachSpec, GateMode,
+    ItemFailurePolicy, MatrixAxis, MatrixSpec, NodeMode, NodeTransition, Workflow,
 };
 #[cfg(test)]
 pub use schema::{InjectPolicy, LateInject, NodeSpec, RetryPolicy};
 
 use anyhow::{anyhow, bail, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use self::context::VarKind;
+use self::engine::{MAX_FOREACH_ITEMS, MAX_FOREACH_PARALLELISM};
+use serde_json::Value;
 
 /// A workflow that has been loaded AND cross-validated. Produced by
 /// [`compile`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompiledWorkflow {
     pub spec: Workflow,
 }
@@ -59,6 +64,7 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
         if node.subworkflow.is_some() && node.subworkflow_ref.is_some() {
             bail!("node '{node_id}' has BOTH subworkflow (inline) and subworkflow_ref — pick one");
         }
+        validate_dynamic_fanout(node_id, node, spec)?;
         if node.subworkflow.is_some() {
             // Recursively compile the sub-workflow so errors surface
             // at parent-compile time, not at dispatch time.
@@ -126,6 +132,259 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
         bail!("workflow has no Terminal transition — arc can never complete normally");
     }
 
+    Ok(())
+}
+
+fn validate_dynamic_fanout(
+    node_id: &str,
+    node: &schema::NodeSpec,
+    parent: &Workflow,
+) -> Result<()> {
+    let fanout_count = node.foreach.is_some() as u8 + node.matrix.is_some() as u8;
+    if fanout_count == 0 {
+        return Ok(());
+    }
+    if fanout_count > 1 {
+        bail!("node '{node_id}' has BOTH foreach and matrix — pick one");
+    }
+    if !node.actor.is_empty() {
+        bail!(
+            "node '{node_id}' foreach/matrix cannot also declare actor '{}'",
+            node.actor
+        );
+    }
+    if node.subworkflow.is_some() || node.subworkflow_ref.is_some() {
+        bail!("node '{node_id}' foreach/matrix cannot also declare node-level subworkflow");
+    }
+    if node.wait.is_some() {
+        bail!("node '{node_id}' foreach/matrix cannot also declare wait");
+    }
+    if matches!(node.mode, NodeMode::FireAndForget) {
+        bail!("node '{node_id}' foreach/matrix cannot use mode=fire_and_forget");
+    }
+
+    match (&node.foreach, &node.matrix) {
+        (Some(spec), None) => {
+            validate_literal_array_len(node_id, "foreach items", &spec.items)?;
+            validate_foreach_like(node_id, spec, &parent.vars_schema)
+        }
+        (None, Some(matrix)) => {
+            if matrix.axes.is_empty() {
+                bail!("node '{node_id}' matrix has no axes");
+            }
+            let mut axis_names = HashSet::new();
+            for axis in &matrix.axes {
+                validate_var_name(node_id, "matrix axis", &axis.name)?;
+                validate_literal_array_len(
+                    node_id,
+                    &format!("matrix axis '{}'", axis.name),
+                    &axis.values,
+                )?;
+                if !axis_names.insert(axis.name.as_str()) {
+                    bail!("node '{node_id}' matrix has duplicate axis '{}'", axis.name);
+                }
+            }
+            validate_foreach_like(node_id, matrix, &parent.vars_schema)
+        }
+        _ => Ok(()),
+    }
+}
+
+trait FanoutSpec {
+    fn as_var(&self) -> &str;
+    fn index_as(&self) -> Option<&str>;
+    fn subworkflow(&self) -> Option<&Workflow>;
+    fn subworkflow_ref(&self) -> Option<&str>;
+    fn imports(&self) -> &[String];
+    fn import_renames(&self) -> &HashMap<String, String>;
+    fn exports(&self) -> &[String];
+    fn parallelism(&self) -> Option<usize>;
+    fn collect_into_var(&self) -> &str;
+}
+
+impl FanoutSpec for ForeachSpec {
+    fn as_var(&self) -> &str {
+        &self.as_var
+    }
+    fn index_as(&self) -> Option<&str> {
+        self.index_as.as_deref()
+    }
+    fn subworkflow(&self) -> Option<&Workflow> {
+        self.subworkflow.as_deref()
+    }
+    fn subworkflow_ref(&self) -> Option<&str> {
+        self.subworkflow_ref.as_deref()
+    }
+    fn imports(&self) -> &[String] {
+        &self.imports
+    }
+    fn import_renames(&self) -> &HashMap<String, String> {
+        &self.import_renames
+    }
+    fn exports(&self) -> &[String] {
+        &self.exports
+    }
+    fn parallelism(&self) -> Option<usize> {
+        self.parallelism
+    }
+    fn collect_into_var(&self) -> &str {
+        &self.collect.into_var
+    }
+}
+
+impl FanoutSpec for MatrixSpec {
+    fn as_var(&self) -> &str {
+        &self.as_var
+    }
+    fn index_as(&self) -> Option<&str> {
+        self.index_as.as_deref()
+    }
+    fn subworkflow(&self) -> Option<&Workflow> {
+        self.subworkflow.as_deref()
+    }
+    fn subworkflow_ref(&self) -> Option<&str> {
+        self.subworkflow_ref.as_deref()
+    }
+    fn imports(&self) -> &[String] {
+        &self.imports
+    }
+    fn import_renames(&self) -> &HashMap<String, String> {
+        &self.import_renames
+    }
+    fn exports(&self) -> &[String] {
+        &self.exports
+    }
+    fn parallelism(&self) -> Option<usize> {
+        self.parallelism
+    }
+    fn collect_into_var(&self) -> &str {
+        &self.collect.into_var
+    }
+}
+
+fn validate_foreach_like<S: FanoutSpec>(
+    node_id: &str,
+    spec: &S,
+    vars_schema: &Option<context::VarsSchema>,
+) -> Result<()> {
+    validate_var_name(node_id, "as_var", spec.as_var())?;
+    if let Some(index_as) = spec.index_as() {
+        validate_var_name(node_id, "index_as", index_as)?;
+    }
+    validate_var_name(node_id, "collect.into_var", spec.collect_into_var())?;
+    validate_binding_collisions(node_id, spec)?;
+    // TODO(PR2): key template dry-run validation belongs with runtime
+    // item expansion, where the per-item value shape is known. A
+    // schema-only placeholder render would falsely reject valid keys
+    // like `${vars.item.id}` when `item` is a runtime object.
+
+    match (spec.subworkflow(), spec.subworkflow_ref()) {
+        (Some(_), Some(_)) => {
+            bail!("node '{node_id}' foreach/matrix has BOTH subworkflow and subworkflow_ref — pick one")
+        }
+        (None, None) => {
+            bail!("node '{node_id}' foreach/matrix requires subworkflow or subworkflow_ref")
+        }
+        _ => {}
+    }
+
+    if let Some(parallelism) = spec.parallelism() {
+        if parallelism == 0 || parallelism > MAX_FOREACH_PARALLELISM {
+            bail!(
+                "node '{node_id}' foreach/matrix parallelism must be 1..={MAX_FOREACH_PARALLELISM}"
+            );
+        }
+    }
+
+    if let Some(schema) = vars_schema {
+        if let Some(entry) = schema.get(spec.collect_into_var()) {
+            if entry.kind != VarKind::Array {
+                bail!(
+                    "node '{node_id}' foreach/matrix collect.into_var '{}' must be kind=array in vars_schema",
+                    spec.collect_into_var()
+                );
+            }
+        }
+    }
+
+    if let Some(sub) = spec.subworkflow() {
+        compile(sub.clone()).map_err(|e| {
+            anyhow!("foreach/matrix subworkflow on node '{node_id}' failed to compile: {e}")
+        })?;
+        if let Some(schema) = sub.vars_schema.as_ref() {
+            for key in spec.imports() {
+                if !schema.contains_key(key) {
+                    bail!(
+                        "node '{node_id}' foreach/matrix import '{key}' is not declared in inline subworkflow vars_schema"
+                    );
+                }
+            }
+            for key in spec.import_renames().keys() {
+                if !schema.contains_key(key) {
+                    bail!(
+                        "node '{node_id}' foreach/matrix import_renames target '{key}' is not declared in inline subworkflow vars_schema"
+                    );
+                }
+            }
+            for key in spec.exports() {
+                if !schema.contains_key(key) {
+                    bail!(
+                        "node '{node_id}' foreach/matrix export '{key}' is not declared in inline subworkflow vars_schema"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_binding_collisions<S: FanoutSpec>(node_id: &str, spec: &S) -> Result<()> {
+    let mut collisions = Vec::new();
+    for key in spec.imports().iter().map(String::as_str) {
+        if key == spec.as_var() || spec.index_as().is_some_and(|index_as| key == index_as) {
+            collisions.push(key.to_string());
+        }
+    }
+    for key in spec.import_renames().keys().map(String::as_str) {
+        if key == spec.as_var() || spec.index_as().is_some_and(|index_as| key == index_as) {
+            collisions.push(key.to_string());
+        }
+    }
+    collisions.sort();
+    collisions.dedup();
+    if !collisions.is_empty() {
+        bail!(
+            "node '{node_id}' foreach/matrix imports collide with per-item bindings: {:?}",
+            collisions
+        );
+    }
+    Ok(())
+}
+
+fn validate_literal_array_len(node_id: &str, label: &str, value: &Value) -> Result<()> {
+    if let Value::Array(items) = value {
+        if items.len() > MAX_FOREACH_ITEMS {
+            bail!(
+                "node '{node_id}' {label} literal has {} items, exceeding MAX_FOREACH_ITEMS={MAX_FOREACH_ITEMS}",
+                items.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_var_name(node_id: &str, label: &str, name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("node '{node_id}' {label} must not be empty");
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        bail!("node '{node_id}' {label} '{name}' is not a valid var identifier");
+    }
+    if chars.any(|c| !(c == '_' || c.is_ascii_alphanumeric())) {
+        bail!("node '{node_id}' {label} '{name}' is not a valid var identifier");
+    }
     Ok(())
 }
 
@@ -343,6 +602,11 @@ fn format_transition(t: &NodeTransition) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compile_err(spec_json: &str) -> String {
+        let spec = load_workflow(spec_json).unwrap();
+        compile(spec).unwrap_err().to_string()
+    }
 
     #[test]
     fn optimistic_workflow_loads_and_validates() {
@@ -609,6 +873,478 @@ mod tests {
     }
 
     #[test]
+    fn foreach_node_with_inline_subworkflow_compiles() {
+        let spec_json = r#"{
+            "name": "foreach-parent",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "results": {"kind": "array"}
+            },
+            "nodes": {
+                "Each": {
+                    "actor": "",
+                    "foreach": {
+                        "items": ["a", "b"],
+                        "as_var": "item",
+                        "index_as": "item_index",
+                        "on_item_failure": "collect_then_halt",
+                        "collect": {"into_var": "results"},
+                        "subworkflow": {
+                            "name": "foreach-child",
+                            "version": 1,
+                            "actors": {},
+                            "nodes": {
+                                "Only": {"actor": "", "next": {"type": "terminal"}}
+                            },
+                            "start": "Only"
+                        }
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Each"
+        }"#;
+        let spec = load_workflow(spec_json).unwrap();
+        compile(spec).expect("foreach schema-only node compiles");
+    }
+
+    #[test]
+    fn matrix_node_with_runtime_axis_values_compiles() {
+        let spec_json = r#"{
+            "name": "matrix-parent",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "results": {"kind": "array"}
+            },
+            "nodes": {
+                "Grid": {
+                    "actor": "",
+                    "matrix": {
+                        "axes": [
+                            {"name": "query", "values": "${vars.queries}"},
+                            {"name": "strategy", "values": ["search-only", "agentic"]}
+                        ],
+                        "as_var": "case",
+                        "collect": {"into_var": "results"},
+                        "subworkflow_ref": "installed-child-workflow"
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Grid"
+        }"#;
+        let spec = load_workflow(spec_json).unwrap();
+        compile(spec).expect("matrix with runtime axis values compiles");
+    }
+
+    #[test]
+    fn foreach_with_actor_fails_validation() {
+        let spec_json = r#"{
+            "name": "bad-foreach",
+            "version": 1,
+            "actors": {"e": {"kind": "executor", "brofile": "x"}},
+            "nodes": {
+                "Each": {
+                    "actor": "e",
+                    "foreach": {
+                        "items": [],
+                        "as_var": "item",
+                        "collect": {"into_var": "results"},
+                        "subworkflow_ref": "child"
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Each"
+        }"#;
+        let spec = load_workflow(spec_json).unwrap();
+        let err = compile(spec).unwrap_err().to_string();
+        assert!(
+            err.contains("foreach/matrix") && err.contains("actor"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn foreach_collect_var_must_be_array_when_declared() {
+        let spec_json = r#"{
+            "name": "bad-foreach",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "results": {"kind": "string"}
+            },
+            "nodes": {
+                "Each": {
+                    "actor": "",
+                    "foreach": {
+                        "items": [],
+                        "as_var": "item",
+                        "collect": {"into_var": "results"},
+                        "subworkflow_ref": "child"
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Each"
+        }"#;
+        let spec = load_workflow(spec_json).unwrap();
+        let err = compile(spec).unwrap_err().to_string();
+        assert!(err.contains("kind=array"), "err: {err}");
+    }
+
+    #[test]
+    fn matrix_duplicate_axis_fails_validation() {
+        let spec_json = r#"{
+            "name": "bad-matrix",
+            "version": 1,
+            "actors": {},
+            "nodes": {
+                "Grid": {
+                    "actor": "",
+                    "matrix": {
+                        "axes": [
+                            {"name": "query", "values": []},
+                            {"name": "query", "values": []}
+                        ],
+                        "as_var": "case",
+                        "collect": {"into_var": "results"},
+                        "subworkflow_ref": "child"
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Grid"
+        }"#;
+        let spec = load_workflow(spec_json).unwrap();
+        let err = compile(spec).unwrap_err().to_string();
+        assert!(err.contains("duplicate axis"), "err: {err}");
+    }
+
+    #[test]
+    fn foreach_and_matrix_on_same_node_fails_validation() {
+        let err = compile_err(
+            r#"{
+                "name": "bad-fanout",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Node": {
+                        "actor": "",
+                        "foreach": {
+                            "items": [],
+                            "as_var": "item",
+                            "collect": {"into_var": "results"},
+                            "subworkflow_ref": "child"
+                        },
+                        "matrix": {
+                            "axes": [{"name": "axis", "values": []}],
+                            "as_var": "case",
+                            "collect": {"into_var": "results"},
+                            "subworkflow_ref": "child"
+                        },
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Node"
+            }"#,
+        );
+        assert!(err.contains("BOTH foreach and matrix"), "err: {err}");
+    }
+
+    #[test]
+    fn foreach_with_wait_or_node_subworkflow_fails_validation() {
+        let wait_err = compile_err(
+            r#"{
+                "name": "bad-foreach",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Each": {
+                        "actor": "",
+                        "wait": {"any_of": [{"signal": "go"}]},
+                        "foreach": {
+                            "items": [],
+                            "as_var": "item",
+                            "collect": {"into_var": "results"},
+                            "subworkflow_ref": "child"
+                        },
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Each"
+            }"#,
+        );
+        assert!(wait_err.contains("declare wait"), "err: {wait_err}");
+
+        let sub_err = compile_err(
+            r#"{
+                "name": "bad-foreach",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Each": {
+                        "actor": "",
+                        "subworkflow_ref": "outer-child",
+                        "foreach": {
+                            "items": [],
+                            "as_var": "item",
+                            "collect": {"into_var": "results"},
+                            "subworkflow_ref": "inner-child"
+                        },
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Each"
+            }"#,
+        );
+        assert!(sub_err.contains("node-level subworkflow"), "err: {sub_err}");
+    }
+
+    #[test]
+    fn foreach_fire_and_forget_or_missing_child_fails_validation() {
+        let mode_err = compile_err(
+            r#"{
+                "name": "bad-foreach",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Each": {
+                        "actor": "",
+                        "mode": "fire_and_forget",
+                        "foreach": {
+                            "items": [],
+                            "as_var": "item",
+                            "collect": {"into_var": "results"},
+                            "subworkflow_ref": "child"
+                        },
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Each"
+            }"#,
+        );
+        assert!(mode_err.contains("fire_and_forget"), "err: {mode_err}");
+
+        let child_err = compile_err(
+            r#"{
+                "name": "bad-foreach",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Each": {
+                        "actor": "",
+                        "foreach": {
+                            "items": [],
+                            "as_var": "item",
+                            "collect": {"into_var": "results"}
+                        },
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Each"
+            }"#,
+        );
+        assert!(
+            child_err.contains("requires subworkflow"),
+            "err: {child_err}"
+        );
+    }
+
+    #[test]
+    fn foreach_both_child_workflow_forms_fails_validation() {
+        let err = compile_err(
+            r#"{
+                "name": "bad-foreach",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Each": {
+                        "actor": "",
+                        "foreach": {
+                            "items": [],
+                            "as_var": "item",
+                            "collect": {"into_var": "results"},
+                            "subworkflow_ref": "child",
+                            "subworkflow": {
+                                "name": "child",
+                                "version": 1,
+                                "actors": {},
+                                "nodes": {"Only": {"actor": "", "next": {"type": "terminal"}}},
+                                "start": "Only"
+                            }
+                        },
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Each"
+            }"#,
+        );
+        assert!(
+            err.contains("BOTH subworkflow and subworkflow_ref"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn foreach_parallelism_bounds_fail_validation() {
+        for (parallelism, expected) in [(0, "1..=16"), (17, "1..=16")] {
+            let err = compile_err(&format!(
+                r#"{{
+                    "name": "bad-foreach",
+                    "version": 1,
+                    "actors": {{}},
+                    "nodes": {{
+                        "Each": {{
+                            "actor": "",
+                            "foreach": {{
+                                "items": [],
+                                "as_var": "item",
+                                "parallelism": {parallelism},
+                                "collect": {{"into_var": "results"}},
+                                "subworkflow_ref": "child"
+                            }},
+                            "next": {{"type": "terminal"}}
+                        }}
+                    }},
+                    "start": "Each"
+                }}"#
+            ));
+            assert!(
+                err.contains(expected),
+                "parallelism={parallelism}, err: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreach_rejects_bad_binding_identifiers() {
+        for (field, snippet) in [
+            ("as_var", r#""as_var": "1bad""#),
+            ("index_as", r#""as_var": "item", "index_as": "has-dash""#),
+        ] {
+            let err = compile_err(&format!(
+                r#"{{
+                    "name": "bad-foreach",
+                    "version": 1,
+                    "actors": {{}},
+                    "nodes": {{
+                        "Each": {{
+                            "actor": "",
+                            "foreach": {{
+                                "items": [],
+                                {snippet},
+                                "collect": {{"into_var": "results"}},
+                                "subworkflow_ref": "child"
+                            }},
+                            "next": {{"type": "terminal"}}
+                        }}
+                    }},
+                    "start": "Each"
+                }}"#
+            ));
+            assert!(
+                err.contains(field) && err.contains("valid var identifier"),
+                "err: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreach_inline_child_schema_validates_imports_exports_and_collisions() {
+        let missing_import = compile_err(
+            r#"{
+                "name": "bad-foreach",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Each": {
+                        "actor": "",
+                        "foreach": {
+                            "items": [],
+                            "as_var": "item",
+                            "imports": ["missing"],
+                            "collect": {"into_var": "results"},
+                            "subworkflow": {
+                                "name": "child",
+                                "version": 1,
+                                "actors": {},
+                                "vars_schema": {"item": {"kind": "string"}, "summary": {"kind": "string"}},
+                                "nodes": {"Only": {"actor": "", "next": {"type": "terminal"}}},
+                                "start": "Only"
+                            }
+                        },
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Each"
+            }"#,
+        );
+        assert!(
+            missing_import.contains("import 'missing'"),
+            "err: {missing_import}"
+        );
+
+        let missing_export = compile_err(
+            r#"{
+                "name": "bad-foreach",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Each": {
+                        "actor": "",
+                        "foreach": {
+                            "items": [],
+                            "as_var": "item",
+                            "exports": ["sumary"],
+                            "collect": {"into_var": "results"},
+                            "subworkflow": {
+                                "name": "child",
+                                "version": 1,
+                                "actors": {},
+                                "vars_schema": {"item": {"kind": "string"}, "summary": {"kind": "string"}},
+                                "nodes": {"Only": {"actor": "", "next": {"type": "terminal"}}},
+                                "start": "Only"
+                            }
+                        },
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Each"
+            }"#,
+        );
+        assert!(
+            missing_export.contains("export 'sumary'"),
+            "err: {missing_export}"
+        );
+
+        let collision = compile_err(
+            r#"{
+                "name": "bad-foreach",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Each": {
+                        "actor": "",
+                        "foreach": {
+                            "items": [],
+                            "as_var": "item",
+                            "imports": ["item"],
+                            "collect": {"into_var": "results"},
+                            "subworkflow_ref": "child"
+                        },
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Each"
+            }"#,
+        );
+        assert!(collision.contains("collide"), "err: {collision}");
+    }
+
+    #[test]
     fn hook_only_node_without_actor_accepted() {
         // Hook-only nodes (Setup / Done patterns) have empty actor and
         // run only on_enter / on_exit. Validator must accept this.
@@ -700,6 +1436,60 @@ mod tests {
                 .validate(&minimal)
                 .err()
                 .map(|errs| errs.map(|e| e.to_string()).collect::<Vec<_>>())
+        );
+
+        let invalid_parallelism: serde_json::Value = serde_json::json!({
+            "name": "bad-foreach",
+            "version": 1,
+            "actors": {},
+            "nodes": {
+                "Each": {
+                    "actor": "",
+                    "foreach": {
+                        "items": [],
+                        "as_var": "item",
+                        "parallelism": 17,
+                        "collect": {"into_var": "results"},
+                        "subworkflow_ref": "child"
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Each"
+        });
+        assert!(
+            !compiled.is_valid(&invalid_parallelism),
+            "workflow.schema.json should reject foreach parallelism above the engine cap"
+        );
+
+        let invalid_child_xor: serde_json::Value = serde_json::json!({
+            "name": "bad-foreach",
+            "version": 1,
+            "actors": {},
+            "nodes": {
+                "Each": {
+                    "actor": "",
+                    "foreach": {
+                        "items": [],
+                        "as_var": "item",
+                        "collect": {"into_var": "results"},
+                        "subworkflow_ref": "child",
+                        "subworkflow": {
+                            "name": "child",
+                            "version": 1,
+                            "actors": {},
+                            "nodes": {"Only": {"actor": "", "next": {"type": "terminal"}}},
+                            "start": "Only"
+                        }
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Each"
+        });
+        assert!(
+            !compiled.is_valid(&invalid_child_xor),
+            "workflow.schema.json should reject foreach child workflow XOR violations"
         );
     }
 

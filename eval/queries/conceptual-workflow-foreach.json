@@ -1,16 +1,16 @@
 {
   "id": "conceptual-workflow-foreach",
   "query_class": "conceptual_design_doc",
-  "query": "why does the eval harness use a shell script instead of workflow foreach?",
+  "query": "why does the eval harness still bootstrap through a shell script instead of native workflow fanout?",
   "target_locators": [
     {
-      "description": "The eval harness design note that shell iteration sidesteps the missing workflow-engine foreach primitive.",
+      "description": "The eval harness and workflow fanout design note that shell iteration is a bootstrap path until foreach/matrix runtime support lands.",
       "entity_type_hint": "project_file",
       "path_hint": "design/agentic-corpus.md"
     }
   ],
   "expected_entity_refs": [
-    "project_file:d723917f:3b317e2b:3e768b4d16b66baaac582f742feff881e066493b0c2ea2eb0f12cc7794ec350e:16"
+    "project_file:d723917f:3b317e2b:1a5c6e7d2b39b86f4313f0ec6b6a8f074321c62ce82e81b8c596fe7002918026:12"
   ],
   "required_evidence": {
     "kind": "path",
@@ -23,7 +23,7 @@
     }
   },
   "forbidden_stale_answers": [
-    "Do not claim foreach already exists in the workflow engine."
+    "Do not claim foreach/matrix runtime support is complete."
   ],
   "pass_classifier": "check_conceptual_workflow_foreach"
 }

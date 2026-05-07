@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 use super::context::VarsSchema;
@@ -189,10 +190,121 @@ pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wait_for: Vec<String>,
 
+    /// Dynamic-N synchronous fanout/fanin. The node expands `items`
+    /// from the current ArcContext, runs the referenced child
+    /// sub-workflow once per item, collects ordered item results, then
+    /// continues through the ordinary `next` transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreach: Option<ForeachSpec>,
+    /// Cartesian-product sugar over [`ForeachSpec`]. Axes are evaluated
+    /// at dispatch time in declaration order, materialized into item
+    /// objects, then passed through the foreach execution path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<MatrixSpec>,
+
     /// Control-flow successor for this node. Required on every node;
     /// the arc terminates when control reaches a node whose
     /// transition is `Terminal`.
     pub next: NodeTransition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForeachSpec {
+    /// Resolved at dispatch with `workflow::context::resolve_arg_value`.
+    /// Must resolve to a JSON array; inline arrays and `${vars.*}`
+    /// whole-value templates are both valid.
+    pub items: Value,
+    /// Child-local var name that receives the current item.
+    pub as_var: String,
+    /// Optional child-local var name that receives the zero-based item
+    /// index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_as: Option<String>,
+    /// Optional key template rendered against a transient per-item
+    /// context after `as_var` and `index_as` are bound. Runtime
+    /// enforces non-empty, unique rendered keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Inline child workflow. Exactly one of `subworkflow` or
+    /// `subworkflow_ref` must be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subworkflow: Option<Box<Workflow>>,
+    /// Installed child workflow id. Exactly one of `subworkflow` or
+    /// `subworkflow_ref` must be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subworkflow_ref: Option<String>,
+    /// Parent vars copied into each child arc.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
+    /// Parent-context paths extracted into each child arc under local
+    /// names, mirroring subworkflow import_renames.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub import_renames: HashMap<String, String>,
+    /// Child terminal vars copied into each item result's `exports`
+    /// object. These are not promoted directly into parent vars.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<String>,
+    /// Bounded child concurrency. Defaults to 1 at runtime and may not
+    /// exceed `MAX_FOREACH_PARALLELISM`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<usize>,
+    pub collect: ForeachCollect,
+    #[serde(default)]
+    pub on_item_failure: ItemFailurePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatrixSpec {
+    pub axes: Vec<MatrixAxis>,
+    /// Child-local var name that receives the materialized axis object.
+    pub as_var: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_as: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subworkflow: Option<Box<Workflow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subworkflow_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub import_renames: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<usize>,
+    pub collect: ForeachCollect,
+    #[serde(default)]
+    pub on_item_failure: ItemFailurePolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatrixAxis {
+    pub name: String,
+    /// Same resolution rules as [`ForeachSpec::items`]. Must resolve to
+    /// a JSON array at dispatch.
+    pub values: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForeachCollect {
+    pub into_var: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemFailurePolicy {
+    /// Stop dispatching new items and cancel/drain according to the
+    /// runtime's current fanout mode. This is the fail-fast default.
+    #[default]
+    Halt,
+    /// Stop dispatching new items after the first failure, drain any
+    /// already-started children, collect their results, then fail the
+    /// parent node.
+    CollectThenHalt,
+    /// Keep dispatching siblings and collect both successes and failures.
+    Continue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

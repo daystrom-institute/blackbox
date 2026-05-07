@@ -283,6 +283,21 @@ impl SharedState {
         token
     }
 
+    /// Register a cancel token that is chained to a parent token.
+    /// Cancelling the parent trips the child, while the child still
+    /// remains addressable directly through `cancel_arc`.
+    pub fn register_arc_cancel_token_child(
+        &self,
+        arc_id: &str,
+        parent: &CancellationToken,
+    ) -> CancellationToken {
+        let token = parent.child_token();
+        self.arc_cancel_tokens
+            .write()
+            .insert(arc_id.to_string(), token.clone());
+        token
+    }
+
     /// Drop the cancel token for an arc that's reached terminal
     /// state. Called from the runner's exit path so the map doesn't
     /// grow unbounded across daemon uptime.
@@ -2755,6 +2770,17 @@ impl BlackboxServer {
     /// between node iterations and inside Wait suspensions.
     pub fn register_arc_cancel_token(&self, arc_id: &str) -> CancellationToken {
         self.state.register_arc_cancel_token(arc_id)
+    }
+
+    /// Register an arc cancel token chained to a parent arc/group
+    /// token. Used by nested workflows so cancellation propagates
+    /// down the composition tree.
+    pub fn register_arc_cancel_token_child(
+        &self,
+        arc_id: &str,
+        parent: &CancellationToken,
+    ) -> CancellationToken {
+        self.state.register_arc_cancel_token_child(arc_id, parent)
     }
 
     /// Drop the arc's cancel token. Called by the runner at terminus.
@@ -6060,6 +6086,12 @@ impl BlackboxServer {
             Some(t) => t,
             None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
         };
+        {
+            let inner = task.inner.lock();
+            if inner.provider == Provider::Workflow {
+                let _ = self.state.cancel_arc(&inner.session_id);
+            }
+        }
         match orch::cancel_task(&task, &self.state.task_store, &self.state.store_dir) {
             Ok(()) => {
                 let inner = task.inner.lock();
@@ -6786,9 +6818,100 @@ Constraints:\n\
         }
     }
 
+    fn spawn_workflow_task(
+        &self,
+        compiled: workflow::CompiledWorkflow,
+        project_dir: Option<String>,
+        max_steps: Option<usize>,
+        initial_vars: serde_json::Map<String, Value>,
+    ) -> (Arc<orch::Task>, String) {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let arc_id = format!("arc-{}", uuid::Uuid::new_v4().simple());
+        let workflow_name = compiled.spec.name.clone();
+        let task = orch::spawn_in_process_task(
+            task_id.clone(),
+            Provider::Workflow,
+            arc_id.clone(),
+            project_dir.clone(),
+            self.state.store_dir.clone(),
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+            Some(format!("workflow::{workflow_name}")),
+            None,
+        );
+        orch::push_in_process_event(
+            &task,
+            serde_json::json!({
+                "kind": "workflow_task_started",
+                "data": {
+                    "workflow": workflow_name,
+                    "arc_id": arc_id,
+                },
+                "timestamp": crate::util::now_iso(),
+            }),
+        );
+        let state = self.state.clone();
+        let task_for_run = task.clone();
+        let arc_for_run = arc_id.clone();
+        tokio::spawn(async move {
+            let server = BlackboxServer::new(state.clone());
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let task_for_events = task_for_run.clone();
+            let event_forwarder = tokio::spawn(async move {
+                let mut count = 0usize;
+                while let Some(event) = event_rx.recv().await {
+                    count += 1;
+                    orch::push_in_process_event(&task_for_events, event);
+                }
+                count
+            });
+            let result = workflow::run_workflow_streaming_with_vars_and_arc_id(
+                &server,
+                &compiled,
+                project_dir,
+                max_steps,
+                initial_vars,
+                event_tx,
+                arc_for_run.clone(),
+            )
+            .await;
+            let streamed_count = event_forwarder.await.unwrap_or(0);
+            let status = if result.status == "completed" {
+                orch::TaskStatus::Completed
+            } else if result.status == "cancelled" {
+                orch::TaskStatus::Cancelled
+            } else {
+                orch::TaskStatus::Failed
+            };
+            if streamed_count == 0 {
+                for event in &result.events {
+                    orch::push_in_process_event(&task_for_run, event.clone());
+                }
+            }
+            let result_text = serde_json::to_string(&result).unwrap_or_else(|err| {
+                serde_json::json!({
+                    "status": "serialization_error",
+                    "error": err.to_string()
+                })
+                .to_string()
+            });
+            let stderr = (status == orch::TaskStatus::Failed).then(|| result.status.clone());
+            orch::finish_in_process_task(
+                &task_for_run,
+                status,
+                Some(result_text),
+                stderr,
+                &state.task_store,
+                &state.store_dir,
+                &state.tail_tx,
+            );
+        });
+        (task, arc_id)
+    }
+
     #[tool(
         name = "bro_orchestrate_run",
-        description = "Dispatch a workflow. Takes a full spec (actors, nodes with per-node `next` transitions: goto / branch / fork / terminal) and blocks until the arc terminates. Returns the event log, per-node outputs, and the `arc_thread_id` for post-hoc audit via `bbox_notes(thread_id=...)` or `bro orchestrate status`. Pass `dry_run=true` to validate + summarize without dispatching any bros. Replaces long skill-prose protocols like overmind/crucible — the daemon owns the state machine, dispatched bros are stateless function-call turns. See `sm-workflow-orchestration` via `bbox_knowledge`, `schema/workflow.schema.json` for the JSON Schema, and `examples/workflows/` for the shape catalog."
+        description = "Dispatch a workflow as a pollable task. Takes a full spec (actors, nodes with per-node `next` transitions: goto / branch / fork / terminal) and returns {taskId, arcId, status} immediately by default; poll with bro_status(task_id=...), await with bro_wait(task_id=...), or inspect arc state with bro_arc_status(arc_id=...). Pass await_completion=true only when the caller intentionally wants blocking behavior. Pass dry_run=true to validate + summarize without dispatching any bros."
     )]
     async fn bro_orchestrate_run(
         &self,
@@ -6815,15 +6938,30 @@ Constraints:\n\
             return Self::ok_json(&serde_json::to_value(&result).unwrap_or_default());
         }
         let initial_vars = p.initial_vars.unwrap_or_default();
-        let result = workflow::run_workflow_with_initial_vars(
-            self,
-            &compiled,
-            p.project_dir,
-            p.max_steps,
-            initial_vars,
-        )
-        .await;
-        Self::ok_json(&serde_json::to_value(&result).unwrap_or_default())
+        let (task, arc_id) =
+            self.spawn_workflow_task(compiled, p.project_dir, p.max_steps, initial_vars);
+        if p.await_completion.unwrap_or(false) {
+            let completed = orch::wait_for_task_with_timeout(&task, p.timeout_seconds).await;
+            let mut out = if completed {
+                orch::task_result_json(&task)
+            } else {
+                orch::timeout_snapshot_json(&task)
+            };
+            out["arcId"] = Value::String(arc_id);
+            return Self::ok_json(&out);
+        }
+        let inner = task.inner.lock();
+        Self::ok_json(&serde_json::json!({
+            "taskId": inner.id,
+            "sessionId": inner.session_id,
+            "arcId": arc_id,
+            "status": "running",
+            "poll": {
+                "status_tool": "bro_status",
+                "wait_tool": "bro_wait",
+                "arc_status_tool": "bro_arc_status"
+            }
+        }))
     }
 
     #[tool(
@@ -8785,6 +8923,15 @@ struct OrchestrateRunParams {
     /// the run begins.
     #[serde(default)]
     pub initial_vars: Option<serde_json::Map<String, Value>>,
+    /// When true, block until the workflow task reaches a terminal
+    /// state and return the same shape as `bro_wait`. Default false:
+    /// return immediately with taskId + arcId, then poll via
+    /// `bro_status` / await via `bro_wait`.
+    #[serde(default)]
+    pub await_completion: Option<bool>,
+    /// Optional timeout used only when `await_completion=true`.
+    #[serde(default)]
+    pub timeout_seconds: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -14664,6 +14811,258 @@ mod tests {
         );
         assert!(past_ceiling.events.is_empty());
         assert!(past_ceiling.arc_thread_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_foreach_runtime_collects_child_exports() {
+        use crate::workflow::{compile, engine, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let json = r#"{
+            "name": "foreach-runtime",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "parent": {"kind": "string"},
+                "results": {"kind": "array"}
+            },
+            "nodes": {
+                "Each": {
+                    "actor": "",
+                    "foreach": {
+                        "items": ["a", "b"],
+                        "as_var": "item",
+                        "index_as": "idx",
+                        "key": "${vars.item}-${vars.idx}",
+                        "imports": ["parent"],
+                        "exports": ["summary"],
+                        "collect": {"into_var": "results"},
+                        "subworkflow": {
+                            "name": "foreach-child",
+                            "version": 1,
+                            "actors": {},
+                            "vars_schema": {
+                                "item": {"kind": "string"},
+                                "idx": {"kind": "int"},
+                                "parent": {"kind": "string"},
+                                "summary": {"kind": "object"}
+                            },
+                            "nodes": {
+                                "Make": {
+                                    "actor": "",
+                                    "on_enter": [{
+                                        "op": "set_var",
+                                        "args": {
+                                            "key": "summary",
+                                            "value": {
+                                                "item": "${vars.item}",
+                                                "idx": "${vars.idx}",
+                                                "parent": "${vars.parent}"
+                                            }
+                                        }
+                                    }],
+                                    "next": {"type": "terminal"}
+                                }
+                            },
+                            "start": "Make"
+                        }
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Each"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+        let mut vars = serde_json::Map::new();
+        vars.insert("parent".into(), Value::String("p0".into()));
+        let result =
+            engine::run_workflow_with_initial_vars(&server, &compiled, None, Some(20), vars).await;
+
+        assert_eq!(result.status, "completed", "events: {:?}", result.events);
+        let rows = result
+            .vars
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("results array");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["status"], "completed");
+        assert_eq!(rows[0]["key"], "a-0");
+        assert_eq!(rows[0]["exports"]["summary"]["item"], "a");
+        assert_eq!(rows[1]["exports"]["summary"]["idx"], 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_matrix_runtime_expands_axes_through_fanout() {
+        use crate::workflow::{compile, engine, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let json = r#"{
+            "name": "matrix-runtime",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "queries": {"kind": "array"},
+                "results": {"kind": "array"}
+            },
+            "nodes": {
+                "Grid": {
+                    "actor": "",
+                    "matrix": {
+                        "axes": [
+                            {"name": "query", "values": "${vars.queries}"},
+                            {"name": "strategy", "values": ["search", "agentic"]}
+                        ],
+                        "as_var": "case",
+                        "index_as": "idx",
+                        "key": "${vars.case.query}/${vars.case.strategy}",
+                        "exports": ["summary"],
+                        "parallelism": 2,
+                        "collect": {"into_var": "results"},
+                        "subworkflow": {
+                            "name": "matrix-child",
+                            "version": 1,
+                            "actors": {},
+                            "vars_schema": {
+                                "case": {"kind": "object"},
+                                "idx": {"kind": "int"},
+                                "summary": {"kind": "object"}
+                            },
+                            "nodes": {
+                                "Make": {
+                                    "actor": "",
+                                    "on_enter": [{
+                                        "op": "set_var",
+                                        "args": {
+                                            "key": "summary",
+                                            "value": {
+                                                "query": "${vars.case.query}",
+                                                "strategy": "${vars.case.strategy}",
+                                                "idx": "${vars.idx}"
+                                            }
+                                        }
+                                    }],
+                                    "next": {"type": "terminal"}
+                                }
+                            },
+                            "start": "Make"
+                        }
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Grid"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+        let mut vars = serde_json::Map::new();
+        vars.insert("queries".into(), serde_json::json!(["q1", "q2"]));
+        let result =
+            engine::run_workflow_with_initial_vars(&server, &compiled, None, Some(20), vars).await;
+
+        assert_eq!(result.status, "completed", "events: {:?}", result.events);
+        let rows = result
+            .vars
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("results array");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["key"], "q1/search");
+        assert_eq!(rows[1]["key"], "q1/agentic");
+        assert_eq!(rows[2]["key"], "q2/search");
+        assert_eq!(rows[3]["exports"]["summary"]["strategy"], "agentic");
+    }
+
+    #[tokio::test]
+    async fn workflow_foreach_continue_collects_item_failures() {
+        use crate::workflow::{compile, engine, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let json = r#"{
+            "name": "foreach-continue",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "results": {"kind": "array"}
+            },
+            "nodes": {
+                "Each": {
+                    "actor": "",
+                    "foreach": {
+                        "items": ["a", "b"],
+                        "as_var": "item",
+                        "exports": ["missing"],
+                        "on_item_failure": "continue",
+                        "collect": {"into_var": "results"},
+                        "subworkflow": {
+                            "name": "bad-child",
+                            "version": 1,
+                            "actors": {},
+                            "vars_schema": {
+                                "item": {"kind": "string"},
+                                "missing": {"kind": "string"}
+                            },
+                            "nodes": {
+                                "NoExport": {"actor": "", "next": {"type": "terminal"}}
+                            },
+                            "start": "NoExport"
+                        }
+                    },
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Each"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+        let result = engine::run_workflow(&server, &compiled, None, Some(20)).await;
+
+        assert_eq!(result.status, "completed", "events: {:?}", result.events);
+        let rows = result
+            .vars
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("results array");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["status"] == "error"));
+        assert!(rows[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("did not export declared key"));
+    }
+
+    #[tokio::test]
+    async fn workflow_spawn_returns_pollable_task() {
+        use crate::workflow::{compile, load_workflow};
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let json = r#"{
+            "name": "pollable-workflow",
+            "version": 1,
+            "actors": {},
+            "nodes": {
+                "Only": {
+                    "actor": "",
+                    "prompt": "done",
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Only"
+        }"#;
+        let compiled = compile(load_workflow(json).unwrap()).unwrap();
+        let (task, arc_id) =
+            server.spawn_workflow_task(compiled, None, Some(5), serde_json::Map::new());
+        {
+            let inner = task.inner.lock();
+            assert_eq!(inner.provider, Provider::Workflow);
+            assert_eq!(inner.session_id, arc_id);
+            assert_eq!(inner.status, orch::TaskStatus::Running);
+        }
+        assert!(orch::wait_for_task_with_timeout(&task, Some(5.0)).await);
+        let status = orch::task_status_json(&task, 5);
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["provider"], "workflow");
+        assert!(status["eventCount"].as_u64().unwrap_or_default() > 1);
+        let result: Value = serde_json::from_str(status["result"].as_str().unwrap()).unwrap();
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["arc_id"], arc_id);
     }
 
     #[tokio::test]
