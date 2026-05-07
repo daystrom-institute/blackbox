@@ -282,6 +282,76 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &CronSpec) -> R
         );
         return Ok(false);
     }
+    // Slack daily-brief shim: when the cron's payload tool is
+    // `badgey_post_triage_brief`, fan out one call per Slack channel
+    // binding instead of routing through the packet pipeline. This is
+    // the runtime-list fanout `fork` can't express today (tracked in
+    // bbox_thread thread-cba8bfa1 — workflow `foreach` primitive). When
+    // `foreach` lands, the body of this loop migrates to a 1-node
+    // workflow and this shim becomes a thin start_arc-per-binding
+    // dispatcher. Zero bindings = no-op (deliberately no global
+    // fallback brief).
+    if spec.payload.get("tool").and_then(|v| v.as_str()) == Some("badgey_post_triage_brief") {
+        let bindings = state.slack_channel_bindings.list(None, None);
+        let cron_name = spec.name.clone();
+        let crons_for_done = state.crons.clone();
+        if bindings.is_empty() {
+            tracing::info!(
+                "cron '{}': badgey_post_triage_brief tick with no Slack channel bindings — no-op",
+                spec.name
+            );
+            crons_for_done.mark_done(&cron_name);
+            return Ok(true);
+        }
+        // Cron payload shape: top-level fields plus an `arguments`
+        // object (matching the bro_cron_install spec). Operators can
+        // supply since/badgey_id under either; check both for
+        // ergonomics.
+        let arguments = spec.payload.get("arguments");
+        let lookup_str = |key: &str| -> Option<String> {
+            spec.payload
+                .get(key)
+                .and_then(|v| v.as_str())
+                .or_else(|| arguments.and_then(|a| a.get(key).and_then(|v| v.as_str())))
+                .map(str::to_string)
+        };
+        let since = lookup_str("since");
+        let badgey_id = lookup_str("badgey_id");
+        for binding in bindings {
+            let params = crate::BadgeyPostTriageBriefParams {
+                scope: binding.project_dir.clone(),
+                team_id: binding.team_id.clone(),
+                channel_id: binding.channel_id.clone(),
+                channel_name: binding.channel_name.clone(),
+                since: since.clone(),
+                badgey_id: badgey_id.clone(),
+            };
+            match crate::post_triage_brief_with_state(state, &params).await {
+                Ok(value) => {
+                    let posted = value.get("posted").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let errors = value.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
+                    tracing::info!(
+                        "cron '{}': posted {} brief(s) into channel {} (project {}; {} error(s))",
+                        spec.name,
+                        posted,
+                        binding.channel_id,
+                        binding.project_dir,
+                        errors,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "cron '{}': triage brief for channel {} (project {}) failed: {e}",
+                        spec.name,
+                        binding.channel_id,
+                        binding.project_dir,
+                    );
+                }
+            }
+        }
+        crons_for_done.mark_done(&cron_name);
+        return Ok(true);
+    }
     let entity = build_entity(spec);
     let inlet_label = format!("cron:{}", spec.name);
     let cron_name = spec.name.clone();

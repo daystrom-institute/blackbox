@@ -35,6 +35,8 @@ mod query;
 mod render;
 mod routing;
 mod search;
+mod slack_channel_bindings;
+mod slack_proposal_links;
 mod slack_thread_store;
 mod system_memory;
 mod threads;
@@ -191,6 +193,17 @@ struct SharedState {
     /// the executor turn completes. Lets follow-up @mentions in the
     /// same Slack thread continue the same Badgey conversation.
     slack_thread_store: Arc<slack_thread_store::SlackThreadStore>,
+    /// Slack channel → project bindings. Resolves which bbox project
+    /// a Slack channel maps to so inbound badgey activity is auto-scoped
+    /// and the daily-triage cron knows where to fan out per-channel
+    /// briefs. Channel (id, team) is the lookup key; renames are
+    /// id-stable.
+    slack_channel_bindings: Arc<slack_channel_bindings::SlackChannelBindings>,
+    /// Slack message → proposal/authoring-session link records. One
+    /// entry per proposal posted into Slack by the daily-triage tool.
+    /// Reaction handlers resolve item_ts → proposal_id; thread-reply
+    /// handlers resolve thread_ts → authoring_session_id.
+    slack_proposal_links: Arc<slack_proposal_links::SlackProposalLinks>,
 }
 
 const SIGNAL_LOG_CAP: usize = 200;
@@ -2425,88 +2438,7 @@ impl BlackboxServer {
         since: Option<String>,
         badgey_id: Option<String>,
     ) -> Result<Value, String> {
-        let project = scope
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|p| p.to_string_lossy().to_string())
-            })
-            .unwrap_or_default();
-        let stale_threads: Vec<Value> = self
-            .state
-            .threads
-            .read()
-            .all()
-            .iter()
-            .filter(|thread| project.is_empty() || thread.project == project)
-            .filter(|thread| {
-                since
-                    .as_deref()
-                    .is_none_or(|since| thread.last_activity.as_str() >= since)
-            })
-            .filter(|thread| !matches!(thread.status, threads::ThreadStatus::Resolved))
-            .take(20)
-            .map(|thread| {
-                json!({
-                    "thread_id": thread.id,
-                    "topic": thread.topic,
-                    "status": thread.status,
-                    "last_activity": thread.last_activity,
-                })
-            })
-            .collect();
-        let proposals: Vec<Value> = stale_threads
-            .iter()
-            .enumerate()
-            .map(|(idx, thread)| {
-                let stored = badgey_id
-                    .as_deref()
-                    .and_then(|raw| self.badgey_parse_id(raw).ok())
-                    .and_then(|id| {
-                        self.state
-                            .badgey_proposals
-                            .create(
-                                &id,
-                                orchestration::badgey::types::ProposalKind::RedispatchTask,
-                                json!({
-                                    "task_id": uuid::Uuid::new_v4().to_string(),
-                                    "prompt": format!(
-                                        "Review stale work item {} and either close it or issue a narrower follow-up charter.",
-                                        thread["thread_id"].as_str().unwrap_or("unknown")
-                                    ),
-                                    "source_thread_id": thread["thread_id"],
-                                    "source": "badgey_triage_inbox",
-                                }),
-                                thread["thread_id"]
-                                    .as_str()
-                                    .map(|thread_id| format!("triage:{thread_id}")),
-                            )
-                            .ok()
-                    });
-                json!({
-                    "id": stored
-                        .as_ref()
-                        .map(|proposal| proposal.id.clone())
-                        .unwrap_or_else(|| format!("triage-{}", idx + 1)),
-                    "kind": "redispatch_task",
-                    "subject": thread["thread_id"],
-                    "proposal": "Review stale work item and either close it or issue a narrower follow-up charter.",
-                    "stored": stored.is_some(),
-                    "apply_via": badgey_id
-                        .as_ref()
-                        .map(|id| format!("badgey_resume(id={id:?}, prompt=\"apply P-N\")")),
-                })
-            })
-            .collect();
-        Ok(json!({
-            "scope": project,
-            "since": since,
-            "badgey_id": badgey_id,
-            "proposal_sheet": {
-                "proposals": proposals,
-                "source_threads": stale_threads,
-            }
-        }))
+        triage_inbox_with_state(&self.state, scope, since, badgey_id)
     }
 
     fn badgey_close_loops_internal(
@@ -3522,7 +3454,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_rename",
-        description = "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, live teams, councils, whiteboards, pollers, and crons, then reindexes project files."
+        description = "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, councils, whiteboards, pollers, and crons, then reindexes project files."
     )]
     fn bbox_project_rename(
         &self,
@@ -4195,6 +4127,30 @@ struct BadgeyTriageInboxParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct BadgeyPostTriageBriefParams {
+    /// Project path scope for the triage. Required — the daily-brief
+    /// flow is per-project, no implicit fallback.
+    pub scope: String,
+    /// Slack workspace id (T-prefix). Required.
+    pub team_id: String,
+    /// Slack channel id (C-prefix) to post the brief into. Required.
+    pub channel_id: String,
+    /// Optional human-readable channel name for log lines / message
+    /// header. Display-only.
+    #[serde(default)]
+    pub channel_name: Option<String>,
+    /// Optional ISO timestamp lower bound passed through to the
+    /// triage tool.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Optional badgey_id to attach proposal context to. Without it
+    /// the proposals are stored detached (still valid; just no live
+    /// authoring session for refinement loops).
+    #[serde(default)]
+    pub badgey_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct BadgeyCloseLoopsParams {
     /// Window in days. Default 14.
     #[serde(default)]
@@ -4412,6 +4368,39 @@ struct BrofileParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BroSlackBindParams {
+    /// Operation: bind, unbind, list, lookup
+    action: String,
+    /// Slack workspace id (T-prefix). Required for bind/unbind/lookup.
+    #[serde(default)]
+    team_id: Option<String>,
+    /// Slack channel id (C-prefix). Required for bind/unbind/lookup.
+    /// Channel ids are stable across renames; channel names are not —
+    /// always bind by id.
+    #[serde(default)]
+    channel_id: Option<String>,
+    /// Optional human-readable channel name (e.g. `transcript-search`)
+    /// stored alongside the binding for display only. Never used as a
+    /// lookup key.
+    #[serde(default)]
+    channel_name: Option<String>,
+    /// Project to bind. Accepts an absolute path, an 8-hex
+    /// project_id from the registry, or the canonical_path of a
+    /// registered project. Required for `bind`.
+    #[serde(default)]
+    project: Option<String>,
+    /// Optional list filter — return bindings only for this project.
+    #[serde(default)]
+    project_filter: Option<String>,
+    /// Optional list filter — return bindings only for this team.
+    #[serde(default)]
+    team_filter: Option<String>,
+    /// Optional bbox_user attribution captured on bind.
+    #[serde(default)]
+    registered_by: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct TeamParams {
     /// Operation: save_template, list_templates, delete_template, create, list, dissolve, roster
     action: String,
@@ -4525,6 +4514,486 @@ struct AdvisorCheckpoint {
 // NOT send progress notifications unless the caller asked for them.
 
 const PROGRESS_TICK_SECS: u64 = 15;
+
+/// State-only equivalent of `BlackboxServer::badgey_triage_inbox_internal`.
+/// Lifted out of the impl so the cron-tick fanout shim can call it
+/// without holding a `BlackboxServer` reference. The MCP-tool method
+/// is now a 1-line wrapper.
+fn triage_inbox_with_state(
+    state: &Arc<SharedState>,
+    scope: Option<String>,
+    since: Option<String>,
+    badgey_id: Option<String>,
+) -> Result<Value, String> {
+    let project = scope
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+    let stale_threads: Vec<Value> = state
+        .threads
+        .read()
+        .all()
+        .iter()
+        .filter(|thread| project.is_empty() || thread.project == project)
+        .filter(|thread| {
+            since
+                .as_deref()
+                .is_none_or(|since| thread.last_activity.as_str() >= since)
+        })
+        .filter(|thread| !matches!(thread.status, threads::ThreadStatus::Resolved))
+        .take(20)
+        .map(|thread| {
+            json!({
+                "thread_id": thread.id,
+                "topic": thread.topic,
+                "status": thread.status,
+                "last_activity": thread.last_activity,
+            })
+        })
+        .collect();
+    let proposals: Vec<Value> = stale_threads
+        .iter()
+        .enumerate()
+        .map(|(idx, thread)| {
+            let stored = badgey_id
+                .as_deref()
+                .and_then(|raw| {
+                    raw.parse::<orchestration::badgey::types::BadgeyId>().ok()
+                })
+                .and_then(|id| {
+                    state
+                        .badgey_proposals
+                        .create(
+                            &id,
+                            orchestration::badgey::types::ProposalKind::RedispatchTask,
+                            json!({
+                                "task_id": uuid::Uuid::new_v4().to_string(),
+                                "prompt": format!(
+                                    "Review stale work item {} and either close it or issue a narrower follow-up charter.",
+                                    thread["thread_id"].as_str().unwrap_or("unknown")
+                                ),
+                                "source_thread_id": thread["thread_id"],
+                                "source": "badgey_triage_inbox",
+                            }),
+                            thread["thread_id"]
+                                .as_str()
+                                .map(|thread_id| format!("triage:{thread_id}")),
+                        )
+                        .ok()
+                });
+            json!({
+                "id": stored
+                    .as_ref()
+                    .map(|proposal| proposal.id.clone())
+                    .unwrap_or_else(|| format!("triage-{}", idx + 1)),
+                "kind": "redispatch_task",
+                "subject": thread["thread_id"],
+                "proposal": "Review stale work item and either close it or issue a narrower follow-up charter.",
+                "stored": stored.is_some(),
+                "apply_via": badgey_id
+                    .as_ref()
+                    .map(|id| format!("badgey_resume(id={id:?}, prompt=\"apply P-N\")")),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "scope": project,
+        "since": since,
+        "badgey_id": badgey_id,
+        "proposal_sheet": {
+            "proposals": proposals,
+            "source_threads": stale_threads,
+        }
+    }))
+}
+
+/// State-only equivalent of `BlackboxServer::badgey_post_triage_brief`.
+/// Runs a triage, posts each proposal as its own Slack message, and
+/// records a SlackProposalLink per posted message. Both the MCP-tool
+/// wrapper and the cron-tick fanout shim call this directly.
+pub(crate) async fn post_triage_brief_with_state(
+    state: &Arc<SharedState>,
+    p: &BadgeyPostTriageBriefParams,
+) -> Result<Value, String> {
+    if p.scope.trim().is_empty() {
+        return Err("scope is required".into());
+    }
+    if p.team_id.trim().is_empty() {
+        return Err("team_id is required".into());
+    }
+    if p.channel_id.trim().is_empty() {
+        return Err("channel_id is required".into());
+    }
+    let triage = triage_inbox_with_state(
+        state,
+        Some(p.scope.clone()),
+        p.since.clone(),
+        p.badgey_id.clone(),
+    )
+    .map_err(|e| format!("triage failed: {e}"))?;
+    let proposals: Vec<Value> = triage
+        .get("proposal_sheet")
+        .and_then(|s| s.get("proposals"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if proposals.is_empty() {
+        return Ok(json!({
+            "posted": 0,
+            "scope": p.scope,
+            "channel_id": p.channel_id,
+            "reason": "no proposals from triage",
+        }));
+    }
+    let token = match std::env::var("SLACK_BOT_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => return Err("SLACK_BOT_TOKEN env var not set".into()),
+    };
+    // Bounded timeout — without this a hung Slack endpoint can park
+    // the cron loop indefinitely (the cron-tick fanout awaits per
+    // call before releasing its concurrency slot).
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("building reqwest client: {e}"))?;
+    let mut posted: Vec<Value> = Vec::with_capacity(proposals.len());
+    let mut errors: Vec<Value> = Vec::new();
+    for proposal in &proposals {
+        let proposal_id = proposal
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if proposal_id.is_empty() {
+            errors.push(json!({"reason": "proposal missing id", "proposal": proposal}));
+            continue;
+        }
+        let kind = proposal
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("proposal");
+        let subject = proposal
+            .get("subject")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        let body = proposal
+            .get("proposal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let text = format_triage_proposal_message(
+            kind,
+            subject,
+            body,
+            p.scope.as_str(),
+            p.channel_name.as_deref(),
+        );
+        let req_body = json!({
+            "channel": p.channel_id,
+            "text": text,
+            "mrkdwn": true,
+            "metadata": {
+                "event_type": "badgey_proposal",
+                "event_payload": {
+                    "proposal_id": proposal_id,
+                    "project_dir": p.scope,
+                }
+            }
+        });
+        let resp = match client
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&token)
+            .json(&req_body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push(json!({"proposal_id": proposal_id, "reason": format!("http: {e}")}));
+                continue;
+            }
+        };
+        let parsed: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                errors
+                    .push(json!({"proposal_id": proposal_id, "reason": format!("parse: {e}")}));
+                continue;
+            }
+        };
+        if !parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            errors.push(json!({
+                "proposal_id": proposal_id,
+                "reason": "slack returned ok=false",
+                "slack_response": parsed,
+            }));
+            continue;
+        }
+        let msg_ts = parsed
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if msg_ts.is_empty() {
+            errors.push(json!({
+                "proposal_id": proposal_id,
+                "reason": "slack response missing ts",
+            }));
+            continue;
+        }
+        let link = slack_proposal_links::SlackProposalLink {
+            team_id: p.team_id.clone(),
+            channel_id: p.channel_id.clone(),
+            msg_ts: msg_ts.clone(),
+            proposal_id: proposal_id.clone(),
+            instance_id: p.badgey_id.clone(),
+            authoring_session_id: None,
+            version: 1,
+            project_dir: p.scope.clone(),
+            posted_at: util::now_iso(),
+        };
+        let link_recorded = match state.slack_proposal_links.record(link) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    proposal_id = %proposal_id,
+                    msg_ts = %msg_ts,
+                    "recording slack proposal link failed: {e}"
+                );
+                // Surface partial-failure: the message is live in
+                // Slack but reactions/replies on it will not resolve
+                // back to a link. Caller (and inbox readers) can see
+                // this in error_details.
+                errors.push(json!({
+                    "proposal_id": proposal_id,
+                    "msg_ts": msg_ts,
+                    "reason": format!("posted to Slack but link record failed: {e}"),
+                    "partial": true,
+                }));
+                false
+            }
+        };
+        posted.push(json!({
+            "proposal_id": proposal_id,
+            "msg_ts": msg_ts,
+            "link_recorded": link_recorded,
+        }));
+    }
+    Ok(json!({
+        "posted": posted.len(),
+        "errors": errors.len(),
+        "scope": p.scope,
+        "channel_id": p.channel_id,
+        "messages": posted,
+        "error_details": errors,
+    }))
+}
+
+/// Inbound `proposal-approved` / `proposal-clarify` signal hook for
+/// the Slack daily brief. Fires when a reaction (approve) or thread
+/// reply (clarify) lands on a posted triage proposal AND no workflow
+/// was waiting for the signal. Resolves the message back to its
+/// SlackProposalLink and posts a threaded acknowledgement in Slack.
+/// The actual apply work (BadgeyProposalStore CAS + task dispatch)
+/// and the bro_resume refinement loop are deferred until §6.3
+/// sub-bro authoring stores proposals under a registered
+/// BadgeyInstance — at that point this hook becomes the call site
+/// for `badgey_apply_proposal_internal` (approve) and `bro_resume`
+/// (clarify). Errors are logged, never bubbled — best-effort
+/// observability path.
+async fn try_slack_proposal_signal_hook(
+    signal: &str,
+    state: &Arc<SharedState>,
+    correlate: &serde_json::Map<String, Value>,
+    entity: &Value,
+) {
+    let thread_ts = correlate
+        .get("thread_ts")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if thread_ts.is_empty() {
+        return;
+    }
+    let team_id = entity
+        .get("team_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let channel_id = entity
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if team_id.is_empty() || channel_id.is_empty() {
+        return;
+    }
+    let link = match state
+        .slack_proposal_links
+        .lookup_by_msg(team_id, channel_id, thread_ts)
+    {
+        Some(l) => l,
+        None => return,
+    };
+    let user = entity
+        .get("user")
+        .and_then(|v| v.as_str())
+        .unwrap_or("someone");
+    let bbox_user = entity
+        .get("bbox_user")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let acknowledger = if bbox_user.is_empty() {
+        format!("<@{user}>")
+    } else {
+        format!("<@{user}> ({bbox_user})")
+    };
+    let text = match signal {
+        "proposal-approved" => format!(
+            ":white_check_mark: Approved by {acknowledger}. \
+             Apply mechanism is awaiting §6.3 sub-bro authoring — \
+             logged for follow-up. (proposal `{}`)",
+            link.proposal_id
+        ),
+        "proposal-clarify" => {
+            let reply_text = entity.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            // Char-aware truncation — naive byte slicing can panic on
+            // non-ASCII at codepoint boundaries.
+            let snippet = if reply_text.chars().count() > 120 {
+                let truncated: String = reply_text.chars().take(120).collect();
+                format!("{truncated}…")
+            } else {
+                reply_text.to_string()
+            };
+            format!(
+                ":speech_balloon: Heard your follow-up from {acknowledger}{}. \
+                 Refinement loop is awaiting §6.3 sub-bro authoring — \
+                 the proposal author isn't a live agent yet. \
+                 (proposal `{}`)",
+                if snippet.is_empty() {
+                    String::new()
+                } else {
+                    format!(": _{snippet}_")
+                },
+                link.proposal_id,
+            )
+        }
+        _ => return,
+    };
+    // Approve bumps the link version (acks an apply request); clarify
+    // does not — refinements only bump on chat.update of the original
+    // post when a refined proposal lands, which is §6.3 work.
+    if signal == "proposal-approved" {
+        if let Err(e) = state
+            .slack_proposal_links
+            .bump_version(team_id, channel_id, thread_ts)
+        {
+            tracing::warn!(
+                proposal_id = %link.proposal_id,
+                "bump_version on slack proposal link failed: {e}"
+            );
+        }
+    }
+    let token = match std::env::var("SLACK_BOT_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => {
+            tracing::info!(
+                proposal_id = %link.proposal_id,
+                signal = %signal,
+                "proposal hook fired but SLACK_BOT_TOKEN unset; skipping ack post"
+            );
+            return;
+        }
+    };
+    let req_body = json!({
+        "channel": channel_id,
+        "thread_ts": thread_ts,
+        "text": text,
+        "mrkdwn": true,
+    });
+    // Bounded timeout — best-effort hook; never block dispatch_verdict
+    // on a hung Slack endpoint.
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                proposal_id = %link.proposal_id,
+                "building reqwest client for Slack ack failed: {e}"
+            );
+            return;
+        }
+    };
+    match client
+        .post("https://slack.com/api/chat.postMessage")
+        .bearer_auth(&token)
+        .json(&req_body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let parsed: Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        proposal_id = %link.proposal_id,
+                        "parsing Slack ack response failed: {e}"
+                    );
+                    return;
+                }
+            };
+            if !parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                tracing::warn!(
+                    proposal_id = %link.proposal_id,
+                    signal = %signal,
+                    "Slack ack post returned ok=false: {parsed}"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                proposal_id = %link.proposal_id,
+                signal = %signal,
+                "Slack ack post failed: {e}"
+            );
+        }
+    }
+}
+
+/// Render a Badgey triage proposal as Slack mrkdwn for a per-channel
+/// brief post. Body is human prose only — no proposal-id jargon visible.
+/// The proposal_id rides in the message's metadata field; users
+/// approve via reaction and clarify via thread reply, never by typing
+/// the id.
+fn format_triage_proposal_message(
+    kind: &str,
+    subject: &str,
+    body: &str,
+    project_scope: &str,
+    channel_name: Option<&str>,
+) -> String {
+    let kind_human = match kind {
+        "redispatch_task" => "stale work item",
+        "close_thread" => "close-out candidate",
+        other => other,
+    };
+    let header_scope = channel_name.unwrap_or(project_scope);
+    let mut out = format!(
+        "*Badgey morning brief — {header_scope}*\n_{kind_human}_"
+    );
+    if !subject.trim().is_empty() {
+        out.push_str(&format!("\n• {subject}"));
+    }
+    if !body.trim().is_empty() {
+        out.push_str(&format!("\n\n{body}"));
+    }
+    out.push_str("\n\n_React :white_check_mark: to apply, or reply in-thread to clarify._");
+    out
+}
 
 fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, bool) {
     let inner = task.inner.lock();
@@ -5157,6 +5626,20 @@ impl BlackboxServer {
         match self.badgey_triage_inbox_internal(p.scope, p.since, p.badgey_id) {
             Ok(value) => Self::ok_json(&value),
             Err(err) => Self::err_text(&err),
+        }
+    }
+
+    #[tool(
+        name = "badgey_post_triage_brief",
+        description = "Run a Badgey inbox triage for a project and post each proposal as its own Slack message in a target channel. Records a SlackProposalLink (msg_ts ↔ proposal_id) per posted message so inbound reactions and thread replies can resolve back to the proposal/authoring session. Body is human prose (no proposal-id jargon visible); proposal_id rides in Slack message metadata. Called by the daily-triage cron (per channel binding) and available for manual reruns."
+    )]
+    async fn badgey_post_triage_brief(
+        &self,
+        Parameters(p): Parameters<BadgeyPostTriageBriefParams>,
+    ) -> CallToolResult {
+        match post_triage_brief_with_state(&self.state, &p).await {
+            Ok(value) => Self::ok_json(&value),
+            Err(e) => Self::err_text(&e),
         }
     }
 
@@ -6019,6 +6502,127 @@ impl BlackboxServer {
         Parameters(p): Parameters<orchestration::mcp::McpToolParams>,
     ) -> CallToolResult {
         Self::run("bro_mcp", || orchestration::mcp::handle(&p))
+    }
+
+    #[tool(
+        name = "bro_slack_bind",
+        description = "Bind a Slack channel to a bbox project. The binding scopes inbound Slack→badgey activity to a single project and gives the daily-triage cron a per-channel home for proposal posts. Channel id (C-prefix) is the stable lookup key; rename-safe. Actions: bind, unbind, list, lookup. Project accepts absolute path or 8-hex project_id from the registry."
+    )]
+    fn bro_slack_bind(&self, Parameters(p): Parameters<BroSlackBindParams>) -> CallToolResult {
+        let store = &self.state.slack_channel_bindings;
+        match p.action.as_str() {
+            "bind" => {
+                let team_id = match p.team_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(t) => t.to_string(),
+                    None => return Self::err_text("team_id is required"),
+                };
+                let channel_id = match p.channel_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(c) => c.to_string(),
+                    None => return Self::err_text("channel_id is required"),
+                };
+                let project_input = match p.project.as_deref().filter(|s| !s.is_empty()) {
+                    Some(pr) => pr.to_string(),
+                    None => return Self::err_text("project is required"),
+                };
+                let registry = self.state.projects.read();
+                let records = registry.list();
+                // Mirror ProjectRegistry's symlink-resolving behavior so
+                // bind accepts aliases the registry already collapsed at
+                // register time. Without this, a user who registered
+                // `/repo/foo` (resolved target) but binds the symlink
+                // `/home/me/foo` would see project_id=None and miss
+                // rename/preflight scoping later. Refuse paths that
+                // exist on disk but are non-directories (file, etc.)
+                // — those would silently bind nonsense.
+                let canonical_input = match entity_ref::canonical_input_path(&project_input) {
+                    Ok(p) => Some(p.to_string_lossy().into_owned()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        return Self::err_text(&format!(
+                            "project '{project_input}' is not a usable directory: {e}"
+                        ));
+                    }
+                };
+                let resolved = records.iter().find(|r| {
+                    r.canonical_path == project_input
+                        || r.project_id == project_input
+                        || canonical_input
+                            .as_deref()
+                            .is_some_and(|c| c == r.canonical_path)
+                });
+                let (project_dir, project_id) = match resolved {
+                    Some(rec) => (rec.canonical_path.clone(), Some(rec.project_id.clone())),
+                    None => {
+                        let path_buf = std::path::PathBuf::from(&project_input);
+                        if !path_buf.is_absolute() {
+                            return Self::err_text(&format!(
+                                "project '{project_input}' is not registered and not an absolute path; register via bbox_project_register first"
+                            ));
+                        }
+                        // Store the canonicalized form when fs resolution
+                        // succeeded (symlink-stable storage); fall back
+                        // to the operator's literal absolute path when
+                        // it doesn't exist yet on disk.
+                        let stored = canonical_input.unwrap_or_else(|| project_input.clone());
+                        (stored, None)
+                    }
+                };
+                drop(registry);
+                let binding = slack_channel_bindings::ChannelBinding {
+                    team_id: team_id.clone(),
+                    channel_id: channel_id.clone(),
+                    channel_name: p.channel_name.clone(),
+                    project_dir: project_dir.clone(),
+                    project_id: project_id.clone(),
+                    registered_at: util::now_iso(),
+                    registered_by: p.registered_by.clone(),
+                };
+                if let Err(e) = store.bind(binding.clone()) {
+                    return Self::err_text(&format!("bind failed: {e}"));
+                }
+                Self::ok_json(&json!({
+                    "bound": true,
+                    "binding": binding,
+                }))
+            }
+            "unbind" => {
+                let team_id = match p.team_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(t) => t,
+                    None => return Self::err_text("team_id is required"),
+                };
+                let channel_id = match p.channel_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(c) => c,
+                    None => return Self::err_text("channel_id is required"),
+                };
+                match store.unbind(team_id, channel_id) {
+                    Ok(Some(prior)) => Self::ok_json(&json!({
+                        "unbound": true,
+                        "prior": prior,
+                    })),
+                    Ok(None) => Self::ok_json(&json!({"unbound": false})),
+                    Err(e) => Self::err_text(&format!("unbind failed: {e}")),
+                }
+            }
+            "list" => {
+                let bindings = store.list(p.team_filter.as_deref(), p.project_filter.as_deref());
+                Self::ok_json(&json!({"bindings": bindings}))
+            }
+            "lookup" => {
+                let team_id = match p.team_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(t) => t,
+                    None => return Self::err_text("team_id is required"),
+                };
+                let channel_id = match p.channel_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(c) => c,
+                    None => return Self::err_text("channel_id is required"),
+                };
+                match store.lookup(team_id, channel_id) {
+                    Some(b) => Self::ok_json(&json!({"found": true, "binding": b})),
+                    None => Self::ok_json(&json!({"found": false})),
+                }
+            }
+            other => Self::err_text(&format!("Unknown bro_slack_bind action: {other}")),
+        }
     }
 
     #[tool(
@@ -10058,7 +10662,21 @@ async fn dispatch_verdict(
             // `set_var feedback_text = ${last_signal.payload.review.body}`
             // would only see the correlation tuple.
             let signal_payload = payload.unwrap_or_else(|| entity.clone());
-            let resolved = signal_arc_dispatch(&state, &signal, correlate, signal_payload).await;
+            let resolved =
+                signal_arc_dispatch(&state, &signal, correlate.clone(), signal_payload).await;
+            // Slack proposal-approved hook: when a `proposal-approved`
+            // signal falls idle (no workflow waiting) AND the reacted
+            // message maps to a posted triage proposal, acknowledge in
+            // Slack and bump the link version. Real apply (CAS to
+            // BadgeyProposalStore + dispatched task) drops in trivially
+            // once §6.3 sub-bro authoring stores proposals under a
+            // registered BadgeyInstance.
+            if matches!(signal.as_str(), "proposal-approved" | "proposal-clarify")
+                && resolved.get("status").and_then(|v| v.as_str())
+                    == Some("no_matching_wait")
+            {
+                try_slack_proposal_signal_hook(&signal, &state, &correlate, &entity).await;
+            }
             Ok(resolved)
         }
         RoutingVerdict::CancelArc { correlate } => {
@@ -10151,21 +10769,12 @@ async fn dispatch_verdict(
                     let team = merged_vars.get("team_id").and_then(Value::as_str)?;
                     let channel = merged_vars.get("channel").and_then(Value::as_str)?;
                     let thread_ts = merged_vars.get("thread_ts").and_then(Value::as_str)?;
-                    Some((
-                        team.to_string(),
-                        channel.to_string(),
-                        thread_ts.to_string(),
-                    ))
+                    Some((team.to_string(), channel.to_string(), thread_ts.to_string()))
                 })
                 .flatten();
             if let Some((team, channel, thread_ts)) = slack_thread_key.as_ref() {
-                if let Some(session_id) =
-                    state.slack_thread_store.get(team, channel, thread_ts)
-                {
-                    merged_vars.insert(
-                        "_actor_session.badgey".into(),
-                        Value::String(session_id),
-                    );
+                if let Some(session_id) = state.slack_thread_store.get(team, channel, thread_ts) {
+                    merged_vars.insert("_actor_session.badgey".into(), Value::String(session_id));
                 }
             }
             // project_dir resolution priority:
@@ -10206,12 +10815,9 @@ async fn dispatch_verdict(
                 if let Some((team, channel, thread_ts)) = slack_thread_key.as_ref() {
                     if let Some(session_id) = result.actor_sessions.get("badgey") {
                         if !session_id.is_empty() && session_id != "pending" {
-                            slack_state.slack_thread_store.set(
-                                team,
-                                channel,
-                                thread_ts,
-                                session_id,
-                            );
+                            slack_state
+                                .slack_thread_store
+                                .set(team, channel, thread_ts, session_id);
                         }
                     }
                 }
@@ -10830,6 +11436,8 @@ fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> anyhow::Result
         .iter()
         .filter(|packet| packet.project.as_deref() == Some(project))
         .count();
+    let slack_channel_bindings = state.slack_channel_bindings.list(None, Some(project)).len();
+    let slack_proposal_links = state.slack_proposal_links.project_ref_count(project);
     let teams = orchestration::team::load_all_teams(&state.store_dir)
         .iter()
         .filter(|team| team.project_dir.as_deref() == Some(project))
@@ -10865,6 +11473,8 @@ fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> anyhow::Result
         "notes": notes,
         "pins": pins,
         "packets": packets,
+        "slack_channel_bindings": slack_channel_bindings,
+        "slack_proposal_links": slack_proposal_links,
         "teams": teams,
         "councils": councils,
         "whiteboards": whiteboards,
@@ -10877,7 +11487,7 @@ fn migrate_project_refs(
     state: &Arc<SharedState>,
     old_project: &str,
     new_project: &str,
-    _record: &ProjectRecord,
+    record: &ProjectRecord,
 ) -> anyhow::Result<Value> {
     let knowledge = state
         .kb
@@ -10898,6 +11508,14 @@ fn migrate_project_refs(
     let packets = state
         .packets
         .read()
+        .rename_project_refs(old_project, new_project)?;
+    let slack_channel_bindings = state.slack_channel_bindings.rename_project_refs(
+        old_project,
+        new_project,
+        Some(record.project_id.as_str()),
+    )?;
+    let slack_proposal_links = state
+        .slack_proposal_links
         .rename_project_refs(old_project, new_project)?;
     let teams =
         orchestration::team::rename_project_refs(&state.store_dir, old_project, new_project);
@@ -10930,6 +11548,8 @@ fn migrate_project_refs(
         "notes": notes,
         "pins": pins,
         "packets": packets,
+        "slack_channel_bindings": slack_channel_bindings,
+        "slack_proposal_links": slack_proposal_links,
         "teams": teams,
         "councils": councils,
         "whiteboards": whiteboards,
@@ -12031,6 +12651,14 @@ async fn main() -> anyhow::Result<()> {
             slack_thread_store::SlackThreadStore::open(&store_dir)
                 .unwrap_or_else(|e| panic!("opening slack thread store at {store_dir:?}: {e}")),
         ),
+        slack_channel_bindings: Arc::new(
+            slack_channel_bindings::SlackChannelBindings::open(&store_dir)
+                .unwrap_or_else(|e| panic!("opening slack channel bindings at {store_dir:?}: {e}")),
+        ),
+        slack_proposal_links: Arc::new(
+            slack_proposal_links::SlackProposalLinks::open(&store_dir)
+                .unwrap_or_else(|e| panic!("opening slack proposal links at {store_dir:?}: {e}")),
+        ),
     });
     shared
         .agent_adapter_registry
@@ -12501,6 +13129,13 @@ mod tests {
             slack_thread_store: Arc::new(
                 slack_thread_store::SlackThreadStore::open(&tmp.path().join("bro")).unwrap(),
             ),
+            slack_channel_bindings: Arc::new(
+                slack_channel_bindings::SlackChannelBindings::open(&tmp.path().join("bro"))
+                    .unwrap(),
+            ),
+            slack_proposal_links: Arc::new(
+                slack_proposal_links::SlackProposalLinks::open(&tmp.path().join("bro")).unwrap(),
+            ),
         });
         BlackboxServer::new(state)
     }
@@ -12699,6 +13334,120 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn proposal_approved_hook_bumps_link_version() {
+        // Verifies the dispatch_verdict signal hook resolves a Slack
+        // message back to its SlackProposalLink and bumps the version
+        // on `proposal-approved`. The HTTP ack post is short-circuited
+        // (no SLACK_BOT_TOKEN set in the test env) but the bump
+        // happens before the token check.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let link = slack_proposal_links::SlackProposalLink {
+            team_id: "T01".into(),
+            channel_id: "C01".into(),
+            msg_ts: "ts1".into(),
+            proposal_id: "triage-1".into(),
+            instance_id: None,
+            authoring_session_id: None,
+            version: 1,
+            project_dir: "/repo/x".into(),
+            posted_at: util::now_iso(),
+        };
+        server.state.slack_proposal_links.record(link).unwrap();
+        let mut correlate = serde_json::Map::new();
+        correlate.insert("thread_ts".into(), Value::String("ts1".into()));
+        let entity = json!({
+            "team_id": "T01",
+            "channel": "C01",
+            "user": "Ualice",
+            "bbox_user": "alice",
+        });
+        // Ensure no token leaks in from the surrounding env so the
+        // hook short-circuits before HTTP. (Safety belt — the test
+        // depends on the bump happening before the token check.)
+        std::env::remove_var("SLACK_BOT_TOKEN");
+        try_slack_proposal_signal_hook("proposal-approved", &server.state, &correlate, &entity)
+            .await;
+        let bumped = server
+            .state
+            .slack_proposal_links
+            .lookup_by_msg("T01", "C01", "ts1")
+            .unwrap();
+        assert_eq!(bumped.version, 2);
+    }
+
+    #[tokio::test]
+    async fn proposal_clarify_hook_does_not_bump_version() {
+        // Clarify hook resolves the message back to its link and
+        // (will eventually) post a stub reply, but does NOT bump the
+        // link version — version is reserved for chat.update of the
+        // original proposal post when a refined version lands.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let link = slack_proposal_links::SlackProposalLink {
+            team_id: "T01".into(),
+            channel_id: "C01".into(),
+            msg_ts: "ts2".into(),
+            proposal_id: "triage-2".into(),
+            instance_id: None,
+            authoring_session_id: None,
+            version: 1,
+            project_dir: "/repo/x".into(),
+            posted_at: util::now_iso(),
+        };
+        server.state.slack_proposal_links.record(link).unwrap();
+        let mut correlate = serde_json::Map::new();
+        correlate.insert("thread_ts".into(), Value::String("ts2".into()));
+        let entity = json!({
+            "team_id": "T01",
+            "channel": "C01",
+            "user": "Ualice",
+            "text": "actually never mind, this one is fine as-is",
+        });
+        std::env::remove_var("SLACK_BOT_TOKEN");
+        try_slack_proposal_signal_hook("proposal-clarify", &server.state, &correlate, &entity)
+            .await;
+        let unchanged = server
+            .state
+            .slack_proposal_links
+            .lookup_by_msg("T01", "C01", "ts2")
+            .unwrap();
+        assert_eq!(unchanged.version, 1);
+    }
+
+    #[tokio::test]
+    async fn proposal_signal_hook_no_op_for_unknown_thread_ts() {
+        // No SlackProposalLink for the correlated thread_ts → hook is
+        // a silent no-op. Any other in-thread reply or reaction in
+        // the workspace should NOT cause stub acks.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let mut correlate = serde_json::Map::new();
+        correlate.insert("thread_ts".into(), Value::String("ts-unknown".into()));
+        let entity = json!({
+            "team_id": "T01",
+            "channel": "C01",
+            "user": "Ualice",
+        });
+        std::env::remove_var("SLACK_BOT_TOKEN");
+        try_slack_proposal_signal_hook(
+            "proposal-approved",
+            &server.state,
+            &correlate,
+            &entity,
+        )
+        .await;
+        // Nothing to assert beyond "did not panic" — but make a
+        // sanity probe on the link store size to confirm we didn't
+        // accidentally insert anything.
+        assert!(server
+            .state
+            .slack_proposal_links
+            .lookup_by_msg("T01", "C01", "ts-unknown")
+            .is_none());
     }
 
     #[tokio::test]
@@ -13900,6 +14649,20 @@ mod tests {
         assert_eq!(payload["migrated_refs"]["threads"], 1);
         assert_eq!(payload["migrated_refs"]["notes"], 1);
         assert_eq!(payload["migrated_refs"]["pins"], 1);
+
+        assert_eq!(
+            server.state.kb.read().all_entries()[0].project.as_deref(),
+            Some(new_project.as_str())
+        );
+        assert_eq!(
+            server.state.threads.read().all()[0].project.as_str(),
+            new_project.as_str()
+        );
+        assert_eq!(
+            server.state.notes.read().all()[0].project.as_deref(),
+            Some(new_project.as_str())
+        );
+        assert_eq!(server.state.pins.read().project_ref_count(&new_project), 1);
     }
 
     #[test]

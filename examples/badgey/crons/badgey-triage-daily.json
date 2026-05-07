@@ -2,7 +2,7 @@
   "name": "badgey-triage-daily",
   "schedule": "0 0 6 * * *",
   "payload": {
-    "tool": "badgey_triage_inbox",
+    "tool": "badgey_post_triage_brief",
     "arguments": {}
   },
   "concurrency": 1,

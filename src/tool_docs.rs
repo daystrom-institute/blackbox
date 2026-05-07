@@ -277,7 +277,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_rename",
         category: ToolCategory::Projects,
-        summary: "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, live teams, councils, whiteboards, pollers, and crons, then reindexes project files.",
+        summary: "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, councils, whiteboards, pollers, and crons, then reindexes project files.",
         when_to_use: "Use after renaming a repo directory, or with `move_on_disk=true` to let bbox move the directory first. Prefer `dry_run=true` before changing several project names so the affected state counts are visible.",
         example: Some(r#"bbox_project_rename(project="d723917f", new_path="/home/me/repos/blackbox", dry_run=true)"#),
     },
@@ -684,6 +684,24 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Add/remove MCP servers and manage dispatch-time tool filters. Before `action=add`, call `action=list` first. The default bro-tool disallow is mechanical recursion protection, not just prose guidance. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(
             r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#,
+        ),
+    },
+    ToolDoc {
+        name: "badgey_post_triage_brief",
+        category: ToolCategory::Orchestration,
+        summary: "Run a Badgey inbox triage for a project and post each proposal as its own Slack message in a target channel. Records a SlackProposalLink (msg_ts ↔ proposal_id) per posted message so inbound reactions and thread replies can resolve back to the proposal/authoring session. Body is human prose (no proposal-id jargon visible); proposal_id rides in Slack message metadata. Called by the daily-triage cron (per channel binding) and available for manual reruns.",
+        when_to_use: "Use as the per-channel daily-brief implementation, called by the cron fanout shim once per `bro_slack_bind` binding. Manual reruns are fine — pass `scope` (project path), `team_id`, `channel_id`, optionally `channel_name` for header text. Requires `SLACK_BOT_TOKEN` in the daemon env. Empty proposal sheet returns posted=0 without posting anything.",
+        example: Some(
+            r#"badgey_post_triage_brief(scope="/repo/transcript-search", team_id="T0123ABCD", channel_id="C0123XYZ", channel_name="transcript-search")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bro_slack_bind",
+        category: ToolCategory::Orchestration,
+        summary: "Bind a Slack channel to a bbox project. The binding scopes inbound Slack→badgey activity to a single project and gives the daily-triage cron a per-channel home for proposal posts. Channel id (C-prefix) is the stable lookup key; rename-safe. Actions: bind, unbind, list, lookup. Project accepts absolute path or 8-hex project_id from the registry.",
+        when_to_use: "Bind every project channel you want a daily brief in. Without bindings the triage cron is a no-op (deliberately no global fallback) and inbound app_mention / reaction events can't auto-resolve their project. Before `action=bind`, register the project via `bbox_project_register` so the binding captures a stable project_id.",
+        example: Some(
+            r#"bro_slack_bind(action="bind", team_id="T0123ABCD", channel_id="C0123XYZ", channel_name="transcript-search", project="/home/me/repos/transcript-search")"#,
         ),
     },
     // ── Workflows ────────────────────────────────────────────────────
