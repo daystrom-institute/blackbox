@@ -1,0 +1,97 @@
+{
+  "name": "badgey-slack-emit-proposal-arc",
+  "version": 1,
+  "vars_schema": {
+    "proposal": { "kind": "object", "required": true },
+    "team_id": { "kind": "string", "required": true },
+    "channel_id": { "kind": "string", "required": true },
+    "channel_name": { "kind": "string" },
+    "project_dir": { "kind": "string", "required": true },
+    "badgey_id": { "kind": "string" },
+    "rendered_text": { "kind": "string" },
+    "post_response": { "kind": "object" },
+    "msg_ts": { "kind": "string" },
+    "link_recorded": { "kind": "object" }
+  },
+  "actors": {},
+  "start": "Render",
+  "nodes": {
+    "Render": {
+      "actor": "",
+      "prompt": "Render the proposal as Slack mrkdwn.",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "rendered_text",
+            "value": "*${vars.proposal.kind}* — ${vars.channel_name}\n*${vars.proposal.subject}*\n\n*Root cause:* ${vars.proposal.draft.root_cause}\n*Proposal:* ${vars.proposal.draft.proposal}\n*Blast radius:* ${vars.proposal.draft.blast_radius}\n*Draft:* ${vars.proposal.draft.draft_artifact_ref}\n\n_:white_check_mark: to apply · reply in-thread to refine_"
+          }
+        }
+      ],
+      "next": { "type": "goto", "to": "Post" }
+    },
+    "Post": {
+      "actor": "",
+      "prompt": "Post to Slack.",
+      "on_enter": [
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "https://slack.com/api/chat.postMessage",
+            "headers": {
+              "Authorization": "Bearer ${env.SLACK_BOT_TOKEN}",
+              "Content-Type": "application/json; charset=utf-8"
+            },
+            "body": {
+              "channel": "${vars.channel_id}",
+              "text": "${vars.rendered_text}",
+              "mrkdwn": true,
+              "metadata": {
+                "event_type": "badgey_proposal",
+                "event_payload": {
+                  "proposal_id": "${vars.proposal.id}",
+                  "project_dir": "${vars.project_dir}",
+                  "badgey_id": "${vars.badgey_id}"
+                }
+              }
+            },
+            "expect_status": [200]
+          },
+          "into_var": "post_response",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "msg_ts", "value": "${vars.post_response.ts}" }
+        }
+      ],
+      "next": { "type": "goto", "to": "RecordLink" }
+    },
+    "RecordLink": {
+      "actor": "",
+      "prompt": "Record SlackProposalLink so inbound reactions/replies resolve back.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_slack_link_record",
+            "arguments": {
+              "team_id": "${vars.team_id}",
+              "channel_id": "${vars.channel_id}",
+              "msg_ts": "${vars.msg_ts}",
+              "proposal_id": "${vars.proposal.id}",
+              "instance_id": "${vars.badgey_id}",
+              "project_dir": "${vars.project_dir}"
+            },
+            "timeout_secs": 10
+          },
+          "into_var": "link_recorded",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}
