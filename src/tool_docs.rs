@@ -299,8 +299,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_refactor_status",
         category: ToolCategory::Refactor,
         summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",
-        when_to_use: "Use before structural extraction to inventory top-level items in any supported grammar, plus Rust impl methods, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a language-specific bbox_refactor_plan when one exists. Pull `sm-refactor` first, then `sm-refactor-rust`, `sm-refactor-typescript`, or `sm-refactor-csharp` for language-specific arguments and validation commands.",
-        example: Some(r#"bbox_refactor_status(file="src/main.rs", project_dir="/repo/x")"#),
+        when_to_use: "Use before structural extraction to inventory top-level items in any supported grammar, plus Rust impl methods, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a language-specific bbox_refactor_plan when one exists. On large files, pass item_kinds/item_names and limit to keep the response agent-sized. Pull `sm-refactor` first, then `sm-refactor-rust`, `sm-refactor-typescript`, or `sm-refactor-csharp` for language-specific arguments and validation commands.",
+        example: Some(r#"bbox_refactor_status(file="src/main.rs", project_dir="/repo/x", item_kinds=["impl_method"], limit=50, include_attributes=false)"#),
     },
     ToolDoc {
         name: "bbox_refactor_plan",
@@ -315,8 +315,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_refactor_apply",
         category: ToolCategory::Refactor,
         summary: "Apply a previously generated refactor plan with hash checks, Rust parse validation, atomic writes, and rollback on write failure.",
-        when_to_use: "Use only after reviewing a bbox_refactor_plan result. Requires confirm=true; refuses stale file hashes and validates rewritten Rust before writing.",
-        example: Some(r#"bbox_refactor_apply(plan=<plan-json>, confirm=true)"#),
+        when_to_use: "Use only after reviewing a bbox_refactor_plan result. Requires confirm=true; refuses stale file hashes and validates rewritten Rust before writing. Paths must live under registered projects unless allow_unregistered_paths=true is explicitly set for a disposable practice worktree or isolated smoke test.",
+        example: Some(r#"bbox_refactor_apply(plan=<plan-json>, confirm=true, allow_unregistered_paths=true)"#),
     },
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {

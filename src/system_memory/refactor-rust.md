@@ -49,13 +49,18 @@ Supported top-level item kinds include:
 ```text
 bbox_refactor_status(
   file="src/path.rs",
-  project_dir="/absolute/project/root"
+  project_dir="/absolute/project/root",
+  item_kinds=["impl_method"],
+  limit=100,
+  include_attributes=false
 )
 ```
 
 Copy exact `name` and `kind` values from the returned `items`. For `impl_item`,
 the name is the impl header, not a type identifier. Rust status also includes
-`impl_method` entries for methods directly inside impl bodies.
+`impl_method` entries for methods directly inside impl bodies. Use filters on
+large files; status returns `total_items`, `matching_items`, `returned_items`,
+and `truncated` so agents can tell when to narrow the query.
 
 2. Create a dry-run move plan:
 
@@ -128,7 +133,9 @@ Apply refuses stale file hashes. It reparses changed supported source files and
 writes atomically with rollback on write failure. Apply is scoped to registered
 projects and refuses dirty git files by default; use
 `allow_dirty_worktree=true` only when you intentionally planned against current
-uncommitted edits.
+uncommitted edits. For disposable practice worktrees, pass
+`allow_unregistered_paths=true` to skip project registration while keeping hash,
+dirty-file, parse, and atomic-write safeguards.
 
 4. Run the Rust toolchain:
 

@@ -56,11 +56,19 @@ Writable structural plans are narrower:
 1. Inspect first:
 
 ```text
-bbox_refactor_status(file="path/to/file", project_dir="/absolute/project/root")
+bbox_refactor_status(
+  file="path/to/file",
+  project_dir="/absolute/project/root",
+  item_kinds=["impl_method"],
+  limit=50,
+  include_attributes=false
+)
 ```
 
 For Rust, status includes top-level items plus `impl_method` entries so agents
-can copy exact method names before planning an impl extraction.
+can copy exact method names before planning an impl extraction. Omit filters for
+small files only; status defaults to at most 200 returned items and reports
+`total_items`, `matching_items`, `returned_items`, and `truncated`.
 
 2. Only call `bbox_refactor_plan` for a plan kind that the language memory says
    is writable.
@@ -68,7 +76,9 @@ can copy exact method names before planning an impl extraction.
 3. Only call `bbox_refactor_apply` after reviewing the JSON plan. Apply requires
    `confirm=true`, registered-project path scope, clean git files by default
    unless `allow_dirty_worktree=true`, hash checks, non-overlapping edits, parse
-   validation, and atomic writes.
+   validation, and atomic writes. For disposable practice worktrees or isolated
+   smoke tests, `allow_unregistered_paths=true` bypasses the registered-project
+   requirement without disabling hash, syntax, or dirty-file checks.
 
 4. Run the language toolchain after apply. Tree-sitter proves syntax shape, not
    semantic binding.
