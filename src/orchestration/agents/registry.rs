@@ -581,18 +581,92 @@ fn parse_versioned(input: &str) -> Result<(String, Option<String>)> {
 // Text relevance scoring (BM25-like simplified)
 // ---------------------------------------------------------------------------
 
+/// Common short English tokens that contribute pure noise to substring/word
+/// matching. Kept tight (high-frequency function words only) so domain
+/// terms still match. Length<3 tokens are filtered separately.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "you", "are", "but", "with", "that", "this", "from",
+    "into", "your", "they", "them", "their", "there", "when", "what", "which",
+    "while", "would", "could", "should", "have", "has", "had", "was", "were",
+    "been", "being", "will", "shall", "can", "may", "not", "use", "using",
+    "use's", "yes", "no", "off", "any", "all", "some", "more", "most",
+    "much", "many", "few", "such", "very", "just", "only", "than", "then",
+    "now", "how", "why", "where", "who", "whom", "whose", "its", "his",
+    "her", "him", "she", "out", "our", "ours", "owns", "own", "via", "per",
+];
+
+fn token_match(query_term: &str, target_token: &str) -> bool {
+    if query_term == target_token {
+        return true;
+    }
+    if query_term.len().min(target_token.len()) < 4 {
+        return false;
+    }
+    // Stem-prefix match: the two tokens are morphologically related
+    // when they share a long common prefix and neither side extends
+    // beyond that prefix by more than 3 chars (typical English
+    // suffixes: -s, -es, -ed, -ing, -ion, -ate, -ies, etc.). Catches
+    // navigate/navigating, function/functional, rust/rusts; rejects
+    // agent/agencies (LCP too short) and code/consider (suffix gap
+    // too large).
+    let q = query_term.as_bytes();
+    let t = target_token.as_bytes();
+    let lcp = q.iter().zip(t.iter()).take_while(|(a, b)| a == b).count();
+    if lcp < 4 {
+        return false;
+    }
+    let max_len = q.len().max(t.len());
+    max_len - lcp <= 3
+}
+
+fn tokenize_for_match(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter_map(|tok| {
+            if tok.len() < 3 {
+                return None;
+            }
+            if STOPWORDS.contains(&tok) {
+                return None;
+            }
+            Some(tok.to_string())
+        })
+        .collect()
+}
+
 fn text_relevance(query_terms: &[&str], description: &str, lines: &[String]) -> f64 {
-    let all_text: String = {
-        let mut s = description.to_string();
-        for line in lines {
-            s.push(' ');
-            s.push_str(line);
-        }
-        s.to_lowercase()
-    };
+    let mut all_text = String::from(description);
+    for line in lines {
+        all_text.push(' ');
+        all_text.push_str(line);
+    }
+    let target_tokens = tokenize_for_match(&all_text);
+    if target_tokens.is_empty() {
+        return 0.0;
+    }
     let mut score = 0.0f64;
     for term in query_terms {
-        let count = all_text.matches(term).count();
+        // Filter out trivial query terms with the same rules as target
+        // tokenization so substring noise (e.g. single-letter "a"
+        // matching "agentic", or "me" matching "teach-mode") does not
+        // inflate positive_score for unrelated agents.
+        let term = term.trim();
+        if term.len() < 3 {
+            continue;
+        }
+        if STOPWORDS.contains(&term) {
+            continue;
+        }
+        let term_lc = term.to_lowercase();
+        // Loose stem-prefix match: a query term hits an agent token if
+        // either is a prefix of the other and the shared prefix is at
+        // least 4 chars. Catches navigate/navigating/navigates without
+        // letting 3-char query tokens wildcard-match across the
+        // dictionary.
+        let count = target_tokens
+            .iter()
+            .filter(|t| token_match(&term_lc, t))
+            .count();
         if count > 0 {
             score += 1.0 + (count as f64).ln_1p();
         }
@@ -1052,6 +1126,37 @@ mod tests {
         assert!(score > 0.0, "should have positive score: {score}");
         let zero = text_relevance(&["xyz"], "unrelated text", &[]);
         assert_eq!(zero, 0.0);
+    }
+
+    #[test]
+    fn text_relevance_filters_short_and_stop_tokens() {
+        // Earlier behavior: substring scoring with no tokenization let
+        // single-letter "a" and stopword "me" inflate scores by
+        // matching inside unrelated words ("agentic", "teach-mode").
+        // A query that shares no domain-relevant tokens with the agent
+        // text must score zero.
+        let score = text_relevance(
+            &["write", "me", "a", "rust", "function"],
+            "long-lived agentic-corpus consultant that proposes durable artifacts",
+            &["when a caller needs help navigating the agentic corpus".into()],
+        );
+        assert_eq!(
+            score, 0.0,
+            "short/stop tokens must not inflate score: {score}"
+        );
+    }
+
+    #[test]
+    fn text_relevance_stem_prefix_matches_morphology() {
+        // A query token must match agent tokens that share a >=4-char
+        // common prefix so morphology like navigate/navigates/navigating
+        // counts as a hit.
+        let score = text_relevance(
+            &["navigate"],
+            "",
+            &["help navigating the agentic corpus".into()],
+        );
+        assert!(score > 0.0, "navigate must match navigating: {score}");
     }
 
     #[test]
