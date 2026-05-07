@@ -3965,7 +3965,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_refactor_status",
-        description = "Inspect a supported source file for tree-sitter parse health and top-level refactorable items."
+        description = "Inspect a supported source file for tree-sitter parse health and refactorable items."
     )]
     fn bbox_refactor_status(
         &self,
@@ -3976,7 +3976,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_refactor_plan",
-        description = "Create a dry-run structural refactor plan. V1 supports extract_rust_items for named top-level Rust items."
+        description = "Create a dry-run structural refactor plan. Supports Rust top-level item extraction and Rust impl-method extraction."
     )]
     fn bbox_refactor_plan(&self, Parameters(p): Parameters<RefactorPlanParams>) -> CallToolResult {
         Self::run("bbox_refactor_plan", || refactor::plan(&p))

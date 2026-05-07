@@ -190,7 +190,8 @@ Rules:
 
 - Plans are dry-run first. Applying a plan requires explicit caller intent.
 - `bbox_refactor_status` is language-generic for supported tree-sitter
-  grammars and returns parse health plus top-level syntactic inventory.
+  grammars and returns parse health plus syntactic inventory. Rust includes
+  top-level items and direct `impl_method` entries.
 - `bbox_refactor_plan` is a dispatcher: each plan kind declares the language
   backend it uses. Unsupported language/kind pairs fail closed.
 - Edits in one file must be non-overlapping and applied from high byte offset to
@@ -236,6 +237,17 @@ The refactor API should remain language-neutral at the entry point:
 Adding a new language backend means adding or updating that language's system
 memory in the same patch as the backend, so agents do not have to infer support
 from source code.
+
+Current Rust writable plan kinds:
+
+- `extract_rust_items`: move named top-level Rust items between files.
+- `extract_rust_impl_methods`: move named methods from a single Rust `impl`
+  block into a generated target `impl` wrapper, preserving method attributes
+  and optionally adding `#[tool_router(router = name)]`.
+  If a matching target impl already exists, the planner appends into it instead
+  of creating another sibling impl. The `#[tool_router(router = name)]` shape is
+  intentionally coupled to the current `rmcp` macro syntax used by
+  `BlackboxServer`; future macro changes require updating this generator.
 
 ## Tree-Sitter Recipes
 
@@ -319,6 +331,13 @@ Tool extraction can be made mostly mechanical:
 - wrap each target set in a new `impl BlackboxServer` block with its own
   `#[tool_router(router = <domain>_tools)]`
 - update the router sum in `BlackboxServer::new`
+
+The implemented `extract_rust_impl_methods` primitive covers the method move and
+target wrapper generation, including appending into an existing matching target
+impl for repeated extraction waves. It deliberately does not update module
+declarations, imports, DTO/helper moves, or the server router sum; those are
+separate mechanical steps that must be planned explicitly so the agent can
+review the blast radius.
 
 The DTO move is manifest-driven, not inferred by loose token search. The
 planner may list probable DTO/helper dependencies, but the accepted move set is

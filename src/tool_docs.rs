@@ -298,17 +298,17 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_refactor_status",
         category: ToolCategory::Refactor,
-        summary: "Inspect a supported source file for tree-sitter parse health and top-level refactorable items.",
-        when_to_use: "Use before structural extraction to inventory top-level items in any supported grammar, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a language-specific bbox_refactor_plan when one exists. Pull `sm-refactor` first, then `sm-refactor-rust`, `sm-refactor-typescript`, or `sm-refactor-csharp` for language-specific arguments and validation commands.",
+        summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",
+        when_to_use: "Use before structural extraction to inventory top-level items in any supported grammar, plus Rust impl methods, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a language-specific bbox_refactor_plan when one exists. Pull `sm-refactor` first, then `sm-refactor-rust`, `sm-refactor-typescript`, or `sm-refactor-csharp` for language-specific arguments and validation commands.",
         example: Some(r#"bbox_refactor_status(file="src/main.rs", project_dir="/repo/x")"#),
     },
     ToolDoc {
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
-        summary: "Create a dry-run structural refactor plan. V1 supports extract_rust_items for named top-level Rust items.",
-        when_to_use: "Use to generate a reviewable plan for moving named top-level Rust items from one file to another. The plan is structural-only and includes hash checks, text edits, parse validations, selected items, and leftovers.",
+        summary: "Create a dry-run structural refactor plan. Supports Rust top-level item extraction and Rust impl-method extraction.",
+        when_to_use: "Use to generate a reviewable plan for moving named top-level Rust items or named Rust impl methods from one file to another. Impl-method extraction can wrap moved methods in a new #[tool_router(router = name)] impl block and append into an existing matching target impl. The plan is structural-only and includes hash checks, text edits, parse validations, selected items, and leftovers.",
         example: Some(
-            r#"bbox_refactor_plan(kind="extract_rust_items", source="src/lib.rs", target="src/moved.rs", item_names=["helper"], project_dir="/repo/x")"#,
+            r#"bbox_refactor_plan(kind="extract_rust_impl_methods", source="src/main.rs", target="src/tools/search.rs", item_names=["bbox_search"], impl_name="impl BlackboxServer", router_name="search_tools", target_prelude="use super::*;", project_dir="/repo/x")"#,
         ),
     },
     ToolDoc {

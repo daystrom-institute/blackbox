@@ -24,7 +24,8 @@ mapped languages are inspect-only unless a newer language memory says otherwise.
 
 Writable structural plans are narrower:
 
-- Rust: `bbox_refactor_plan(kind="extract_rust_items")`, then
+- Rust: `bbox_refactor_plan(kind="extract_rust_items")` or
+  `bbox_refactor_plan(kind="extract_rust_impl_methods")`, then
   `bbox_refactor_apply(confirm=true)`.
 - TypeScript / JavaScript: inspect-only today. Use `sm-refactor-typescript`.
 - C#: inspect-only today. Use `sm-refactor-csharp`.
@@ -56,6 +57,9 @@ Writable structural plans are narrower:
 ```text
 bbox_refactor_status(file="path/to/file", project_dir="/absolute/project/root")
 ```
+
+For Rust, status includes top-level items plus `impl_method` entries so agents
+can copy exact method names before planning an impl extraction.
 
 2. Only call `bbox_refactor_plan` for a plan kind that the language memory says
    is writable.
