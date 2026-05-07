@@ -20,6 +20,18 @@ pub struct RefactorStatusParams {
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
+    /// Optional exact item names to return.
+    #[serde(default)]
+    pub item_names: Option<Vec<String>>,
+    /// Optional item kinds to return, e.g. function_item, struct_item, impl_method.
+    #[serde(default)]
+    pub item_kinds: Option<Vec<String>>,
+    /// Maximum matching items to return. Defaults to 200 and is capped at 1000.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Include syntax attributes in returned items. Defaults true.
+    #[serde(default)]
+    pub include_attributes: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -64,6 +76,10 @@ pub struct RefactorApplyParams {
     /// Default false. When false, refuses to modify files that are dirty in git.
     #[serde(default)]
     pub allow_dirty_worktree: Option<bool>,
+    /// Default false. When false, refuses paths outside registered projects.
+    /// Use true only for disposable practice worktrees or isolated smoke tests.
+    #[serde(default)]
+    pub allow_unregistered_paths: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -134,6 +150,10 @@ pub struct RefactorStatus {
     pub language: String,
     pub sha256: String,
     pub parse: ParseReport,
+    pub total_items: usize,
+    pub matching_items: usize,
+    pub returned_items: usize,
+    pub truncated: bool,
     pub items: Vec<SyntaxItem>,
 }
 
@@ -188,17 +208,44 @@ pub fn status(p: &RefactorStatusParams) -> Result<String> {
     let path = resolve_path(p.project_dir.as_deref(), &p.file)?;
     let parsed = parse_source_file(&path)?;
     let report = parse_report(parsed.tree.root_node());
-    let items = if parsed.language == "rust" {
+    let mut items = if parsed.language == "rust" {
         rust_status_items(&parsed)
     } else {
         generic_top_level_items(&parsed)
     };
+    let total_items = items.len();
+    if let Some(kinds) = p.item_kinds.as_deref().filter(|kinds| !kinds.is_empty()) {
+        let kinds = kinds.iter().map(String::as_str).collect::<HashSet<_>>();
+        items.retain(|item| kinds.contains(item.kind.as_str()));
+    }
+    if let Some(names) = p.item_names.as_deref().filter(|names| !names.is_empty()) {
+        let names = names.iter().map(String::as_str).collect::<HashSet<_>>();
+        items.retain(|item| {
+            item.name
+                .as_deref()
+                .is_some_and(|name| names.contains(name))
+        });
+    }
+    if p.include_attributes == Some(false) {
+        for item in &mut items {
+            item.attributes.clear();
+        }
+    }
+    let matching_items = items.len();
+    let limit = p.limit.unwrap_or(200).min(1000);
+    let truncated = matching_items > limit;
+    items.truncate(limit);
+    let returned_items = items.len();
     let response = RefactorStatus {
         status: "ok".to_string(),
         path: path_string(&path),
         language: parsed.language.to_string(),
         sha256: sha256_hex(parsed.source.as_bytes()),
         parse: report,
+        total_items,
+        matching_items,
+        returned_items,
+        truncated,
         items,
     };
     Ok(serde_json::to_string_pretty(&response)?)
@@ -227,7 +274,9 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
     let mut rewritten = Vec::new();
     for edit in &plan.edits {
         let path = PathBuf::from(&edit.path);
-        ensure_path_in_registered_project(&path, projects)?;
+        if p.allow_unregistered_paths != Some(true) {
+            ensure_path_in_registered_project(&path, projects)?;
+        }
         if p.allow_dirty_worktree != Some(true) {
             ensure_git_clean_for_path(&path)?;
         }
@@ -708,10 +757,7 @@ fn rust_impl_methods_target_edits(
     ])
 }
 
-fn find_rust_field_initializer<'a>(
-    parsed: &'a ParsedSource,
-    field_name: &str,
-) -> Option<Node<'a>> {
+fn find_rust_field_initializer<'a>(parsed: &'a ParsedSource, field_name: &str) -> Option<Node<'a>> {
     find_node(parsed.tree.root_node(), |node| {
         node.kind() == "field_initializer"
             && rust_field_initializer_name(node, &parsed.source).as_deref() == Some(field_name)
@@ -850,7 +896,9 @@ fn existing_target_impl_insert_byte(
             .ok_or_else(|| anyhow!("matching target impl has no closing brace"))?;
         return Ok(Some(TargetImplInsertion {
             byte: close,
-            body_is_empty: parsed.source[body.start_byte() + 1..close].trim().is_empty(),
+            body_is_empty: parsed.source[body.start_byte() + 1..close]
+                .trim()
+                .is_empty(),
         }));
     }
     Ok(None)
@@ -1505,6 +1553,10 @@ mod tests {
         let text = status(&RefactorStatusParams {
             file: path_string(&path),
             project_dir: None,
+            item_names: None,
+            item_kinds: None,
+            limit: None,
+            include_attributes: None,
         })
         .unwrap();
         let parsed: RefactorStatus = serde_json::from_str(&text).unwrap();
@@ -1534,6 +1586,10 @@ mod tests {
         let text = status(&RefactorStatusParams {
             file: path_string(&path),
             project_dir: None,
+            item_names: None,
+            item_kinds: None,
+            limit: None,
+            include_attributes: None,
         })
         .unwrap();
         let parsed: RefactorStatus = serde_json::from_str(&text).unwrap();
@@ -1542,12 +1598,10 @@ mod tests {
             .iter()
             .find(|item| item.kind == "impl_method" && item.name.as_deref() == Some("find"))
             .expect("impl method should be listed");
-        assert!(
-            method
-                .attributes
-                .iter()
-                .any(|attr| attr == "#[tool(description = \"x\")]")
-        );
+        assert!(method
+            .attributes
+            .iter()
+            .any(|attr| attr == "#[tool(description = \"x\")]"));
     }
 
     #[test]
@@ -1579,6 +1633,7 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
@@ -1622,6 +1677,7 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
@@ -1675,6 +1731,7 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
@@ -1722,6 +1779,7 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
@@ -1763,6 +1821,7 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
@@ -1808,6 +1867,7 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
@@ -1850,17 +1910,16 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
         .unwrap();
         let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(applied.status, "ok");
-        assert!(
-            fs::read_to_string(&target)
-                .unwrap()
-                .starts_with("/*!\nmodule docs\n*/\n\nuse super::*;")
-        );
+        assert!(fs::read_to_string(&target)
+            .unwrap()
+            .starts_with("/*!\nmodule docs\n*/\n\nuse super::*;"));
     }
 
     #[test]
@@ -1893,6 +1952,7 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
@@ -1947,10 +2007,9 @@ mod tests {
             project_dir: None,
         })
         .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("only supports item_kinds impl_method")
-        );
+        assert!(err
+            .to_string()
+            .contains("only supports item_kinds impl_method"));
     }
 
     #[test]
@@ -1981,6 +2040,7 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
@@ -1988,11 +2048,9 @@ mod tests {
         let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(applied.status, "ok");
         let source_text = fs::read_to_string(&source).unwrap();
-        assert!(
-            source_text.contains(
-                "tool_router: Self::bbox_tools() + Self::bro_tools() + Self::search_tools(),"
-            )
-        );
+        assert!(source_text.contains(
+            "tool_router: Self::bbox_tools() + Self::bro_tools() + Self::search_tools(),"
+        ));
     }
 
     #[test]
@@ -2029,6 +2087,10 @@ mod tests {
         let text = status(&RefactorStatusParams {
             file: path_string(&path),
             project_dir: None,
+            item_names: None,
+            item_kinds: None,
+            limit: None,
+            include_attributes: None,
         })
         .unwrap();
         let parsed: RefactorStatus = serde_json::from_str(&text).unwrap();
@@ -2065,6 +2127,7 @@ mod tests {
                 plan: plan_value,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(dir.path())],
         )
@@ -2155,10 +2218,51 @@ mod tests {
                 plan: serde_json::to_value(plan).unwrap(),
                 confirm: Some(true),
                 allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
             },
             &[project_record(project.path())],
         )
         .unwrap_err();
         assert!(err.to_string().contains("outside registered projects"));
+    }
+
+    #[test]
+    fn apply_can_allow_unregistered_paths_for_practice_worktrees() {
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("lib.rs");
+        fs::write(&source, "fn f() {}\n").unwrap();
+        let plan = RefactorPlan {
+            title: "practice".into(),
+            kind: "extract_rust_items".into(),
+            semantic_status: SemanticStatus::StructuralOnly,
+            dry_run: true,
+            edits: vec![FileEdit {
+                path: path_string(&source),
+                original_sha256: sha256_hex(b"fn f() {}\n"),
+                edits: vec![TextEdit {
+                    byte_start: 3,
+                    byte_end: 4,
+                    replacement: "g".into(),
+                }],
+            }],
+            validations: Vec::new(),
+            items: Vec::new(),
+            leftovers: Vec::new(),
+        };
+
+        let response = apply(
+            &RefactorApplyParams {
+                plan: serde_json::to_value(plan).unwrap(),
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[],
+        )
+        .unwrap();
+
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(fs::read_to_string(source).unwrap(), "fn g() {}\n");
     }
 }
