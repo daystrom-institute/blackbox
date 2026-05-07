@@ -29,7 +29,9 @@ Writable structural plans are narrower:
   `bbox_refactor_plan(kind="delete_rust_items")` or
   `bbox_refactor_plan(kind="add_rust_router_to_sum")` or
   `bbox_refactor_plan(kind="add_rust_mod_decl")` or
-  `bbox_refactor_plan(kind="add_rust_use_decl")`, then
+  `bbox_refactor_plan(kind="add_rust_use_decl")` or
+  `bbox_refactor_plan(kind="copy_rust_mod_decls")` or
+  `bbox_refactor_plan(kind="rewrite_rust_mod_visibility")`, then
   `bbox_refactor_apply(confirm=true)`. Use `bbox_refactor_run(confirm=true)`
   when several primitive plans must succeed or rollback together.
 - TypeScript / JavaScript: inspect-only today. Use `sm-refactor-typescript`.

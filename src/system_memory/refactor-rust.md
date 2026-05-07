@@ -13,7 +13,9 @@ Rust is the first writable backend.
   `bbox_refactor_plan(kind="delete_rust_items")` and
   `bbox_refactor_plan(kind="add_rust_router_to_sum")` and
   `bbox_refactor_plan(kind="add_rust_mod_decl")` and
-  `bbox_refactor_plan(kind="add_rust_use_decl")`.
+  `bbox_refactor_plan(kind="add_rust_use_decl")` and
+  `bbox_refactor_plan(kind="copy_rust_mod_decls")` and
+  `bbox_refactor_plan(kind="rewrite_rust_mod_visibility")`.
 - Apply: supported with `bbox_refactor_apply(confirm=true)`.
 - Compound run: supported with `bbox_refactor_run(confirm=true)` for ordered
   primitive plans, with rollback across primitive-plan file writes if a later
@@ -42,6 +44,13 @@ Writable plan kinds:
   declarations. Optional `visibility` supports `pub` and `pub(crate)`.
 - `add_rust_use_decl`: add `use <use_path>;`, `pub use <use_path>;`, or
   `pub(crate) use <use_path>;` after existing top-level use declarations.
+- `copy_rust_mod_decls`: copy selected source `mod name;` declarations into a
+  target Rust file, optionally rewriting their visibility. Use this for
+  reparenting declarations into `lib.rs`; inline `mod name { ... }` modules are
+  rejected.
+- `rewrite_rust_mod_visibility`: rewrite an existing `mod name;`,
+  `pub mod name;`, or `pub(crate) mod name;` declaration to requested
+  visibility (`private`, `pub`, or `pub(crate)`).
 
 Compound run steps:
 

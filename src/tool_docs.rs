@@ -67,7 +67,7 @@ impl ToolCategory {
             }
             Self::Projects => "Register project roots for later file indexing.",
             Self::Refactor => {
-                "Mechanize structural refactors with tree-sitter-backed source inventory, dry-run extraction plans, hash-checked apply, and parse validation. Inspection is multi-language for supported grammars; mutation starts with Rust item extraction. Pull `sm-refactor` first, then the language runbook: `sm-refactor-rust`, `sm-refactor-typescript`, or `sm-refactor-csharp` via `bbox_knowledge`. These tools are syntax-aware, not semantic rename engines; use language servers or compiler feedback for reference resolution and import repair."
+                "Mechanize structural refactors with tree-sitter-backed source inventory, dry-run plans, hash-checked apply, transaction composition, and parse validation. Inspection is multi-language for supported grammars; writable plan kinds are language-scoped. Pull `sm-refactor` first, then the relevant language runbook via `bbox_knowledge` for exact plan kinds, arguments, and validation expectations. These tools are syntax-aware, not semantic rename engines; use language servers or compiler feedback for reference resolution and import repair."
             }
             Self::Knowledge => {
                 "Memory lanes: `bbox_learn` for rendered rules, `bbox_remember` for cold recall, `bbox_decide` for durable commitments, and `bbox_pin` for scoped active context."
@@ -299,33 +299,29 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_refactor_status",
         category: ToolCategory::Refactor,
         summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",
-        when_to_use: "Use before structural extraction to inventory top-level items in any supported grammar, plus Rust impl methods, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a language-specific bbox_refactor_plan when one exists. On large files, pass item_kinds/item_names and limit to keep the response agent-sized. Pull `sm-refactor` first, then `sm-refactor-rust`, `sm-refactor-typescript`, or `sm-refactor-csharp` for language-specific arguments and validation commands.",
-        example: Some(r#"bbox_refactor_status(file="src/main.rs", project_dir="/repo/x", item_kinds=["impl_method"], limit=50, include_attributes=false)"#),
+        when_to_use: "Use before structural planning to inventory refactorable syntax items, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a language-specific bbox_refactor_plan when one exists. On large files, pass item_kinds/item_names and limit to keep the response agent-sized. Pull `sm-refactor` first, then the relevant language memory for language-specific item kinds, arguments, caveats, and validation commands.",
+        example: Some(r#"bbox_refactor_status(file="src/path/to/file.ext", project_dir="/repo/x", item_names=["Thing"], limit=50, include_attributes=false)"#),
     },
     ToolDoc {
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
-        summary: "Create a dry-run structural refactor plan. Supports Rust top-level extraction/deletion, Rust impl-method extraction/deletion, module/use declarations, and Rust router-sum updates.",
-        when_to_use: "Use to generate a reviewable plan for moving or deleting named top-level Rust items, moving or deleting named Rust impl methods, adding Rust `mod name;` or `use path;` declarations, or wiring a generated Rust tool router into a `tool_router:` sum. Impl-method extraction can wrap moved methods in a new #[tool_router(router = name)] impl block, generate a module-local router export helper, and append into an existing matching target impl. Delete plans require explicit item_names, are structural-only, and refuse to mix impl methods with top-level items in one primitive plan. The plan includes hash checks, text edits, parse validations, selected items, and leftovers.",
-        example: Some(
-            r#"bbox_refactor_plan(kind="extract_rust_impl_methods", source="src/main.rs", target="src/tools/search.rs", item_names=["bbox_search"], impl_name="impl BlackboxServer", router_name="search_tools", router_export_name="router", target_prelude="use super::*;", project_dir="/repo/x")
-bbox_refactor_plan(kind="delete_rust_items", source="src/main.rs", item_names=["old_mod"], item_kinds=["mod_item"], project_dir="/repo/x")
-bbox_refactor_plan(kind="add_rust_use_decl", source="src/lib.rs", use_path="server::BlackboxServer", visibility="pub", project_dir="/repo/x")"#,
-        ),
+        summary: "Create a dry-run structural refactor plan using a language-scoped plan kind.",
+        when_to_use: "Use after bbox_refactor_status and the relevant language memory identify an exact supported plan kind. The plan is reviewable JSON with hash checks, text edits, parse validations, selected items, and leftovers where applicable. Keep this generic surface free of language-specific assumptions: plan kind names and extra arguments come from language memories such as `sm-refactor-rust`, while semantic rename/import repair belongs to LSP or future validation surfaces.",
+        example: Some(r#"bbox_refactor_plan(kind="<language_plan_kind>", source="src/path/to/file.ext", target="src/path/to/target.ext", item_names=["Thing"], project_dir="/repo/x")"#),
     },
     ToolDoc {
         name: "bbox_refactor_apply",
         category: ToolCategory::Refactor,
-        summary: "Apply a previously generated refactor plan with hash checks, Rust parse validation, atomic writes, and rollback on write failure.",
-        when_to_use: "Use only after reviewing a bbox_refactor_plan result. Requires confirm=true; refuses stale file hashes and validates rewritten Rust before writing. Paths must live under registered projects unless allow_unregistered_paths=true is explicitly set for a disposable practice worktree or isolated smoke test.",
+        summary: "Apply a previously generated refactor plan with hash checks, supported-source parse validation, atomic writes, and rollback on write failure.",
+        when_to_use: "Use only after reviewing a bbox_refactor_plan result. Requires confirm=true; refuses stale file hashes and validates rewritten supported source files before writing. Paths must live under registered projects unless allow_unregistered_paths=true is explicitly set for a disposable practice worktree or isolated smoke test.",
         example: Some(r#"bbox_refactor_apply(plan=<plan-json>, confirm=true, allow_unregistered_paths=true)"#),
     },
     ToolDoc {
         name: "bbox_refactor_run",
         category: ToolCategory::Refactor,
         summary: "Compose primitive refactor plans into one transactional run with rollback across touched files.",
-        when_to_use: "Use when a restructuring move needs several bbox_refactor_plan primitives to succeed or fail together, such as extract handlers, add a module declaration, then wire a router sum. V1 executes primitive plan steps sequentially against the live projected state when confirm=true, snapshots touched files before first write, rejects initially dirty files unless allow_dirty_worktree=true, and rolls back primitive-plan writes if any later plan step fails. Language-specific validation commands belong in language memories or a separate validation surface, not in this generic runner.",
-        example: Some(r#"bbox_refactor_run(title="extract refactor tools", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"extract_rust_impl_methods","source":"src/main.rs","target":"src/refactor_tools.rs","item_names":["bbox_refactor_status"],"item_kinds":["impl_method"],"impl_name":"impl BlackboxServer","router_name":"refactor_tools","router_export_name":"router","target_prelude":"use super::*;"},{"op":"plan","kind":"add_rust_mod_decl","source":"src/main.rs","module_name":"refactor_tools"}])"#),
+        when_to_use: "Use when a restructuring move needs several bbox_refactor_plan primitives to succeed or fail together. V1 executes primitive plan steps sequentially against the live projected state when confirm=true, snapshots touched files before first write, rejects initially dirty files unless allow_dirty_worktree=true, and rolls back primitive-plan writes if any later plan step fails. Language-specific validation commands belong in language memories or a separate validation surface, not in this generic runner.",
+        example: Some(r#"bbox_refactor_run(title="compound structural move", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"<language_plan_kind>","source":"src/path/to/file.ext","item_names":["Thing"]},{"op":"plan","kind":"<another_language_plan_kind>","source":"src/path/to/file.ext"}])"#),
     },
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {

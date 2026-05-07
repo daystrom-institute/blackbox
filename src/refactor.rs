@@ -36,47 +36,41 @@ pub struct RefactorStatusParams {
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
-    /// Plan kind. Supports Rust extraction, deletion, declaration insertion,
-    /// and router-sum updates.
+    /// Language-scoped plan kind. Pull the language memory for supported values.
     pub kind: String,
-    /// Source Rust file. Relative paths resolve against project_dir or cwd.
+    /// Source file. Relative paths resolve against project_dir or cwd.
     pub source: String,
-    /// Target Rust file for extracted items. Required for writable plan kinds.
+    /// Optional target file. Required by plan kinds that write or copy elsewhere.
     #[serde(default)]
     pub target: Option<String>,
-    /// Item names to extract. Names are exact; extract_rust_impl_methods uses method names.
+    /// Optional exact item names. Meaning is plan-specific.
     #[serde(default)]
     pub item_names: Option<Vec<String>>,
-    /// Optional item kinds, e.g. function_item, struct_item, impl_item.
+    /// Optional syntax item kinds. Values are language-specific.
     #[serde(default)]
     pub item_kinds: Option<Vec<String>>,
-    /// Optional exact impl header filter for extract_rust_impl_methods,
-    /// e.g. "impl BlackboxServer".
+    /// Optional plan-specific implementation/scope filter.
     #[serde(default)]
     pub impl_name: Option<String>,
-    /// Optional module name for add_rust_mod_decl.
+    /// Optional plan-specific module/declaration name.
     #[serde(default)]
     pub module_name: Option<String>,
-    /// Optional visibility for declaration-insertion plans: "pub" or "pub(crate)".
+    /// Optional plan-specific visibility value.
     #[serde(default)]
     pub visibility: Option<String>,
-    /// Optional Rust use path for add_rust_use_decl, without the leading `use`
-    /// and without a trailing semicolon.
+    /// Optional plan-specific import/use path.
     #[serde(default)]
     pub use_path: Option<String>,
-    /// Optional router name for extract_rust_impl_methods. When present, the
-    /// generated target wrapper is annotated as #[tool_router(router = name)].
+    /// Optional plan-specific router name.
     #[serde(default)]
     pub router_name: Option<String>,
-    /// Optional explicit router call for add_rust_router_to_sum, e.g.
-    /// "refactor_tools::router()". Defaults to "Self::<router_name>()".
+    /// Optional plan-specific router call expression.
     #[serde(default)]
     pub router_call: Option<String>,
-    /// Optional helper function name generated before a new router wrapper.
-    /// Use with router_name when extracting tool impls into a child module.
+    /// Optional plan-specific router export helper name.
     #[serde(default)]
     pub router_export_name: Option<String>,
-    /// Optional text inserted before the generated target wrapper.
+    /// Optional plan-specific text inserted before generated target content.
     #[serde(default)]
     pub target_prelude: Option<String>,
     /// Optional project root used to resolve relative paths.
@@ -336,8 +330,10 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "add_rust_router_to_sum" => plan_add_rust_router_to_sum(p),
         "add_rust_mod_decl" => plan_add_rust_mod_decl(p),
         "add_rust_use_decl" => plan_add_rust_use_decl(p),
+        "copy_rust_mod_decls" => plan_copy_rust_mod_decls(p),
+        "rewrite_rust_mod_visibility" => plan_rewrite_rust_mod_visibility(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility"
         ),
     }
 }
@@ -1272,6 +1268,151 @@ fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let target_path = p
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("target is required for copy_rust_mod_decls"))
+        .and_then(|target| resolve_path(p.project_dir.as_deref(), target))?;
+    if source_path == target_path {
+        bail!("source and target must be different files");
+    }
+    let parsed = parse_rust_file(&source_path)?;
+    let source_items = rust_items(&parsed);
+    let mod_items = source_items
+        .iter()
+        .filter(|item| item.kind == "mod_item")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mod_kind = vec!["mod_item".to_string()];
+    let selected = select_items(&mod_items, p.item_names.as_deref(), Some(&mod_kind))?;
+    let mut declarations = Vec::new();
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    for item in &selected {
+        ensure_rust_mod_declaration(&parsed.source, item)?;
+        let name = item
+            .name
+            .as_deref()
+            .ok_or_else(|| anyhow!("selected mod_item has no module name"))?;
+        declarations.push(format!("{visibility}mod {name};"));
+    }
+
+    let target_source = fs::read_to_string(&target_path).unwrap_or_default();
+    let existing = rust_existing_mod_decl_names(&target_path, &target_source)?;
+    let declarations = declarations
+        .into_iter()
+        .filter(|declaration| {
+            let name = declaration
+                .trim_end_matches(';')
+                .split_whitespace()
+                .last()
+                .unwrap_or_default();
+            !existing.contains(name)
+        })
+        .collect::<Vec<_>>();
+    if declarations.is_empty() {
+        bail!("all selected module declarations already exist in target");
+    }
+
+    let insert_at = rust_mod_decl_insert_byte(&target_path, &target_source)?;
+    let replacement = rust_decl_batch_insert_text(&target_source, insert_at, &declarations);
+    let plan = RefactorPlan {
+        title: format!(
+            "copy {} Rust module declaration(s) from {} to {}",
+            declarations.len(),
+            path_string(&source_path),
+            path_string(&target_path)
+        ),
+        kind: "copy_rust_mod_decls".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        edits: vec![FileEdit {
+            path: path_string(&target_path),
+            original_sha256: sha256_hex(target_source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: insert_at,
+                byte_end: insert_at,
+                replacement,
+            }],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&target_path),
+            byte_range: None,
+        }],
+        items: selected.into_iter().cloned().collect(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let module_name = p
+        .module_name
+        .as_deref()
+        .or_else(|| {
+            p.item_names
+                .as_deref()
+                .and_then(|names| names.first().map(String::as_str))
+        })
+        .ok_or_else(|| {
+            anyhow!("module_name or item_names[0] is required for rewrite_rust_mod_visibility")
+        })?;
+    validate_rust_identifier(module_name, "module_name")?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+
+    let parsed = parse_rust_file(&source_path)?;
+    let items = rust_items(&parsed);
+    let selected = items
+        .iter()
+        .filter(|item| item.kind == "mod_item" && item.name.as_deref() == Some(module_name))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        bail!("module declaration `{module_name}` was not found");
+    }
+    if selected.len() > 1 {
+        bail!("module declaration `{module_name}` matched multiple items");
+    }
+    let item = selected[0];
+    ensure_rust_mod_declaration(&parsed.source, item)?;
+    let mod_keyword = rust_mod_keyword_byte(&parsed.source, item)?;
+    let visibility_start = rust_mod_visibility_start_byte(&parsed.source, mod_keyword);
+    let current_prefix = &parsed.source[visibility_start..mod_keyword];
+    if current_prefix == visibility {
+        bail!("module declaration `{module_name}` already has requested visibility");
+    }
+    let plan = RefactorPlan {
+        title: format!(
+            "rewrite Rust module declaration {module_name} visibility in {}",
+            path_string(&source_path)
+        ),
+        kind: "rewrite_rust_mod_visibility".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: visibility_start,
+                byte_end: mod_keyword,
+                replacement: visibility.to_string(),
+            }],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: vec![item.clone()],
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
 fn rust_impl_methods_target_edits(
     target_path: &Path,
     target_source: &str,
@@ -1627,6 +1768,127 @@ fn rust_decl_visibility_prefix(visibility: Option<&str>) -> Result<&'static str>
         "pub" => Ok("pub "),
         "pub(crate)" => Ok("pub(crate) "),
         other => bail!("unsupported Rust visibility `{other}`; supported: pub, pub(crate)"),
+    }
+}
+
+fn rust_mod_keyword_byte(source: &str, item: &SyntaxItem) -> Result<usize> {
+    let text = source
+        .get(item.byte_start..item.byte_end)
+        .ok_or_else(|| anyhow!("invalid mod_item range for {}", item.plan_local_id))?;
+    let name = item
+        .name
+        .as_deref()
+        .ok_or_else(|| anyhow!("selected mod_item has no module name"))?;
+    for (idx, _) in text.match_indices("mod") {
+        let before = idx
+            .checked_sub(1)
+            .and_then(|pos| text.as_bytes().get(pos))
+            .copied();
+        let after = text.as_bytes().get(idx + 3).copied();
+        let before_boundary = before.is_none_or(|byte| !rust_ident_byte(byte));
+        let after_boundary = after.is_none_or(|byte| !rust_ident_byte(byte));
+        if !before_boundary || !after_boundary {
+            continue;
+        }
+        let rest = &text[idx + 3..];
+        let trimmed = rest.trim_start();
+        if trimmed
+            .strip_prefix(name)
+            .and_then(|suffix| suffix.as_bytes().first().copied())
+            .is_some_and(|byte| rust_ident_byte(byte))
+        {
+            continue;
+        }
+        if trimmed.starts_with(name) {
+            return Ok(item.byte_start + idx);
+        }
+    }
+    bail!("could not locate `mod` keyword for {}", item.plan_local_id)
+}
+
+fn rust_mod_visibility_start_byte(source: &str, mod_keyword: usize) -> usize {
+    let line_start = line_start_before(source, mod_keyword);
+    let leading = source[line_start..mod_keyword]
+        .bytes()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    line_start + leading
+}
+
+fn rust_ident_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn ensure_rust_mod_declaration(source: &str, item: &SyntaxItem) -> Result<()> {
+    let text = source
+        .get(item.byte_start..item.byte_end)
+        .ok_or_else(|| anyhow!("invalid mod_item range for {}", item.plan_local_id))?;
+    let semicolon = text.find(';');
+    let brace = text.find('{');
+    match (semicolon, brace) {
+        (Some(_), None) => Ok(()),
+        (Some(semi), Some(brace)) if semi < brace => Ok(()),
+        _ => bail!(
+            "module `{}` is inline; only `mod name;` declarations are supported",
+            item.name.as_deref().unwrap_or("(unnamed)")
+        ),
+    }
+}
+
+fn rust_existing_mod_decl_names(path: &Path, source: &str) -> Result<HashSet<String>> {
+    if source.trim().is_empty() {
+        return Ok(HashSet::new());
+    }
+    let tree = parse_source("rust", source)?;
+    let parsed = ParsedSource {
+        path: path.to_path_buf(),
+        language: "rust",
+        source: source.to_string(),
+        tree,
+    };
+    let names = rust_items(&parsed)
+        .into_iter()
+        .filter(|item| item.kind == "mod_item")
+        .filter_map(|item| {
+            ensure_rust_mod_declaration(source, &item)
+                .ok()
+                .and_then(|_| item.name)
+        })
+        .collect::<HashSet<_>>();
+    Ok(names)
+}
+
+fn rust_mod_decl_insert_byte(path: &Path, source: &str) -> Result<usize> {
+    if source.trim().is_empty() {
+        return Ok(0);
+    }
+    let tree = parse_source("rust", source)?;
+    let parsed = ParsedSource {
+        path: path.to_path_buf(),
+        language: "rust",
+        source: source.to_string(),
+        tree,
+    };
+    Ok(rust_items(&parsed)
+        .iter()
+        .filter(|item| item.kind == "mod_item")
+        .max_by_key(|item| item.byte_end)
+        .map(|item| item.byte_end)
+        .unwrap_or_else(|| rust_module_decl_fallback_insert_byte(source)))
+}
+
+fn rust_decl_batch_insert_text(source: &str, insert_at: usize, declarations: &[String]) -> String {
+    let mut text = declarations.join("\n");
+    if source.trim().is_empty() || insert_at == 0 {
+        text.push('\n');
+        text
+    } else if source[..insert_at].ends_with('\n') {
+        if !source[insert_at..].starts_with('\n') {
+            text.push('\n');
+        }
+        text
+    } else {
+        format!("\n{text}")
     }
 }
 
@@ -3376,6 +3638,209 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&source).unwrap(),
             "pub mod alpha;\npub(crate) mod beta;\n"
+        );
+    }
+
+    #[test]
+    fn copy_rust_mod_decls_copies_selected_declarations_with_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "mod alpha;\nmod beta;\nmod inline { fn no_copy() {} }\n\nfn main() {}\n",
+        )
+        .unwrap();
+        fs::write(&target, "pub mod existing;\n\npub use existing::Thing;\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "copy_rust_mod_decls".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["alpha".into(), "beta".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: Some("pub".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "pub mod existing;\npub mod alpha;\npub mod beta;\n\npub use existing::Thing;\n"
+        );
+    }
+
+    #[test]
+    fn copy_rust_mod_decls_rejects_inline_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("lib.rs");
+        fs::write(&source, "mod inline { fn no_copy() {} }\n").unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "copy_rust_mod_decls".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["inline".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: Some("pub".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("is inline"));
+    }
+
+    #[test]
+    fn copy_rust_mod_decls_creates_missing_target_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("lib.rs");
+        fs::write(&source, "mod alpha;\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "copy_rust_mod_decls".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["alpha".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: Some("pub".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "pub mod alpha;\n");
+    }
+
+    #[test]
+    fn rewrite_rust_mod_visibility_updates_existing_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "mod alpha;\npub(crate) mod beta;\npub mod gamma;\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_mod_visibility".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["beta".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: Some("pub".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "mod alpha;\npub mod beta;\npub mod gamma;\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_rust_mod_visibility_preserves_attached_attribute() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "#[path = \"alpha_impl.rs\"]\nmod alpha;\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_mod_visibility".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["alpha".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: Some("pub".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "#[path = \"alpha_impl.rs\"]\npub mod alpha;\n"
         );
     }
 

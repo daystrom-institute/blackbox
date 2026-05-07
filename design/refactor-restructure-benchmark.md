@@ -25,7 +25,7 @@ file names or tool prefixes, it does not count.
 | Restructure Step | Needed Generic MCP Capability | Current Coverage | Gap |
 |---|---|---|---|
 | Add `[lib]` target to `Cargo.toml` | TOML table insertion/update with idempotent key checks | none | `edit_toml_manifest` or generic structured-config edit |
-| Create `src/lib.rs` from `mod` declarations in `main.rs` | extract/copy module declarations; transform copied declarations to `pub mod`; create file | partial: `add_rust_mod_decl` can create new declarations with visibility | batch module-declaration extraction/copy; existing declaration visibility rewrite |
+| Create `src/lib.rs` from `mod` declarations in `main.rs` | extract/copy module declarations; transform copied declarations to `pub mod`; create file | covered for declaration copy/rewrite with `copy_rust_mod_decls` and `rewrite_rust_mod_visibility` | compound transaction integration with `[lib]` manifest edit |
 | Delete `mod foo;` from `main.rs` after lib reparent | syntactic deletion of selected top-level `mod_item`s | covered with `delete_rust_items`; can participate in `bbox_refactor_run` | none for top-level declarations |
 | Rewrite binary crate references from `crate::foo` to `blackbox::foo` where needed | semantic path rewrite across crate boundary | none | rust-analyzer/workspace reference rewrite plus compiler diagnostics |
 | Move inline `SharedState`, `BlackboxServer`, impls, routes, tests to `server/mod.rs` | top-level item extraction; impl extraction; route/helper extraction; test block extraction | partial: top-level + impl method extraction | nested module/test extraction, multi-item grouping, visibility/import repair |
@@ -62,6 +62,13 @@ file names or tool prefixes, it does not count.
   - same parse/hash/dirty checks as extraction
   - implemented for top-level items and impl methods; nested module items remain
     future work
+- `copy_rust_mod_decls`
+  - copy selected source `mod name;` declarations into another Rust file
+  - optionally rewrite copied declaration visibility
+  - rejects inline `mod name { ... }` modules
+- `rewrite_rust_mod_visibility`
+  - `mod foo;` -> `pub mod foo;`, `pub(crate) mod foo;`, or private
+  - applies to existing declarations in place
 - `move_rust_file`
   - `src/foo.rs` -> `src/foo/mod.rs` or arbitrary file move
   - records old/new path, creates parent dirs, updates rollback
@@ -119,7 +126,8 @@ file names or tool prefixes, it does not count.
 
 2. **Deletion and declaration batching**
    - `delete_rust_items` for top-level items and impl methods is covered
-   - copy/batch module declarations from one file to another
+   - `copy_rust_mod_decls` and `rewrite_rust_mod_visibility` are covered for
+     module-declaration reparenting
 
 3. **File move support**
    - `move_file`

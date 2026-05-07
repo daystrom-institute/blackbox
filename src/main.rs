@@ -3976,7 +3976,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_refactor_plan",
-        description = "Create a dry-run structural refactor plan. Supports Rust top-level extraction/deletion, Rust impl-method extraction/deletion, module/use declarations, and Rust router-sum updates."
+        description = "Create a dry-run structural refactor plan using a language-scoped plan kind."
     )]
     fn bbox_refactor_plan(&self, Parameters(p): Parameters<RefactorPlanParams>) -> CallToolResult {
         Self::run("bbox_refactor_plan", || refactor::plan(&p))
@@ -3984,7 +3984,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_refactor_apply",
-        description = "Apply a previously generated refactor plan with hash checks, Rust parse validation, atomic writes, and rollback on write failure."
+        description = "Apply a previously generated refactor plan with hash checks, supported-source parse validation, atomic writes, and rollback on write failure."
     )]
     fn bbox_refactor_apply(
         &self,
