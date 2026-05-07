@@ -61,6 +61,12 @@ pub struct CronSpec {
     /// `${INLET_NAME}_PROJECT_DIR` env override → this field → None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_project_dir: Option<String>,
+    /// Timezone the cron expression is interpreted in. `"UTC"` (default)
+    /// uses UTC; `"Local"` uses the daemon's system-local timezone with
+    /// DST-aware handling (re-evaluated each tick). Other values fall
+    /// back to UTC with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
 }
 
 fn default_concurrency() -> u32 {
@@ -282,76 +288,6 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &CronSpec) -> R
         );
         return Ok(false);
     }
-    // Slack daily-brief shim: when the cron's payload tool is
-    // `badgey_post_triage_brief`, fan out one call per Slack channel
-    // binding instead of routing through the packet pipeline. This is
-    // the runtime-list fanout `fork` can't express today (tracked in
-    // bbox_thread thread-cba8bfa1 — workflow `foreach` primitive). When
-    // `foreach` lands, the body of this loop migrates to a 1-node
-    // workflow and this shim becomes a thin start_arc-per-binding
-    // dispatcher. Zero bindings = no-op (deliberately no global
-    // fallback brief).
-    if spec.payload.get("tool").and_then(|v| v.as_str()) == Some("badgey_post_triage_brief") {
-        let bindings = state.slack_channel_bindings.list(None, None);
-        let cron_name = spec.name.clone();
-        let crons_for_done = state.crons.clone();
-        if bindings.is_empty() {
-            tracing::info!(
-                "cron '{}': badgey_post_triage_brief tick with no Slack channel bindings — no-op",
-                spec.name
-            );
-            crons_for_done.mark_done(&cron_name);
-            return Ok(true);
-        }
-        // Cron payload shape: top-level fields plus an `arguments`
-        // object (matching the bro_cron_install spec). Operators can
-        // supply since/badgey_id under either; check both for
-        // ergonomics.
-        let arguments = spec.payload.get("arguments");
-        let lookup_str = |key: &str| -> Option<String> {
-            spec.payload
-                .get(key)
-                .and_then(|v| v.as_str())
-                .or_else(|| arguments.and_then(|a| a.get(key).and_then(|v| v.as_str())))
-                .map(str::to_string)
-        };
-        let since = lookup_str("since");
-        let badgey_id = lookup_str("badgey_id");
-        for binding in bindings {
-            let params = crate::BadgeyPostTriageBriefParams {
-                scope: binding.project_dir.clone(),
-                team_id: binding.team_id.clone(),
-                channel_id: binding.channel_id.clone(),
-                channel_name: binding.channel_name.clone(),
-                since: since.clone(),
-                badgey_id: badgey_id.clone(),
-            };
-            match crate::post_triage_brief_with_state(state, &params).await {
-                Ok(value) => {
-                    let posted = value.get("posted").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let errors = value.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
-                    tracing::info!(
-                        "cron '{}': posted {} brief(s) into channel {} (project {}; {} error(s))",
-                        spec.name,
-                        posted,
-                        binding.channel_id,
-                        binding.project_dir,
-                        errors,
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "cron '{}': triage brief for channel {} (project {}) failed: {e}",
-                        spec.name,
-                        binding.channel_id,
-                        binding.project_dir,
-                    );
-                }
-            }
-        }
-        crons_for_done.mark_done(&cron_name);
-        return Ok(true);
-    }
     let entity = build_entity(spec);
     let inlet_label = format!("cron:{}", spec.name);
     let cron_name = spec.name.clone();
@@ -413,16 +349,38 @@ pub fn spawn_loop(state: Arc<crate::SharedState>, spec: CronSpec) -> JoinHandle<
                 return;
             }
         };
+        let tz_local = matches!(spec.tz.as_deref(), Some("Local") | Some("local"));
+        if let Some(tz) = spec.tz.as_deref() {
+            if !matches!(tz, "Local" | "local" | "UTC" | "utc") {
+                tracing::warn!(
+                    "cron '{}': unknown tz '{tz}' — falling back to UTC",
+                    spec.name
+                );
+            }
+        }
         loop {
             let now = Utc::now();
-            let next = match schedule.upcoming(Utc).next() {
-                Some(t) => t,
-                None => {
-                    tracing::warn!(
-                        "cron '{}': schedule produced no upcoming time — task exiting",
-                        spec.name
-                    );
-                    return;
+            let next = if tz_local {
+                match schedule.upcoming(chrono::Local).next() {
+                    Some(t) => t.with_timezone(&Utc),
+                    None => {
+                        tracing::warn!(
+                            "cron '{}': schedule produced no upcoming time — task exiting",
+                            spec.name
+                        );
+                        return;
+                    }
+                }
+            } else {
+                match schedule.upcoming(Utc).next() {
+                    Some(t) => t,
+                    None => {
+                        tracing::warn!(
+                            "cron '{}': schedule produced no upcoming time — task exiting",
+                            spec.name
+                        );
+                        return;
+                    }
                 }
             };
             let wait = (next - now)
@@ -511,6 +469,7 @@ mod tests {
             concurrency: 1,
             routing_packet: "domain:cron-routing/x".into(),
             default_project_dir: None,
+            tz: None,
         };
         let e = debug_build_entity(&spec);
         assert_eq!(e.get("cron_name"), Some(&json!("nightly")));
@@ -529,6 +488,7 @@ mod tests {
             concurrency: 1,
             routing_packet: "domain:cron-routing/x".into(),
             default_project_dir: None,
+            tz: None,
         };
         let e = debug_build_entity(&spec);
         assert_eq!(e.get("owner"), Some(&json!("acme")));
@@ -548,6 +508,7 @@ mod tests {
             concurrency: 1,
             routing_packet: "x".into(),
             default_project_dir: None,
+            tz: None,
         };
         let e = debug_build_entity(&spec);
         assert_eq!(e.get("cron_name"), Some(&json!("override")));

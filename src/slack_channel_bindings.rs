@@ -53,6 +53,13 @@ pub struct ChannelBinding {
     /// caller's identity context, when available).
     #[serde(default)]
     pub registered_by: Option<String>,
+    /// Badgey instance id (`bg-<8hex>-<8hex>`) that serves this
+    /// channel as the triage / brief authoring agent. Populated
+    /// lazily on first triage cycle (see `post_triage_brief_with_state`).
+    /// Stored here so subsequent ticks resume the same instance for
+    /// continuity, and so unbind can dismiss the instance cleanly.
+    #[serde(default)]
+    pub badgey_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -104,6 +111,32 @@ impl SlackChannelBindings {
             data.bindings.insert(key, binding);
         }
         self.save()
+    }
+
+    /// Set / update the Badgey instance id for an existing binding.
+    /// Returns Ok(true) if the binding existed and was updated, Ok(false)
+    /// if no binding for that (team, channel) was found. Persists once
+    /// on update.
+    pub fn set_badgey_id(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        badgey_id: Option<String>,
+    ) -> Result<bool> {
+        let key = compose_key(team_id, channel_id);
+        let updated = {
+            let mut data = self.inner.write();
+            if let Some(b) = data.bindings.get_mut(&key) {
+                b.badgey_id = badgey_id;
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            self.save()?;
+        }
+        Ok(updated)
     }
 
     /// Remove a binding. Returns the previous record, if any.
@@ -199,7 +232,37 @@ mod tests {
             project_id: None,
             registered_at: "2026-05-07T06:00:00Z".into(),
             registered_by: Some("mathieu".into()),
+            badgey_id: None,
         }
+    }
+
+    #[test]
+    fn set_badgey_id_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SlackChannelBindings::open(dir.path()).unwrap();
+        assert!(!store
+            .set_badgey_id("T01", "C01", Some("bg-deadbeef-cafef00d".into()))
+            .unwrap());
+        store
+            .bind(sample("T01", "C01", "ts", "/repo/x"))
+            .unwrap();
+        assert!(store
+            .set_badgey_id("T01", "C01", Some("bg-deadbeef-cafef00d".into()))
+            .unwrap());
+        assert_eq!(
+            store.lookup("T01", "C01").unwrap().badgey_id.as_deref(),
+            Some("bg-deadbeef-cafef00d")
+        );
+        // Reopen — survives.
+        drop(store);
+        let store = SlackChannelBindings::open(dir.path()).unwrap();
+        assert_eq!(
+            store.lookup("T01", "C01").unwrap().badgey_id.as_deref(),
+            Some("bg-deadbeef-cafef00d")
+        );
+        // Clear.
+        store.set_badgey_id("T01", "C01", None).unwrap();
+        assert!(store.lookup("T01", "C01").unwrap().badgey_id.is_none());
     }
 
     #[test]

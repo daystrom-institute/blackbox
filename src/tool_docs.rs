@@ -717,15 +717,6 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
-        name: "badgey_post_triage_brief",
-        category: ToolCategory::Orchestration,
-        summary: "Run a Badgey inbox triage for a project and post each proposal as its own Slack message in a target channel. Records a SlackProposalLink (msg_ts ↔ proposal_id) per posted message so inbound reactions and thread replies can resolve back to the proposal/authoring session. Body is human prose (no proposal-id jargon visible); proposal_id rides in Slack message metadata. Called by the daily-triage cron (per channel binding) and available for manual reruns.",
-        when_to_use: "Use as the per-channel daily-brief implementation, called by the cron fanout shim once per `bro_slack_bind` binding. Manual reruns are fine — pass `scope` (project path), `team_id`, `channel_id`, optionally `channel_name` for header text. Requires `SLACK_BOT_TOKEN` in the daemon env. Empty proposal sheet returns posted=0 without posting anything.",
-        example: Some(
-            r#"badgey_post_triage_brief(scope="/repo/transcript-search", team_id="T0123ABCD", channel_id="C0123XYZ", channel_name="transcript-search")"#,
-        ),
-    },
-    ToolDoc {
         name: "bro_slack_bind",
         category: ToolCategory::Orchestration,
         summary: "Bind a Slack channel to a bbox project. The binding scopes inbound Slack→badgey activity to a single project and gives the daily-triage cron a per-channel home for proposal posts. Channel id (C-prefix) is the stable lookup key; rename-safe. Actions: bind, unbind, list, lookup. Project accepts absolute path or 8-hex project_id from the registry.",

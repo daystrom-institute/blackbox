@@ -1,8 +1,9 @@
 {
   "name": "badgey-triage-daily",
-  "schedule": "0 0 6 * * *",
+  "schedule": "0 0 8 * * *",
+  "tz": "Local",
   "payload": {
-    "tool": "badgey_post_triage_brief",
+    "tool": "badgey_triage_inbox",
     "arguments": {}
   },
   "concurrency": 1,

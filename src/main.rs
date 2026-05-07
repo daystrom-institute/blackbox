@@ -2439,7 +2439,88 @@ impl BlackboxServer {
         since: Option<String>,
         badgey_id: Option<String>,
     ) -> Result<Value, String> {
-        triage_inbox_with_state(&self.state, scope, since, badgey_id)
+        let project = scope
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        let stale_threads: Vec<Value> = self
+            .state
+            .threads
+            .read()
+            .all()
+            .iter()
+            .filter(|thread| project.is_empty() || thread.project == project)
+            .filter(|thread| {
+                since
+                    .as_deref()
+                    .is_none_or(|since| thread.last_activity.as_str() >= since)
+            })
+            .filter(|thread| !matches!(thread.status, threads::ThreadStatus::Resolved))
+            .take(20)
+            .map(|thread| {
+                json!({
+                    "thread_id": thread.id,
+                    "topic": thread.topic,
+                    "status": thread.status,
+                    "last_activity": thread.last_activity,
+                })
+            })
+            .collect();
+        let proposals: Vec<Value> = stale_threads
+            .iter()
+            .enumerate()
+            .map(|(idx, thread)| {
+                let stored = badgey_id
+                    .as_deref()
+                    .and_then(|raw| self.badgey_parse_id(raw).ok())
+                    .and_then(|id| {
+                        self.state
+                            .badgey_proposals
+                            .create(
+                                &id,
+                                orchestration::badgey::types::ProposalKind::RedispatchTask,
+                                json!({
+                                    "task_id": uuid::Uuid::new_v4().to_string(),
+                                    "prompt": format!(
+                                        "Review stale work item {} and either close it or issue a narrower follow-up charter.",
+                                        thread["thread_id"].as_str().unwrap_or("unknown")
+                                    ),
+                                    "source_thread_id": thread["thread_id"],
+                                    "source": "badgey_triage_inbox",
+                                }),
+                                thread["thread_id"]
+                                    .as_str()
+                                    .map(|thread_id| format!("triage:{thread_id}")),
+                            )
+                            .ok()
+                    });
+                json!({
+                    "id": stored
+                        .as_ref()
+                        .map(|proposal| proposal.id.clone())
+                        .unwrap_or_else(|| format!("triage-{}", idx + 1)),
+                    "kind": "redispatch_task",
+                    "subject": thread["thread_id"],
+                    "proposal": "Review stale work item and either close it or issue a narrower follow-up charter.",
+                    "stored": stored.is_some(),
+                    "apply_via": badgey_id
+                        .as_ref()
+                        .map(|id| format!("badgey_resume(id={id:?}, prompt=\"apply P-N\")")),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "scope": project,
+            "since": since,
+            "badgey_id": badgey_id,
+            "proposal_sheet": {
+                "proposals": proposals,
+                "source_threads": stale_threads,
+            }
+        }))
     }
 
     fn badgey_close_loops_internal(
@@ -4162,30 +4243,6 @@ struct BadgeyTriageInboxParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub(crate) struct BadgeyPostTriageBriefParams {
-    /// Project path scope for the triage. Required — the daily-brief
-    /// flow is per-project, no implicit fallback.
-    pub scope: String,
-    /// Slack workspace id (T-prefix). Required.
-    pub team_id: String,
-    /// Slack channel id (C-prefix) to post the brief into. Required.
-    pub channel_id: String,
-    /// Optional human-readable channel name for log lines / message
-    /// header. Display-only.
-    #[serde(default)]
-    pub channel_name: Option<String>,
-    /// Optional ISO timestamp lower bound passed through to the
-    /// triage tool.
-    #[serde(default)]
-    pub since: Option<String>,
-    /// Optional badgey_id to attach proposal context to. Without it
-    /// the proposals are stored detached (still valid; just no live
-    /// authoring session for refinement loops).
-    #[serde(default)]
-    pub badgey_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct BadgeyCloseLoopsParams {
     /// Window in days. Default 14.
     #[serde(default)]
@@ -4550,295 +4607,15 @@ struct AdvisorCheckpoint {
 
 const PROGRESS_TICK_SECS: u64 = 15;
 
-/// State-only equivalent of `BlackboxServer::badgey_triage_inbox_internal`.
-/// Lifted out of the impl so the cron-tick fanout shim can call it
-/// without holding a `BlackboxServer` reference. The MCP-tool method
-/// is now a 1-line wrapper.
-fn triage_inbox_with_state(
-    state: &Arc<SharedState>,
-    scope: Option<String>,
-    since: Option<String>,
-    badgey_id: Option<String>,
-) -> Result<Value, String> {
-    let project = scope
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().to_string())
-        })
-        .unwrap_or_default();
-    let stale_threads: Vec<Value> = state
-        .threads
-        .read()
-        .all()
-        .iter()
-        .filter(|thread| project.is_empty() || thread.project == project)
-        .filter(|thread| {
-            since
-                .as_deref()
-                .is_none_or(|since| thread.last_activity.as_str() >= since)
-        })
-        .filter(|thread| !matches!(thread.status, threads::ThreadStatus::Resolved))
-        .take(20)
-        .map(|thread| {
-            json!({
-                "thread_id": thread.id,
-                "topic": thread.topic,
-                "status": thread.status,
-                "last_activity": thread.last_activity,
-            })
-        })
-        .collect();
-    let proposals: Vec<Value> = stale_threads
-        .iter()
-        .enumerate()
-        .map(|(idx, thread)| {
-            let stored = badgey_id
-                .as_deref()
-                .and_then(|raw| {
-                    raw.parse::<orchestration::badgey::types::BadgeyId>().ok()
-                })
-                .and_then(|id| {
-                    state
-                        .badgey_proposals
-                        .create(
-                            &id,
-                            orchestration::badgey::types::ProposalKind::RedispatchTask,
-                            json!({
-                                "task_id": uuid::Uuid::new_v4().to_string(),
-                                "prompt": format!(
-                                    "Review stale work item {} and either close it or issue a narrower follow-up charter.",
-                                    thread["thread_id"].as_str().unwrap_or("unknown")
-                                ),
-                                "source_thread_id": thread["thread_id"],
-                                "source": "badgey_triage_inbox",
-                            }),
-                            thread["thread_id"]
-                                .as_str()
-                                .map(|thread_id| format!("triage:{thread_id}")),
-                        )
-                        .ok()
-                });
-            json!({
-                "id": stored
-                    .as_ref()
-                    .map(|proposal| proposal.id.clone())
-                    .unwrap_or_else(|| format!("triage-{}", idx + 1)),
-                "kind": "redispatch_task",
-                "subject": thread["thread_id"],
-                "proposal": "Review stale work item and either close it or issue a narrower follow-up charter.",
-                "stored": stored.is_some(),
-                "apply_via": badgey_id
-                    .as_ref()
-                    .map(|id| format!("badgey_resume(id={id:?}, prompt=\"apply P-N\")")),
-            })
-        })
-        .collect();
-    Ok(json!({
-        "scope": project,
-        "since": since,
-        "badgey_id": badgey_id,
-        "proposal_sheet": {
-            "proposals": proposals,
-            "source_threads": stale_threads,
-        }
-    }))
-}
-
-/// State-only equivalent of `BlackboxServer::badgey_post_triage_brief`.
-/// Runs a triage, posts each proposal as its own Slack message, and
-/// records a SlackProposalLink per posted message. Both the MCP-tool
-/// wrapper and the cron-tick fanout shim call this directly.
-pub(crate) async fn post_triage_brief_with_state(
-    state: &Arc<SharedState>,
-    p: &BadgeyPostTriageBriefParams,
-) -> Result<Value, String> {
-    if p.scope.trim().is_empty() {
-        return Err("scope is required".into());
-    }
-    if p.team_id.trim().is_empty() {
-        return Err("team_id is required".into());
-    }
-    if p.channel_id.trim().is_empty() {
-        return Err("channel_id is required".into());
-    }
-    let triage = triage_inbox_with_state(
-        state,
-        Some(p.scope.clone()),
-        p.since.clone(),
-        p.badgey_id.clone(),
-    )
-    .map_err(|e| format!("triage failed: {e}"))?;
-    let proposals: Vec<Value> = triage
-        .get("proposal_sheet")
-        .and_then(|s| s.get("proposals"))
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if proposals.is_empty() {
-        return Ok(json!({
-            "posted": 0,
-            "scope": p.scope,
-            "channel_id": p.channel_id,
-            "reason": "no proposals from triage",
-        }));
-    }
-    let token = match std::env::var("SLACK_BOT_TOKEN") {
-        Ok(t) if !t.trim().is_empty() => t,
-        _ => return Err("SLACK_BOT_TOKEN env var not set".into()),
-    };
-    // Bounded timeout — without this a hung Slack endpoint can park
-    // the cron loop indefinitely (the cron-tick fanout awaits per
-    // call before releasing its concurrency slot).
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("building reqwest client: {e}"))?;
-    let mut posted: Vec<Value> = Vec::with_capacity(proposals.len());
-    let mut errors: Vec<Value> = Vec::new();
-    for proposal in &proposals {
-        let proposal_id = proposal
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if proposal_id.is_empty() {
-            errors.push(json!({"reason": "proposal missing id", "proposal": proposal}));
-            continue;
-        }
-        let kind = proposal
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("proposal");
-        let subject = proposal
-            .get("subject")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .unwrap_or("");
-        let body = proposal
-            .get("proposal")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let text = format_triage_proposal_message(
-            kind,
-            subject,
-            body,
-            p.scope.as_str(),
-            p.channel_name.as_deref(),
-        );
-        let req_body = json!({
-            "channel": p.channel_id,
-            "text": text,
-            "mrkdwn": true,
-            "metadata": {
-                "event_type": "badgey_proposal",
-                "event_payload": {
-                    "proposal_id": proposal_id,
-                    "project_dir": p.scope,
-                }
-            }
-        });
-        let resp = match client
-            .post("https://slack.com/api/chat.postMessage")
-            .bearer_auth(&token)
-            .json(&req_body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                errors.push(json!({"proposal_id": proposal_id, "reason": format!("http: {e}")}));
-                continue;
-            }
-        };
-        let parsed: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                errors
-                    .push(json!({"proposal_id": proposal_id, "reason": format!("parse: {e}")}));
-                continue;
-            }
-        };
-        if !parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            errors.push(json!({
-                "proposal_id": proposal_id,
-                "reason": "slack returned ok=false",
-                "slack_response": parsed,
-            }));
-            continue;
-        }
-        let msg_ts = parsed
-            .get("ts")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if msg_ts.is_empty() {
-            errors.push(json!({
-                "proposal_id": proposal_id,
-                "reason": "slack response missing ts",
-            }));
-            continue;
-        }
-        let link = slack_proposal_links::SlackProposalLink {
-            team_id: p.team_id.clone(),
-            channel_id: p.channel_id.clone(),
-            msg_ts: msg_ts.clone(),
-            proposal_id: proposal_id.clone(),
-            instance_id: p.badgey_id.clone(),
-            authoring_session_id: None,
-            version: 1,
-            project_dir: p.scope.clone(),
-            posted_at: util::now_iso(),
-        };
-        let link_recorded = match state.slack_proposal_links.record(link) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(
-                    proposal_id = %proposal_id,
-                    msg_ts = %msg_ts,
-                    "recording slack proposal link failed: {e}"
-                );
-                // Surface partial-failure: the message is live in
-                // Slack but reactions/replies on it will not resolve
-                // back to a link. Caller (and inbox readers) can see
-                // this in error_details.
-                errors.push(json!({
-                    "proposal_id": proposal_id,
-                    "msg_ts": msg_ts,
-                    "reason": format!("posted to Slack but link record failed: {e}"),
-                    "partial": true,
-                }));
-                false
-            }
-        };
-        posted.push(json!({
-            "proposal_id": proposal_id,
-            "msg_ts": msg_ts,
-            "link_recorded": link_recorded,
-        }));
-    }
-    Ok(json!({
-        "posted": posted.len(),
-        "errors": errors.len(),
-        "scope": p.scope,
-        "channel_id": p.channel_id,
-        "messages": posted,
-        "error_details": errors,
-    }))
-}
-
 /// Inbound `proposal-approved` / `proposal-clarify` signal hook for
 /// the Slack daily brief. Fires when a reaction (approve) or thread
 /// reply (clarify) lands on a posted triage proposal AND no workflow
 /// was waiting for the signal. Resolves the message back to its
 /// SlackProposalLink and posts a threaded acknowledgement in Slack.
-/// The actual apply work (BadgeyProposalStore CAS + task dispatch)
-/// and the bro_resume refinement loop are deferred until §6.3
-/// sub-bro authoring stores proposals under a registered
-/// BadgeyInstance — at that point this hook becomes the call site
-/// for `badgey_apply_proposal_internal` (approve) and `bro_resume`
+/// The actual apply work and the bro_resume refinement loop drop in
+/// here once the foreach-driven Badgey workflow stack is wired —
+/// then this hook becomes the call site for
+/// `badgey_apply_proposal_internal` (approve) and `bro_resume`
 /// (clarify). Errors are logged, never bubbled — best-effort
 /// observability path.
 async fn try_slack_proposal_signal_hook(
@@ -4888,7 +4665,7 @@ async fn try_slack_proposal_signal_hook(
     let text = match signal {
         "proposal-approved" => format!(
             ":white_check_mark: Approved by {acknowledger}. \
-             Apply mechanism is awaiting §6.3 sub-bro authoring — \
+             Apply path lands with the foreach-driven Badgey workflow — \
              logged for follow-up. (proposal `{}`)",
             link.proposal_id
         ),
@@ -4904,7 +4681,7 @@ async fn try_slack_proposal_signal_hook(
             };
             format!(
                 ":speech_balloon: Heard your follow-up from {acknowledger}{}. \
-                 Refinement loop is awaiting §6.3 sub-bro authoring — \
+                 Refinement loop lands with the foreach-driven Badgey workflow — \
                  the proposal author isn't a live agent yet. \
                  (proposal `{}`)",
                 if snippet.is_empty() {
@@ -4917,9 +4694,6 @@ async fn try_slack_proposal_signal_hook(
         }
         _ => return,
     };
-    // Approve bumps the link version (acks an apply request); clarify
-    // does not — refinements only bump on chat.update of the original
-    // post when a refined proposal lands, which is §6.3 work.
     if signal == "proposal-approved" {
         if let Err(e) = state
             .slack_proposal_links
@@ -4948,8 +4722,6 @@ async fn try_slack_proposal_signal_hook(
         "text": text,
         "mrkdwn": true,
     });
-    // Bounded timeout — best-effort hook; never block dispatch_verdict
-    // on a hung Slack endpoint.
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -4997,37 +4769,6 @@ async fn try_slack_proposal_signal_hook(
             );
         }
     }
-}
-
-/// Render a Badgey triage proposal as Slack mrkdwn for a per-channel
-/// brief post. Body is human prose only — no proposal-id jargon visible.
-/// The proposal_id rides in the message's metadata field; users
-/// approve via reaction and clarify via thread reply, never by typing
-/// the id.
-fn format_triage_proposal_message(
-    kind: &str,
-    subject: &str,
-    body: &str,
-    project_scope: &str,
-    channel_name: Option<&str>,
-) -> String {
-    let kind_human = match kind {
-        "redispatch_task" => "stale work item",
-        "close_thread" => "close-out candidate",
-        other => other,
-    };
-    let header_scope = channel_name.unwrap_or(project_scope);
-    let mut out = format!(
-        "*Badgey morning brief — {header_scope}*\n_{kind_human}_"
-    );
-    if !subject.trim().is_empty() {
-        out.push_str(&format!("\n• {subject}"));
-    }
-    if !body.trim().is_empty() {
-        out.push_str(&format!("\n\n{body}"));
-    }
-    out.push_str("\n\n_React :white_check_mark: to apply, or reply in-thread to clarify._");
-    out
 }
 
 fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, bool) {
@@ -5661,20 +5402,6 @@ impl BlackboxServer {
         match self.badgey_triage_inbox_internal(p.scope, p.since, p.badgey_id) {
             Ok(value) => Self::ok_json(&value),
             Err(err) => Self::err_text(&err),
-        }
-    }
-
-    #[tool(
-        name = "badgey_post_triage_brief",
-        description = "Run a Badgey inbox triage for a project and post each proposal as its own Slack message in a target channel. Records a SlackProposalLink (msg_ts ↔ proposal_id) per posted message so inbound reactions and thread replies can resolve back to the proposal/authoring session. Body is human prose (no proposal-id jargon visible); proposal_id rides in Slack message metadata. Called by the daily-triage cron (per channel binding) and available for manual reruns."
-    )]
-    async fn badgey_post_triage_brief(
-        &self,
-        Parameters(p): Parameters<BadgeyPostTriageBriefParams>,
-    ) -> CallToolResult {
-        match post_triage_brief_with_state(&self.state, &p).await {
-            Ok(value) => Self::ok_json(&value),
-            Err(e) => Self::err_text(&e),
         }
     }
 
@@ -6603,6 +6330,12 @@ impl BlackboxServer {
                     }
                 };
                 drop(registry);
+                // Preserve any badgey_id from a prior bind so re-binding
+                // an already-active channel doesn't orphan its system
+                // BadgeyInstance. The instance lifecycle is unbind-only;
+                // rebind updates project/name/path in place.
+                let prior_badgey_id =
+                    store.lookup(&team_id, &channel_id).and_then(|b| b.badgey_id);
                 let binding = slack_channel_bindings::ChannelBinding {
                     team_id: team_id.clone(),
                     channel_id: channel_id.clone(),
@@ -6611,6 +6344,7 @@ impl BlackboxServer {
                     project_id: project_id.clone(),
                     registered_at: util::now_iso(),
                     registered_by: p.registered_by.clone(),
+                    badgey_id: prior_badgey_id,
                 };
                 if let Err(e) = store.bind(binding.clone()) {
                     return Self::err_text(&format!("bind failed: {e}"));
@@ -6630,10 +6364,31 @@ impl BlackboxServer {
                     None => return Self::err_text("channel_id is required"),
                 };
                 match store.unbind(team_id, channel_id) {
-                    Ok(Some(prior)) => Self::ok_json(&json!({
-                        "unbound": true,
-                        "prior": prior,
-                    })),
+                    Ok(Some(prior)) => {
+                        // Dismiss the system Badgey instance that was
+                        // serving this channel, if any. Best-effort:
+                        // dismissal failure (e.g. instance already gone)
+                        // is logged but doesn't fail the unbind.
+                        let mut dismissed_badgey: Option<String> = None;
+                        if let Some(ref bid) = prior.badgey_id {
+                            if let Ok(parsed) = bid
+                                .parse::<orchestration::badgey::types::BadgeyId>()
+                            {
+                                match self.state.badgey_registry.dismiss(&parsed) {
+                                    Ok(_) => dismissed_badgey = Some(bid.clone()),
+                                    Err(e) => tracing::warn!(
+                                        badgey_id = %bid,
+                                        "unbind: dismissing system Badgey instance failed: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                        Self::ok_json(&json!({
+                            "unbound": true,
+                            "prior": prior,
+                            "dismissed_badgey": dismissed_badgey,
+                        }))
+                    }
                     Ok(None) => Self::ok_json(&json!({"unbound": false})),
                     Err(e) => Self::err_text(&format!("unbind failed: {e}")),
                 }
