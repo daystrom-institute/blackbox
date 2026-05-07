@@ -22,8 +22,9 @@
         "path": "$.team_id"
       },
       "channel": {
-        "kind": "json_path",
-        "path": "$.channel"
+        "kind": "default",
+        "inner": { "kind": "json_path", "path": "$.channel" },
+        "fallback": { "kind": "json_path", "path": "$.raw.event.item.channel" }
       },
       "channel_type": {
         "kind": "json_path",

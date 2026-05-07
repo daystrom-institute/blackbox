@@ -24,7 +24,7 @@
           "op": "set_var",
           "args": {
             "key": "rendered_text",
-            "value": "*${vars.proposal.kind}* — ${vars.channel_name}\n\n*Root cause:* ${vars.proposal.draft.root_cause}\n\n*Proposal:* ${vars.proposal.draft.proposal}\n\n*Blast radius:* ${vars.proposal.draft.blast_radius}\n\n*Draft:* ${vars.proposal.draft.draft_artifact_ref}\n\n_:white_check_mark: to apply · reply in-thread to refine_"
+            "value": "*${vars.proposal.kind}* — ${vars.channel_name}\n\n*Root cause:* ${vars.proposal.draft.root_cause}\n\n*Proposal:* ${vars.proposal.draft.proposal}\n\n*Blast radius:* ${vars.proposal.draft.blast_radius}\n\n*Draft:* ${vars.proposal.draft.draft_artifact_ref}\n\n_:white_check_mark: to apply | reply in-thread to refine_"
           }
         }
       ],
