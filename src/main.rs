@@ -4244,6 +4244,7 @@ struct AgentDescribeParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct AgentDispatchParams {
     agent: String,
+    #[schemars(with = "serde_json::Map<String, serde_json::Value>")]
     args: serde_json::Value,
     #[serde(default)]
     project_dir: Option<String>,
