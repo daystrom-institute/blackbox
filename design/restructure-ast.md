@@ -29,6 +29,11 @@ Before each phase:
    source path the command may rewrite. Validation-only commands can omit it.
 6. Review plan JSON before confirming.
 
+On phase failure: report the `bbox_refactor_run` response, including status,
+failed step, error, and rollback errors, then pause. Do not run additional Bash
+commands to debug a failed transaction. If the rollback report is incomplete,
+say so and pause; the orchestrator owns any design correction loop.
+
 Allowed generic plan kinds:
 
 - `ensure_toml_table`
@@ -55,7 +60,8 @@ Checkpoint rule: after each phase, stop and report:
 - exact `bbox_refactor_run` status
 - files written
 - validation commands run
-- remaining compile/test failures, if any
+- remaining compile/test failures, if any, transcribed from the
+  `bbox_refactor_run` response without re-running the failed command
 - next phase you intend to run
 
 Do not proceed to the next phase until the orchestrator resumes you.
@@ -83,7 +89,8 @@ Checkpoint: pause after reporting the baseline result.
 
 ## Phase 1: Add Library Crate Shell
 
-Goal: add `[lib]` and create `src/lib.rs` while leaving `src/main.rs` runnable.
+Goal: add `[lib]` and create a minimal `src/lib.rs` shell while leaving
+`src/main.rs` runnable.
 
 Grounding:
 
@@ -110,9 +117,10 @@ bbox_refactor_run(
       "op":"plan",
       "kind":"write_file",
       "source":"src/lib.rs",
-      "new_text":"<public module declarations copied from src/main.rs, excluding cfg(test) eval modules unless needed>"
+      "new_text":"// Library crate shell. Modules move here after their dependencies are extracted.\n"
     },
     {"op":"command","command":"cargo","args":["fmt"],"touches":["src/lib.rs"],"required":true},
+    {"op":"command","command":"cargo","args":["check","--lib"],"required":true},
     {"op":"command","command":"cargo","args":["check","--bin","blackboxd"],"required":true},
     {"op":"command","command":"cargo","args":["test","--bin","blackboxd"],"required":true}
   ]
@@ -121,9 +129,15 @@ bbox_refactor_run(
 
 Notes:
 
-- `src/lib.rs` should contain `pub mod` declarations for production modules.
-- Keep `src/main.rs` module declarations in this phase. Removing them is a
-  later phase after the library compiles.
+- Do not copy all current `src/main.rs` module declarations into `src/lib.rs`
+  in this phase. Many modules still depend on binary-root items such as
+  `SharedState`, `BlackboxServer`, and route helpers.
+- `src/lib.rs` can be a minimal shell. Add module declarations only after the
+  relevant dependencies have moved or after `cargo check --lib` proves the
+  declaration compiles.
+- Keep `src/main.rs` module declarations in this phase. Removing or reparenting
+  them is a later phase after the relevant module compiles from the library
+  root.
 
 Checkpoint: pause.
 
