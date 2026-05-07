@@ -2071,13 +2071,19 @@ impl BlackboxServer {
                     "metadata": metadata,
                 }))
             } else if applying.kind == ProposalKind::RedispatchTask {
+                // Accept the canonical fields plus Badgey's natural
+                // emission shape: synthesis charters describe the
+                // human-readable action under `proposal`, which is
+                // what we want as the dispatch prompt for a redispatch.
                 let prompt = applying
                     .draft
                     .get("prompt")
                     .or_else(|| applying.draft.get("refined_charter"))
+                    .or_else(|| applying.draft.get("proposal"))
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
-                        "redispatch proposal missing prompt/refined_charter".to_string()
+                        "redispatch proposal missing prompt/refined_charter/proposal"
+                            .to_string()
                     })?;
                 if applying.idempotency_key.is_none() {
                     return Err("redispatch proposal missing idempotency_key".to_string());
@@ -6773,20 +6779,30 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<BadgeyApplyProposalParams>,
     ) -> CallToolResult {
-        // Always return Ok with an explicit `status` field so workflow
-        // gates can branch cleanly without distinguishing between
-        // tool-call failure (op-level Err) and apply-path failure
-        // (proposal-level rejection). status is one of:
+        // Always return Ok with explicit `status` + `summary` fields.
+        //
+        // status is one of:
         //   "applied"         — fresh apply succeeded
         //   "already_applied" — proposal was already in Applied state
-        //   "failed"          — apply path raised (returns `error` field)
-        //   "bad_input"       — badgey_id couldn't parse (returns `error`)
+        //   "failed"          — apply path raised
+        //   "bad_input"       — badgey_id couldn't parse
+        //
+        // summary is a one-line human-readable description that the
+        // Slack-emit summary template can interpolate without
+        // worrying about which fields are present per kind/outcome:
+        //   applied (RedispatchTask):  "dispatched task `<task_id>`"
+        //   applied (artifact_*):      "installed `<artifact_ref>`"
+        //   already_applied:           "already applied (prior task `<id>`)"
+        //   failed / bad_input:        "<error>"
         let id = match self.badgey_parse_id(&p.badgey_id) {
             Ok(parsed) => parsed,
             Err(e) => {
-                return Self::ok_json(
-                    &json!({"status": "bad_input", "error": e, "badgey_id": p.badgey_id}),
-                );
+                return Self::ok_json(&json!({
+                    "status": "bad_input",
+                    "error": e.clone(),
+                    "summary": e,
+                    "badgey_id": p.badgey_id,
+                }));
             }
         };
         let result = self
@@ -6798,25 +6814,44 @@ impl BlackboxServer {
             .await;
         match result {
             Ok(mut value) => {
-                if value.get("status").is_none() {
-                    let status = if value
-                        .get("already_applied")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                    {
-                        "already_applied"
+                let already = value
+                    .get("already_applied")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let status = if already { "already_applied" } else { "applied" };
+                let summary = if already {
+                    let prior = value
+                        .get("prior_task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if prior.is_empty() {
+                        "already applied".to_string()
                     } else {
-                        "applied"
-                    };
-                    if let Some(obj) = value.as_object_mut() {
-                        obj.insert("status".into(), Value::String(status.into()));
+                        format!("already applied (prior task `{prior}`)")
                     }
+                } else if let Some(task_id) = value.get("task_id").and_then(Value::as_str) {
+                    format!("dispatched task `{task_id}`")
+                } else if let Some(artifact_ref) =
+                    value.get("artifact_ref").and_then(Value::as_str)
+                {
+                    format!("installed `{artifact_ref}`")
+                } else {
+                    "applied".to_string()
+                };
+                if let Some(obj) = value.as_object_mut() {
+                    obj.entry("status".to_string())
+                        .or_insert_with(|| Value::String(status.into()));
+                    obj.insert("summary".into(), Value::String(summary));
                 }
                 Self::ok_json(&value)
             }
-            Err(e) => Self::ok_json(
-                &json!({"status": "failed", "error": e, "badgey_id": p.badgey_id, "proposal_id": p.proposal_id}),
-            ),
+            Err(e) => Self::ok_json(&json!({
+                "status": "failed",
+                "error": e.clone(),
+                "summary": e,
+                "badgey_id": p.badgey_id,
+                "proposal_id": p.proposal_id,
+            })),
         }
     }
 

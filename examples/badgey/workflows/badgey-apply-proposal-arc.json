@@ -173,7 +173,7 @@
           "op": "set_var",
           "args": {
             "key": "summary_text",
-            "value": "*${vars.apply_response.status}* | ${vars.proposal_id}\n\n${vars.apply_response.error}\n\n_(applied via Slack reaction by <@${vars.user}>)_"
+            "value": "*${vars.apply_response.status}* | ${vars.proposal_id}\n\n${vars.apply_response.summary}\n\n_(applied via Slack reaction by <@${vars.user}>)_"
           },
           "when": "domain:hook-when/slack-proposal-found"
         },
