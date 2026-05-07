@@ -305,8 +305,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
-        summary: "Create a dry-run structural refactor plan. Supports Rust top-level item extraction and Rust impl-method extraction.",
-        when_to_use: "Use to generate a reviewable plan for moving named top-level Rust items or named Rust impl methods from one file to another. Impl-method extraction can wrap moved methods in a new #[tool_router(router = name)] impl block and append into an existing matching target impl. The plan is structural-only and includes hash checks, text edits, parse validations, selected items, and leftovers.",
+        summary: "Create a dry-run structural refactor plan. Supports Rust top-level extraction, Rust impl-method extraction, and Rust router-sum updates.",
+        when_to_use: "Use to generate a reviewable plan for moving named top-level Rust items, moving named Rust impl methods, or wiring a generated Rust tool router into a `tool_router:` sum. Impl-method extraction can wrap moved methods in a new #[tool_router(router = name)] impl block and append into an existing matching target impl. The plan is structural-only and includes hash checks, text edits, parse validations, selected items, and leftovers.",
         example: Some(
             r#"bbox_refactor_plan(kind="extract_rust_impl_methods", source="src/main.rs", target="src/tools/search.rs", item_names=["bbox_search"], impl_name="impl BlackboxServer", router_name="search_tools", target_prelude="use super::*;", project_dir="/repo/x")"#,
         ),
