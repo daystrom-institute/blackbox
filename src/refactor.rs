@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::Write as _;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
+use reqwest::Url;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -73,6 +74,21 @@ pub struct RefactorPlanParams {
     /// Optional plan-specific text inserted before generated target content.
     #[serde(default)]
     pub target_prelude: Option<String>,
+    /// Optional exact text to replace. Used by generic text replacement plans.
+    #[serde(default)]
+    pub old_text: Option<String>,
+    /// Optional replacement text or complete file content, depending on plan kind.
+    #[serde(default)]
+    pub new_text: Option<String>,
+    /// Optional toggle for replacing every exact match instead of requiring one.
+    #[serde(default)]
+    pub replace_all: Option<bool>,
+    /// Optional TOML table name for structured TOML edit plans.
+    #[serde(default)]
+    pub toml_table: Option<String>,
+    /// Optional TOML key/value entries for structured TOML edit plans.
+    #[serde(default)]
+    pub toml_entries: Option<BTreeMap<String, serde_json::Value>>,
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
@@ -119,6 +135,19 @@ pub enum RefactorRunStep {
     Plan {
         #[serde(flatten)]
         params: RefactorPlanParams,
+    },
+    Command {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        /// Optional extra files the command may mutate. Relative paths resolve against project_dir.
+        #[serde(default)]
+        touches: Vec<String>,
+        /// Defaults true. Required command failure rolls back prior plan writes.
+        #[serde(default)]
+        required: Option<bool>,
     },
 }
 
@@ -341,9 +370,14 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "add_rust_use_decl" => plan_add_rust_use_decl(p),
         "copy_rust_mod_decls" => plan_copy_rust_mod_decls(p),
         "rewrite_rust_mod_visibility" => plan_rewrite_rust_mod_visibility(p),
+        "rust_lsp_rename" => plan_rust_lsp_rename(p),
+        "rust_organize_imports" => plan_rust_organize_imports(p),
         "move_file" => plan_move_file(p),
+        "replace_text" => plan_replace_text(p),
+        "write_file" => plan_write_file(p),
+        "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, move_file"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rust_lsp_rename, rust_organize_imports, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
@@ -734,6 +768,99 @@ pub fn run(p: &RefactorRunParams, projects: &[ProjectRecord]) -> Result<String> 
                     });
                 }
             }
+            RefactorRunStep::Command {
+                command,
+                args,
+                cwd,
+                touches,
+                required,
+            } => {
+                if !confirmed {
+                    reports.push(RefactorRunStepReport {
+                        index: idx,
+                        op: "command".to_string(),
+                        status: "planned".to_string(),
+                        kind: None,
+                        title: Some(command_display(command, args)),
+                        files: touches.clone(),
+                        validations: Vec::new(),
+                        error: None,
+                    });
+                    continue;
+                }
+
+                let touched_paths = touches
+                    .iter()
+                    .map(|path| resolve_path(Some(&path_string(&project_dir)), path))
+                    .collect::<Result<Vec<_>>>()?;
+                for path in &touched_paths {
+                    if p.allow_unregistered_paths != Some(true) {
+                        ensure_path_in_registered_project(path, projects)?;
+                    }
+                    if !snapshot_paths.contains(path) {
+                        if p.allow_dirty_worktree != Some(true) {
+                            ensure_git_clean_for_path(path)?;
+                        }
+                        let original = match fs::read(path) {
+                            Ok(bytes) => Some(bytes),
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(err) => {
+                                let rollback_errors = restore_snapshots(&snapshots);
+                                return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                                    status: "step_failed".to_string(),
+                                    title: p.title.clone(),
+                                    dry_run: false,
+                                    steps: reports,
+                                    files_written,
+                                    rolled_back: rollback_errors.is_empty(),
+                                    error: Some(format!(
+                                        "failed to read command touch {}: {err}",
+                                        path.display()
+                                    )),
+                                    rollback_errors,
+                                })?);
+                            }
+                        };
+                        snapshot_paths.insert(path.clone());
+                        snapshots.push((path.clone(), original));
+                    }
+                }
+                let command_result = run_validation_command(&project_dir, command, args, cwd)?;
+                let command_required = required.unwrap_or(true);
+                files_written.extend(touched_paths.iter().map(|path| path_string(path)));
+                reports.push(RefactorRunStepReport {
+                    index: idx,
+                    op: "command".to_string(),
+                    status: if command_result.success {
+                        "ok".to_string()
+                    } else if command_required {
+                        "failed".to_string()
+                    } else {
+                        "failed_optional".to_string()
+                    },
+                    kind: None,
+                    title: Some(command_display(command, args)),
+                    files: touched_paths.iter().map(|path| path_string(path)).collect(),
+                    validations: Vec::new(),
+                    error: command_result.error,
+                });
+                if !command_result.success && command_required {
+                    let rollback_errors = restore_snapshots(&snapshots);
+                    return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                        status: "step_failed".to_string(),
+                        title: p.title.clone(),
+                        dry_run: false,
+                        steps: reports,
+                        files_written,
+                        rolled_back: rollback_errors.is_empty(),
+                        error: Some(format!(
+                            "command failed: {}",
+                            command_display(command, args)
+                        )),
+                        rollback_errors,
+                    })?);
+                }
+            }
         }
     }
 
@@ -755,6 +882,67 @@ fn append_report(
 ) -> Vec<RefactorRunStepReport> {
     reports.push(report);
     reports
+}
+
+struct CommandStepResult {
+    success: bool,
+    error: Option<String>,
+}
+
+fn run_validation_command(
+    project_dir: &Path,
+    command: &str,
+    args: &[String],
+    cwd: &Option<String>,
+) -> Result<CommandStepResult> {
+    let working_dir = match cwd.as_deref() {
+        Some(cwd) => resolve_path(Some(&path_string(project_dir)), cwd)?,
+        None => project_dir.to_path_buf(),
+    };
+    let output = Command::new(command)
+        .args(args)
+        .current_dir(&working_dir)
+        .output()
+        .with_context(|| {
+            format!(
+                "running validation command `{}` in {}",
+                command_display(command, args),
+                working_dir.display()
+            )
+        })?;
+    if output.status.success() {
+        return Ok(CommandStepResult {
+            success: true,
+            error: None,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(CommandStepResult {
+        success: false,
+        error: Some(format!(
+            "exit status: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            truncate_for_report(&stdout, 4000),
+            truncate_for_report(&stderr, 4000)
+        )),
+    })
+}
+
+fn command_display(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_for_report(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    out.push_str("\n[truncated]");
+    out
 }
 
 fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> {
@@ -1549,6 +1737,244 @@ fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+fn plan_rust_lsp_rename(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let project_dir = p
+        .project_dir
+        .as_deref()
+        .map(|dir| resolve_path(None, dir))
+        .transpose()?
+        .unwrap_or_else(|| {
+            crate::entity_ref::git_root_for_path(&source_path)
+                .unwrap_or_else(|| source_path.parent().unwrap_or(Path::new(".")).to_path_buf())
+        });
+    let old_name = p
+        .item_names
+        .as_deref()
+        .and_then(|names| names.first())
+        .map(String::as_str)
+        .or(p.old_text.as_deref())
+        .ok_or_else(|| anyhow!("item_names[0] or old_text is required for rust_lsp_rename"))?;
+    validate_rust_identifier(old_name, "item_names[0]")?;
+    let new_name = p
+        .new_text
+        .as_deref()
+        .ok_or_else(|| anyhow!("new_text is required for rust_lsp_rename"))?;
+    validate_rust_identifier(new_name, "new_text")?;
+    if old_name == new_name {
+        bail!("rust_lsp_rename requires different old and new names");
+    }
+    let parsed = parse_rust_file(&source_path)?;
+    let position_byte = rust_rename_position_byte(&parsed, old_name)?;
+    let position = byte_to_lsp_position(&parsed.source, position_byte);
+    let lsp_edits = rust_analyzer_rename(&project_dir, &source_path, position, new_name)?;
+    if lsp_edits.is_empty() {
+        bail!("rust-analyzer returned no edits for rename `{old_name}`");
+    }
+    let file_edits = lsp_edits_to_file_edits(lsp_edits)?;
+    let validations = file_edits
+        .iter()
+        .flat_map(|edit| parse_validation_step_for_path(Path::new(&edit.path)))
+        .collect::<Vec<_>>();
+    let plan = RefactorPlan {
+        title: format!("rust-analyzer rename {old_name} to {new_name}"),
+        kind: "rust_lsp_rename".to_string(),
+        semantic_status: SemanticStatus::LspVerified,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: file_edits,
+        validations,
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_rust_organize_imports(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let project_dir = p
+        .project_dir
+        .as_deref()
+        .map(|dir| resolve_path(None, dir))
+        .transpose()?
+        .unwrap_or_else(|| {
+            crate::entity_ref::git_root_for_path(&source_path)
+                .unwrap_or_else(|| source_path.parent().unwrap_or(Path::new(".")).to_path_buf())
+        });
+    parse_rust_file(&source_path)?;
+    let lsp_edits = rust_analyzer_organize_imports(&project_dir, &source_path)?;
+    if lsp_edits.is_empty() {
+        bail!("rust-analyzer returned no import organization edits");
+    }
+    let file_edits = lsp_edits_to_file_edits(lsp_edits)?;
+    let validations = file_edits
+        .iter()
+        .flat_map(|edit| parse_validation_step_for_path(Path::new(&edit.path)))
+        .collect::<Vec<_>>();
+    let plan = RefactorPlan {
+        title: format!(
+            "rust-analyzer organize imports in {}",
+            path_string(&source_path)
+        ),
+        kind: "rust_organize_imports".to_string(),
+        semantic_status: SemanticStatus::LspVerified,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: file_edits,
+        validations,
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let source = fs::read_to_string(&source_path)
+        .with_context(|| format!("failed to read {}", source_path.display()))?;
+    let old_text = p
+        .old_text
+        .as_deref()
+        .ok_or_else(|| anyhow!("old_text is required for replace_text"))?;
+    if old_text.is_empty() {
+        bail!("old_text must not be empty");
+    }
+    let new_text = p
+        .new_text
+        .as_deref()
+        .ok_or_else(|| anyhow!("new_text is required for replace_text"))?;
+    let matches = source.match_indices(old_text).collect::<Vec<_>>();
+    if matches.is_empty() {
+        bail!("old_text was not found in {}", source_path.display());
+    }
+    if p.replace_all != Some(true) && matches.len() > 1 {
+        bail!(
+            "old_text matched {} times in {}; pass replace_all=true or use a more specific old_text",
+            matches.len(),
+            source_path.display()
+        );
+    }
+    let edits = if p.replace_all == Some(true) {
+        matches
+            .iter()
+            .map(|(start, text)| TextEdit {
+                byte_start: *start,
+                byte_end: start + text.len(),
+                replacement: new_text.to_string(),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let (start, text) = matches[0];
+        vec![TextEdit {
+            byte_start: start,
+            byte_end: start + text.len(),
+            replacement: new_text.to_string(),
+        }]
+    };
+    let plan = RefactorPlan {
+        title: format!(
+            "replace exact text in {} ({} occurrence(s))",
+            path_string(&source_path),
+            edits.len()
+        ),
+        kind: "replace_text".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(source.as_bytes()),
+            edits,
+        }],
+        validations: parse_validation_step_for_path(&source_path),
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let source = fs::read_to_string(&source_path).unwrap_or_default();
+    let new_text = p
+        .new_text
+        .as_deref()
+        .ok_or_else(|| anyhow!("new_text is required for write_file"))?;
+    let plan = RefactorPlan {
+        title: format!("write complete file {}", path_string(&source_path)),
+        kind: "write_file".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: 0,
+                byte_end: source.len(),
+                replacement: new_text.to_string(),
+            }],
+        }],
+        validations: parse_validation_step_for_path(&source_path),
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let source = fs::read_to_string(&source_path)
+        .with_context(|| format!("failed to read {}", source_path.display()))?;
+    let table = p
+        .toml_table
+        .as_deref()
+        .ok_or_else(|| anyhow!("toml_table is required for ensure_toml_table"))?;
+    validate_toml_table_name(table)?;
+    let entries = p
+        .toml_entries
+        .as_ref()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| anyhow!("toml_entries is required for ensure_toml_table"))?;
+    let replacement = ensure_toml_table_content(&source, table, entries)?;
+    replacement
+        .parse::<toml::Value>()
+        .with_context(|| format!("planned TOML for {} is invalid", source_path.display()))?;
+    let plan = RefactorPlan {
+        title: format!(
+            "ensure TOML table [{table}] in {}",
+            path_string(&source_path)
+        ),
+        kind: "ensure_toml_table".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: 0,
+                byte_end: source.len(),
+                replacement,
+            }],
+        }],
+        validations: Vec::new(),
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
 fn rust_impl_methods_target_edits(
     target_path: &Path,
     target_source: &str,
@@ -2238,6 +2664,399 @@ fn first_identifier_after_keyword(text: &str) -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone)]
+struct LspTextEdit {
+    path: PathBuf,
+    start_line: u64,
+    start_character: u64,
+    end_line: u64,
+    end_character: u64,
+    new_text: String,
+}
+
+fn rust_rename_position_byte(parsed: &ParsedSource, old_name: &str) -> Result<usize> {
+    let mut candidates = rust_status_items(parsed)
+        .into_iter()
+        .filter(|item| item.name.as_deref() == Some(old_name))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        bail!(
+            "no Rust item named `{old_name}` found in {}",
+            parsed.path.display()
+        );
+    }
+    candidates.sort_by_key(|item| item.byte_start);
+    let item = &candidates[0];
+    let item_source = parsed
+        .source
+        .get(item.byte_start..item.byte_end)
+        .ok_or_else(|| anyhow!("invalid item range for `{old_name}`"))?;
+    let relative = item_source
+        .find(old_name)
+        .ok_or_else(|| anyhow!("could not find `{old_name}` text inside selected item"))?;
+    Ok(item.byte_start + relative + old_name.len().saturating_sub(1) / 2)
+}
+
+fn byte_to_lsp_position(source: &str, byte: usize) -> serde_json::Value {
+    let line = source[..byte].bytes().filter(|b| *b == b'\n').count() as u64;
+    let line_start = line_start_before(source, byte);
+    let character = source[line_start..byte].encode_utf16().count() as u64;
+    serde_json::json!({ "line": line, "character": character })
+}
+
+fn lsp_position_to_byte(source: &str, line: u64, character: u64) -> Result<usize> {
+    let mut current_line = 0u64;
+    let mut line_start = 0usize;
+    for (idx, byte) in source.bytes().enumerate() {
+        if current_line == line {
+            break;
+        }
+        if byte == b'\n' {
+            current_line += 1;
+            line_start = idx + 1;
+        }
+    }
+    if current_line != line {
+        bail!("line {line} is outside source");
+    }
+    let line_end = source[line_start..]
+        .find('\n')
+        .map(|offset| line_start + offset)
+        .unwrap_or(source.len());
+    let mut utf16 = 0u64;
+    for (offset, ch) in source[line_start..line_end].char_indices() {
+        if utf16 == character {
+            return Ok(line_start + offset);
+        }
+        utf16 += ch.len_utf16() as u64;
+        if utf16 > character {
+            bail!("character {character} is not on a UTF-16 boundary");
+        }
+    }
+    if utf16 == character {
+        return Ok(line_end);
+    }
+    bail!("character {character} is outside line {line}");
+}
+
+fn lsp_edits_to_file_edits(lsp_edits: Vec<LspTextEdit>) -> Result<Vec<FileEdit>> {
+    let mut grouped: BTreeMap<PathBuf, Vec<LspTextEdit>> = BTreeMap::new();
+    for edit in lsp_edits {
+        grouped.entry(edit.path.clone()).or_default().push(edit);
+    }
+    let mut file_edits = Vec::new();
+    for (path, edits) in grouped {
+        let source = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read LSP edit target {}", path.display()))?;
+        let mut text_edits = Vec::new();
+        for edit in edits {
+            let byte_start =
+                lsp_position_to_byte(&source, edit.start_line, edit.start_character)
+                    .with_context(|| format!("invalid LSP start range for {}", path.display()))?;
+            let byte_end = lsp_position_to_byte(&source, edit.end_line, edit.end_character)
+                .with_context(|| format!("invalid LSP end range for {}", path.display()))?;
+            text_edits.push(TextEdit {
+                byte_start,
+                byte_end,
+                replacement: edit.new_text,
+            });
+        }
+        file_edits.push(FileEdit {
+            path: path_string(&path),
+            original_sha256: sha256_hex(source.as_bytes()),
+            edits: text_edits,
+        });
+    }
+    Ok(file_edits)
+}
+
+fn rust_analyzer_rename(
+    project_dir: &Path,
+    source_path: &Path,
+    position: serde_json::Value,
+    new_name: &str,
+) -> Result<Vec<LspTextEdit>> {
+    let mut child = Command::new("rust-analyzer")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning rust-analyzer")?;
+    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
+    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let root_uri = Url::from_directory_path(project_dir)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?
+        .to_string();
+    let source_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?
+        .to_string();
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "rootPath": project_dir.to_string_lossy(),
+                "workspaceFolders": [{"uri": root_uri, "name": "refactor-root"}],
+                "capabilities": {
+                    "workspace": {
+                        "applyEdit": false,
+                        "workspaceEdit": {
+                            "documentChanges": true,
+                            "resourceOperations": ["create", "rename", "delete"]
+                        }
+                    }
+                }
+            }
+        }),
+    )?;
+    read_lsp_response(&mut reader, 1)?;
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"textDocument/rename",
+            "params":{
+                "textDocument":{"uri":source_uri},
+                "position": position,
+                "newName": new_name
+            }
+        }),
+    )?;
+    let response = read_lsp_response(&mut reader, 2)?;
+    let _ = send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+    );
+    let _ = send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","method":"exit"}),
+    );
+    let _ = child.wait();
+    workspace_edit_to_text_edits(&response["result"])
+}
+
+fn rust_analyzer_organize_imports(
+    project_dir: &Path,
+    source_path: &Path,
+) -> Result<Vec<LspTextEdit>> {
+    let mut child = Command::new("rust-analyzer")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning rust-analyzer")?;
+    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
+    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let root_uri = Url::from_directory_path(project_dir)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?
+        .to_string();
+    let source_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?
+        .to_string();
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "rootPath": project_dir.to_string_lossy(),
+                "workspaceFolders": [{"uri": root_uri, "name": "refactor-root"}],
+                "capabilities": {
+                    "textDocument": {
+                        "codeAction": {
+                            "codeActionLiteralSupport": {
+                                "codeActionKind": {"valueSet": ["source.organizeImports"]}
+                            }
+                        }
+                    },
+                    "workspace": {
+                        "workspaceEdit": {"documentChanges": true}
+                    }
+                }
+            }
+        }),
+    )?;
+    read_lsp_response(&mut reader, 1)?;
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    )?;
+    let source = fs::read_to_string(source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
+    let end_position = byte_to_lsp_position(&source, source.len());
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"textDocument/codeAction",
+            "params":{
+                "textDocument":{"uri":source_uri},
+                "range":{"start":{"line":0,"character":0},"end":end_position},
+                "context":{"diagnostics":[],"only":["source.organizeImports"]}
+            }
+        }),
+    )?;
+    let response = read_lsp_response(&mut reader, 2)?;
+    let _ = send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+    );
+    let _ = send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","method":"exit"}),
+    );
+    let _ = child.wait();
+    code_actions_to_text_edits(&response["result"])
+}
+
+fn send_lsp(stdin: &mut impl Write, value: &serde_json::Value) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
+    write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
+    stdin.write_all(&body)?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn read_lsp_response(reader: &mut impl BufRead, expected_id: u64) -> Result<serde_json::Value> {
+    loop {
+        let value = read_lsp_message(reader)?;
+        if value.get("id").and_then(serde_json::Value::as_u64) != Some(expected_id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            bail!("rust-analyzer returned error: {error}");
+        }
+        return Ok(value);
+    }
+}
+
+fn read_lsp_message(reader: &mut impl BufRead) -> Result<serde_json::Value> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            bail!("rust-analyzer closed stdout");
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse::<usize>()?);
+        }
+    }
+    let len = content_length.context("LSP message missing Content-Length")?;
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+fn workspace_edit_to_text_edits(value: &serde_json::Value) -> Result<Vec<LspTextEdit>> {
+    let mut edits = Vec::new();
+    if let Some(changes) = value.get("changes").and_then(serde_json::Value::as_object) {
+        for (uri, uri_edits) in changes {
+            collect_lsp_text_edits(uri, uri_edits, &mut edits)?;
+        }
+    }
+    if let Some(document_changes) = value
+        .get("documentChanges")
+        .and_then(serde_json::Value::as_array)
+    {
+        for change in document_changes {
+            if let Some(uri) = change
+                .get("textDocument")
+                .and_then(|td| td.get("uri"))
+                .and_then(serde_json::Value::as_str)
+            {
+                collect_lsp_text_edits(uri, &change["edits"], &mut edits)?;
+            }
+        }
+    }
+    Ok(edits)
+}
+
+fn code_actions_to_text_edits(value: &serde_json::Value) -> Result<Vec<LspTextEdit>> {
+    let actions = value
+        .as_array()
+        .ok_or_else(|| anyhow!("LSP codeAction result is not an array"))?;
+    let mut edits = Vec::new();
+    for action in actions {
+        let kind = action
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let title = action
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if kind != "source.organizeImports" && !title.to_ascii_lowercase().contains("organize") {
+            continue;
+        }
+        if let Some(edit) = action.get("edit") {
+            edits.extend(workspace_edit_to_text_edits(edit)?);
+        }
+    }
+    Ok(edits)
+}
+
+fn collect_lsp_text_edits(
+    uri: &str,
+    edit_value: &serde_json::Value,
+    edits: &mut Vec<LspTextEdit>,
+) -> Result<()> {
+    let url = Url::parse(uri).with_context(|| format!("invalid LSP uri {uri}"))?;
+    let path = url
+        .to_file_path()
+        .map_err(|_| anyhow!("LSP uri is not a file path: {uri}"))?;
+    let edit_array = edit_value
+        .as_array()
+        .ok_or_else(|| anyhow!("LSP edits for {uri} are not an array"))?;
+    for edit in edit_array {
+        let range = edit
+            .get("range")
+            .ok_or_else(|| anyhow!("LSP edit missing range"))?;
+        edits.push(LspTextEdit {
+            path: path.clone(),
+            start_line: lsp_range_num(range, "start", "line")?,
+            start_character: lsp_range_num(range, "start", "character")?,
+            end_line: lsp_range_num(range, "end", "line")?,
+            end_character: lsp_range_num(range, "end", "character")?,
+            new_text: edit
+                .get("newText")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn lsp_range_num(range: &serde_json::Value, endpoint: &str, field: &str) -> Result<u64> {
+    range
+        .get(endpoint)
+        .and_then(|value| value.get(field))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("LSP range missing {endpoint}.{field}"))
+}
+
 fn leading_trivia_start(source: &str, node: Node<'_>) -> usize {
     let mut line_start = line_start_before(source, node.start_byte());
     let mut prev = node.prev_named_sibling();
@@ -2401,6 +3220,142 @@ fn parse_validation_step_for_path(path: &Path) -> Vec<ValidationStep> {
     } else {
         Vec::new()
     }
+}
+
+fn validate_toml_table_name(table: &str) -> Result<()> {
+    if table.trim() != table || table.is_empty() {
+        bail!("toml_table must be a non-empty top-level table name");
+    }
+    if table
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+    {
+        bail!("toml_table must be an unquoted top-level TOML table name");
+    }
+    Ok(())
+}
+
+fn ensure_toml_table_content(
+    source: &str,
+    table: &str,
+    entries: &BTreeMap<String, serde_json::Value>,
+) -> Result<String> {
+    source
+        .parse::<toml::Value>()
+        .context("source TOML is invalid")?;
+    let formatted_entries = entries
+        .iter()
+        .map(|(key, value)| {
+            validate_toml_key(key)?;
+            Ok((key.as_str(), toml_literal(value)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let header = format!("[{table}]");
+    let mut out = source.to_string();
+    let Some((section_start, section_end)) = toml_top_level_section_range(source, &header) else {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.ends_with("\n\n") && !out.trim().is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&header);
+        out.push('\n');
+        for (key, value) in formatted_entries {
+            out.push_str(key);
+            out.push_str(" = ");
+            out.push_str(&value);
+            out.push('\n');
+        }
+        return Ok(out);
+    };
+
+    let section = &source[section_start..section_end];
+    let mut section_out = section.to_string();
+    for (key, value) in formatted_entries {
+        let replacement_line = format!("{key} = {value}");
+        if let Some((line_start, line_end)) = toml_key_line_range(&section_out, key) {
+            section_out.replace_range(line_start..line_end, &replacement_line);
+        } else {
+            if !section_out.ends_with('\n') {
+                section_out.push('\n');
+            }
+            section_out.push_str(&replacement_line);
+            section_out.push('\n');
+        }
+    }
+    out.replace_range(section_start..section_end, &section_out);
+    Ok(out)
+}
+
+fn validate_toml_key(key: &str) -> Result<()> {
+    if key.trim() != key || key.is_empty() {
+        bail!("TOML entry keys must be non-empty bare keys");
+    }
+    if key
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+    {
+        bail!("unsupported TOML key `{key}`; only bare keys are supported");
+    }
+    Ok(())
+}
+
+fn toml_top_level_section_range(source: &str, header: &str) -> Option<(usize, usize)> {
+    let mut found_start = None;
+    for (line_start, line) in source.split_inclusive('\n').scan(0usize, |offset, line| {
+        let start = *offset;
+        *offset += line.len();
+        Some((start, line))
+    }) {
+        let trimmed = line.trim();
+        if found_start.is_none() {
+            if trimmed == header {
+                found_start = Some(line_start);
+            }
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            return found_start.map(|start| (start, line_start));
+        }
+    }
+    found_start.map(|start| (start, source.len()))
+}
+
+fn toml_key_line_range(section: &str, key: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for line in section.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            let without_comment = trimmed.split('#').next().unwrap_or_default();
+            if let Some((lhs, _)) = without_comment.split_once('=') {
+                if lhs.trim() == key {
+                    let line_end = offset + line.trim_end_matches(['\r', '\n']).len();
+                    return Some((offset, line_end));
+                }
+            }
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn toml_literal(value: &serde_json::Value) -> Result<String> {
+    Ok(match value {
+        serde_json::Value::String(value) => serde_json::to_string(value)?,
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(toml_literal)
+                .collect::<Result<Vec<_>>>()?;
+            format!("[{}]", values.join(", "))
+        }
+        serde_json::Value::Null | serde_json::Value::Object(_) => {
+            bail!("unsupported TOML value {value}; use string, bool, number, or array")
+        }
+    })
 }
 
 fn restore_snapshots(snapshots: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
@@ -2720,6 +3675,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -2769,6 +3729,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: Some("use super::*;".into()),
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -2823,6 +3788,11 @@ mod tests {
             router_call: None,
             router_export_name: Some("router".into()),
             target_prelude: Some("use super::*;".into()),
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -2876,6 +3846,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -2929,6 +3904,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -2976,6 +3956,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: Some("use super::*;".into()),
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3027,6 +4012,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: Some("use super::*;".into()),
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3075,6 +4065,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: Some("use super::*;".into()),
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3122,6 +4117,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3166,6 +4166,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
@@ -3193,6 +4198,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
@@ -3225,6 +4235,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3273,6 +4288,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3319,6 +4339,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3356,6 +4381,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
@@ -3382,6 +4412,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
@@ -3408,6 +4443,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
@@ -3440,6 +4480,11 @@ mod tests {
                             router_call: None,
                             router_export_name: None,
                             target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
                             project_dir: None,
                         },
                     },
@@ -3458,6 +4503,11 @@ mod tests {
                             router_call: None,
                             router_export_name: None,
                             target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
                             project_dir: None,
                         },
                     },
@@ -3502,6 +4552,11 @@ mod tests {
                             router_call: None,
                             router_export_name: None,
                             target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
                             project_dir: None,
                         },
                     },
@@ -3520,6 +4575,11 @@ mod tests {
                             router_call: None,
                             router_export_name: None,
                             target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
                             project_dir: None,
                         },
                     },
@@ -3566,6 +4626,11 @@ mod tests {
                             router_call: None,
                             router_export_name: None,
                             target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
                             project_dir: None,
                         },
                     },
@@ -3584,6 +4649,11 @@ mod tests {
                             router_call: None,
                             router_export_name: None,
                             target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
                             project_dir: None,
                         },
                     },
@@ -3633,6 +4703,11 @@ mod tests {
                             router_call: None,
                             router_export_name: None,
                             target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
                             project_dir: None,
                         },
                     },
@@ -3651,6 +4726,11 @@ mod tests {
                             router_call: None,
                             router_export_name: None,
                             target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
                             project_dir: None,
                         },
                     },
@@ -3667,6 +4747,91 @@ mod tests {
         assert!(run_response.rolled_back);
         assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn refactor_run_rolls_back_when_required_command_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "rollback failed command".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "add_rust_mod_decl".into(),
+                            source: "lib.rs".into(),
+                            target: None,
+                            item_names: None,
+                            item_kinds: None,
+                            impl_name: None,
+                            module_name: Some("newmod".into()),
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
+                            project_dir: None,
+                        },
+                    },
+                    RefactorRunStep::Command {
+                        command: "false".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "step_failed");
+        assert!(run_response.rolled_back);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
+    }
+
+    #[test]
+    fn refactor_run_rolls_back_declared_command_touches() {
+        let dir = tempfile::tempdir().unwrap();
+        let generated = dir.path().join("generated.txt");
+
+        let response = run(
+            &RefactorRunParams {
+                title: "rollback command side effects".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Command {
+                    command: "sh".into(),
+                    args: vec!["-c".into(), "printf created > generated.txt; false".into()],
+                    cwd: None,
+                    touches: vec!["generated.txt".into()],
+                    required: Some(true),
+                }],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "step_failed");
+        assert!(run_response.rolled_back);
+        assert!(!generated.exists());
     }
 
     #[test]
@@ -3693,6 +4858,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3739,6 +4909,11 @@ mod tests {
             router_call: Some("refactor_tools::router()".into()),
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3781,6 +4956,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3823,6 +5003,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
@@ -3849,6 +5034,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3897,6 +5087,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -3940,6 +5135,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
@@ -3967,6 +5167,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -4010,6 +5215,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -4052,6 +5262,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -4095,6 +5310,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -4139,10 +5359,218 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
         assert!(err.to_string().contains("target already exists"));
+    }
+
+    #[test]
+    fn replace_text_replaces_exact_single_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "pub fn before() {}\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "replace_text".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: Some("before".into()),
+            new_text: Some("after".into()),
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: serde_json::from_str(&plan_text).unwrap(),
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "pub fn after() {}\n");
+    }
+
+    #[test]
+    fn write_file_creates_missing_supported_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src").join("lib.rs");
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "write_file".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: Some("pub mod packets;\n".into()),
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: serde_json::from_str(&plan_text).unwrap(),
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "pub mod packets;\n");
+    }
+
+    #[test]
+    fn ensure_toml_table_adds_lib_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Cargo.toml");
+        fs::write(
+            &source,
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"demo\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "ensure_toml_table".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: Some("lib".into()),
+            toml_entries: Some(BTreeMap::from([
+                ("name".into(), serde_json::json!("demo")),
+                ("path".into(), serde_json::json!("src/lib.rs")),
+            ])),
+            project_dir: None,
+        })
+        .unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: serde_json::from_str(&plan_text).unwrap(),
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let updated = fs::read_to_string(&source).unwrap();
+        assert!(updated.contains("[lib]\nname = \"demo\"\npath = \"src/lib.rs\"\n"));
+        updated.parse::<toml::Value>().unwrap();
+    }
+
+    #[test]
+    fn rust_lsp_rename_renames_references() {
+        if !Command::new("rust-analyzer")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("skipping rust_lsp_rename test: rust-analyzer unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"rename_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let source = dir.path().join("src").join("lib.rs");
+        fs::write(
+            &source,
+            "pub fn old_name() -> usize { 1 }\n\npub fn caller() -> usize { old_name() }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rust_lsp_rename".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["old_name".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: Some("new_name".into()),
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: Some(path_string(dir.path())),
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        assert_eq!(plan_value["semantic_status"], "lsp_verified");
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let updated = fs::read_to_string(&source).unwrap();
+        assert!(updated.contains("pub fn new_name()"));
+        assert!(updated.contains("new_name() }"));
+        assert!(!updated.contains("old_name"));
     }
 
     #[test]
@@ -4165,6 +5593,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();
@@ -4207,6 +5640,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
@@ -4237,6 +5675,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap_err();
@@ -4288,6 +5731,11 @@ mod tests {
             router_call: None,
             router_export_name: None,
             target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
             project_dir: None,
         })
         .unwrap();

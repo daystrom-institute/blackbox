@@ -24,27 +24,27 @@ file names or tool prefixes, it does not count.
 
 | Restructure Step | Needed Generic MCP Capability | Current Coverage | Gap |
 |---|---|---|---|
-| Add `[lib]` target to `Cargo.toml` | TOML table insertion/update with idempotent key checks | none | `edit_toml_manifest` or generic structured-config edit |
-| Create `src/lib.rs` from `mod` declarations in `main.rs` | extract/copy module declarations; transform copied declarations to `pub mod`; create file | covered for declaration copy/rewrite with `copy_rust_mod_decls` and `rewrite_rust_mod_visibility` | compound transaction integration with `[lib]` manifest edit |
+| Add `[lib]` target to `Cargo.toml` | TOML table insertion/update with idempotent key checks | covered with `ensure_toml_table` | none for top-level table/string entries |
+| Create `src/lib.rs` from `mod` declarations in `main.rs` | extract/copy module declarations; transform copied declarations to `pub mod`; create file | covered for declaration copy/rewrite with `copy_rust_mod_decls`, `rewrite_rust_mod_visibility`, and `write_file` | none for declaration-driven lib bootstrap |
 | Delete `mod foo;` from `main.rs` after lib reparent | syntactic deletion of selected top-level `mod_item`s | covered with `delete_rust_items`; can participate in `bbox_refactor_run` | none for top-level declarations |
-| Rewrite binary crate references from `crate::foo` to `blackbox::foo` where needed | semantic path rewrite across crate boundary | none | rust-analyzer/workspace reference rewrite plus compiler diagnostics |
-| Move inline `SharedState`, `BlackboxServer`, impls, routes, tests to `server/mod.rs` | top-level item extraction; impl extraction; route/helper extraction; test block extraction | partial: top-level + impl method extraction | nested module/test extraction, multi-item grouping, visibility/import repair |
-| Shrink `main.rs` to bootstrap only | create replacement file from selected retained functions/imports | none | file rewrite plan from template + import pruning |
-| Split one tool domain per `tools/<domain>.rs` | extract selected `#[tool]` impl methods; create router helper; add module decl; wire router sum | strong for current Rust tool pattern | compound run wrapper; grouping by attribute/name prefix |
-| Move parameter structs with tool handlers | extract top-level structs near selected methods by type usage | partial: top-level item extraction by exact names | symbol dependency discovery from method signatures |
+| Rewrite binary crate references from `crate::foo` to `blackbox::foo` where needed | explicit path-prefix rewrite plus compiler validation | assisted with `replace_text(replace_all=true)` only after grounding exact intended text | not symbolic; use `rust_lsp_rename` for real symbol rename |
+| Move inline `SharedState`, `BlackboxServer`, impls, routes, tests to `server/mod.rs` | top-level item extraction; impl extraction; route/helper extraction; test block extraction; exact file rewrite fallback | covered with extraction primitives plus `write_file` after grounding | no automatic dependency closure; plan must name moved items explicitly |
+| Shrink `main.rs` to bootstrap only | create replacement file from selected retained functions/imports | covered with `write_file` after grounding and command validation | none for checkpointed rewrite |
+| Split one tool domain per `tools/<domain>.rs` | extract selected `#[tool]` impl methods; create router helper; add module decl; wire router sum | covered with `extract_rust_impl_methods`, `add_rust_mod_decl`, `add_rust_router_to_sum`, `bbox_refactor_run` | grouping by attribute/name prefix remains agent-grounded, not automatic |
+| Move parameter structs with tool handlers | extract top-level structs near selected methods by type usage | covered with `extract_rust_items` by exact grounded names | automatic symbol dependency discovery remains future |
 | Update `BlackboxServer::new` router sum | insert router call into `tool_router:` field initializer | covered; can participate in `bbox_refactor_run` | none for existing router-sum shape |
-| Move file-local helper functions with a domain | dependency closure over selected handlers | none | call graph / reference extraction via rust-analyzer |
-| Move per-domain tests next to code | test discovery and relocation | none | test-to-symbol association and nested `#[cfg(test)]` module editing |
+| Move file-local helper functions with a domain | dependency closure over selected handlers | covered with `extract_rust_items` by exact grounded helper names | automatic call graph remains future |
+| Move per-domain tests next to code | test discovery and relocation | assisted with `write_file` after grounding, plus command validation | automatic test-to-symbol association remains future |
 | Convert `src/packets.rs` to `src/packets/mod.rs` | git/file move; update module layout; preserve module identity | covered for file move with `move_file` | module-layout declaration follow-up still manual/compound |
-| Split `packets` by layer (`ast`, `compile`, `apply`, etc.) | extract AST/types/functions/tests by dependency layers | partial for top-level items | dependency closure, import repair, test relocation |
+| Split `packets` by layer (`ast`, `compile`, `apply`, etc.) | extract AST/types/functions/tests by dependency layers | covered with `extract_rust_items`, `add_rust_mod_decl`, `add_rust_use_decl`, and exact rewrite plans after grounding | automatic dependency closure/import repair remains future |
 | Add `pub mod ast;` etc. inside `packets/mod.rs` | module declaration insertion | covered with visibility option | compound transaction integration |
 | Re-export moved symbols for compatibility | add `pub use` statements | covered with `add_rust_use_decl` | semantic choice of re-export path still manual/LSP-assisted |
-| Split HTTP routes into route modules | extract functions/structs + update route builder references | partial for top-level functions | reference rewrite, import repair, path update |
-| Move free functions referenced from siblings | extract functions and update `crate::...` paths or add re-exports | partial for extraction | LSP find refs/rename; `pub use` insertion |
-| Run format/check/test after every step | command validation in transaction | none in generic MCP surface | generic validation/profile surface; language memories can name cargo/npm/dotnet/etc. commands |
-| Rollback across multi-step refactor | transaction across several primitive plans + validations | partial: `bbox_refactor_run` snapshots primitive-plan file writes and rolls back on required plan-step failure | temp-worktree validated diff mode; validation-step integration |
-| Optimize imports after moves | semantic import organize/prune | none | rust-analyzer organize imports / code actions |
-| Symbolic rename/reference rewrite | workspace-safe semantic rename | none | LSP-backed `lsp_rename` |
+| Split HTTP routes into route modules | extract functions/structs + update route builder references | covered with `extract_rust_items`, `write_file`, and command validation | automatic reference discovery remains future; symbolic renames use `rust_lsp_rename` |
+| Move free functions referenced from siblings | extract functions and update paths or add re-exports | covered with extraction plus `add_rust_use_decl` and `rust_lsp_rename` where symbols are renamed | automatic reference discovery remains future |
+| Run format/check/test after every step | command validation in transaction | covered with `bbox_refactor_run` command steps | structured diagnostic parsing remains future |
+| Rollback across multi-step refactor | transaction across several primitive plans + validations | covered: `bbox_refactor_run` snapshots primitive-plan file writes and rolls back on required plan or command failure | temp-worktree validated diff mode remains future |
+| Optimize imports after moves | semantic import organize/prune | covered per file with `rust_organize_imports` backed by rust-analyzer `source.organizeImports`; explicit missing imports still use `add_rust_use_decl` plus compiler validation | fully automatic missing-import repair remains future |
+| Symbolic rename/reference rewrite | workspace-safe semantic rename | covered with `rust_lsp_rename` backed by rust-analyzer `textDocument/rename` | none for rename-capable Rust symbols |
 
 ## Generic Operations Required
 
@@ -81,35 +81,45 @@ file names or tool prefixes, it does not count.
     for a coherent move
   - tree-sitter can seed candidates; rust-analyzer confirms references
 - `rust_lsp_rename`
-  - backed by rust-analyzer `prepareRename` + `rename`
+  - backed by rust-analyzer `textDocument/rename`
   - converts `WorkspaceEdit` to `FileEdit`
 - `rust_import_repair`
   - apply rust-analyzer missing-import code actions
   - parse and compiler validate
 - `rust_import_prune`
-  - organize imports or exact unused-import deletions
+  - implemented as `rust_organize_imports` for rust-analyzer
+    `source.organizeImports`
 
 ### Cross-Language/Generic Operations
 
-- `edit_toml_manifest`
-  - structured TOML edits for `[lib]`, `[[bin]]`, dependencies, workspace
-    members
+- `ensure_toml_table`
+  - structured TOML edits for top-level tables such as `[lib]`
+  - preserves unrelated manifest content and validates TOML after planning
 - `move_file`
   - move any file to a missing target path
   - records old/new path, creates parent dirs, preserves source bytes, rejects
     existing targets, validates supported source syntax at the destination, and
     rolls back write/remove failures
+- `replace_text`
+  - exact string replacement in any UTF-8 file
+  - defaults to exactly-one match; `replace_all=true` is explicit
+  - validates supported source files after rewriting
+  - does not count as semantic rename or import repair
+- `write_file`
+  - replace or create an entire UTF-8 file under hash/path/dirty checks
+  - validates supported source files after rewriting
 - `compound_run`
   - compose primitive plans and rollback
   - V1 implemented as `bbox_refactor_run` for primitive plans, with live
-    sequential planning and rollback across primitive-plan file writes
-  - validation and LSP steps should attach through generic extension points,
-    not Rust-specific command handling
+    sequential planning and rollback across primitive-plan file writes and
+    required command failures
 - `command_validation`
-  - future generic validation/profile surface
+  - implemented as `{"op":"command","command":"...","args":[...]}` steps in
+    `bbox_refactor_run`
   - language memories should provide profile details for cargo, npm, dotnet,
     go, pytest, etc.
-  - declared mutating globs remain future work
+  - commands are validation-only unless `touches` declares paths they may
+    mutate; declared touches are snapshotted and rolled back with the run
 - `diagnostic_parse`
   - parse cargo/rustc diagnostics into structured file/range/code messages
 
@@ -132,21 +142,21 @@ file names or tool prefixes, it does not count.
    - especially `src/packets.rs` -> `src/packets/mod.rs`
    - future: module-layout update helper and temp-worktree validated diff mode
 
-4. **Structured TOML edits**
-   - add `[lib]`
-   - preserve formatting where practical
-   - validate with `cargo metadata` or `cargo check`
+4. **Structured TOML and exact rewrite edits**
+   - `ensure_toml_table` covers adding `[lib]`
+   - `replace_text` covers explicit literal text rewrites only
+   - `write_file` covers checkpointed bootstrap-file rewrites
 
 5. **Rust LSP adapter**
-   - `rust_lsp_rename`
-   - find references / go to definition
-   - missing import code actions
-   - organize imports
+   - `rust_lsp_rename` covers binding-aware symbol rename
+   - `rust_organize_imports` covers per-file import organization
+   - fully automatic missing-import repair remains future; current benchmark can
+     still proceed by adding explicit imports and compiler-validating
 
 6. **Dependency closure and test relocation**
-   - discover helper functions and DTO structs used by moved handlers
-   - associate tests with symbols via references
-   - support nested `#[cfg(test)] mod tests` extraction
+   - benchmark plan must ground exact names/ranges before each move
+   - automatic helper/test association remains future, but no benchmark step
+     requires it to be automatic
 
 ## Benchmark Protocol
 

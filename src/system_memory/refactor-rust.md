@@ -15,15 +15,18 @@ Rust is the first writable backend.
   `bbox_refactor_plan(kind="add_rust_mod_decl")` and
   `bbox_refactor_plan(kind="add_rust_use_decl")` and
   `bbox_refactor_plan(kind="copy_rust_mod_decls")` and
-  `bbox_refactor_plan(kind="rewrite_rust_mod_visibility")`.
+  `bbox_refactor_plan(kind="rewrite_rust_mod_visibility")` and
+  `bbox_refactor_plan(kind="rust_lsp_rename")` and
+  `bbox_refactor_plan(kind="rust_organize_imports")`.
 - Apply: supported with `bbox_refactor_apply(confirm=true)`.
 - Compound run: supported with `bbox_refactor_run(confirm=true)` for ordered
-  primitive plans, with rollback across primitive-plan file writes if a later
-  plan step fails.
-- Semantic rename: not supported by blackbox yet; use rust-analyzer, compiler
-  feedback, or manual edits after inspection.
-- Import repair: not automatic; use `cargo fmt`, `cargo check`, `cargo clippy`,
-  and rust-analyzer feedback after structural moves.
+  primitive plans and command validation steps, with rollback across
+  primitive-plan file writes if a later required plan or command step fails.
+- Semantic rename: supported with `rust_lsp_rename`, backed by rust-analyzer
+  `textDocument/rename` and emitted as normal hash-checked `FileEdit`s.
+- Import organization: supported per file with `rust_organize_imports`, backed
+  by rust-analyzer `source.organizeImports`. Missing-import repair is still
+  compiler/LSP-guided.
 
 Tree-sitter language: `rust`.
 
@@ -51,14 +54,28 @@ Writable plan kinds:
 - `rewrite_rust_mod_visibility`: rewrite an existing `mod name;`,
   `pub mod name;`, or `pub(crate) mod name;` declaration to requested
   visibility (`private`, `pub`, or `pub(crate)`).
+- `rust_lsp_rename`: rename a Rust symbol through rust-analyzer. Pass
+  `item_names=["old_name"]` or `old_text="old_name"` plus
+  `new_text="new_name"` and `source` pointing at a file containing the symbol
+  declaration. The plan is `semantic_status="lsp_verified"` and can touch
+  multiple files.
+- `rust_organize_imports`: request rust-analyzer `source.organizeImports` for
+  `source` and emit the resulting workspace edit as normal hash-checked edits.
 
 Compound run steps:
 
 - `{"op":"plan", ...}`: accepts the same arguments as `bbox_refactor_plan`.
   If `project_dir` is omitted in the step, the run-level `project_dir` is used.
+- `{"op":"command","command":"cargo","args":["test","--bin","blackboxd"]}`:
+  runs a required validation command in the run-level `project_dir` by default.
+  Required command failure rolls back prior plan writes in the same run.
+- `{"op":"command","command":"cargo","args":["fmt"],"touches":["src/lib.rs"]}`:
+  use `touches` for mutating toolchain commands. `cargo check` and `cargo test`
+  normally omit it because they validate rather than rewrite source files.
 
-Run Rust validation commands outside `bbox_refactor_run` until a separate
-generic validation/profile surface exists.
+Prefer command steps inside `bbox_refactor_run` for phase gates that should
+rollback together. Run additional exploratory commands outside the transaction
+when they should not control rollback.
 
 Supported top-level item kinds include:
 
@@ -236,6 +253,8 @@ Use a narrower test command when the changed package has a clearer local test.
 - Plain `//` comments above a method are not treated as owned method trivia
   unless attached to an attribute/doc block. Convert durable method comments to
   rustdoc before moving when the comment must follow the method.
-- For symbolic rename, require an LSP-backed or compiler-verified workflow.
+- For symbolic rename, use `rust_lsp_rename`; do not substitute
+  `replace_text` unless the intended edit is genuinely a literal text rewrite
+  rather than a binding-aware rename.
 - For broad autonomous restructuring, use a durable bro plus reviewer loop; the
   refactor tools supply mechanical edits, not architectural judgment.

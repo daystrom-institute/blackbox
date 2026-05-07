@@ -24,12 +24,23 @@ mapped languages are inspect-only unless a newer language memory says otherwise.
 
 Writable structural plans are narrower:
 
-- Generic: `bbox_refactor_plan(kind="move_file")` moves a file from `source`
-  to a missing `target`, then `bbox_refactor_apply(confirm=true)`. Supported
-  source files are syntax-validated at the destination path; unsupported file
-  types still get hash, dirty-file, path-scope, target-exists, and rollback
-  checks. Use `bbox_refactor_run(confirm=true)` when the file move must be
-  grouped with language-specific declaration/reference edits.
+- Generic:
+  - `bbox_refactor_plan(kind="move_file")` moves a file from `source` to a
+    missing `target`. Supported source files are syntax-validated at the
+    destination path; unsupported file types still get hash, dirty-file,
+    path-scope, target-exists, and rollback checks.
+  - `bbox_refactor_plan(kind="replace_text")` replaces exact `old_text` with
+    `new_text` in `source`. By default the old text must match exactly once;
+    pass `replace_all=true` for every occurrence. This is a literal edit
+    primitive, not symbolic rename or import repair.
+  - `bbox_refactor_plan(kind="write_file")` replaces or creates `source` with
+    complete `new_text`. Supported source files are parse-validated.
+  - `bbox_refactor_plan(kind="ensure_toml_table")` ensures a top-level TOML
+    table named by `toml_table` contains `toml_entries` values. This is for
+    simple structured config edits such as adding `[lib]` to a manifest.
+  Use `bbox_refactor_apply(confirm=true)` for one plan or
+  `bbox_refactor_run(confirm=true)` when several primitive plans and command
+  validations must succeed or rollback together.
 - Rust: `bbox_refactor_plan(kind="extract_rust_items")` or
   `bbox_refactor_plan(kind="extract_rust_impl_methods")` or
   `bbox_refactor_plan(kind="delete_rust_items")` or
@@ -93,7 +104,18 @@ small files only; status defaults to at most 200 returned items and reports
    requirement without disabling hash, syntax, or dirty-file checks.
 
 4. Run the language toolchain after apply. Tree-sitter proves syntax shape, not
-   semantic binding.
+   semantic binding. For compound phases, add command validation steps directly
+   to `bbox_refactor_run`:
+
+```text
+{"op":"command","command":"make","args":["test"],"required":true}
+{"op":"command","command":"make","args":["format"],"touches":["src/example.ext"],"required":true}
+```
+
+   The runner executes commands in `project_dir` by default. Command steps are
+   validation-only unless `touches` declares paths they may mutate. Declared
+   touches are snapshotted before the command and are rolled back with prior
+   plan writes on required command failure.
 
 5. Dispatched agents normally cannot see `bbox_refactor_*` because those tools
    are in the default recursion guard. The orchestrator must deliberately use

@@ -306,8 +306,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
         summary: "Create a dry-run structural refactor plan using a supported generic or language-scoped plan kind.",
-        when_to_use: "Use after `sm-refactor` identifies an exact supported plan kind. For syntax-item operations, inspect with bbox_refactor_status first and use the relevant language memory for exact item kinds and extra arguments. The plan is reviewable JSON with hash checks, file moves or text edits, parse validations, selected items, and leftovers where applicable. Keep this generic surface free of language-specific assumptions; semantic rename/import repair belongs to LSP or future validation surfaces.",
-        example: Some(r#"bbox_refactor_plan(kind="<supported_plan_kind>", source="src/path/to/file.ext", target="src/path/to/target.ext", item_names=["Thing"], project_dir="/repo/x")"#),
+        when_to_use: "Use after `sm-refactor` identifies an exact supported plan kind. For syntax-item operations, inspect with bbox_refactor_status first and use the relevant language memory for exact item kinds and extra arguments. Generic plans cover file moves, exact text replacement, whole-file writes, and simple TOML table ensures; exact text replacement is not semantic rename. The plan is reviewable JSON with hash checks, file moves or text edits, parse validations, selected items, and leftovers where applicable. Keep this generic surface free of language-specific assumptions; semantic rename/import repair belongs to LSP, compiler validation, or language-scoped surfaces.",
+        example: Some(r#"bbox_refactor_plan(kind="<supported_plan_kind>", source="src/path/to/file.ext", target="src/path/to/target.ext", item_names=["Thing"], old_text="exact before", new_text="exact after", project_dir="/repo/x")"#),
     },
     ToolDoc {
         name: "bbox_refactor_apply",
@@ -320,8 +320,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_refactor_run",
         category: ToolCategory::Refactor,
         summary: "Compose primitive refactor plans into one transactional run with rollback across touched files.",
-        when_to_use: "Use when a restructuring move needs several bbox_refactor_plan primitives to succeed or fail together. V1 executes primitive plan steps sequentially against the live projected state when confirm=true, snapshots touched files before first write, rejects initially dirty files unless allow_dirty_worktree=true, and rolls back primitive-plan writes if any later plan step fails. Language-specific validation commands belong in language memories or a separate validation surface, not in this generic runner.",
-        example: Some(r#"bbox_refactor_run(title="compound structural move", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"<supported_plan_kind>","source":"src/path/to/file.ext","item_names":["Thing"]},{"op":"plan","kind":"<another_supported_plan_kind>","source":"src/path/to/file.ext"}])"#),
+        when_to_use: "Use when a restructuring move needs several bbox_refactor_plan primitives and validation commands to succeed or fail together. V1 executes primitive plan steps sequentially against the live projected state when confirm=true, snapshots touched files before first write, rejects initially dirty files unless allow_dirty_worktree=true, and rolls back primitive-plan writes if any later required plan or command step fails. Command steps are validation-only unless `touches` declares paths they may mutate; declared touches are snapshotted and included in rollback. Language memories should name the project-specific validation commands; the runner executes them generically.",
+        example: Some(r#"bbox_refactor_run(title="compound structural move", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"<supported_plan_kind>","source":"src/path/to/file.ext","item_names":["Thing"]},{"op":"command","command":"make","args":["test"],"touches":["generated.lock"]}])"#),
     },
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {
