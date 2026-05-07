@@ -68,7 +68,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -1715,9 +1715,15 @@ impl BlackboxServer {
         let mut completion_from = ActionJournalState::Seen;
         let dispatch_result = match event.as_str() {
             "bg-action-emit-proposal" => {
+                // Accept both `kind` (canonical) and `proposal_kind`
+                // (natural LLM shape — synthesis charters describing
+                // proposal shape often phrase the field this way).
                 let kind_value = body
                     .get("kind")
-                    .ok_or_else(|| "bg-action-emit-proposal missing kind".to_string())?;
+                    .or_else(|| body.get("proposal_kind"))
+                    .ok_or_else(|| {
+                        "bg-action-emit-proposal missing kind (or proposal_kind)".to_string()
+                    })?;
                 let kind = self.badgey_parse_proposal_kind(kind_value)?;
                 let idempotency_key = body
                     .get("idempotency_key")
@@ -1727,11 +1733,48 @@ impl BlackboxServer {
                         (kind == orchestration::badgey::types::ProposalKind::RedispatchTask)
                             .then(|| uuid::Uuid::new_v4().to_string())
                     });
-                let mut draft = body
-                    .get("draft")
-                    .or_else(|| body.get("proposal"))
-                    .cloned()
-                    .ok_or_else(|| "bg-action-emit-proposal missing draft".to_string())?;
+                // Three accepted draft shapes:
+                //   1. `draft: {…}` — explicit object (canonical).
+                //   2. `proposal: {…}` — explicit object under legacy
+                //      alias key (was the original alias path).
+                //   3. Top-level structured fields (root_cause /
+                //      proposal / blast_radius / draft_artifact_ref /
+                //      subject_ref / source / draft_path / task_id) —
+                //      synthesized into a draft object. This is the
+                //      shape LLMs emit when the synthesis charter
+                //      describes those fields directly.
+                let proposal_field = body.get("proposal");
+                let proposal_is_object = proposal_field.is_some_and(Value::is_object);
+                let mut draft = if let Some(d) = body.get("draft") {
+                    d.clone()
+                } else if proposal_is_object {
+                    proposal_field.cloned().unwrap()
+                } else {
+                    let synthesized: Map<String, Value> = [
+                        "root_cause",
+                        "proposal",
+                        "blast_radius",
+                        "draft_artifact_ref",
+                        "subject_ref",
+                        "source",
+                        "draft_path",
+                        "task_id",
+                        "name",
+                        "version",
+                        "supersedes",
+                        "evidence_refs",
+                    ]
+                    .iter()
+                    .filter_map(|k| body.get(*k).map(|v| (k.to_string(), v.clone())))
+                    .collect();
+                    if synthesized.is_empty() {
+                        return Err(
+                            "bg-action-emit-proposal missing draft (or top-level draft fields)"
+                                .to_string(),
+                        );
+                    }
+                    Value::Object(synthesized)
+                };
                 if kind == orchestration::badgey::types::ProposalKind::RedispatchTask
                     && draft.get("task_id").is_none()
                 {

@@ -2,8 +2,7 @@
   "name": "badgey-scout-arc",
   "version": 1,
   "vars_schema": {
-    "charter": { "kind": "string", "required": true },
-    "scout_id": { "kind": "string", "required": true },
+    "charter_item": { "kind": "object", "required": true },
     "project_dir": { "kind": "string" },
     "done_note": { "kind": "string" }
   },
@@ -18,7 +17,7 @@
   "nodes": {
     "Run": {
       "actor": "scout",
-      "prompt": "Scout charter for ${vars.scout_id}:\n\n${vars.charter}\n\nProtocol: this is one focused investigation. Run the agentic opening sequence (hybrid_search → inspect_entity → find_paths if multi-hop), round-trip every cited entity_ref, and return a structured done note as specified in your brofile (scout_id, verdict, evidence_refs, path_ids, summary, residual_risk). Do NOT spawn further agents — bro_* tools are denied for this brofile. Stay within scope; do not investigate beyond the charter.",
+      "prompt": "Scout charter for ${vars.charter_item.scout_id} (subject: ${vars.charter_item.subject_ref}):\n\n${vars.charter_item.charter}\n\nProtocol: this is one focused investigation. Run the agentic opening sequence (hybrid_search → inspect_entity → find_paths if multi-hop), round-trip every cited entity_ref, and return a structured done note as specified in your brofile (scout_id, verdict, evidence_refs, path_ids, summary, residual_risk). Do NOT spawn further agents — bro_* tools are denied for this brofile. Stay within scope; do not investigate beyond the charter.",
       "on_exit": [
         {
           "op": "set_var",

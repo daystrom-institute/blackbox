@@ -9,12 +9,10 @@
     "project_dir": { "kind": "string" },
     "instance": { "kind": "object" },
     "badgey_id": { "kind": "string" },
-    "triage_started_at": { "kind": "string" },
     "triage_response": { "kind": "object" },
     "triage_data": { "kind": "object" },
     "scout_charters": { "kind": "array" },
     "scout_findings": { "kind": "array" },
-    "synthesis_started_at": { "kind": "string" },
     "synthesis_response": { "kind": "object" },
     "proposals_response": { "kind": "object" }
   },
@@ -58,7 +56,6 @@
       "actor": "",
       "prompt": "Resume Badgey with the triage charter — corpus walk + meatiness scoring + scout-charter emission.",
       "on_enter": [
-        { "op": "set_var", "args": { "key": "triage_started_at", "value": "${meta.now}" } },
         {
           "op": "mcp_call",
           "args": {
@@ -91,10 +88,6 @@
         "as_var": "charter_item",
         "subworkflow_ref": "badgey-scout-arc",
         "imports": ["project_dir"],
-        "import_renames": {
-          "charter": "charter_item.charter",
-          "scout_id": "charter_item.scout_id"
-        },
         "exports": ["done_note"],
         "parallelism": 3,
         "on_item_failure": "collect_then_halt",
@@ -106,7 +99,6 @@
       "actor": "",
       "prompt": "Resume Badgey to synthesize proposals from scout findings (or fall back to dream/explore mode on a clean slate).",
       "on_enter": [
-        { "op": "set_var", "args": { "key": "synthesis_started_at", "value": "${meta.now}" } },
         {
           "op": "mcp_call",
           "args": {
@@ -136,7 +128,7 @@
             "tool": "badgey_proposals_list",
             "arguments": {
               "badgey_id": "${vars.badgey_id}",
-              "since": "${vars.synthesis_started_at}",
+              "since": "${meta.started_at}",
               "only_pending": true
             },
             "timeout_secs": 30

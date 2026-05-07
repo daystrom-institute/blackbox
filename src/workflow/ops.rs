@@ -849,16 +849,33 @@ fn strip_code_fence(s: &str) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
+    // Fast path: first line is the fence opener.
     let first = lines[0].trim();
     let opens_fence = first == "```json" || first == "```JSON" || first == "```";
-    if !opens_fence {
+    if opens_fence {
+        let last_idx = lines.iter().rposition(|l| l.trim() == "```")?;
+        if last_idx == 0 {
+            return None;
+        }
+        return Some(lines[1..last_idx].join("\n"));
+    }
+    // Fallback: prose preamble before a fenced JSON block. Common LLM
+    // output shape — extract the contents of the first ```json (or
+    // bare ```) block found in the body. The first matching closing
+    // fence after the opener delimits the block.
+    let opener_idx = lines.iter().position(|l| {
+        let t = l.trim();
+        t == "```json" || t == "```JSON" || t == "```"
+    })?;
+    let closer_idx = lines[opener_idx + 1..]
+        .iter()
+        .position(|l| l.trim() == "```")?
+        + opener_idx
+        + 1;
+    if closer_idx <= opener_idx + 1 {
         return None;
     }
-    let last_idx = lines.iter().rposition(|l| l.trim() == "```")?;
-    if last_idx == 0 {
-        return None;
-    }
-    Some(lines[1..last_idx].join("\n"))
+    Some(lines[opener_idx + 1..closer_idx].join("\n"))
 }
 
 async fn exec_shell(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
@@ -1255,6 +1272,35 @@ mod tests {
             OpEffect::SetVar { key, value } => {
                 assert_eq!(key, "parsed");
                 assert_eq!(value, json!({"x": 1}));
+            }
+            _ => panic!("expected SetVar effect"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_json_extracts_fenced_block_after_prose_preamble() {
+        // LLMs commonly precede the structured JSON with prose
+        // ("Here's the result:\n\n```json\n{...}\n```"). Earlier
+        // strip_code_fence required the fence opener on line 1.
+        // Now it falls back to first-fenced-block-anywhere when the
+        // first line isn't a fence.
+        let ctx = ArcContext::new(ArcMeta::default());
+        let body = "Scoring meatiness on the top candidates.\n\nEmitting reply now.\n\n```json\n{\"scout_charters\": [{\"scout_id\": \"s1\"}]}\n```";
+        let hook = HookOp {
+            op: OpKind::ParseJson,
+            args: json!({ "from": body }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("parsed".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "parsed");
+                assert_eq!(
+                    value,
+                    json!({"scout_charters": [{"scout_id": "s1"}]})
+                );
             }
             _ => panic!("expected SetVar effect"),
         }
