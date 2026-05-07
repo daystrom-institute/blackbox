@@ -35,6 +35,7 @@ mod query;
 mod render;
 mod routing;
 mod search;
+mod slack_thread_store;
 mod system_memory;
 mod threads;
 mod tool_docs;
@@ -182,6 +183,12 @@ struct SharedState {
     badgey_registry: Arc<orchestration::badgey::BadgeyRegistry>,
     badgey_proposals: Arc<orchestration::badgey::ProposalStore>,
     badgey_journal: Arc<orchestration::badgey::ActionJournal>,
+    /// Slack thread → claude session_id continuity map. Webhook
+    /// `start_arc` looks up the prior session before starting an arc
+    /// and seeds it into actor_sessions; the arc writes back when
+    /// the executor turn completes. Lets follow-up @mentions in the
+    /// same Slack thread continue the same Badgey conversation.
+    slack_thread_store: Arc<slack_thread_store::SlackThreadStore>,
 }
 
 const SIGNAL_LOG_CAP: usize = 200;
@@ -10087,6 +10094,35 @@ async fn dispatch_verdict(
             for (k, v) in initial_vars {
                 merged_vars.insert(k, v);
             }
+            // Slack thread continuity: if this arc came in through the
+            // slack inlet and the entity carries `(team_id, channel,
+            // thread_ts)`, look up any prior Claude session_id for
+            // that thread and seed the badgey actor with it. The
+            // `_actor_session.<actor>` magic key is stripped from
+            // initial_vars in the engine before seed_vars runs (see
+            // `extract_actor_session_seeds`).
+            let slack_thread_key = (inlet_name == "slack")
+                .then(|| {
+                    let team = merged_vars.get("team_id").and_then(Value::as_str)?;
+                    let channel = merged_vars.get("channel").and_then(Value::as_str)?;
+                    let thread_ts = merged_vars.get("thread_ts").and_then(Value::as_str)?;
+                    Some((
+                        team.to_string(),
+                        channel.to_string(),
+                        thread_ts.to_string(),
+                    ))
+                })
+                .flatten();
+            if let Some((team, channel, thread_ts)) = slack_thread_key.as_ref() {
+                if let Some(session_id) =
+                    state.slack_thread_store.get(team, channel, thread_ts)
+                {
+                    merged_vars.insert(
+                        "_actor_session.badgey".into(),
+                        Value::String(session_id),
+                    );
+                }
+            }
             // project_dir resolution priority:
             //   1. ${INLET_NAME_UPPERCASE}_PROJECT_DIR env override
             //      (works for webhooks AND pollers — both pass their
@@ -10109,8 +10145,9 @@ async fn dispatch_verdict(
             let cron_name = inlet_name.strip_prefix("cron:").map(|s| s.to_string());
             let crons_for_done = state.crons.clone();
             let server = BlackboxServer::new(state.clone());
+            let slack_state = state.clone();
             tokio::spawn(async move {
-                let _ = workflow::run_workflow_with_initial_vars(
+                let result = workflow::run_workflow_with_initial_vars(
                     &server,
                     &compiled,
                     project_dir,
@@ -10118,6 +10155,21 @@ async fn dispatch_verdict(
                     merged_vars,
                 )
                 .await;
+                // Capture the badgey session_id back to the slack
+                // thread store so the next @mention in this thread
+                // resumes the same conversation.
+                if let Some((team, channel, thread_ts)) = slack_thread_key.as_ref() {
+                    if let Some(session_id) = result.actor_sessions.get("badgey") {
+                        if !session_id.is_empty() && session_id != "pending" {
+                            slack_state.slack_thread_store.set(
+                                team,
+                                channel,
+                                thread_ts,
+                                session_id,
+                            );
+                        }
+                    }
+                }
                 if let Some(name) = cron_name {
                     crons_for_done.mark_done(&name);
                 }
@@ -11785,6 +11837,10 @@ async fn main() -> anyhow::Result<()> {
         badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),
         badgey_proposals,
         badgey_journal,
+        slack_thread_store: Arc::new(
+            slack_thread_store::SlackThreadStore::open(&store_dir)
+                .unwrap_or_else(|e| panic!("opening slack thread store at {store_dir:?}: {e}")),
+        ),
     });
     shared
         .agent_adapter_registry
@@ -12251,6 +12307,9 @@ mod tests {
             ),
             badgey_journal: Arc::new(
                 orchestration::badgey::ActionJournal::new(tmp.path().join("bro")).unwrap(),
+            ),
+            slack_thread_store: Arc::new(
+                slack_thread_store::SlackThreadStore::open(&tmp.path().join("bro")).unwrap(),
             ),
         });
         BlackboxServer::new(state)

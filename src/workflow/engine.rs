@@ -71,6 +71,12 @@ pub struct WorkflowRunResult {
     /// auditable via the normal knowledge + notes surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arc_thread_id: Option<String>,
+    /// Final actor → session_id map at terminal state. Surfaces the
+    /// session ids spawned for each `kind: executor` actor so
+    /// post-arc capture (e.g., the Slack thread continuity store)
+    /// can persist them keyed by an external correlation.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub actor_sessions: HashMap<String, String>,
 }
 
 /// Absolute ceiling on nested sub-workflow composition. The depth is
@@ -79,6 +85,30 @@ pub struct WorkflowRunResult {
 /// silently skip the cap (caught by a Haiku self-audit round, fixed
 /// here). Top-level callers pass 0.
 pub const MAX_COMPOSITION_DEPTH: u32 = 5;
+
+/// Strip `_actor_session.<actor>` magic keys out of `initial_vars` and
+/// return them as an actor → session_id map. Callers (e.g., the Slack
+/// webhook ingress) inject these to seed `actor_sessions` so the
+/// runner's first executor dispatch resumes the named session instead
+/// of starting fresh. Removing the keys before `seed_vars` runs keeps
+/// them out of the workflow's typed-vars schema and out of node
+/// templates.
+fn extract_actor_session_seeds(vars: &mut Map<String, Value>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let keys: Vec<String> = vars
+        .keys()
+        .filter(|k| k.starts_with("_actor_session."))
+        .cloned()
+        .collect();
+    for k in keys {
+        if let Some(Value::String(s)) = vars.remove(&k) {
+            if let Some(actor) = k.strip_prefix("_actor_session.") {
+                out.insert(actor.to_string(), s);
+            }
+        }
+    }
+    out
+}
 
 pub async fn run_workflow(
     server: &BlackboxServer,
@@ -141,11 +171,15 @@ pub async fn run_workflow_streaming_with_vars(
     compiled: &CompiledWorkflow,
     project_dir: Option<String>,
     max_steps: Option<usize>,
-    initial_vars: Map<String, Value>,
+    mut initial_vars: Map<String, Value>,
     event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
 ) -> WorkflowRunResult {
+    let actor_session_seeds = extract_actor_session_seeds(&mut initial_vars);
     let mut runner = WorkflowRunner::new(server, compiled, project_dir, max_steps.unwrap_or(50), 0);
     runner.event_sink = Some(event_sink);
+    for (actor, session) in actor_session_seeds {
+        runner.actor_sessions.insert(actor, session);
+    }
     if let Err(e) = runner
         .ctx
         .seed_vars(initial_vars, compiled.spec.vars_schema.as_ref())
@@ -161,6 +195,7 @@ pub async fn run_workflow_streaming_with_vars(
             arc_id: runner.ctx.meta.arc_id.clone(),
             plan: None,
             arc_thread_id: None,
+            actor_sessions: HashMap::new(),
         };
     }
     // Required-vars enforcement at arc start. seed_vars validates kind
@@ -178,6 +213,7 @@ pub async fn run_workflow_streaming_with_vars(
                 arc_id: runner.ctx.meta.arc_id.clone(),
                 plan: None,
                 arc_thread_id: None,
+                actor_sessions: HashMap::new(),
             };
         }
     }
@@ -245,6 +281,7 @@ pub async fn run_workflow_streaming_with_vars(
     // impl (which would conflict with the by-value field moves into
     // WorkflowRunResult below).
     server.unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
+    let actor_sessions = runner.actor_sessions.clone();
     WorkflowRunResult {
         status,
         events: runner.events,
@@ -253,6 +290,7 @@ pub async fn run_workflow_streaming_with_vars(
         arc_id: runner.ctx.meta.arc_id,
         plan: None,
         arc_thread_id,
+        actor_sessions,
     }
 }
 
@@ -269,9 +307,10 @@ pub async fn run_workflow_at_depth(
     max_steps: Option<usize>,
     composition_depth: u32,
     seed_outputs: HashMap<String, String>,
-    initial_vars: Map<String, Value>,
+    mut initial_vars: Map<String, Value>,
     parent_arc_id: Option<String>,
 ) -> WorkflowRunResult {
+    let actor_session_seeds = extract_actor_session_seeds(&mut initial_vars);
     if composition_depth > MAX_COMPOSITION_DEPTH {
         return WorkflowRunResult {
             status: format!(
@@ -283,6 +322,7 @@ pub async fn run_workflow_at_depth(
             arc_id: String::new(),
             plan: None,
             arc_thread_id: None,
+            actor_sessions: HashMap::new(),
         };
     }
     let mut runner = WorkflowRunner::new(
@@ -293,6 +333,9 @@ pub async fn run_workflow_at_depth(
         composition_depth,
     );
     runner.node_outputs = seed_outputs.clone();
+    for (actor, session) in actor_session_seeds {
+        runner.actor_sessions.insert(actor, session);
+    }
     // Mirror seeded outputs into the typed channel as JSON strings.
     for (k, v) in &seed_outputs {
         runner.ctx.set_output(k, Value::String(v.clone()));
@@ -313,6 +356,7 @@ pub async fn run_workflow_at_depth(
             arc_id: runner.ctx.meta.arc_id.clone(),
             plan: None,
             arc_thread_id: None,
+            actor_sessions: HashMap::new(),
         };
     }
     // Required-vars enforcement at sub-arc start. Catches subworkflow
@@ -329,6 +373,7 @@ pub async fn run_workflow_at_depth(
                 arc_id: runner.ctx.meta.arc_id.clone(),
                 plan: None,
                 arc_thread_id: None,
+                actor_sessions: HashMap::new(),
             };
         }
     }
@@ -392,6 +437,7 @@ pub async fn run_workflow_at_depth(
         }
     }
     server.unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
+    let actor_sessions = runner.actor_sessions.clone();
     WorkflowRunResult {
         status,
         events: runner.events,
@@ -400,6 +446,7 @@ pub async fn run_workflow_at_depth(
         arc_id: runner.ctx.meta.arc_id,
         plan: None,
         arc_thread_id,
+        actor_sessions,
     }
 }
 
@@ -415,6 +462,7 @@ pub fn dry_run(compiled: &CompiledWorkflow) -> WorkflowRunResult {
         arc_id: String::new(),
         plan: Some(compiled.summarize()),
         arc_thread_id: None,
+        actor_sessions: HashMap::new(),
     }
 }
 
