@@ -926,6 +926,8 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             cmd.env(k, v);
         }
     }
+    cmd.env_remove("BLACKBOX_MCP_NAME")
+        .env_remove("BLACKBOX_MCP_URL");
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

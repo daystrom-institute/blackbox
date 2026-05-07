@@ -902,6 +902,8 @@ fn run_validation_command(
     let output = Command::new(command)
         .args(args)
         .current_dir(&working_dir)
+        .env_remove("BLACKBOX_MCP_NAME")
+        .env_remove("BLACKBOX_MCP_URL")
         .output()
         .with_context(|| {
             format!(
