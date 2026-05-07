@@ -202,10 +202,32 @@ pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<MatrixSpec>,
 
+    /// What to do when the actor's dispatched task terminates with a
+    /// non-success outcome (timed out / failed / cancelled). Default
+    /// `halt` matches the engine's pre-existing behavior — bail and
+    /// fail the arc. Setting `continue` records the task envelope into
+    /// `actor_results.<NodeId>` and proceeds to `next` so downstream
+    /// nodes can branch on the outcome (e.g. PostOutcome rendering a
+    /// red badge instead of crashing the arc). Only meaningful on
+    /// nodes with a real `actor` reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_failure: Option<ActorFailureMode>,
+
     /// Control-flow successor for this node. Required on every node;
     /// the arc terminates when control reaches a node whose
     /// transition is `Terminal`.
     pub next: NodeTransition,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorFailureMode {
+    /// Bail the arc on actor failure (default — preserves legacy semantics).
+    #[default]
+    Halt,
+    /// Record the task envelope and continue to `next`. Downstream
+    /// gates / templates inspect `actor_results.<NodeId>.status` etc.
+    Continue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

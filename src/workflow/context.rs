@@ -29,6 +29,14 @@ use serde_json::{json, Map, Value};
 pub struct ArcContext {
     pub vars: Map<String, Value>,
     pub outputs: HashMap<String, Value>,
+    /// Per-node actor task envelopes: `task_result_json` for each actor
+    /// node that has dispatched. Populated regardless of terminal
+    /// outcome (success / failed / cancelled / timed_out) when the
+    /// node is configured `actor_failure: continue`. Lets downstream
+    /// nodes inspect `taskId`, `status`, `costUsd`, `result`, etc.
+    /// for branching, summary rendering, and state-machine bookkeeping.
+    #[serde(default)]
+    pub actor_results: HashMap<String, Value>,
     pub meta: ArcMeta,
     /// Most recent Wait resolution. Cleared when the next Wait
     /// dispatches (not on node boundary) so the immediate-successor
@@ -121,10 +129,21 @@ impl ArcContext {
         Self {
             vars: Map::new(),
             outputs: HashMap::new(),
+            actor_results: HashMap::new(),
             meta,
             last_signal: None,
             signal_history: Vec::new(),
         }
+    }
+
+    /// Record the full task envelope returned by an actor node. Called
+    /// by the engine after every actor dispatch, regardless of terminal
+    /// outcome. Downstream nodes (and gate packets) read fields off
+    /// `actor_results.<NodeId>`: `taskId`, `status`, `costUsd`,
+    /// `result`, `sessionId`, etc. See `orch::task_result_json` for
+    /// the canonical shape.
+    pub fn record_actor_result(&mut self, node_id: &str, value: Value) {
+        self.actor_results.insert(node_id.to_string(), value);
     }
 
     /// Validate-and-write a single var. Returns Err if a schema is
@@ -213,6 +232,7 @@ impl ArcContext {
         json!({
             "vars": self.vars,
             "outputs": self.outputs,
+            "actor_results": self.actor_results,
             "meta": self.meta,
             "last_signal": self.last_signal,
             "signals_count": self.signal_history.len(),
@@ -232,6 +252,7 @@ impl ArcContext {
         json!({
             "vars": self.vars,
             "outputs": self.outputs,
+            "actor_results": self.actor_results,
             "meta": self.meta,
             "last_signal": self.last_signal,
             "node_output": str_form,
@@ -297,6 +318,14 @@ impl ArcContext {
                 }
                 let node = parts[1];
                 let raw = self.outputs.get(node)?.clone();
+                walk_value(&raw, &parts[2..])
+            }
+            "actor_results" => {
+                if parts.len() == 1 {
+                    return Some(json!(self.actor_results));
+                }
+                let node = parts[1];
+                let raw = self.actor_results.get(node)?.clone();
                 walk_value(&raw, &parts[2..])
             }
             "meta" => {

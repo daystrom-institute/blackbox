@@ -26,8 +26,8 @@ use super::context::{resolve_arg_value, ArcContext, ArcMeta, SignalRef};
 use super::ops::{execute_op, HookOp, OnFailure, OpEffect};
 use super::wait::{canonicalize_correlation, PendingWait, WaitSpec};
 use super::{
-    ActorKind, ActorSpec, CompiledWorkflow, ForeachSpec, GateMode, ItemFailurePolicy, MatrixSpec,
-    NodeMode, NodeTransition, Workflow,
+    ActorFailureMode, ActorKind, ActorSpec, CompiledWorkflow, ForeachSpec, GateMode,
+    ItemFailurePolicy, MatrixSpec, NodeMode, NodeTransition, Workflow,
 };
 use crate::orchestration as orch;
 use crate::BlackboxServer;
@@ -755,6 +755,10 @@ impl<'a> WorkflowRunner<'a> {
             OpEffect::SetWorktree(path) => {
                 self.ctx.meta.worktree = path;
             }
+            OpEffect::SetProjectDir(path) => {
+                self.ctx.meta.project_dir = path.clone();
+                self.project_dir = path;
+            }
         }
         Ok(())
     }
@@ -1406,9 +1410,10 @@ impl<'a> WorkflowRunner<'a> {
             );
         }
 
+        let actor_failure = spec.actor_failure.unwrap_or_default();
         match &actor.kind {
             ActorKind::Executor => {
-                self.run_executor_node(node_id, actor, &actor_name, &prompt)
+                self.run_executor_node(node_id, actor, &actor_name, &prompt, actor_failure)
                     .await?;
             }
             ActorKind::Ensemble => {
@@ -1530,6 +1535,7 @@ impl<'a> WorkflowRunner<'a> {
         actor: &ActorSpec,
         actor_name: &str,
         prompt: &str,
+        failure_mode: ActorFailureMode,
     ) -> Result<()> {
         let brofile = actor
             .brofile
@@ -1567,22 +1573,77 @@ impl<'a> WorkflowRunner<'a> {
             inner.id.clone()
         };
         let completed = orch::wait_for_task_with_timeout(&task, Some(900.0)).await;
-        if !completed {
-            bail!("node '{node_id}' (task {task_id}) exceeded timeout");
+        // Record full task envelope into actor_results regardless of
+        // outcome so downstream nodes can branch on `status`, surface
+        // `result` text, or stash `taskId` for state-machine bookkeeping.
+        // Timeout uses the snapshot variant (sets `timed_out: true`); a
+        // completed task uses the canonical task_result_json.
+        let result_json = if completed {
+            orch::task_result_json(&task)
+        } else {
+            orch::timeout_snapshot_json(&task)
+        };
+        self.ctx
+            .record_actor_result(node_id, result_json.clone());
+
+        let session_id = task.inner.lock().session_id.clone();
+        if actor.durable {
+            self.actor_sessions
+                .insert(actor_name.to_string(), session_id.clone());
         }
-        let result_json = orch::task_result_json(&task);
+
+        let task_status = result_json
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let success = completed && task_status == "completed";
+
         let output = result_json
             .get("result")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let session_id = task.inner.lock().session_id.clone();
-
-        if actor.durable {
-            self.actor_sessions
-                .insert(actor_name.to_string(), session_id.clone());
-        }
+        // Always record string output so legacy `${outputs.NodeId}`
+        // templates stay populated even on failure (best-effort: the
+        // `result` field on a failed/timed-out task is the last
+        // assistant message before termination).
         self.record_output(node_id, output.clone());
+
+        if !success {
+            let reason = if !completed { "timeout" } else { "task_failed" };
+            self.log_event(
+                "node_actor_failure",
+                json!({
+                    "node": node_id,
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "reason": reason,
+                    "task_status": task_status,
+                    "failure_mode": failure_mode,
+                }),
+            );
+            match failure_mode {
+                ActorFailureMode::Halt => {
+                    if !completed {
+                        bail!("node '{node_id}' (task {task_id}) exceeded timeout");
+                    } else {
+                        bail!(
+                            "node '{node_id}' (task {task_id}) terminated with status={task_status}"
+                        );
+                    }
+                }
+                ActorFailureMode::Continue => {
+                    self.arc_note(
+                        "surprise",
+                        &format!(
+                            "node '{node_id}' actor failed (reason={reason}, status={task_status}); continuing per actor_failure=continue"
+                        ),
+                    );
+                    return Ok(());
+                }
+            }
+        }
 
         let output_preview: String = output.chars().take(160).collect();
         self.log_event(

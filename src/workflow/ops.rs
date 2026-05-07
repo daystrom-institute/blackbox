@@ -153,6 +153,11 @@ pub enum OpEffect {
     SetVar { key: String, value: Value },
     /// Update meta.worktree (set to Some / None).
     SetWorktree(Option<String>),
+    /// Update the runner's project_dir (and ctx.meta.project_dir).
+    /// Used when the arc's project context is determined dynamically
+    /// (e.g. resolved from a Slack channel→project binding) rather
+    /// than fixed at arc start.
+    SetProjectDir(Option<String>),
 }
 
 /// Execute one HookOp against the given context. The context is
@@ -1124,8 +1129,8 @@ async fn exec_worktree_remove(args: &Value, ctx: &ArcContext) -> Result<OpEffect
 }
 
 fn exec_set_meta(args: &Value) -> Result<OpEffect> {
-    // Only `worktree` is mutable through SetMeta for now. Other meta
-    // fields are arc-intrinsic.
+    // Mutable meta keys: `worktree`, `project_dir`. Other meta fields
+    // are arc-intrinsic and immutable.
     let key = args
         .get("key")
         .and_then(|v| v.as_str())
@@ -1140,7 +1145,18 @@ fn exec_set_meta(args: &Value) -> Result<OpEffect> {
             };
             Ok(OpEffect::SetWorktree(v))
         }
-        other => bail!("SetMeta: unsupported key '{other}' (only 'worktree' is mutable)"),
+        "project_dir" => {
+            let v = match value {
+                Value::String(s) if s.is_empty() => None,
+                Value::String(s) => Some(s),
+                Value::Null => None,
+                other => bail!("SetMeta project_dir must be string or null, got {other:?}"),
+            };
+            Ok(OpEffect::SetProjectDir(v))
+        }
+        other => bail!(
+            "SetMeta: unsupported key '{other}' (mutable keys: worktree, project_dir)"
+        ),
     }
 }
 
