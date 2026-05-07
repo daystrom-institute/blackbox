@@ -1,90 +1,156 @@
-# Slack daily-brief — design + status
+# Slack daily-brief — runbook
 
 Per-project Slack channels host a daily Badgey-driven triage brief.
-Inbound flow: `:white_check_mark:` reaction approves, in-thread reply
-clarifies/refines.
+Inbound flow: `:white_check_mark:` reaction approves, in-thread
+reply clarifies/refines.
 
-## Status
-
-**Plumbing landed:** channel-binding store + `bro_slack_bind` MCP
-tool, `SlackProposalLinks` store, `signal_proposal_approved_on_check`
-+ `signal_proposal_clarify_on_thread_reply` rules in
-`webhook-routing/slack`, `try_slack_proposal_signal_hook` in
-`dispatch_verdict`, cron `tz` field for system-local schedules,
-bind/unbind → BadgeyInstance dismissal.
-
-**Outbound implementation pending:** the per-channel triage cycle
-itself is being rebuilt as a workflow on top of the upcoming
-`foreach`/`matrix` workflow primitives (work in `transcript-search-foreach-matrix`,
-commit `0530ba2`). When that lands and merges to main, the daily
-brief gets implemented natively as:
+## Architecture
 
 ```
-badgey-triage-fanout-arc (started by daily cron)
-└── ForeachBinding (foreach over slack_channel_bindings)
-    └── badgey-triage-channel-arc (subworkflow per binding)
-        ├── EnsureInstance — get-or-create system Badgey for (project, channel)
-        ├── TriageTurn — Badgey emits scout charters via bg-action-spawn-subbro
-        ├── ForeachScout (foreach with parallelism cap)
-        │   └── badgey-scout-arc — bro_exec(badgey-scout-persona) per charter
-        ├── SynthesisTurn — Badgey reads scout dones, emits bg-action-emit-proposal
-        ├── Branch — proposals empty? → DreamTurn else → PostToSlack
-        ├── DreamTurn — Badgey corpus-mining mode (workflow/agent extraction)
-        └── PostToSlack — foreach over proposals: chat.postMessage per
+daily 08:00 system-local cron tick
+  → routing packet badgey/cron-routing matches cron_name=badgey-triage-daily
+    → start_arc badgey-triage-fanout-arc
+      └── ListBindings  (mcp_call bro_slack_bind action=list)
+      └── ForeachBinding (parallelism=2, on_item_failure=continue)
+            └── badgey-triage-channel-arc  (per channel binding)
+                  ├── ExtractBinding   (set top-level vars from binding)
+                  ├── EnsureInstance   (mcp_call badgey_ensure_for_channel)
+                  ├── TriageTurn       (mcp_call badgey_resume — corpus walk + scout-charter emission)
+                  ├── ForeachScout     (parallelism=3, subworkflow_ref=badgey-scout-arc)
+                  │     └── badgey-scout-arc  (executor=badgey-scout-persona, durable=false)
+                  ├── SynthesisTurn    (mcp_call badgey_resume — proposals or dream/explore)
+                  ├── ListProposals    (mcp_call badgey_proposals_list since=synthesis_started_at)
+                  └── ForeachPostProposal (parallelism=1, on_item_failure=continue)
+                        └── badgey-slack-emit-proposal-arc
+                              ├── Render      (set_var rendered_text)
+                              ├── Post        (http_json chat.postMessage with metadata)
+                              └── RecordLink  (mcp_call bro_slack_link_record)
 ```
 
-Until then the cron payload tool is `badgey_triage_inbox` (the simple
-stale-thread synthesizer), which does not post to Slack. No automatic
-brief lands; the inbound hooks still fire for any messages a human
-posts manually.
+Empty-day handling falls out naturally:
+- 0 scout charters → `ForeachScout` iterates 0×, `scout_findings` empty,
+  synthesis charter pivots to dream/explore mode.
+- 0 proposals → `ForeachPostProposal` iterates 0×, channel stays quiet.
 
-## Configure a channel binding
+Inbound side stays the same as before:
+- `:white_check_mark:` reaction → `proposal-approved` signal correlated
+  by `thread_ts=item_ts` → `try_slack_proposal_signal_hook` resolves
+  via `SlackProposalLinks` and posts a threaded ack. Apply call-site
+  becomes `badgey_apply_proposal_internal(link.instance_id, link.proposal_id, false)`.
+- In-thread reply → `proposal-clarify` signal → same hook, refine
+  call-site becomes `bro_resume(link.authoring_session_id, reply_text)`.
+
+## Prerequisites
+
+1. Daemon built + running with the merged foreach/matrix runtime
+   (commit `0530ba2` and friends).
+2. Slack sidecar `bro-slack.service` running.
+3. `SLACK_BOT_TOKEN` in the daemon environment.
+4. `~/.bro/slack-identities.json` populated for any user you want
+   surfaced as `bbox_user` in ack messages.
+
+## Install (idempotent — re-run after `git pull`)
+
+```bash
+PORT="${BBOX_PORT:-7264}"
+BBOX="http://127.0.0.1:${PORT}"
+
+# Workflows
+for wf in badgey-scout-arc badgey-slack-emit-proposal-arc \
+          badgey-triage-channel-arc badgey-triage-fanout-arc; do
+  curl -fsS -X POST -H 'Content-Type: application/json' \
+    "${BBOX}/admin/workflow/install" \
+    -d "$(jq -nc --arg id "$wf" \
+        --slurpfile spec examples/badgey/workflows/${wf}.json \
+        '{id:$id, spec:$spec[0]}')"
+done
+
+# Cron-routing packet (compiles + activates the start_arc rule)
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  "${BBOX}/admin/packet/compile" \
+  -d @examples/badgey/packets/badgey-cron-routing.json
+
+# Daily cron — schedule + routing-packet binding
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  "${BBOX}/admin/cron/install" \
+  -d "$(jq -nc --slurpfile spec examples/badgey/crons/badgey-triage-daily.json \
+        '{spec: $spec[0]}')"
+```
+
+## Bind a channel
 
 ```
-bbox_project_register(path="/home/me/repos/transcript-search")
+bbox_project_register(path="/home/me/repos/my-project")
 bro_slack_bind(
   action="bind",
   team_id="T0123ABCD",
-  channel_id="C0123XYZ",
-  channel_name="transcript-search",
-  project="/home/me/repos/transcript-search"
+  channel_id="C0123XYZ",          # rename-safe lookup key
+  channel_name="my-project",      # display only
+  project="/home/me/repos/my-project"
 )
 ```
 
-Inspect with `bro_slack_bind(action="list")`. Unbinding dismisses
-the system Badgey instance for that channel (best-effort, logged on
-failure).
+`bro_slack_bind(action="list")` to inspect. `action="unbind"` also
+dismisses the system Badgey instance for that channel (best-effort).
 
-## Schedule
+## Manual smoke
 
-The cron runs at **08:00 system-local time** (`tz: "Local"` in the
-spec). With DST, that's 14:00 UTC during MDT, 15:00 UTC during MST —
-re-evaluated each tick so DST transitions are seamless.
+```
+bro_orchestrate_run(
+  workflow=<contents of badgey-triage-fanout-arc.json>,
+  dry_run=true
+)
+```
 
-## Inbound routing
+Then for a real run (drop dry_run): the arc returns when every
+per-channel subworkflow terminates. Per-channel timing depends on
+Badgey's triage turn (~minutes), scout fanout (parallelism=3),
+synthesis turn (~minutes), Slack post burst.
 
-Already wired via `webhook-routing/slack`:
-- `:white_check_mark:` reaction on a posted proposal →
-  `proposal-approved` signal correlated by `thread_ts=item_ts`.
-- In-thread reply on a posted proposal →
-  `proposal-clarify` signal correlated by `thread_ts`.
+## Verification
 
-Signal hooks in `dispatch_verdict` resolve the message back to its
-`SlackProposalLink` and post a threaded ack. When sub-bro authoring
-fully lands, those hooks become the call sites for
-`badgey_apply_proposal_internal` (approve) and `bro_resume`
-(clarify).
+- `bro_arc_status(arc_id=…)` — current node, completed nodes, in-flight
+  fork branches, last verdict, visit counts. Works on both the top-level
+  fanout arc and per-binding subworkflows.
+- `bbox_inbox` — surfaces unresolved disputes/blocked notes from
+  Badgey scouts and the synthesis turn.
+- `bro_signals(signal="proposal-approved")` and
+  `bro_signals(signal="proposal-clarify")` — inbound reaction and
+  thread-reply traffic.
+- `bro_webhook_deliveries(name="slack")` — every Slack event through
+  the routing packet, with extracted entity + verdict classification.
+- `badgey_proposals_list(badgey_id=…)` — snapshot of all proposals
+  owned by a channel's system Badgey instance.
 
-## Future work checklist
+## Tunables
 
-- [ ] Wait for `foreach`/`matrix` to merge from
-      `transcript-search-foreach-matrix` to main.
-- [ ] Author `badgey-triage-fanout-arc`,
-      `badgey-triage-channel-arc`, `badgey-scout-arc` workflow specs
-      (see topology above).
-- [ ] Switch the daily cron payload to `start_arc` of the fanout
-      workflow.
-- [ ] Replace stub-ack reply text in
-      `try_slack_proposal_signal_hook` with the real
-      `badgey_apply_proposal_internal` / `bro_resume` calls once
-      proposals are stored under a registered `BadgeyInstance`.
+- **Cron schedule** — `examples/badgey/crons/badgey-triage-daily.json`,
+  `schedule` field in 6-field cron form. `tz: "Local"` keeps it
+  stable across DST transitions.
+- **Channel-fanout parallelism** — `ForeachBinding.foreach.parallelism`
+  in `badgey-triage-fanout-arc.json`. Default 2.
+- **Scout-fanout parallelism** — `ForeachScout.foreach.parallelism`
+  in `badgey-triage-channel-arc.json`. Default 3 (capped by the
+  workflow engine's `MAX_FOREACH_PARALLELISM`).
+- **Triage / synthesis timeouts** — `badgey_resume(timeout_seconds=…)`
+  argument in the channel-arc's TriageTurn (600s) and SynthesisTurn
+  (900s) nodes.
+
+## Future-work checklist
+
+- [ ] Wire the apply call-site in `try_slack_proposal_signal_hook`:
+      replace the stub-ack text with
+      `badgey_apply_proposal_internal(link.instance_id, link.proposal_id,
+      retry_failed=false)` once a proposal lands. The link record
+      already carries `instance_id` for this.
+- [ ] Wire the refine call-site likewise: `bro_resume(link.authoring_session_id,
+      reply_text)`. Requires populating `authoring_session_id` on
+      link records — the synthesis turn could capture the badgey
+      session_id used for that proposal.
+- [ ] Per-proposal Slack message-update on refinement (chat.update on
+      the original msg_ts; bumps `link.version`).
+- [ ] User-gate on `proposal-approved` so only the project owner's
+      reaction triggers apply (read `bbox_user` from the entity,
+      check against an allowlist).
+- [ ] Rate-limit / backoff on Slack 429 responses in
+      `badgey-slack-emit-proposal-arc`.
