@@ -957,12 +957,23 @@ fn command_display(command: &str, args: &[String]) -> String {
 }
 
 fn truncate_for_report(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
         return value.to_string();
     }
-    let mut out = value.chars().take(max_chars).collect::<String>();
-    out.push_str("\n[truncated]");
-    out
+    if max_chars < 32 {
+        return value.chars().take(max_chars).collect();
+    }
+    let marker = "\n[truncated middle]\n";
+    let budget = max_chars.saturating_sub(marker.chars().count());
+    let head_len = budget / 2;
+    let tail_len = budget - head_len;
+    let head = value.chars().take(head_len).collect::<String>();
+    let tail = value
+        .chars()
+        .skip(char_count.saturating_sub(tail_len))
+        .collect::<String>();
+    format!("{head}{marker}{tail}")
 }
 
 fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> {
@@ -4852,6 +4863,22 @@ mod tests {
         assert_eq!(run_response.status, "step_failed");
         assert!(run_response.rolled_back);
         assert!(!generated.exists());
+    }
+
+    #[test]
+    fn command_output_truncation_preserves_failure_tail() {
+        let output = (0..200)
+            .map(|idx| format!("line {idx}"))
+            .chain(std::iter::once("failures: important_test".to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let truncated = truncate_for_report(&output, 120);
+
+        assert!(truncated.contains("line 0"));
+        assert!(truncated.contains("[truncated middle]"));
+        assert!(truncated.contains("failures: important_test"));
+        assert!(truncated.chars().count() <= 120);
     }
 
     #[test]
