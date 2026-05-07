@@ -26,7 +26,7 @@ file names or tool prefixes, it does not count.
 |---|---|---|---|
 | Add `[lib]` target to `Cargo.toml` | TOML table insertion/update with idempotent key checks | none | `edit_toml_manifest` or generic structured-config edit |
 | Create `src/lib.rs` from `mod` declarations in `main.rs` | extract/copy module declarations; transform copied declarations to `pub mod`; create file | partial: `add_rust_mod_decl` can create new declarations with visibility | batch module-declaration extraction/copy; existing declaration visibility rewrite |
-| Delete `mod foo;` from `main.rs` after lib reparent | syntactic deletion of selected top-level `mod_item`s | partial: `extract_rust_items` can move/delete via extraction, but not delete-only | `delete_rust_items` or move-without-target |
+| Delete `mod foo;` from `main.rs` after lib reparent | syntactic deletion of selected top-level `mod_item`s | covered with `delete_rust_items` | compound transaction integration |
 | Rewrite binary crate references from `crate::foo` to `blackbox::foo` where needed | semantic path rewrite across crate boundary | none | rust-analyzer/workspace reference rewrite plus compiler diagnostics |
 | Move inline `SharedState`, `BlackboxServer`, impls, routes, tests to `server/mod.rs` | top-level item extraction; impl extraction; route/helper extraction; test block extraction | partial: top-level + impl method extraction | nested module/test extraction, multi-item grouping, visibility/import repair |
 | Shrink `main.rs` to bootstrap only | create replacement file from selected retained functions/imports | none | file rewrite plan from template + import pruning |
@@ -58,7 +58,10 @@ file names or tool prefixes, it does not count.
   - idempotent duplicate detection
 - `delete_rust_items`
   - delete top-level items or impl methods by exact syntactic identity
+  - require explicit `item_names`; `item_kinds` can narrow but not select alone
   - same parse/hash/dirty checks as extraction
+  - implemented for top-level items and impl methods; nested module items remain
+    future work
 - `move_rust_file`
   - `src/foo.rs` -> `src/foo/mod.rs` or arbitrary file move
   - records old/new path, creates parent dirs, updates rollback
@@ -107,7 +110,7 @@ file names or tool prefixes, it does not count.
    - rollback across all touched files
 
 2. **Deletion and declaration batching**
-   - `delete_rust_items`
+   - `delete_rust_items` for top-level items and impl methods is covered
    - copy/batch module declarations from one file to another
 
 3. **File move support**

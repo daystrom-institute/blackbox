@@ -36,8 +36,8 @@ pub struct RefactorStatusParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
-    /// Plan kind. Supports "extract_rust_items", "extract_rust_impl_methods",
-    /// and "add_rust_router_to_sum".
+    /// Plan kind. Supports Rust extraction, deletion, declaration insertion,
+    /// and router-sum updates.
     pub kind: String,
     /// Source Rust file. Relative paths resolve against project_dir or cwd.
     pub source: String,
@@ -273,11 +273,12 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
     match p.kind.as_str() {
         "extract_rust_items" => plan_extract_rust_items(p),
         "extract_rust_impl_methods" => plan_extract_rust_impl_methods(p),
+        "delete_rust_items" => plan_delete_rust_items(p),
         "add_rust_router_to_sum" => plan_add_rust_router_to_sum(p),
         "add_rust_mod_decl" => plan_add_rust_mod_decl(p),
         "add_rust_use_decl" => plan_add_rust_use_decl(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl"
         ),
     }
 }
@@ -656,6 +657,144 @@ fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<String> {
             },
         ],
         items: selected.into_iter().map(|method| method.item).collect(),
+        leftovers,
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_delete_rust_items(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let has_names = p
+        .item_names
+        .as_deref()
+        .is_some_and(|names| !names.is_empty());
+    if !has_names {
+        bail!("delete_rust_items requires non-empty item_names; use item_kinds only to narrow deletion matches");
+    }
+    let wants_impl_methods = p
+        .item_kinds
+        .as_deref()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "impl_method"));
+    if wants_impl_methods {
+        plan_delete_rust_impl_methods(p, &source_path)
+    } else {
+        plan_delete_rust_top_level_items(p, &source_path)
+    }
+}
+
+fn plan_delete_rust_top_level_items(p: &RefactorPlanParams, source_path: &Path) -> Result<String> {
+    if let Some(kinds) = p.item_kinds.as_deref() {
+        if kinds.iter().any(|kind| kind == "impl_method") {
+            bail!("delete_rust_items cannot mix impl_method with top-level item kinds");
+        }
+    }
+    let parsed = parse_rust_file(source_path)?;
+    let items = rust_items(&parsed);
+    let selected = select_items(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
+    build_delete_rust_plan(&parsed, "top-level Rust item(s)", &items, selected)
+}
+
+fn plan_delete_rust_impl_methods(p: &RefactorPlanParams, source_path: &Path) -> Result<String> {
+    if let Some(kinds) = p.item_kinds.as_deref() {
+        if !kinds.iter().all(|kind| kind == "impl_method") {
+            bail!("delete_rust_items cannot mix impl_method with top-level item kinds");
+        }
+    }
+    let parsed = parse_rust_file(source_path)?;
+    let methods = rust_impl_methods(&parsed);
+    let candidates = methods
+        .iter()
+        .filter(|method| {
+            p.impl_name
+                .as_deref()
+                .is_none_or(|impl_name| method.impl_name == impl_name)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        if let Some(impl_name) = p.impl_name.as_deref() {
+            bail!("no impl block matching `{impl_name}` found");
+        }
+        bail!("no Rust impl methods found");
+    }
+
+    let items = candidates
+        .iter()
+        .map(|method| method.item.clone())
+        .collect::<Vec<_>>();
+    let selected = select_items(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
+    if p.impl_name.is_none() {
+        if let Some(names) = p.item_names.as_deref() {
+            for name in names {
+                let matches = selected
+                    .iter()
+                    .filter(|item| item.name.as_deref() == Some(name.as_str()))
+                    .count();
+                if matches > 1 {
+                    bail!(
+                        "requested impl method `{name}` matched multiple impl blocks; pass impl_name"
+                    );
+                }
+            }
+        }
+    }
+    build_delete_rust_plan(&parsed, "Rust impl method(s)", &items, selected)
+}
+
+fn build_delete_rust_plan(
+    parsed: &ParsedSource,
+    label: &str,
+    all_items: &[SyntaxItem],
+    selected: Vec<&SyntaxItem>,
+) -> Result<String> {
+    let selected_ids: HashSet<_> = selected
+        .iter()
+        .map(|item| item.plan_local_id.clone())
+        .collect();
+    let leftovers = all_items
+        .iter()
+        .filter(|item| !selected_ids.contains(&item.plan_local_id))
+        .map(|item| {
+            format!(
+                "{} {} bytes {}..{}",
+                item.kind,
+                item.name.as_deref().unwrap_or("(unnamed)"),
+                item.byte_start,
+                item.byte_end
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_edits = selected
+        .iter()
+        .map(|item| TextEdit {
+            byte_start: item.leading_trivia_start,
+            byte_end: item.trailing_trivia_end,
+            replacement: String::new(),
+        })
+        .collect::<Vec<_>>();
+    ensure_non_overlapping(&source_edits)?;
+
+    let plan = RefactorPlan {
+        title: format!(
+            "delete {} {} from {}",
+            selected.len(),
+            label,
+            path_string(&parsed.path)
+        ),
+        kind: "delete_rust_items".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        edits: vec![FileEdit {
+            path: path_string(&parsed.path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: source_edits,
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&parsed.path),
+            byte_range: None,
+        }],
+        items: selected.into_iter().cloned().collect(),
         leftovers,
     };
 
@@ -2329,6 +2468,219 @@ mod tests {
         assert!(err
             .to_string()
             .contains("only supports item_kinds impl_method"));
+    }
+
+    #[test]
+    fn delete_rust_items_removes_top_level_items_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "mod remove_me;\nmod keep_mod;\n\n#[derive(Debug)]\nstruct DeleteMe;\n\nfn keep() {}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "delete_rust_items".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["remove_me".into(), "DeleteMe".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let source_text = fs::read_to_string(&source).unwrap();
+        assert!(!source_text.contains("remove_me"));
+        assert!(!source_text.contains("DeleteMe"));
+        assert!(!source_text.contains("#[derive(Debug)]"));
+        assert!(source_text.contains("mod keep_mod;"));
+        assert!(source_text.contains("fn keep()"));
+    }
+
+    #[test]
+    fn delete_rust_items_removes_impl_method_with_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "struct A;\nimpl A {\n    #[allow(dead_code)]\n    fn delete_me(&self) {}\n\n    fn keep(&self) {}\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "delete_rust_items".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["delete_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl A".into()),
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let source_text = fs::read_to_string(&source).unwrap();
+        assert!(!source_text.contains("delete_me"));
+        assert!(!source_text.contains("#[allow(dead_code)]"));
+        assert!(source_text.contains("fn keep"));
+    }
+
+    #[test]
+    fn delete_rust_items_reports_leftovers_within_impl_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "struct A;\nstruct B;\nimpl A { fn delete_me(&self) {} fn keep_a(&self) {} }\nimpl B { fn keep_b(&self) {} }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "delete_rust_items".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["delete_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl A".into()),
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let leftovers = plan_value["leftovers"].as_array().unwrap();
+        assert!(leftovers
+            .iter()
+            .any(|leftover| leftover.as_str().unwrap().contains("keep_a")));
+        assert!(!leftovers
+            .iter()
+            .any(|leftover| leftover.as_str().unwrap().contains("keep_b")));
+    }
+
+    #[test]
+    fn delete_rust_items_requires_impl_filter_for_ambiguous_method_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "struct A;\nstruct B;\nimpl A { fn same(&self) {} }\nimpl B { fn same(&self) {} }\n",
+        )
+        .unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "delete_rust_items".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["same".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("matched multiple impl blocks"));
+    }
+
+    #[test]
+    fn delete_rust_items_requires_explicit_item_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "mod remove_me;\nmod keep_mod;\n").unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "delete_rust_items".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: Some(vec!["mod_item".into()]),
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("requires non-empty item_names"));
+    }
+
+    #[test]
+    fn delete_rust_items_rejects_mixed_top_level_and_impl_method_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "struct A;\nimpl A { fn method(&self) {} }\n").unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "delete_rust_items".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["method".into()]),
+            item_kinds: Some(vec!["struct_item".into(), "impl_method".into()]),
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot mix impl_method"));
     }
 
     #[test]

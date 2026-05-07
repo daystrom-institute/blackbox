@@ -305,10 +305,11 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
-        summary: "Create a dry-run structural refactor plan. Supports Rust top-level extraction, Rust impl-method extraction, module/use declarations, and Rust router-sum updates.",
-        when_to_use: "Use to generate a reviewable plan for moving named top-level Rust items, moving named Rust impl methods, adding Rust `mod name;` or `use path;` declarations, or wiring a generated Rust tool router into a `tool_router:` sum. Impl-method extraction can wrap moved methods in a new #[tool_router(router = name)] impl block, generate a module-local router export helper, and append into an existing matching target impl. The plan is structural-only and includes hash checks, text edits, parse validations, selected items, and leftovers.",
+        summary: "Create a dry-run structural refactor plan. Supports Rust top-level extraction/deletion, Rust impl-method extraction/deletion, module/use declarations, and Rust router-sum updates.",
+        when_to_use: "Use to generate a reviewable plan for moving or deleting named top-level Rust items, moving or deleting named Rust impl methods, adding Rust `mod name;` or `use path;` declarations, or wiring a generated Rust tool router into a `tool_router:` sum. Impl-method extraction can wrap moved methods in a new #[tool_router(router = name)] impl block, generate a module-local router export helper, and append into an existing matching target impl. Delete plans require explicit item_names, are structural-only, and refuse to mix impl methods with top-level items in one primitive plan. The plan includes hash checks, text edits, parse validations, selected items, and leftovers.",
         example: Some(
             r#"bbox_refactor_plan(kind="extract_rust_impl_methods", source="src/main.rs", target="src/tools/search.rs", item_names=["bbox_search"], impl_name="impl BlackboxServer", router_name="search_tools", router_export_name="router", target_prelude="use super::*;", project_dir="/repo/x")
+bbox_refactor_plan(kind="delete_rust_items", source="src/main.rs", item_names=["old_mod"], item_kinds=["mod_item"], project_dir="/repo/x")
 bbox_refactor_plan(kind="add_rust_use_decl", source="src/lib.rs", use_path="server::BlackboxServer", visibility="pub", project_dir="/repo/x")"#,
         ),
     },

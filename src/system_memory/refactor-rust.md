@@ -10,6 +10,7 @@ Rust is the first writable backend.
 - Inspect: supported with `bbox_refactor_status`.
 - Plan: supported with `bbox_refactor_plan(kind="extract_rust_items")` and
   `bbox_refactor_plan(kind="extract_rust_impl_methods")` and
+  `bbox_refactor_plan(kind="delete_rust_items")` and
   `bbox_refactor_plan(kind="add_rust_router_to_sum")` and
   `bbox_refactor_plan(kind="add_rust_mod_decl")` and
   `bbox_refactor_plan(kind="add_rust_use_decl")`.
@@ -27,6 +28,11 @@ Writable plan kinds:
 - `extract_rust_impl_methods`: move named methods out of one `impl` block into
   another file, preserving method attributes and optionally generating a
   `#[tool_router(router = name)]` wrapper around the moved methods.
+- `delete_rust_items`: delete named top-level Rust items or named impl methods
+  in place. `item_names` is required; use `item_kinds` only to narrow matches.
+  Use `item_kinds=["impl_method"]` plus `impl_name` when method names are
+  ambiguous across impl blocks. A single delete plan cannot mix top-level items
+  and impl methods.
 - `add_rust_router_to_sum`: append `+ Self::<router_name>()` to a Rust
   `tool_router:` field initializer if that router call is not already present.
 - `add_rust_mod_decl`: add `mod <module_name>;` after existing top-level module
@@ -134,6 +140,21 @@ bbox_refactor_plan(
 
 Use `router_name="search_tools"` instead when the router impl remains in the
 same module as the constructor and `Self::search_tools()` is visible.
+
+Delete obsolete items after a move or reparent:
+
+```text
+bbox_refactor_plan(
+  kind="delete_rust_items",
+  source="src/main.rs",
+  item_names=["old_module"],
+  item_kinds=["mod_item"],
+  project_dir="/absolute/project/root"
+)
+```
+
+For impl methods, pass explicit `item_names`, `item_kinds=["impl_method"]`, and
+usually `impl_name`.
 
 Add the module declaration:
 

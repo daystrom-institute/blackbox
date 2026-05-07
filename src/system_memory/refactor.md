@@ -26,6 +26,7 @@ Writable structural plans are narrower:
 
 - Rust: `bbox_refactor_plan(kind="extract_rust_items")` or
   `bbox_refactor_plan(kind="extract_rust_impl_methods")` or
+  `bbox_refactor_plan(kind="delete_rust_items")` or
   `bbox_refactor_plan(kind="add_rust_router_to_sum")` or
   `bbox_refactor_plan(kind="add_rust_mod_decl")` or
   `bbox_refactor_plan(kind="add_rust_use_decl")`, then
