@@ -77,7 +77,9 @@ use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
 use packets::{Packets, ScannerConfig};
 use pins::{AmbientPinQuery, PinParams, Pins};
-use projects::{ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry};
+use projects::{
+    ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry, ProjectRenameParams,
+};
 use providers::ProviderContext;
 use threads::Threads;
 
@@ -3515,6 +3517,49 @@ impl BlackboxServer {
             // the next unrelated rebuild trigger.
             self.rebuild_edge_index_from_stores();
             Ok(serde_json::to_string_pretty(&record)?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_project_rename",
+        description = "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, live teams, councils, whiteboards, pollers, and crons, then reindexes project files."
+    )]
+    fn bbox_project_rename(
+        &self,
+        Parameters(p): Parameters<ProjectRenameParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_project_rename", || {
+            let response = self.state.projects.write().rename_project(&p)?;
+            let old_project = response.old_record.canonical_path.clone();
+            let new_project = response.record.canonical_path.clone();
+
+            let counts = if response.dry_run {
+                project_ref_counts(&self.state, &old_project)?
+            } else {
+                migrate_project_refs(&self.state, &old_project, &new_project, &response.record)?
+            };
+
+            let reindex = if response.dry_run {
+                None
+            } else {
+                let result = self
+                    .state
+                    .idx
+                    .write()
+                    .reindex(&ReindexParams { full: Some(false) })?;
+                self.rebuild_edge_index_from_stores();
+                Some(result)
+            };
+
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "old_record": response.old_record,
+                "record": response.record,
+                "moved_on_disk": response.moved_on_disk,
+                "dry_run": response.dry_run,
+                "migrated_refs": counts,
+                "reindex": reindex,
+            }))?)
         })
     }
 
@@ -10755,6 +10800,151 @@ fn trigger_project_bootstrap_arc(state: Arc<SharedState>, record: ProjectRecord)
     });
 }
 
+fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> anyhow::Result<Value> {
+    let knowledge = state
+        .kb
+        .read()
+        .all_entries()
+        .iter()
+        .filter(|entry| entry.project.as_deref() == Some(project))
+        .count();
+    let threads = state
+        .threads
+        .read()
+        .all()
+        .iter()
+        .filter(|thread| thread.project == project)
+        .count();
+    let notes = state
+        .notes
+        .read()
+        .all()
+        .iter()
+        .filter(|note| note.project.as_deref() == Some(project))
+        .count();
+    let pins = state.pins.read().project_ref_count(project);
+    let packets = state
+        .packets
+        .read()
+        .list_all()?
+        .iter()
+        .filter(|packet| packet.project.as_deref() == Some(project))
+        .count();
+    let teams = orchestration::team::load_all_teams(&state.store_dir)
+        .iter()
+        .filter(|team| team.project_dir.as_deref() == Some(project))
+        .count();
+    let councils = state.councils.list_summaries(Some(project)).len();
+    let whiteboards = state
+        .whiteboards
+        .list_ids()
+        .iter()
+        .filter(|id| {
+            state
+                .whiteboards
+                .get(id)
+                .is_some_and(|board| board.read().project == project)
+        })
+        .count();
+    let pollers = state
+        .pollers
+        .list()
+        .iter()
+        .filter(|spec| spec.default_project_dir.as_deref() == Some(project))
+        .count();
+    let crons = state
+        .crons
+        .list()
+        .iter()
+        .filter(|spec| spec.default_project_dir.as_deref() == Some(project))
+        .count();
+
+    Ok(json!({
+        "knowledge": knowledge,
+        "threads": threads,
+        "notes": notes,
+        "pins": pins,
+        "packets": packets,
+        "teams": teams,
+        "councils": councils,
+        "whiteboards": whiteboards,
+        "pollers": pollers,
+        "crons": crons,
+    }))
+}
+
+fn migrate_project_refs(
+    state: &Arc<SharedState>,
+    old_project: &str,
+    new_project: &str,
+    _record: &ProjectRecord,
+) -> anyhow::Result<Value> {
+    let knowledge = state
+        .kb
+        .write()
+        .rename_project_refs(old_project, new_project)?;
+    let threads = state
+        .threads
+        .write()
+        .rename_project_refs(old_project, new_project)?;
+    let notes = state
+        .notes
+        .write()
+        .rename_project_refs(old_project, new_project)?;
+    let pins = state
+        .pins
+        .write()
+        .rename_project_refs(old_project, new_project)?;
+    let packets = state
+        .packets
+        .read()
+        .rename_project_refs(old_project, new_project)?;
+    let teams =
+        orchestration::team::rename_project_refs(&state.store_dir, old_project, new_project);
+    let councils = state
+        .councils
+        .rename_project_refs(old_project, new_project)?;
+    let whiteboards = state
+        .whiteboards
+        .rename_project_refs(old_project, new_project)?;
+
+    let pollers = state.pollers.rename_project_refs(old_project, new_project);
+    let poller_count = pollers.len();
+    for spec in pollers {
+        persist_named_json(&state.store_dir.join("pollers"), &spec.name, &spec)?;
+        let handle = pollers::spawn_loop(state.clone(), spec.clone());
+        state.pollers.track_handle(&spec.name, handle);
+    }
+
+    let crons = state.crons.rename_project_refs(old_project, new_project);
+    let cron_count = crons.len();
+    for spec in crons {
+        persist_named_json(&state.store_dir.join("crons"), &spec.name, &spec)?;
+        let handle = crons::spawn_loop(state.clone(), spec.clone());
+        state.crons.track_handle(&spec.name, handle);
+    }
+
+    Ok(json!({
+        "knowledge": knowledge,
+        "threads": threads,
+        "notes": notes,
+        "pins": pins,
+        "packets": packets,
+        "teams": teams,
+        "councils": councils,
+        "whiteboards": whiteboards,
+        "pollers": poller_count,
+        "crons": cron_count,
+    }))
+}
+
+fn persist_named_json<T: Serialize>(dir: &Path, name: &str, value: &T) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{name}.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(value)?)?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct AdminWorkflowInstallReq {
     #[serde(default)]
@@ -13586,6 +13776,130 @@ mod tests {
             response.projects[0].project_id,
             entity_ref::project_id_for_path(&project).unwrap()
         );
+    }
+
+    #[test]
+    fn bbox_project_rename_migrates_project_scoped_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_project = tmp.path().join("old-project");
+        let new_project = tmp.path().join("new-project");
+        std::fs::create_dir_all(&old_project).unwrap();
+        std::fs::create_dir_all(&new_project).unwrap();
+        let old_project = std::fs::canonicalize(&old_project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let new_project = std::fs::canonicalize(&new_project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let server = test_server(&tmp);
+
+        let register = server.bbox_project_register(Parameters(ProjectRegisterParams {
+            path: old_project.clone(),
+        }));
+        assert_ne!(register.is_error, Some(true));
+        let text = serde_json::to_value(&register).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let registered: ProjectRecord = serde_json::from_str(&text).unwrap();
+
+        server
+            .state
+            .kb
+            .write()
+            .remember(
+                &knowledge::RememberParams {
+                    content: "project fact".into(),
+                    category: None,
+                    title: Some("project fact".into()),
+                    scope: Some("project".into()),
+                    project: Some(old_project.clone()),
+                    decay: None,
+                    review_at: None,
+                    expires_at: None,
+                },
+                false,
+            )
+            .unwrap();
+        server
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".into(),
+                name: None,
+                id: None,
+                topic: Some("project thread".into()),
+                project: Some(old_project.clone()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: None,
+            })
+            .unwrap();
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "learned".into(),
+                body: "project note".into(),
+                task_id: None,
+                session_id: None,
+                project: Some(old_project.clone()),
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        server
+            .state
+            .pins
+            .write()
+            .pin(&pins::PinParams {
+                action: "set".into(),
+                id: None,
+                content: Some("project pin".into()),
+                title: Some("project pin".into()),
+                scope: Some("session".into()),
+                target: Some("sid".into()),
+                project: Some(old_project.clone()),
+                expires_at: None,
+            })
+            .unwrap();
+
+        let renamed = server.bbox_project_rename(Parameters(ProjectRenameParams {
+            project: registered.project_id.clone(),
+            new_path: new_project.clone(),
+            move_on_disk: None,
+            dry_run: None,
+        }));
+        assert_ne!(renamed.is_error, Some(true));
+        let text = serde_json::to_value(&renamed).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            payload["record"]["project_id"].as_str(),
+            Some(registered.project_id.as_str())
+        );
+        assert_eq!(
+            payload["record"]["canonical_path"].as_str(),
+            Some(new_project.as_str())
+        );
+        assert_eq!(payload["migrated_refs"]["knowledge"], 1);
+        assert_eq!(payload["migrated_refs"]["threads"], 1);
+        assert_eq!(payload["migrated_refs"]["notes"], 1);
+        assert_eq!(payload["migrated_refs"]["pins"], 1);
     }
 
     #[test]

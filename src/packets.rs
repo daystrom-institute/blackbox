@@ -2194,6 +2194,18 @@ impl Packets {
         Ok(out)
     }
 
+    pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Result<usize> {
+        let mut updated = 0usize;
+        for mut packet in self.list_all()? {
+            if packet.project.as_deref() == Some(old_project) {
+                packet.project = Some(new_project.to_string());
+                self.save_packet(&packet)?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     pub fn remove_domain(&self, domain: &str) -> Result<usize> {
         let packets: Vec<Packet> = self
             .list_all()?

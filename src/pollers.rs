@@ -118,6 +118,18 @@ impl PollerRegistry {
         self.by_name.read().get(name).cloned()
     }
 
+    pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Vec<PollerSpec> {
+        let mut updated = Vec::new();
+        let mut by_name = self.by_name.write();
+        for spec in by_name.values_mut() {
+            if spec.default_project_dir.as_deref() == Some(old_project) {
+                spec.default_project_dir = Some(new_project.to_string());
+                updated.push(spec.clone());
+            }
+        }
+        updated
+    }
+
     /// True if dedup_id is fresh (not seen recently). False = seen.
     /// `None` id always fresh (no dedup configured).
     pub fn check_dedup(&self, poller_name: &str, dedup_id: Option<&str>) -> bool {

@@ -141,6 +141,22 @@ impl CouncilRegistry {
         self.councils.read().get(id).cloned()
     }
 
+    pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Result<usize> {
+        let councils = self.councils.read().values().cloned().collect::<Vec<_>>();
+        let mut updated = 0usize;
+        for council in councils {
+            let mut session = council.session.write();
+            if session.project.as_deref() == Some(old_project) {
+                session.project = Some(new_project.to_string());
+                session.touch();
+                drop(session);
+                council.persist_session()?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     /// Create a new council. Validates the team exists (members are
     /// resolved at first dispatch via `resolve_brofile`, not here).
     pub fn create(

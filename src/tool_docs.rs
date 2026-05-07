@@ -275,6 +275,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: None,
     },
     ToolDoc {
+        name: "bbox_project_rename",
+        category: ToolCategory::Projects,
+        summary: "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, live teams, councils, whiteboards, pollers, and crons, then reindexes project files.",
+        when_to_use: "Use after renaming a repo directory, or with `move_on_disk=true` to let bbox move the directory first. Prefer `dry_run=true` before changing several project names so the affected state counts are visible.",
+        example: Some(r#"bbox_project_rename(project="d723917f", new_path="/home/me/repos/blackbox", dry_run=true)"#),
+    },
+    ToolDoc {
         name: "bbox_project_list",
         category: ToolCategory::Projects,
         summary: "List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered.",

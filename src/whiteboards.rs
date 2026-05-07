@@ -628,6 +628,20 @@ impl WhiteboardRegistry {
         self.boards.read().get(id).cloned()
     }
 
+    pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Result<usize> {
+        let boards = self.boards.read().values().cloned().collect::<Vec<_>>();
+        let mut updated = 0usize;
+        for board_lock in boards {
+            let mut board = board_lock.write();
+            if board.project == old_project {
+                board.project = new_project.to_string();
+                self.persist(&board.id, &board)?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
     /// Open a new board. Returns the board id (which the caller chose).
     /// Errors if the id is already in use.
     pub fn open(

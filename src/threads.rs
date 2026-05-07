@@ -243,6 +243,27 @@ impl Threads {
         &self.store.threads
     }
 
+    pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
+        let mut updated = 0usize;
+        let now = Self::now_iso();
+        for thread in &mut self.store.threads {
+            if thread.project == old_project {
+                thread.project = new_project.to_string();
+                thread.last_activity = now.clone();
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            self.save()?;
+            for thread in &self.store.threads {
+                if thread.project == new_project {
+                    crate::embed_queue::enqueue_thread(thread);
+                }
+            }
+        }
+        Ok(updated)
+    }
+
     // ── blackbox_thread (CRUD) ─────────────────────────────────────
 
     pub fn thread(&mut self, p: &ThreadParams) -> Result<String> {

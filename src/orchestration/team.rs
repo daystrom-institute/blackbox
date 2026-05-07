@@ -207,6 +207,18 @@ pub fn remove_team(name: &str, store_dir: &Path) -> bool {
     fs::remove_file(teams_dir(store_dir).join(format!("{name}.json"))).is_ok()
 }
 
+pub fn rename_project_refs(store_dir: &Path, old_project: &str, new_project: &str) -> usize {
+    let mut updated = 0usize;
+    for mut team in load_all_teams(store_dir) {
+        if team.project_dir.as_deref() == Some(old_project) {
+            team.project_dir = Some(new_project.to_string());
+            save_team(&team, store_dir);
+            updated += 1;
+        }
+    }
+    updated
+}
+
 // ---------------------------------------------------------------------------
 // Instantiation
 // ---------------------------------------------------------------------------

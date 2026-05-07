@@ -94,6 +94,18 @@ impl CronRegistry {
         self.by_name.read().values().cloned().collect()
     }
 
+    pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Vec<CronSpec> {
+        let mut updated = Vec::new();
+        let mut by_name = self.by_name.write();
+        for spec in by_name.values_mut() {
+            if spec.default_project_dir.as_deref() == Some(old_project) {
+                spec.default_project_dir = Some(new_project.to_string());
+                updated.push(spec.clone());
+            }
+        }
+        updated
+    }
+
     /// Try to claim a tick slot. Returns true if the cron may dispatch
     /// (in-flight count < concurrency cap, or cap is 0). On true, the
     /// counter is incremented; caller MUST call `mark_done` when the

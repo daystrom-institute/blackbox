@@ -751,6 +751,22 @@ impl Knowledge {
         &self.store.entries
     }
 
+    pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
+        let mut updated = 0usize;
+        let now = Self::now_iso();
+        for entry in &mut self.store.entries {
+            if entry.project.as_deref() == Some(old_project) {
+                entry.project = Some(new_project.to_string());
+                entry.updated_at = now.clone();
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            self.save()?;
+        }
+        Ok(updated)
+    }
+
     pub fn entry(&self, id: &str) -> Option<&KnowledgeEntry> {
         self.store.entries.iter().find(|entry| entry.id == id)
     }

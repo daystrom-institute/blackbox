@@ -240,6 +240,27 @@ impl Notes {
         &self.store.notes
     }
 
+    pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
+        let mut updated = 0usize;
+        let now = Self::now_iso();
+        for note in &mut self.store.notes {
+            if note.project.as_deref() == Some(old_project) {
+                note.project = Some(new_project.to_string());
+                note.updated_at = now.clone();
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            self.save()?;
+            for note in &self.store.notes {
+                if note.project.as_deref() == Some(new_project) {
+                    crate::embed_queue::enqueue_note(note);
+                }
+            }
+        }
+        Ok(updated)
+    }
+
     // ── bbox_note (create) ─────────────────────────────────────────
 
     pub fn create(&mut self, p: &NoteParams) -> Result<String> {

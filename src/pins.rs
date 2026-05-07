@@ -150,6 +150,28 @@ impl Pins {
         format!("pin-{:08x}", h.finish() as u32)
     }
 
+    pub fn project_ref_count(&self, project: &str) -> usize {
+        self.store
+            .pins
+            .iter()
+            .filter(|pin| pin.project.as_deref() == Some(project))
+            .count()
+    }
+
+    pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
+        let mut updated = 0usize;
+        for pin in &mut self.store.pins {
+            if pin.project.as_deref() == Some(old_project) {
+                pin.project = Some(new_project.to_string());
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            self.save()?;
+        }
+        Ok(updated)
+    }
+
     fn is_expired(pin: &Pin) -> bool {
         pin.expires_at
             .as_deref()

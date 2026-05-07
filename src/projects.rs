@@ -14,6 +14,22 @@ pub struct ProjectRegisterParams {
     pub path: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectRenameParams {
+    /// Existing project to rename. Accepts project_id, registered
+    /// canonical_path, or an absolute path resolving to a registered project.
+    pub project: String,
+    /// New absolute project directory path.
+    pub new_path: String,
+    /// Move the directory on disk before updating bbox state. Default false:
+    /// the new_path must already exist.
+    #[serde(default)]
+    pub move_on_disk: Option<bool>,
+    /// Preview without moving or writing state.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct ProjectRecord {
     pub project_id: String,
@@ -27,6 +43,14 @@ pub struct ProjectRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct ProjectListResponse {
     pub projects: Vec<ProjectRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct ProjectRenameResponse {
+    pub old_record: ProjectRecord,
+    pub record: ProjectRecord,
+    pub moved_on_disk: bool,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +83,15 @@ impl ProjectRegistry {
 
     pub fn register_path(&mut self, path: impl AsRef<Path>) -> Result<ProjectRecord> {
         let canonical = canonical_project_path(path)?;
+        let canonical_path = canonical.to_string_lossy().into_owned();
+        if let Some(existing) = self
+            .store
+            .projects
+            .iter()
+            .find(|project| project.canonical_path == canonical_path)
+        {
+            return Ok(existing.clone());
+        }
         let project_id = entity_ref::project_id_for_path(&canonical)?;
         if let Some(existing) = self
             .store
@@ -78,7 +111,7 @@ impl ProjectRegistry {
         let record = ProjectRecord {
             project_id,
             repo_id,
-            canonical_path: canonical.to_string_lossy().into_owned(),
+            canonical_path,
             registered_at: util::now_iso(),
             is_git_repo,
         };
@@ -88,6 +121,98 @@ impl ProjectRegistry {
             .sort_by(|a, b| a.canonical_path.cmp(&b.canonical_path));
         self.save()?;
         Ok(record)
+    }
+
+    pub fn rename_project(&mut self, p: &ProjectRenameParams) -> Result<ProjectRenameResponse> {
+        let idx = self
+            .resolve_project_index(&p.project)?
+            .with_context(|| format!("project not registered: {}", p.project))?;
+        let old_record = self.store.projects[idx].clone();
+        let move_on_disk = p.move_on_disk.unwrap_or(false);
+        let dry_run = p.dry_run.unwrap_or(false);
+        let new_path = PathBuf::from(&p.new_path);
+        if !new_path.is_absolute() {
+            anyhow::bail!("new_path must be absolute: {}", p.new_path);
+        }
+
+        let canonical = if move_on_disk {
+            let old_path = PathBuf::from(&old_record.canonical_path);
+            if !old_path.is_dir() {
+                anyhow::bail!(
+                    "cannot move_on_disk: registered path is not a directory: {}",
+                    old_path.display()
+                );
+            }
+            if new_path.exists() {
+                anyhow::bail!(
+                    "cannot move_on_disk: target already exists: {}",
+                    new_path.display()
+                );
+            }
+            if let Some(parent) = new_path.parent() {
+                if !parent.is_dir() {
+                    anyhow::bail!(
+                        "cannot move_on_disk: target parent is not a directory: {}",
+                        parent.display()
+                    );
+                }
+            }
+            if dry_run {
+                canonical_nonexistent_absolute_path(&new_path)?
+            } else {
+                fs::rename(&old_path, &new_path).with_context(|| {
+                    format!("moving {} to {}", old_path.display(), new_path.display())
+                })?;
+                canonical_project_path(&new_path)?
+            }
+        } else {
+            canonical_project_path(&new_path)?
+        };
+        let canonical_path = canonical.to_string_lossy().into_owned();
+
+        if self
+            .store
+            .projects
+            .iter()
+            .enumerate()
+            .any(|(other_idx, project)| {
+                other_idx != idx && project.canonical_path == canonical_path
+            })
+        {
+            anyhow::bail!("another project is already registered at {canonical_path}");
+        }
+
+        let (repo_id, is_git_repo) = if dry_run && move_on_disk {
+            (old_record.repo_id.clone(), old_record.is_git_repo)
+        } else {
+            let git_root = entity_ref::git_root_for_path(&canonical);
+            (
+                git_root
+                    .as_deref()
+                    .map(entity_ref::repo_id_for_root)
+                    .transpose()?,
+                git_root.is_some(),
+            )
+        };
+        let mut record = old_record.clone();
+        record.canonical_path = canonical_path;
+        record.repo_id = repo_id;
+        record.is_git_repo = is_git_repo;
+
+        if !dry_run {
+            self.store.projects[idx] = record.clone();
+            self.store
+                .projects
+                .sort_by(|a, b| a.canonical_path.cmp(&b.canonical_path));
+            self.save()?;
+        }
+
+        Ok(ProjectRenameResponse {
+            old_record,
+            record,
+            moved_on_disk: move_on_disk && !dry_run,
+            dry_run,
+        })
     }
 
     pub fn list(&self) -> Vec<ProjectRecord> {
@@ -123,6 +248,30 @@ impl ProjectRegistry {
         })?;
         Ok(())
     }
+
+    fn resolve_project_index(&self, raw: &str) -> Result<Option<usize>> {
+        if let Some((idx, _)) = self
+            .store
+            .projects
+            .iter()
+            .enumerate()
+            .find(|(_, project)| project.project_id == raw || project.canonical_path == raw)
+        {
+            return Ok(Some(idx));
+        }
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            if let Ok(canonical) = canonical_project_path(&path) {
+                let canonical_path = canonical.to_string_lossy();
+                return Ok(self
+                    .store
+                    .projects
+                    .iter()
+                    .position(|project| project.canonical_path == canonical_path));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn load_store(path: &Path) -> Result<ProjectStore> {
@@ -137,6 +286,18 @@ fn load_store(path: &Path) -> Result<ProjectStore> {
 
 fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(entity_ref::canonical_input_path(path)?)
+}
+
+fn canonical_nonexistent_absolute_path(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("path has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("path has no final component: {}", path.display()))?;
+    let parent = fs::canonicalize(parent)
+        .with_context(|| format!("canonicalizing parent {}", parent.display()))?;
+    Ok(parent.join(file_name))
 }
 
 #[cfg(test)]
@@ -213,6 +374,41 @@ mod tests {
             entity_ref::project_id_for_path(&sibling).unwrap()
         );
         assert_ne!(this_record.project_id, sibling_record.project_id);
+    }
+
+    #[test]
+    fn rename_preserves_project_id_and_new_path_reregisters_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old-name");
+        let new_path = dir.path().join("new-name");
+        fs::create_dir_all(&old_path).unwrap();
+        fs::create_dir_all(&new_path).unwrap();
+        let mut registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
+
+        let old_record = registry.register_path(&old_path).unwrap();
+        let derived_new_id = entity_ref::project_id_for_path(&new_path).unwrap();
+        assert_ne!(old_record.project_id, derived_new_id);
+
+        let rename = registry
+            .rename_project(&ProjectRenameParams {
+                project: old_record.project_id.clone(),
+                new_path: new_path.to_string_lossy().into_owned(),
+                move_on_disk: None,
+                dry_run: None,
+            })
+            .unwrap();
+        assert_eq!(rename.record.project_id, old_record.project_id);
+        assert_eq!(
+            rename.record.canonical_path,
+            fs::canonicalize(&new_path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+
+        let registered_again = registry.register_path(&new_path).unwrap();
+        assert_eq!(registered_again.project_id, old_record.project_id);
+        assert_eq!(registry.list().len(), 1);
     }
 
     fn init_git_repo(path: &Path) {
