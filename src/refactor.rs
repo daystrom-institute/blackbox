@@ -1024,7 +1024,7 @@ fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> {
     }
 
     let target_source = fs::read_to_string(&target_path).unwrap_or_default();
-    let target_insert = if target_source.trim().is_empty() {
+    let moved_insert = if target_source.trim().is_empty() {
         moved
     } else {
         format!(
@@ -1037,6 +1037,12 @@ fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> {
             moved
         )
     };
+    let target_prelude = p
+        .target_prelude
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .filter(|text| !rust_prelude_present(&target_source, text));
 
     let source_edits = selected
         .iter()
@@ -1049,13 +1055,36 @@ fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> {
     ensure_non_overlapping(&source_edits)?;
 
     let mut target_edits = Vec::new();
-    if !target_insert.is_empty() {
+    if let Some(prelude) = target_prelude {
+        if target_source.trim().is_empty() {
+            target_edits.push(TextEdit {
+                byte_start: 0,
+                byte_end: 0,
+                replacement: format!("{prelude}\n\n{moved_insert}"),
+            });
+        } else {
+            let prelude_insert = rust_prelude_insert_byte(&target_source);
+            target_edits.push(TextEdit {
+                byte_start: prelude_insert,
+                byte_end: prelude_insert,
+                replacement: format!("{prelude}\n"),
+            });
+            if !moved_insert.is_empty() {
+                target_edits.push(TextEdit {
+                    byte_start: target_source.len(),
+                    byte_end: target_source.len(),
+                    replacement: moved_insert,
+                });
+            }
+        }
+    } else if !moved_insert.is_empty() {
         target_edits.push(TextEdit {
             byte_start: target_source.len(),
             byte_end: target_source.len(),
-            replacement: target_insert,
+            replacement: moved_insert,
         });
     }
+    ensure_non_overlapping(&target_edits)?;
 
     let plan = RefactorPlan {
         title: format!(
@@ -6049,6 +6078,52 @@ mod tests {
         assert!(fs::read_to_string(&source).unwrap().contains("keep"));
         assert!(!fs::read_to_string(&source).unwrap().contains("move_me"));
         assert!(fs::read_to_string(&target).unwrap().contains("move_me"));
+    }
+
+    #[test]
+    fn extract_rust_items_inserts_target_prelude() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        let target = dir.path().join("moved.rs");
+        fs::write(&source, "fn keep() {}\n\nfn move_me() {}\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_items".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: Some("use super::*;".into()),
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.starts_with("use super::*;\n\nfn move_me()"));
     }
 
     #[test]

@@ -213,10 +213,10 @@ bbox_refactor_run(
     {"op":"plan","kind":"extract_rust_items","source":"src/packets/mod.rs","target":"src/packets/events.rs","item_names":[...],"target_prelude":"use super::*;\nuse anyhow::{Context, Result};\nuse serde::{Deserialize, Serialize};\nuse std::fs;\nuse std::path::{Path, PathBuf};\n"},
     {"op":"plan","kind":"extract_rust_items","source":"src/packets/mod.rs","target":"src/packets/ast.rs","item_names":[...],"target_prelude":"use super::*;\nuse anyhow::Result;\nuse serde::{Deserialize, Serialize};\nuse std::collections::BTreeMap;\n"},
     {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/coerce.rs","item_names":[...],"item_kinds":["function_item"],"visibility":"pub(super)"},
-    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/events.rs","item_names":["packets_dir","scope_dir","packet_path","events_log_path","append_line","PacketEvent"],"visibility":"pub(super)"},
+    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/events.rs","item_names":["packets_dir","scope_dir","packet_path","events_log_path","append_line"],"item_kinds":["function_item"],"visibility":"pub(super)"},
     {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/events.rs","item_names":["now","with_packet_id","with_domain","with_details"],"item_kinds":["impl_method"],"impl_name":"impl PacketEvent","visibility":"pub(super)"},
-    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/ast.rs","item_names":["Value","CmpOp","Predicate","Emit","Rule","RuleInput","review_lattice","review_prefix_inference","infer_classification","infer_classification_detailed","validate_path","validate_predicate","collect_apply_refs","rule_antecedents_referencing","collect_apply_by_id","check_apply_expect_against_lattice","default_confidence"],"visibility":"pub(super)"},
-    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/ast.rs","item_names":["from_json","to_json"],"item_kinds":["impl_method"],"impl_name":"impl Value","visibility":"pub(super)"},
+    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/ast.rs","item_names":["RuleInput"],"item_kinds":["struct_item"],"visibility":"pub(super)"},
+    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/ast.rs","item_names":["from_json"],"item_kinds":["impl_method"],"impl_name":"impl Value","visibility":"pub(super)"},
     {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/ast.rs","item_names":["apply"],"item_kinds":["impl_method"],"impl_name":"impl CmpOp","visibility":"pub(super)"},
     {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/ast.rs","item_names":["materialize"],"item_kinds":["impl_method"],"impl_name":"impl RuleInput","visibility":"pub(super)"},
     {"op":"plan","kind":"add_rust_use_decl","source":"src/packets/mod.rs","use_path":"ast::*","visibility":"pub"},
@@ -232,9 +232,10 @@ If item extraction cannot express a helper because it is nested inside a test
 module, use `replace_text` or `write_file` only after grounding the exact source
 range and report the fallback.
 
-Use `rewrite_rust_item_visibility` after extraction when parent code still calls
-helpers or inherent methods moved into child modules. This is a structural Rust
-visibility repair, not a literal text fallback.
+Use `rewrite_rust_item_visibility` after extraction only for formerly-private
+helpers or inherent methods that parent or sibling modules still call. Do not
+downgrade already-public API types or methods such as `Value`, `Rule`, or
+`Value::to_json`; those remain public through `pub use ast::*`.
 
 Checkpoint: pause.
 

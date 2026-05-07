@@ -34,6 +34,9 @@ Tree-sitter language: `rust`.
 Writable plan kinds:
 
 - `extract_rust_items`: move named top-level Rust items from one file to another.
+  Optional `target_prelude` is inserted before generated target content when it
+  is not already present; use it for child-module imports needed by derives and
+  external crates.
 - `extract_rust_impl_methods`: move named methods out of one `impl` block into
   another file, preserving method attributes and optionally generating a
   `#[tool_router(router = name)]` wrapper around the moved methods.
