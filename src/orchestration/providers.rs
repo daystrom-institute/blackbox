@@ -1082,6 +1082,14 @@ impl Provider {
     }
 }
 
+fn append_block_separator(buf: &mut Option<String>) {
+    if let Some(existing) = buf.as_mut() {
+        if !existing.is_empty() {
+            existing.push_str("\n\n");
+        }
+    }
+}
+
 fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
     // Hook events (subtype: hook_started / hook_response) carry their
     // own transient per-invocation session_id, distinct from the real
@@ -1106,14 +1114,23 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         sink.session_id = Some(session_id.to_string());
     }
 
-    // Partial streaming chunks from --include-partial-messages. Each text_delta
-    // grows the in-flight message; a new message_start clears the buffer so we
-    // don't concatenate across turns / tool-use blocks.
+    // Accumulate every assistant text block across the entire task.
+    // Tool-using turns emit text alongside tool_use blocks; multi-turn
+    // tool-use cycles emit text on more than one assistant message.
+    // The previous design reset the buffer on each message_start and
+    // overwrote on each assistant text block, which kept only the
+    // final text — usually a brief closure like "No response
+    // requested." — and dropped the actual answer that preceded the
+    // tool call. text_delta and assistant text blocks now both append
+    // (separated by a blank line between distinct blocks). thinking
+    // and tool_use content do not contribute to the surfaced answer.
     if evt["type"].as_str() == Some("stream_event") {
         let inner_ty = evt["event"]["type"].as_str().unwrap_or("");
         match inner_ty {
-            "message_start" => {
-                sink.last_assistant_message = Some(String::new());
+            "content_block_start" => {
+                if evt["event"]["content_block"]["type"].as_str() == Some("text") {
+                    append_block_separator(&mut sink.last_assistant_message);
+                }
             }
             "content_block_delta" => {
                 if evt["event"]["delta"]["type"].as_str() == Some("text_delta") {
@@ -1127,11 +1144,31 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         }
     }
     if evt["type"].as_str() == Some("assistant") {
-        if let Some(content) = evt["message"]["content"].as_array() {
-            for block in content {
-                if block["type"].as_str() == Some("text") {
-                    if let Some(text) = block["text"].as_str() {
-                        sink.last_assistant_message = Some(text.to_string());
+        // The non-streaming `assistant` event mirrors a turn's full
+        // content. With --include-partial-messages set on every Claude
+        // dispatch (the canonical path), streaming events already
+        // captured the text and this branch is a no-op. Without that
+        // flag, fall back to populating from the assistant event so
+        // text is still surfaced — appending each text block with a
+        // blank-line separator preserves multi-block answers.
+        let streaming_captured = sink
+            .last_assistant_message
+            .as_deref()
+            .is_some_and(|m| !m.is_empty());
+        if !streaming_captured {
+            if let Some(content) = evt["message"]["content"].as_array() {
+                for block in content {
+                    if block["type"].as_str() == Some("text") {
+                        if let Some(text) = block["text"].as_str() {
+                            if text.is_empty() {
+                                continue;
+                            }
+                            append_block_separator(&mut sink.last_assistant_message);
+                            let buf = sink
+                                .last_assistant_message
+                                .get_or_insert_with(String::new);
+                            buf.push_str(text);
+                        }
                     }
                 }
             }
@@ -1139,7 +1176,22 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
     }
     if evt["type"].as_str() == Some("result") {
         if let Some(result) = evt["result"].as_str() {
-            sink.last_assistant_message = Some(result.to_string());
+            // Claude's `result` summary field is the post-turn
+            // single-shot answer when the turn produced exactly one
+            // text block; it is empty when the turn ended with a
+            // tool_use block, and reflects only the *final* text when
+            // the turn contained multiple text blocks. Streaming
+            // events have already captured every text block in order,
+            // so prefer the accumulated streamed text over the
+            // result summary. Only fall back to the summary when
+            // streaming captured nothing.
+            let already_have_streamed_text = sink
+                .last_assistant_message
+                .as_deref()
+                .is_some_and(|m| !m.is_empty());
+            if !result.is_empty() && !already_have_streamed_text {
+                sink.last_assistant_message = Some(result.to_string());
+            }
         }
         if let Some(usage) = evt["usage"].as_object() {
             sink.usage = Some(Usage {
@@ -2262,6 +2314,108 @@ mod tests {
         assert_eq!(sink.usage.as_ref().unwrap().input_tokens, 100);
         assert_eq!(sink.cost_usd, Some(0.05));
         assert_eq!(sink.num_turns, Some(3));
+    }
+
+    #[test]
+    fn test_parse_claude_streaming_accumulates_text_across_blocks_and_turns() {
+        // Tool-using turns interleave text blocks and tool_use blocks;
+        // multi-turn loops emit text on more than one assistant message.
+        // Streaming must accumulate every text block (separated by a
+        // blank line) so the substantive answer is not clobbered by a
+        // trailing closure like "No response requested." that arrives
+        // in a later block / later turn.
+        let mut sink = EventSink {
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
+        };
+        let events = vec![
+            serde_json::json!({"type":"stream_event","event":{"type":"message_start"}}),
+            serde_json::json!({
+                "type":"stream_event",
+                "event":{"type":"content_block_start","content_block":{"type":"text"}}
+            }),
+            serde_json::json!({
+                "type":"stream_event",
+                "event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Substantive answer."}}
+            }),
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_stop"}}),
+            serde_json::json!({
+                "type":"stream_event",
+                "event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"some_tool"}}
+            }),
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_stop"}}),
+            // Turn 2 begins; message_start no longer resets.
+            serde_json::json!({"type":"stream_event","event":{"type":"message_start"}}),
+            serde_json::json!({
+                "type":"stream_event",
+                "event":{"type":"content_block_start","content_block":{"type":"text"}}
+            }),
+            serde_json::json!({
+                "type":"stream_event",
+                "event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"No response requested."}}
+            }),
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_stop"}}),
+            // Result event with empty `result` (turn ended on a tool_use earlier);
+            // must not clobber accumulated streamed text.
+            serde_json::json!({"type":"result","result":""}),
+        ];
+        for evt in &events {
+            Provider::Claude.parse_event(evt, &mut sink);
+        }
+        assert_eq!(
+            sink.last_assistant_message.as_deref(),
+            Some("Substantive answer.\n\nNo response requested."),
+            "streaming must accumulate every text block across turns"
+        );
+    }
+
+    #[test]
+    fn test_parse_claude_result_with_empty_text_preserves_streamed_message() {
+        // When a Claude turn ends with a tool_use block, the post-turn
+        // `result` event's `result` field is the empty string (the
+        // user-facing answer text was emitted earlier as its own block
+        // and captured by the streaming parser). The result event
+        // must not clobber that captured text with empty.
+        let stream_text = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    { "type": "text", "text": "Captured during the turn." }
+                ]
+            }
+        });
+        let result_with_empty = serde_json::json!({
+            "type": "result",
+            "result": "",
+            "usage": { "input_tokens": 10, "output_tokens": 50 },
+            "total_cost_usd": 0.001,
+            "num_turns": 1
+        });
+        let mut sink = EventSink {
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
+        };
+        Provider::Claude.parse_event(&stream_text, &mut sink);
+        assert_eq!(
+            sink.last_assistant_message.as_deref(),
+            Some("Captured during the turn.")
+        );
+        Provider::Claude.parse_event(&result_with_empty, &mut sink);
+        assert_eq!(
+            sink.last_assistant_message.as_deref(),
+            Some("Captured during the turn."),
+            "empty result must not overwrite previously captured text"
+        );
+        // Usage / cost / num_turns from the result event should still apply.
+        assert_eq!(sink.cost_usd, Some(0.001));
+        assert_eq!(sink.num_turns, Some(1));
+        assert_eq!(sink.usage.as_ref().unwrap().output_tokens, 50);
     }
 
     #[test]
