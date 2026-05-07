@@ -437,10 +437,71 @@ Minimum tests:
 
 ## Open Questions
 
-- Confirm the exact `rmcp` seam for getting `?surface` into session state.
+- ~~Confirm the exact `rmcp` seam for getting `?surface` into session state.~~
+  **Resolved** — see Addendum below.
 - Should surface decisions include instructions, and if so where can RMCP expose
   per-surface instructions cleanly?
 - Should surface aliases be auto-registered by default, or only through explicit
   `bro_mcp` calls?
 - Should a surface be allowed to change data scope defaults for tools that accept
   project parameters, or should that remain strictly out of scope?
+
+## Addendum: Surface-Binding Model Decision
+
+**Decision: session-level surface binding (option a).**
+
+Rationale grounded in rmcp 1.4 mechanics: `StreamableHttpService` uses
+`LocalSessionManager`. The factory closure that constructs each
+`BlackboxServer` instance fires once at `initialize` and receives only the
+initial HTTP request. Subsequent JSON-RPC frames (`list_tools`, `call_tool`,
+`notifications/cancelled`, etc.) travel over the established session channel
+and never re-expose URL query parameters. Per-request surface variation is
+therefore not mechanically available through `LocalSessionManager` — the
+closure has already returned and the handler owns the session.
+
+The alternative — option (b) per-request binding — would require replacing
+`LocalSessionManager` with a custom session manager that re-reads URL state on
+every request. That is a high-blast-radius change to the rmcp integration seam
+and buys nothing over session-level binding: MCP session semantics already
+treat `initialize` as the contract boundary for capability negotiation, so
+varying the tool surface mid-session would contradict the protocol model
+anyway.
+
+**Chosen implementation path (option a, path 1):**
+
+Wrap the existing `StreamableHttpService` in a thin axum `Extension`-injection
+layer that reads `?surface` from the `initialize` request URI and stores it in
+an `Arc<str>` (or small newtype). The `BlackboxServer` factory closure receives
+this value from axum `Extension` extraction and stores it as a session-scoped
+field. All subsequent `list_tools` and `call_tool` calls read from that field.
+
+```text
+GET /mcp?surface=readonly HTTP/1.1      <- URL lives here, on initialize
+  -> axum middleware injects Extension<SurfaceId>
+  -> factory closure reads Extension<SurfaceId>
+  -> BlackboxServer { surface: "readonly", ... }
+  -> all handler methods read self.surface
+```
+
+The path-per-surface fallback (option a, path 2: separate
+`StreamableHttpService` mount per surface) is an acceptable v1 fallback if
+axum `Extension` extraction from inside the factory closure proves impossible,
+but should be the last resort because it multiplies mount points and makes
+dynamic surface registration awkward.
+
+**Constraints this decision records:**
+
+1. `?surface` is read-once at `initialize`; no mid-session surface changes.
+2. `BlackboxServer` gains a `surface: Arc<str>` field (or equivalent).
+3. `LocalSessionManager` is preserved; no custom session manager.
+4. Surface re-evaluation on each `list_tools`/`call_tool` (hot packet edits)
+   reads `self.surface` against the current packet store — the URL selector is
+   fixed but the packet result is live.
+5. The `deny` verdict fails `initialize` with an MCP protocol error, not an
+   empty tool list. This was the subject of note-90686e66; the doc's
+   Enforcement Semantics and ToolSurfaceVerdict sections already say
+   "fail MCP initialization" — the note was filed against an earlier draft.
+
+**Superseded open question:** The first Open Question above ("Confirm the
+exact `rmcp` seam") is resolved by this decision. The seam is axum middleware
+`Extension` injection into the `StreamableHttpService` factory closure.
