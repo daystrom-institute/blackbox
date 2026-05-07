@@ -389,6 +389,7 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "add_rust_use_decl" => plan_add_rust_use_decl(p),
         "copy_rust_mod_decls" => plan_copy_rust_mod_decls(p),
         "rewrite_rust_mod_visibility" => plan_rewrite_rust_mod_visibility(p),
+        "rewrite_rust_item_visibility" => plan_rewrite_rust_item_visibility(p),
         "rust_lsp_rename" => plan_rust_lsp_rename(p),
         "rust_organize_imports" => plan_rust_organize_imports(p),
         "move_file" => plan_move_file(p),
@@ -396,7 +397,7 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rust_lsp_rename, rust_organize_imports, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rust_lsp_rename, rust_organize_imports, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
@@ -1725,6 +1726,107 @@ fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+fn plan_rewrite_rust_item_visibility(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let parsed = parse_rust_file(&source_path)?;
+    let wants_impl_methods = p
+        .item_kinds
+        .as_deref()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "impl_method"));
+    let items = if wants_impl_methods {
+        if let Some(kinds) = p.item_kinds.as_deref() {
+            if !kinds.iter().all(|kind| kind == "impl_method") {
+                bail!(
+                    "rewrite_rust_item_visibility cannot mix impl_method with top-level item kinds"
+                );
+            }
+        }
+        let methods = rust_impl_methods(&parsed);
+        let candidates = methods
+            .iter()
+            .filter(|method| {
+                p.impl_name
+                    .as_deref()
+                    .is_none_or(|impl_name| method.impl_name == impl_name)
+            })
+            .map(|method| method.item.clone())
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            if let Some(impl_name) = p.impl_name.as_deref() {
+                bail!("no impl block matching `{impl_name}` found");
+            }
+            bail!("no Rust impl methods found");
+        }
+        candidates
+    } else {
+        if p.impl_name.is_some() {
+            bail!("impl_name requires item_kinds=[\"impl_method\"]");
+        }
+        rust_items(&parsed)
+    };
+    let selected = select_items(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
+    if wants_impl_methods && p.impl_name.is_none() {
+        if let Some(names) = p.item_names.as_deref() {
+            for name in names {
+                let matches = selected
+                    .iter()
+                    .filter(|item| item.name.as_deref() == Some(name.as_str()))
+                    .count();
+                if matches > 1 {
+                    bail!(
+                        "requested impl method `{name}` matched multiple impl blocks; pass impl_name"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut edits = Vec::new();
+    for item in &selected {
+        let keyword = rust_visibility_keyword_byte(&parsed.source, item)?;
+        let visibility_start = rust_item_visibility_start_byte(&parsed.source, item, keyword);
+        let current_prefix = &parsed.source[visibility_start..keyword];
+        if current_prefix == visibility {
+            continue;
+        }
+        edits.push(TextEdit {
+            byte_start: visibility_start,
+            byte_end: keyword,
+            replacement: visibility.to_string(),
+        });
+    }
+    if edits.is_empty() {
+        bail!("all selected Rust items already have requested visibility");
+    }
+    ensure_non_overlapping(&edits)?;
+    let plan = RefactorPlan {
+        title: format!(
+            "rewrite visibility for {} Rust item(s) in {}",
+            selected.len(),
+            path_string(&source_path)
+        ),
+        kind: "rewrite_rust_item_visibility".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits,
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: selected.into_iter().cloned().collect(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
 fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let target_path = p
@@ -2360,8 +2462,57 @@ fn rust_decl_visibility_prefix(visibility: Option<&str>) -> Result<&'static str>
         "" | "private" => Ok(""),
         "pub" => Ok("pub "),
         "pub(crate)" => Ok("pub(crate) "),
-        other => bail!("unsupported Rust visibility `{other}`; supported: pub, pub(crate)"),
+        "pub(super)" => Ok("pub(super) "),
+        other => {
+            bail!("unsupported Rust visibility `{other}`; supported: pub, pub(crate), pub(super)")
+        }
     }
+}
+
+fn rust_visibility_keyword_byte(source: &str, item: &SyntaxItem) -> Result<usize> {
+    let keyword = match item.kind.as_str() {
+        "function_item" | "impl_method" => "fn",
+        "struct_item" => "struct",
+        "enum_item" => "enum",
+        "trait_item" => "trait",
+        "const_item" => "const",
+        "static_item" => "static",
+        "type_item" => "type",
+        "mod_item" => "mod",
+        other => bail!("visibility rewrite does not support Rust item kind `{other}`"),
+    };
+    let text = source
+        .get(item.byte_start..item.byte_end)
+        .ok_or_else(|| anyhow!("invalid item range for {}", item.plan_local_id))?;
+    for (idx, _) in text.match_indices(keyword) {
+        let before = idx
+            .checked_sub(1)
+            .and_then(|pos| text.as_bytes().get(pos))
+            .copied();
+        let after = text.as_bytes().get(idx + keyword.len()).copied();
+        let before_boundary = before.is_none_or(|byte| !rust_ident_byte(byte));
+        let after_boundary = after.is_none_or(|byte| !rust_ident_byte(byte));
+        if before_boundary && after_boundary {
+            return Ok(item.byte_start + idx);
+        }
+    }
+    bail!(
+        "could not locate `{keyword}` keyword for {}",
+        item.plan_local_id
+    )
+}
+
+fn rust_visibility_start_byte(source: &str, keyword: usize) -> usize {
+    let line_start = line_start_before(source, keyword);
+    let leading = source[line_start..keyword]
+        .bytes()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    line_start + leading
+}
+
+fn rust_item_visibility_start_byte(source: &str, item: &SyntaxItem, keyword: usize) -> usize {
+    rust_visibility_start_byte(source, keyword).max(item.byte_start)
 }
 
 fn rust_mod_keyword_byte(source: &str, item: &SyntaxItem) -> Result<usize> {
@@ -4879,6 +5030,102 @@ mod tests {
         assert!(truncated.contains("[truncated middle]"));
         assert!(truncated.contains("failures: important_test"));
         assert!(truncated.chars().count() <= 120);
+    }
+
+    #[test]
+    fn rewrite_rust_item_visibility_updates_top_level_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "struct Hidden;\nfn helper() {}\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_item_visibility".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["Hidden".into(), "helper".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: Some("pub(super)".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let text = fs::read_to_string(&source).unwrap();
+        assert!(text.contains("pub(super) struct Hidden;"));
+        assert!(text.contains("pub(super) fn helper() {}"));
+    }
+
+    #[test]
+    fn rewrite_rust_item_visibility_updates_impl_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "struct Thing;\nimpl Thing { fn hidden(&self) {} }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_item_visibility".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["hidden".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl Thing".into()),
+            module_name: None,
+            visibility: Some("pub(super)".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert!(fs::read_to_string(&source)
+            .unwrap()
+            .contains("impl Thing { pub(super) fn hidden(&self) {} }"));
     }
 
     #[test]

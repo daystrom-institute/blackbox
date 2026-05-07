@@ -16,6 +16,7 @@ Rust is the first writable backend.
   `bbox_refactor_plan(kind="add_rust_use_decl")` and
   `bbox_refactor_plan(kind="copy_rust_mod_decls")` and
   `bbox_refactor_plan(kind="rewrite_rust_mod_visibility")` and
+  `bbox_refactor_plan(kind="rewrite_rust_item_visibility")` and
   `bbox_refactor_plan(kind="rust_lsp_rename")` and
   `bbox_refactor_plan(kind="rust_organize_imports")`.
 - Apply: supported with `bbox_refactor_apply(confirm=true)`.
@@ -53,7 +54,13 @@ Writable plan kinds:
   rejected.
 - `rewrite_rust_mod_visibility`: rewrite an existing `mod name;`,
   `pub mod name;`, or `pub(crate) mod name;` declaration to requested
-  visibility (`private`, `pub`, or `pub(crate)`).
+  visibility (`private`, `pub`, `pub(crate)`, or `pub(super)`).
+- `rewrite_rust_item_visibility`: rewrite selected top-level Rust items or
+  selected impl methods to requested visibility (`private`, `pub`,
+  `pub(crate)`, or `pub(super)`). Use `item_kinds=["impl_method"]` plus
+  `impl_name` when method names are ambiguous across impl blocks. Use this
+  after extracting items into child modules when the parent must still call
+  helper functions, constructors, or inherent methods.
 - `rust_lsp_rename`: rename a Rust symbol through rust-analyzer. Pass
   `item_names=["old_name"]` or `old_text="old_name"` plus
   `new_text="new_name"` and `source` pointing at a file containing the symbol
