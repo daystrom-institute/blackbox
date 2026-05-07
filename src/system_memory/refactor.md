@@ -27,7 +27,8 @@ Writable structural plans are narrower:
 - Rust: `bbox_refactor_plan(kind="extract_rust_items")` or
   `bbox_refactor_plan(kind="extract_rust_impl_methods")` or
   `bbox_refactor_plan(kind="add_rust_router_to_sum")` or
-  `bbox_refactor_plan(kind="add_rust_mod_decl")`, then
+  `bbox_refactor_plan(kind="add_rust_mod_decl")` or
+  `bbox_refactor_plan(kind="add_rust_use_decl")`, then
   `bbox_refactor_apply(confirm=true)`.
 - TypeScript / JavaScript: inspect-only today. Use `sm-refactor-typescript`.
 - C#: inspect-only today. Use `sm-refactor-csharp`.

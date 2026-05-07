@@ -57,6 +57,13 @@ pub struct RefactorPlanParams {
     /// Optional module name for add_rust_mod_decl.
     #[serde(default)]
     pub module_name: Option<String>,
+    /// Optional visibility for declaration-insertion plans: "pub" or "pub(crate)".
+    #[serde(default)]
+    pub visibility: Option<String>,
+    /// Optional Rust use path for add_rust_use_decl, without the leading `use`
+    /// and without a trailing semicolon.
+    #[serde(default)]
+    pub use_path: Option<String>,
     /// Optional router name for extract_rust_impl_methods. When present, the
     /// generated target wrapper is annotated as #[tool_router(router = name)].
     #[serde(default)]
@@ -268,8 +275,9 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "extract_rust_impl_methods" => plan_extract_rust_impl_methods(p),
         "add_rust_router_to_sum" => plan_add_rust_router_to_sum(p),
         "add_rust_mod_decl" => plan_add_rust_mod_decl(p),
+        "add_rust_use_decl" => plan_add_rust_use_decl(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, add_rust_router_to_sum, add_rust_mod_decl"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl"
         ),
     }
 }
@@ -724,6 +732,8 @@ fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
         })
         .ok_or_else(|| anyhow!("module_name is required for add_rust_mod_decl"))?;
     validate_rust_identifier(module_name, "module_name")?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let declaration = format!("{visibility}mod {module_name};");
 
     let parsed = parse_rust_file(&source_path)?;
     let items = rust_items(&parsed);
@@ -739,19 +749,83 @@ fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
         .filter(|item| item.kind == "mod_item")
         .max_by_key(|item| item.byte_end);
     let (insert_at, replacement) = if let Some(item) = last_mod {
-        (item.byte_end, format!("\nmod {module_name};"))
+        (item.byte_end, format!("\n{declaration}"))
     } else {
         (
             rust_module_decl_fallback_insert_byte(&parsed.source),
-            format!("mod {module_name};\n"),
+            format!("{declaration}\n"),
         )
     };
     let plan = RefactorPlan {
         title: format!(
-            "add Rust module declaration {module_name} to {}",
+            "add Rust module declaration {declaration} to {}",
             path_string(&source_path)
         ),
         kind: "add_rust_mod_decl".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: insert_at,
+                byte_end: insert_at,
+                replacement,
+            }],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let use_path = p
+        .use_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("use_path is required for add_rust_use_decl"))?;
+    validate_rust_use_path(use_path)?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let declaration = format!("{visibility}use {use_path};");
+
+    let parsed = parse_rust_file(&source_path)?;
+    if parsed.source.lines().any(|line| line.trim() == declaration) {
+        bail!("use declaration `{declaration}` already exists");
+    }
+    let items = rust_items(&parsed);
+    let insert_at = items
+        .iter()
+        .filter(|item| item.kind == "use_declaration")
+        .max_by_key(|item| item.byte_end)
+        .map(|item| item.byte_end)
+        .or_else(|| {
+            items
+                .iter()
+                .filter(|item| item.kind == "mod_item")
+                .max_by_key(|item| item.byte_end)
+                .map(|item| item.trailing_trivia_end)
+        })
+        .unwrap_or_else(|| rust_module_decl_fallback_insert_byte(&parsed.source));
+    let replacement = if parsed.source[insert_at..].starts_with('\n') {
+        format!("\n{declaration}")
+    } else if insert_at == parsed.source.len() || parsed.source[..insert_at].ends_with('\n') {
+        format!("{declaration}\n")
+    } else {
+        format!("\n{declaration}\n")
+    };
+    let plan = RefactorPlan {
+        title: format!(
+            "add Rust use declaration {declaration} to {}",
+            path_string(&source_path)
+        ),
+        kind: "add_rust_use_decl".to_string(),
         semantic_status: SemanticStatus::StructuralOnly,
         dry_run: true,
         edits: vec![FileEdit {
@@ -1120,6 +1194,29 @@ fn validate_rust_router_call(value: &str, field: &str) -> Result<()> {
     }
     for segment in path.split("::") {
         validate_rust_identifier(segment, field)?;
+    }
+    Ok(())
+}
+
+fn rust_decl_visibility_prefix(visibility: Option<&str>) -> Result<&'static str> {
+    match visibility.unwrap_or("").trim() {
+        "" | "private" => Ok(""),
+        "pub" => Ok("pub "),
+        "pub(crate)" => Ok("pub(crate) "),
+        other => bail!("unsupported Rust visibility `{other}`; supported: pub, pub(crate)"),
+    }
+}
+
+fn validate_rust_use_path(value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("use_path must not be empty");
+    }
+    if trimmed != value {
+        bail!("use_path must not have leading or trailing whitespace");
+    }
+    if value.contains('\n') || value.contains('\r') || value.contains(';') {
+        bail!("use_path must be a single Rust use path without a trailing semicolon");
     }
     Ok(())
 }
@@ -1747,6 +1844,8 @@ mod tests {
             item_kinds: Some(vec!["struct_item".into()]),
             impl_name: None,
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -1794,6 +1893,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: Some("moved_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -1846,6 +1947,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: Some("moved_tools".into()),
             router_call: None,
             router_export_name: Some("router".into()),
@@ -1897,6 +2000,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: Some("moved_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -1948,6 +2053,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: Some("search_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -1993,6 +2100,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2042,6 +2151,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2088,6 +2199,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2133,6 +2246,8 @@ mod tests {
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some(header.into()),
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2175,6 +2290,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2200,6 +2317,8 @@ mod tests {
             item_kinds: Some(vec!["function_item".into()]),
             impl_name: Some("impl A".into()),
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2230,6 +2349,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: Some("search_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -2274,6 +2395,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: Some("refactor_tools::router()".into()),
             router_export_name: None,
@@ -2314,6 +2437,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             module_name: Some("gamma".into()),
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2354,6 +2479,118 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             module_name: Some("alpha".into()),
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn add_rust_mod_decl_supports_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "pub mod alpha;\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "add_rust_mod_decl".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: Some("beta".into()),
+            visibility: Some("pub(crate)".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "pub mod alpha;\npub(crate) mod beta;\n"
+        );
+    }
+
+    #[test]
+    fn add_rust_use_decl_inserts_after_existing_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "mod alpha;\n\nuse std::fmt;\n\nfn main() {}\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "add_rust_use_decl".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: Some("crate::alpha::Thing".into()),
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "mod alpha;\n\nuse std::fmt;\nuse crate::alpha::Thing;\n\nfn main() {}\n"
+        );
+    }
+
+    #[test]
+    fn add_rust_use_decl_supports_pub_use_and_rejects_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "pub use crate::alpha::Thing;\n").unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "add_rust_use_decl".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: Some("pub".into()),
+            use_path: Some("crate::alpha::Thing".into()),
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2382,6 +2619,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: Some("search_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -2431,6 +2670,8 @@ mod tests {
             item_kinds: None,
             impl_name: None,
             module_name: None,
+            visibility: None,
+            use_path: None,
             router_name: None,
             router_call: None,
             router_export_name: None,

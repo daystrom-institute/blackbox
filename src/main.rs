@@ -3976,7 +3976,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_refactor_plan",
-        description = "Create a dry-run structural refactor plan. Supports Rust top-level extraction, Rust impl-method extraction, module declarations, and Rust router-sum updates."
+        description = "Create a dry-run structural refactor plan. Supports Rust top-level extraction, Rust impl-method extraction, module/use declarations, and Rust router-sum updates."
     )]
     fn bbox_refactor_plan(&self, Parameters(p): Parameters<RefactorPlanParams>) -> CallToolResult {
         Self::run("bbox_refactor_plan", || refactor::plan(&p))

@@ -11,7 +11,8 @@ Rust is the first writable backend.
 - Plan: supported with `bbox_refactor_plan(kind="extract_rust_items")` and
   `bbox_refactor_plan(kind="extract_rust_impl_methods")` and
   `bbox_refactor_plan(kind="add_rust_router_to_sum")` and
-  `bbox_refactor_plan(kind="add_rust_mod_decl")`.
+  `bbox_refactor_plan(kind="add_rust_mod_decl")` and
+  `bbox_refactor_plan(kind="add_rust_use_decl")`.
 - Apply: supported with `bbox_refactor_apply(confirm=true)`.
 - Semantic rename: not supported by blackbox yet; use rust-analyzer, compiler
   feedback, or manual edits after inspection.
@@ -29,7 +30,9 @@ Writable plan kinds:
 - `add_rust_router_to_sum`: append `+ Self::<router_name>()` to a Rust
   `tool_router:` field initializer if that router call is not already present.
 - `add_rust_mod_decl`: add `mod <module_name>;` after existing top-level module
-  declarations.
+  declarations. Optional `visibility` supports `pub` and `pub(crate)`.
+- `add_rust_use_decl`: add `use <use_path>;`, `pub use <use_path>;`, or
+  `pub(crate) use <use_path>;` after existing top-level use declarations.
 
 Supported top-level item kinds include:
 
@@ -139,6 +142,18 @@ bbox_refactor_plan(
   kind="add_rust_mod_decl",
   source="src/main.rs",
   module_name="search_tools",
+  project_dir="/absolute/project/root"
+)
+```
+
+Add a re-export or import:
+
+```text
+bbox_refactor_plan(
+  kind="add_rust_use_decl",
+  source="src/lib.rs",
+  use_path="server::BlackboxServer",
+  visibility="pub",
   project_dir="/absolute/project/root"
 )
 ```
