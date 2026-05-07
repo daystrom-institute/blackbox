@@ -51,30 +51,28 @@ Inbound side stays the same as before:
 
 ## Install (idempotent — re-run after `git pull`)
 
-```bash
-PORT="${BBOX_PORT:-7264}"
-BBOX="http://127.0.0.1:${PORT}"
+Use `bbox_artifact_install` (MCP) or the `/admin/artifact/install`
+HTTP endpoint — **not** `/admin/workflow/install` directly. The
+artifact-install path updates BOTH the artifact catalog (durable,
+versioned, source-tracked) AND the runtime workflow registry. The
+admin/workflow/install path only updates the runtime registry,
+leaving the catalog stale — which makes future audits and supersession
+chains see drift between source files and the daemon's view.
 
-# Workflows
-for wf in badgey-scout-arc badgey-slack-emit-proposal-arc \
-          badgey-triage-channel-arc badgey-triage-fanout-arc; do
-  curl -fsS -X POST -H 'Content-Type: application/json' \
-    "${BBOX}/admin/workflow/install" \
-    -d "$(jq -nc --arg id "$wf" \
-        --slurpfile spec examples/badgey/workflows/${wf}.json \
-        '{id:$id, spec:$spec[0]}')"
-done
+```text
+# MCP form (preferred):
+bbox_artifact_install(kind="workflow", source="examples/badgey/workflows/badgey-scout-arc.json")
+bbox_artifact_install(kind="workflow", source="examples/badgey/workflows/badgey-slack-emit-proposal-arc.json")
+bbox_artifact_install(kind="workflow", source="examples/badgey/workflows/badgey-triage-channel-arc.json")
+bbox_artifact_install(kind="workflow", source="examples/badgey/workflows/badgey-triage-fanout-arc.json")
+bbox_artifact_install(kind="packet",   source="examples/badgey/packets/badgey-cron-routing.json")
+```
 
-# Cron-routing packet (compiles + activates the start_arc rule)
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  "${BBOX}/admin/packet/compile" \
-  -d @examples/badgey/packets/badgey-cron-routing.json
+The cron itself still installs via `bro_cron_install` (no artifact
+catalog for crons today):
 
-# Daily cron — schedule + routing-packet binding
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  "${BBOX}/admin/cron/install" \
-  -d "$(jq -nc --slurpfile spec examples/badgey/crons/badgey-triage-daily.json \
-        '{spec: $spec[0]}')"
+```text
+bro_cron_install(spec=<contents of examples/badgey/crons/badgey-triage-daily.json>)
 ```
 
 ## Bind a channel
