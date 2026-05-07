@@ -67,7 +67,7 @@ impl ToolCategory {
             }
             Self::Projects => "Register project roots for later file indexing.",
             Self::Refactor => {
-                "Mechanize structural refactors with tree-sitter-backed source inventory, dry-run plans, hash-checked apply, transaction composition, and parse validation. Inspection is multi-language for supported grammars; writable plan kinds are language-scoped. Pull `sm-refactor` first, then the relevant language runbook via `bbox_knowledge` for exact plan kinds, arguments, and validation expectations. These tools are syntax-aware, not semantic rename engines; use language servers or compiler feedback for reference resolution and import repair."
+                "Mechanize structural refactors with tree-sitter-backed source inventory, dry-run plans, hash-checked apply, transaction composition, file moves, and parse validation. Inspection is multi-language for supported grammars; writable plan kinds may be generic or language-scoped. Pull `sm-refactor` first, then any relevant language runbook via `bbox_knowledge` for exact plan kinds, arguments, and validation expectations. These tools are syntax-aware, not semantic rename engines; use language servers or compiler feedback for reference resolution and import repair."
             }
             Self::Knowledge => {
                 "Memory lanes: `bbox_learn` for rendered rules, `bbox_remember` for cold recall, `bbox_decide` for durable commitments, and `bbox_pin` for scoped active context."
@@ -299,15 +299,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_refactor_status",
         category: ToolCategory::Refactor,
         summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",
-        when_to_use: "Use before structural planning to inventory refactorable syntax items, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a language-specific bbox_refactor_plan when one exists. On large files, pass item_kinds/item_names and limit to keep the response agent-sized. Pull `sm-refactor` first, then the relevant language memory for language-specific item kinds, arguments, caveats, and validation commands.",
+        when_to_use: "Use before syntax-aware structural planning to inventory refactorable syntax items, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a supported bbox_refactor_plan when the plan kind needs them. On large files, pass item_kinds/item_names and limit to keep the response agent-sized. Pull `sm-refactor` first, then any relevant language memory for language-specific item kinds, arguments, caveats, and validation commands.",
         example: Some(r#"bbox_refactor_status(file="src/path/to/file.ext", project_dir="/repo/x", item_names=["Thing"], limit=50, include_attributes=false)"#),
     },
     ToolDoc {
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
-        summary: "Create a dry-run structural refactor plan using a language-scoped plan kind.",
-        when_to_use: "Use after bbox_refactor_status and the relevant language memory identify an exact supported plan kind. The plan is reviewable JSON with hash checks, text edits, parse validations, selected items, and leftovers where applicable. Keep this generic surface free of language-specific assumptions: plan kind names and extra arguments come from language memories such as `sm-refactor-rust`, while semantic rename/import repair belongs to LSP or future validation surfaces.",
-        example: Some(r#"bbox_refactor_plan(kind="<language_plan_kind>", source="src/path/to/file.ext", target="src/path/to/target.ext", item_names=["Thing"], project_dir="/repo/x")"#),
+        summary: "Create a dry-run structural refactor plan using a supported generic or language-scoped plan kind.",
+        when_to_use: "Use after `sm-refactor` identifies an exact supported plan kind. For syntax-item operations, inspect with bbox_refactor_status first and use the relevant language memory for exact item kinds and extra arguments. The plan is reviewable JSON with hash checks, file moves or text edits, parse validations, selected items, and leftovers where applicable. Keep this generic surface free of language-specific assumptions; semantic rename/import repair belongs to LSP or future validation surfaces.",
+        example: Some(r#"bbox_refactor_plan(kind="<supported_plan_kind>", source="src/path/to/file.ext", target="src/path/to/target.ext", item_names=["Thing"], project_dir="/repo/x")"#),
     },
     ToolDoc {
         name: "bbox_refactor_apply",
@@ -321,7 +321,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Refactor,
         summary: "Compose primitive refactor plans into one transactional run with rollback across touched files.",
         when_to_use: "Use when a restructuring move needs several bbox_refactor_plan primitives to succeed or fail together. V1 executes primitive plan steps sequentially against the live projected state when confirm=true, snapshots touched files before first write, rejects initially dirty files unless allow_dirty_worktree=true, and rolls back primitive-plan writes if any later plan step fails. Language-specific validation commands belong in language memories or a separate validation surface, not in this generic runner.",
-        example: Some(r#"bbox_refactor_run(title="compound structural move", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"<language_plan_kind>","source":"src/path/to/file.ext","item_names":["Thing"]},{"op":"plan","kind":"<another_language_plan_kind>","source":"src/path/to/file.ext"}])"#),
+        example: Some(r#"bbox_refactor_run(title="compound structural move", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"<supported_plan_kind>","source":"src/path/to/file.ext","item_names":["Thing"]},{"op":"plan","kind":"<another_supported_plan_kind>","source":"src/path/to/file.ext"}])"#),
     },
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {

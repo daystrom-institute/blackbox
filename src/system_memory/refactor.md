@@ -24,6 +24,12 @@ mapped languages are inspect-only unless a newer language memory says otherwise.
 
 Writable structural plans are narrower:
 
+- Generic: `bbox_refactor_plan(kind="move_file")` moves a file from `source`
+  to a missing `target`, then `bbox_refactor_apply(confirm=true)`. Supported
+  source files are syntax-validated at the destination path; unsupported file
+  types still get hash, dirty-file, path-scope, target-exists, and rollback
+  checks. Use `bbox_refactor_run(confirm=true)` when the file move must be
+  grouped with language-specific declaration/reference edits.
 - Rust: `bbox_refactor_plan(kind="extract_rust_items")` or
   `bbox_refactor_plan(kind="extract_rust_impl_methods")` or
   `bbox_refactor_plan(kind="delete_rust_items")` or
@@ -76,8 +82,8 @@ can copy exact method names before planning an impl extraction. Omit filters for
 small files only; status defaults to at most 200 returned items and reports
 `total_items`, `matching_items`, `returned_items`, and `truncated`.
 
-2. Only call `bbox_refactor_plan` for a plan kind that the language memory says
-   is writable.
+2. Only call `bbox_refactor_plan` for a generic plan kind listed here or for a
+   language-scoped plan kind that the language memory says is writable.
 
 3. Only call `bbox_refactor_apply` after reviewing the JSON plan. Apply requires
    `confirm=true`, registered-project path scope, clean git files by default

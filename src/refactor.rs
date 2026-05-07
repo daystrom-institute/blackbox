@@ -36,7 +36,7 @@ pub struct RefactorStatusParams {
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
-    /// Language-scoped plan kind. Pull the language memory for supported values.
+    /// Supported generic or language-scoped plan kind. Pull sm-refactor first.
     pub kind: String,
     /// Source file. Relative paths resolve against project_dir or cwd.
     pub source: String,
@@ -153,6 +153,13 @@ pub struct FileEdit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct FileMove {
+    pub source_path: String,
+    pub target_path: String,
+    pub original_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticStatus {
     StructuralOnly,
@@ -176,6 +183,8 @@ pub struct RefactorPlan {
     pub kind: String,
     pub semantic_status: SemanticStatus,
     pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_moves: Vec<FileMove>,
     pub edits: Vec<FileEdit>,
     pub validations: Vec<ValidationStep>,
     pub items: Vec<SyntaxItem>,
@@ -332,8 +341,9 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "add_rust_use_decl" => plan_add_rust_use_decl(p),
         "copy_rust_mod_decls" => plan_copy_rust_mod_decls(p),
         "rewrite_rust_mod_visibility" => plan_rewrite_rust_mod_visibility(p),
+        "move_file" => plan_move_file(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, move_file"
         ),
     }
 }
@@ -346,7 +356,41 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
         .context("plan must be a RefactorPlan JSON object returned by bbox_refactor_plan")?;
     validate_plan_shape(&plan)?;
 
-    let mut originals = Vec::new();
+    let mut originals: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let mut moved_files = Vec::new();
+    for file_move in &plan.file_moves {
+        let source_path = PathBuf::from(&file_move.source_path);
+        let target_path = PathBuf::from(&file_move.target_path);
+        if p.allow_unregistered_paths != Some(true) {
+            ensure_path_in_registered_project(&source_path, projects)?;
+            ensure_path_in_registered_project(&target_path, projects)?;
+        }
+        if p.allow_dirty_worktree != Some(true) {
+            ensure_git_clean_for_path(&source_path)?;
+            ensure_git_clean_for_path(&target_path)?;
+        }
+        if target_path.exists() {
+            bail!(
+                "refusing to move {} to {}: target already exists",
+                source_path.display(),
+                target_path.display()
+            );
+        }
+        let original = read_original_for_edit(&source_path, &file_move.original_sha256)?;
+        let original_hash = sha256_hex(&original);
+        if original_hash != file_move.original_sha256 {
+            bail!(
+                "refusing to move {}: file hash changed (expected {}, got {})",
+                source_path.display(),
+                file_move.original_sha256,
+                original_hash
+            );
+        }
+        originals.push((source_path.clone(), Some(original.clone())));
+        originals.push((target_path.clone(), None));
+        moved_files.push((source_path, target_path, original));
+    }
+
     let mut rewritten = Vec::new();
     for edit in &plan.edits {
         let path = PathBuf::from(&edit.path);
@@ -370,11 +414,17 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
             .with_context(|| format!("{} is not valid utf-8", path.display()))?;
         let next = apply_text_edits(&original_text, &edit.edits)
             .with_context(|| format!("failed to apply edits for {}", path.display()))?;
-        originals.push((path.clone(), original));
+        originals.push((path.clone(), Some(original)));
         rewritten.push((path, next.into_bytes()));
     }
 
-    let validations = validate_rewritten_files(&rewritten)?;
+    let mut validation_inputs = rewritten.clone();
+    validation_inputs.extend(
+        moved_files
+            .iter()
+            .map(|(_, target_path, bytes)| (target_path.clone(), bytes.clone())),
+    );
+    let validations = validate_rewritten_files(&validation_inputs)?;
     if validations
         .iter()
         .any(|v| v.has_error || v.error_nodes > 0 || v.missing_nodes > 0)
@@ -390,19 +440,58 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
     }
 
     let mut files_written = Vec::new();
-    let mut wrote = Vec::new();
+    for (source_path, target_path, bytes) in &moved_files {
+        if let Some(parent) = target_path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                let rollback_errors = restore_snapshots(&originals);
+                return Ok(serde_json::to_string_pretty(&RefactorApplyResponse {
+                    status: "write_failed".to_string(),
+                    files_written,
+                    validations,
+                    rolled_back: rollback_errors.is_empty(),
+                    error: Some(format!(
+                        "failed to create parent directory {}: {err:#}",
+                        parent.display()
+                    )),
+                    rollback_errors,
+                })?);
+            }
+        }
+        if let Err(err) = write_atomic(target_path, bytes) {
+            let rollback_errors = restore_snapshots(&originals);
+            return Ok(serde_json::to_string_pretty(&RefactorApplyResponse {
+                status: "write_failed".to_string(),
+                files_written,
+                validations,
+                rolled_back: rollback_errors.is_empty(),
+                error: Some(format!(
+                    "failed to write {}: {err:#}",
+                    target_path.display()
+                )),
+                rollback_errors,
+            })?);
+        }
+        files_written.push(path_string(target_path));
+        if let Err(err) = fs::remove_file(source_path) {
+            let rollback_errors = restore_snapshots(&originals);
+            return Ok(serde_json::to_string_pretty(&RefactorApplyResponse {
+                status: "remove_failed".to_string(),
+                files_written,
+                validations,
+                rolled_back: rollback_errors.is_empty(),
+                error: Some(format!(
+                    "failed to remove {}: {err:#}",
+                    source_path.display()
+                )),
+                rollback_errors,
+            })?);
+        }
+    }
+
     for (path, bytes) in &rewritten {
         if p.allow_dirty_worktree != Some(true) {
             if let Err(err) = ensure_git_clean_for_path(path) {
-                let mut rollback_errors = Vec::new();
-                for (restore_path, restore_bytes) in
-                    originals.iter().filter(|(p, _)| wrote.contains(p))
-                {
-                    if let Err(restore_err) = write_atomic(restore_path, restore_bytes) {
-                        rollback_errors
-                            .push(format!("{}: {restore_err:#}", restore_path.display()));
-                    }
-                }
+                let rollback_errors = restore_snapshots(&originals);
                 return Ok(serde_json::to_string_pretty(&RefactorApplyResponse {
                     status: "dirty_worktree".to_string(),
                     files_written,
@@ -417,13 +506,7 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
             fs::create_dir_all(parent)?;
         }
         if let Err(err) = write_atomic(path, bytes) {
-            let mut rollback_errors = Vec::new();
-            for (restore_path, restore_bytes) in originals.iter().filter(|(p, _)| wrote.contains(p))
-            {
-                if let Err(restore_err) = write_atomic(restore_path, restore_bytes) {
-                    rollback_errors.push(format!("{}: {restore_err:#}", restore_path.display()));
-                }
-            }
+            let rollback_errors = restore_snapshots(&originals);
             return Ok(serde_json::to_string_pretty(&RefactorApplyResponse {
                 status: "write_failed".to_string(),
                 files_written,
@@ -433,7 +516,6 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
                 rollback_errors,
             })?);
         }
-        wrote.push(path.clone());
         files_written.push(path_string(path));
     }
 
@@ -499,15 +581,18 @@ pub fn run(p: &RefactorRunParams, projects: &[ProjectRecord]) -> Result<String> 
                 let plan_value: serde_json::Value = serde_json::from_str(&plan_text)?;
                 let refactor_plan: RefactorPlan = serde_json::from_value(plan_value.clone())?;
                 validate_plan_shape(&refactor_plan)?;
-                let step_files = refactor_plan
-                    .edits
+                let mut step_files = refactor_plan
+                    .file_moves
                     .iter()
-                    .map(|edit| edit.path.clone())
+                    .flat_map(|file_move| {
+                        [file_move.source_path.clone(), file_move.target_path.clone()]
+                    })
                     .collect::<Vec<_>>();
+                step_files.extend(refactor_plan.edits.iter().map(|edit| edit.path.clone()));
 
                 if confirmed {
-                    for edit in &refactor_plan.edits {
-                        let path = PathBuf::from(&edit.path);
+                    for file in &step_files {
+                        let path = PathBuf::from(file);
                         if p.allow_unregistered_paths != Some(true) {
                             if let Err(err) = ensure_path_in_registered_project(&path, projects) {
                                 let rollback_errors = restore_snapshots(&snapshots);
@@ -762,6 +847,7 @@ fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> {
         kind: "extract_rust_items".to_string(),
         semantic_status: SemanticStatus::StructuralOnly,
         dry_run: true,
+        file_moves: Vec::new(),
         edits: vec![
             FileEdit {
                 path: path_string(&source_path),
@@ -914,6 +1000,7 @@ fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<String> {
         kind: "extract_rust_impl_methods".to_string(),
         semantic_status: SemanticStatus::StructuralOnly,
         dry_run: true,
+        file_moves: Vec::new(),
         edits: vec![
             FileEdit {
                 path: path_string(&source_path),
@@ -1065,6 +1152,7 @@ fn build_delete_rust_plan(
         kind: "delete_rust_items".to_string(),
         semantic_status: SemanticStatus::StructuralOnly,
         dry_run: true,
+        file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&parsed.path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
@@ -1122,6 +1210,7 @@ fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<String> {
         kind: "add_rust_router_to_sum".to_string(),
         semantic_status: SemanticStatus::StructuralOnly,
         dry_run: true,
+        file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
@@ -1183,6 +1272,7 @@ fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
         kind: "add_rust_mod_decl".to_string(),
         semantic_status: SemanticStatus::StructuralOnly,
         dry_run: true,
+        file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
@@ -1247,6 +1337,7 @@ fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
         kind: "add_rust_use_decl".to_string(),
         semantic_status: SemanticStatus::StructuralOnly,
         dry_run: true,
+        file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
@@ -1327,6 +1418,7 @@ fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String> {
         kind: "copy_rust_mod_decls".to_string(),
         semantic_status: SemanticStatus::StructuralOnly,
         dry_run: true,
+        file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&target_path),
             original_sha256: sha256_hex(target_source.as_bytes()),
@@ -1392,6 +1484,7 @@ fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result<String> {
         kind: "rewrite_rust_mod_visibility".to_string(),
         semantic_status: SemanticStatus::StructuralOnly,
         dry_run: true,
+        file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
@@ -1406,6 +1499,49 @@ fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result<String> {
             byte_range: None,
         }],
         items: vec![item.clone()],
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let target_path = p
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("target is required for move_file"))
+        .and_then(|target| resolve_path(p.project_dir.as_deref(), target))?;
+    if source_path == target_path {
+        bail!("source and target must be different files");
+    }
+    if !source_path.is_file() {
+        bail!("source file does not exist: {}", source_path.display());
+    }
+    if target_path.exists() {
+        bail!("target already exists: {}", target_path.display());
+    }
+    let original = fs::read(&source_path)
+        .with_context(|| format!("failed to read {}", source_path.display()))?;
+    let validations = parse_validation_step_for_path(&target_path);
+    let plan = RefactorPlan {
+        title: format!(
+            "move file {} to {}",
+            path_string(&source_path),
+            path_string(&target_path)
+        ),
+        kind: "move_file".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: vec![FileMove {
+            source_path: path_string(&source_path),
+            target_path: path_string(&target_path),
+            original_sha256: sha256_hex(&original),
+        }],
+        edits: Vec::new(),
+        validations,
+        items: Vec::new(),
         leftovers: Vec::new(),
     };
 
@@ -2231,14 +2367,40 @@ fn select_items<'a>(
 }
 
 fn validate_plan_shape(plan: &RefactorPlan) -> Result<()> {
-    if plan.edits.is_empty() {
-        bail!("plan has no edits");
+    if plan.edits.is_empty() && plan.file_moves.is_empty() {
+        bail!("plan has no edits or file moves");
+    }
+    let mut paths = HashSet::new();
+    for file_move in &plan.file_moves {
+        if file_move.source_path == file_move.target_path {
+            bail!("file move source and target must differ");
+        }
+        if !paths.insert(file_move.source_path.clone()) {
+            bail!("duplicate refactor path {}", file_move.source_path);
+        }
+        if !paths.insert(file_move.target_path.clone()) {
+            bail!("duplicate refactor path {}", file_move.target_path);
+        }
     }
     for edit in &plan.edits {
+        if !paths.insert(edit.path.clone()) {
+            bail!("duplicate refactor path {}", edit.path);
+        }
         ensure_non_overlapping(&edit.edits)
             .with_context(|| format!("overlapping edits in {}", edit.path))?;
     }
     Ok(())
+}
+
+fn parse_validation_step_for_path(path: &Path) -> Vec<ValidationStep> {
+    if language_for_path(path).is_some() {
+        vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(path),
+            byte_range: None,
+        }]
+    } else {
+        Vec::new()
+    }
 }
 
 fn restore_snapshots(snapshots: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
@@ -2335,15 +2497,20 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf> {
         return fs::canonicalize(path)
             .with_context(|| format!("canonicalizing {}", path.display()));
     }
-    let parent = path
+    let mut ancestor = path
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("{} has no final component", path.display()))?;
-    let parent = fs::canonicalize(parent)
-        .with_context(|| format!("canonicalizing parent {}", parent.display()))?;
-    Ok(parent.join(file_name))
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| anyhow!("{} has no existing parent directory", path.display()))?;
+    }
+    let canonical_ancestor = fs::canonicalize(ancestor)
+        .with_context(|| format!("canonicalizing parent {}", ancestor.display()))?;
+    let suffix = path
+        .strip_prefix(ancestor)
+        .with_context(|| format!("resolving missing suffix for {}", path.display()))?;
+    Ok(canonical_ancestor.join(suffix))
 }
 
 fn ensure_git_clean_for_path(path: &Path) -> Result<()> {
@@ -3440,6 +3607,69 @@ mod tests {
     }
 
     #[test]
+    fn refactor_run_rolls_back_file_move_when_later_plan_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("packets.rs");
+        let target = dir.path().join("packets").join("mod.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "rollback moved file".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "move_file".into(),
+                            source: "packets.rs".into(),
+                            target: Some("packets/mod.rs".into()),
+                            item_names: None,
+                            item_kinds: None,
+                            impl_name: None,
+                            module_name: None,
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            project_dir: None,
+                        },
+                    },
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "delete_rust_items".into(),
+                            source: "packets/mod.rs".into(),
+                            target: None,
+                            item_names: Some(vec!["missing".into()]),
+                            item_kinds: Some(vec!["function_item".into()]),
+                            impl_name: None,
+                            module_name: None,
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            project_dir: None,
+                        },
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "step_failed");
+        assert!(run_response.rolled_back);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn add_rust_router_to_sum_appends_router_call() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -3845,6 +4075,77 @@ mod tests {
     }
 
     #[test]
+    fn move_file_moves_source_to_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("packets.rs");
+        let target = dir.path().join("packets").join("mod.rs");
+        fs::write(&source, "pub fn packet() {}\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "move_file".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        assert_eq!(plan_value["kind"], "move_file");
+        assert_eq!(plan_value["file_moves"].as_array().unwrap().len(), 1);
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "pub fn packet() {}\n");
+    }
+
+    #[test]
+    fn move_file_rejects_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.rs");
+        let target = dir.path().join("b.rs");
+        fs::write(&source, "pub fn a() {}\n").unwrap();
+        fs::write(&target, "pub fn b() {}\n").unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "move_file".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("target already exists"));
+    }
+
+    #[test]
     fn add_rust_use_decl_inserts_after_existing_uses() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
@@ -4073,6 +4374,7 @@ mod tests {
             kind: "extract_rust_items".into(),
             semantic_status: SemanticStatus::StructuralOnly,
             dry_run: true,
+            file_moves: Vec::new(),
             edits: vec![FileEdit {
                 path: path_string(&source),
                 original_sha256: sha256_hex(b"fn f() {}\n"),
@@ -4105,6 +4407,7 @@ mod tests {
             kind: "extract_rust_items".into(),
             semantic_status: SemanticStatus::StructuralOnly,
             dry_run: true,
+            file_moves: Vec::new(),
             edits: vec![FileEdit {
                 path: path_string(&source),
                 original_sha256: sha256_hex(b"fn f() {}\n"),

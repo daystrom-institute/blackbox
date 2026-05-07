@@ -35,7 +35,7 @@ file names or tool prefixes, it does not count.
 | Update `BlackboxServer::new` router sum | insert router call into `tool_router:` field initializer | covered; can participate in `bbox_refactor_run` | none for existing router-sum shape |
 | Move file-local helper functions with a domain | dependency closure over selected handlers | none | call graph / reference extraction via rust-analyzer |
 | Move per-domain tests next to code | test discovery and relocation | none | test-to-symbol association and nested `#[cfg(test)]` module editing |
-| Convert `src/packets.rs` to `src/packets/mod.rs` | git/file move; update module layout; preserve module identity | none | transactional file move/rename op |
+| Convert `src/packets.rs` to `src/packets/mod.rs` | git/file move; update module layout; preserve module identity | covered for file move with `move_file` | module-layout declaration follow-up still manual/compound |
 | Split `packets` by layer (`ast`, `compile`, `apply`, etc.) | extract AST/types/functions/tests by dependency layers | partial for top-level items | dependency closure, import repair, test relocation |
 | Add `pub mod ast;` etc. inside `packets/mod.rs` | module declaration insertion | covered with visibility option | compound transaction integration |
 | Re-export moved symbols for compatibility | add `pub use` statements | covered with `add_rust_use_decl` | semantic choice of re-export path still manual/LSP-assisted |
@@ -69,13 +69,6 @@ file names or tool prefixes, it does not count.
 - `rewrite_rust_mod_visibility`
   - `mod foo;` -> `pub mod foo;`, `pub(crate) mod foo;`, or private
   - applies to existing declarations in place
-- `move_rust_file`
-  - `src/foo.rs` -> `src/foo/mod.rs` or arbitrary file move
-  - records old/new path, creates parent dirs, updates rollback
-- `rewrite_rust_mod_visibility`
-  - `mod foo;` -> `pub mod foo;` or `pub(crate) mod foo;`
-  - distinct from `add_rust_mod_decl.visibility`, which only controls newly
-    inserted declarations
 - `extract_rust_nested_module_items`
   - move items out of `#[cfg(test)] mod tests { ... }`
   - move nested support modules without flattening incorrectly
@@ -101,6 +94,11 @@ file names or tool prefixes, it does not count.
 - `edit_toml_manifest`
   - structured TOML edits for `[lib]`, `[[bin]]`, dependencies, workspace
     members
+- `move_file`
+  - move any file to a missing target path
+  - records old/new path, creates parent dirs, preserves source bytes, rejects
+    existing targets, validates supported source syntax at the destination, and
+    rolls back write/remove failures
 - `compound_run`
   - compose primitive plans and rollback
   - V1 implemented as `bbox_refactor_run` for primitive plans, with live
@@ -130,9 +128,9 @@ file names or tool prefixes, it does not count.
      module-declaration reparenting
 
 3. **File move support**
-   - `move_file`
+   - `move_file` is covered for missing-target file moves
    - especially `src/packets.rs` -> `src/packets/mod.rs`
-   - rollback and hash checks for file existence/non-existence
+   - future: module-layout update helper and temp-worktree validated diff mode
 
 4. **Structured TOML edits**
    - add `[lib]`

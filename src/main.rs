@@ -3976,7 +3976,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_refactor_plan",
-        description = "Create a dry-run structural refactor plan using a language-scoped plan kind."
+        description = "Create a dry-run structural refactor plan using a supported generic or language-scoped plan kind."
     )]
     fn bbox_refactor_plan(&self, Parameters(p): Parameters<RefactorPlanParams>) -> CallToolResult {
         Self::run("bbox_refactor_plan", || refactor::plan(&p))
