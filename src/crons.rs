@@ -171,9 +171,73 @@ pub fn load_all(dir: &std::path::Path) -> Vec<CronSpec> {
 /// keep the schedule object — `spawn_loop` re-parses (cron::Schedule
 /// isn't Clone, and we want the spec to remain a plain JSON struct).
 pub fn validate_schedule(expr: &str) -> Result<()> {
-    Schedule::from_str(expr)
+    let normalized = normalize_unix_dow(expr);
+    Schedule::from_str(&normalized)
         .map(|_| ())
         .map_err(|e| anyhow!("cron schedule '{expr}': {e}"))
+}
+
+/// Translate Unix-cron DOW conventions (`0` and `7` both = Sunday) into
+/// the `cron` crate's accepted 1-7 range. The crate rejects DOW=0 with
+/// a not-very-helpful "Days of Week must be greater than or equal to 1"
+/// error; users coming from standard crontab syntax expect `0` to work.
+///
+/// Handles standalone `0`, ranges starting at 0 (`0-3` → `7,1-3`), and
+/// step bases (`0/2` → `7/2`). Lists are walked element-wise. Anything
+/// else passes through unchanged so the underlying parser can produce
+/// its own error.
+pub fn normalize_unix_dow(expr: &str) -> String {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 6 {
+        return expr.to_string();
+    }
+    let dow_normalized = normalize_dow_field(fields[5]);
+    let mut out = String::with_capacity(expr.len());
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if i == 5 {
+            out.push_str(&dow_normalized);
+        } else {
+            out.push_str(f);
+        }
+    }
+    out
+}
+
+fn normalize_dow_field(field: &str) -> String {
+    field
+        .split(',')
+        .map(normalize_dow_token)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn normalize_dow_token(tok: &str) -> String {
+    if let Some((base, step)) = tok.split_once('/') {
+        return format!("{}/{}", normalize_dow_base(base), step);
+    }
+    normalize_dow_base(tok)
+}
+
+fn normalize_dow_base(base: &str) -> String {
+    if let Some((lo, hi)) = base.split_once('-') {
+        let lo_t = lo.trim();
+        let hi_t = hi.trim();
+        if lo_t == "0" {
+            if hi_t == "0" {
+                return "7".to_string();
+            }
+            // 0-N (Sun..N) → 7,1-N
+            return format!("7,1-{hi_t}");
+        }
+        return base.to_string();
+    }
+    if base.trim() == "0" {
+        return "7".to_string();
+    }
+    base.to_string()
 }
 
 /// Build the entity that the routing packet sees on a tick. Synthetic
@@ -256,7 +320,7 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &CronSpec) -> R
 /// scheduled time (computed via `cron::Schedule`) and fires one tick.
 pub fn spawn_loop(state: Arc<crate::SharedState>, spec: CronSpec) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let schedule = match Schedule::from_str(&spec.schedule) {
+        let schedule = match Schedule::from_str(&normalize_unix_dow(&spec.schedule)) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -299,7 +363,8 @@ pub fn spawn_loop(state: Arc<crate::SharedState>, spec: CronSpec) -> JoinHandle<
 /// Helper for tests / introspection: compute the next N scheduled
 /// times for a cron expression as RFC3339 strings.
 pub fn upcoming_times(expr: &str, n: usize) -> Result<Vec<String>> {
-    let schedule = Schedule::from_str(expr).map_err(|e| anyhow!("schedule: {e}"))?;
+    let schedule =
+        Schedule::from_str(&normalize_unix_dow(expr)).map_err(|e| anyhow!("schedule: {e}"))?;
     Ok(schedule
         .upcoming(Utc)
         .take(n)
@@ -329,6 +394,22 @@ mod tests {
     fn schedule_rejects_garbage() {
         assert!(validate_schedule("not a cron").is_err());
         assert!(validate_schedule("").is_err());
+    }
+
+    #[test]
+    fn unix_dow_zero_accepted_as_sunday() {
+        // Standard Unix cron treats 0 as Sunday; the cron crate only
+        // accepts 1-7. The normalizer should bridge.
+        validate_schedule("0 0 9 * * 0").expect("DOW=0 should normalize to Sunday");
+        assert_eq!(normalize_unix_dow("0 0 9 * * 0"), "0 0 9 * * 7");
+        assert_eq!(normalize_unix_dow("0 0 9 * * 0-3"), "0 0 9 * * 7,1-3");
+        assert_eq!(normalize_unix_dow("0 0 9 * * 0/2"), "0 0 9 * * 7/2");
+        assert_eq!(normalize_unix_dow("0 0 9 * * 0,3,5"), "0 0 9 * * 7,3,5");
+        // Untouched: non-zero values, named days, non-DOW fields
+        assert_eq!(normalize_unix_dow("0 0 9 * * 1-5"), "0 0 9 * * 1-5");
+        assert_eq!(normalize_unix_dow("0 0 9 * * MON-FRI"), "0 0 9 * * MON-FRI");
+        // Pass-through for malformed-length expressions; downstream parser surfaces the error
+        assert_eq!(normalize_unix_dow("malformed"), "malformed");
     }
 
     #[test]

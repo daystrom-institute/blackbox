@@ -492,6 +492,27 @@ impl BlackboxServer {
         counts.insert("thread".into(), self.state.threads.read().all().len());
         counts.insert("note".into(), self.state.notes.read().all().len());
         counts.insert("whiteboard".into(), self.state.whiteboards.list_ids().len());
+        // Brofile and agent vertices live in the artifact catalog. They
+        // don't naturally appear in the EdgeIndex's known_refs until a
+        // DERIVED_FROM / SUPERSEDES edge points at them; until that
+        // wire-up matures (design/agent-system.md §8.1), seed the
+        // counts directly from the catalog so describe_schema reflects
+        // installed artifacts.
+        let catalog = self.state.artifacts.read();
+        for (kind, key) in [
+            (artifacts::ArtifactKind::Brofile, "brofile"),
+            (artifacts::ArtifactKind::Agent, "agent"),
+        ] {
+            let params = artifacts::ArtifactListParams {
+                kind: Some(kind),
+                name: None,
+                include_superseded: false,
+            };
+            if let Ok(entries) = catalog.list(&params) {
+                let active = entries.iter().filter(|e| e.active).count();
+                counts.insert(key.into(), active);
+            }
+        }
         counts
     }
 
@@ -2776,6 +2797,29 @@ impl BlackboxServer {
         let mut r = CallToolResult::success(Self::cap_response_text(msg).into_contents());
         r.is_error = Some(true);
         r
+    }
+
+    /// Parse a tool-supplied spec field that nominally takes a JSON object
+    /// but may arrive as a stringified JSON document (some MCP clients
+    /// stringify nested objects when the schema doesn't pin `type: object`
+    /// tightly). Accepts either form.
+    fn parse_spec<T: serde::de::DeserializeOwned>(
+        spec: Value,
+        kind: &str,
+    ) -> Result<T, CallToolResult> {
+        let resolved = match spec {
+            Value::String(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(Self::err_text(&format!(
+                        "{kind} spec parse failed: passed as string but not valid JSON: {e}"
+                    )));
+                }
+            },
+            other => other,
+        };
+        serde_json::from_value(resolved)
+            .map_err(|e| Self::err_text(&format!("{kind} spec parse failed: {e}")))
     }
 
     fn cap_response_text(text: &str) -> String {
@@ -6499,9 +6543,9 @@ Constraints:\n\
         &self,
         Parameters(p): Parameters<WebhookInstallParams>,
     ) -> CallToolResult {
-        let spec: webhooks::WebhookSpec = match serde_json::from_value(p.spec) {
+        let spec: webhooks::WebhookSpec = match Self::parse_spec(p.spec, "webhook") {
             Ok(s) => s,
-            Err(e) => return Self::err_text(&format!("webhook spec parse failed: {e}")),
+            Err(r) => return r,
         };
         // Reject schemes that aren't safe under the daemon's bind
         // (today: SignatureScheme::None requires loopback). Defense
@@ -6545,9 +6589,9 @@ Constraints:\n\
         &self,
         Parameters(p): Parameters<PollerInstallParams>,
     ) -> CallToolResult {
-        let spec: pollers::PollerSpec = match serde_json::from_value(p.spec) {
+        let spec: pollers::PollerSpec = match Self::parse_spec(p.spec, "poller") {
             Ok(s) => s,
-            Err(e) => return Self::err_text(&format!("poller spec parse failed: {e}")),
+            Err(r) => return r,
         };
         // Persist for restart durability.
         let dir = self.state.store_dir.join("pollers");
@@ -6586,9 +6630,9 @@ Constraints:\n\
         &self,
         Parameters(p): Parameters<CronInstallParams>,
     ) -> CallToolResult {
-        let spec: crons::CronSpec = match serde_json::from_value(p.spec) {
+        let spec: crons::CronSpec = match Self::parse_spec(p.spec, "cron") {
             Ok(s) => s,
-            Err(e) => return Self::err_text(&format!("cron spec parse failed: {e}")),
+            Err(r) => return r,
         };
         if let Err(e) = crons::validate_schedule(&spec.schedule) {
             return Self::err_text(&format!("cron schedule invalid: {e}"));
@@ -7083,9 +7127,9 @@ Constraints:\n\
         &self,
         Parameters(p): Parameters<WorkflowInstallParams>,
     ) -> CallToolResult {
-        let spec: workflow::Workflow = match serde_json::from_value(p.spec) {
+        let spec: workflow::Workflow = match Self::parse_spec(p.spec, "workflow") {
             Ok(s) => s,
-            Err(e) => return Self::err_text(&format!("workflow spec parse failed: {e}")),
+            Err(r) => return r,
         };
         let compiled = match workflow::compile(spec.clone()) {
             Ok(c) => c,
@@ -8115,6 +8159,7 @@ struct SignalsParams {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct WebhookInstallParams {
     /// Full WebhookSpec JSON (name, signature, extractor, routing_packet).
+    #[schemars(with = "serde_json::Map<String, Value>")]
     pub spec: Value,
 }
 
@@ -8123,6 +8168,7 @@ struct PollerInstallParams {
     /// Full PollerSpec JSON (name, every_seconds, source, optional
     /// iterate, extractor, optional dedup_id_path, routing_packet,
     /// optional default_project_dir).
+    #[schemars(with = "serde_json::Map<String, Value>")]
     pub spec: Value,
 }
 
@@ -8130,6 +8176,7 @@ struct PollerInstallParams {
 struct CronInstallParams {
     /// Full CronSpec JSON (name, schedule, optional payload, optional
     /// concurrency cap, routing_packet, optional default_project_dir).
+    #[schemars(with = "serde_json::Map<String, Value>")]
     pub spec: Value,
 }
 
@@ -8266,6 +8313,7 @@ struct WorkflowInstallParams {
     #[serde(default)]
     pub id: Option<String>,
     /// Full Workflow spec JSON.
+    #[schemars(with = "serde_json::Map<String, Value>")]
     pub spec: Value,
 }
 
@@ -8275,6 +8323,7 @@ struct OrchestrateRunParams {
     /// contain `name`, `version`, `actors`, `nodes`, and `graph` (an
     /// per-node `next` transitions). Optional `policy_packet` for
     /// arc-level advisor-as-packet evaluation.
+    #[schemars(with = "serde_json::Map<String, Value>")]
     pub workflow: Value,
     /// Working directory passed to every dispatched bro.
     #[serde(default)]

@@ -1083,6 +1083,20 @@ impl Provider {
 }
 
 fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
+    // Hook events (subtype: hook_started / hook_response) carry their
+    // own transient per-invocation session_id, distinct from the real
+    // conversation session. They are emitted *before* the canonical
+    // `subtype: init` event. Pulling session_id from a hook event
+    // makes the streaming parser lock onto the hook id, then trip
+    // the resume fork-detector when the real session_id arrives.
+    // Skip them; only init + assistant/result events carry the
+    // session_id worth tracking.
+    if evt["type"].as_str() == Some("system") {
+        let subtype = evt["subtype"].as_str();
+        if matches!(subtype, Some("hook_started") | Some("hook_response")) {
+            return;
+        }
+    }
     if let Some(session_id) = evt["session_id"]
         .as_str()
         .or_else(|| evt["sessionId"].as_str())
@@ -2248,6 +2262,49 @@ mod tests {
         assert_eq!(sink.usage.as_ref().unwrap().input_tokens, 100);
         assert_eq!(sink.cost_usd, Some(0.05));
         assert_eq!(sink.num_turns, Some(3));
+    }
+
+    #[test]
+    fn test_parse_claude_hook_event_skips_session_capture() {
+        // Hook events (subtype: hook_started/hook_response) carry a
+        // transient per-invocation session_id distinct from the
+        // canonical conversation session. They land before the real
+        // `init` event; if the parser reads session_id from them, the
+        // streaming sink locks onto the hook id and the resume
+        // fork-detector trips when the real session_id arrives.
+        let hook_started = serde_json::json!({
+            "type": "system",
+            "subtype": "hook_started",
+            "session_id": "hook-only-id"
+        });
+        let hook_response = serde_json::json!({
+            "type": "system",
+            "subtype": "hook_response",
+            "session_id": "hook-only-id"
+        });
+        let init = serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "real-conversation-id"
+        });
+
+        let mut sink = EventSink {
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
+        };
+        Provider::Claude.parse_event(&hook_started, &mut sink);
+        assert_eq!(sink.session_id, None, "hook_started must not set session_id");
+        Provider::Claude.parse_event(&hook_response, &mut sink);
+        assert_eq!(sink.session_id, None, "hook_response must not set session_id");
+        Provider::Claude.parse_event(&init, &mut sink);
+        assert_eq!(
+            sink.session_id.as_deref(),
+            Some("real-conversation-id"),
+            "init event must set session_id"
+        );
     }
 
     #[test]
