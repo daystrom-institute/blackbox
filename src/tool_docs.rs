@@ -24,6 +24,7 @@ pub enum ToolCategory {
     Transcripts,
     Graph,
     Projects,
+    Refactor,
     Knowledge,
     Threads,
     Notes,
@@ -42,6 +43,7 @@ impl ToolCategory {
             Self::Transcripts => "Transcripts",
             Self::Graph => "Agentic graph",
             Self::Projects => "Projects",
+            Self::Refactor => "Refactor mechanization",
             Self::Knowledge => "Knowledge",
             Self::Threads => "Threads",
             Self::Notes => "Side-channel notes",
@@ -64,6 +66,9 @@ impl ToolCategory {
                 "Inspect entities, graph vocabulary, paths, bundles, and retrieval."
             }
             Self::Projects => "Register project roots for later file indexing.",
+            Self::Refactor => {
+                "Mechanize structural refactors with tree-sitter-backed source inventory, dry-run extraction plans, hash-checked apply, and parse validation. Inspection is multi-language for supported grammars; mutation starts with Rust item extraction. Pull `sm-refactor` first, then the language runbook: `sm-refactor-rust`, `sm-refactor-typescript`, or `sm-refactor-csharp` via `bbox_knowledge`. These tools are syntax-aware, not semantic rename engines; use language servers or compiler feedback for reference resolution and import repair."
+            }
             Self::Knowledge => {
                 "Memory lanes: `bbox_learn` for rendered rules, `bbox_remember` for cold recall, `bbox_decide` for durable commitments, and `bbox_pin` for scoped active context."
             }
@@ -101,6 +106,7 @@ impl ToolCategory {
 fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
     match category {
         ToolCategory::Packets => Some("sm-rule-packets"),
+        ToolCategory::Refactor => Some("sm-refactor"),
         ToolCategory::Orchestration => Some("sm-bro-dispatch-patterns"),
         ToolCategory::Workflows => Some("sm-workflow-orchestration"),
         ToolCategory::Whiteboards => Some("sm-whiteboards"),
@@ -287,6 +293,30 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered.",
         when_to_use: "Use to inspect registered roots or confirm symlink aliases collapsed.",
         example: None,
+    },
+    // ── Refactor mechanization ───────────────────────────────────────
+    ToolDoc {
+        name: "bbox_refactor_status",
+        category: ToolCategory::Refactor,
+        summary: "Inspect a supported source file for tree-sitter parse health and top-level refactorable items.",
+        when_to_use: "Use before structural extraction to inventory top-level items in any supported grammar, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a language-specific bbox_refactor_plan when one exists. Pull `sm-refactor` first, then `sm-refactor-rust`, `sm-refactor-typescript`, or `sm-refactor-csharp` for language-specific arguments and validation commands.",
+        example: Some(r#"bbox_refactor_status(file="src/main.rs", project_dir="/repo/x")"#),
+    },
+    ToolDoc {
+        name: "bbox_refactor_plan",
+        category: ToolCategory::Refactor,
+        summary: "Create a dry-run structural refactor plan. V1 supports extract_rust_items for named top-level Rust items.",
+        when_to_use: "Use to generate a reviewable plan for moving named top-level Rust items from one file to another. The plan is structural-only and includes hash checks, text edits, parse validations, selected items, and leftovers.",
+        example: Some(
+            r#"bbox_refactor_plan(kind="extract_rust_items", source="src/lib.rs", target="src/moved.rs", item_names=["helper"], project_dir="/repo/x")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_refactor_apply",
+        category: ToolCategory::Refactor,
+        summary: "Apply a previously generated refactor plan with hash checks, Rust parse validation, atomic writes, and rollback on write failure.",
+        when_to_use: "Use only after reviewing a bbox_refactor_plan result. Requires confirm=true; refuses stale file hashes and validates rewritten Rust before writing.",
+        example: Some(r#"bbox_refactor_apply(plan=<plan-json>, confirm=true)"#),
     },
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {
@@ -1046,15 +1076,16 @@ fn system_memory_hint(doc: &ToolDoc) -> Option<String> {
 
 // ── Filter translation helpers ───────────────────────────────────────
 
-/// Bare names of every orchestration (`bro_*`) tool. Used by provider
+/// Bare names of every dispatch-guarded tool. Used by provider
 /// filter translators that can't accept glob patterns (Codex,
 /// Gemini's policy engine) to expand the current blackbox MCP prefix's
-/// `bro_*` pattern into a concrete list.
-/// concrete list.
+/// `bro_*` / `bbox_refactor_*` patterns into a concrete list.
 pub fn orchestration_tool_names() -> Vec<&'static str> {
     TOOL_DOCS
         .iter()
-        .filter(|d| d.category == ToolCategory::Orchestration)
+        .filter(|d| {
+            d.category == ToolCategory::Orchestration || d.category == ToolCategory::Refactor
+        })
         .map(|d| d.name)
         .collect()
 }
@@ -1127,6 +1158,7 @@ pub fn render_markdown() -> String {
         ToolCategory::Transcripts,
         ToolCategory::Graph,
         ToolCategory::Projects,
+        ToolCategory::Refactor,
         ToolCategory::Knowledge,
         ToolCategory::Threads,
         ToolCategory::Notes,

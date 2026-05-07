@@ -32,6 +32,7 @@ mod pollers;
 mod projects;
 mod providers;
 mod query;
+mod refactor;
 mod render;
 mod routing;
 mod search;
@@ -3135,6 +3136,7 @@ use packets::{
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
     PacketListParams,
 };
+use refactor::{RefactorApplyParams, RefactorPlanParams, RefactorStatusParams};
 use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
@@ -3506,6 +3508,39 @@ impl BlackboxServer {
             })
             .unwrap_or_default(),
         )
+    }
+
+    #[tool(
+        name = "bbox_refactor_status",
+        description = "Inspect a supported source file for tree-sitter parse health and top-level refactorable items."
+    )]
+    fn bbox_refactor_status(
+        &self,
+        Parameters(p): Parameters<RefactorStatusParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_refactor_status", || refactor::status(&p))
+    }
+
+    #[tool(
+        name = "bbox_refactor_plan",
+        description = "Create a dry-run structural refactor plan. V1 supports extract_rust_items for named top-level Rust items."
+    )]
+    fn bbox_refactor_plan(&self, Parameters(p): Parameters<RefactorPlanParams>) -> CallToolResult {
+        Self::run("bbox_refactor_plan", || refactor::plan(&p))
+    }
+
+    #[tool(
+        name = "bbox_refactor_apply",
+        description = "Apply a previously generated refactor plan with hash checks, Rust parse validation, atomic writes, and rollback on write failure."
+    )]
+    fn bbox_refactor_apply(
+        &self,
+        Parameters(p): Parameters<RefactorApplyParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_refactor_apply", || {
+            let projects = self.state.projects.read().list();
+            refactor::apply(&p, &projects)
+        })
     }
 
     #[tool(

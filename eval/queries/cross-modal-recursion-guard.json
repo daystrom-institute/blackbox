@@ -10,14 +10,14 @@
       "path_hint": "AGENTS.md"
     },
     {
-      "description": "The MCP filter implementation that applies the default bro_* disallow guard.",
+      "description": "The MCP filter implementation that applies the default recursive-tool disallow guard.",
       "entity_type_hint": "project_file",
       "path_hint": "src/orchestration/mcp.rs"
     }
   ],
   "expected_entity_refs": [
     "project_file:d723917f:a54ff182:27d6dd72cfbc502d8378c0f2972645f56e3f54dbde99481de3b2d04e624b7f60:5",
-    "project_file:d723917f:3f15b6df:e871e9b8511d5436016fa80df2cbea8d89fa4568ece5fb3825060e6377afe542:20"
+    "project_file:d723917f:3f15b6df:e4485bb6fbfdfb2487582f777433fa10210e1904ff333676303b6561129a79b0:89"
   ],
   "required_evidence": {
     "kind": "entity_set",

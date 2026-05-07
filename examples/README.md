@@ -59,7 +59,7 @@ Workflow definitions for Claude Code, invocable as `/user:<name>` (user-scoped) 
 
 Overmind is one of the rare legitimate uses of `bro_exec(..., allow_recursion=true)`.
 
-By default, the daemon applies a mechanical recursion guard to every dispatched bro: the provider CLI gets filter args at argv construction (`--disallowedTools mcp__blackbox__bro_*` for Claude, equivalent for the other providers) so dispatched bros cannot call `bro_*` tools and can't recurse into nested dispatches. This is on for every `bro_exec` and `bro_resume` unless you explicitly opt out.
+By default, the daemon applies a mechanical recursion guard to every dispatched bro: the provider CLI gets filter args at argv construction (`--disallowedTools mcp__blackbox__bro_*,mcp__blackbox__bbox_refactor_*` for Claude, equivalent for the other providers) so dispatched bros cannot call `bro_*` orchestration tools or the structural refactor write surface, and can't recurse into nested dispatches. This is on for every `bro_exec` and `bro_resume` unless you explicitly opt out.
 
 Overmind's orchestrator is itself a dispatcher — it runs crucible, which fans out an ensemble via `bro_broadcast` and manages a durable implementer via `bro_exec`/`bro_resume`. It needs the `bro_*` surface available. So the **orchestrator dispatch** uses `allow_recursion=true`:
 

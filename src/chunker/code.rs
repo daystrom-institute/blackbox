@@ -81,7 +81,7 @@ fn log_language_pack_failure(language: &'static str, err: &dyn std::fmt::Display
     }
 }
 
-fn parser_for_language(language: &str) -> Result<tree_sitter::Parser> {
+pub(crate) fn parser_for_language(language: &str) -> Result<tree_sitter::Parser> {
     if let Ok(parser) = get_parser(language) {
         return Ok(parser);
     }

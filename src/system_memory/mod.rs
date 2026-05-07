@@ -25,7 +25,7 @@
 //! query via bbox_knowledge." Agent reads tool description, spots pointer,
 //! pulls the runbook with one query when they actually need it.
 
-use crate::query::{parse_query, QueryAtom, QueryNode};
+use crate::query::{QueryAtom, QueryNode, parse_query};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SystemMemory {
@@ -182,6 +182,103 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
             "runbook",
         ],
         content: include_str!("create-etiquette.md"),
+    },
+    SystemMemory {
+        id: "sm-refactor",
+        title: "Refactor mechanization catalog — language routing and support matrix",
+        tags: &[
+            "refactor",
+            "refactoring",
+            "mechanization",
+            "restructure",
+            "language",
+            "catalog",
+            "support-matrix",
+            "tree-sitter",
+            "bbox_refactor_status",
+            "bbox_refactor_plan",
+            "bbox_refactor_apply",
+            "rust",
+            "typescript",
+            "javascript",
+            "csharp",
+            "python",
+            "java",
+            "go",
+            "c",
+            "cpp",
+        ],
+        content: include_str!("refactor.md"),
+    },
+    SystemMemory {
+        id: "sm-refactor-rust",
+        title: "Rust refactor mechanization — tree-sitter inventory and writable item extraction",
+        tags: &[
+            "refactor",
+            "refactoring",
+            "mechanization",
+            "restructure",
+            "rust",
+            "rs",
+            "tree-sitter",
+            "bbox_refactor_status",
+            "bbox_refactor_plan",
+            "bbox_refactor_apply",
+            "extract_rust_items",
+            "cargo",
+            "rust-analyzer",
+            "symbol",
+            "rename",
+            "move",
+            "extract",
+        ],
+        content: include_str!("refactor-rust.md"),
+    },
+    SystemMemory {
+        id: "sm-refactor-typescript",
+        title: "TypeScript and JavaScript refactor mechanization — tree-sitter inventory and validation workflow",
+        tags: &[
+            "refactor",
+            "refactoring",
+            "mechanization",
+            "restructure",
+            "typescript",
+            "javascript",
+            "tsx",
+            "jsx",
+            "tsserver",
+            "tree-sitter",
+            "bbox_refactor_status",
+            "symbol",
+            "rename",
+            "move",
+            "extract",
+            "typecheck",
+        ],
+        content: include_str!("refactor-typescript.md"),
+    },
+    SystemMemory {
+        id: "sm-refactor-csharp",
+        title: "C# refactor mechanization — tree-sitter inventory and Roslyn validation workflow",
+        tags: &[
+            "refactor",
+            "refactoring",
+            "mechanization",
+            "restructure",
+            "csharp",
+            "c#",
+            "cs",
+            "roslyn",
+            "omnisharp",
+            "tree-sitter",
+            "bbox_refactor_status",
+            "symbol",
+            "rename",
+            "move",
+            "extract",
+            "dotnet",
+        ],
+        content: include_str!("refactor-csharp.md"),
     },
     SystemMemory {
         id: "sm-side-channel-notes",
@@ -549,6 +646,21 @@ mod tests {
         // Review-domain runbook mentions "adversarial".
         let review_hits = search(Some("adversarial"));
         assert!(review_hits.iter().any(|m| m.id == "sm-review-packets"));
+    }
+
+    #[test]
+    fn search_finds_refactor_language_memories() {
+        let catalog_hits = search(Some("refactor support matrix"));
+        assert!(catalog_hits.iter().any(|m| m.id == "sm-refactor"));
+
+        let rust_hits = search(Some("rust refactor extract_rust_items"));
+        assert!(rust_hits.iter().any(|m| m.id == "sm-refactor-rust"));
+
+        let ts_hits = search(Some("typescript refactor tsserver"));
+        assert!(ts_hits.iter().any(|m| m.id == "sm-refactor-typescript"));
+
+        let csharp_hits = search(Some("csharp refactor roslyn"));
+        assert!(csharp_hits.iter().any(|m| m.id == "sm-refactor-csharp"));
     }
 
     #[test]

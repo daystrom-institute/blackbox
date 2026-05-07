@@ -134,8 +134,12 @@ wide = "0.7"
 cron = "0.16"
 jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
 
-[dev-dependencies]
+# Atomic-rename writes — used by both production code (refactor.rs's
+# write_atomic) and tests. Production usage requires this be a real
+# dependency, not dev-only.
 tempfile = "3"
+
+[dev-dependencies]
 
 [profile.release]
 opt-level = 3
