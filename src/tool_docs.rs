@@ -1364,7 +1364,7 @@ mod tests {
         assert!(!md.contains("query=<one keyword>"));
     }
 
-    /// Parse `#[tool(...)]` attributes from main.rs. Tolerates:
+    /// Parse `#[tool(...)]` attributes from Rust source files. Tolerates:
     ///   - single-line and multi-line attribute bodies
     ///   - `name` and `description` in any order
     ///   - arbitrary whitespace between `=` and the string literal
@@ -1375,7 +1375,35 @@ mod tests {
     /// skipped — `every_registered_tool_has_a_doc` covers the missing-doc
     /// case separately.
     fn parse_registered_tools() -> Vec<(String, String)> {
-        let src = include_str!("main.rs");
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = Vec::new();
+        collect_rust_files(&src_dir, &mut paths);
+        paths.sort();
+
+        let mut out = Vec::new();
+        for path in paths {
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+            out.extend(parse_registered_tools_from_source(&src));
+        }
+        out
+    }
+
+    fn collect_rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("failed to read source dir {}: {err}", dir.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|err| panic!("failed to read source entry: {err}"));
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_files(&path, out);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn parse_registered_tools_from_source(src: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let mut cursor = 0;
         while let Some(open) = src[cursor..].find("#[tool(") {
@@ -1492,7 +1520,7 @@ mod tests {
             .collect();
         assert!(
             !registered.is_empty(),
-            "no tools found in main.rs — parse regressed"
+            "no tools found under src/ — parse regressed"
         );
 
         let documented: std::collections::HashSet<&str> =
@@ -1506,7 +1534,7 @@ mod tests {
 
         assert!(
             missing.is_empty(),
-            "tools registered in main.rs without a ToolDoc stanza: {missing:?}"
+            "tools registered under src/ without a ToolDoc stanza: {missing:?}"
         );
 
         let registered_set: std::collections::HashSet<&str> =
@@ -1525,7 +1553,7 @@ mod tests {
     #[test]
     fn description_summary_parity() {
         // Fourth-surface invariant: the per-call chooser blurb in
-        // `#[tool(description = ...)]` (src/main.rs) must equal the
+        // `#[tool(description = ...)]` (src/**/*.rs) must equal the
         // managed-layer `ToolDoc.summary` (this file). They're the same
         // text to the agent — let them drift and the agent gets
         // contradictory guidance at the two surfaces. See the
