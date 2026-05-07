@@ -54,6 +54,9 @@ pub struct RefactorPlanParams {
     /// e.g. "impl BlackboxServer".
     #[serde(default)]
     pub impl_name: Option<String>,
+    /// Optional module name for add_rust_mod_decl.
+    #[serde(default)]
+    pub module_name: Option<String>,
     /// Optional router name for extract_rust_impl_methods. When present, the
     /// generated target wrapper is annotated as #[tool_router(router = name)].
     #[serde(default)]
@@ -264,8 +267,9 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "extract_rust_items" => plan_extract_rust_items(p),
         "extract_rust_impl_methods" => plan_extract_rust_impl_methods(p),
         "add_rust_router_to_sum" => plan_add_rust_router_to_sum(p),
+        "add_rust_mod_decl" => plan_add_rust_mod_decl(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, add_rust_router_to_sum"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, add_rust_router_to_sum, add_rust_mod_decl"
         ),
     }
 }
@@ -708,6 +712,69 @@ fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let module_name = p
+        .module_name
+        .as_deref()
+        .or_else(|| {
+            p.item_names
+                .as_deref()
+                .and_then(|names| names.first().map(String::as_str))
+        })
+        .ok_or_else(|| anyhow!("module_name is required for add_rust_mod_decl"))?;
+    validate_rust_identifier(module_name, "module_name")?;
+
+    let parsed = parse_rust_file(&source_path)?;
+    let items = rust_items(&parsed);
+    if items
+        .iter()
+        .any(|item| item.kind == "mod_item" && item.name.as_deref() == Some(module_name))
+    {
+        bail!("module declaration `{module_name}` already exists");
+    }
+
+    let last_mod = items
+        .iter()
+        .filter(|item| item.kind == "mod_item")
+        .max_by_key(|item| item.byte_end);
+    let (insert_at, replacement) = if let Some(item) = last_mod {
+        (item.byte_end, format!("\nmod {module_name};"))
+    } else {
+        (
+            rust_module_decl_fallback_insert_byte(&parsed.source),
+            format!("mod {module_name};\n"),
+        )
+    };
+    let plan = RefactorPlan {
+        title: format!(
+            "add Rust module declaration {module_name} to {}",
+            path_string(&source_path)
+        ),
+        kind: "add_rust_mod_decl".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: insert_at,
+                byte_end: insert_at,
+                replacement,
+            }],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
 fn rust_impl_methods_target_edits(
     target_path: &Path,
     target_source: &str,
@@ -879,6 +946,10 @@ fn rust_prelude_insert_byte(target_source: &str) -> usize {
         idx += 1;
     }
     idx
+}
+
+fn rust_module_decl_fallback_insert_byte(source: &str) -> usize {
+    rust_prelude_insert_byte(source)
 }
 
 fn existing_target_impl_insert_byte(
@@ -1675,6 +1746,7 @@ mod tests {
             item_names: Some(vec!["MoveMe".into()]),
             item_kinds: Some(vec!["struct_item".into()]),
             impl_name: None,
+            module_name: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -1721,6 +1793,7 @@ mod tests {
             item_names: Some(vec!["move_me".into()]),
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
+            module_name: None,
             router_name: Some("moved_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -1772,6 +1845,7 @@ mod tests {
             item_names: Some(vec!["move_me".into()]),
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
+            module_name: None,
             router_name: Some("moved_tools".into()),
             router_call: None,
             router_export_name: Some("router".into()),
@@ -1822,6 +1896,7 @@ mod tests {
             item_names: Some(vec!["move_me".into()]),
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
+            module_name: None,
             router_name: Some("moved_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -1872,6 +1947,7 @@ mod tests {
             item_names: Some(vec!["move_me".into()]),
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
+            module_name: None,
             router_name: Some("search_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -1916,6 +1992,7 @@ mod tests {
             item_names: Some(vec!["move_me".into()]),
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
+            module_name: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -1964,6 +2041,7 @@ mod tests {
             item_names: Some(vec!["move_me".into()]),
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
+            module_name: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2009,6 +2087,7 @@ mod tests {
             item_names: Some(vec!["move_me".into()]),
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some("impl BlackboxServer".into()),
+            module_name: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2053,6 +2132,7 @@ mod tests {
             item_names: Some(vec!["clone_inner".into()]),
             item_kinds: Some(vec!["impl_method".into()]),
             impl_name: Some(header.into()),
+            module_name: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2094,6 +2174,7 @@ mod tests {
             item_names: Some(vec!["same".into()]),
             item_kinds: None,
             impl_name: None,
+            module_name: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2118,6 +2199,7 @@ mod tests {
             item_names: Some(vec!["method".into()]),
             item_kinds: Some(vec!["function_item".into()]),
             impl_name: Some("impl A".into()),
+            module_name: None,
             router_name: None,
             router_call: None,
             router_export_name: None,
@@ -2147,6 +2229,7 @@ mod tests {
             item_names: None,
             item_kinds: None,
             impl_name: None,
+            module_name: None,
             router_name: Some("search_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -2190,6 +2273,7 @@ mod tests {
             item_names: None,
             item_kinds: None,
             impl_name: None,
+            module_name: None,
             router_name: None,
             router_call: Some("refactor_tools::router()".into()),
             router_export_name: None,
@@ -2217,6 +2301,70 @@ mod tests {
     }
 
     #[test]
+    fn add_rust_mod_decl_appends_after_existing_mods() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        fs::write(&source, "mod alpha;\nmod beta;\n\nuse std::fmt;\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "add_rust_mod_decl".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: Some("gamma".into()),
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "mod alpha;\nmod beta;\nmod gamma;\n\nuse std::fmt;\n"
+        );
+    }
+
+    #[test]
+    fn add_rust_mod_decl_rejects_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        fs::write(&source, "mod alpha;\n").unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "add_rust_mod_decl".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: Some("alpha".into()),
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            project_dir: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
     fn add_rust_router_to_sum_rejects_duplicate_router() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -2233,6 +2381,7 @@ mod tests {
             item_names: None,
             item_kinds: None,
             impl_name: None,
+            module_name: None,
             router_name: Some("search_tools".into()),
             router_call: None,
             router_export_name: None,
@@ -2281,6 +2430,7 @@ mod tests {
             item_names: Some(vec!["move_me".into()]),
             item_kinds: None,
             impl_name: None,
+            module_name: None,
             router_name: None,
             router_call: None,
             router_export_name: None,

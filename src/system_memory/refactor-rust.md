@@ -10,7 +10,8 @@ Rust is the first writable backend.
 - Inspect: supported with `bbox_refactor_status`.
 - Plan: supported with `bbox_refactor_plan(kind="extract_rust_items")` and
   `bbox_refactor_plan(kind="extract_rust_impl_methods")` and
-  `bbox_refactor_plan(kind="add_rust_router_to_sum")`.
+  `bbox_refactor_plan(kind="add_rust_router_to_sum")` and
+  `bbox_refactor_plan(kind="add_rust_mod_decl")`.
 - Apply: supported with `bbox_refactor_apply(confirm=true)`.
 - Semantic rename: not supported by blackbox yet; use rust-analyzer, compiler
   feedback, or manual edits after inspection.
@@ -27,6 +28,8 @@ Writable plan kinds:
   `#[tool_router(router = name)]` wrapper around the moved methods.
 - `add_rust_router_to_sum`: append `+ Self::<router_name>()` to a Rust
   `tool_router:` field initializer if that router call is not already present.
+- `add_rust_mod_decl`: add `mod <module_name>;` after existing top-level module
+  declarations.
 
 Supported top-level item kinds include:
 
@@ -128,6 +131,17 @@ bbox_refactor_plan(
 
 Use `router_name="search_tools"` instead when the router impl remains in the
 same module as the constructor and `Self::search_tools()` is visible.
+
+Add the module declaration:
+
+```text
+bbox_refactor_plan(
+  kind="add_rust_mod_decl",
+  source="src/main.rs",
+  module_name="search_tools",
+  project_dir="/absolute/project/root"
+)
+```
 
 3. Apply only after review:
 
