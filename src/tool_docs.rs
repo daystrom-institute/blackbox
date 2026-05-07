@@ -755,10 +755,28 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "badgey_apply_proposal",
         category: ToolCategory::Orchestration,
-        summary: "Apply a stored BadgeyProposal — drives the wrapper's full apply path: state-machine transition (Pending/Failed → Applying), kind-specific dispatch (artifact_promotion → bbox_artifact_install; redispatch_task → spawn_privileged_task with the proposal's prompt; workflow_install/agent_install/packet_install → matching artifact install), record applied_task_id, transition (Applying → Applied | Failed). Returns the apply result with status. Used by badgey-apply-proposal-arc when a Slack approval reaction fires.",
-        when_to_use: "Workflow node hook that runs after a Slack approval reaction has been resolved to a (BadgeyId, proposal_id) pair via bro_slack_link_lookup. Pass `retry_failed=true` only when explicitly retrying a proposal in Failed state — default rejects retries.",
+        summary: "Apply a stored BadgeyProposal — drives the wrapper's full apply path: state-machine transition (Pending/Failed → Applying), kind-specific dispatch (artifact_promotion → bbox_artifact_install; redispatch_task → spawn_privileged_task with the proposal's prompt; workflow_install/agent_install/packet_install → matching artifact install), record applied_task_id, transition (Applying → Applied | Failed). Returns the apply result with status. One-shot wrapper — for the Slack-reaction flow prefer the split `badgey_proposal_begin_apply` + `badgey_proposal_complete_apply` pair so the workflow engine tracks the dispatched bro natively as an actor node.",
+        when_to_use: "Workflow / direct callers that want a one-shot apply. The Slack-reaction badgey-apply-proposal-arc uses the split pair instead so the dispatched bro is tracked as an actor node (visible in actor_results.<NodeId> for downstream PostOutcome rendering). Pass `retry_failed=true` only when explicitly retrying a proposal in Failed state.",
         example: Some(
             r#"badgey_apply_proposal(badgey_id="bg-deadbeef-cafef00d", proposal_id="P-3")"#,
+        ),
+    },
+    ToolDoc {
+        name: "badgey_proposal_begin_apply",
+        category: ToolCategory::Orchestration,
+        summary: "Phase 1 of the split apply path. Transitions a proposal Pending|Failed → Applying and returns dispatch parameters (prompt + brofile + label for redispatch_task; artifact_kind + source + version for artifact installs). Does NOT spawn the bro or install the artifact — the workflow caller does that via an actor node or `bbox_artifact_install` mcp_call, then calls `badgey_proposal_complete_apply` with the outcome. Lets the engine track the dispatched work natively (actor task lifecycle, retries, gates) instead of opaquely spawning behind a wrapper.",
+        when_to_use: "First mcp_call inside badgey-apply-proposal-arc after the Slack link is resolved. Read the returned `outcome`: `redispatch` → run an actor with `prompt`; `install` → mcp_call bbox_artifact_install with the returned source/kind; `already_applied` → skip dispatch and skip the complete call (PostOutcome emits green directly); `rejected` → skip with a failure post.",
+        example: Some(
+            r#"badgey_proposal_begin_apply(badgey_id="bg-deadbeef-cafef00d", proposal_id="P-3")"#,
+        ),
+    },
+    ToolDoc {
+        name: "badgey_proposal_complete_apply",
+        category: ToolCategory::Orchestration,
+        summary: "Phase 2 of the split apply path. Given the outcome of the dispatched work (passed in `outcome`: `completed` / `failed` / `cancelled` / `timed_out`), transitions the proposal Applying → Applied or Applying → Failed and writes the audit decision. Always returns `{status: applied|failed, ...}` so the workflow's PostOutcome node can read the final state and pick the badge.",
+        when_to_use: "Last mcp_call before PostOutcome in badgey-apply-proposal-arc. For the redispatch path, pass `outcome=${actor_results.Dispatch.status}`, `task_id=${actor_results.Dispatch.taskId}`, `summary=${actor_results.Dispatch.result}`. For the artifact-install path, pass `outcome=completed` on a successful install, with `artifact_ref=${vars.install_response.<artifact_ref>}`. Skip this call entirely on the `already_applied` / `rejected` short-circuit paths.",
+        example: Some(
+            r#"badgey_proposal_complete_apply(badgey_id="bg-deadbeef-cafef00d", proposal_id="P-3", outcome="completed", task_id="3c2df23e-...", summary="Done — fix landed at src/main.rs:669")"#,
         ),
     },
     ToolDoc {

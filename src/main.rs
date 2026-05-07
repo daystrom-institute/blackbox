@@ -666,11 +666,11 @@ impl BlackboxServer {
             allow_recursion: false,
             provider: Some(provider),
         };
-        let final_prompt =
-            orch::apply_brofile_lens(&orch::apply_ambient(prompt, &ambient_ctx), lens.as_deref());
+        let ambient_prompt = orch::apply_ambient(prompt, &ambient_ctx);
         let mut args = if is_resume {
-            provider.build_resume_args(&session_id, &final_prompt, exec_opts.as_ref())
+            provider.build_resume_args(&session_id, &ambient_prompt, exec_opts.as_ref())
         } else {
+            let final_prompt = orch::apply_brofile_lens(&ambient_prompt, lens.as_deref());
             provider.build_exec_args(
                 &final_prompt,
                 &session_id,
@@ -2244,6 +2244,302 @@ impl BlackboxServer {
                 );
                 Err(err)
             }
+        }
+    }
+
+    /// Begin the apply path for a proposal: transition Pending|Failed →
+    /// Applying, return dispatch parameters that the caller (a workflow
+    /// arc) uses to actually do the work via an actor node or
+    /// mcp_call. Pairs with [`badgey_proposal_complete_apply_internal`].
+    ///
+    /// Return shape — flat object the workflow can destructure into
+    /// vars in one set_var per field:
+    ///
+    /// Pre-existing terminal states:
+    /// - `{outcome: "already_applied", prior_task_id?: "..."}` — proposal
+    ///   was already in Applied state; caller should skip dispatch and
+    ///   skip the complete call. PostOutcome emits the green badge.
+    /// - `{outcome: "rejected", reason: "..."}` — bad-input shape (e.g.
+    ///   already_in_progress, failed-without-retry).
+    ///
+    /// Ready-to-dispatch states:
+    /// - `{outcome: "redispatch", kind: "redispatch_task", prompt, task_id,
+    ///    instance_id, project_dir, brofile, label, idempotency_key}` —
+    ///   caller dispatches a Claude actor with `prompt`.
+    /// - `{outcome: "install", kind: "artifact_promotion"|...,
+    ///    artifact_kind: "workflow"|"packet"|..., source, name?,
+    ///    version?, supersedes?, instance_id, project_dir}` — caller
+    ///   does an `mcp_call bbox_artifact_install`.
+    async fn badgey_proposal_begin_apply_internal(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        proposal_id: &str,
+        retry_failed: bool,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::{ProposalKind, ProposalState};
+
+        let instance = self
+            .state
+            .badgey_registry
+            .get(id)
+            .map_err(|e| e.to_string())?;
+        let proposal = self
+            .state
+            .badgey_proposals
+            .get(id, proposal_id)
+            .map_err(|e| format!("reading proposal: {e}"))?
+            .ok_or_else(|| format!("error.not_found: proposal {proposal_id}"))?;
+        match proposal.state {
+            ProposalState::Applied => {
+                let prior = proposal.applied_task_id.clone().unwrap_or_default();
+                let summary = if prior.is_empty() {
+                    "already applied".to_string()
+                } else {
+                    format!("already applied (prior task `{prior}`)")
+                };
+                return Ok(json!({
+                    "outcome": "already_applied",
+                    "badgey_id": id,
+                    "proposal_id": proposal_id,
+                    "prior_task_id": proposal.applied_task_id,
+                    "summary": summary,
+                }));
+            }
+            ProposalState::Applying => {
+                return Ok(json!({
+                    "outcome": "rejected",
+                    "reason": "already_in_progress",
+                    "badgey_id": id,
+                    "proposal_id": proposal_id,
+                    "summary": "rejected: already in progress",
+                }));
+            }
+            ProposalState::Failed if !retry_failed => {
+                return Ok(json!({
+                    "outcome": "rejected",
+                    "reason": "proposal_failed",
+                    "hint": format!("retry with retry_failed=true on proposal {proposal_id}"),
+                    "badgey_id": id,
+                    "proposal_id": proposal_id,
+                    "summary": format!(
+                        "rejected: proposal previously failed — retry with `retry_failed=true`"
+                    ),
+                }));
+            }
+            ProposalState::Pending | ProposalState::Failed => {}
+        }
+        let from = proposal.state;
+        let applying = self
+            .state
+            .badgey_proposals
+            .transition(
+                id,
+                proposal_id,
+                from,
+                ProposalState::Applying,
+                Some(if retry_failed {
+                    "retry apply requested".to_string()
+                } else {
+                    "apply requested".to_string()
+                }),
+            )
+            .map_err(|e| format!("transitioning proposal to applying: {e}"))?;
+
+        if applying.kind == ProposalKind::RedispatchTask {
+            let prompt = applying
+                .draft
+                .get("prompt")
+                .or_else(|| applying.draft.get("refined_charter"))
+                .or_else(|| applying.draft.get("proposal"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "redispatch proposal missing prompt/refined_charter/proposal".to_string()
+                })?;
+            if applying.idempotency_key.is_none() {
+                return Err("redispatch proposal missing idempotency_key".to_string());
+            }
+            let task_id = applying
+                .applied_task_id
+                .clone()
+                .or_else(|| {
+                    applying
+                        .draft
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            self.state
+                .badgey_proposals
+                .set_applied_task_id(id, proposal_id, task_id.clone())
+                .map_err(|e| format!("recording redispatch task id: {e}"))?;
+            return Ok(json!({
+                "outcome": "redispatch",
+                "kind": "redispatch_task",
+                "prompt": prompt,
+                "task_id": task_id,
+                "instance_id": id.as_str(),
+                "proposal_id": proposal_id,
+                "project_dir": instance.scope.project_id,
+                "thread_id": instance.thread_of_record_id,
+                "brofile": "badgey-persona",
+                "label": "badgey-redispatch",
+                "idempotency_key": applying.idempotency_key,
+                "summary": format!("dispatching task `{task_id}`..."),
+            }));
+        }
+        // Artifact-install kinds — return install params; caller
+        // mcp_calls bbox_artifact_install. The artifact_kind comes from
+        // the proposal kind itself for direct kinds (workflow / packet /
+        // brofile / lens / agent), or from draft.artifact_kind for
+        // generic ArtifactPromotion proposals.
+        let artifact_kind_str = match applying.kind {
+            ProposalKind::Workflow => "workflow",
+            ProposalKind::Packet => "packet",
+            ProposalKind::Brofile | ProposalKind::Lens => "brofile",
+            ProposalKind::Agent => "agent",
+            ProposalKind::ArtifactPromotion => applying
+                .draft
+                .get("artifact_kind")
+                .or_else(|| applying.draft.get("kind"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| "artifact promotion draft missing artifact_kind".to_string())?,
+            ProposalKind::RedispatchTask => unreachable!("handled above"),
+        };
+        let source = applying
+            .draft
+            .get("source")
+            .or_else(|| applying.draft.get("draft_path"))
+            .or_else(|| applying.draft.get("path"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "artifact proposal draft missing source/draft_path".to_string())?;
+        Ok(json!({
+            "outcome": "install",
+            "kind": format!("{:?}", applying.kind).to_lowercase(),
+            "artifact_kind": artifact_kind_str,
+            "source": source,
+            "name": applying.draft.get("name"),
+            "version": applying.draft.get("version"),
+            "supersedes": applying.draft.get("supersedes"),
+            "instance_id": id.as_str(),
+            "proposal_id": proposal_id,
+            "project_dir": instance.scope.project_id,
+            "summary": format!("installing {artifact_kind_str} from `{source}`..."),
+        }))
+    }
+
+    /// Complete the apply path: transition Applying → Applied (on
+    /// success) or Applying → Failed (on any non-success outcome),
+    /// write the audit decision, emit the ProposalApplied event.
+    /// Pairs with [`badgey_proposal_begin_apply_internal`].
+    ///
+    /// `outcome` values: `completed` (success) → Applied; anything else
+    /// (`failed`, `cancelled`, `timed_out`) → Failed.
+    async fn badgey_proposal_complete_apply_internal(
+        &self,
+        id: &orchestration::badgey::types::BadgeyId,
+        proposal_id: &str,
+        outcome: &str,
+        task_id: Option<&str>,
+        artifact_ref: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<Value, String> {
+        use orchestration::badgey::types::ProposalState;
+
+        let instance = self
+            .state
+            .badgey_registry
+            .get(id)
+            .map_err(|e| e.to_string())?;
+        let success = outcome == "completed";
+        if success {
+            let note = match (artifact_ref, task_id, summary) {
+                (Some(ar), _, _) => json!({"artifact_ref": ar, "summary": summary}).to_string(),
+                (None, Some(tid), _) => json!({"task_id": tid, "summary": summary}).to_string(),
+                _ => json!({"summary": summary}).to_string(),
+            };
+            let applied = self
+                .state
+                .badgey_proposals
+                .transition(
+                    id,
+                    proposal_id,
+                    ProposalState::Applying,
+                    ProposalState::Applied,
+                    Some(note),
+                )
+                .map_err(|e| format!("transitioning proposal to applied: {e}"))?;
+            let decide_id = if let Some(existing) =
+                self.badgey_existing_audit_decision_id(id.as_str(), proposal_id)
+            {
+                existing
+            } else {
+                self.state
+                    .kb
+                    .write()
+                    .decide_result(
+                        &knowledge::DecideParams {
+                            content: format!(
+                                "Badgey proposal {proposal_id} for {id} was applied."
+                            ),
+                            rationale: format!("User approved Badgey proposal {proposal_id}."),
+                            supersedes: applied
+                                .draft
+                                .get("audit_supersedes")
+                                .and_then(Value::as_str)
+                                .map(String::from),
+                            title: Some(format!("Badgey proposal {proposal_id} applied")),
+                            scope: Some("project".to_string()),
+                            project: Some(instance.scope.project_id.clone()),
+                            priority: Some("standard".to_string()),
+                            render: Some(false),
+                        },
+                        false,
+                    )
+                    .map_err(|e| format!("writing proposal audit decision: {e:#}"))?
+                    .id
+            };
+            let audit_ref = artifact_ref
+                .map(String::from)
+                .unwrap_or_else(|| "task".to_string());
+            self.badgey_write_event(
+                &instance,
+                orchestration::badgey::events::ThreadEvent::ProposalApplied {
+                    proposal_id: proposal_id.to_string(),
+                    artifact_ref: audit_ref,
+                    decide_id: decide_id.clone(),
+                },
+                applied.applied_task_id.clone(),
+            )?;
+            Ok(json!({
+                "status": "applied",
+                "badgey_id": id,
+                "proposal_id": proposal_id,
+                "task_id": task_id,
+                "artifact_ref": artifact_ref,
+                "summary": summary,
+                "decide_id": decide_id,
+            }))
+        } else {
+            let err_note = format!(
+                "actor outcome={outcome}; {}",
+                summary.unwrap_or("no summary")
+            );
+            let _ = self.state.badgey_proposals.transition(
+                id,
+                proposal_id,
+                ProposalState::Applying,
+                ProposalState::Failed,
+                Some(err_note.clone()),
+            );
+            Ok(json!({
+                "status": "failed",
+                "badgey_id": id,
+                "proposal_id": proposal_id,
+                "outcome": outcome,
+                "summary": summary,
+                "error": err_note,
+            }))
         }
     }
 
@@ -4621,6 +4917,45 @@ struct BadgeyApplyProposalParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyProposalBeginApplyParams {
+    /// Badgey instance id (`bg-<8hex>-<8hex>`).
+    badgey_id: String,
+    /// Proposal id within that instance.
+    proposal_id: String,
+    /// When true, retry a proposal currently in Failed state.
+    #[serde(default)]
+    retry_failed: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BadgeyProposalCompleteApplyParams {
+    /// Badgey instance id.
+    badgey_id: String,
+    /// Proposal id.
+    proposal_id: String,
+    /// Outcome of the dispatched work as observed by the caller.
+    /// Maps to TaskStatus serialization: `completed` / `failed` /
+    /// `cancelled`. Workflow callers pass the actor's
+    /// `actor_results.<NodeId>.status` here. `timed_out` is treated
+    /// as failure.
+    outcome: String,
+    /// Task id of the dispatched work, when applicable. For
+    /// redispatch_task this is the `actor_results.<NodeId>.taskId`;
+    /// for artifact installs it is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    /// Artifact reference for artifact-install proposals
+    /// (`<kind>:<name>@<version>`). Omitted for redispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_ref: Option<String>,
+    /// One-line summary of the work performed (typically the
+    /// actor's last assistant message snippet, or the install
+    /// metadata). Stored on the proposal's audit trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct SlackProposalLinkRecordParams {
     /// Slack workspace id (T-prefix).
     team_id: String,
@@ -6773,7 +7108,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "badgey_apply_proposal",
-        description = "Apply a stored BadgeyProposal — drives the wrapper's full apply path: state-machine transition (Pending/Failed → Applying), kind-specific dispatch (artifact_promotion → bbox_artifact_install; redispatch_task → spawn_privileged_task with the proposal's prompt; workflow_install/agent_install/packet_install → matching artifact install), record applied_task_id, transition (Applying → Applied | Failed). Returns the apply result with status. Used by badgey-apply-proposal-arc when a Slack approval reaction fires."
+        description = "Apply a stored BadgeyProposal — drives the wrapper's full apply path: state-machine transition (Pending/Failed → Applying), kind-specific dispatch (artifact_promotion → bbox_artifact_install; redispatch_task → spawn_privileged_task with the proposal's prompt; workflow_install/agent_install/packet_install → matching artifact install), record applied_task_id, transition (Applying → Applied | Failed). Returns the apply result with status. One-shot wrapper — for the Slack-reaction flow prefer the split `badgey_proposal_begin_apply` + `badgey_proposal_complete_apply` pair so the workflow engine tracks the dispatched bro natively as an actor node."
     )]
     async fn badgey_apply_proposal(
         &self,
@@ -6849,6 +7184,83 @@ impl BlackboxServer {
                 "status": "failed",
                 "error": e.clone(),
                 "summary": e,
+                "badgey_id": p.badgey_id,
+                "proposal_id": p.proposal_id,
+            })),
+        }
+    }
+
+    #[tool(
+        name = "badgey_proposal_begin_apply",
+        description = "Phase 1 of the split apply path. Transitions a proposal Pending|Failed → Applying and returns dispatch parameters (prompt + brofile + label for redispatch_task; artifact_kind + source + version for artifact installs). Does NOT spawn the bro or install the artifact — the workflow caller does that via an actor node or `bbox_artifact_install` mcp_call, then calls `badgey_proposal_complete_apply` with the outcome. Lets the engine track the dispatched work natively (actor task lifecycle, retries, gates) instead of opaquely spawning behind a wrapper."
+    )]
+    async fn badgey_proposal_begin_apply(
+        &self,
+        Parameters(p): Parameters<BadgeyProposalBeginApplyParams>,
+    ) -> CallToolResult {
+        let id = match self.badgey_parse_id(&p.badgey_id) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return Self::ok_json(&json!({
+                    "outcome": "rejected",
+                    "reason": "bad_input",
+                    "error": e.clone(),
+                    "badgey_id": p.badgey_id,
+                }));
+            }
+        };
+        match self
+            .badgey_proposal_begin_apply_internal(
+                &id,
+                &p.proposal_id,
+                p.retry_failed.unwrap_or(false),
+            )
+            .await
+        {
+            Ok(value) => Self::ok_json(&value),
+            Err(e) => Self::ok_json(&json!({
+                "outcome": "rejected",
+                "reason": "internal_error",
+                "error": e.clone(),
+                "badgey_id": p.badgey_id,
+                "proposal_id": p.proposal_id,
+            })),
+        }
+    }
+
+    #[tool(
+        name = "badgey_proposal_complete_apply",
+        description = "Phase 2 of the split apply path. Given the outcome of the dispatched work (passed in `outcome`: `completed` / `failed` / `cancelled` / `timed_out`), transitions the proposal Applying → Applied or Applying → Failed and writes the audit decision. Always returns `{status: applied|failed, ...}` so the workflow's PostOutcome node can read the final state and pick the badge."
+    )]
+    async fn badgey_proposal_complete_apply(
+        &self,
+        Parameters(p): Parameters<BadgeyProposalCompleteApplyParams>,
+    ) -> CallToolResult {
+        let id = match self.badgey_parse_id(&p.badgey_id) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return Self::ok_json(&json!({
+                    "status": "failed",
+                    "error": e.clone(),
+                    "badgey_id": p.badgey_id,
+                }));
+            }
+        };
+        match self
+            .badgey_proposal_complete_apply_internal(
+                &id,
+                &p.proposal_id,
+                &p.outcome,
+                p.task_id.as_deref(),
+                p.artifact_ref.as_deref(),
+                p.summary.as_deref(),
+            )
+            .await
+        {
+            Ok(value) => Self::ok_json(&value),
+            Err(e) => Self::ok_json(&json!({
+                "status": "failed",
+                "error": e.clone(),
                 "badgey_id": p.badgey_id,
                 "proposal_id": p.proposal_id,
             })),
