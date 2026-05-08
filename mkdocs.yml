@@ -1,0 +1,50 @@
+site_name: blackbox
+site_description: Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration
+repo_url: https://github.com/invidious9000/transcript-search
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.details
+  - pymdownx.snippets
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Operating Guide: operating-blackbox.md
+  - Workflow Engine: workflows.md
+  - Rule Packets: rule-packets.md
+  - Agent System: agent-system.md
+  - Ingress Paths: ingress-paths.md
+  - Slack Bridge: slack-bridge.md
+  - IRC Bridge: irc-bridge.md
+  - Councils & Whiteboards: councils-whiteboards.md
+
+plugins:
+  - search

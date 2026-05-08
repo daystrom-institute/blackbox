@@ -3,7 +3,7 @@
 This doc covers everything the bbox daemon now does beyond what the README
 describes: the agentic graph surface, hybrid retrieval, the embedding
 pipeline, and the upkeep steps that keep all of it healthy. Read in order
-or jump via the section index. Cross-linked from the [README](../README.md).
+or jump via the section index. Cross-linked from the [README](index.md).
 
 ## Section index
 
@@ -14,7 +14,7 @@ or jump via the section index. Cross-linked from the [README](../README.md).
 - [Schema migrations](#schema-migrations)
 - [Upkeep checklist](#upkeep-checklist)
 - [Key locations on disk](#key-locations-on-disk)
-- [System memories — on-demand runbooks](#system-memories--on-demand-runbooks)
+- [System memories — on-demand runbooks](#system-memories-on-demand-runbooks)
 - [Provider integration matrix](#provider-integration-matrix)
 - [Open follow-ups](#open-follow-ups)
 
