@@ -261,6 +261,7 @@ Grounding:
 ```text
 bbox_refactor_status(file="src/packets/mod.rs", project_dir=<worktree>, limit=500)
 bbox_refactor_status(file="src/packets/ast.rs", project_dir=<worktree>, limit=200)
+bbox_refactor_project_refs(file="src/packets/mod.rs", project_dir=<worktree>, query="packets", limit=20)
 ```
 
 Plan shape:
@@ -290,6 +291,12 @@ bbox_refactor_run(
 ```
 
 Checkpoint: pause.
+
+If `eval/queries/cross-modal-rule-packets.json` needs a `project_file` ref
+repair after this phase, ground the new ref with `bbox_refactor_project_refs`.
+The `rel_path_hash` segment is derived from the relative path; the long
+`chunk_hash` segment is derived from the current chunk content. Do not compute
+either segment from whole-file `sha256sum`.
 
 ## Phase 5: Extract Server State And Progress
 

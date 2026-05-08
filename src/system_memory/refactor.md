@@ -10,6 +10,13 @@ whose extension maps to a supported tree-sitter parser in `CodeChunker`. The
 operational runbooks below cover the common application languages; additional
 mapped languages are inspect-only unless a newer language memory says otherwise.
 
+`bbox_refactor_project_refs` is a grounding-only companion for metadata and
+provenance repairs. It returns current
+`project_file:<project>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>` refs for
+one file using the same chunking/hash rules as the agentic corpus. Use it before
+literal edits to eval fixtures, citations, or expected refs; whole-file
+`sha256sum` is not a valid substitute for a chunk hash.
+
 - Rust: `rust`
 - TypeScript / TSX: `typescript`
 - JavaScript / JSX / MJS / CJS: `javascript`

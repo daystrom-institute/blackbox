@@ -303,6 +303,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bbox_refactor_status(file="src/path/to/file.ext", project_dir="/repo/x", item_names=["Thing"], limit=50, include_attributes=false)"#),
     },
     ToolDoc {
+        name: "bbox_refactor_project_refs",
+        category: ToolCategory::Refactor,
+        summary: "Ground current project_file entity refs for a source file using the same chunk and hash rules as the agentic corpus.",
+        when_to_use: "Use before editing eval fixtures, provenance metadata, design docs, or any other structured text that stores `project_file:<project>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>` refs. This is a grounding/read tool: it returns the current rel_path_hash, chunk hashes, occurrence indexes, symbols, byte ranges, and canonical entity_ref strings for a file so agents do not guess from whole-file sha256 or replace the wrong ref segment.",
+        example: Some(r#"bbox_refactor_project_refs(file="src/packets/mod.rs", project_dir="/repo/x", query="compile", limit=20)"#),
+    },
+    ToolDoc {
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
         summary: "Create a dry-run structural refactor plan using a supported generic or language-scoped plan kind.",

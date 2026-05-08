@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Tree};
 
+use crate::chunker;
 use crate::chunker::code::{language_for_path, parser_for_language};
+use crate::entity_ref;
 use crate::projects::ProjectRecord;
 
 const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
@@ -52,6 +54,24 @@ pub struct RefactorStatusParams {
     /// Include syntax attributes in returned items. Defaults true.
     #[serde(default)]
     pub include_attributes: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RefactorProjectRefsParams {
+    /// Source file to chunk. Relative paths resolve against project_dir or cwd.
+    pub file: String,
+    /// Optional project root used to resolve relative paths and compute the project_file project id.
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    /// Optional substring filter applied to chunk content, symbol, chunk kind, and entity_ref.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Maximum matching chunks to return. Defaults to 100 and is capped at 1000.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Include chunk content excerpts. Defaults true.
+    #[serde(default)]
+    pub include_excerpt: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -254,6 +274,37 @@ pub struct RefactorStatus {
     pub items: Vec<SyntaxItem>,
 }
 
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RefactorProjectRefs {
+    pub status: String,
+    pub path: String,
+    pub project_dir: String,
+    pub relative_path: String,
+    pub project_id: String,
+    pub rel_path_hash: String,
+    pub total_chunks: usize,
+    pub matching_chunks: usize,
+    pub returned_chunks: usize,
+    pub truncated: bool,
+    pub chunks: Vec<ProjectFileChunkRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProjectFileChunkRef {
+    pub entity_ref: String,
+    pub chunk_hash: String,
+    pub occurrence_idx: u32,
+    pub chunk_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct ParseReport {
     pub has_error: bool,
@@ -375,6 +426,81 @@ pub fn status(p: &RefactorStatusParams) -> Result<String> {
         returned_items,
         truncated,
         items,
+    };
+    Ok(serde_json::to_string_pretty(&response)?)
+}
+
+pub fn project_refs(p: &RefactorProjectRefsParams) -> Result<String> {
+    let project_dir = resolve_project_dir(p.project_dir.as_deref())?;
+    let project_dir_arg = project_dir.to_string_lossy().into_owned();
+    let path = resolve_path(Some(&project_dir_arg), &p.file)?;
+    let relative_path = path
+        .strip_prefix(&project_dir)
+        .with_context(|| {
+            format!(
+                "{} is not under project_dir {}",
+                path.display(),
+                project_dir.display()
+            )
+        })?
+        .to_path_buf();
+    let project_id = entity_ref::project_id_for_path(&project_dir)?;
+    let rel_path_hash = short_hash(relative_path.to_string_lossy().as_bytes());
+    let chunks = chunk_file_for_refs(&path, &relative_path, &project_id, &rel_path_hash)?;
+    let total_chunks = chunks.len();
+    let include_excerpt = p.include_excerpt.unwrap_or(true);
+    let query = p.query.as_deref().map(str::to_lowercase);
+    let mut refs = chunks
+        .into_iter()
+        .map(|chunk| {
+            let entity_ref = format!(
+                "project_file:{project_id}:{rel_path_hash}:{}:{}",
+                chunk.chunk_hash, chunk.occurrence_idx
+            );
+            ProjectFileChunkRef {
+                entity_ref,
+                chunk_hash: chunk.chunk_hash,
+                occurrence_idx: chunk.occurrence_idx,
+                chunk_kind: chunk.chunk_kind,
+                language: chunk.language,
+                symbol: chunk.symbol,
+                byte_start: chunk.byte_start,
+                byte_end: chunk.byte_end,
+                excerpt: include_excerpt.then(|| excerpt(&chunk.content, 320)),
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(query) = query.as_deref().filter(|query| !query.is_empty()) {
+        refs.retain(|chunk| {
+            chunk.entity_ref.to_lowercase().contains(query)
+                || chunk.chunk_hash.to_lowercase().contains(query)
+                || chunk.chunk_kind.to_lowercase().contains(query)
+                || chunk
+                    .symbol
+                    .as_deref()
+                    .is_some_and(|symbol| symbol.to_lowercase().contains(query))
+                || chunk
+                    .excerpt
+                    .as_deref()
+                    .is_some_and(|excerpt| excerpt.to_lowercase().contains(query))
+        });
+    }
+    let matching_chunks = refs.len();
+    let limit = p.limit.unwrap_or(100).min(1000);
+    let truncated = matching_chunks > limit;
+    refs.truncate(limit);
+    let response = RefactorProjectRefs {
+        status: "ok".to_string(),
+        path: path_string(&path),
+        project_dir: path_string(&project_dir),
+        relative_path: relative_path.to_string_lossy().into_owned(),
+        project_id,
+        rel_path_hash,
+        total_chunks,
+        matching_chunks,
+        returned_chunks: refs.len(),
+        truncated,
+        chunks: refs,
     };
     Ok(serde_json::to_string_pretty(&response)?)
 }
@@ -2691,6 +2817,95 @@ fn resolve_path(project_dir: Option<&str>, path: &str) -> Result<PathBuf> {
     Ok(full)
 }
 
+fn resolve_project_dir(project_dir: Option<&str>) -> Result<PathBuf> {
+    let root = match project_dir {
+        Some(project_dir) => PathBuf::from(project_dir),
+        None => std::env::current_dir()?,
+    };
+    root.canonicalize()
+        .with_context(|| format!("failed to canonicalize project_dir {}", root.display()))
+}
+
+fn chunk_file_for_refs(
+    abs_path: &Path,
+    rel_path: &Path,
+    project_id: &str,
+    rel_path_hash: &str,
+) -> Result<Vec<chunker::Chunk>> {
+    let bytes =
+        fs::read(abs_path).with_context(|| format!("failed to read {}", abs_path.display()))?;
+    let sniff_len = bytes.len().min(4096);
+    let mut chunks = Vec::new();
+    for candidate in chunker::default_registry() {
+        if !candidate.claims(rel_path, &bytes[..sniff_len]) {
+            continue;
+        }
+        chunks = candidate.chunk(rel_path, &bytes)?.0;
+        break;
+    }
+    if chunks.is_empty() && !bytes.is_empty() {
+        bail!("no chunker claimed {}", rel_path.display());
+    }
+    let chunks = chunks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut chunk)| {
+            chunk.project_id = project_id.to_string();
+            chunk.file_path = rel_path.to_path_buf();
+            chunk.rel_path_hash = rel_path_hash.to_string();
+            chunk.chunk_hash = sha256_hex(chunk.content.as_bytes());
+            chunk.occurrence_idx = idx as u32;
+            chunk
+        })
+        .collect::<Vec<_>>();
+    Ok(bound_chunks_for_refs(&chunks))
+}
+
+fn bound_chunks_for_refs(chunks: &[chunker::Chunk]) -> Vec<chunker::Chunk> {
+    chunks
+        .iter()
+        .flat_map(|chunk| {
+            if chunk.content.len() <= chunker::MAX_CHUNK_BYTES {
+                return vec![chunk.clone()];
+            }
+            let mut out = Vec::new();
+            let mut start = 0usize;
+            while start < chunk.content.len() {
+                let mut end = (start + chunker::MAX_CHUNK_BYTES).min(chunk.content.len());
+                while !chunk.content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let mut split = chunk.clone();
+                split.content = chunk.content[start..end].to_string();
+                split.byte_start = chunk.byte_start + start as u64;
+                split.byte_end = chunk.byte_start + end as u64;
+                split.chunk_hash = sha256_hex(split.content.as_bytes());
+                split.occurrence_idx = out.len() as u32;
+                out.push(split);
+                start = end;
+            }
+            out
+        })
+        .enumerate()
+        .map(|(idx, mut chunk)| {
+            chunk.occurrence_idx = idx as u32;
+            chunk
+        })
+        .collect()
+}
+
+fn short_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    hex::encode(&digest[..4])
+}
+
+fn excerpt(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(max_chars).collect()
+}
+
 fn parse_source_file(path: &Path) -> Result<ParsedSource> {
     let language =
         language_for_path(path).ok_or_else(|| anyhow!("unsupported source file extension"))?;
@@ -3795,6 +4010,43 @@ mod tests {
             registered_at: "2026-05-07T00:00:00Z".to_string(),
             is_git_repo: false,
         }
+    }
+
+    #[test]
+    fn project_refs_returns_current_chunk_entity_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "pub fn alpha() -> i32 { 1 }\n\npub fn beta() -> i32 { alpha() + 1 }\n",
+        )
+        .unwrap();
+
+        let text = project_refs(&RefactorProjectRefsParams {
+            file: "src/lib.rs".into(),
+            project_dir: Some(dir.path().to_string_lossy().to_string()),
+            query: Some("alpha".into()),
+            limit: Some(10),
+            include_excerpt: Some(true),
+        })
+        .unwrap();
+        let parsed: RefactorProjectRefs = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.status, "ok");
+        assert_eq!(parsed.relative_path, "src/lib.rs");
+        assert_eq!(parsed.rel_path_hash, short_hash(b"src/lib.rs"));
+        assert!(!parsed.chunks.is_empty());
+        let chunk = &parsed.chunks[0];
+        assert!(chunk.entity_ref.starts_with(&format!(
+            "project_file:{}:{}:",
+            parsed.project_id, parsed.rel_path_hash
+        )));
+        assert_eq!(chunk.chunk_hash.len(), 64);
+        assert!(chunk
+            .excerpt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("alpha"));
     }
 
     #[test]

@@ -3589,7 +3589,10 @@ use packets::{
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
     PacketListParams,
 };
-use refactor::{RefactorApplyParams, RefactorPlanParams, RefactorRunParams, RefactorStatusParams};
+use refactor::{
+    RefactorApplyParams, RefactorPlanParams, RefactorProjectRefsParams, RefactorRunParams,
+    RefactorStatusParams,
+};
 use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
@@ -3972,6 +3975,17 @@ impl BlackboxServer {
         Parameters(p): Parameters<RefactorStatusParams>,
     ) -> CallToolResult {
         Self::run("bbox_refactor_status", || refactor::status(&p))
+    }
+
+    #[tool(
+        name = "bbox_refactor_project_refs",
+        description = "Ground current project_file entity refs for a source file using the same chunk and hash rules as the agentic corpus."
+    )]
+    fn bbox_refactor_project_refs(
+        &self,
+        Parameters(p): Parameters<RefactorProjectRefsParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_refactor_project_refs", || refactor::project_refs(&p))
     }
 
     #[tool(
