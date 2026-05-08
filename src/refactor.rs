@@ -1672,6 +1672,7 @@ fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
     let last_mod = items
         .iter()
         .filter(|item| item.kind == "mod_item")
+        .filter(|item| ensure_rust_mod_declaration(&parsed.source, item).is_ok())
         .max_by_key(|item| item.byte_end);
     let (insert_at, replacement) = if let Some(item) = last_mod {
         (item.byte_end, format!("\n{declaration}"))
@@ -2901,6 +2902,7 @@ fn rust_mod_decl_insert_byte(path: &Path, source: &str) -> Result<usize> {
     Ok(rust_items(&parsed)
         .iter()
         .filter(|item| item.kind == "mod_item")
+        .filter(|item| ensure_rust_mod_declaration(source, item).is_ok())
         .max_by_key(|item| item.byte_end)
         .map(|item| item.byte_end)
         .unwrap_or_else(|| rust_module_decl_fallback_insert_byte(source)))
@@ -5910,6 +5912,57 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&source).unwrap(),
             "mod alpha;\nmod beta;\nmod gamma;\n\nuse std::fmt;\n"
+        );
+    }
+
+    #[test]
+    fn add_rust_mod_decl_ignores_inline_modules_for_insert_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        fs::write(
+            &source,
+            "mod alpha;\n\nfn main() {}\n\nmod tests { fn helper() {} }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "add_rust_mod_decl".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: None,
+            impl_name: None,
+            module_name: Some("server".into()),
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "mod alpha;\nmod server;\n\nfn main() {}\n\nmod tests { fn helper() {} }\n"
         );
     }
 
