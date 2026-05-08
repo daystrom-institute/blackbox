@@ -268,9 +268,20 @@ impl EmbedQueueHandle {
         if self.inner.router.is_none() {
             return true;
         }
-        match crate::vectors::contains_active(vector_route, &request.entity_id, &request.chunk_hash)
-        {
-            Ok(already_indexed) => !already_indexed,
+        match crate::vectors::try_contains_active_if_initialized(
+            vector_route,
+            &request.entity_id,
+            &request.chunk_hash,
+        ) {
+            Ok(Some(already_indexed)) => !already_indexed,
+            Ok(None) => {
+                tracing::debug!(
+                    vector_route,
+                    entity_id = %request.entity_id,
+                    "embedding dedup check skipped because vector store is still initializing"
+                );
+                true
+            }
             Err(err) => {
                 tracing::warn!(
                     vector_route,

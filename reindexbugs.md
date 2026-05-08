@@ -300,6 +300,9 @@ Fix:
   reindex startup delay now defaults to the normal reindex interval instead of
   5 seconds, and can be overridden with
   `BLACKBOX_REINDEX_STARTUP_DELAY_SECS`.
+- Initial mitigation: embedding enqueue dedupe now skips the vector
+  `contains_active` check while the global vector store is still initializing,
+  so project indexing does not block on vector warmup's `OnceLock`.
 - Add a maintenance-state route/tool that reports active phase and writer-lock
   holder.
 

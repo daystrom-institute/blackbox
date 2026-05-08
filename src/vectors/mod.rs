@@ -198,6 +198,24 @@ pub fn contains_active(route: &str, entity_id: &str, content_hash: &str) -> Resu
     global().contains_active(route, entity_id, content_hash)
 }
 
+pub(crate) fn try_contains_active_if_initialized(
+    route: &str,
+    entity_id: &str,
+    content_hash: &str,
+) -> Result<Option<bool>> {
+    #[cfg(test)]
+    if let Some(store) = test_global_store().read().clone() {
+        return store
+            .contains_active(route, entity_id, content_hash)
+            .map(Some);
+    }
+
+    let Some(store) = GLOBAL_STORE.get().cloned() else {
+        return Ok(None);
+    };
+    store.contains_active(route, entity_id, content_hash).map(Some)
+}
+
 pub fn search(route: &str, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
     global().search(route, query, k)
 }
