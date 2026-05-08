@@ -424,24 +424,16 @@ impl Roadmap {
         category: Option<&str>,
         project: Option<&str>,
     ) -> Vec<&RoadmapItem> {
-        // Pre-compute the items with unresolved spawns to avoid
-        // double-borrow issues in the filter closure.
-        let in_progress_items: std::collections::HashSet<&str> = self
-            .store
-            .items
-            .iter()
-            .filter(|i| i.status == RoadmapStatus::Accepted && !self.spawned_edges(&i.id).is_empty())
-            .map(|i| i.id.as_str())
-            .collect();
-
         self.store
             .items
             .iter()
             .filter(|i| {
                 if let Some(s) = status {
                     match s {
-                        "in_progress" => in_progress_items.contains(i.id.as_str()),
-                        "done" => false, // computed per-thread, not from store
+                        "in_progress" => {
+                            i.status == RoadmapStatus::Accepted
+                                && !self.spawned_edges(&i.id).is_empty()
+                        }
                         _ => i.status.as_str() == s,
                     }
                 } else {
@@ -604,8 +596,9 @@ impl Roadmap {
     // ── Next ─────────────────────────────────────────────────────────
 
     /// Rank accepted items by composite score. Returns top N.
-    /// Higher score = more actionable.
-    pub fn next(&self, n: usize, include_blocked: bool) -> Vec<&RoadmapItem> {
+    /// Higher score = more actionable. If `project` is provided, only
+    /// items matching that project (or global-scope items) are scored.
+    pub fn next(&self, n: usize, include_blocked: bool, project: Option<&str>) -> Vec<&RoadmapItem> {
         let now = Self::now_iso();
         let mut scored: Vec<(&RoadmapItem, f64)> = self
             .store
@@ -613,7 +606,19 @@ impl Roadmap {
             .iter()
             .filter(|i| i.status == RoadmapStatus::Accepted)
             .filter(|i| include_blocked || self.blocker_count(&i.id) == 0)
-            .filter(|i| !self.has_unresolved_spawns(&i.id)) // not already in progress
+            .filter(|i| !self.has_unresolved_spawns(&i.id))
+            .filter(|i| {
+                if let Some(p) = project {
+                    if i.scope == "global" {
+                        return true;
+                    }
+                    if let Some(ref ip) = i.project {
+                        return ip.contains(p);
+                    }
+                    return false;
+                }
+                true
+            })
             .map(|i| {
                 let mut score = 0.0;
 

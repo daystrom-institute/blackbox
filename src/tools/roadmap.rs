@@ -101,6 +101,8 @@ pub(crate) struct RoadmapNextParams {
     #[serde(default)]
     pub(crate) include_blocked: bool,
     pub(crate) project: Option<String>,
+    #[serde(default)]
+    pub(crate) project_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,12 +240,18 @@ impl BlackboxServer {
             anyhow::bail!("roadmap item '{}' not found", p.id);
         };
         let spawned_ids = rm.spawned_thread_ids(&p.id);
-        let status_label = if item.status == roadmap::RoadmapStatus::Accepted && !spawned_ids.is_empty() {
-            // We can't check thread state here; render as in_progress if there are spawns
-            "in_progress"
-        } else {
-            item.status.as_str()
-        };
+        let th = self.state.threads.read();
+        let resolved: Vec<bool> = spawned_ids
+            .iter()
+            .map(|tid| {
+                let raw = tid.strip_prefix("thread:").unwrap_or(tid);
+                th.all()
+                    .iter()
+                    .any(|t| t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved))
+            })
+            .collect();
+        drop(th);
+        let (status_label, _is_computed) = rm.computed_status(item, &resolved);
 
         Ok(serde_json::json!({
             "id": item.id,
@@ -283,18 +291,23 @@ impl BlackboxServer {
             p.category.as_deref(),
             p.project.as_deref(),
         );
+        let th = self.state.threads.read();
         let limit = p.limit.unwrap_or(50).min(500);
         let result: Vec<_> = items
             .into_iter()
             .take(limit)
             .map(|item| {
                 let spawned_ids = rm.spawned_thread_ids(&item.id);
-                let status_label =
-                    if item.status == roadmap::RoadmapStatus::Accepted && !spawned_ids.is_empty() {
-                        "in_progress"
-                    } else {
-                        item.status.as_str()
-                    };
+                let resolved: Vec<bool> = spawned_ids
+                    .iter()
+                    .map(|tid| {
+                        let raw = tid.strip_prefix("thread:").unwrap_or(tid);
+                        th.all()
+                            .iter()
+                            .any(|t| t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved))
+                    })
+                    .collect();
+                let (status_label, _) = rm.computed_status(&item, &resolved);
                 serde_json::json!({
                     "id": item.id,
                     "title": item.title,
@@ -434,24 +447,12 @@ impl BlackboxServer {
     fn roadmap_next(&self, p: RoadmapNextParams) -> anyhow::Result<String> {
         let rm = self.state.roadmap.read();
         let n = p.n.unwrap_or(5);
+        let project = p.project.as_deref().or(p.project_dir.as_deref());
 
-        // Apply project filter before scoring, then rank by the store's next()
-        let items = rm.next(n, p.include_blocked);
+        let items = rm.next(n, p.include_blocked, project);
 
         let result: Vec<_> = items
             .iter()
-            .filter(|item| {
-                if let Some(ref proj) = p.project {
-                    if item.scope == "global" {
-                        return true;
-                    }
-                    if let Some(ref ip) = item.project {
-                        return ip.contains(proj.as_str());
-                    }
-                    return false;
-                }
-                true
-            })
             .map(|item| {
                 serde_json::json!({
                     "id": item.id,
