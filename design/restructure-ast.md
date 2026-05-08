@@ -240,8 +240,9 @@ bbox_refactor_run(
 ```
 
 If item extraction cannot express a helper because it is nested inside a test
-module, use `replace_text` or `write_file` only after grounding the exact source
-range and report the fallback.
+module, pause and report the missing operation unless the intended change is
+literal test-fixture metadata. Do not count a manual text rewrite as satisfying
+symbolic extraction.
 
 Use explicit target preludes. Avoid `use super::*;` in these child modules; it
 is too broad and often imports nothing useful after extraction. Use
@@ -326,7 +327,9 @@ bbox_refactor_run(
 )
 ```
 
-Use `replace_text` for explicit path/import adjustments reported by the compiler.
+Use `add_rust_use_decl`, visibility rewrites, or a future path/import rewrite
+primitive for compiler-reported path/import adjustments. `replace_text` is only
+acceptable here for non-code metadata that remains after the semantic move.
 
 Checkpoint: pause.
 
@@ -358,9 +361,9 @@ bbox_refactor_run(
 )
 ```
 
-For later domains, first ground `src/tools/mod.rs` and use either
-`add_rust_mod_decl` or `replace_text` to add exactly one new `pub mod <domain>;`
-line without rewriting existing domain declarations.
+For later domains, first ground `src/tools/mod.rs` and use `add_rust_mod_decl`
+to add exactly one new `pub mod <domain>;` line without rewriting existing
+domain declarations.
 
 Checkpoint after each domain. Do not batch many domains in one checkpoint.
 
