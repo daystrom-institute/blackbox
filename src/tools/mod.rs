@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod attention;
 pub mod graph;
+pub mod knowledge;
 pub mod notes;
 pub mod packets;
 pub mod projects;
