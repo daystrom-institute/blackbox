@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Result;
 use tantivy::schema::*;
@@ -17,7 +17,7 @@ use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::entity_ref;
 use crate::parser;
 
-const BACKGROUND_FULL_REINDEX_EVERY_TICKS: u64 = 12;
+const DEFAULT_BACKGROUND_FULL_REINDEX_EVERY_TICKS: u64 = 0;
 
 pub(super) fn conservative_log_merge_policy() -> tantivy::merge_policy::LogMergePolicy {
     let mut policy = tantivy::merge_policy::LogMergePolicy::default();
@@ -223,8 +223,9 @@ fn try_background_reindex(
     let mut indexed_files = 0u64;
     let mut indexed_docs = 0u64;
     let mut skipped = 0u64;
-    let tool_edges = ToolEdgeContext::from_config(config)?;
+    let tool_edges = ToolEdgeContext::from_config(config, !full)?;
 
+    let transcript_phase = Instant::now();
     for (account_name, root) in &config.roots {
         let projects_dir = root.join("projects");
         if projects_dir.exists() {
@@ -238,6 +239,7 @@ fn try_background_reindex(
                 &mut indexed_docs,
                 &mut skipped,
                 &tool_edges,
+                !full,
             )?;
         }
         let history = root.join("history.jsonl");
@@ -268,6 +270,7 @@ fn try_background_reindex(
                 &mut indexed_docs,
                 &mut skipped,
                 &tool_edges,
+                !full,
             )?;
         }
         let history = codex_root.join("history.jsonl");
@@ -284,7 +287,16 @@ fn try_background_reindex(
             )?;
         }
     }
+    tracing::info!(
+        full,
+        elapsed_ms = transcript_phase.elapsed().as_millis(),
+        indexed_files,
+        indexed_docs,
+        skipped,
+        "auto-reindex: transcript phase complete"
+    );
 
+    let project_phase = Instant::now();
     let project_stats = project_files::index_registered_projects_standalone(
         config,
         fields,
@@ -295,6 +307,16 @@ fn try_background_reindex(
     indexed_files += project_stats.indexed_files;
     indexed_docs += project_stats.indexed_docs;
     skipped += project_stats.skipped;
+    tracing::info!(
+        full,
+        elapsed_ms = project_phase.elapsed().as_millis(),
+        indexed_files = project_stats.indexed_files,
+        indexed_docs = project_stats.indexed_docs,
+        skipped = project_stats.skipped,
+        emitted_edges = project_stats.emitted_edges,
+        indexed_commits = project_stats.indexed_commits,
+        "auto-reindex: project phase complete"
+    );
     if project_stats.emitted_edges > 0 {
         tracing::debug!(
             emitted_edges = project_stats.emitted_edges,
@@ -305,6 +327,7 @@ fn try_background_reindex(
         );
     }
 
+    let stores_phase = Instant::now();
     let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
         &config.knowledge_path,
         fields,
@@ -325,8 +348,16 @@ fn try_background_reindex(
         indexed_files += 1;
         indexed_docs += thread_docs;
     }
+    tracing::info!(
+        full,
+        elapsed_ms = stores_phase.elapsed().as_millis(),
+        knowledge_docs,
+        thread_docs,
+        "auto-reindex: store-doc phase complete"
+    );
 
     // 4b. Purge documents for deleted source files
+    let purge_phase = Instant::now();
     let current_files = scan_all_source_files(config);
     let current_paths: std::collections::HashSet<String> =
         current_files.iter().map(|(p, _, _)| p.clone()).collect();
@@ -342,6 +373,13 @@ fn try_background_reindex(
         meta.remove(path.as_str());
         purged += 1;
     }
+    tracing::info!(
+        full,
+        elapsed_ms = purge_phase.elapsed().as_millis(),
+        current_files = current_files.len(),
+        purged,
+        "auto-reindex: purge phase complete"
+    );
 
     if !full && indexed_files == 0 && purged == 0 {
         tracing::debug!("auto-reindex: no changes after post-lock re-check");
@@ -349,11 +387,17 @@ fn try_background_reindex(
     }
 
     // 5. Commit + atomic meta save (while still holding writer lock)
+    let commit_phase = Instant::now();
     writer.commit()?;
     if full {
         writer.wait_merging_threads()?;
     }
     save_meta(&config.meta_path, &meta)?;
+    tracing::info!(
+        full,
+        elapsed_ms = commit_phase.elapsed().as_millis(),
+        "auto-reindex: commit phase complete"
+    );
 
     let segments = segment_count(index);
     tracing::info!(
@@ -381,12 +425,24 @@ pub fn spawn_reindex_thread(
                 "background reindex thread started (interval: {:?})",
                 interval
             );
+            let full_reindex_every_ticks = std::env::var("BLACKBOX_BACKGROUND_FULL_REINDEX_TICKS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_BACKGROUND_FULL_REINDEX_EVERY_TICKS);
+            if full_reindex_every_ticks == 0 {
+                tracing::info!("background full reindex disabled");
+            } else {
+                tracing::info!(
+                    ticks = full_reindex_every_ticks,
+                    "background full reindex enabled"
+                );
+            }
             // First tick fires after a short delay to let the MCP handshake complete
             std::thread::sleep(Duration::from_secs(5));
             let mut tick = 0_u64;
             loop {
                 tick = tick.wrapping_add(1);
-                let full = tick % BACKGROUND_FULL_REINDEX_EVERY_TICKS == 0;
+                let full = full_reindex_every_ticks != 0 && tick % full_reindex_every_ticks == 0;
                 if let Err(e) = try_background_reindex(&index, &config, fields, full) {
                     tracing::error!("background reindex failed: {:#}", e);
                 }
@@ -475,6 +531,7 @@ pub(super) fn index_directory_standalone(
     indexed_docs: &mut u64,
     skipped: &mut u64,
     tool_edges: &ToolEdgeContext,
+    commit_progress: bool,
 ) -> Result<()> {
     for entry in WalkDir::new(dir)
         .follow_links(true)
@@ -551,7 +608,7 @@ pub(super) fn index_directory_standalone(
             },
         );
         *indexed_files += 1;
-        if (*indexed_files).is_multiple_of(500) {
+        if commit_progress && (*indexed_files).is_multiple_of(500) {
             tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);
             writer.commit()?;
         }
@@ -626,6 +683,7 @@ pub(super) fn index_codex_directory_standalone(
     indexed_docs: &mut u64,
     skipped: &mut u64,
     tool_edges: &ToolEdgeContext,
+    commit_progress: bool,
 ) -> Result<()> {
     for entry in WalkDir::new(sessions_dir)
         .follow_links(true)
@@ -699,7 +757,7 @@ pub(super) fn index_codex_directory_standalone(
             },
         );
         *indexed_files += 1;
-        if (*indexed_files).is_multiple_of(500) {
+        if commit_progress && (*indexed_files).is_multiple_of(500) {
             tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);
             writer.commit()?;
         }

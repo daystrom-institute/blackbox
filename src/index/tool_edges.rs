@@ -15,13 +15,15 @@ use crate::projects::{ProjectRecord, ProjectRegistry};
 pub(super) struct ToolEdgeContext {
     projects: Vec<ProjectRecord>,
     edges_dir: PathBuf,
+    emit_sidecars: bool,
 }
 
 impl ToolEdgeContext {
-    pub(super) fn from_config(config: &ReindexConfig) -> Result<Self> {
+    pub(super) fn from_config(config: &ReindexConfig, emit_sidecars: bool) -> Result<Self> {
         Ok(Self {
             projects: ProjectRegistry::load_records(&config.projects_path)?,
             edges_dir: crate::edge_index::edges_dir_from_projects_path(&config.projects_path),
+            emit_sidecars,
         })
     }
 
@@ -32,6 +34,9 @@ impl ToolEdgeContext {
         line_offset: u64,
         event_idx: u32,
     ) -> Result<usize> {
+        if !self.emit_sidecars {
+            return Ok(0);
+        }
         let Some(tool_call) = event.tool_call.as_ref() else {
             return Ok(0);
         };
@@ -299,7 +304,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{ToolCallInfo, ToolCallKind};
+    use crate::parser::{MessageRole, ParsedEvent, ToolCallInfo, ToolCallKind};
     use serde_json::json;
 
     #[test]
@@ -327,6 +332,35 @@ mod tests {
         };
 
         assert_eq!(read_byte_range(&tool_call, 100), Some((10, 30)));
+    }
+
+    #[test]
+    fn disabled_context_does_not_emit_sidecar_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolEdgeContext {
+            projects: Vec::new(),
+            edges_dir: dir.path().to_path_buf(),
+            emit_sidecars: false,
+        };
+        let event = ParsedEvent {
+            role: MessageRole::ToolUse,
+            content: String::new(),
+            session_id: "sess-1".into(),
+            timestamp: None,
+            git_branch: None,
+            is_subagent: false,
+            agent_slug: None,
+            cwd: Some("/tmp".into()),
+            tool_call: Some(ToolCallInfo {
+                kind: ToolCallKind::Bash,
+                name: "Bash".into(),
+                tool_use_id: None,
+                input: json!({"command": "echo hi"}),
+            }),
+        };
+
+        assert_eq!(ctx.emit_event_edges(&event, "claude", 42, 0).unwrap(), 0);
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 
     #[test]

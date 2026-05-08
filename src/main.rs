@@ -8338,15 +8338,25 @@ async fn main() -> anyhow::Result<()> {
     let bind_host = std::env::var("BBOX_BIND").unwrap_or_else(|_| "127.0.0.1".into());
     let bind_is_loopback = is_loopback_bind(&bind_host);
 
-    let edge_index = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
-        index: &idx,
-        knowledge: &kb,
-        threads: &th,
-        notes: &notes_store,
-        task_store: &task_store,
-        edges_dir: edge_index::edges_dir_from_bro_store(&store_dir),
-        include_tantivy_projection: false,
-    });
+    let edge_index = if std::env::var("BLACKBOX_EDGE_INDEX_BOOT_REBUILD")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+            index: &idx,
+            knowledge: &kb,
+            threads: &th,
+            notes: &notes_store,
+            task_store: &task_store,
+            edges_dir: edge_index::edges_dir_from_bro_store(&store_dir),
+            include_tantivy_projection: false,
+        })
+    } else {
+        tracing::info!(
+            "startup EdgeIndex rebuild deferred (set BLACKBOX_EDGE_INDEX_BOOT_REBUILD=1 to restore eager rebuild)"
+        );
+        edge_index::EdgeIndex::default()
+    };
 
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),

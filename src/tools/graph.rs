@@ -1,8 +1,23 @@
 use crate::server::*;
 use crate::*;
+use rmcp::schemars;
+use serde::{Deserialize, Serialize};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::graph_tools()
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct EdgeCompactParams {
+    /// Project id whose legacy sidecar should be compacted.
+    pub project_id: String,
+    /// Apply the compaction. Defaults to false, returning a dry-run summary.
+    pub apply: Option<bool>,
+    /// Rebuild the in-memory EdgeIndex after applying. With apply=true, this
+    /// also works when compaction is already a no-op. Uses a sidecar-only
+    /// rebuild. Defaults to false because graph rebuilds can be expensive while
+    /// legacy sidecars are still large.
+    pub rebuild: Option<bool>,
 }
 
 #[tool_router(router = graph_tools)]
@@ -81,6 +96,30 @@ impl BlackboxServer {
                 &self.state.edge_index.read(),
                 &mut self.state.path_cache.write(),
             )
+        })
+    }
+
+    #[tool(
+        name = "bbox_edge_compact",
+        description = "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement. With apply=true, rebuild=true forces a sidecar-only in-memory EdgeIndex rebuild even when compaction is already complete."
+    )]
+    pub(crate) fn bbox_edge_compact(
+        &self,
+        Parameters(p): Parameters<EdgeCompactParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_edge_compact", || {
+            let edges_dir = edge_index::edges_dir_from_bro_store(&self.state.store_dir);
+            let apply = p.apply.unwrap_or(false);
+            let stats = edge_index::compact_legacy_sidecar(&edges_dir, &p.project_id, apply)?;
+            let edge_index_rebuilt = apply && p.rebuild.unwrap_or(false);
+            if edge_index_rebuilt {
+                crate::server::rebuild_edge_index_from_shared(&self.state, false);
+            }
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "stats": stats,
+                "edge_index_rebuilt": edge_index_rebuilt,
+            }))?)
         })
     }
 

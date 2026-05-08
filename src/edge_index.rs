@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -445,6 +445,21 @@ impl EdgeIndex {
     }
 
     fn project_sidecar_edges(&mut self, edges_dir: &Path, seen: &mut HashSet<Edge>) {
+        let managed_derived_dir = managed_derived_edges_dir(edges_dir);
+        self.project_sidecar_edges_in_dir(edges_dir, seen);
+        let Ok(entries) = fs::read_dir(&managed_derived_dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            self.project_sidecar_edges_in_dir(&path, seen);
+        }
+    }
+
+    fn project_sidecar_edges_in_dir(&mut self, edges_dir: &Path, seen: &mut HashSet<Edge>) {
         let Ok(entries) = fs::read_dir(edges_dir) else {
             return;
         };
@@ -454,21 +469,25 @@ impl EdgeIndex {
                 tracing::debug!(path = %path.display(), "skipping non-jsonl edge sidecar file");
                 continue;
             }
-            let Ok(file) = fs::File::open(&path) else {
+            self.project_sidecar_edges_file(&path, seen);
+        }
+    }
+
+    fn project_sidecar_edges_file(&mut self, path: &Path, seen: &mut HashSet<Edge>) {
+        let Ok(file) = fs::File::open(path) else {
+            return;
+        };
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
                 continue;
-            };
-            let reader = std::io::BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
-                    continue;
+            }
+            match serde_json::from_str::<Edge>(&line) {
+                Ok(edge) => {
+                    self.insert_sidecar_edge(edge, seen);
                 }
-                match serde_json::from_str::<Edge>(&line) {
-                    Ok(edge) => {
-                        self.insert_sidecar_edge(edge, seen);
-                    }
-                    Err(err) => {
-                        tracing::warn!(path = %path.display(), error = %err, "failed to parse edge sidecar line");
-                    }
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), error = %err, "failed to parse edge sidecar line");
                 }
             }
         }
@@ -497,6 +516,10 @@ pub(crate) fn edges_dir_from_projects_path(projects_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("edges"))
 }
 
+fn managed_derived_edges_dir(edges_dir: &Path) -> PathBuf {
+    edges_dir.join("derived")
+}
+
 pub(crate) fn append_project_edges(
     edges_dir: &Path,
     project_id: &str,
@@ -520,6 +543,48 @@ pub(crate) fn append_project_edges(
         serde_json::to_writer(&mut file, &persisted)?;
         file.write_all(b"\n")?;
     }
+    Ok(())
+}
+
+pub(crate) fn replace_project_edges(
+    edges_dir: &Path,
+    namespace: &str,
+    project_id: &str,
+    edges: &[crate::chunker::Edge],
+) -> Result<()> {
+    let dir = managed_derived_edges_dir(edges_dir).join(namespace);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{project_id}.jsonl"));
+    if edges.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        return Ok(());
+    }
+
+    let tmp_path = path.with_extension("jsonl.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    for edge in edges {
+        let persisted = Edge {
+            source: edge.source.clone(),
+            kind: edge.kind.clone(),
+            target: edge.target.clone(),
+            provenance: edge.provenance,
+            confidence: edge.confidence,
+            metadata: BTreeMap::new(),
+        };
+        serde_json::to_writer(&mut file, &persisted)?;
+        file.write_all(b"\n")?;
+    }
+    file.sync_all()?;
+    drop(file);
+    fs::rename(tmp_path, path)?;
     Ok(())
 }
 
@@ -567,6 +632,132 @@ pub(crate) fn append_edges_dedup(
         written += 1;
     }
     Ok(written)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct EdgeSidecarCompactionStats {
+    pub project_id: String,
+    pub applied: bool,
+    pub existed: bool,
+    pub legacy_path: String,
+    pub backup_path: Option<String>,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub lines_seen: u64,
+    pub retained_lines: u64,
+    pub derived_edges_removed: u64,
+    pub explicit_edges_retained: u64,
+    pub malformed_lines_retained: u64,
+    pub blank_lines_dropped: u64,
+}
+
+pub(crate) fn compact_legacy_sidecar(
+    edges_dir: &Path,
+    project_id: &str,
+    apply: bool,
+) -> Result<EdgeSidecarCompactionStats> {
+    let path = edges_dir.join(format!("{project_id}.jsonl"));
+    let mut stats = EdgeSidecarCompactionStats {
+        project_id: project_id.to_string(),
+        applied: false,
+        existed: path.exists(),
+        legacy_path: path.display().to_string(),
+        backup_path: None,
+        bytes_before: 0,
+        bytes_after: 0,
+        lines_seen: 0,
+        retained_lines: 0,
+        derived_edges_removed: 0,
+        explicit_edges_retained: 0,
+        malformed_lines_retained: 0,
+        blank_lines_dropped: 0,
+    };
+    if !path.exists() {
+        return Ok(stats);
+    }
+
+    stats.bytes_before = fs::metadata(&path)?.len();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let tmp_path = path.with_file_name(format!(
+        "{project_id}.jsonl.compact-{stamp}-{}.tmp",
+        std::process::id()
+    ));
+    let mut writer = if apply {
+        Some(BufWriter::new(
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)?,
+        ))
+    } else {
+        None
+    };
+
+    let file = fs::File::open(&path)?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        stats.lines_seen += 1;
+        if line.trim().is_empty() {
+            stats.blank_lines_dropped += 1;
+            continue;
+        }
+        match serde_json::from_str::<Edge>(&line) {
+            Ok(edge) if edge.provenance == EdgeProvenance::Derived => {
+                stats.derived_edges_removed += 1;
+            }
+            Ok(_) => {
+                stats.explicit_edges_retained += 1;
+                stats.retained_lines += 1;
+                stats.bytes_after += line.len() as u64 + 1;
+                if let Some(writer) = writer.as_mut() {
+                    writer.write_all(line.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                }
+            }
+            Err(_) => {
+                stats.malformed_lines_retained += 1;
+                stats.retained_lines += 1;
+                stats.bytes_after += line.len() as u64 + 1;
+                if let Some(writer) = writer.as_mut() {
+                    writer.write_all(line.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                }
+            }
+        }
+    }
+
+    if !apply || stats.derived_edges_removed == 0 && stats.blank_lines_dropped == 0 {
+        if let Some(mut writer) = writer {
+            writer.flush()?;
+            drop(writer);
+            let _ = fs::remove_file(&tmp_path);
+        }
+        return Ok(stats);
+    }
+
+    let backup_path = path.with_file_name(format!("{project_id}.jsonl.bak-{stamp}"));
+    if let Some(mut writer) = writer {
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    } else {
+        anyhow::bail!("internal error: compaction apply requested without writer");
+    }
+    fs::rename(&path, &backup_path)?;
+    match fs::rename(&tmp_path, &path) {
+        Ok(()) => {}
+        Err(err) => {
+            let _ = fs::rename(&backup_path, &path);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+    }
+    stats.applied = true;
+    stats.backup_path = Some(backup_path.display().to_string());
+    Ok(stats)
 }
 
 fn edge_import_key(edge: &Edge) -> String {
@@ -839,6 +1030,173 @@ mod tests {
 
         assert_eq!(index.forward_edges(&source).len(), 1);
         assert_eq!(index.reverse_edges(&target).len(), 1);
+    }
+
+    #[test]
+    fn managed_project_edge_sidecar_replaces_previous_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let first_target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "b".repeat(64),
+            occurrence_idx: 1,
+        };
+        let second_target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "c".repeat(64),
+            occurrence_idx: 2,
+        };
+        let first = crate::chunker::Edge {
+            source: source.clone(),
+            kind: "NEXT_SECTION".into(),
+            target: first_target.clone(),
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        let second = crate::chunker::Edge {
+            source: source.clone(),
+            kind: "NEXT_SECTION".into(),
+            target: second_target.clone(),
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+
+        replace_project_edges(dir.path(), "project", "proj1234", &[first]).unwrap();
+        replace_project_edges(dir.path(), "project", "proj1234", &[second]).unwrap();
+
+        let sidecar = fs::read_to_string(
+            dir.path()
+                .join("derived")
+                .join("project")
+                .join("proj1234.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(sidecar.lines().count(), 1);
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), &mut seen);
+
+        assert!(index
+            .forward_edges(&source)
+            .iter()
+            .any(|edge| edge.target == second_target));
+        assert!(!index
+            .forward_edges(&source)
+            .iter()
+            .any(|edge| edge.target == first_target));
+    }
+
+    #[test]
+    fn managed_project_edges_do_not_hide_legacy_until_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let legacy_target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "b".repeat(64),
+            occurrence_idx: 1,
+        };
+        let managed_target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "c".repeat(64),
+            occurrence_idx: 2,
+        };
+        let legacy = crate::chunker::Edge {
+            source: source.clone(),
+            kind: "NEXT_SECTION".into(),
+            target: legacy_target.clone(),
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        append_project_edges(dir.path(), "proj1234", &[legacy]).unwrap();
+        let managed = crate::chunker::Edge {
+            source: source.clone(),
+            kind: "NEXT_SECTION".into(),
+            target: managed_target.clone(),
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        replace_project_edges(dir.path(), "project", "proj1234", &[managed]).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), &mut seen);
+
+        assert!(index
+            .forward_edges(&source)
+            .iter()
+            .any(|edge| edge.target == managed_target));
+        assert!(index
+            .forward_edges(&source)
+            .iter()
+            .any(|edge| edge.target == legacy_target));
+    }
+
+    #[test]
+    fn compact_legacy_sidecar_removes_only_derived_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let derived = crate::chunker::Edge {
+            source: source.clone(),
+            kind: "NEXT_SECTION".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "proj1234".into(),
+                rel_path_hash: "pathhash".into(),
+                chunk_hash: "b".repeat(64),
+                occurrence_idx: 1,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        append_project_edges(dir.path(), "proj1234", &[derived]).unwrap();
+        let explicit = Edge {
+            source: EntityRef::Transcript {
+                provider: "claude".into(),
+                session_id: "sess-1".into(),
+                line_offset: 42,
+                event_idx: 0,
+            },
+            kind: "READ_FILE".into(),
+            target: source.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata: BTreeMap::new(),
+        };
+        append_edges(dir.path(), "proj1234", &[explicit]).unwrap();
+
+        let dry_run = compact_legacy_sidecar(dir.path(), "proj1234", false).unwrap();
+        assert!(!dry_run.applied);
+        assert_eq!(dry_run.derived_edges_removed, 1);
+        assert_eq!(dry_run.explicit_edges_retained, 1);
+
+        let applied = compact_legacy_sidecar(dir.path(), "proj1234", true).unwrap();
+        assert!(applied.applied);
+        assert_eq!(applied.derived_edges_removed, 1);
+        assert!(applied.backup_path.is_some());
+
+        let compacted = fs::read_to_string(dir.path().join("proj1234.jsonl")).unwrap();
+        assert_eq!(compacted.lines().count(), 1);
+        assert!(compacted.contains("READ_FILE"));
+        assert!(!compacted.contains("NEXT_SECTION"));
     }
 
     #[test]

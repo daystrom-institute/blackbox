@@ -1401,7 +1401,8 @@ impl TranscriptIndex {
         let mut indexed_docs = 0u64;
         let mut skipped = 0u64;
         let f = self.fields;
-        let tool_edges = crate::index::tool_edges::ToolEdgeContext::from_config(&self.config)?;
+        let tool_edges =
+            crate::index::tool_edges::ToolEdgeContext::from_config(&self.config, !full)?;
 
         for (account_name, root) in &self.config.roots.clone() {
             let projects_dir = root.join("projects");
@@ -1416,6 +1417,7 @@ impl TranscriptIndex {
                     &mut indexed_docs,
                     &mut skipped,
                     &tool_edges,
+                    !full,
                 )?;
             }
             let history = root.join("history.jsonl");
@@ -1446,6 +1448,7 @@ impl TranscriptIndex {
                     &mut indexed_docs,
                     &mut skipped,
                     &tool_edges,
+                    !full,
                 )?;
             }
             let history = codex_root.join("history.jsonl");

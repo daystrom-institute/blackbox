@@ -252,6 +252,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
+        name: "bbox_edge_compact",
+        category: ToolCategory::Graph,
+        summary: "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement. With apply=true, rebuild=true forces a sidecar-only in-memory EdgeIndex rebuild even when compaction is already complete.",
+        when_to_use: "Use when legacy edge sidecars have grown from repeated full reindex replay. Call first with `apply=false` (default) for exactly one project_id, inspect removed/retained counts, then call with `apply=true` for that same project if the dry-run scope is acceptable. Leave `rebuild=false` while compacting multiple projects; after the last project, call with `apply=true,rebuild=true` once to reload graph state.",
+        example: Some(r#"bbox_edge_compact(project_id="d723917f", apply=false)"#),
+    },
+    ToolDoc {
         name: "bbox_blame",
         category: ToolCategory::Graph,
         summary: "Walk back from a code line to the conversation that produced it. Two modes: 1. Anchor-matching: the line's git blame commit matches a bbox-tracked tool-call anchor, returning the full session/brofile/arc/trigger chain. 2. Git-only fallback: no bbox anchor matches, returning git blame author info only, marked as non-bbox. Use this when you want to understand WHY a line exists, not just WHO wrote it.",

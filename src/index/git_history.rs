@@ -115,7 +115,16 @@ pub(super) fn index_git_history_for_project(
         edges.extend(commit_edges(root, repo_id, &commit, project_chunks)?);
     }
     stats.emitted_edges = edges.len() as u64;
-    crate::edge_index::append_project_edges(ctx.edges_dir, &project.project_id, &edges)?;
+    if ctx.force_full {
+        crate::edge_index::replace_project_edges(
+            ctx.edges_dir,
+            "git",
+            &project.project_id,
+            &edges,
+        )?;
+    } else {
+        crate::edge_index::append_project_edges(ctx.edges_dir, &project.project_id, &edges)?;
+    }
     git_meta.last_ingested_sha = Some(head);
     save_git_meta(&git_meta_path, &git_meta)?;
     ctx.meta.insert(
@@ -413,7 +422,15 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
 
-        let sidecar = fs::read_to_string(state.path().join("edges/proj1234.jsonl")).unwrap();
+        let sidecar = fs::read_to_string(
+            state
+                .path()
+                .join("edges")
+                .join("derived")
+                .join("git")
+                .join("proj1234.jsonl"),
+        )
+        .unwrap();
         assert!(sidecar.contains("COMMIT_PARENT"), "{sidecar}");
     }
 
