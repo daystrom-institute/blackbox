@@ -1,0 +1,3080 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+      
+      
+      
+      
+        <link rel="prev" href="../operating-blackbox/">
+      
+      
+        <link rel="next" href="../rule-packets/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Workflow Engine - blackbox</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#workflows" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="blackbox" class="md-header__button md-logo" aria-label="blackbox" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            blackbox
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Workflow Engine
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-hidden="true"  type="radio" name="__palette" id="__palette_0">
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-hidden="true"  type="radio" name="__palette" id="__palette_1">
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/invidious9000/transcript-search" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="blackbox" class="md-nav__button md-logo" aria-label="blackbox" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    blackbox
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/invidious9000/transcript-search" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workflow Engine
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workflow Engine
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#why-it-exists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why it exists
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tldr-shape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TL;DR shape
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#arccontext-the-universal-state-container" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ArcContext — the universal state container
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="ArcContext — the universal state container">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#templating" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Templating
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#vars-schema" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vars schema
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#packet-entity-flatten" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Packet entity flatten
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#actors" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Actors
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#capability-tags" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Capability tags
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#nodes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Nodes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hooks-and-the-op-catalog" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hooks and the op catalog
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Hooks and the op catalog">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#hook-gating" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hook gating
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#op-catalog-current" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Op catalog (current)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#worktree_create-semantics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        worktree_create semantics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#failure-semantics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure semantics
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#wait-nodes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Wait nodes
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Wait nodes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#correlation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Correlation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#resolution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Resolution
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#timeout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Timeout
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#subworkflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Subworkflows
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Subworkflows">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#inline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Inline
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#by-id" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        By id
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#imports-exports-renames" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Imports / exports / renames
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#gates-and-branch-transitions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Gates and branch transitions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#workflow-level-policy-packets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Workflow-level policy packets
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#domain-shaped-packet-refs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Domain-shaped packet refs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#inlets-webhook-poller-cron" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Inlets — webhook, poller, cron
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Inlets — webhook, poller, cron">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#webhook" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Webhook
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#extractor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extractor
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#routing-verdicts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Routing verdicts
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#start_arc-semantics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        start_arc semantics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#default-deny" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Default-deny
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#replay" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Replay
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#poller" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Poller
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cron" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cron
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#inlet-selection-cheat-sheet" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Inlet selection cheat sheet
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#whiteboards" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Whiteboards
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Whiteboards">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#spec-shape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Spec shape
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-protocol" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase protocol
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#conflict-detection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Conflict detection
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#resume-on-phase-transition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Resume on phase transition
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#persistence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Persistence
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#where-to-dispatch-what" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where to dispatch what
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#comparison-with-phaser" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Comparison with phaser
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#operator-blessed-registries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Operator-blessed registries
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#audit-and-observability" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Audit and observability
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#lifecycle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lifecycle
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#currently-implemented" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Currently implemented
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#phase-next" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase-next
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Examples
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#authoring-loops" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Authoring loops
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../rule-packets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rule Packets
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agent-system/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Agent System
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ingress-paths/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Ingress Paths
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../slack-bridge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Slack Bridge
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../irc-bridge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    IRC Bridge
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../councils-whiteboards/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Councils & Whiteboards
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#why-it-exists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why it exists
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tldr-shape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TL;DR shape
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#arccontext-the-universal-state-container" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ArcContext — the universal state container
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="ArcContext — the universal state container">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#templating" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Templating
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#vars-schema" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vars schema
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#packet-entity-flatten" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Packet entity flatten
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#actors" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Actors
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#capability-tags" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Capability tags
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#nodes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Nodes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hooks-and-the-op-catalog" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hooks and the op catalog
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Hooks and the op catalog">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#hook-gating" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hook gating
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#op-catalog-current" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Op catalog (current)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#worktree_create-semantics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        worktree_create semantics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#failure-semantics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure semantics
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#wait-nodes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Wait nodes
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Wait nodes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#correlation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Correlation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#resolution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Resolution
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#timeout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Timeout
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#subworkflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Subworkflows
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Subworkflows">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#inline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Inline
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#by-id" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        By id
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#imports-exports-renames" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Imports / exports / renames
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#gates-and-branch-transitions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Gates and branch transitions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#workflow-level-policy-packets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Workflow-level policy packets
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#domain-shaped-packet-refs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Domain-shaped packet refs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#inlets-webhook-poller-cron" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Inlets — webhook, poller, cron
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Inlets — webhook, poller, cron">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#webhook" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Webhook
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#extractor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extractor
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#routing-verdicts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Routing verdicts
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#start_arc-semantics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        start_arc semantics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#default-deny" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Default-deny
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#replay" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Replay
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#poller" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Poller
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cron" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cron
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#inlet-selection-cheat-sheet" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Inlet selection cheat sheet
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#whiteboards" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Whiteboards
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Whiteboards">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#spec-shape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Spec shape
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-protocol" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase protocol
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#conflict-detection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Conflict detection
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#resume-on-phase-transition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Resume on phase transition
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#persistence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Persistence
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#where-to-dispatch-what" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where to dispatch what
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#comparison-with-phaser" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Comparison with phaser
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#operator-blessed-registries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Operator-blessed registries
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#audit-and-observability" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Audit and observability
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#lifecycle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lifecycle
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#currently-implemented" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Currently implemented
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#phase-next" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase-next
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Examples
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#authoring-loops" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Authoring loops
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="workflows">Workflows<a class="headerlink" href="#workflows" title="Permanent link">&para;</a></h1>
+<p>Canonical reference for the blackbox workflow engine — the durable
+execution loop that lets you stitch together rule-packet decisions,
+hook side-effects, sub-arc composition, and external webhook signals
+into a deterministic state machine driven by mermaid graphs.</p>
+<blockquote>
+<p><strong>Why a separate doc.</strong> README is for the project. This is for the
+engine. If you're authoring a workflow, this is your map. If you
+just want to <em>run</em> an example, head to
+<a href="https://github.com/invidious9000/transcript-search/tree/main/examples/keystone"><code>examples/keystone/</code></a>.</p>
+</blockquote>
+<h2 id="why-it-exists">Why it exists<a class="headerlink" href="#why-it-exists" title="Permanent link">&para;</a></h2>
+<p>An LLM maintaining workflow state across turns drifts. It forgets
+phases, re-litigates settled decisions, invents new steps to paper
+over mistakes, and dies on context compaction. A daemon-driven loop
+doesn't — it has no context to forget. LLMs become stateless function
+calls dispatched <em>into</em> the loop rather than the loop's substrate.</p>
+<p>This is the same lesson Temporal, Restate, Sayiir, and Wolverine
+learned for deterministic handlers. The shape adapted here:
+<strong>checkpoint-based</strong> (LLMs are non-deterministic so replay is
+meaningless), <strong>JSON-spec-driven</strong> (specs are LLM-author-friendly),
+<strong>packet-policy-mechanized</strong> (decisions are data, not code),
+<strong>MCP-surfaced</strong> (operator commands the engine through the same
+protocol agents use).</p>
+<h2 id="tldr-shape">TL;DR shape<a class="headerlink" href="#tldr-shape" title="Permanent link">&para;</a></h2>
+<p>A workflow is one JSON file:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>{
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>  &quot;name&quot;: &quot;issue-to-merged-pr&quot;,
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>  &quot;version&quot;: 1,
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>  &quot;vars_schema&quot;: { &quot;issue_number&quot;: {&quot;kind&quot;: &quot;int&quot;, &quot;required&quot;: true}, ... },
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>  &quot;actors&quot;:  { &quot;implementer&quot;: { &quot;kind&quot;: &quot;executor&quot;, &quot;brofile&quot;: &quot;...&quot;, &quot;durable&quot;: true } },
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>  &quot;policy_packet&quot;:  &quot;domain:workflow-policy/arc-budget&quot;,
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>  &quot;on_arc_exit&quot;:    [ ... cleanup hooks ... ],
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>  &quot;on_arc_cancel&quot;:  [ ... compensating hooks ... ],
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>  &quot;start&quot;: &quot;Setup&quot;,
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>  &quot;nodes&quot;: {
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    &quot;Setup&quot;:     { &quot;actor&quot;: &quot;&quot;, &quot;on_enter&quot;: [ ... ],
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>                   &quot;next&quot;: { &quot;type&quot;: &quot;goto&quot;, &quot;to&quot;: &quot;Implement&quot; } },
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    &quot;Implement&quot;: { &quot;subworkflow_ref&quot;: &quot;implementer-arc&quot;,
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>                   &quot;imports&quot;: [&quot;issue_number&quot;,&quot;owner&quot;,&quot;repo&quot;],
+<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>                   &quot;exports&quot;: [&quot;pr_number&quot;,&quot;branch&quot;],
+<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>                   &quot;next&quot;: { &quot;type&quot;: &quot;goto&quot;, &quot;to&quot;: &quot;Wait&quot; } },
+<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>    &quot;Wait&quot;:      { &quot;wait&quot;: { &quot;any_of&quot;: [{&quot;signal&quot;:&quot;pr-merged&quot;,
+<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>                                          &quot;correlate&quot;:{&quot;pr&quot;:{&quot;kind&quot;:&quot;json_path&quot;,&quot;path&quot;:&quot;vars.pr_number&quot;}}}],
+<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>                              &quot;timeout&quot;: &quot;24h&quot; },
+<a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a>                   &quot;gate&quot;: &quot;domain:workflow-gate/merge-or-review&quot;,
+<a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a>                   &quot;next&quot;: { &quot;type&quot;: &quot;branch&quot;,
+<a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>                             &quot;cases&quot;: { &quot;merged&quot;: &quot;Done&quot;, &quot;ready&quot;: &quot;Done&quot; } } },
+<a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a>    &quot;Done&quot;:      { &quot;actor&quot;: &quot;&quot;, &quot;next&quot;: { &quot;type&quot;: &quot;terminal&quot; } }
+<a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a>  }
+<a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a>}
+</code></pre></div>
+<p>The metadata declares <code>actors</code>, <code>nodes</code>, <code>vars_schema</code>, <code>policy_packet</code>,
+and arc-level hooks. Control flow lives on each node as a typed <code>next</code>
+clause (<code>goto</code> / <code>branch</code> / <code>fork</code> / <code>terminal</code>); top-level <code>start</code>
+names the entry node. The daemon validates every transition target,
+every actor reference, every late_inject source, and every node's
+reachability from <code>start</code> before any dispatch fires. The canonical
+JSON Schema is at <code>schema/workflow.schema.json</code>.</p>
+<h2 id="arccontext-the-universal-state-container">ArcContext — the universal state container<a class="headerlink" href="#arccontext-the-universal-state-container" title="Permanent link">&para;</a></h2>
+<p>Every node, hook, gate, policy packet, and webhook routing decision
+sees the same JSON-shaped state, called the <strong>ArcContext</strong>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>{
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>  &quot;vars&quot;:        { ... user-set, hook-writable, schema-validated ... },
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>  &quot;outputs&quot;:     { &quot;NodeName&quot;: &lt;value&gt;, ... immutable per node ... },
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>  &quot;meta&quot;:        { &quot;arc_id&quot;, &quot;workflow_name&quot;, &quot;workflow_version&quot;,
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>                   &quot;started_at&quot;, &quot;project_dir&quot;, &quot;worktree&quot;,
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>                   &quot;arc_outcome&quot;, &quot;parent_arc_id&quot;, &quot;composition_depth&quot; },
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>  &quot;last_signal&quot;: { &quot;name&quot;, &quot;payload&quot;, &quot;correlation&quot;, &quot;received_at&quot; }?,
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>  &quot;signal_history&quot;: [ ... append-only ... ]
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>}
+</code></pre></div>
+<h3 id="templating">Templating<a class="headerlink" href="#templating" title="Permanent link">&para;</a></h3>
+<p>Anywhere a string is interpreted as a template (<code>prompt</code>, hook <code>args</code>,
+correlation values), <code>${path.into.context}</code> resolves against this shape:</p>
+<table>
+<thead>
+<tr>
+<th>Template form</th>
+<th>Resolves to</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>${vars.x}</code></td>
+<td><code>vars["x"]</code></td>
+</tr>
+<tr>
+<td><code>${vars.list.0}</code></td>
+<td><code>vars["list"][0]</code> (array indexing)</td>
+</tr>
+<tr>
+<td><code>${outputs.NodeName}</code></td>
+<td>output of <code>NodeName</code> (raw)</td>
+</tr>
+<tr>
+<td><code>${outputs.NodeName.field.subfield}</code></td>
+<td>nested JSON traversal</td>
+</tr>
+<tr>
+<td><code>${meta.arc_id}</code> / <code>${meta.worktree}</code></td>
+<td>arc-intrinsic metadata</td>
+</tr>
+<tr>
+<td><code>${last_signal.name}</code></td>
+<td>which Wait signal just resolved</td>
+</tr>
+<tr>
+<td><code>${last_signal.payload.x}</code></td>
+<td>resolved-signal payload field</td>
+</tr>
+<tr>
+<td><code>${NodeName.output}</code> (legacy)</td>
+<td>same as <code>${outputs.NodeName}</code></td>
+</tr>
+</tbody>
+</table>
+<p>Whole-string templates resolve as their <strong>typed value</strong> (a <code>${vars.n}</code>
+where <code>vars.n == 42</code> becomes the integer 42 in a hook arg). Mixed
+strings stringify (<code>"issue-${vars.n}"</code> → <code>"issue-42"</code>).</p>
+<p>Unresolved expressions are left in place verbatim — <code>${vars.does_not_exist}</code>
+shows up as the literal string in the dispatched prompt rather than
+silently becoming the empty string. Misspellings are loud.</p>
+<h3 id="vars-schema">Vars schema<a class="headerlink" href="#vars-schema" title="Permanent link">&para;</a></h3>
+<p>Optional <code>vars_schema</code> declares per-key kind and required-ness:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>&quot;vars_schema&quot;: {
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>  &quot;issue_number&quot;:  { &quot;kind&quot;: &quot;int&quot;,    &quot;required&quot;: true },
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>  &quot;branch&quot;:        { &quot;kind&quot;: &quot;string&quot;, &quot;required&quot;: false },
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>  &quot;labels&quot;:        { &quot;kind&quot;: &quot;array&quot; },
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>  &quot;metadata&quot;:      { &quot;kind&quot;: &quot;object&quot; }
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>}
+</code></pre></div>
+<p>Kinds: <code>bool</code> / <code>int</code> / <code>float</code> / <code>string</code> / <code>array</code> / <code>object</code> /
+<code>any</code>. Hook writes (<code>SetVar</code>, <code>IncVar</code>, <code>MergeVar</code>, <code>ParseJson</code>,
+<code>HttpJson</code> with <code>into_var</code>) are kind-validated against the schema —
+mismatches fail at write time, not later. <code>required: true</code> keys are
+enforced at arc start (initial vars), at sub-arc start (imports), and
+at terminal state (exports). Unknown keys are accepted (open schema
+by design — explicit <code>required</code> fields are how you lock down the
+surface).</p>
+<h3 id="packet-entity-flatten">Packet entity flatten<a class="headerlink" href="#packet-entity-flatten" title="Permanent link">&para;</a></h3>
+<p>When a packet evaluates against the ArcContext (gates, hook <code>when</code>,
+policy packets, webhook routing), the engine flattens to:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>{
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>  &quot;vars&quot;:    { ... },
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>  &quot;outputs&quot;: { ... },
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>  &quot;meta&quot;:    { ... },
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>  &quot;last_signal&quot;: { ... }?,
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>  &quot;node_output&quot;:      &quot;&lt;just-completed node&#39;s output as string&gt;&quot;,
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>  &quot;node_output_json&quot;: &lt;raw&gt;,
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>  &quot;node_id&quot;:          &quot;&lt;just-completed node id&gt;&quot;
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>}
+</code></pre></div>
+<p>Predicate paths support dotted resolution — <code>vars.issue_number</code>,
+<code>outputs.Plan.branch</code>, <code>last_signal.name</code>. Array elements via numeric
+indices: <code>vars.labels.0</code>. Quantified predicates work too:
+<code>Exists{path:"vars.labels[*]", pred:Eq{field:"$", value:"bug"}}</code>.</p>
+<h2 id="actors">Actors<a class="headerlink" href="#actors" title="Permanent link">&para;</a></h2>
+<p>Declared in the workflow's <code>actors</code> map and referenced by node specs.
+Two kinds.</p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>executor</code></td>
+<td>Single bro dispatched via <code>bro_exec</code> / <code>bro_resume</code>. Used for every single-bro role the workflow declares — implementer, fixer, triager, planner, facilitator, advisor, aggregator, synthesizer, reviewer, etc. The brofile + prompt carry the persona.</td>
+</tr>
+<tr>
+<td><code>ensemble</code></td>
+<td>Team broadcast: every member runs the same prompt; output is the labeled concatenation. When the node has an associated whiteboard (see §Whiteboards), each member's STRICT-JSON output is also auto-postable via <code>whiteboard_post</code> from inside the dispatched turn.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Why only two kinds.</strong> Earlier iterations had <code>advisor</code>, <code>planner</code>,
+<code>triager</code>, <code>user</code> as marker types. They didn't pull engine weight —
+mechanically each was identical to <code>executor</code>, and the marker was
+never enforced. Persona / role / contract is a workflow-author concern
+carried by the brofile lens + prompt + on_exit <code>parse_json</code>
+validation. Engine vocabulary describes <em>dispatch shape</em>, not roles.</p>
+<p><strong>Human-in-the-loop without a <code>user</code> actor.</strong> When a workflow needs
+human input — operator approval, external Claude weighing in,
+ntfy-routed acknowledgement — the pattern is: open a whiteboard,
+register the human as an <code>operator</code> role, suspend the arc on a
+<code>board-transitioned</code> signal correlated to <code>(board_id, target_phase)</code>.
+The human (or their Claude session, or a slack/ntfy adapter) calls
+<code>whiteboard_post</code> / <code>whiteboard_vote</code> / <code>whiteboard_transition</code>
+through the same MCP surface in-workflow specialists use. No special
+"user" type. See §Whiteboards.</p>
+<p>For hook-only / pure-routing nodes (Setup / Done patterns where the
+work is on_enter / on_exit hooks and there's no LLM dispatch), leave
+the node's <code>actor</code> field empty (<code>""</code>). The validator only complains
+when a non-empty actor name fails to resolve. Hook-only nodes still
+fire hooks, capture their rendered <code>prompt</code> as the node output (so
+<code>${NodeName.output}</code> references stay legal), and follow <code>next</code>.</p>
+<p>Per-actor fields:</p>
+<ul>
+<li><code>brofile</code> — single-bro target (executor / advisor)</li>
+<li><code>team</code> — ensemble target</li>
+<li><code>durable: true</code> — reuse the same session across every node that
+  invokes this actor; the engine threads the session id through
+  <code>bro_resume</code> automatically. Critical for the implementer that has
+  to address feedback after initial PR.</li>
+<li><code>compaction_anchor: true</code> — the actor contributes a rolling summary
+  to the arc's work_item thread at every boundary, so an orchestrator
+  swap-out doesn't lose strategic memory.</li>
+<li><code>requires: [Capability, ...]</code> — see Capability tags below.</li>
+</ul>
+<h2 id="capability-tags">Capability tags<a class="headerlink" href="#capability-tags" title="Permanent link">&para;</a></h2>
+<p>Mirrors daystrom's <code>CapabilityTag</code> shape. Hard-fail at compile rather
+than silent route-around.</p>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Provider availability</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>structured_output</code></td>
+<td>Claude (extension), Codex (<code>--output-schema</code>); NOT Gemini CLI</td>
+</tr>
+<tr>
+<td><code>vision</code></td>
+<td>Claude, Gemini</td>
+</tr>
+<tr>
+<td><code>long_context</code></td>
+<td>Claude (1M); promote to model-keyed when smaller variants matter</td>
+</tr>
+<tr>
+<td><code>tool_use</code></td>
+<td>All except Vibe</td>
+</tr>
+<tr>
+<td><code>resume</code></td>
+<td>All except Vibe and Gemini</td>
+</tr>
+</tbody>
+</table>
+<p>Declare on the actor:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>&quot;actors&quot;: {
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>  &quot;structured_review&quot;: {
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    &quot;kind&quot;: &quot;ensemble&quot;,
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    &quot;team&quot;: &quot;review-team&quot;,
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    &quot;requires&quot;: [&quot;structured_output&quot;]
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>  }
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>}
+</code></pre></div>
+<p><code>bro_orchestrate_run</code> (and the <code>bro_workflow_install</code> + webhook-routing
+<code>start_arc</code> paths) walk every actor's brofile / team-member brofiles,
+resolve to provider, check capability coverage. First missing
+capability is a compile error with the offending actor + provider
+named. Sub-workflows are recursively validated.</p>
+<h2 id="nodes">Nodes<a class="headerlink" href="#nodes" title="Permanent link">&para;</a></h2>
+<p>A node declares the unit of work. Fields:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>actor</code></td>
+<td>Which actor runs this node (mutually exclusive with <code>subworkflow*</code> and <code>wait</code>).</td>
+</tr>
+<tr>
+<td><code>prompt</code></td>
+<td>Template (rendered against ArcContext).</td>
+</tr>
+<tr>
+<td><code>gate</code></td>
+<td>Packet id; verdict drives next-node selection at choice nodes.</td>
+</tr>
+<tr>
+<td><code>gate_mode</code></td>
+<td><code>first</code> (one verdict, default) or <code>all</code> (multi-finding aggregate).</td>
+</tr>
+<tr>
+<td><code>mode</code></td>
+<td><code>sync</code> (default) or <code>fire_and_forget</code>.</td>
+</tr>
+<tr>
+<td><code>retry</code></td>
+<td><code>{max_generations: N}</code> — visit-count ceiling.</td>
+</tr>
+<tr>
+<td><code>late_inject</code></td>
+<td><code>{from: NodeId, policy: "resume_on_return"}</code> — fold an async source into this node at its entry.</td>
+</tr>
+<tr>
+<td><code>subworkflow</code></td>
+<td>Inline <code>Workflow</code> spec (mutually exclusive with <code>subworkflow_ref</code>).</td>
+</tr>
+<tr>
+<td><code>subworkflow_ref</code></td>
+<td>Workflow id resolved from the registry at dispatch time.</td>
+</tr>
+<tr>
+<td><code>imports</code></td>
+<td>Vars to copy from parent into the sub's fresh ArcContext (subworkflow nodes only).</td>
+</tr>
+<tr>
+<td><code>exports</code></td>
+<td>Vars to promote back to parent on sub completion (missing exports = runtime error).</td>
+</tr>
+<tr>
+<td><code>import_renames</code></td>
+<td><code>{ local_name: "parent.path.expression" }</code> — Extractor-style projection from parent context into sub.</td>
+</tr>
+<tr>
+<td><code>on_enter</code></td>
+<td>Hook ops fired BEFORE actor dispatch / sub descent / Wait registration.</td>
+</tr>
+<tr>
+<td><code>on_exit</code></td>
+<td>Hook ops fired AFTER body returns, BEFORE the gate evaluates. Lets <code>ParseJson</code> normalize output the gate sees.</td>
+</tr>
+<tr>
+<td><code>wait</code></td>
+<td><code>WaitSpec</code> — suspend the arc on a signal. Mutually exclusive with <code>actor</code> + <code>subworkflow*</code>.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="hooks-and-the-op-catalog">Hooks and the op catalog<a class="headerlink" href="#hooks-and-the-op-catalog" title="Permanent link">&para;</a></h2>
+<p>Hooks are guarded side effects that fire at lifecycle boundaries:</p>
+<table>
+<thead>
+<tr>
+<th>Lifecycle slot</th>
+<th>When fires</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>node.on_enter</code></td>
+<td>Before actor dispatch / Wait registration / subworkflow descent.</td>
+</tr>
+<tr>
+<td><code>node.on_exit</code></td>
+<td>After actor body returns, BEFORE the gate.</td>
+</tr>
+<tr>
+<td><code>workflow.on_arc_exit</code></td>
+<td>At terminal state (success, fail, cancel, timeout).</td>
+</tr>
+<tr>
+<td><code>workflow.on_arc_cancel</code></td>
+<td>ONLY when arc is cancelled. Runs BEFORE on_arc_exit.</td>
+</tr>
+</tbody>
+</table>
+<p>Each hook is one declaration:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>{
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>  &quot;op&quot;: &quot;set_var&quot;,
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>  &quot;args&quot;: { &quot;key&quot;: &quot;branch&quot;, &quot;value&quot;: &quot;fix/issue-${vars.issue_number}&quot; },
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>  &quot;when&quot;: &quot;domain:workflow-cleanup/keep-on-fail&quot;,   // optional packet gate
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>  &quot;on_failure&quot;: &quot;halt&quot;,                              // halt | warn | ignore
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>  &quot;into_var&quot;: &quot;result_key&quot;                           // for ops that produce a value
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>}
+</code></pre></div>
+<h3 id="hook-gating">Hook gating<a class="headerlink" href="#hook-gating" title="Permanent link">&para;</a></h3>
+<p>A hook's <code>when</code> references a packet. The packet evaluates against the
+flattened ArcContext. The hook fires only if the packet's verdict is in
+the operator-blessed allow set: <code>allow</code>, <code>pass</code>, <code>proceed</code>, <code>fire</code>,
+<code>ok</code>, <code>delete</code>, <code>keep</code>, <code>yes</code>, <code>true</code>. Unknown verdicts (e.g. <code>flag</code>,
+<code>manual</code>) do NOT permit firing — conservative on purpose.</p>
+<h3 id="op-catalog-current">Op catalog (current)<a class="headerlink" href="#op-catalog-current" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Op</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>set_var</code></td>
+<td>Write <code>vars[key] = value</code> (schema-validated).</td>
+</tr>
+<tr>
+<td><code>inc_var</code></td>
+<td>Increment integer var (default delta 1).</td>
+</tr>
+<tr>
+<td><code>append_var</code></td>
+<td>Append to array var.</td>
+</tr>
+<tr>
+<td><code>merge_var</code></td>
+<td>Merge object into object var.</td>
+</tr>
+<tr>
+<td><code>parse_json</code></td>
+<td>Parse a string-shaped value into JSON; strips <code>```json</code> fences.</td>
+</tr>
+<tr>
+<td><code>shell</code></td>
+<td>Sandboxed shell command (gated via packet policy in v-next; today reads <code>cwd</code> from <code>meta.worktree</code>).</td>
+</tr>
+<tr>
+<td><code>worktree_create</code></td>
+<td><code>git worktree add</code> with smart branch reuse (see below).</td>
+</tr>
+<tr>
+<td><code>worktree_remove</code></td>
+<td><code>git worktree remove</code>; idempotent on missing path. No <code>rm -rf</code> fallback — surfaces git's error if the path is not a git-tracked worktree.</td>
+</tr>
+<tr>
+<td><code>set_meta</code></td>
+<td>Update <code>meta.worktree</code> directly (only mutable meta field today).</td>
+</tr>
+<tr>
+<td><code>http_json</code></td>
+<td>Generic HTTP request → response into_var. Workflow author composes URL/headers/body using <code>${env.X}</code> + <code>${vars.X}</code> templates to express any code-host integration without baking platform-specific ops into the engine. <code>response_kind</code>: <code>json</code> (default — parse, error on non-JSON), <code>text</code> (capture body as-is, e.g. for <code>.diff</code> URLs), or <code>auto</code> (try JSON, fall back to text). <code>expect_status</code>: optional override of the default 2xx success window.</td>
+</tr>
+<tr>
+<td><code>find_first</code></td>
+<td>Find the first element of an array variable whose nested fields all equal the targets in <code>where</code>, write into_var. Writes <code>Value::Null</code> (not Err) when no match — downstream <code>IsNull</code> / <code>IsNonNull</code> packets branch cleanly. Composable primitive for "find existing PR for this branch" / "find label by name" without baking platform-specific search ops or relying on upstream API filters that may be broken. <code>where</code> keys use dotted paths (e.g. <code>head.ref</code>).</td>
+</tr>
+<tr>
+<td><code>mcp_call</code></td>
+<td>Outbound MCP tool call — sibling of <code>http_json</code> but speaking MCP JSON-RPC. Resolves <code>args.server</code> against the existing <code>bro_mcp</code> registry (global <code>~/.bro/mcp.json</code> + project overlay), opens a transient client (stdio child-process or streamable HTTP), invokes <code>args.tool</code> with <code>args.arguments</code>, captures the result into <code>vars[into_var]</code>. Tool errors (<code>is_error: true</code>) become op failures so <code>on_failure</code> fires. Result normalization preserves typing when <code>structured_content</code> is present, falls back to JSON-parsed text content otherwise. Args: <code>{server, tool, arguments?, timeout_secs?}</code> (default 300s). Use for engine-level grounding calls — <code>sast_run</code> / <code>sast_findings</code> against biofilter, <code>bbox_thread</code> / <code>bbox_note</code> against blackbox-self — instead of dispatching a bro just to make a tool call.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="worktree_create-semantics"><code>worktree_create</code> semantics<a class="headerlink" href="#worktree_create-semantics" title="Permanent link">&para;</a></h3>
+<p>Three real cases the op handles:</p>
+<ol>
+<li><strong>Branch absent</strong> → <code>git worktree add -b &lt;branch&gt; &lt;path&gt; &lt;base&gt;</code> (fresh).</li>
+<li><strong>Branch present, no worktree references it</strong> → <code>git worktree add &lt;path&gt; &lt;branch&gt;</code> (REUSE — common after a prior arc died with <code>cleanup-policy=keep-on-fail</code>).</li>
+<li><strong>Branch present AND another worktree has it checked out</strong> → fail loudly with the occupant path. Suggests including <code>${meta.arc_id}</code> in the branch name for concurrent-arc-safe naming.</li>
+</ol>
+<h3 id="failure-semantics">Failure semantics<a class="headerlink" href="#failure-semantics" title="Permanent link">&para;</a></h3>
+<p><code>on_failure</code> per hook decides what an op error means:</p>
+<ul>
+<li><code>halt</code> (default) — abort the arc with the op's error.</li>
+<li><code>warn</code> — log + write a <code>surprise</code> note on the arc thread, continue.</li>
+<li><code>ignore</code> — log only, continue.</li>
+</ul>
+<p>Hooks cannot change which next node runs — that authority stays with
+the gate packet. Hooks are guarded <em>side effects</em>, not control flow.
+If you need conditional branching, that's a node + gate.</p>
+<h2 id="wait-nodes">Wait nodes<a class="headerlink" href="#wait-nodes" title="Permanent link">&para;</a></h2>
+<p><code>WaitSpec</code> suspends the arc until one of <code>any_of</code> signals arrives or
+the timeout fires.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>&quot;AwaitFeedbackOrMerge&quot;: {
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>  &quot;wait&quot;: {
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>    &quot;any_of&quot;: [
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>      { &quot;signal&quot;: &quot;pr-feedback&quot;, &quot;correlate&quot;: { &quot;pr&quot;: &quot;${vars.pr_number}&quot; } },
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>      { &quot;signal&quot;: &quot;pr-merged&quot;,   &quot;correlate&quot;: { &quot;pr&quot;: &quot;${vars.pr_number}&quot; } }
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>    ],
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>    &quot;timeout&quot;: &quot;7d&quot;
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>  },
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>  &quot;gate&quot;: &quot;domain:workflow-gate/loop-or-exit&quot;
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>}
+</code></pre></div>
+<h3 id="correlation">Correlation<a class="headerlink" href="#correlation" title="Permanent link">&para;</a></h3>
+<p>Each <code>WaitSignal.correlate</code> is a tuple of key → Extractor-Selector
+expressions evaluated against the <strong>current</strong> ArcContext at Wait
+registration. The canonical form (sorted JSON keys) is the second
+component of the <code>(signal_name, correlation) → (arc_id, wait_id)</code>
+index in the daemon's <code>WaitStore</code>. When a signal arrives, the router
+walks pending waits whose <code>correlate</code> is a subset-match against the
+signal's payload-correlation map. <strong>Empty correlation = broadcast</strong>:
+matches anything that signals the same name.</p>
+<h3 id="resolution">Resolution<a class="headerlink" href="#resolution" title="Permanent link">&para;</a></h3>
+<p>When a matching signal arrives:</p>
+<ol>
+<li>The router pops the first-matching wait from the store.</li>
+<li>Writes a <code>SignalRef { name, payload, correlation, received_at }</code>
+   into the wait's resolved-slot.</li>
+<li>Wakes the arc via the wait's <code>Notify</code>.</li>
+<li>Sibling waits in the same <code>any_of</code> are removed from the store
+   (race-loser cleanup — only the first signal wins).</li>
+</ol>
+<p>The arc resumes, populates <code>ctx.last_signal</code> + appends to
+<code>signal_history</code>, and proceeds to the gate (which can branch on
+<code>last_signal.name</code>, <code>last_signal.payload.*</code>, etc.).</p>
+<h3 id="timeout">Timeout<a class="headerlink" href="#timeout" title="Permanent link">&para;</a></h3>
+<p>If <code>timeout</code> fires before any signal:</p>
+<ol>
+<li>All sibling waits are removed.</li>
+<li>A synthetic signal is recorded:
+   <code>SignalRef { name: "__timeout__", payload: { expired: ["sig1", "sig2"] } }</code>.</li>
+<li>Gate evaluates as normal (route via <code>Eq{field: "last_signal.name", value: "__timeout__"}</code>).</li>
+</ol>
+<p><code>timeout</code> accepts <code>30s</code>, <code>5m</code>, <code>1h</code>, <code>7d</code> — any decimal followed by a
+unit suffix. Absent timeout = wait indefinitely (suitable for
+never-firing-but-cancellable arcs).</p>
+<h2 id="subworkflows">Subworkflows<a class="headerlink" href="#subworkflows" title="Permanent link">&para;</a></h2>
+<p>Two ways to compose a subworkflow into a node:</p>
+<h3 id="inline">Inline<a class="headerlink" href="#inline" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>&quot;Implement&quot;: {
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>  &quot;subworkflow&quot;: { &quot;name&quot;: &quot;...&quot;, &quot;version&quot;: 1, &quot;actors&quot;: { ... }, ... },
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>  &quot;imports&quot;: [&quot;issue_number&quot;],
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>  &quot;exports&quot;: [&quot;pr_number&quot;]
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>}
+</code></pre></div>
+<p>The full sub-spec is embedded. Compiled at parent compile time
+(errors surface immediately).</p>
+<h3 id="by-id">By id<a class="headerlink" href="#by-id" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>&quot;Implement&quot;: {
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>  &quot;subworkflow_ref&quot;: &quot;implementer-arc&quot;,
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>  &quot;imports&quot;: [&quot;issue_number&quot;],
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>  &quot;exports&quot;: [&quot;pr_number&quot;]
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>}
+</code></pre></div>
+<p>Resolved at <strong>dispatch</strong> time against the daemon's workflow registry.
+Lets the same sub be referenced multiple times (e.g. keystone calls
+<code>implementer-arc</code> once for initial impl, calls a peer
+<code>implementer-feedback-arc</code> later for revisions) without inlining the
+spec twice. Install the referenced workflow with <code>bro_workflow_install</code>
+or POST <code>/admin/workflow/install</code>.</p>
+<h3 id="imports-exports-renames">Imports / exports / renames<a class="headerlink" href="#imports-exports-renames" title="Permanent link">&para;</a></h3>
+<p>The sub gets its own fresh ArcContext. <code>imports</code> copies parent vars
+in by name. <code>import_renames</code> is for the cases where the parent's
+shape doesn't match the sub's expected names:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>&quot;RunInner&quot;: {
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>  &quot;subworkflow_ref&quot;: &quot;issue-to-merged-pr&quot;,
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>  &quot;imports&quot;: [&quot;repo&quot;, &quot;owner&quot;],
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>  &quot;import_renames&quot;: { &quot;issue_number&quot;: &quot;next_issue.0.number&quot; }
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>}
+</code></pre></div>
+<p>Right-hand side is an Extractor path (dotted). Evaluated against the
+parent's ArcContext flatten.</p>
+<p><code>exports</code> declares which sub vars get promoted back into the parent
+on sub completion. <strong>Missing exports are a runtime error</strong> — if you
+declare <code>exports: ["pr_number"]</code> and the sub never sets <code>vars.pr_number</code>,
+the parent fails. This is the contract.</p>
+<p><code>meta.parent_arc_id</code> propagates so audit walks back up the call tree.
+Composition depth is capped at <code>MAX_COMPOSITION_DEPTH = 5</code>; exceeding
+errors out at the offending nest.</p>
+<h2 id="gates-and-branch-transitions">Gates and branch transitions<a class="headerlink" href="#gates-and-branch-transitions" title="Permanent link">&para;</a></h2>
+<p>A gate packet runs after the node body, against the flattened
+ArcContext (with <code>node_output</code> exposed at the top level for legacy
+rules). The classification becomes the verdict; the same node's
+<code>next.branch.cases</code> selects the target whose key matches.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>{
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>  &quot;Decide&quot;: {
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>    &quot;actor&quot;: &quot;worker&quot;,
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>    &quot;prompt&quot;: &quot;...&quot;,
+<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>    &quot;gate&quot;: &quot;packet-decide&quot;,
+<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>    &quot;next&quot;: {
+<a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a>      &quot;type&quot;: &quot;branch&quot;,
+<a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a>      &quot;cases&quot;: { &quot;yes&quot;: &quot;Yes&quot;, &quot;no&quot;: &quot;No&quot; },
+<a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a>      &quot;default&quot;: &quot;No&quot;      // optional fallback for unmatched verdicts
+<a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a>    }
+<a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a>  },
+<a id="__codelineno-10-12" name="__codelineno-10-12" href="#__codelineno-10-12"></a>  &quot;Yes&quot;: { &quot;actor&quot;: &quot;worker&quot;, &quot;next&quot;: { &quot;type&quot;: &quot;terminal&quot; } },
+<a id="__codelineno-10-13" name="__codelineno-10-13" href="#__codelineno-10-13"></a>  &quot;No&quot;:  { &quot;actor&quot;: &quot;worker&quot;, &quot;next&quot;: { &quot;type&quot;: &quot;terminal&quot; } }
+<a id="__codelineno-10-14" name="__codelineno-10-14" href="#__codelineno-10-14"></a>}
+</code></pre></div>
+<p>Two modes:</p>
+<ul>
+<li><code>gate_mode: "first"</code> (default) — first-matching rule wins, single verdict.</li>
+<li><code>gate_mode: "all"</code> — every matching rule fires, aggregate verdict is
+  the lattice-highest-priority classification across all findings.
+  Findings are surfaced as a <code>learned</code> note on the arc thread and
+  exposed via <code>bro orchestrate status</code>.</li>
+</ul>
+<p>Back-edges in the graph become natural retry loops. Each visit bumps
+<code>visit_counts[node]</code>; exceeding <code>retry.max_generations</code> halts the
+arc. Retried prompts get <code>[retry — attempt N, prior gate verdict: X]</code>
+prepended automatically.</p>
+<h2 id="workflow-level-policy-packets">Workflow-level policy packets<a class="headerlink" href="#workflow-level-policy-packets" title="Permanent link">&para;</a></h2>
+<p><code>policy_packet: &lt;id&gt;</code> runs at every node boundary against the
+flattened ArcContext (with arc-shape additions: <code>step</code>, <code>just_ran</code>,
+<code>next</code>, <code>completed</code>, <code>in_flight</code>, <code>visit_counts</code>). Classifications
+are arc-level verdicts:</p>
+<ul>
+<li><code>halt</code> — stop the arc immediately (error exit, reason posted to thread).</li>
+<li><code>escalate</code> — write a <code>blocked</code> note, continue.</li>
+<li><code>warn</code> — write a <code>surprise</code> note, continue.</li>
+<li>anything else — no-op.</li>
+</ul>
+<p>This is the mechanization of the advisor loop: instead of dispatching
+an LLM at every boundary to read the checkpoint and judge, compile
+those rules into a packet once and let them evaluate deterministically.
+Useful for runaway-visit detectors, time / step ceilings, arc-shape
+invariants.</p>
+<h2 id="domain-shaped-packet-refs">Domain-shaped packet refs<a class="headerlink" href="#domain-shaped-packet-refs" title="Permanent link">&para;</a></h2>
+<p>Anywhere a workflow names a packet (<code>gate</code>, <code>policy_packet</code>,
+<code>hook.when</code>, <code>webhook.routing_packet</code>), accept either:</p>
+<ul>
+<li><code>packet-XXXXXXXX</code> — pinned exact compile.</li>
+<li><code>domain:&lt;name&gt;</code> — resolves to the most-recently-compiled packet
+  matching <code>&lt;name&gt;</code>.</li>
+</ul>
+<p>Domain refs let workflow + webhook specs survive packet recompiles
+without re-edit. Audit events name the resolved <code>packet-id</code> so you
+always know which compile actually fired.</p>
+<h2 id="inlets-webhook-poller-cron">Inlets — webhook, poller, cron<a class="headerlink" href="#inlets-webhook-poller-cron" title="Permanent link">&para;</a></h2>
+<p>Three inlet primitives, all converging on the same dispatch pipeline:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>&lt;inlet emits a flat entity&gt;
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>  → extractor.project(payload)       [JSON → flat entity]
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>  → routing_packet.apply(entity)     [verdict]
+<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>  → routing::resolve_entity_template [substitute ${entity.X} with typed values]
+<a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>  → RoutingVerdict::parse            [typed verdict]
+<a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>  → dispatch_verdict(...)            [start_arc | signal_arc | cancel_arc | ignore | dead_letter]
+</code></pre></div>
+<p>The shared dispatch path is <code>crate::dispatch_routed_event</code>. Routing
+rules don't know which inlet fed them — they see a flat entity and a
+routing-packet id, the rest is the engine's problem. Pick the inlet
+that matches your trigger source:</p>
+<table>
+<thead>
+<tr>
+<th>Inlet</th>
+<th>Trigger source</th>
+<th>Spec lives in</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Webhook</td>
+<td>External HTTP POST + signature</td>
+<td><code>webhooks/&lt;name&gt;.json</code></td>
+<td>Upstream pushes to you (Forgejo / GitHub / Stripe / generic JSON). Lower latency than polling, but needs ingress.</td>
+</tr>
+<tr>
+<td>Poller</td>
+<td>Scheduled HTTP fetch (data rides on the tick)</td>
+<td><code>pollers/&lt;name&gt;.json</code></td>
+<td>Upstream is poll-only OR you have no public ingress. Carries an <code>HttpFetchSpec</code> + optional <code>iterate</code> for array responses + dedup ring.</td>
+</tr>
+<tr>
+<td>Cron</td>
+<td>Calendar / clock (no fetch — entity is operator-supplied <code>payload</code>)</td>
+<td><code>crons/&lt;name&gt;.json</code></td>
+<td>Trigger is time-based, not event-based. Nightly maintenance, hourly sweeps, scheduled SAST squashing. The dispatched arc does its own data acquisition (typically via <code>mcp_call</code> hooks). Concurrency cap (default 1) skips ticks while a prior arc is still in flight.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="webhook">Webhook<a class="headerlink" href="#webhook" title="Permanent link">&para;</a></h3>
+<p>Webhooks are operator-installed (signature scheme + Extractor +
+routing packet). The pipeline:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>HTTP POST /webhook/&lt;name&gt;
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>  → verify_signature(secret)         [HmacSha256 (configurable header
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>                                       + optional `prefix=`) | None
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>                                       (loopback-bind only)]
+<a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>  → idempotency dedup                [delivery-id ring per webhook]
+<a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a>  → extractor.project(payload)       [JSON → flat entity]
+<a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a>  → routing_packet.apply(entity)     [verdict]
+<a id="__codelineno-12-8" name="__codelineno-12-8" href="#__codelineno-12-8"></a>  → dispatch_verdict(...)            [start_arc | signal_arc | cancel_arc | ignore | dead_letter]
+</code></pre></div>
+<h3 id="extractor">Extractor<a class="headerlink" href="#extractor" title="Permanent link">&para;</a></h3>
+<p>Tiny AST that projects a webhook payload (plus <code>_headers</code> map for
+header-driven routing — operator names the header in their extractor;
+the engine doesn't know the sender) into a flat entity:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>&quot;extractor&quot;: {
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>  &quot;outputs&quot;: {
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>    &quot;event&quot;:  { &quot;kind&quot;: &quot;json_path&quot;, &quot;path&quot;: &quot;$._headers.x-gitea-event&quot; },
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>    &quot;action&quot;: { &quot;kind&quot;: &quot;json_path&quot;, &quot;path&quot;: &quot;$.action&quot; },
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    &quot;issue_number&quot;: {
+<a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>      &quot;kind&quot;: &quot;default&quot;,
+<a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a>      &quot;inner&quot;: { &quot;kind&quot;: &quot;json_path&quot;, &quot;path&quot;: &quot;$.issue.number&quot; },
+<a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a>      &quot;fallback&quot;: null
+<a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a>    },
+<a id="__codelineno-13-10" name="__codelineno-13-10" href="#__codelineno-13-10"></a>    &quot;owner&quot;:  { &quot;kind&quot;: &quot;json_path&quot;, &quot;path&quot;: &quot;$.repository.owner.login&quot; },
+<a id="__codelineno-13-11" name="__codelineno-13-11" href="#__codelineno-13-11"></a>    &quot;repo&quot;:   { &quot;kind&quot;: &quot;json_path&quot;, &quot;path&quot;: &quot;$.repository.name&quot; }
+<a id="__codelineno-13-12" name="__codelineno-13-12" href="#__codelineno-13-12"></a>  }
+<a id="__codelineno-13-13" name="__codelineno-13-13" href="#__codelineno-13-13"></a>}
+</code></pre></div>
+<p>Selector kinds: <code>json_path</code>, <code>const</code>, <code>default { inner, fallback }</code>,
+<code>concat { parts: [...] }</code>, <code>coalesce { sources: [...] }</code> (first
+non-null wins; lets one extractor field cover divergent payload
+shapes — e.g. Forgejo's <code>pull_request_review</code> puts the comment text
+at <code>.review.body</code> while <code>pull_request_review_comment</code> uses
+<code>.comment.body</code>). Deliberately small — no transformations (regex,
+case folding, math). Those belong in packet predicates or downstream
+nodes.</p>
+<h3 id="routing-verdicts">Routing verdicts<a class="headerlink" href="#routing-verdicts" title="Permanent link">&para;</a></h3>
+<p>The routing packet is a normal rule packet whose <code>consequent</code> is
+either a JSON-encoded string (since <code>Rule.consequent</code> is the typed
+<code>packets::Value</code> enum, structured shapes go through string-encoding):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>{
+<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>  &quot;id&quot;: &quot;start_arc_on_issue_opened&quot;,
+<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>  &quot;classification&quot;: &quot;start_arc&quot;,
+<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>  &quot;antecedent&quot;: { &quot;op&quot;: &quot;All&quot;, &quot;args&quot;: [
+<a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>    { &quot;op&quot;: &quot;Eq&quot;, &quot;field&quot;: &quot;event&quot;,  &quot;value&quot;: &quot;issues&quot; },
+<a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a>    { &quot;op&quot;: &quot;Eq&quot;, &quot;field&quot;: &quot;action&quot;, &quot;value&quot;: &quot;opened&quot; }
+<a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a>  ]},
+<a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a>  &quot;consequent&quot;: &quot;{\&quot;route\&quot;:\&quot;start_arc\&quot;,\&quot;workflow\&quot;:\&quot;issue-to-merged-pr\&quot;,\&quot;initial_vars\&quot;:{}}&quot;
+<a id="__codelineno-14-9" name="__codelineno-14-9" href="#__codelineno-14-9"></a>}
+</code></pre></div>
+<p>Or a string shorthand for <code>ignore</code> / <code>dead_letter</code>.</p>
+<p>Verdict shapes:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a>{ &quot;route&quot;: &quot;start_arc&quot;,   &quot;workflow&quot;: &quot;&lt;id&gt;&quot;, &quot;initial_vars&quot;: { ... } }
+<a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>{ &quot;route&quot;: &quot;signal_arc&quot;,  &quot;signal&quot;: &quot;pr-merged&quot;, &quot;correlate&quot;: { &quot;pr&quot;: 42 } }
+<a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a>{ &quot;route&quot;: &quot;cancel_arc&quot;,  &quot;correlate&quot;: { &quot;pr&quot;: 42 } }   // not yet implemented
+<a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>{ &quot;route&quot;: &quot;ignore&quot; }
+<a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a>{ &quot;route&quot;: &quot;dead_letter&quot;, &quot;reason&quot;: &quot;...&quot; }
+</code></pre></div>
+<h3 id="start_arc-semantics"><code>start_arc</code> semantics<a class="headerlink" href="#start_arc-semantics" title="Permanent link">&para;</a></h3>
+<p>When a webhook resolves to <code>start_arc</code>, the engine:</p>
+<ol>
+<li>Resolves the workflow by id from the registry.</li>
+<li>Compiles + capability-validates.</li>
+<li>Builds <code>merged_vars</code>: extracted entity (excluding <code>_headers</code> and
+   <code>null</code> values) overlaid by the verdict's explicit <code>initial_vars</code>
+   (last-writer wins).</li>
+<li>Resolves <code>project_dir</code>:</li>
+<li><code>${WEBHOOK_NAME_UPPER}_PROJECT_DIR</code> env override</li>
+<li><code>WebhookSpec.default_project_dir</code></li>
+<li><code>None</code> (worktree hooks fail loudly — better than silent fallback to cwd).</li>
+<li>Spawns the arc in a background task. Webhook returns immediately
+   with <code>{status: "arc_started", workflow: &lt;id&gt;}</code>.</li>
+</ol>
+<h3 id="default-deny">Default-deny<a class="headerlink" href="#default-deny" title="Permanent link">&para;</a></h3>
+<p>No-match on the routing packet is <strong>dead-lettered</strong>, not ignored.
+The extracted entity is included in the response for forensics.</p>
+<h3 id="replay">Replay<a class="headerlink" href="#replay" title="Permanent link">&para;</a></h3>
+<p>POST <code>/webhook/&lt;name&gt;/replay</code> with the same payload runs extractor →
+routing packet → verdict <strong>without dispatching</strong>. Use to debug routing
+rules without firing arcs.</p>
+<h3 id="poller">Poller<a class="headerlink" href="#poller" title="Permanent link">&para;</a></h3>
+<p>Scheduled HTTP-source inlet — operationally "a webhook whose source is
+a tokio interval pulling from a URL instead of an inbound POST." Spec
+shape:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>{
+<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>  &quot;name&quot;: &quot;forgejo-open-issues&quot;,
+<a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>  &quot;every_seconds&quot;: 120,
+<a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>  &quot;source&quot;: {
+<a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a>    &quot;method&quot;: &quot;GET&quot;,
+<a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a>    &quot;url&quot;: &quot;${env.FORGEJO_BASE_URL}/api/v1/repos/owner/repo/issues?state=open&quot;,
+<a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a>    &quot;headers&quot;: { &quot;Accept&quot;: &quot;application/json&quot; }
+<a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a>  },
+<a id="__codelineno-16-9" name="__codelineno-16-9" href="#__codelineno-16-9"></a>  &quot;iterate&quot;:      { &quot;kind&quot;: &quot;json_path&quot;, &quot;path&quot;: &quot;$&quot; },
+<a id="__codelineno-16-10" name="__codelineno-16-10" href="#__codelineno-16-10"></a>  &quot;extractor&quot;:    { &quot;outputs&quot;: { ... } },
+<a id="__codelineno-16-11" name="__codelineno-16-11" href="#__codelineno-16-11"></a>  &quot;dedup_id_path&quot;: { &quot;kind&quot;: &quot;json_path&quot;, &quot;path&quot;: &quot;$.id&quot; },
+<a id="__codelineno-16-12" name="__codelineno-16-12" href="#__codelineno-16-12"></a>  &quot;routing_packet&quot;: &quot;domain:webhook-routing/forgejo&quot;,
+<a id="__codelineno-16-13" name="__codelineno-16-13" href="#__codelineno-16-13"></a>  &quot;default_project_dir&quot;: &quot;/path/to/local/clone&quot;
+<a id="__codelineno-16-14" name="__codelineno-16-14" href="#__codelineno-16-14"></a>}
+</code></pre></div>
+<ul>
+<li><code>every_seconds</code> is clamped above <code>BBOX_POLLER_MIN_INTERVAL_SECS</code>
+  (default 5s) — operators can't accidentally hammer an upstream.</li>
+<li><code>source</code> is the same <code>HttpFetchSpec</code> shape the workflow <code>http_json</code>
+  op consumes. <code>${env.X}</code> is resolved at spec-load time (no per-tick
+  ArcContext to resolve <code>${vars.X}</code> against — credentials live in env).</li>
+<li><code>iterate</code> (optional) — array path; each element becomes its own
+  event (extractor runs per-element). Absent → whole response is one
+  event.</li>
+<li><code>dedup_id_path</code> (optional) — stable id per item; in-memory recent-
+  seen ring (1024 cap, per-poller, resets on daemon restart). Repeated
+  items are dropped before dispatch.</li>
+</ul>
+<p>Manage with <code>bro_poller_install</code> / <code>bro_poller_list</code> MCP tools, or the
+plain-HTTP <code>/admin/poller/install</code> endpoint. Persisted under
+<code>store_dir/pollers/&lt;name&gt;.json</code>; restored on daemon startup.</p>
+<h3 id="cron">Cron<a class="headerlink" href="#cron" title="Permanent link">&para;</a></h3>
+<p>Calendar-driven inlet — sibling of webhook + poller. Distinction from
+poller: poller fetches HTTP per tick (data rides on the tick), cron
+carries no fetch (entity is operator-supplied <code>payload</code> plus synthetic
+<code>cron_name</code> + <code>tick_at</code> fields). Use cron when the trigger is time-
+based and the dispatched arc itself does the data acquisition.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a>{
+<a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>  &quot;name&quot;: &quot;sastquatch-daily&quot;,
+<a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a>  &quot;schedule&quot;: &quot;0 0 9 * * *&quot;,       // 6-field: sec min hour dom mon dow
+<a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a>  &quot;payload&quot;: {
+<a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a>    &quot;owner&quot;: &quot;sastquatch-admin&quot;,
+<a id="__codelineno-17-6" name="__codelineno-17-6" href="#__codelineno-17-6"></a>    &quot;repo&quot;: &quot;quat&quot;
+<a id="__codelineno-17-7" name="__codelineno-17-7" href="#__codelineno-17-7"></a>  },
+<a id="__codelineno-17-8" name="__codelineno-17-8" href="#__codelineno-17-8"></a>  &quot;concurrency&quot;: 1,                 // 0 disables the cap
+<a id="__codelineno-17-9" name="__codelineno-17-9" href="#__codelineno-17-9"></a>  &quot;routing_packet&quot;: &quot;domain:cron-routing/sastquatch&quot;,
+<a id="__codelineno-17-10" name="__codelineno-17-10" href="#__codelineno-17-10"></a>  &quot;default_project_dir&quot;: &quot;/path/to/local/clone&quot;
+<a id="__codelineno-17-11" name="__codelineno-17-11" href="#__codelineno-17-11"></a>}
+</code></pre></div>
+<ul>
+<li><code>schedule</code> uses the <code>cron</code> crate's 6- or 7-field form (seconds-first;
+  prefix a classic 5-field cron with <code>0</code> to run-at-second-0). Validated
+  at install time. <code>bro_cron_upcoming</code> is a pure helper that returns
+  the next N scheduled times for a candidate expression — use to sanity-
+  check before installing.</li>
+<li><code>payload</code> is operator-supplied entity fields. Synthetic <code>cron_name</code>
+  and <code>tick_at</code> (RFC3339 UTC) are merged in at tick time so routing
+  rules can discriminate without operator boilerplate. Operator-supplied
+  keys win on collision.</li>
+<li><code>concurrency</code> caps in-flight arcs spawned by this cron. Default 1
+  (skip ticks while a prior arc is still running — the most common
+  case for daily sweeps). Set 0 to lift the cap. The counter
+  decrements when the dispatched arc terminates; failed dispatches
+  refund immediately.</li>
+<li>The routing-packet entity sees <code>{cron_name, tick_at, ...payload}</code>.
+  Most cron arcs route to <code>start_arc</code> unconditionally, but you can
+  branch on <code>cron_name</code> if multiple crons share a routing packet.</li>
+</ul>
+<p>Manage with <code>bro_cron_install</code> / <code>bro_cron_list</code> / <code>bro_cron_upcoming</code>
+MCP tools, or the plain-HTTP <code>/admin/cron/install</code> endpoint. Persisted
+under <code>store_dir/crons/&lt;name&gt;.json</code>; restored on daemon startup.</p>
+<h3 id="inlet-selection-cheat-sheet">Inlet selection cheat sheet<a class="headerlink" href="#inlet-selection-cheat-sheet" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Event arrives at known time, low frequency, you control the source</strong> → webhook.</li>
+<li><strong>Event arrives at known time but you can't push (closed network, polling-only API)</strong> → poller.</li>
+<li><strong>Trigger is time-based, no upstream event to react to</strong> → cron.</li>
+<li><strong>Resilience layering</strong> → webhook + poller against the same upstream, accept the duplicate-dispatch cost (workflow-level idempotency catches it).</li>
+<li><strong>Event-driven AND time-bounded</strong> (e.g. "open a PR but auto-close after 7 days") → webhook for the open, cron sweeping for the close.</li>
+</ul>
+<h2 id="whiteboards">Whiteboards<a class="headerlink" href="#whiteboards" title="Permanent link">&para;</a></h2>
+<p>Multi-agent deliberation surface, first-class in the engine. Posts
+(proposals / claims / concerns / informational), annotations
+(challenge / corroborate / resolve / validation), and votes accumulate
+on a board, advanced through phases (blind → read → validate →
+debate → resolve → archived) by a facilitator-or-operator role.</p>
+<p>Where webhooks and crons are <em>inlet</em> primitives (events arriving
+into the engine), whiteboards are a <em>deliberation</em> primitive — a
+shared structured log that any audience can read and write through
+the same MCP surface:</p>
+<ul>
+<li><strong>In-workflow ensemble specialists.</strong> Their dispatched bro
+  prompts instruct them to call <code>whiteboard_post</code> (and later
+  <code>whiteboard_annotate</code> / <code>whiteboard_vote</code>) from inside their turn.
+  Each member's brofile lens carries its <code>agent_name</code> so the bro
+  knows which name to use without prompt-side per-member
+  interpolation.</li>
+<li><strong>In-workflow facilitators (single bro, executor mechanics).</strong>
+  Drive phase transitions via <code>whiteboard_transition</code>. Phase
+  transitions emit a <code>board-transitioned</code> signal correlated to
+  <code>(board, target_phase)</code> through the shared
+  <code>dispatch_routed_event</code> pipeline — same machinery webhooks use.</li>
+<li><strong>External agents — operator's Claude session, dispatched help,
+  eventually humans through slack / ntfy adapters.</strong> Read board
+  state via <code>whiteboard_state</code>, act via the same write tools. The
+  board IS the human-in-the-loop surface; no separate escalation
+  registry, no <code>user</code> actor type.</li>
+</ul>
+<h3 id="spec-shape">Spec shape<a class="headerlink" href="#spec-shape" title="Permanent link">&para;</a></h3>
+<p>Whiteboards aren't operator-installed like webhooks/pollers/crons —
+they're created on demand by workflows (via <code>mcp_call → whiteboard_open</code>)
+or by external clients (via <code>whiteboard_open</code> MCP tool directly). The
+board id is the operator's choice; convention is
+<code>&lt;workflow-name&gt;-&lt;arc_id&gt;</code> or a deliberation-specific slug.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a>// In a workflow node&#39;s on_enter:
+<a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a>{
+<a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a>  &quot;op&quot;: &quot;mcp_call&quot;,
+<a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a>  &quot;args&quot;: {
+<a id="__codelineno-18-5" name="__codelineno-18-5" href="#__codelineno-18-5"></a>    &quot;server&quot;: &quot;blackbox&quot;,
+<a id="__codelineno-18-6" name="__codelineno-18-6" href="#__codelineno-18-6"></a>    &quot;tool&quot;: &quot;whiteboard_open&quot;,
+<a id="__codelineno-18-7" name="__codelineno-18-7" href="#__codelineno-18-7"></a>    &quot;arguments&quot;: {
+<a id="__codelineno-18-8" name="__codelineno-18-8" href="#__codelineno-18-8"></a>      &quot;board_id&quot;: &quot;${vars.board_id}&quot;,
+<a id="__codelineno-18-9" name="__codelineno-18-9" href="#__codelineno-18-9"></a>      &quot;topic&quot;: &quot;ADR #${vars.issue_number}: ${vars.issue_title}&quot;,
+<a id="__codelineno-18-10" name="__codelineno-18-10" href="#__codelineno-18-10"></a>      &quot;project&quot;: &quot;${vars.worktree_path}&quot;,
+<a id="__codelineno-18-11" name="__codelineno-18-11" href="#__codelineno-18-11"></a>      &quot;arc_thread_id&quot;: &quot;${meta.arc_thread_id}&quot;,
+<a id="__codelineno-18-12" name="__codelineno-18-12" href="#__codelineno-18-12"></a>      &quot;opened_by&quot;: &quot;facilitator&quot;
+<a id="__codelineno-18-13" name="__codelineno-18-13" href="#__codelineno-18-13"></a>    }
+<a id="__codelineno-18-14" name="__codelineno-18-14" href="#__codelineno-18-14"></a>  }
+<a id="__codelineno-18-15" name="__codelineno-18-15" href="#__codelineno-18-15"></a>}
+</code></pre></div>
+<h3 id="phase-protocol">Phase protocol<a class="headerlink" href="#phase-protocol" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Allowed actions</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>blind</code></td>
+<td>post (specialists post without seeing others)</td>
+</tr>
+<tr>
+<td><code>read</code></td>
+<td>(none — observation phase, advance when ready)</td>
+</tr>
+<tr>
+<td><code>validate</code></td>
+<td>annotate (validation only, with required result)</td>
+</tr>
+<tr>
+<td><code>debate</code></td>
+<td>annotate (challenge / corroborate / resolve), vote</td>
+</tr>
+<tr>
+<td><code>resolve</code></td>
+<td>(none — frozen, facilitator synthesizes outside)</td>
+</tr>
+<tr>
+<td><code>archived</code></td>
+<td>(terminal — board moved to <code>archive/</code> directory)</td>
+</tr>
+</tbody>
+</table>
+<p>Skip rule: <code>read → debate</code> is legal (skip validate). All other
+transitions follow the canonical order.</p>
+<h3 id="conflict-detection">Conflict detection<a class="headerlink" href="#conflict-detection" title="Permanent link">&para;</a></h3>
+<p><code>whiteboard_conflicts</code> evaluates the board state and returns three
+kinds of conflicts:</p>
+<ul>
+<li><strong>direct_overlap</strong> — two posts target the same <code>target_file</code> +
+  <code>target_location</code></li>
+<li><strong>cascade_collision</strong> — post A's <code>cascade_targets</code> includes post
+  B's direct target</li>
+<li><strong>severity_disagreement</strong> — two posts share a <code>finding_ref</code> but
+  disagree on <code>severity</code></li>
+</ul>
+<p>This generalizes phaser's domain-specific shapes; the operator's
+posts decide whether the conflict types apply by setting (or not
+setting) the relevant fields.</p>
+<h3 id="resume-on-phase-transition">Resume on phase transition<a class="headerlink" href="#resume-on-phase-transition" title="Permanent link">&para;</a></h3>
+<p>A workflow can suspend on a board's phase advance using the existing
+<code>wait</code> primitive — no new variant needed:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a>&quot;AwaitResolve&quot;: {
+<a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>  &quot;actor&quot;: &quot;&quot;,
+<a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a>  &quot;wait&quot;: {
+<a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a>    &quot;any_of&quot;: [
+<a id="__codelineno-19-5" name="__codelineno-19-5" href="#__codelineno-19-5"></a>      {
+<a id="__codelineno-19-6" name="__codelineno-19-6" href="#__codelineno-19-6"></a>        &quot;signal&quot;: &quot;board-transitioned&quot;,
+<a id="__codelineno-19-7" name="__codelineno-19-7" href="#__codelineno-19-7"></a>        &quot;correlate&quot;: {
+<a id="__codelineno-19-8" name="__codelineno-19-8" href="#__codelineno-19-8"></a>          &quot;board&quot;: { &quot;kind&quot;: &quot;json_path&quot;, &quot;path&quot;: &quot;vars.board_id&quot; },
+<a id="__codelineno-19-9" name="__codelineno-19-9" href="#__codelineno-19-9"></a>          &quot;phase&quot;: { &quot;kind&quot;: &quot;const&quot;, &quot;value&quot;: &quot;resolve&quot; }
+<a id="__codelineno-19-10" name="__codelineno-19-10" href="#__codelineno-19-10"></a>        }
+<a id="__codelineno-19-11" name="__codelineno-19-11" href="#__codelineno-19-11"></a>      }
+<a id="__codelineno-19-12" name="__codelineno-19-12" href="#__codelineno-19-12"></a>    ],
+<a id="__codelineno-19-13" name="__codelineno-19-13" href="#__codelineno-19-13"></a>    &quot;timeout&quot;: &quot;1h&quot;
+<a id="__codelineno-19-14" name="__codelineno-19-14" href="#__codelineno-19-14"></a>  },
+<a id="__codelineno-19-15" name="__codelineno-19-15" href="#__codelineno-19-15"></a>  &quot;next&quot;: { &quot;type&quot;: &quot;goto&quot;, &quot;to&quot;: &quot;Synthesize&quot; }
+<a id="__codelineno-19-16" name="__codelineno-19-16" href="#__codelineno-19-16"></a>}
+</code></pre></div>
+<p>The transition tool fires the signal; the wait correlates on
+<code>(board, phase)</code>; routing-pipeline machinery resolves the wait and
+the arc resumes. Same shape webhook ingress uses to resume on PR
+events.</p>
+<h3 id="persistence">Persistence<a class="headerlink" href="#persistence" title="Permanent link">&para;</a></h3>
+<p>Boards are JSON files under <code>$store_dir/whiteboards/&lt;id&gt;.json</code>,
+atomically written via tempfile + rename, restored on daemon
+startup. Archived boards move to <code>$store_dir/whiteboards/archive/</code>
+and are not loaded back into memory — they exist for audit only.</p>
+<h3 id="where-to-dispatch-what">Where to dispatch what<a class="headerlink" href="#where-to-dispatch-what" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Who calls</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>whiteboard_open</code> from <code>on_enter</code> hook (mcp_call)</td>
+<td>Engine, on Setup</td>
+<td>Predictable id, deterministic registration</td>
+</tr>
+<tr>
+<td><code>whiteboard_register</code> from <code>on_enter</code> hook (mcp_call)</td>
+<td>Engine, on Setup</td>
+<td>All specialists registered up-front so role checks work</td>
+</tr>
+<tr>
+<td><code>whiteboard_post</code> / <code>whiteboard_annotate</code> / <code>whiteboard_vote</code> from inside dispatched bro</td>
+<td>Specialist (LLM)</td>
+<td>The structured deliberation IS the agent's output</td>
+</tr>
+<tr>
+<td><code>whiteboard_transition</code> from <code>on_enter</code> hook (mcp_call)</td>
+<td>Engine, on phase-advance node</td>
+<td>Deterministic — facilitator's "decide to advance" is part of arc shape, not dispatched</td>
+</tr>
+<tr>
+<td><code>whiteboard_state</code> / <code>whiteboard_summarize</code></td>
+<td>Anyone (specialist mid-turn, facilitator at synthesis, external Claude joining)</td>
+<td>Read-only inspection</td>
+</tr>
+<tr>
+<td><code>whiteboard_archive</code> from <code>on_enter</code> of Done</td>
+<td>Engine, terminal</td>
+<td>Strip live state after the artifact ships</td>
+</tr>
+</tbody>
+</table>
+<h3 id="comparison-with-phaser">Comparison with phaser<a class="headerlink" href="#comparison-with-phaser" title="Permanent link">&para;</a></h3>
+<p>The engine's whiteboard machinery absorbs phaser's mk0 protocol
+(blind → read → debate → resolve, posts / annotations / votes,
+conflict detection, auto-transition advisory). Phaser stays peer
+software in the daystrom-claude-plugins monorepo; bridgecrew /
+isolinear / ARS keep using the stdio MCP until they migrate. The
+engine version is a same-shape superset accessible in-process.</p>
+<h2 id="operator-blessed-registries">Operator-blessed registries<a class="headerlink" href="#operator-blessed-registries" title="Permanent link">&para;</a></h2>
+<p>Three registries, all persisted to disk and restored on daemon
+startup. Workflow specs reference packets by domain and webhooks by
+name; specs themselves never inline secrets or routing logic.</p>
+<table>
+<thead>
+<tr>
+<th>Registry</th>
+<th>On-disk path</th>
+<th>Install MCP tool</th>
+<th>Plain-HTTP admin endpoint</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Workflows</td>
+<td><code>${BRO_HOME}/workflows/&lt;id&gt;.json</code></td>
+<td><code>bro_workflow_install</code></td>
+<td><code>POST /admin/workflow/install</code></td>
+</tr>
+<tr>
+<td>Webhooks</td>
+<td><code>${BRO_HOME}/webhooks/&lt;name&gt;.json</code></td>
+<td><code>bro_webhook_install</code></td>
+<td><code>POST /admin/webhook/install</code></td>
+</tr>
+<tr>
+<td>Packets</td>
+<td><code>${PACKETS_PATH}/&lt;scope&gt;/&lt;packet-id&gt;.json</code></td>
+<td><code>bbox_compile</code> (MCP)</td>
+<td><code>POST /admin/packet/compile</code></td>
+</tr>
+</tbody>
+</table>
+<p>Brofiles + teams have their own MCP surface (<code>bro_brofile</code>, <code>bro_team</code>)
+plus admin shortcuts (<code>/admin/brofile/upsert</code>, <code>/admin/team/upsert</code>)
+for install scripts that can't easily speak rmcp's streamable-HTTP
+transport.</p>
+<p>The admin endpoints are loopback-only by default (<code>BBOX_BIND=127.0.0.1</code>).
+Set <code>BBOX_BIND=0.0.0.0</code> if you need a Docker container on the same
+host (Forgejo/Gitea webhook → <code>http://172.17.0.1:7264/webhook/...</code>).
+<strong>Closed-network assumption applies in 0.0.0.0 mode.</strong> The dev daemon
+template ships at <code>0.0.0.0</code>; prod stays at loopback.</p>
+<h2 id="audit-and-observability">Audit and observability<a class="headerlink" href="#audit-and-observability" title="Permanent link">&para;</a></h2>
+<p>Every <code>bro orchestrate run</code> opens a <code>bbox_thread(kind=work_item)</code>. The
+returned <code>arc_thread_id</code> is the audit handle.</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>What it shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bro orchestrate peek [&lt;thread-id&gt;]</code></td>
+<td>Live in-flight state from the <code>running_arcs</code> registry. No id = all.</td>
+</tr>
+<tr>
+<td><code>bro orchestrate status &lt;thread-id&gt;</code></td>
+<td>Note trail + latest compaction anchor for one arc.</td>
+</tr>
+<tr>
+<td><code>bro orchestrate list [--limit N]</code></td>
+<td>Recent arcs catalog with final status + anchor.</td>
+</tr>
+<tr>
+<td><code>bbox_notes(thread_id=&lt;arc&gt;)</code></td>
+<td>Every structured note the engine wrote (kind: done / learned / surprise / blocked).</td>
+</tr>
+<tr>
+<td><code>bbox_inbox</code></td>
+<td>Arcs currently flagged for attention (failed, blocked, etc.).</td>
+</tr>
+<tr>
+<td><code>bro_arc_status(arc_id=&lt;id&gt;)</code></td>
+<td>Snapshot + pending-wait registrations for one arc.</td>
+</tr>
+<tr>
+<td><code>bro_signals(signal=, since=, outcome=)</code></td>
+<td>Recent signal-dispatch events as a bounded ring buffer. Each entry: <code>(timestamp, signal, correlation, outcome, matched_arc_id, idle_pending)</code>. On <code>outcome=no_matching_wait</code> the <code>idle_pending</code> snapshot shows what waits were registered with the same signal name but didn't match — the diff between what arrived and what was waiting is one read away.</td>
+</tr>
+<tr>
+<td><code>bro_webhook_deliveries(name=, since=, verdict_classification=)</code></td>
+<td>Recent webhook deliveries (live + replay). Each entry: extracted entity, routing verdict classification, response. Filter by name to focus on one inlet.</td>
+</tr>
+<tr>
+<td><code>bro_webhook_replay(name, body, headers)</code></td>
+<td>Replay a synthetic payload through an installed webhook's extractor + routing packet WITHOUT dispatching. Returns the extracted entity + verdict consequent (after <code>${entity.X}</code> substitution). Recorded into the same delivery buffer with <code>source: replay</code>.</td>
+</tr>
+<tr>
+<td><code>bro_arc_cancel(arc_id=&lt;id&gt;)</code></td>
+<td>Trip an arc's cancellation token. Runner observes between node iterations and inside Wait suspensions, exits with status <code>cancelled</code>, runs <code>on_arc_cancel</code> + <code>on_arc_exit</code>.</td>
+</tr>
+<tr>
+<td>HTTP <code>GET /tail</code> (SSE)</td>
+<td>Live event stream from the daemon — every node_dispatch / hook_ok / wait_registered / gate_applied / ...</td>
+</tr>
+</tbody>
+</table>
+<p>Compaction anchors: at every node boundary the engine writes a
+rolling <code>ANCHOR [step N, just-ran='X', next='Y']: completed=[...]
+in_flight=[...] verdict=Z visits=[...]</code> note. Lets observers
+reconstruct arc state without reading every event.</p>
+<h2 id="lifecycle">Lifecycle<a class="headerlink" href="#lifecycle" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a>spawn arc
+<a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a>  → seed initial_vars (schema-validated)
+<a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a>  → open arc thread (bbox_thread kind=work_item)
+<a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a>  → walk graph from [*]
+<a id="__codelineno-20-5" name="__codelineno-20-5" href="#__codelineno-20-5"></a>      → for each activity node:
+<a id="__codelineno-20-6" name="__codelineno-20-6" href="#__codelineno-20-6"></a>          on_enter hooks (gated)
+<a id="__codelineno-20-7" name="__codelineno-20-7" href="#__codelineno-20-7"></a>          dispatch (actor / wait / subworkflow)
+<a id="__codelineno-20-8" name="__codelineno-20-8" href="#__codelineno-20-8"></a>          on_exit hooks (gated)        ← runs BEFORE gate
+<a id="__codelineno-20-9" name="__codelineno-20-9" href="#__codelineno-20-9"></a>          gate packet (if any)         ← chooses next-node label
+<a id="__codelineno-20-10" name="__codelineno-20-10" href="#__codelineno-20-10"></a>      → policy_packet at every boundary (halt/escalate/warn/continue)
+<a id="__codelineno-20-11" name="__codelineno-20-11" href="#__codelineno-20-11"></a>  → terminal state (success / failed / cancelled / timeout)
+<a id="__codelineno-20-12" name="__codelineno-20-12" href="#__codelineno-20-12"></a>      → set meta.arc_outcome
+<a id="__codelineno-20-13" name="__codelineno-20-13" href="#__codelineno-20-13"></a>      → on_arc_cancel hooks (only if cancelled)
+<a id="__codelineno-20-14" name="__codelineno-20-14" href="#__codelineno-20-14"></a>      → on_arc_exit hooks (always)
+<a id="__codelineno-20-15" name="__codelineno-20-15" href="#__codelineno-20-15"></a>  → return WorkflowRunResult { status, vars, outputs, events, arc_thread_id }
+</code></pre></div>
+<h2 id="currently-implemented">Currently implemented<a class="headerlink" href="#currently-implemented" title="Permanent link">&para;</a></h2>
+<ul>
+<li>ArcContext (vars / typed outputs / meta / last_signal / history) with full templating including <code>${env.X}</code> for credentials</li>
+<li>Routing verdicts can carry typed correlation tuples + payload via
+  <code>${entity.X}</code> template substitution (resolved against the
+  extracted entity before verdict parse) — same <code>${X}</code> shape the
+  workflow templater uses, applied to a different scope</li>
+<li>Three convergent event inlets: webhook (signed inbound POST), poller
+  (scheduled HTTP fetch — data rides on the tick), cron (calendar-
+  driven, no fetch — entity is operator-supplied <code>payload</code> plus
+  synthetic <code>cron_name</code> + <code>tick_at</code>). All three extract → route →
+  dispatch through one shared <code>dispatch_routed_event</code> so a workflow
+  doesn't care how it was triggered. Pollers reuse <code>HttpFetchSpec</code>
+  (same primitive the <code>http_json</code> op consumes), explode array
+  responses via <code>iterate</code>, dedup by operator-named id field, and
+  resolve <code>${env.X}</code> in source URL/headers per-tick (no secrets
+  persisted to disk). Crons use the <code>cron</code> crate's 6-field expression
+  form, support a <code>concurrency</code> cap (default 1, skip ticks while a
+  prior arc is in flight; set 0 to disable), and decrement the
+  in-flight counter when the dispatched arc terminates.</li>
+<li>Hook lifecycle: on_enter, on_exit, on_arc_exit, on_arc_cancel</li>
+<li>Op catalog: SetVar, IncVar, AppendVar, MergeVar, ParseJson, Shell,
+  WorktreeCreate (with smart branch reuse), WorktreeRemove, SetMeta,
+  HttpJson (generic HTTP; <code>response_kind: json|text|auto</code>),
+  FindFirst (array search by dotted-path equality — composable
+  primitive for idempotent lookups), McpCall (outbound MCP tool
+  call — JSON-RPC over stdio child-process or streamable HTTP;
+  resolves server name through the existing <code>bro_mcp</code> registry; lets
+  hooks inject deterministic tool results without dispatching a bro).
+  Engine carries no platform knowledge; workflow author composes
+  generic ops + <code>${env.X}</code> + <code>${vars.X}</code> to express any code-host
+  integration.</li>
+<li>Hook gating via <code>when: domain:...</code> + <code>on_failure: halt|warn|ignore</code>
+  (gate-packet errors route through <code>on_failure</code> too — no silent skips)</li>
+<li>Terminal hook <code>halt</code> failures rewrite <code>meta.arc_outcome</code> to <code>failed:
+  ...</code> so cleanup failures are visible in the arc summary</li>
+<li>Wait nodes with <code>any_of</code> race + correlation tuples + timeout
+  (synthetic <code>__timeout__</code> signal)</li>
+<li>Subworkflows: inline + by-id registry refs + imports/exports/renames;
+  capability validation runs at dispatch, not just install</li>
+<li>Capability tags: provider catalog + actor <code>requires</code> + workflow-compile validation</li>
+<li>Domain-shaped packet refs (<code>domain:...</code>)</li>
+<li>Hook-only nodes (empty <code>actor</code> field) for Setup / Done patterns</li>
+<li>Webhook ingress: HmacSha256 (configurable header + optional <code>prefix=</code>
+  for <code>sha256=</code> style senders), None for loopback-only testing,
+  idempotency dedup, replay endpoint, default-deny on no-match</li>
+<li>Operator-blessed registries (workflows / webhooks) + admin HTTP</li>
+<li>Actor kinds: just <code>executor</code> and <code>ensemble</code>. Persona / role /
+  contract (advisor, planner, triager, facilitator, specialist,
+  reviewer, aggregator, …) is brofile-lens + prompt + on_exit
+  <code>parse_json</code> validation, never an engine type. Empty <code>actor: ""</code>
+  for hook-only / pure-routing nodes.</li>
+<li>Whiteboards: in-engine multi-agent deliberation primitive (port of
+  phaser's mk0 protocol). 10 <code>whiteboard_*</code> MCP tools, three
+  audiences (in-workflow ensemble specialists / facilitator,
+  external Claude operators, eventual humans through slack/ntfy
+  adapters) sharing one surface. Phase transitions emit
+  <code>board-transitioned</code> signals through the same dispatch_routed_event
+  pipeline webhooks use, so workflows resume on transitions via the
+  existing <code>wait</code> primitive correlated to <code>(board, target_phase)</code> —
+  no new wait variant needed. Replaces the deprecated <code>user</code> actor
+  kind: humans-in-the-loop join boards as agents, no special engine
+  type for them.</li>
+<li>Transition shapes: <code>goto</code> (forward edges + back-edges), <code>branch</code>
+  (verdict-routed multi-way with optional <code>default</code>), <code>fork</code>
+  (fire-and-forget side-dispatch + <code>continue_to</code>) paired with
+  <code>wait_for</code> on the join node for fan-in, <code>terminal</code> (arc end)</li>
+<li>Gate modes: <code>first</code> (single verdict), <code>all</code> (multi-finding aggregate)</li>
+<li>Workflow-level <code>policy_packet</code> (advisor-as-packet)</li>
+<li><code>late_inject</code> for fire-and-forget → join-on-next-turn</li>
+<li>Per-actor <code>durable: true</code> session continuity + <code>compaction_anchor: true</code></li>
+<li>Arc threads + structured notes + rolling compaction anchors</li>
+<li><code>bro_arc_signal</code> / <code>bro_arc_status</code> MCP tools</li>
+<li><code>--dry-run</code> validates + summarizes without dispatching</li>
+<li><code>bro orchestrate run --stream</code> SSE event firehose during execution</li>
+</ul>
+<h2 id="phase-next">Phase-next<a class="headerlink" href="#phase-next" title="Permanent link">&para;</a></h2>
+<ul>
+<li><code>bro orchestrate resume &lt;thread-id&gt;</code> — genuine re-entry at the last
+  recorded step for arcs that paused or errored. Needs persistent
+  full-output snapshots to survive daemon restarts.</li>
+<li>Disk-backed <code>WaitStore</code> (currently in-memory) so suspended arcs
+  survive daemon restart.</li>
+<li>Disk-backed <code>running_arcs</code> registry so <code>peek</code> works after a restart.</li>
+<li>YAML workflow loader (JSON-only today; one-line add once <code>serde_yaml</code>
+  is introduced).</li>
+<li><code>cancel_arc</code> routing verdict actually wired through.</li>
+<li>Push-storm debouncing (real deployments want a <code>vars.review_in_progress</code>
+  flag the routing packet checks). Pattern documented; not yet wired
+  in the keystone example.</li>
+<li>Sandboxed <code>Shell</code> op gated via packet policy (today: shell runs
+  with <code>cwd</code> from <code>meta.worktree</code> but no allowlist enforcement).</li>
+</ul>
+<h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
+<ul>
+<li><a href="https://github.com/invidious9000/transcript-search/tree/main/examples/whiteboard"><code>examples/whiteboard/</code></a> — end-to-end:
+  ADR-tagged issue webhook → 3-specialist ensemble posts blind to
+  whiteboard → debate (annotate + vote) → facilitator synthesizes ADR
+  markdown → PR opens → auto-merge. The reference arc for the
+  whiteboard primitive + multi-round durable ensemble.</li>
+<li><a href="https://github.com/invidious9000/transcript-search/tree/main/examples/sastquatch"><code>examples/sastquatch/</code></a> — end-to-end:
+  cron tick → analyzer (mcp_call → biofilter sast_*; executor picks
+  a finding cluster) → fixer subworkflow → wait → ensemble reviewer →
+  loop on feedback → auto-merge. The reference arc for cron + mcp_call.</li>
+<li><a href="https://github.com/invidious9000/transcript-search/tree/main/examples/keystone"><code>examples/keystone/</code></a> — end-to-end:
+  Forgejo webhook → arc → implementer subworkflow → wait → reviewer
+  ensemble → wait-loop until merged → cleanup hooks. Real LLM
+  dispatch. Full layout + adaptation guide in the example's README.</li>
+<li><a href="https://github.com/invidious9000/transcript-search/tree/main/examples/workflows"><code>examples/workflows/</code></a> — smaller
+  shape catalog: linear, gated, ensemble, fork-join, blind-convergence,
+  optimistic-review, self-audit.</li>
+</ul>
+<h2 id="authoring-loops">Authoring loops<a class="headerlink" href="#authoring-loops" title="Permanent link">&para;</a></h2>
+<p>If you don't want to hand-write specs:</p>
+<ul>
+<li><code>bro_orchestrate_author(charter, brofile, hint?)</code> — prose-charter
+  to validated spec via an authoring LLM. Auto-retries on compile
+  failure with the error appended.</li>
+<li>Always pair with <code>bro_orchestrate_run(workflow, dry_run=true)</code> to
+  validate before dispatching.</li>
+</ul>
+<p>For runtime debugging — the canonical "an arc is stuck, why?" loop:</p>
+<ol>
+<li><strong><code>bro_arc_status</code></strong> — confirm the arc is parked, see which node, see the registered wait correlations.</li>
+<li><strong><code>bro_signals(signal=&lt;name&gt;)</code></strong> — did the signal the arc is waiting on actually arrive? <code>outcome=matched</code> means the wait resolved (arc should have advanced; if it didn't, look at the gate). <code>outcome=no_matching_wait</code> means the signal arrived but its correlation didn't match any pending wait — <code>idle_pending</code> shows what was waiting at dispatch time, the diff between that and the signal's correlation IS the bug (typed <code>pr: 24</code> vs string <code>pr: "24"</code> is the classic).</li>
+<li><strong><code>bro_webhook_deliveries(name=&lt;webhook&gt;)</code></strong> — if the signal never arrived, walk back one step. Did the webhook actually arrive? What did the routing packet classify it as? <code>verdict_classification</code> of <code>ignore</code> / <code>no_match</code> for an event you expected to route reveals a missing or mis-shaped routing rule. <code>extracted_entity</code> shows what the extractor projected — useful when the routing rule isn't matching because the event field's actual value differs from what the rule expects (Forgejo sends <code>action: synchronized</code> not <code>synchronize</code>, etc.).</li>
+<li><strong><code>bro_webhook_replay(name, body, headers)</code></strong> — once you suspect a routing-rule fix, replay a synthetic payload through the same path the live webhook would take, see the verdict, iterate without needing the upstream to fire a real event.</li>
+<li><strong><code>bbox_notes(thread_id=&lt;arc&gt;)</code></strong> — the arc's audit trail with structured notes (done / learned / surprise / blocked) and rolling <code>ANCHOR</code> compaction summaries.</li>
+</ol>
+<p>Control:</p>
+<ul>
+<li><code>bro_arc_cancel(arc_id)</code> — manually stop a runaway / mis-dispatched / no-longer-relevant arc. Cleanup hooks fire automatically.</li>
+<li><code>cancel_arc</code> routing verdict — emit from a routing packet to cancel arcs by correlation tuple (e.g. an upstream "PR closed without merge" event cancelling the arc that was waiting on its merge).</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.indexes", "search.suggest", "search.highlight", "content.code.copy"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>

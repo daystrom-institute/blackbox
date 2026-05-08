@@ -1,0 +1,1487 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+      
+      
+      
+      
+        <link rel="prev" href="../getting-started/">
+      
+      
+        <link rel="next" href="../workflows/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Operating Guide - blackbox</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#operating-blackbox-what-landed-in-agentic-corpus-how-to-keep-it-healthy" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="blackbox" class="md-header__button md-logo" aria-label="blackbox" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            blackbox
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Operating Guide
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-hidden="true"  type="radio" name="__palette" id="__palette_0">
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-hidden="true"  type="radio" name="__palette" id="__palette_1">
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/invidious9000/transcript-search" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="blackbox" class="md-nav__button md-logo" aria-label="blackbox" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    blackbox
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/invidious9000/transcript-search" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#section-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Section index
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#whats-new-at-a-glance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What's new at a glance
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-agentic-graph-surface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The agentic graph surface
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hybrid-search-internals" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hybrid search internals
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#embedding-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Embedding pipeline
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Embedding pipeline">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#api-key-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        API key configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#batch-caps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Batch caps
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#status-check" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Status check
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#schema-migrations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Schema migrations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#upkeep-checklist" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Upkeep checklist
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#key-locations-on-disk" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key locations on disk
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#system-memories-on-demand-runbooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        System memories — on-demand runbooks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#provider-integration-matrix" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provider integration matrix
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#open-follow-ups" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Open follow-ups
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../workflows/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workflow Engine
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../rule-packets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rule Packets
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agent-system/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Agent System
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ingress-paths/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Ingress Paths
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../slack-bridge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Slack Bridge
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../irc-bridge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    IRC Bridge
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../councils-whiteboards/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Councils & Whiteboards
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#section-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Section index
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#whats-new-at-a-glance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What's new at a glance
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-agentic-graph-surface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The agentic graph surface
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hybrid-search-internals" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hybrid search internals
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#embedding-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Embedding pipeline
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Embedding pipeline">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#api-key-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        API key configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#batch-caps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Batch caps
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#status-check" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Status check
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#schema-migrations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Schema migrations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#upkeep-checklist" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Upkeep checklist
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#key-locations-on-disk" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key locations on disk
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#system-memories-on-demand-runbooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        System memories — on-demand runbooks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#provider-integration-matrix" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provider integration matrix
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#open-follow-ups" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Open follow-ups
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="operating-blackbox-what-landed-in-agentic-corpus-how-to-keep-it-healthy">Operating blackbox — what landed in agentic-corpus, how to keep it healthy<a class="headerlink" href="#operating-blackbox-what-landed-in-agentic-corpus-how-to-keep-it-healthy" title="Permanent link">&para;</a></h1>
+<p>This doc covers everything the bbox daemon now does beyond what the README
+describes: the agentic graph surface, hybrid retrieval, the embedding
+pipeline, and the upkeep steps that keep all of it healthy. Read in order
+or jump via the section index. Cross-linked from the <a href="../">README</a>.</p>
+<h2 id="section-index">Section index<a class="headerlink" href="#section-index" title="Permanent link">&para;</a></h2>
+<ul>
+<li><a href="#whats-new-at-a-glance">What's new at a glance</a></li>
+<li><a href="#the-agentic-graph-surface">The agentic graph surface</a></li>
+<li><a href="#hybrid-search-internals">Hybrid search internals</a></li>
+<li><a href="#embedding-pipeline">Embedding pipeline</a></li>
+<li><a href="#schema-migrations">Schema migrations</a></li>
+<li><a href="#upkeep-checklist">Upkeep checklist</a></li>
+<li><a href="#key-locations-on-disk">Key locations on disk</a></li>
+<li><a href="#system-memories-on-demand-runbooks">System memories — on-demand runbooks</a></li>
+<li><a href="#provider-integration-matrix">Provider integration matrix</a></li>
+<li><a href="#open-follow-ups">Open follow-ups</a></li>
+</ul>
+<h2 id="whats-new-at-a-glance">What's new at a glance<a class="headerlink" href="#whats-new-at-a-glance" title="Permanent link">&para;</a></h2>
+<p>The agentic-corpus arc added a graph projection layer over the same
+transcript / knowledge / commit / file substrate that bbox already
+indexed. Every entity has a canonical <code>&lt;type&gt;:&lt;segments&gt;</code> ref; entities
+are connected by typed edges (CONTAINS_SYMBOL, CALLS, EDITED_BY_SESSION,
+COMMIT_TOUCHED_FILE, KNOWLEDGE_FROM_SESSION, READ_FILE, etc); five new
+MCP tools (<code>bbox_describe_schema</code>, <code>bbox_hybrid_search</code>,
+<code>bbox_discover_seed_entities</code>, <code>bbox_inspect_entity</code>, <code>bbox_find_paths</code>,
+<code>bbox_bundle_evidence</code>) compose into a 5-step opening sequence that
+replaces the old "single bbox_knowledge call" cold-start pattern.</p>
+<p>The hybrid retrieval blends BM25, vector cosine (Voyage embeddings or
+Ollama fallback), and a path-token boost. The fusion runs RRF, then a
+per-file collapse + modal diversification pass before returning the
+top-N. The recall improvement on cold-start questions matches what the
+donor McpPoc spike measured (~97% vs ~23% with naive rerank), with a
+local benchmark reaching 4 of top-5 ground truth on the erlang-test
+"recombination" probe and surfacing the .ex code chunks alongside docs
+on the "triad implementation" probe.</p>
+<h2 id="the-agentic-graph-surface">The agentic graph surface<a class="headerlink" href="#the-agentic-graph-surface" title="Permanent link">&para;</a></h2>
+<p><code>bbox_describe_schema</code> is the canonical orientation call. As of this
+writing the corpus knows:</p>
+<table>
+<thead>
+<tr>
+<th>Entity type</th>
+<th>Population</th>
+<th>Used for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>knowledge</code></td>
+<td>rules / decisions / conventions</td>
+<td>"what's the policy on X?"</td>
+</tr>
+<tr>
+<td><code>project_file</code></td>
+<td>source / doc chunks (10454+)</td>
+<td>"where does X live?"</td>
+</tr>
+<tr>
+<td><code>transcript</code></td>
+<td>one block of one Claude/Codex/Gemini session (~1M)</td>
+<td>"what did this turn say?"</td>
+</tr>
+<tr>
+<td><code>session</code></td>
+<td>a full agent conversation (~4500)</td>
+<td>"what was that session about?"</td>
+</tr>
+<tr>
+<td><code>thread</code></td>
+<td>persistent investigation across sessions</td>
+<td>active arcs / deferred work</td>
+</tr>
+<tr>
+<td><code>note</code></td>
+<td>side-channel records (~6700)</td>
+<td>dispute/done/blocked/etc</td>
+</tr>
+<tr>
+<td><code>symbol</code></td>
+<td>named code symbols (~6300)</td>
+<td>call graph + defining file</td>
+</tr>
+<tr>
+<td><code>brofile</code></td>
+<td>persona+model+lens triple</td>
+<td>dispatch provenance</td>
+</tr>
+<tr>
+<td><code>whiteboard</code></td>
+<td>multi-agent deliberation surface</td>
+<td>board state</td>
+</tr>
+<tr>
+<td><code>commit</code></td>
+<td>git commits with parent + touched-file edges (~770)</td>
+<td>version history</td>
+</tr>
+<tr>
+<td><code>task</code> (virtual)</td>
+<td>bro_exec dispatch unit</td>
+<td>what produced this artifact</td>
+</tr>
+<tr>
+<td><code>bash_call</code> (virtual)</td>
+<td>one shell invocation in a transcript</td>
+<td>what did this command emit</td>
+</tr>
+</tbody>
+</table>
+<p>Edge families (full list via <code>bbox_describe_schema</code>):</p>
+<ul>
+<li><strong>Structural</strong> — IN_FILE, IN_SESSION, NEXT_SECTION, NEXT_CHUNK,
+  PREV_CHUNK, THREAD_HAS_SESSION</li>
+<li><strong>AST</strong> — DEFINED_IN, CONTAINS_SYMBOL, CALLS, USES_TYPE, HAS_FIELD,
+  IMPLEMENTS_TRAIT</li>
+<li><strong>Knowledge</strong> — SUPERSEDES, DERIVED_FROM, Contradicts,
+  KNOWLEDGE_FROM_SESSION, KNOWLEDGE_FROM_BOARD</li>
+<li><strong>Provenance</strong> — SESSION_USED_BROFILE, ARC_USED_BROFILE,
+  ARC_OPENED_BOARD, NOTE_FROM_SESSION, NOTE_IN_THREAD, NOTE_FROM_TASK,
+  TASK_PRODUCED_NOTE</li>
+<li><strong>Git</strong> — COMMIT_PARENT, COMMIT_TOUCHED_FILE, COMMIT_PRODUCED_BY_ARC</li>
+<li><strong>Format-specific</strong> — LINKS_TO_FILE, LINKS_TO_SECTION, DESCRIBES,
+  ON_PAGE, FIGURE_OF, TABLE_OF</li>
+<li><strong>Tool-call</strong> — EDITED_FILE, EDITED_BY_SESSION, READ_FILE, RAN_BASH</li>
+</ul>
+<p>The 5-step opening sequence is documented in detail in the
+<code>sm-agentic-opening-sequence</code> system memory. Pull on demand with
+<code>bbox_knowledge(query="sm-agentic-opening-sequence")</code>.</p>
+<h2 id="hybrid-search-internals">Hybrid search internals<a class="headerlink" href="#hybrid-search-internals" title="Permanent link">&para;</a></h2>
+<p><code>bbox_hybrid_search</code> fuses three ranked lists via RRF:</p>
+<ol>
+<li><strong>bm25</strong> — chunk-level Tantivy BM25 over <code>content</code>, <code>project</code>,
+   <code>code_content</code>, <code>symbol</code>, <code>commit_author_name</code>, <code>path_tokens</code> fields.
+   Path tokens use the code tokenizer (splits on <code>/_-.:&gt;</code> plus
+   CamelCase) and carry a 1.5× field boost. Symbol field also 1.5×.</li>
+<li><strong>bm25_file</strong> — sum-of-scores aggregated per <code>(project_id,
+   rel_path_hash)</code>, then weighted by <code>sum * sqrt(chunk_count)</code>. Lifts
+   high-coverage files (e.g. STATUS.md with 21 sparse mentions) that
+   would otherwise be invisible to per-chunk ranking.</li>
+<li><strong>vector</strong> — per-route HNSW search via Voyage <code>voyage-code-3</code> (1024d)
+   embeddings. RRF default weight 0.6 (0.4 BM25, 0.6 vector); set
+   <code>vector_weight=0</code> for BM25-only, <code>1.0</code> for vector-only.</li>
+</ol>
+<p>After fusion, the result list is post-processed:</p>
+<ul>
+<li><strong>Project filter</strong> — when <code>project=&lt;path or project_id&gt;</code> is passed,
+  drop project_file refs from other projects. Commits / knowledge /
+  transcripts pass through. Cuts cross-repo keyword pollution that
+  otherwise dominates ("voyage" returning erlang-test/voyage.ex above
+  transcript-search/src/embed/voyage.rs).</li>
+<li><strong>Per-file collapse</strong> — only the highest-scoring chunk per file
+  survives. Mirrors the AgenticTools donor's diversity-by-file pass.</li>
+<li><strong>Modal diversification</strong> — guarantees at least one
+  <code>code_block</code> / <code>doc_section</code> / <code>git_message</code> in top-N when the fetch
+  set has them. Stops a query like "triad implementation" from being
+  10 docs with the defining .ex file invisible.</li>
+<li><strong>Symbol_exact boost</strong> — single-token queries (snake_case, CamelCase,
+  dotted) add a SHOULD clause matching <code>symbol_exact</code> with 6× boost so
+  the defining chunk lifts above docs that just mention the symbol.</li>
+</ul>
+<p><code>bbox_discover_seed_entities</code> is the same call with <code>notable_edges</code>
+rendered for each result — useful when the next step is
+<code>bbox_inspect_entity</code> and you want pre-vetted hops.</p>
+<h2 id="embedding-pipeline">Embedding pipeline<a class="headerlink" href="#embedding-pipeline" title="Permanent link">&para;</a></h2>
+<p>Voyage embeddings drive the vector lane. The daemon runs a per-route
+async queue (one worker per route) with debounce, batching, and retry.
+Routes:</p>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>What's embedded</th>
+<th>Default provider</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>code</td>
+<td>source-file code chunks</td>
+<td>voyage / voyage-code-3</td>
+</tr>
+<tr>
+<td>docs</td>
+<td>source-file doc chunks (markdown)</td>
+<td>voyage / voyage-code-3</td>
+</tr>
+<tr>
+<td>git_message</td>
+<td>commit subject + body</td>
+<td>voyage / voyage-code-3</td>
+</tr>
+<tr>
+<td>knowledge</td>
+<td>knowledge-store entries</td>
+<td>voyage / voyage-code-3</td>
+</tr>
+<tr>
+<td>notes</td>
+<td>side-channel notes</td>
+<td>voyage / voyage-code-3</td>
+</tr>
+<tr>
+<td>transcripts</td>
+<td>transcript event blocks</td>
+<td>voyage / voyage-code-3</td>
+</tr>
+</tbody>
+</table>
+<p>Provider config lives in <code>src/embed/mod.rs::EmbeddingRouter</code>. Override
+per-bucket or per-project in <code>~/.config/blackbox/embed.toml</code>.</p>
+<h3 id="api-key-configuration">API key configuration<a class="headerlink" href="#api-key-configuration" title="Permanent link">&para;</a></h3>
+<p>Production daemon needs <code>DAYSTROM_VOYAGE_API_KEY</code> (or <code>VOYAGE_API_KEY</code>)
+in its environment. The systemd drop-in pattern:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># ~/.config/systemd/user/blackbox.service.d/voyage-key.conf</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">[Service]</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="na">Environment</span><span class="o">=</span><span class="s">DAYSTROM_VOYAGE_API_KEY=pa-...</span>
+</code></pre></div>
+<p>Then <code>systemctl --user daemon-reload &amp;&amp; systemctl --user restart blackbox.service</code>.</p>
+<p>Falling back to <code>Ollama</code> works without an API key — set the route to
+<code>ollama</code> in <code>embed.toml</code> to use a local <code>nomic-embed-text</code> (768d)
+endpoint. Mixing Voyage and Ollama is fine; each route persists its own
+HNSW partition keyed on <code>(provider, model, dimensions)</code>.</p>
+<h3 id="batch-caps">Batch caps<a class="headerlink" href="#batch-caps" title="Permanent link">&para;</a></h3>
+<p>The queue caps at <strong>64 documents</strong> or <strong>80KB total</strong> per Voyage request
+(under the 128/120k Voyage limits). Without this cap a single restart
+that re-fills the queue with thousands of pending chunks would send one
+oversized request, get rejected, retry 3×, then DROP the entire batch.
+See the cap definition in <code>src/embed/queue.rs::collect_quiescent_batch</code>.</p>
+<h3 id="status-check">Status check<a class="headerlink" href="#status-check" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># Via MCP</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>bbox_embed_status<span class="o">()</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="c1"># Or curl directly</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>curl<span class="w"> </span>-sN<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://127.0.0.1:7264/mcp<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">  </span>-H<span class="w"> </span><span class="s1">&#39;content-type: application/json&#39;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span>-H<span class="w"> </span><span class="s1">&#39;accept: application/json,text/event-stream&#39;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;mcp-session-id: </span><span class="nv">$SESSION</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;id&quot;:1,&quot;method&quot;:&quot;tools/call&quot;,&quot;params&quot;:{&quot;name&quot;:&quot;bbox_embed_status&quot;,&quot;arguments&quot;:{}}}&#39;</span>
+</code></pre></div>
+<p>Per-route fields: <code>available</code>, <code>provider</code>, <code>model</code>, <code>dim</code>,
+<code>indexed_count</code>, <code>queue_depth</code>, <code>retried_count</code>, <code>last_error</code>. A healthy
+daemon shows <code>available: true</code> everywhere with <code>last_error: null</code>.</p>
+<h2 id="schema-migrations">Schema migrations<a class="headerlink" href="#schema-migrations" title="Permanent link">&para;</a></h2>
+<p>Tantivy index schema changes are versioned via the
+<code>INDEX_SCHEMA_VERSION</code> constant in <code>src/index/mod.rs</code>. On daemon start
+the schema marker is compared and the index dropped + rebuilt if it
+mismatches. A full rebuild on a 1.1M-doc corpus takes 5-7 minutes
+including the EdgeIndex projection pass (which auto-fires via the
+<code>blackbox-edge-rebuild</code> watcher thread when tantivy's doc count grows).</p>
+<p>Recent schema bumps in chronological order:</p>
+<ul>
+<li><code>agentic-corpus-g1</code> — initial agentic schema</li>
+<li><code>agentic-corpus-g2-path-tokens</code> — added tokenized <code>path_tokens</code> field</li>
+<li><code>agentic-corpus-g3-commit-subject-tokens</code> — populates <code>path_tokens</code>
+  from commit subject too so commits compete on equal footing with
+  project_files for ranking</li>
+<li><code>agentic-corpus-g4-elixir-symbols</code> — elixir symbol extraction (defmodule/
+  def/defp/defmacro/etc via tree-sitter <code>call</code> node filtering)</li>
+<li><code>agentic-corpus-g5-symbol-tokenized</code> — <code>symbol</code> field switched from
+  default tokenizer to code_tokenizer so <code>Substrate.TriadClosure</code>
+  indexes as the union of [Substrate, TriadClosure, Triad, Closure]
+  and matches both camelCase and snake_case query forms</li>
+</ul>
+<p>Bumping the version triggers a full reindex; old segments are removed.</p>
+<h2 id="upkeep-checklist">Upkeep checklist<a class="headerlink" href="#upkeep-checklist" title="Permanent link">&para;</a></h2>
+<p>Daily / on-demand:
+- <code>bbox_inbox(project="...")</code> — round-boundary attention sweep
+- <code>bbox_thread_list(status="open")</code> — investigation continuity check</p>
+<p>Per-release / when changing schema or chunker:
+- Bump <code>INDEX_SCHEMA_VERSION</code>
+- <code>cargo build --release &amp;&amp; install -m 755 target/release/blackboxd ~/.local/bin/blackboxd &amp;&amp; systemctl --user restart blackbox.service</code>
+- Wait for <code>auto-reindex: indexed N files (M docs)</code> log line
+  (~5-7 min for 1.1M docs)
+- Wait for <code>edge-index watcher: corpus grew, EdgeIndex rebuilt</code> log line
+  (~6 sec after reindex completes)
+- Smoke: <code>bbox_describe_schema</code> should return all entity types with
+  populations; <code>bbox_hybrid_search("test query", limit=5)</code> should return
+  results with both <code>bm25</code> and <code>vector</code> sources contributing.</p>
+<p>After tantivy schema bump:
+- The schema-version marker file at <code>~/.local/share/blackbox/index/schema_version.txt</code>
+  is rewritten on successful start. If you see "dropping transcript
+  index for schema migration" in the journal, that's the expected path.</p>
+<p>After embedding provider change:
+- <code>bbox_reembed(route="&lt;route&gt;")</code> to re-fill the queue from existing
+  indexed entities (lands in E3 and verified working)
+- Watch <code>bbox_embed_status</code> for <code>queue_depth</code> to drain</p>
+<p>After registering a new project:
+- <code>bbox_project_register(path="/abs/path")</code> adds to the registry,
+  triggers an EdgeIndex rebuild, and runs an incremental reindex
+- The auto-reindex thread (120s tick) picks up new project files within
+  the next 1-2 cycles
+- For large repos (10k+ files) this can take 10+ minutes</p>
+<h2 id="key-locations-on-disk">Key locations on disk<a class="headerlink" href="#key-locations-on-disk" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>~/.local/bin/blackboxd</code></td>
+<td>Production daemon binary</td>
+</tr>
+<tr>
+<td><code>~/.local/bin/blackboxd-dev</code></td>
+<td>Dev daemon binary (separate inode)</td>
+</tr>
+<tr>
+<td><code>~/.local/bin/bro</code></td>
+<td>Terminal TUI client</td>
+</tr>
+<tr>
+<td><code>~/.config/systemd/user/blackbox.service</code></td>
+<td>Prod systemd unit</td>
+</tr>
+<tr>
+<td><code>~/.config/systemd/user/blackbox.service.d/*.conf</code></td>
+<td>Drop-in env (e.g. voyage-key.conf)</td>
+</tr>
+<tr>
+<td><code>~/.local/share/blackbox/index/</code></td>
+<td>Tantivy index + schema_version.txt</td>
+</tr>
+<tr>
+<td><code>~/.local/state/blackbox/</code></td>
+<td>Knowledge / threads / notes / pins / projects / packets / artifacts JSON stores</td>
+</tr>
+<tr>
+<td><code>~/.local/state/blackbox/edges/&lt;project_id&gt;.jsonl</code></td>
+<td>Per-project edge sidecars</td>
+</tr>
+<tr>
+<td><code>~/.local/state/blackbox/vectors/</code></td>
+<td>HNSW partitions (one per provider+model+dim)</td>
+</tr>
+<tr>
+<td><code>~/.local/state/blackbox/backups/&lt;ISO-ts&gt;/</code></td>
+<td>Pre-render snapshots of provider markdown files</td>
+</tr>
+<tr>
+<td><code>~/.local/state/blackbox/git_meta/&lt;project_id&gt;.json</code></td>
+<td>Git history fingerprints for incremental indexing</td>
+</tr>
+<tr>
+<td><code>~/.bro/mcp.json</code></td>
+<td>Global MCP server config (per-provider sync)</td>
+</tr>
+<tr>
+<td><code>&lt;project&gt;/.bro/mcp.json</code></td>
+<td>Project-overlay MCP config</td>
+</tr>
+<tr>
+<td><code>~/.claude-shared/BLACKBOX.md</code></td>
+<td>Rendered tool reference + CORE RULEs (single source of truth, included by other provider files)</td>
+</tr>
+<tr>
+<td><code>~/.claude-shared/CLAUDE.md</code>, <code>~/.codex/AGENTS.md</code>, <code>~/.gemini/GEMINI.md</code></td>
+<td>Per-provider memory files that include BLACKBOX.md by reference</td>
+</tr>
+</tbody>
+</table>
+<h2 id="system-memories-on-demand-runbooks">System memories — on-demand runbooks<a class="headerlink" href="#system-memories-on-demand-runbooks" title="Permanent link">&para;</a></h2>
+<p>Code-embedded markdown runbooks queryable via <code>bbox_knowledge(query="sm-...")</code>.
+Not rendered into provider files (kept cold; pulled when an agent reaches
+for a primitive it hasn't used before).</p>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Topic</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sm-agentic-opening-sequence</code></td>
+<td>The 5-step grounding pattern (orient → search → inspect → traverse → answer)</td>
+</tr>
+<tr>
+<td><code>sm-rule-packets</code></td>
+<td>Compile reusable judges/rubrics from examples</td>
+</tr>
+<tr>
+<td><code>sm-workflow-orchestration</code></td>
+<td>JSON workflow specs with per-node next transitions</td>
+</tr>
+<tr>
+<td><code>sm-bro-dispatch-patterns</code></td>
+<td>bro_exec / bro_resume usage</td>
+</tr>
+<tr>
+<td><code>sm-whiteboards</code></td>
+<td>Multi-agent deliberation boards</td>
+</tr>
+<tr>
+<td><code>sm-transcript-retrieval</code></td>
+<td>search / cite / context / session ladders</td>
+</tr>
+<tr>
+<td><code>sm-persistence-taxonomy</code></td>
+<td>learn vs decide vs remember vs pin lane selection</td>
+</tr>
+<tr>
+<td><code>sm-render-lifecycle</code></td>
+<td>Render → review → revoke flow</td>
+</tr>
+<tr>
+<td><code>sm-scoped-pins</code></td>
+<td>Active-arc context pins</td>
+</tr>
+<tr>
+<td><code>sm-create-etiquette</code></td>
+<td>List-before-create dedupe hygiene</td>
+</tr>
+<tr>
+<td><code>sm-side-channel-notes</code></td>
+<td>dispute/assumption/surprise/followup/blocked/learned/done</td>
+</tr>
+<tr>
+<td><code>sm-design-packets</code></td>
+<td>Multi-domain rule-packet design</td>
+</tr>
+<tr>
+<td><code>sm-auth-packets</code></td>
+<td>Authorization/policy packets</td>
+</tr>
+<tr>
+<td><code>sm-review-packets</code></td>
+<td>Review-style packets</td>
+</tr>
+</tbody>
+</table>
+<h2 id="provider-integration-matrix">Provider integration matrix<a class="headerlink" href="#provider-integration-matrix" title="Permanent link">&para;</a></h2>
+<p>Validated grounding behavior across CLI providers when given a cold-start
+question:</p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>Honors AGENTS.md @-imports</th>
+<th>Reaches for bbox_* tools</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>claude</code> (claude-opus-4-7)</td>
+<td>✅</td>
+<td>✅ first-class</td>
+<td>Followed full 5-step loop, caught cross-repo collisions naturally. Best cold-start reliability.</td>
+</tr>
+<tr>
+<td><code>codex</code> (gpt-5.5)</td>
+<td>✅</td>
+<td>✅ first-class</td>
+<td>Quality high, latency tends 2× of claude — verbose exploratory turns</td>
+</tr>
+<tr>
+<td><code>gemini</code> (gemini-3.1-pro)</td>
+<td>✅</td>
+<td>Untested in probe series</td>
+<td>Renders to GEMINI.md; should mirror claude pattern</td>
+</tr>
+<tr>
+<td><code>glm</code> (zai-coding-plan/glm-5.1, via opencode)</td>
+<td>❌</td>
+<td>Falls back to grep/read</td>
+<td>Opencode SQLite contention with parallel deepseek runs</td>
+</tr>
+<tr>
+<td><code>deepseek</code> (deepseek-v4-pro, via opencode)</td>
+<td>❌</td>
+<td>Falls back to grep/read</td>
+<td>Same opencode integration gap</td>
+</tr>
+</tbody>
+</table>
+<p>Opencode-based bros currently grep instead of using the agentic surface
+because opencode doesn't follow <code>@/path/...</code> includes in AGENTS.md by
+default. Workaround under investigation; tracked in deferred-items
+thread.</p>
+<h2 id="open-follow-ups">Open follow-ups<a class="headerlink" href="#open-follow-ups" title="Permanent link">&para;</a></h2>
+<p>Tracked in bbox threads; surface with <code>bbox_thread_list(status="open")</code>.</p>
+<ul>
+<li><code>thread-3cfbf9e0</code> — agentic-corpus impl: deferred items across all phases</li>
+<li><code>thread-f4e4624f</code> — Agentic-loop tools as composable subagents (scout
+  brofile + workflow actor type)</li>
+<li><code>thread-cba8bfa1</code> — workflow engine: foreach/matrix primitive</li>
+<li><code>thread-e8f0371a</code> — apply_brofile_lens runs every turn — strip from
+  resume paths</li>
+<li><code>thread-7e2bd735</code> — workflow engine phase-next: template library + resume</li>
+</ul>
+<p>Smaller items still open at session end:
+- file: virtual entity refactor (currently chunk[0] proxies as the file)
+- opencode bros not loading rendered guidance
+- bbox_blame anchor-metadata file_path mismatch when multi-file edits
+  share a commit
+- Probe-team Q2-Q8 (only Q1 captured in this session)</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.indexes", "search.suggest", "search.highlight", "content.code.copy"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
