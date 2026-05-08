@@ -35,6 +35,7 @@ pub enum ToolCategory {
     Workflows,
     Whiteboards,
     Councils,
+    Roadmap,
 }
 
 impl ToolCategory {
@@ -54,6 +55,7 @@ impl ToolCategory {
             Self::Workflows => "Workflow orchestration",
             Self::Whiteboards => "Whiteboards",
             Self::Councils => "Councils",
+            Self::Roadmap => "Roadmap",
         }
     }
 
@@ -98,6 +100,9 @@ impl ToolCategory {
             }
             Self::Councils => {
                 "Multi-peer chat councils — TUI-driven conversational coordination over a team. Read-only MCP surface for external observers; the human-facing CRUD lives in the `bro council` CLI. Distinct from whiteboards: a council is a chat log (turns, @-mentions, riffing), not a structured decision artifact. If a deliberation produces a claim worth durable record, post it to a whiteboard separately. Councils compose with whiteboards; they do not replace them."
+            }
+            Self::Roadmap => {
+                "Prospective work tracker: designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Inbox is reactive; threads are active work; knowledge is atemporal. The roadmap tracks the future band. Link items to design docs (ROADMAP_DESIGNED_IN) and threads (ROADMAP_SPAWNS). Use `action=\"next\"` to rank accepted items by priority/staleness/blockers, and `action=\"promote\"` to spin a roadmap item into a work thread."
             }
         }
     }
@@ -1084,6 +1089,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use to follow a council incrementally — call with the last seen sequence to fetch only new posts. Cheaper than `bro_council_open` for long-running observation.",
         example: Some(r#"bro_council_posts(id="council-7f01324e", since_seq=42, limit=50)"#),
     },
+    // ── Roadmap ─────────────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_roadmap",
+        category: ToolCategory::Roadmap,
+        summary: "Manage the bbox roadmap — a prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Inbox is reactive (surprises, blockages); threads are active work; knowledge is atemporal. The roadmap tracks the *future*: accepted items awaiting promotion, deferred items with provenance, and proposed ideas awaiting review. Items link to design docs via ROADMAP_DESIGNED_IN edges and to threads via ROADMAP_SPAWNS edges.",
+        when_to_use: "Use when planning future work, reviewing what's been designed but not yet built, or deciding what to work on next. `action=\"next\"` ranks accepted items by priority, staleness, blockers, and design-link health. `action=\"promote\"` opens a bbox_thread with the item's context injected. Link to design docs (designed_in) and threads (spawns / deferred_from).",
+        example: Some(r#"bbox_roadmap(action="next", n=5)"#),
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\
@@ -1242,6 +1255,7 @@ pub fn render_markdown() -> String {
         ToolCategory::Workflows,
         ToolCategory::Whiteboards,
         ToolCategory::Councils,
+        ToolCategory::Roadmap,
     ];
 
     for cat in categories {

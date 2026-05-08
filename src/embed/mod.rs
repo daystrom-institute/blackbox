@@ -537,6 +537,21 @@ pub(crate) fn route_coverage(
                 &crate::index::knowledge_chunk_hash(entry),
             )?;
         }
+        for item in state.roadmap.read().all_items() {
+            // Rejected items are not indexed — skip
+            if matches!(item.status, crate::roadmap::RoadmapStatus::Rejected) {
+                continue;
+            }
+            record_coverage(
+                &router,
+                &mut coverage,
+                &mut active_by_route,
+                Bucket::Knowledge,
+                None,
+                &crate::index::roadmap_entity_id(&item.id),
+                &crate::index::roadmap_chunk_hash(item),
+            )?;
+        }
     }
     if buckets.contains(&Bucket::Notes) {
         for note in state.notes.read().all() {
@@ -758,6 +773,18 @@ fn enqueue_reembed_routes(
             crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash);
             enqueued += 1;
         }
+        for item in state.roadmap.read().all_items() {
+            if limit_reached(max_entities, enqueued) {
+                return Ok(enqueued);
+            }
+            if matches!(item.status, crate::roadmap::RoadmapStatus::Rejected) {
+                continue;
+            }
+            let entity_id = crate::index::roadmap_entity_id(&item.id);
+            let chunk_hash = crate::index::roadmap_chunk_hash(item);
+            crate::embed_queue::enqueue_roadmap(item, &entity_id, &chunk_hash);
+            enqueued += 1;
+        }
     }
     if buckets.contains(&Bucket::Notes) {
         for note in state.notes.read().all() {
@@ -959,6 +986,7 @@ fn reembed_index_doc_bucket(doc: &EmbeddingSourceDoc) -> Option<Bucket> {
         "commit" if doc.chunk_kind == "git_message" && !doc.content.is_empty() => {
             Some(Bucket::GitMessage)
         }
+        "knowledge" | "roadmap" => Some(Bucket::Knowledge),
         "project_file" => {
             let path = Path::new(&doc.file_path);
             if crate::chunker::code::language_for_path(path).is_some() {

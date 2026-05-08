@@ -26,10 +26,11 @@ pub enum EntityType {
     Task,
     BashCall,
     Agent,
+    RoadmapItem,
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 13] = [
+    pub const ALL: [EntityType; 14] = [
         EntityType::Knowledge,
         EntityType::Transcript,
         EntityType::ProjectFile,
@@ -43,6 +44,7 @@ impl EntityType {
         EntityType::Task,
         EntityType::BashCall,
         EntityType::Agent,
+        EntityType::RoadmapItem,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -60,6 +62,7 @@ impl EntityType {
             EntityType::Task => "task",
             EntityType::BashCall => "bash_call",
             EntityType::Agent => "agent",
+            EntityType::RoadmapItem => "roadmap_item",
         }
     }
 
@@ -82,6 +85,7 @@ impl EntityType {
             EntityType::Task => "task:<task_id>",
             EntityType::BashCall => "bash_call:<session>:<turn>",
             EntityType::Agent => "agent:<name>@v<version>",
+            EntityType::RoadmapItem => "roadmap_item:<id>",
         }
     }
 
@@ -161,6 +165,9 @@ pub enum EntityRef {
         name: String,
         version: u32,
     },
+    RoadmapItem {
+        id: String,
+    },
 }
 
 impl EntityRef {
@@ -212,6 +219,11 @@ impl EntityRef {
             }),
             EntityType::BashCall => parse_bash_call(input, rest),
             EntityType::Agent => parse_agent(input, rest),
+            EntityType::RoadmapItem => {
+                parse_single(input, rest, EntityType::RoadmapItem, |id| {
+                    EntityRef::RoadmapItem { id }
+                })
+            }
         }
     }
 
@@ -273,6 +285,7 @@ impl EntityRef {
                 }
                 Ok(format!("agent:{name}@v{version}"))
             }
+            EntityRef::RoadmapItem { id } => Ok(format!("roadmap_item:{id}")),
         }
     }
 
@@ -291,6 +304,7 @@ impl EntityRef {
             EntityRef::Task { .. } => EntityType::Task,
             EntityRef::BashCall { .. } => EntityType::BashCall,
             EntityRef::Agent { .. } => EntityType::Agent,
+            EntityRef::RoadmapItem { .. } => EntityType::RoadmapItem,
         }
     }
 
@@ -1007,6 +1021,9 @@ mod tests {
             12 => EntityRef::Agent {
                 name: rng.token("agent-"),
                 version: 1 + (rng.next() as u32) % 10,
+            },
+            13 => EntityRef::RoadmapItem {
+                id: rng.token("roadmap-"),
             },
             _ => unreachable!(),
         }

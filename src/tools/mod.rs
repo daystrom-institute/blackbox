@@ -11,6 +11,7 @@ pub mod packets;
 pub mod projects;
 pub mod refactor;
 pub mod render;
+pub mod roadmap;
 pub mod sessions;
 pub mod threads;
 pub mod transcripts;

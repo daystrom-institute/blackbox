@@ -153,6 +153,9 @@ pub(super) fn scan_all_source_files(config: &ReindexConfig) -> Vec<(String, u64,
     if config.threads_path.exists() {
         scan_single_file(&config.threads_path, &mut files);
     }
+    if config.roadmap_path.exists() {
+        scan_single_file(&config.roadmap_path, &mut files);
+    }
     match project_files::scan_registered_project_files(config) {
         Ok(mut project_files) => files.append(&mut project_files),
         Err(err) => tracing::warn!(error = %err, "failed to scan registered project files"),
@@ -356,11 +359,22 @@ fn try_background_reindex(
         indexed_files += 1;
         indexed_docs += thread_docs;
     }
+    let roadmap_docs = super::roadmap_docs::reindex_roadmap_store_standalone(
+        &config.roadmap_path,
+        fields,
+        &mut writer,
+        &mut meta,
+    )?;
+    if roadmap_docs > 0 {
+        indexed_files += 1;
+        indexed_docs += roadmap_docs;
+    }
     tracing::info!(
         full,
         elapsed_ms = stores_phase.elapsed().as_millis(),
         knowledge_docs,
         thread_docs,
+        roadmap_docs,
         "auto-reindex: store-doc phase complete"
     );
 

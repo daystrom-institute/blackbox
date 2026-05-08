@@ -125,6 +125,27 @@ pub(crate) fn tombstone_knowledge(entity_id: &str) {
     }
 }
 
+pub(crate) fn enqueue_roadmap(item: &crate::roadmap::RoadmapItem, entity_id: &str, chunk_hash: &str) {
+    enqueue(EmbedRequest {
+        bucket: Bucket::Knowledge, // reuses knowledge bucket for vector search
+        project_id: None,
+        entity_id: entity_id.to_string(),
+        chunk_hash: chunk_hash.to_string(),
+        text: format!("{}\n\n{}", item.title, item.body),
+    });
+}
+
+pub(crate) fn tombstone_roadmap(entity_id: &str) {
+    if let Some(queue) = queue_slot().read().as_ref() {
+        queue.tombstone(entity_id);
+    } else {
+        tracing::debug!(
+            entity_id,
+            "embedding queue not installed; accepted roadmap tombstone as no-op"
+        );
+    }
+}
+
 pub(crate) fn enqueue_project_file(chunk: &Chunk, entity_id: &str) {
     let bucket = if chunk.language.is_some() || chunk.chunk_kind == "code_block" {
         Bucket::Code

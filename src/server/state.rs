@@ -8,6 +8,7 @@ use crate::*;
 pub(crate) struct SharedState {
     pub(crate) idx: RwLock<TranscriptIndex>,
     pub(crate) kb: RwLock<Knowledge>,
+    pub(crate) roadmap: RwLock<Roadmap>,
     pub(crate) threads: RwLock<Threads>,
     pub(crate) notes: RwLock<Notes>,
     pub(crate) pins: RwLock<Pins>,

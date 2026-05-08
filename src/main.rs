@@ -34,6 +34,7 @@ mod providers;
 mod query;
 mod refactor;
 mod render;
+mod roadmap;
 mod routing;
 mod search;
 mod server;
@@ -88,6 +89,7 @@ use projects::{
     ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry, ProjectRenameParams,
 };
 use providers::ProviderContext;
+use roadmap::Roadmap;
 use threads::Threads;
 
 static AGENT_QUERY_EMBED_CACHE: OnceLock<RwLock<BTreeMap<String, Vec<f32>>>> = OnceLock::new();
@@ -111,7 +113,8 @@ impl BlackboxServer {
                 + tools::transcripts::router()
                 + tools::sessions::router()
                 + tools::knowledge::router()
-                + tools::render::router(),
+                + tools::render::router()
+                + tools::roadmap::router(),
         }
     }
 
@@ -8217,6 +8220,7 @@ async fn main() -> anyhow::Result<()> {
     let projects_path = util::blackbox_projects_path(&home);
     let kb_path = util::blackbox_knowledge_path(&home);
     let th_path = util::blackbox_threads_path(&home);
+    let rm_path = util::blackbox_roadmap_path(&home);
     let mut idx = TranscriptIndex::open_or_create(
         &index_path,
         roots,
@@ -8224,6 +8228,7 @@ async fn main() -> anyhow::Result<()> {
         projects_path.clone(),
         kb_path.clone(),
         th_path.clone(),
+        rm_path.clone(),
     )?;
     let projects_store = ProjectRegistry::open(&projects_path)?;
     tracing::info!("Project registry: {}", projects_path.display());
@@ -8283,6 +8288,9 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = idx.index_threads_store(&th) {
         tracing::warn!(error = %err, "thread index sync failed; will retry on next reindex cycle");
     }
+
+    let roadmap_store = Roadmap::open(&rm_path)?;
+    tracing::info!("Roadmap store: {}", rm_path.display());
 
     let notes_path = util::blackbox_notes_path(&home);
     let notes_store = Notes::open(&notes_path)?;
@@ -8351,6 +8359,7 @@ async fn main() -> anyhow::Result<()> {
             threads: &th,
             notes: &notes_store,
             task_store: &task_store,
+            roadmap: &roadmap_store,
             edges_dir: edge_index::edges_dir_from_bro_store(&store_dir),
             include_tantivy_projection: false,
         })
@@ -8364,6 +8373,7 @@ async fn main() -> anyhow::Result<()> {
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
         kb: RwLock::new(kb),
+        roadmap: RwLock::new(roadmap_store),
         threads: RwLock::new(th),
         notes: RwLock::new(notes_store),
         pins: RwLock::new(pins_store),

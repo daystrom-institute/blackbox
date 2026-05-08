@@ -8,10 +8,12 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         tmp.path().join("projects.json"),
         tmp.path().join("knowledge.json"),
         tmp.path().join("threads.json"),
+        tmp.path().join("roadmap.json"),
     )
     .unwrap();
     let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
     let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
+    let roadmap_store = Roadmap::open(&tmp.path().join("roadmap.json")).unwrap();
     let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
     let pins = Pins::open(&tmp.path().join("pins.json")).unwrap();
     let projects = ProjectRegistry::open(tmp.path().join("projects.json")).unwrap();
@@ -21,6 +23,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let state = Arc::new(SharedState {
         idx: RwLock::new(index),
         kb: RwLock::new(kb),
+        roadmap: RwLock::new(roadmap_store),
         threads: RwLock::new(threads),
         notes: RwLock::new(notes),
         pins: RwLock::new(pins),
@@ -1031,6 +1034,7 @@ async fn write_semantic_edge_projects_describes_sidecar() {
         threads: &server.state.threads.read(),
         notes: &server.state.notes.read(),
         task_store: &server.state.task_store.read(),
+        roadmap: &server.state.roadmap.read(),
         edges_dir,
         include_tantivy_projection: true,
     });

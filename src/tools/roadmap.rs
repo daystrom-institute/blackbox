@@ -1,0 +1,782 @@
+use crate::server::*;
+use crate::*;
+use rmcp::schemars;
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct RoadmapParams {
+    /// Roadmap operation: create, get, list, search, update, delete, next, promote, link, unlink, repair_links, or render.
+    pub(crate) action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) n: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) include_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) brofile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) project_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) link_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) link_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) link_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dry_run: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) write_path: Option<String>,
+}
+
+pub(crate) fn router() -> ToolRouter<BlackboxServer> {
+    BlackboxServer::roadmap_tools()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapCreateParams {
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) category: String,
+    #[serde(default)]
+    pub(crate) priority: Option<String>,
+    #[serde(default)]
+    pub(crate) scope: Option<String>,
+    pub(crate) project: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapUpdateParams {
+    pub(crate) id: String,
+    pub(crate) title: Option<String>,
+    pub(crate) body: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) category: Option<String>,
+    pub(crate) priority: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapLinkParams {
+    pub(crate) id: String,
+    pub(crate) link_type: String,
+    pub(crate) link_target: String,
+    pub(crate) link_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapUnlinkParams {
+    pub(crate) id: String,
+    pub(crate) link_type: String,
+    pub(crate) link_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapRepairLinksParams {
+    pub(crate) id: Option<String>,
+    #[serde(default)]
+    pub(crate) dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapNextParams {
+    #[serde(default)]
+    pub(crate) n: Option<usize>,
+    #[serde(default)]
+    pub(crate) include_blocked: bool,
+    pub(crate) project: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapPromoteParams {
+    pub(crate) id: String,
+    pub(crate) brofile: Option<String>,
+    pub(crate) project_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapGetParams {
+    pub(crate) id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapDeleteParams {
+    pub(crate) id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RoadmapSearchParams {
+    pub(crate) query: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) category: Option<String>,
+    pub(crate) project: Option<String>,
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+}
+
+#[tool_router(router = roadmap_tools)]
+impl BlackboxServer {
+    #[tool(
+        name = "bbox_roadmap",
+        description = "Manage the bbox roadmap — a prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Inbox is reactive (surprises, blockages); threads are active work; knowledge is atemporal. The roadmap tracks the *future*: accepted items awaiting promotion, deferred items with provenance, and proposed ideas awaiting review. Items link to design docs via ROADMAP_DESIGNED_IN edges and to threads via ROADMAP_SPAWNS edges."
+    )]
+    pub(crate) fn bbox_roadmap(
+        &self,
+        Parameters(p): Parameters<RoadmapParams>,
+    ) -> CallToolResult {
+        let start = std::time::Instant::now();
+        match (|| -> anyhow::Result<String> {
+            let action = p.action.as_str();
+            let params = serde_json::to_value(&p)?;
+
+            match action {
+                "create" => self.roadmap_create(serde_json::from_value(params)?),
+                "get" => self.roadmap_get(serde_json::from_value(params)?),
+                "list" => self.roadmap_list(serde_json::from_value(params)?),
+                "search" => self.roadmap_search(serde_json::from_value(params)?),
+                "update" => self.roadmap_update(serde_json::from_value(params)?),
+                "delete" => self.roadmap_delete(serde_json::from_value(params)?),
+                "next" => self.roadmap_next(serde_json::from_value(params)?),
+                "promote" => self.roadmap_promote(serde_json::from_value(params)?),
+                "link" => self.roadmap_link(serde_json::from_value(params)?),
+                "unlink" => self.roadmap_unlink(serde_json::from_value(params)?),
+                "repair_links" => self.roadmap_repair_links(serde_json::from_value(params)?),
+                "render" => self.roadmap_render(serde_json::from_value(params)?),
+                other => anyhow::bail!(
+                    "unknown action '{other}'. Valid: create, get, list, search, update, delete, next, promote, link, unlink, repair_links, render"
+                ),
+            }
+        })() {
+            Ok(text) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool = "bbox_roadmap", elapsed_ms = ms, bytes = text.len(), "ok");
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool = "bbox_roadmap", elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
+    }
+}
+
+impl BlackboxServer {
+    fn roadmap_create(&self, p: RoadmapCreateParams) -> anyhow::Result<String> {
+        let priority = roadmap::RoadmapPriority::parse(p.priority.as_deref().unwrap_or("medium"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let category = roadmap::RoadmapCategory::parse(&p.category)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let scope = p.scope.as_deref().unwrap_or("project").to_string();
+        if scope != "global" && scope != "project" {
+            anyhow::bail!("scope must be 'global' or 'project', got '{scope}'");
+        }
+        if scope == "project" && p.project.is_none() {
+            anyhow::bail!("scope='project' requires a 'project' path");
+        }
+
+        let mut rm = self.state.roadmap.write();
+
+        // List Before Create guard
+        if let Some(existing) = rm.find_by_title(&p.title) {
+            return Ok(serde_json::json!({
+                "duplicate": true,
+                "existing_id": existing.id,
+                "message": format!("Roadmap item with title '{}' already exists as {}. Use update instead.", p.title, existing.id)
+            })
+            .to_string());
+        }
+
+        let item = rm.create(
+            p.title.clone(),
+            p.body,
+            category,
+            priority,
+            scope,
+            p.project,
+            None,
+        )?;
+
+        // Sync to index + embed
+        let entity_id = crate::index::roadmap_entity_id(&item.id);
+        let chunk_hash = crate::index::roadmap_chunk_hash(item);
+        if let Err(err) = self.state.idx.write().index_roadmap_item(item) {
+            tracing::warn!(error = %err, item = %item.id, "roadmap index sync failed");
+        }
+        embed_queue::enqueue_roadmap(item, &entity_id, &chunk_hash);
+
+        Ok(serde_json::json!({
+            "id": item.id,
+            "title": item.title,
+            "status": item.status.as_str(),
+            "category": item.category.as_str(),
+            "priority": item.priority.as_str(),
+            "created_at": item.created_at,
+        })
+        .to_string())
+    }
+
+    fn roadmap_get(&self, p: RoadmapGetParams) -> anyhow::Result<String> {
+        let rm = self.state.roadmap.read();
+        let Some(item) = rm.item(&p.id) else {
+            anyhow::bail!("roadmap item '{}' not found", p.id);
+        };
+        let spawned_ids = rm.spawned_thread_ids(&p.id);
+        let status_label = if item.status == roadmap::RoadmapStatus::Accepted && !spawned_ids.is_empty() {
+            // We can't check thread state here; render as in_progress if there are spawns
+            "in_progress"
+        } else {
+            item.status.as_str()
+        };
+
+        Ok(serde_json::json!({
+            "id": item.id,
+            "title": item.title,
+            "body": item.body,
+            "status": status_label,
+            "stored_status": item.status.as_str(),
+            "category": item.category.as_str(),
+            "priority": item.priority.as_str(),
+            "scope": item.scope,
+            "project": item.project,
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+            "transitions": item.transitions.iter().map(|t| serde_json::json!({
+                "status": t.status.as_str(),
+                "at": t.at,
+                "note": t.note,
+                "actor": t.actor,
+                "source": t.source,
+            })).collect::<Vec<_>>(),
+            "edges": rm.edges_for(&p.id).iter().map(|e| serde_json::json!({
+                "from": e.from,
+                "to": e.to,
+                "kind": format!("{:?}", e.kind),
+                "note": e.note,
+                "at": e.at,
+            })).collect::<Vec<_>>(),
+            "spawned_thread_ids": spawned_ids,
+        })
+        .to_string())
+    }
+
+    fn roadmap_list(&self, p: RoadmapSearchParams) -> anyhow::Result<String> {
+        let rm = self.state.roadmap.read();
+        let items = rm.list(
+            p.status.as_deref(),
+            p.category.as_deref(),
+            p.project.as_deref(),
+        );
+        let limit = p.limit.unwrap_or(50).min(500);
+        let result: Vec<_> = items
+            .into_iter()
+            .take(limit)
+            .map(|item| {
+                let spawned_ids = rm.spawned_thread_ids(&item.id);
+                let status_label =
+                    if item.status == roadmap::RoadmapStatus::Accepted && !spawned_ids.is_empty() {
+                        "in_progress"
+                    } else {
+                        item.status.as_str()
+                    };
+                serde_json::json!({
+                    "id": item.id,
+                    "title": item.title,
+                    "status": status_label,
+                    "category": item.category.as_str(),
+                    "priority": item.priority.as_str(),
+                    "scope": item.scope,
+                    "spawned_thread_ids": spawned_ids,
+                    "blockers": rm.blocker_count(&item.id),
+                    "updated_at": item.updated_at,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "count": result.len(),
+            "items": result,
+        })
+        .to_string())
+    }
+
+    fn roadmap_search(&self, p: RoadmapSearchParams) -> anyhow::Result<String> {
+        let rm = self.state.roadmap.read();
+        let project_filter = |i: &&roadmap::RoadmapItem| -> bool {
+            if let Some(ref proj) = p.project {
+                if i.scope == "global" {
+                    return true;
+                }
+                if let Some(ref ip) = i.project {
+                    return ip.contains(proj.as_str());
+                }
+                return false;
+            }
+            true
+        };
+        let items = if let Some(q) = &p.query {
+            rm.search(q)
+        } else {
+            let all: Vec<&roadmap::RoadmapItem> = rm
+                .all_items()
+                .iter()
+                .filter(|i| match p.status.as_deref() {
+                    Some(s) => i.status.as_str() == s,
+                    None => true,
+                })
+                .filter(|i| match p.category.as_deref() {
+                    Some(c) => i.category.as_str() == c,
+                    None => true,
+                })
+                .filter(project_filter)
+                .collect();
+            all
+        };
+        let limit = p.limit.unwrap_or(50).min(500);
+        let result: Vec<_> = items
+            .into_iter()
+            .take(limit)
+            .map(|item| {
+                serde_json::json!({
+                    "id": item.id,
+                    "title": item.title,
+                    "status": item.status.as_str(),
+                    "category": item.category.as_str(),
+                    "priority": item.priority.as_str(),
+                    "updated_at": item.updated_at,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "count": result.len(),
+            "items": result,
+        })
+        .to_string())
+    }
+
+    fn roadmap_update(&self, p: RoadmapUpdateParams) -> anyhow::Result<String> {
+        let status = match p.status.as_deref() {
+            Some(s) => Some(
+                roadmap::RoadmapStatus::parse(s)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            ),
+            None => None,
+        };
+        let category = match p.category.as_deref() {
+            Some(c) => Some(
+                roadmap::RoadmapCategory::parse(c)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            ),
+            None => None,
+        };
+        let priority = match p.priority.as_deref() {
+            Some("high") | Some("High") => Some(roadmap::RoadmapPriority::High),
+            Some("medium") | Some("Medium") => Some(roadmap::RoadmapPriority::Medium),
+            Some("low") | Some("Low") => Some(roadmap::RoadmapPriority::Low),
+            Some(other) => anyhow::bail!("unknown priority '{other}'"),
+            None => None,
+        };
+
+        let mut rm = self.state.roadmap.write();
+        let item = rm.update(&p.id, p.title, p.body, status, category, priority, None, None)?;
+
+        // Sync to index
+        let entity_id = crate::index::roadmap_entity_id(&item.id);
+        let chunk_hash = crate::index::roadmap_chunk_hash(&item);
+        if let Err(err) = self.state.idx.write().index_roadmap_item(&item) {
+            tracing::warn!(error = %err, item = %item.id, "roadmap index sync failed");
+        }
+        embed_queue::enqueue_roadmap(&item, &entity_id, &chunk_hash);
+
+        Ok(serde_json::json!({
+            "id": item.id,
+            "title": item.title,
+            "status": item.status.as_str(),
+            "category": item.category.as_str(),
+            "priority": item.priority.as_str(),
+            "updated_at": item.updated_at,
+        })
+        .to_string())
+    }
+
+    fn roadmap_delete(&self, p: RoadmapDeleteParams) -> anyhow::Result<String> {
+        let mut rm = self.state.roadmap.write();
+        let entity_id = crate::index::roadmap_entity_id(&p.id);
+        rm.delete(&p.id)?;
+
+        // Tombstone in index
+        if let Err(err) = self.state.idx.write().delete_roadmap_item(&p.id) {
+            tracing::warn!(error = %err, item = %p.id, "roadmap index delete failed");
+        }
+        embed_queue::tombstone_roadmap(&entity_id);
+
+        Ok(serde_json::json!({
+            "deleted": p.id,
+        })
+        .to_string())
+    }
+
+    fn roadmap_next(&self, p: RoadmapNextParams) -> anyhow::Result<String> {
+        let rm = self.state.roadmap.read();
+        let n = p.n.unwrap_or(5);
+
+        // Apply project filter before scoring, then rank by the store's next()
+        let items = rm.next(n, p.include_blocked);
+
+        let result: Vec<_> = items
+            .iter()
+            .filter(|item| {
+                if let Some(ref proj) = p.project {
+                    if item.scope == "global" {
+                        return true;
+                    }
+                    if let Some(ref ip) = item.project {
+                        return ip.contains(proj.as_str());
+                    }
+                    return false;
+                }
+                true
+            })
+            .map(|item| {
+                serde_json::json!({
+                    "id": item.id,
+                    "title": item.title,
+                    "priority": item.priority.as_str(),
+                    "category": item.category.as_str(),
+                    "blockers": rm.blocker_count(&item.id),
+                    "created_at": item.created_at,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "count": result.len(),
+            "items": result,
+        })
+        .to_string())
+    }
+
+    fn roadmap_promote(&self, p: RoadmapPromoteParams) -> anyhow::Result<String> {
+        let rm = self.state.roadmap.read();
+        let Some(item) = rm.item(&p.id) else {
+            anyhow::bail!("roadmap item '{}' not found", p.id);
+        };
+        let item = item.clone();
+        let canonical_from = format!("roadmap_item:{}", p.id);
+
+        // Check idempotency: existing unresolved spawns
+        let existing_spawns = rm.spawned_thread_ids(&p.id);
+        drop(rm);
+
+        if !existing_spawns.is_empty() {
+            return Ok(serde_json::json!({
+                "already_promoted": true,
+                "existing_thread_ids": existing_spawns,
+                "message": format!("Item already promoted with {} thread(s). Use bro_resume to continue.", existing_spawns.len())
+            })
+            .to_string());
+        }
+
+        // Open a thread with the item's context injected
+        let thread_topic = format!("[roadmap] {}", item.title);
+        let thread_note = format!(
+            "**Roadmap item:** {} ({})\n**Priority:** {}\n**Category:** {}\n\n{}",
+            item.title,
+            item.id,
+            item.priority.as_str(),
+            item.category.as_str(),
+            item.body,
+        );
+
+        let mut th = self.state.threads.write();
+        let params = threads::ThreadParams {
+            action: "open".into(),
+            topic: Some(thread_topic),
+            kind: Some("work_item".into()),
+            project: p.project_dir.or(item.project.clone()),
+            handoff_doc: Some(thread_note),
+            name: None,
+            id: None,
+            session_id: None,
+            provider: None,
+            session_name: None,
+            edge: None,
+            target: None,
+            target_type: None,
+            note: None,
+            promoted_to: None,
+        };
+        let result = th.thread(&params)?;
+        drop(th);
+
+        // Parse thread id from result string: "Thread created: <id> — \"<topic>\""
+        let thread_id = result
+            .strip_prefix("Thread created: ")
+            .and_then(|s| s.split(" — ").next())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("failed to parse thread id from: {}", result))?;
+
+        // Record the SPOWNS edge
+        let mut rm = self.state.roadmap.write();
+        rm.add_edge(
+            canonical_from.clone(),
+            format!("thread:{thread_id}"),
+            roadmap::RoadmapEdgeKind::Spawns,
+            Some(format!("Promoted from roadmap item {}", p.id)),
+            None,
+            None,
+        )?;
+
+        Ok(serde_json::json!({
+            "id": item.id,
+            "title": item.title,
+            "thread_id": thread_id,
+            "message": format!("Promoted '{}' to thread {}", item.title, thread_id),
+        })
+        .to_string())
+    }
+
+    fn roadmap_link(&self, p: RoadmapLinkParams) -> anyhow::Result<String> {
+        let edge_kind = roadmap::RoadmapEdgeKind::parse(&p.link_type)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Domain validation using EntityRef::parse
+        let target_ref = crate::entity_ref::EntityRef::parse(&p.link_target)
+            .map_err(|e| anyhow::anyhow!("invalid link_target '{}': {e}", p.link_target))?;
+
+        match edge_kind {
+            roadmap::RoadmapEdgeKind::Spawns => {
+                if !matches!(target_ref, crate::entity_ref::EntityRef::Thread { .. }) {
+                    anyhow::bail!("spawns link target must be a thread entity ref (thread:<id>)");
+                }
+            }
+            roadmap::RoadmapEdgeKind::DeferredFrom => {
+                if !matches!(target_ref,
+                    crate::entity_ref::EntityRef::Thread { .. } | crate::entity_ref::EntityRef::Knowledge { .. }
+                ) {
+                    anyhow::bail!("deferred_from link target must be a thread or knowledge entity ref");
+                }
+            }
+            roadmap::RoadmapEdgeKind::DesignedIn => {
+                if !matches!(target_ref, crate::entity_ref::EntityRef::ProjectFile { .. }) {
+                    anyhow::bail!("designed_in link target must be a project_file entity ref");
+                }
+            }
+            roadmap::RoadmapEdgeKind::DependsOn
+            | roadmap::RoadmapEdgeKind::BlockedBy
+            | roadmap::RoadmapEdgeKind::Supersedes
+            | roadmap::RoadmapEdgeKind::Subsumes
+            | roadmap::RoadmapEdgeKind::RelatedTo => {
+                if !matches!(target_ref, crate::entity_ref::EntityRef::RoadmapItem { .. }) {
+                    anyhow::bail!(
+                        "{} link target must be a roadmap_item entity ref (roadmap_item:<id>)",
+                        p.link_type
+                    );
+                }
+            }
+        };
+
+        let canonical_from = format!("roadmap_item:{}", p.id);
+
+        // Validate source item exists
+        let mut rm = self.state.roadmap.write();
+        if rm.item(&p.id).is_none() {
+            anyhow::bail!("source roadmap item '{}' not found", p.id);
+        }
+
+        // For designed_in edges, try to capture file_path from the project_file ref
+        let (file_path, section_anchor) = if edge_kind == roadmap::RoadmapEdgeKind::DesignedIn {
+            let path = resolve_project_file_path(&self.state, &p.link_target)?;
+            (path, None)
+        } else {
+            (None, None)
+        };
+
+        rm.add_edge(
+            canonical_from,
+            p.link_target.clone(),
+            edge_kind,
+            p.link_note,
+            file_path,
+            section_anchor,
+        )?;
+
+        Ok(serde_json::json!({
+            "from": format!("roadmap_item:{}", p.id),
+            "to": p.link_target,
+            "link_type": p.link_type,
+        })
+        .to_string())
+    }
+
+    fn roadmap_unlink(&self, p: RoadmapUnlinkParams) -> anyhow::Result<String> {
+        let edge_kind = roadmap::RoadmapEdgeKind::parse(&p.link_type)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let canonical_from = format!("roadmap_item:{}", p.id);
+        let mut rm = self.state.roadmap.write();
+        rm.remove_edge(&canonical_from, &p.link_target, edge_kind)?;
+
+        Ok(serde_json::json!({
+            "from": canonical_from,
+            "to": p.link_target,
+            "link_type": p.link_type,
+            "removed": true,
+        })
+        .to_string())
+    }
+
+    fn roadmap_repair_links(&self, p: RoadmapRepairLinksParams) -> anyhow::Result<String> {
+        let rm = self.state.roadmap.read();
+        let edges: Vec<crate::roadmap::RoadmapEdge> = rm
+            .designed_in_edges(p.id.as_deref())
+            .into_iter()
+            .cloned()
+            .collect();
+        drop(rm);
+
+        let mut repaired = 0;
+        let mut unresolved = 0;
+
+        // Fetch all project_file docs once
+        let project_docs = self.state.idx.read().embedding_source_docs_for_doc_types(
+            &["project_file"],
+            None, // no limit — scan all
+        ).unwrap_or_default();
+
+        for edge in &edges {
+            // Refuse repair without a stored file_path or entity ref
+            let file_path_hint = edge.file_path.as_deref().unwrap_or("");
+            let target_entity = &edge.to;
+
+            if file_path_hint.is_empty() {
+                // No stored path — try exact entity-id match only
+                let exact_match = project_docs
+                    .iter()
+                    .find(|d| d.entity_id.as_deref() == Some(target_entity.as_str()));
+
+                if let Some(matched) = exact_match {
+                    if !p.dry_run {
+                        let mut rm2 = self.state.roadmap.write();
+                        rm2.update_edge_metadata(
+                            &edge.from, &edge.to,
+                            matched.entity_id.clone(),
+                            Some(matched.file_path.clone()),
+                            None,
+                        )?;
+                    }
+                    repaired += 1;
+                } else {
+                    unresolved += 1;
+                }
+                continue;
+            }
+
+            // Has stored file_path — find by path match then verify entity
+            let best_match = project_docs
+                .iter()
+                .filter(|d| d.file_path.contains(file_path_hint))
+                .next();
+
+            if let Some(matched) = best_match {
+                if !p.dry_run {
+                    let mut rm2 = self.state.roadmap.write();
+                    rm2.update_edge_metadata(
+                        &edge.from, &edge.to,
+                        matched.entity_id.clone(),
+                        Some(matched.file_path.clone()),
+                        None,
+                    )?;
+                }
+                repaired += 1;
+            } else {
+                unresolved += 1;
+            }
+        }
+
+        Ok(serde_json::json!({
+            "total_edges": edges.len(),
+            "repaired": repaired,
+            "unresolved": unresolved,
+            "dry_run": p.dry_run,
+        })
+        .to_string())
+    }
+
+    fn roadmap_render(&self, p: serde_json::Value) -> anyhow::Result<String> {
+        let project = p.get("project").and_then(|v| v.as_str()).unwrap_or("blackbox");
+        let write_path = p.get("write_path").and_then(|v| v.as_str());
+
+        let rm = self.state.roadmap.read();
+        let th = self.state.threads.read();
+
+        // Pre-compute spawn status for all items
+        let spawn_data: std::collections::HashMap<String, Vec<(String, bool)>> = rm
+            .all_items()
+            .iter()
+            .map(|item| {
+                let thread_ids = rm.spawned_thread_ids(&item.id);
+                if thread_ids.is_empty() {
+                    return (item.id.clone(), Vec::new());
+                }
+                let mut resolved = Vec::new();
+                for tid in &thread_ids {
+                    let raw = tid.strip_prefix("thread:").unwrap_or(tid);
+                    let is_resolved = th
+                        .all()
+                        .iter()
+                        .any(|t| t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved));
+                    resolved.push((tid.clone(), is_resolved));
+                }
+                (item.id.clone(), resolved)
+            })
+            .collect();
+
+        let spawn = |id: &str| -> Option<Vec<(String, bool)>> {
+            let data = spawn_data.get(id)?;
+            if data.is_empty() { None } else { Some(data.clone()) }
+        };
+
+        let md = rm.render_markdown(project, &spawn);
+
+        if let Some(path) = write_path {
+            std::fs::write(path, &md)
+                .map_err(|e| anyhow::anyhow!("failed to write ROADMAP.md to {path}: {e}"))?;
+            Ok(serde_json::json!({
+                "written": path,
+                "bytes": md.len(),
+            })
+            .to_string())
+        } else {
+            Ok(md)
+        }
+    }
+}
+
+/// Resolve a project_file entity ref to its file path by querying the tantivy index.
+fn resolve_project_file_path(state: &crate::SharedState, entity_ref: &str) -> anyhow::Result<Option<String>> {
+    if let Ok(results) = state.idx.read().embedding_source_docs_for_doc_types(
+        &["project_file"],
+        Some(5),
+    ) {
+        for doc in &results {
+            if doc.entity_id.as_deref() == Some(entity_ref) {
+                return Ok(Some(doc.file_path.clone()));
+            }
+        }
+    }
+    Ok(None)
+}

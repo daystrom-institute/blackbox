@@ -6,6 +6,7 @@ pub mod commit;
 pub mod knowledge;
 pub mod note;
 pub mod project_file;
+pub mod roadmap_item;
 pub mod session;
 pub mod symbol;
 pub mod thread;
@@ -130,6 +131,7 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(virtual_task::TaskProvider),
             Box::new(virtual_bash_call::BashCallProvider),
             Box::new(agent::AgentProvider),
+            Box::new(roadmap_item::RoadmapItemProvider),
         ]
     })
 }

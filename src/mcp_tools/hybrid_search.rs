@@ -484,7 +484,7 @@ fn queue_status_for_hybrid(
 
 fn status_buckets_for_doc_type(doc_type: Option<&str>) -> Option<Vec<Bucket>> {
     match doc_type?.trim() {
-        "knowledge" => Some(vec![Bucket::Knowledge]),
+        "knowledge" | "roadmap" => Some(vec![Bucket::Knowledge]),
         "thread" => Some(vec![Bucket::Threads]),
         "note" => Some(vec![Bucket::Notes]),
         "commit" => Some(vec![Bucket::GitMessage]),

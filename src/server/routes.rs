@@ -1199,6 +1199,7 @@ pub(crate) fn rebuild_edge_index_from_shared(
         threads: &threads,
         notes: &notes,
         task_store: &task_store,
+        roadmap: &state.roadmap.read(),
         edges_dir,
         include_tantivy_projection,
     });

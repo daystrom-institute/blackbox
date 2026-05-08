@@ -78,6 +78,7 @@ pub struct ReindexConfig {
     pub projects_path: PathBuf,
     pub knowledge_path: PathBuf,
     pub threads_path: PathBuf,
+    pub roadmap_path: PathBuf,
 }
 
 pub struct TranscriptIndex {
@@ -142,6 +143,7 @@ impl TranscriptIndex {
         projects_path: PathBuf,
         knowledge_path: PathBuf,
         threads_path: PathBuf,
+        roadmap_path: PathBuf,
     ) -> Result<Self> {
         reset_index_on_schema_mismatch(index_path)?;
         let meta_path = index_path.join("_meta.json");
@@ -176,6 +178,7 @@ impl TranscriptIndex {
             projects_path,
             knowledge_path,
             threads_path,
+            roadmap_path,
         };
 
         Ok(Self {
@@ -220,6 +223,28 @@ impl TranscriptIndex {
 
     pub(crate) fn delete_knowledge_entry(&mut self, entry_id: &str) -> Result<()> {
         knowledge_docs::delete_knowledge_entry(&self.index, self.fields, entry_id)?;
+        self.reader.reload()?;
+        *self.stats_cache.lock() = None;
+        Ok(())
+    }
+
+    pub(crate) fn index_roadmap_item(
+        &mut self,
+        item: &crate::roadmap::RoadmapItem,
+    ) -> Result<()> {
+        roadmap_docs::upsert_roadmap_item(
+            &self.index,
+            self.fields,
+            &self.config.roadmap_path,
+            item,
+        )?;
+        self.reader.reload()?;
+        *self.stats_cache.lock() = None;
+        Ok(())
+    }
+
+    pub(crate) fn delete_roadmap_item(&mut self, item_id: &str) -> Result<()> {
+        roadmap_docs::delete_roadmap_item(&self.index, self.fields, item_id)?;
         self.reader.reload()?;
         *self.stats_cache.lock() = None;
         Ok(())
@@ -605,6 +630,7 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
         )
         .unwrap();
 
@@ -627,6 +653,7 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
         )
         .unwrap();
 
@@ -646,6 +673,7 @@ mod tests {
             dir.path().join("projects.json"),
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
         )
         .unwrap();
         let project = crate::projects::ProjectRecord {
@@ -708,6 +736,7 @@ mod tests {
             dir.path().join("projects.json"),
             knowledge_path.clone(),
             dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
         )
         .unwrap();
         let entry = crate::knowledge::KnowledgeEntry {
@@ -780,12 +809,14 @@ mod helpers;
 mod knowledge_docs;
 mod project_files;
 mod reindex;
+mod roadmap_docs;
 mod search;
 mod thread_docs;
 mod tool_edges;
 
 pub use helpers::find_session_file;
 pub(crate) use knowledge_docs::{knowledge_chunk_hash, knowledge_entity_id};
+pub(crate) use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};
 pub use reindex::spawn_reindex_thread;
 pub use search::{
     CiteParams, ContextParams, HybridBm25Hit, MessagesParams, ReindexParams, SearchParams,

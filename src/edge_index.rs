@@ -14,6 +14,7 @@ use crate::index::{EdgeProjectionDoc, TranscriptIndex};
 use crate::knowledge::{Knowledge, KnowledgeEdgeKind};
 use crate::notes::Notes;
 use crate::orchestration::TaskStore;
+use crate::roadmap::Roadmap;
 use crate::threads::{EdgeKind, EdgeTarget, Threads};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -41,6 +42,7 @@ pub struct EdgeStoreRefs<'a> {
     pub threads: &'a Threads,
     pub notes: &'a Notes,
     pub task_store: &'a TaskStore,
+    pub roadmap: &'a Roadmap,
     pub edges_dir: PathBuf,
     pub include_tantivy_projection: bool,
 }
@@ -55,6 +57,7 @@ impl EdgeIndex {
         index.project_thread_edges(stores.threads, &mut seen);
         index.project_note_edges(stores.notes, &mut seen);
         index.project_task_edges(stores.task_store, &mut seen);
+        index.project_roadmap_edges(stores.roadmap, &mut seen);
         if stores.include_tantivy_projection {
             if let Ok(docs) = stores.index.edge_projection_docs() {
                 index.project_tantivy_edges(&docs, &mut seen);
@@ -369,6 +372,33 @@ impl EdgeIndex {
                     },
                     EdgeProvenance::Derived,
                 ),
+                seen,
+            );
+        }
+    }
+
+    fn project_roadmap_edges(&mut self, roadmap: &Roadmap, seen: &mut HashSet<Edge>) {
+        for edge in roadmap.all_edges() {
+            let source = match EntityRef::parse(&edge.from) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let target = match EntityRef::parse(&edge.to) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let kind = match edge.kind {
+                crate::roadmap::RoadmapEdgeKind::Spawns => "ROADMAP_SPAWNS",
+                crate::roadmap::RoadmapEdgeKind::DeferredFrom => "ROADMAP_DEFERRED_FROM",
+                crate::roadmap::RoadmapEdgeKind::DesignedIn => "ROADMAP_DESIGNED_IN",
+                crate::roadmap::RoadmapEdgeKind::DependsOn => "ROADMAP_DEPENDS_ON",
+                crate::roadmap::RoadmapEdgeKind::BlockedBy => "ROADMAP_BLOCKED_BY",
+                crate::roadmap::RoadmapEdgeKind::Supersedes => "ROADMAP_SUPERSEDES",
+                crate::roadmap::RoadmapEdgeKind::Subsumes => "ROADMAP_SUBSUMES",
+                crate::roadmap::RoadmapEdgeKind::RelatedTo => "ROADMAP_RELATED_TO",
+            };
+            self.insert(
+                exact_edge(source, kind, target, EdgeProvenance::Derived),
                 seen,
             );
         }
