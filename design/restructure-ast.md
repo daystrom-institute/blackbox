@@ -381,6 +381,10 @@ bbox_refactor_run(
 For later domains, first ground `src/tools/mod.rs` and use
 `add_rust_mod_decl` with `visibility="pub"` to add exactly one new
 `pub mod <domain>;` line without rewriting existing domain declarations.
+Async tool methods, such as `bbox_artifact_install`, are valid candidates here:
+`extract_rust_impl_methods` preserves the `async` modifier and
+`rewrite_rust_item_visibility` must preserve modifiers while changing only the
+visibility prefix.
 
 Checkpoint after each domain. Do not batch many domains in one checkpoint.
 

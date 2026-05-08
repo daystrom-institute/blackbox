@@ -38,8 +38,9 @@ Writable plan kinds:
   is not already present; use it for child-module imports needed by derives and
   external crates.
 - `extract_rust_impl_methods`: move named methods out of one `impl` block into
-  another file, preserving method attributes and optionally generating a
-  `#[tool_router(router = name)]` wrapper around the moved methods.
+  another file, preserving method attributes/modifiers such as `async` and
+  optionally generating a `#[tool_router(router = name)]` wrapper around the
+  moved methods.
 - `delete_rust_items`: delete named top-level Rust items or named impl methods
   in place. `item_names` is required; use `item_kinds` only to narrow matches.
   Use `item_kinds=["impl_method"]` plus `impl_name` when method names are
@@ -65,7 +66,9 @@ Writable plan kinds:
   after extracting items into child modules when the parent must still call
   helper functions, constructors, or inherent methods. To promote every method
   in one impl block, omit `item_names` and pass
-  `item_kinds=["impl_method"]` plus `impl_name`.
+  `item_kinds=["impl_method"]` plus `impl_name`. The rewrite preserves Rust
+  qualifiers such as `async`, `unsafe`, or `const` while changing only the
+  visibility prefix.
 - `rewrite_rust_field_visibility`: rewrite every named field in one or more
   selected Rust structs to requested visibility. Pass `item_names` as the
   struct names, for example `item_names=["SharedState","BlackboxServer"]`,

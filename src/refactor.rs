@@ -1985,13 +1985,15 @@ fn plan_rewrite_rust_item_visibility(p: &RefactorPlanParams) -> Result<String> {
         let keyword = rust_visibility_keyword_byte(&parsed.source, item)?;
         let visibility_start = rust_item_visibility_start_byte(&parsed.source, item, keyword);
         let current_prefix = &parsed.source[visibility_start..keyword];
-        if current_prefix == visibility {
+        let qualifier_prefix = rust_strip_visibility_prefix(current_prefix);
+        let replacement = format!("{visibility}{qualifier_prefix}");
+        if current_prefix == replacement {
             continue;
         }
         edits.push(TextEdit {
             byte_start: visibility_start,
             byte_end: keyword,
-            replacement: visibility.to_string(),
+            replacement,
         });
     }
     if edits.is_empty() {
@@ -2753,6 +2755,23 @@ fn rust_decl_visibility_prefix(visibility: Option<&str>) -> Result<&'static str>
             bail!("unsupported Rust visibility `{other}`; supported: pub, pub(crate), pub(super)")
         }
     }
+}
+
+fn rust_strip_visibility_prefix(prefix: &str) -> &str {
+    for visibility in ["pub ", "pub(crate) ", "pub(super) "] {
+        if let Some(rest) = prefix.strip_prefix(visibility) {
+            return rest;
+        }
+    }
+    if let Some(rest) = prefix.strip_prefix("pub(") {
+        if let Some(close) = rest.find(')') {
+            let after_close = close + 1;
+            if rest[after_close..].starts_with(' ') {
+                return &rest[after_close + 1..];
+            }
+        }
+    }
+    prefix
 }
 
 fn rust_visibility_keyword_byte(source: &str, item: &SyntaxItem) -> Result<usize> {
@@ -4423,6 +4442,55 @@ mod tests {
     }
 
     #[test]
+    fn extract_impl_methods_preserves_async_modifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("tools.rs");
+        fs::write(
+            &source,
+            "struct BlackboxServer;\n\nimpl BlackboxServer {\n    #[tool(description = \"move\")]\n    async fn move_me(&self) -> usize {\n        1\n    }\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl BlackboxServer".into()),
+            module_name: None,
+            visibility: None,
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: Some("use super::*;".into()),
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.contains("async fn move_me"));
+    }
+
+    #[test]
     fn extract_impl_methods_can_generate_router_export_helper() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -5663,6 +5731,56 @@ mod tests {
         assert!(fs::read_to_string(&source)
             .unwrap()
             .contains("impl Thing { pub(super) fn hidden(&self) {} }"));
+    }
+
+    #[test]
+    fn rewrite_rust_item_visibility_updates_async_impl_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "struct Thing;\nimpl Thing { async fn hidden(&self) {} }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_item_visibility".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["hidden".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl Thing".into()),
+            module_name: None,
+            visibility: Some("pub(super)".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert!(fs::read_to_string(&source)
+            .unwrap()
+            .contains("impl Thing { pub(super) async fn hidden(&self) {} }"));
     }
 
     #[test]
