@@ -314,5 +314,8 @@ Fix:
 
 - Install a shutdown token shared by background reindex, vector warmup, edge
   watcher, and orchestration workers.
-- Make loops check the token and exit promptly.
+- Make loops check the token and exit promptly. Initial mitigation: HTTP
+  graceful shutdown is now bounded by `BLACKBOX_SHUTDOWN_GRACE_SECS` (default
+  15), after which the daemon proceeds to the persistence/flush shutdown path.
+  The embed queue is also signaled to stop before task/vector flush.
 - Join or detach known background workers deliberately during shutdown.

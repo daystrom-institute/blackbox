@@ -8725,31 +8725,53 @@ async fn main() -> anyhow::Result<()> {
         "blackboxd listening on http://{bind_host}:{port}/mcp (loopback={bind_is_loopback})"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            // Wait for either Ctrl-C (interactive) or SIGTERM (systemd
-            // stop). Without the SIGTERM branch, `systemctl stop` would
-            // not signal graceful shutdown and would rely on the
-            // TimeoutStopSec SIGKILL.
-            #[cfg(unix)]
-            {
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("install SIGTERM handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = sigterm.recv() => {}
-                }
+    let shutdown_grace = std::env::var("BLACKBOX_SHUTDOWN_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(15));
+    let signal_ct = ct.clone();
+    tokio::spawn(async move {
+        // Wait for either Ctrl-C (interactive) or SIGTERM (systemd
+        // stop). Without the SIGTERM branch, `systemctl stop` would
+        // not signal graceful shutdown and would rely on the
+        // TimeoutStopSec SIGKILL.
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
             }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c().await.ok();
-            }
-            ct.cancel();
-        })
-        .await?;
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+        }
+        signal_ct.cancel();
+    });
+
+    let graceful_ct = ct.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        graceful_ct.cancelled().await;
+    });
+    tokio::select! {
+        result = server => result?,
+        _ = async {
+            ct.cancelled().await;
+            tokio::time::sleep(shutdown_grace).await;
+        } => {
+            tracing::warn!(
+                grace_secs = shutdown_grace.as_secs(),
+                "HTTP graceful shutdown timed out; forcing daemon shutdown path"
+            );
+        }
+    }
 
     // Persist tasks on shutdown
+    embed_queue::shutdown();
     shared.task_store.read().persist(&store_dir);
     // Best-effort vector-partition force-flush with a short timeout.
     // The earlier unconditional `vectors::global().flush_all()` could

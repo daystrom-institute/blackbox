@@ -33,6 +33,12 @@ pub(crate) fn install(handle: EmbedQueueHandle) {
     *queue_slot().write() = Some(handle);
 }
 
+pub(crate) fn shutdown() {
+    if let Some(handle) = queue_slot().read().clone() {
+        handle.shutdown();
+    }
+}
+
 pub(crate) fn install_contradiction_state(state: std::sync::Arc<SharedState>) {
     *CONTRADICTION_STATE
         .get_or_init(|| RwLock::new(None))
