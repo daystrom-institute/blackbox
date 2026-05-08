@@ -63,7 +63,14 @@ Writable plan kinds:
   `pub(crate)`, or `pub(super)`). Use `item_kinds=["impl_method"]` plus
   `impl_name` when method names are ambiguous across impl blocks. Use this
   after extracting items into child modules when the parent must still call
-  helper functions, constructors, or inherent methods.
+  helper functions, constructors, or inherent methods. To promote every method
+  in one impl block, omit `item_names` and pass
+  `item_kinds=["impl_method"]` plus `impl_name`.
+- `rewrite_rust_field_visibility`: rewrite every named field in one or more
+  selected Rust structs to requested visibility. Pass `item_names` as the
+  struct names, for example `item_names=["SharedState","BlackboxServer"]`,
+  with `visibility="pub(crate)"` after moving state structs into child modules
+  while existing sibling modules still access their fields.
 - `rust_lsp_rename`: rename a Rust symbol through rust-analyzer. Pass
   `item_names=["old_name"]` or `old_text="old_name"` plus
   `new_text="new_name"` and `source` pointing at a file containing the symbol

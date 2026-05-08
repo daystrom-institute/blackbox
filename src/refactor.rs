@@ -377,6 +377,12 @@ struct RustImplMethod {
     item: SyntaxItem,
 }
 
+#[derive(Debug, Clone)]
+struct RustStructField {
+    name_byte_start: usize,
+    item: SyntaxItem,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TargetImplInsertion {
     byte: usize,
@@ -516,6 +522,7 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "copy_rust_mod_decls" => plan_copy_rust_mod_decls(p),
         "rewrite_rust_mod_visibility" => plan_rewrite_rust_mod_visibility(p),
         "rewrite_rust_item_visibility" => plan_rewrite_rust_item_visibility(p),
+        "rewrite_rust_field_visibility" => plan_rewrite_rust_field_visibility(p),
         "rust_lsp_rename" => plan_rust_lsp_rename(p),
         "rust_organize_imports" => plan_rust_organize_imports(p),
         "move_file" => plan_move_file(p),
@@ -523,7 +530,7 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rust_lsp_rename, rust_organize_imports, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
@@ -2017,6 +2024,94 @@ fn plan_rewrite_rust_item_visibility(p: &RefactorPlanParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+fn plan_rewrite_rust_field_visibility(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let parsed = parse_rust_file(&source_path)?;
+    let struct_names = p
+        .item_names
+        .as_deref()
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| anyhow!("item_names must name one or more Rust structs"))?;
+    let struct_name_set = struct_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let struct_items = rust_items(&parsed)
+        .into_iter()
+        .filter(|item| {
+            item.kind == "struct_item"
+                && item
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| struct_name_set.contains(name))
+        })
+        .collect::<Vec<_>>();
+    if struct_items.is_empty() {
+        bail!("no matching Rust structs found");
+    }
+    for name in struct_names {
+        if !struct_items
+            .iter()
+            .any(|item| item.name.as_deref() == Some(name.as_str()))
+        {
+            bail!("requested struct `{name}` was not found");
+        }
+    }
+
+    let mut fields = Vec::new();
+    for struct_item in &struct_items {
+        fields.extend(rust_named_struct_fields(&parsed, struct_item)?);
+    }
+    if fields.is_empty() {
+        bail!("no named struct fields found");
+    }
+
+    let mut edits = Vec::new();
+    for field in &fields {
+        let visibility_start =
+            rust_item_visibility_start_byte(&parsed.source, &field.item, field.name_byte_start);
+        let current_prefix = &parsed.source[visibility_start..field.name_byte_start];
+        if current_prefix == visibility {
+            continue;
+        }
+        edits.push(TextEdit {
+            byte_start: visibility_start,
+            byte_end: field.name_byte_start,
+            replacement: visibility.to_string(),
+        });
+    }
+    if edits.is_empty() {
+        bail!("all selected Rust fields already have requested visibility");
+    }
+    ensure_non_overlapping(&edits)?;
+    let plan = RefactorPlan {
+        title: format!(
+            "rewrite visibility for {} Rust struct field(s) in {}",
+            fields.len(),
+            path_string(&source_path)
+        ),
+        kind: "rewrite_rust_field_visibility".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits,
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: fields.into_iter().map(|field| field.item).collect(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
 fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let target_path = p
@@ -3017,6 +3112,70 @@ fn rust_impl_methods_in(parsed: &ParsedSource, impl_node: Node<'_>) -> Vec<RustI
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+fn rust_named_struct_fields(
+    parsed: &ParsedSource,
+    struct_item: &SyntaxItem,
+) -> Result<Vec<RustStructField>> {
+    let struct_name = struct_item
+        .name
+        .clone()
+        .ok_or_else(|| anyhow!("selected struct has no name"))?;
+    let struct_node = rust_node_by_range(
+        parsed.tree.root_node(),
+        "struct_item",
+        struct_item.byte_start,
+        struct_item.byte_end,
+    )
+    .ok_or_else(|| anyhow!("could not locate tree-sitter node for struct `{struct_name}`"))?;
+    let mut fields = Vec::new();
+    collect_rust_named_struct_fields(parsed, struct_node, &mut fields)?;
+    Ok(fields)
+}
+
+fn collect_rust_named_struct_fields(
+    parsed: &ParsedSource,
+    node: Node<'_>,
+    fields: &mut Vec<RustStructField>,
+) -> Result<()> {
+    if node.kind() == "field_declaration" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let mut item = syntax_item_with_kind(parsed, node, "field_declaration");
+            item.name = Some(name_node.utf8_text(parsed.source.as_bytes())?.to_string());
+            fields.push(RustStructField {
+                name_byte_start: name_node.start_byte(),
+                item,
+            });
+        }
+        return Ok(());
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_rust_named_struct_fields(parsed, child, fields)?;
+    }
+    Ok(())
+}
+
+fn rust_node_by_range<'a>(
+    node: Node<'a>,
+    kind: &str,
+    byte_start: usize,
+    byte_end: usize,
+) -> Option<Node<'a>> {
+    if node.kind() == kind && node.start_byte() == byte_start && node.end_byte() == byte_end {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() > byte_start || child.end_byte() < byte_end {
+            continue;
+        }
+        if let Some(found) = rust_node_by_range(child, kind, byte_start, byte_end) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn generic_top_level_items(parsed: &ParsedSource) -> Vec<SyntaxItem> {
@@ -5502,6 +5661,107 @@ mod tests {
         assert!(fs::read_to_string(&source)
             .unwrap()
             .contains("impl Thing { pub(super) fn hidden(&self) {} }"));
+    }
+
+    #[test]
+    fn rewrite_rust_item_visibility_can_update_all_methods_in_impl() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "struct Thing;\nimpl Thing { fn hidden(&self) {} fn also_hidden(&self) {} }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_item_visibility".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: None,
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl Thing".into()),
+            module_name: None,
+            visibility: Some("pub(crate)".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let text = fs::read_to_string(&source).unwrap();
+        assert!(text.contains("pub(crate) fn hidden(&self) {}"));
+        assert!(text.contains("pub(crate) fn also_hidden(&self) {}"));
+    }
+
+    #[test]
+    fn rewrite_rust_field_visibility_updates_named_struct_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(
+            &source,
+            "#[derive(Default)]\nstruct SharedState {\n    artifacts: usize,\n    #[allow(dead_code)]\n    task_store: String,\n    pub already_public: bool,\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_field_visibility".into(),
+            source: path_string(&source),
+            target: None,
+            item_names: Some(vec!["SharedState".into()]),
+            item_kinds: None,
+            impl_name: None,
+            module_name: None,
+            visibility: Some("pub(crate)".into()),
+            use_path: None,
+            router_name: None,
+            router_call: None,
+            router_export_name: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            toml_table: None,
+            toml_entries: None,
+            project_dir: None,
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let text = fs::read_to_string(&source).unwrap();
+        assert!(text.contains("pub(crate) artifacts: usize"));
+        assert!(text.contains("#[allow(dead_code)]\n    pub(crate) task_store: String"));
+        assert!(text.contains("pub(crate) already_public: bool"));
     }
 
     #[test]

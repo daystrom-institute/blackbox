@@ -54,6 +54,7 @@ Allowed Rust plan kinds:
 - `copy_rust_mod_decls`
 - `rewrite_rust_mod_visibility`
 - `rewrite_rust_item_visibility`
+- `rewrite_rust_field_visibility`
 - `rust_lsp_rename`
 - `rust_organize_imports`
 - `delete_rust_items`
@@ -303,6 +304,11 @@ either segment from whole-file `sha256sum`.
 
 Goal: introduce `src/server/` and move low-risk server subsystems.
 
+Current constraint: the project still declares most modules in the binary
+crate. Until those dependencies move into `lib.rs`, declare `server` from
+`src/main.rs`, not `src/lib.rs`, and preserve existing `crate::SharedState` /
+`crate::BlackboxServer` references with a root re-export.
+
 Grounding:
 
 ```text
@@ -317,11 +323,16 @@ bbox_refactor_run(
   project_dir=<worktree>,
   confirm=true,
   steps=[
-    {"op":"plan","kind":"add_rust_mod_decl","source":"src/lib.rs","module_name":"server","visibility":"pub"},
+    {"op":"plan","kind":"add_rust_mod_decl","source":"src/main.rs","module_name":"server"},
     {"op":"plan","kind":"write_file","source":"src/server/mod.rs","new_text":"pub mod state;\npub mod progress;\n\npub use state::*;\npub use progress::*;\n"},
     {"op":"plan","kind":"extract_rust_items","source":"src/main.rs","target":"src/server/state.rs","item_names":[...],"target_prelude":"use crate::*;\nuse super::*;"},
     {"op":"plan","kind":"extract_rust_items","source":"src/main.rs","target":"src/server/progress.rs","item_names":[...],"target_prelude":"use crate::*;\nuse super::*;"},
-    {"op":"command","command":"cargo","args":["fmt"],"touches":["src/lib.rs","src/server/mod.rs","src/server/state.rs","src/server/progress.rs","src/main.rs"],"required":true},
+    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/server/state.rs","item_names":["SharedState","SIGNAL_LOG_CAP","WEBHOOK_LOG_CAP","SignalEvent","WebhookDelivery","ArcSnapshot","BlackboxServer"],"visibility":"pub(crate)"},
+    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/server/progress.rs","item_names":[...],"visibility":"pub(crate)"},
+    {"op":"plan","kind":"rewrite_rust_field_visibility","source":"src/server/state.rs","item_names":["SharedState","BlackboxServer"],"visibility":"pub(crate)"},
+    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/server/state.rs","item_kinds":["impl_method"],"impl_name":"impl SharedState","visibility":"pub(crate)"},
+    {"op":"plan","kind":"add_rust_use_decl","source":"src/main.rs","use_path":"server::*","visibility":"pub(crate)"},
+    {"op":"command","command":"cargo","args":["fmt"],"touches":["src/main.rs","src/server/mod.rs","src/server/state.rs","src/server/progress.rs"],"required":true},
     {"op":"command","command":"cargo","args":["test","--bin","blackboxd"],"required":true}
   ]
 )
