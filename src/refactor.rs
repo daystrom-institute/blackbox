@@ -971,7 +971,34 @@ pub fn run(p: &RefactorRunParams, projects: &[ProjectRecord]) -> Result<String> 
                         snapshots.push((path.clone(), original));
                     }
                 }
-                let command_result = run_validation_command(&project_dir, command, args, cwd)?;
+                let command_result = match run_validation_command(&project_dir, command, args, cwd)
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        let title = command_display(command, args);
+                        reports.push(RefactorRunStepReport {
+                            index: idx,
+                            op: "command".to_string(),
+                            status: "failed".to_string(),
+                            kind: None,
+                            title: Some(title.clone()),
+                            files: touched_paths.iter().map(|path| path_string(path)).collect(),
+                            validations: Vec::new(),
+                            error: Some(format!("{err:#}")),
+                        });
+                        let rollback_errors = restore_snapshots(&snapshots);
+                        return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                            status: "step_failed".to_string(),
+                            title: p.title.clone(),
+                            dry_run: false,
+                            steps: reports,
+                            files_written,
+                            rolled_back: rollback_errors.is_empty(),
+                            error: Some(format!("command failed: {title}")),
+                            rollback_errors,
+                        })?);
+                    }
+                };
                 let command_required = required.unwrap_or(true);
                 files_written.extend(touched_paths.iter().map(|path| path_string(path)));
                 reports.push(RefactorRunStepReport {
@@ -1045,6 +1072,14 @@ fn run_validation_command(
         Some(cwd) => resolve_path(Some(&path_string(project_dir)), cwd)?,
         None => project_dir.to_path_buf(),
     };
+    if command.chars().any(char::is_whitespace) {
+        return Ok(CommandStepResult {
+            success: false,
+            error: Some(format!(
+                "command must be an executable path without whitespace; put arguments in args, e.g. command=\"cargo\", args=[\"fmt\"], not command=\"cargo fmt\""
+            )),
+        });
+    }
     let mut cmd = Command::new(command);
     cmd.args(args).current_dir(&working_dir);
     for key in BLACKBOX_SERVICE_ENV_VARS {
@@ -5264,6 +5299,66 @@ mod tests {
         let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(run_response.status, "step_failed");
         assert!(run_response.rolled_back);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
+    }
+
+    #[test]
+    fn refactor_run_reports_command_with_embedded_args_and_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "rollback malformed command".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "add_rust_mod_decl".into(),
+                            source: "lib.rs".into(),
+                            target: None,
+                            item_names: None,
+                            item_kinds: None,
+                            impl_name: None,
+                            module_name: Some("newmod".into()),
+                            visibility: None,
+                            use_path: None,
+                            router_name: None,
+                            router_call: None,
+                            router_export_name: None,
+                            target_prelude: None,
+                            old_text: None,
+                            new_text: None,
+                            replace_all: None,
+                            toml_table: None,
+                            toml_entries: None,
+                            project_dir: None,
+                        },
+                    },
+                    RefactorRunStep::Command {
+                        command: "cargo fmt".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "step_failed");
+        assert!(run_response.rolled_back);
+        assert!(run_response.steps[1]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("put arguments in args"));
         assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
     }
 

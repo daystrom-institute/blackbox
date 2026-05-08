@@ -51,6 +51,9 @@ Writable structural plans are narrower:
   Use `bbox_refactor_apply(confirm=true)` for one plan or
   `bbox_refactor_run(confirm=true)` when several primitive plans and command
   validations must succeed or rollback together.
+  In `bbox_refactor_run` command steps, `command` is the executable only and
+  arguments go in `args`: use `{"command":"cargo","args":["fmt"]}`, not
+  `{"command":"cargo fmt"}`.
 - Rust: `bbox_refactor_plan(kind="extract_rust_items")` or
   `bbox_refactor_plan(kind="extract_rust_impl_methods")` or
   `bbox_refactor_plan(kind="delete_rust_items")` or
