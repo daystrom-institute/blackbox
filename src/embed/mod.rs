@@ -8,17 +8,17 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::SharedState;
 use crate::chunker::Chunk;
 use crate::entity_ref::EntityRef;
 use crate::index::EmbeddingSourceDoc;
-use crate::SharedState;
 
 pub const VOYAGE_PROVIDER_ID: &str = "voyage";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";
@@ -497,15 +497,19 @@ fn count_reembed_entities(state: &Arc<SharedState>, buckets: &[Bucket]) -> Resul
         0
     };
     let doc_types = reembed_index_doc_types(buckets);
-    let docs = if !doc_types.is_empty() {
+    let mut index_count = 0usize;
+    if !doc_types.is_empty() {
         state
             .idx
             .read()
-            .embedding_source_docs_for_doc_types(&doc_types, None)?
-    } else {
-        Vec::new()
-    };
-    Ok(knowledge_count + note_count + agent_count + count_reembed_index_docs(buckets, &docs))
+            .for_each_embedding_source_doc_for_doc_types(&doc_types, None, |doc| {
+                if reembed_index_doc_bucket(&doc).is_some_and(|bucket| buckets.contains(&bucket)) {
+                    index_count += 1;
+                }
+                Ok(())
+            })?;
+    }
+    Ok(knowledge_count + note_count + agent_count + index_count)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -571,13 +575,19 @@ pub(crate) fn route_coverage(
     }
     let doc_types = reembed_index_doc_types(buckets);
     if !doc_types.is_empty() {
-        let docs = state
+        state
             .idx
             .read()
-            .embedding_source_docs_for_doc_types(&doc_types, None)?;
-        for doc in docs {
-            record_index_doc_coverage(&router, &mut coverage, &mut active_by_route, buckets, &doc)?;
-        }
+            .for_each_embedding_source_doc_for_doc_types(&doc_types, None, |doc| {
+                record_index_doc_coverage(
+                    &router,
+                    &mut coverage,
+                    &mut active_by_route,
+                    buckets,
+                    &doc,
+                )?;
+                Ok(())
+            })?;
     }
     Ok(coverage)
 }
@@ -777,11 +787,20 @@ fn enqueue_reembed_routes(
     let doc_types = reembed_index_doc_types(buckets);
     if !doc_types.is_empty() {
         let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
-        let docs = state
+        let mut index_enqueued = 0usize;
+        state
             .idx
             .read()
-            .embedding_source_docs_for_doc_types(&doc_types, remaining)?;
-        enqueued += enqueue_reembed_index_docs(buckets, &docs, remaining);
+            .for_each_embedding_source_doc_for_doc_types(&doc_types, remaining, |doc| {
+                if limit_reached(remaining, index_enqueued) {
+                    return Ok(());
+                }
+                if enqueue_reembed_index_doc(buckets, &doc) {
+                    index_enqueued += 1;
+                }
+                Ok(())
+            })?;
+        enqueued += index_enqueued;
     }
     Ok(enqueued)
 }
@@ -866,46 +885,52 @@ fn enqueue_reembed_index_docs(
         if limit_reached(max_entities, enqueued) {
             break;
         }
-        let Some(bucket) = reembed_index_doc_bucket(doc) else {
-            continue;
-        };
-        if !buckets.contains(&bucket) {
-            continue;
-        }
-        match bucket {
-            Bucket::Code | Bucket::Docs => {
-                let Some(chunk) = chunk_from_embedding_doc(doc) else {
-                    continue;
-                };
-                let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
-                crate::embed_queue::enqueue_project_file(&chunk, &entity_id);
-                enqueued += 1;
-            }
-            Bucket::Transcripts => {
-                let chunk_hash = doc
-                    .chunk_hash
-                    .clone()
-                    .unwrap_or_else(|| crate::embed_queue::content_hash(&doc.content));
-                crate::embed_queue::enqueue_transcript(
-                    &doc.account,
-                    &doc.session_id,
-                    doc.byte_offset,
-                    &doc.content,
-                    &chunk_hash,
-                );
-                enqueued += 1;
-            }
-            Bucket::GitMessage => {
-                let (Some(entity_id), Some(chunk_hash)) = (&doc.entity_id, &doc.chunk_hash) else {
-                    continue;
-                };
-                crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content);
-                enqueued += 1;
-            }
-            Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => {}
+        if enqueue_reembed_index_doc(buckets, doc) {
+            enqueued += 1;
         }
     }
     enqueued
+}
+
+fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bool {
+    let Some(bucket) = reembed_index_doc_bucket(doc) else {
+        return false;
+    };
+    if !buckets.contains(&bucket) {
+        return false;
+    }
+    match bucket {
+        Bucket::Code | Bucket::Docs => {
+            let Some(chunk) = chunk_from_embedding_doc(doc) else {
+                return false;
+            };
+            let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+            crate::embed_queue::enqueue_project_file(&chunk, &entity_id);
+            true
+        }
+        Bucket::Transcripts => {
+            let chunk_hash = doc
+                .chunk_hash
+                .clone()
+                .unwrap_or_else(|| crate::embed_queue::content_hash(&doc.content));
+            crate::embed_queue::enqueue_transcript(
+                &doc.account,
+                &doc.session_id,
+                doc.byte_offset,
+                &doc.content,
+                &chunk_hash,
+            );
+            true
+        }
+        Bucket::GitMessage => {
+            let (Some(entity_id), Some(chunk_hash)) = (&doc.entity_id, &doc.chunk_hash) else {
+                return false;
+            };
+            crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content);
+            true
+        }
+        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => false,
+    }
 }
 
 fn limit_reached(max_entities: Option<usize>, enqueued: usize) -> bool {

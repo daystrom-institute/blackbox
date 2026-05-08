@@ -63,7 +63,8 @@ pub fn install_global(store: Arc<VectorStore>) {
     if already {
         return;
     }
-    spawn_periodic_flusher(store);
+    spawn_periodic_flusher(store.clone());
+    spawn_periodic_compactor(store);
 }
 
 /// Periodic flusher thread. Walks every partition every FLUSH_INTERVAL_SECS
@@ -119,6 +120,46 @@ fn spawn_periodic_flusher(store: Arc<VectorStore>) {
         .expect("failed to spawn vector flush thread");
 }
 
+fn spawn_periodic_compactor(store: Arc<VectorStore>) {
+    std::thread::Builder::new()
+        .name("blackbox-vectors-compact".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(COMPACT_INTERVAL_SECS));
+                let partitions: Vec<_> = store.partitions.read().values().cloned().collect();
+                for partition in partitions {
+                    let needs = partition.read().needs_compaction();
+                    if !needs {
+                        continue;
+                    }
+                    let mut p = partition.write();
+                    if !p.needs_compaction() {
+                        continue;
+                    }
+                    let started = std::time::Instant::now();
+                    let route = p.route.clone();
+                    match p.compact() {
+                        Ok(stats) => tracing::info!(
+                            route = %route,
+                            before_wal_records = stats.before_wal_records,
+                            after_wal_records = stats.after_wal_records,
+                            before_slab_entries = stats.before_slab_entries,
+                            after_slab_entries = stats.after_slab_entries,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "vector partition compacted"
+                        ),
+                        Err(err) => tracing::warn!(
+                            route = %route,
+                            error = %err,
+                            "vector partition compaction failed; will retry"
+                        ),
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn vector compaction thread");
+}
+
 pub fn global() -> Arc<VectorStore> {
     #[cfg(test)]
     if let Some(store) = test_global_store().read().clone() {
@@ -131,6 +172,7 @@ pub fn global() -> Arc<VectorStore> {
                 VectorStore::open(default_vectors_dir()).expect("default vector store should open"),
             );
             spawn_periodic_flusher(store.clone());
+            spawn_periodic_compactor(store.clone());
             store
         })
         .clone()
@@ -243,9 +285,8 @@ impl VectorStore {
             .with_context(|| format!("flushing vector partition {route}"))
     }
 
-    /// Force-flush every partition's derived files INCLUDING slab.bin.
-    /// Called on graceful shutdown so the next start can mmap slab.bin
-    /// and skip rebuild_from_wal. Also fsyncs every dirty WAL.
+    /// Force-checkpoint every partition's derived metadata and fsync every
+    /// dirty WAL. Cold-start still rebuilds from the WAL.
     pub fn flush_all(&self) -> Result<()> {
         let partitions: Vec<_> = self.partitions.read().values().cloned().collect();
         for partition in partitions {
@@ -325,7 +366,7 @@ impl VectorStore {
 
     pub fn rebuild(&self, route: &str) -> Result<()> {
         let partition = self.partition(route)?;
-        let result = partition.write().rebuild_from_wal();
+        let result = partition.write().compact().map(|_| ());
         result
     }
 
@@ -472,6 +513,18 @@ const FLUSH_MIN_RECORDS: usize = 8192;
 /// last_flushed_wal_records` gets a force-flush at this interval, so users
 /// who stop ingest mid-stream still get derived files reasonably fresh.
 const FLUSH_INTERVAL_SECS: u64 = 30;
+const COMPACT_INTERVAL_SECS: u64 = 300;
+const COMPACT_DELETED_RATIO: f32 = 0.30;
+const COMPACT_MIN_DELETED_ENTRIES: usize = 10_000;
+const COMPACT_MIN_WAL_SURPLUS_RECORDS: usize = 100_000;
+
+#[derive(Debug, Clone, Copy)]
+struct CompactionStats {
+    before_wal_records: usize,
+    after_wal_records: usize,
+    before_slab_entries: usize,
+    after_slab_entries: usize,
+}
 
 impl Partition {
     fn open(route: String, path: PathBuf) -> Result<Self> {
@@ -592,25 +645,76 @@ impl Partition {
     }
 
     fn rebuild_from_wal(&mut self) -> Result<()> {
-        let records = wal::read_all(&self.wal_path())?;
+        let wal_path = self.wal_path();
         self.slab = VectorSlab::default();
-        for record in &records {
+        let mut wal_records = 0usize;
+        wal::for_each(&wal_path, |record| {
+            wal_records += 1;
             if record.deleted_at.is_some() {
                 self.slab.delete(&record.entity_id);
             } else {
                 self.slab.upsert_at(
                     &record.entity_id,
                     &record.content_hash,
-                    record.vector.clone(),
-                    record.upserted_at.clone(),
+                    record.vector,
+                    record.upserted_at,
                 )?;
             }
-        }
-        self.wal_records = records.len();
+            Ok(())
+        })?;
+        self.wal_records = wal_records;
         self.rebuild_hnsw()?;
-        // After a full rebuild, materialize slab.bin so subsequent cold
-        // starts can mmap it instead of replaying the WAL again.
+        // After a full replay, checkpoint metadata and sync the WAL.
         self.flush_derived_full()
+    }
+
+    fn compact(&mut self) -> Result<CompactionStats> {
+        let before_wal_records = self.wal_records;
+        let before_slab_entries = self.slab.len();
+        // Build the new slab from the old one's active entries.
+        // Each entry's metadata and vector are cloned into the replacement
+        // slab (unavoidable — the old slab is still the source of truth
+        // until we swap). The HNSW rebuild further below clones vectors
+        // again for the graph construction. Two copies is the floor for
+        // compaction; the previous implementation kept four.
+        let mut compacted_slab = VectorSlab::new(self.slab.dims());
+        let mut compacted_count = 0usize;
+        for entry in self.slab.active_entries() {
+            compacted_slab.upsert_at(
+                &entry.entity_id,
+                &entry.content_hash,
+                entry.vector.clone(),
+                entry.upserted_at.clone(),
+            )?;
+            compacted_count += 1;
+        }
+        // Stream the compacted slab directly to the WAL file — no
+        // intermediate Vec<WalRecord>. This avoids doubling memory
+        // during compaction for routes with millions of vectors.
+        wal::rewrite(
+            &self.wal_path(),
+            compacted_slab.active_entries().map(|entry| WalRecord {
+                entity_id: entry.entity_id.clone(),
+                content_hash: entry.content_hash.clone(),
+                model: self.route.clone(),
+                dims: entry.vector.len(),
+                vector: entry.vector.clone(),
+                upserted_at: entry.upserted_at.clone(),
+                deleted_at: None,
+                route: self.route.clone(),
+            }),
+        )?;
+        self.slab = compacted_slab;
+        self.wal_records = compacted_count;
+        self.rebuild_hnsw()?;
+        self.flush_derived_full()?;
+
+        Ok(CompactionStats {
+            before_wal_records,
+            after_wal_records: self.wal_records,
+            before_slab_entries,
+            after_slab_entries: self.slab.len(),
+        })
     }
 
     fn rebuild_hnsw(&mut self) -> Result<()> {
@@ -734,6 +838,20 @@ impl Partition {
     /// the next tick.
     fn needs_flush(&self) -> bool {
         self.wal_records > self.last_flushed_wal_records
+    }
+
+    fn needs_compaction(&self) -> bool {
+        let active_count = self.slab.active_count();
+        let deleted_count = self.slab.deleted_count();
+        if deleted_count == 0 {
+            return false;
+        }
+        let total = active_count + deleted_count;
+        let deleted_ratio = deleted_count as f32 / total as f32;
+        let wal_surplus = self.wal_records.saturating_sub(active_count);
+        deleted_ratio >= COMPACT_DELETED_RATIO
+            && (deleted_count >= COMPACT_MIN_DELETED_ENTRIES
+                || wal_surplus >= COMPACT_MIN_WAL_SURPLUS_RECORDS)
     }
 
     fn wal_path(&self) -> PathBuf {

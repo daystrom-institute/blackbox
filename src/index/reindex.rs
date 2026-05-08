@@ -17,6 +17,23 @@ use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::entity_ref;
 use crate::parser;
 
+const BACKGROUND_FULL_REINDEX_EVERY_TICKS: u64 = 12;
+
+pub(super) fn conservative_log_merge_policy() -> tantivy::merge_policy::LogMergePolicy {
+    let mut policy = tantivy::merge_policy::LogMergePolicy::default();
+    policy.set_min_num_segments(20);
+    policy.set_max_docs_before_merge(500_000);
+    policy.set_del_docs_ratio_before_merge(0.3);
+    policy
+}
+
+pub(super) fn segment_count(index: &Index) -> usize {
+    index
+        .searchable_segment_metas()
+        .map(|segments| segments.len())
+        .unwrap_or(0)
+}
+
 pub(super) fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
     if !path.exists() {
         return Ok(HashMap::new());
@@ -164,9 +181,10 @@ fn try_background_reindex(
     index: &Index,
     config: &ReindexConfig,
     fields: FieldHandles,
+    full: bool,
 ) -> Result<()> {
     // 1. Speculative scan — cheap, no writer allocation
-    if !needs_reindex(config) {
+    if !full && !needs_reindex(config) {
         tracing::debug!("auto-reindex: no changes detected");
         return Ok(());
     }
@@ -180,18 +198,26 @@ fn try_background_reindex(
         }
         Err(e) => return Err(e.into()),
     };
-    // Disable background segment merges. Tantivy's default LogMergePolicy
-    // fires on every commit; with our 1.3 GB / 1.18M-doc corpus on a
-    // slow disk that read+wrote multi-GB during ingest and pinned 400+
-    // MB/s sustained for hours during the agentic-corpus backfill.
-    // Segment count is bounded by reindex tick cadence (every 120s adds
-    // at most one segment per active writer), so we trade some search
-    // overhead for predictable I/O. Manual `bbox_reindex(full=true)`
-    // can rebuild + compact when the operator wants.
-    writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+    if !full {
+        // Keep incremental ingest from eagerly merging large segments while
+        // still bounding long-running segment fanout. The default policy was
+        // too aggressive for the backfill workload; NoMergePolicy was too lax
+        // for a daemon that runs for days.
+        writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    }
 
     // 3. Reload meta AFTER acquiring lock (another process may have committed)
-    let mut meta = load_meta(&config.meta_path).unwrap_or_default();
+    let mut meta = if full {
+        tracing::info!("auto-reindex: periodic full rebuild requested");
+        writer.delete_all_documents()?;
+        // Don't commit yet — let the rebuild work and the trailing
+        // writer.commit() atomically commit delete+adds together.
+        // If we commit delete now and a later step fails, the index
+        // is empty while _meta.json still says sources are current.
+        HashMap::new()
+    } else {
+        load_meta(&config.meta_path).unwrap_or_default()
+    };
 
     // 4. Index changed files
     let mut indexed_files = 0u64;
@@ -264,7 +290,7 @@ fn try_background_reindex(
         fields,
         &mut writer,
         &mut meta,
-        false,
+        full,
     )?;
     indexed_files += project_stats.indexed_files;
     indexed_docs += project_stats.indexed_docs;
@@ -317,21 +343,26 @@ fn try_background_reindex(
         purged += 1;
     }
 
-    if indexed_files == 0 && purged == 0 {
+    if !full && indexed_files == 0 && purged == 0 {
         tracing::debug!("auto-reindex: no changes after post-lock re-check");
         return Ok(());
     }
 
     // 5. Commit + atomic meta save (while still holding writer lock)
     writer.commit()?;
+    if full {
+        writer.wait_merging_threads()?;
+    }
     save_meta(&config.meta_path, &meta)?;
 
+    let segments = segment_count(index);
     tracing::info!(
-        "auto-reindex: indexed {} files ({} docs), skipped {} unchanged, purged {} deleted",
+        "auto-reindex: indexed {} files ({} docs), skipped {} unchanged, purged {} deleted, segments {}",
         indexed_files,
         indexed_docs,
         skipped,
-        purged
+        purged,
+        segments
     );
     Ok(())
 }
@@ -352,8 +383,11 @@ pub fn spawn_reindex_thread(
             );
             // First tick fires after a short delay to let the MCP handshake complete
             std::thread::sleep(Duration::from_secs(5));
+            let mut tick = 0_u64;
             loop {
-                if let Err(e) = try_background_reindex(&index, &config, fields) {
+                tick = tick.wrapping_add(1);
+                let full = tick % BACKGROUND_FULL_REINDEX_EVERY_TICKS == 0;
+                if let Err(e) = try_background_reindex(&index, &config, fields, full) {
                     tracing::error!("background reindex failed: {:#}", e);
                 }
                 std::thread::sleep(interval);

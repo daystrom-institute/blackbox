@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -48,6 +48,10 @@ impl VectorSlab {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn deleted_count(&self) -> usize {
+        self.len().saturating_sub(self.active_count())
     }
 
     pub fn active_count(&self) -> usize {

@@ -7,7 +7,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+use tantivy::query::{BooleanQuery, Occur, Query as QueryTrait, TermQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
@@ -287,11 +287,28 @@ impl TranscriptIndex {
         doc_types: &[&str],
         max_docs: Option<usize>,
     ) -> Result<Vec<EmbeddingSourceDoc>> {
+        let mut docs = Vec::new();
+        self.for_each_embedding_source_doc_for_doc_types(doc_types, max_docs, |doc| {
+            docs.push(doc);
+            Ok(())
+        })?;
+        Ok(docs)
+    }
+
+    pub(crate) fn for_each_embedding_source_doc_for_doc_types<F>(
+        &self,
+        doc_types: &[&str],
+        max_docs: Option<usize>,
+        mut f: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(EmbeddingSourceDoc) -> Result<()>,
+    {
         if doc_types.is_empty() {
-            return Ok(Vec::new());
+            return Ok(0);
         }
         let searcher = self.reader.searcher();
-        let query: Box<dyn Query> = if doc_types.len() == 1 {
+        let query: Box<dyn QueryTrait> = if doc_types.len() == 1 {
             Box::new(TermQuery::new(
                 Term::from_field_text(self.fields.doc_type, doc_types[0]),
                 IndexRecordOption::Basic,
@@ -306,25 +323,38 @@ impl TranscriptIndex {
                             Box::new(TermQuery::new(
                                 Term::from_field_text(self.fields.doc_type, doc_type),
                                 IndexRecordOption::Basic,
-                            )) as Box<dyn Query>,
+                            )) as Box<dyn QueryTrait>,
                         )
                     })
                     .collect(),
             ))
         };
         let limit = match max_docs {
-            Some(max_docs) => max_docs,
+            Some(n) => n,
             None => searcher.search(&*query, &Count)?,
         };
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(0);
         }
+        // TopDocs materializes (f32, DocAddress) pairs — ~12 bytes each.
+        // That's small compared to loading full stored fields (~200+ bytes),
+        // so we can afford to collect all addresses for large corpuses then
+        // stream stored-field loads one at a time through the callback.
         let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit))?;
-        let mut docs = Vec::with_capacity(top_docs.len());
+        let mut emitted = 0usize;
         for (_score, addr) in top_docs {
+            if max_docs.is_some_and(|max| emitted >= max) {
+                break;
+            }
             let doc: TantivyDocument = searcher.doc(addr)?;
-            docs.push(EmbeddingSourceDoc {
-                doc_type: first_text(&doc, self.fields.doc_type),
+            let doc_type = first_text(&doc, self.fields.doc_type);
+            // Belt-and-suspenders: doc_type field should match the query,
+            // but skip if it doesn't (stale segment, merge artifact, etc.).
+            if !doc_types.iter().any(|wanted| *wanted == doc_type) {
+                continue;
+            }
+            f(EmbeddingSourceDoc {
+                doc_type,
                 account: first_text(&doc, self.fields.account),
                 session_id: first_text(&doc, self.fields.session_id),
                 project: first_text(&doc, self.fields.project),
@@ -337,9 +367,10 @@ impl TranscriptIndex {
                 chunk_hash: optional_text(&doc, self.fields.chunk_hash),
                 entity_id: optional_text(&doc, self.fields.entity_id),
                 content: first_text(&doc, self.fields.content),
-            });
+            })?;
+            emitted += 1;
         }
-        Ok(docs)
+        Ok(emitted)
     }
 
     pub(crate) fn entity_properties(

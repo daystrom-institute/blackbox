@@ -152,22 +152,88 @@ pub fn sync_pending() -> Result<usize> {
 }
 
 pub fn read_all(path: &Path) -> Result<Vec<WalRecord>> {
+    let mut records = Vec::new();
+    for_each(path, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+pub fn for_each(path: &Path, mut f: impl FnMut(WalRecord) -> Result<()>) -> Result<()> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let file =
         fs::File::open(path).with_context(|| format!("opening vector WAL {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut records = Vec::new();
     for (idx, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading vector WAL line {}", idx + 1))?;
         if line.trim().is_empty() {
             continue;
         }
-        records.push(
-            serde_json::from_str(&line)
-                .with_context(|| format!("parsing vector WAL line {}", idx + 1))?,
-        );
+        let record = serde_json::from_str(&line)
+            .with_context(|| format!("parsing vector WAL line {}", idx + 1))?;
+        f(record)?;
     }
-    Ok(records)
+    Ok(())
+}
+
+pub fn rewrite(
+    path: &Path,
+    records: impl IntoIterator<Item = WalRecord>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating vector WAL dir {}", parent.display()))?;
+    }
+    let tmp_path = path.with_extension("wal.tmp");
+    // Clean up any stale temp file from a prior failed compaction.
+    let _ = fs::remove_file(&tmp_path);
+    let result = (|| -> Result<()> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| format!("opening vector WAL temp {}", tmp_path.display()))?;
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+        for record in records.into_iter() {
+            serde_json::to_writer(&mut writer, &record)
+                .context("serializing vector WAL record")?;
+            writer
+                .write_all(b"\n")
+                .context("writing vector WAL newline")?;
+        }
+        writer.flush().context("flushing vector WAL temp buffer")?;
+        writer
+            .get_ref()
+            .sync_data()
+            .with_context(|| format!("fsync vector WAL temp {}", tmp_path.display()))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(e) =
+                fs::rename(&tmp_path, path).with_context(|| {
+                    format!(
+                        "renaming compacted vector WAL {} to {}",
+                        tmp_path.display(),
+                        path.display()
+                    )
+                })
+            {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    }
+    dirty_wals()
+        .lock()
+        .expect("WAL dirty-set lock poisoned")
+        .remove(path);
+    Ok(())
 }

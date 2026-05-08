@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rmcp::schemars;
@@ -15,6 +15,8 @@ const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_BATCH_RETRIES: u8 = 3;
+const MAX_ROUTE_QUEUE_DEPTH: u64 = 10_000;
+const MAX_ROUTE_QUEUE_BYTES: u64 = 128 * 1024 * 1024;
 
 type ProviderSpec = (String, Arc<dyn EmbeddingProvider>, Option<u32>, String);
 
@@ -37,6 +39,7 @@ pub struct RouteStatus {
     pub indexed_count: u64,
     pub session_indexed_count: Option<u64>,
     pub queue_depth: u64,
+    pub queue_bytes: u64,
     pub retried_count: u64,
     pub last_error: Option<String>,
     pub coverage_ratio: Option<f32>,
@@ -53,6 +56,7 @@ impl Default for RouteStatus {
             indexed_count: 0,
             session_indexed_count: None,
             queue_depth: 0,
+            queue_bytes: 0,
             retried_count: 0,
             last_error: None,
             coverage_ratio: None,
@@ -175,13 +179,27 @@ impl EmbedQueueHandle {
             );
             return false;
         }
-        increment_depth(&self.inner.statuses, &resolved.queue_route, 1);
+        let request_bytes = request.text.len() as u64;
+        if !try_reserve_queue(&self.inner.statuses, &resolved.queue_route, request_bytes) {
+            tracing::warn!(
+                route = %resolved.queue_route,
+                entity_id = %request.entity_id,
+                request_bytes,
+                "embedding enqueue rejected because route queue is full"
+            );
+            return false;
+        }
         let sender = self.ensure_sender(&resolved, &request);
         match sender {
             Some(sender) => {
                 let sent = sender.send(WorkerCommand::Enqueue(request)).is_ok();
                 if !sent {
-                    increment_depth(&self.inner.statuses, &resolved.queue_route, -1);
+                    release_queue(
+                        &self.inner.statuses,
+                        &resolved.queue_route,
+                        1,
+                        request_bytes,
+                    );
                     mark_error(
                         &self.inner.statuses,
                         &resolved.queue_route,
@@ -191,7 +209,12 @@ impl EmbedQueueHandle {
                 sent
             }
             None => {
-                increment_depth(&self.inner.statuses, &resolved.queue_route, -1);
+                release_queue(
+                    &self.inner.statuses,
+                    &resolved.queue_route,
+                    1,
+                    request_bytes,
+                );
                 mark_error(
                     &self.inner.statuses,
                     &resolved.queue_route,
@@ -535,7 +558,12 @@ async fn process_batch_outcome(
                 model = spec.provider.model_name(),
                 "embedding vectors persisted"
             );
-            mark_success(&spec.statuses, &spec.route, batch.len() as u64);
+            mark_success(
+                &spec.statuses,
+                &spec.route,
+                batch.len() as u64,
+                batch_text_bytes(&batch),
+            );
             retry_batch.clear();
             *retry_attempts = 0;
             *backoff = spec.retry_backoff;
@@ -575,6 +603,7 @@ async fn schedule_retry_or_drop(
     mark_retry(&spec.statuses, &spec.route);
     if *retry_attempts >= MAX_BATCH_RETRIES {
         let dropped = batch.len() as u64;
+        let dropped_bytes = batch_text_bytes(&batch);
         let message = format!("embedding batch dropped after {MAX_BATCH_RETRIES} retries: {error}");
         tracing::warn!(
             route = %spec.route,
@@ -582,7 +611,13 @@ async fn schedule_retry_or_drop(
             dropped,
             "embedding batch dropped after retry limit"
         );
-        mark_dropped(&spec.statuses, &spec.route, dropped, &message);
+        mark_dropped(
+            &spec.statuses,
+            &spec.route,
+            dropped,
+            dropped_bytes,
+            &message,
+        );
         retry_batch.clear();
         *retry_attempts = 0;
         false
@@ -749,22 +784,52 @@ impl TokenBucket {
     }
 }
 
-fn increment_depth(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, delta: i64) {
+fn try_reserve_queue(
+    statuses: &RwLock<BTreeMap<String, RouteStatus>>,
+    route: &str,
+    bytes: u64,
+) -> bool {
     let mut statuses = statuses.write();
     let status = statuses.entry(route.to_string()).or_default();
-    if delta.is_negative() {
-        status.queue_depth = status.queue_depth.saturating_sub(delta.unsigned_abs());
-    } else {
-        status.queue_depth = status.queue_depth.saturating_add(delta as u64);
+    if status.queue_depth >= MAX_ROUTE_QUEUE_DEPTH
+        || status.queue_bytes.saturating_add(bytes) > MAX_ROUTE_QUEUE_BYTES
+    {
+        status.available = false;
+        status.last_error = Some(format!(
+            "embedding route queue full: depth={} bytes={} max_depth={} max_bytes={}",
+            status.queue_depth, status.queue_bytes, MAX_ROUTE_QUEUE_DEPTH, MAX_ROUTE_QUEUE_BYTES
+        ));
+        return false;
     }
+    status.queue_depth = status.queue_depth.saturating_add(1);
+    status.queue_bytes = status.queue_bytes.saturating_add(bytes);
+    true
 }
 
-fn mark_success(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, count: u64) {
+fn release_queue(
+    statuses: &RwLock<BTreeMap<String, RouteStatus>>,
+    route: &str,
+    count: u64,
+    bytes: u64,
+) {
+    let mut statuses = statuses.write();
+    let status = statuses.entry(route.to_string()).or_default();
+    status.queue_depth = status.queue_depth.saturating_sub(count);
+    status.queue_bytes = status.queue_bytes.saturating_sub(bytes);
+}
+
+fn mark_success(
+    statuses: &RwLock<BTreeMap<String, RouteStatus>>,
+    route: &str,
+    count: u64,
+    bytes: u64,
+) {
     let mut statuses = statuses.write();
     let status = statuses.entry(route.to_string()).or_default();
     status.available = true;
     status.indexed_count = status.indexed_count.saturating_add(count);
     status.queue_depth = status.queue_depth.saturating_sub(count);
+    status.queue_bytes = status.queue_bytes.saturating_sub(bytes);
     status.last_error = None;
 }
 
@@ -778,12 +843,14 @@ fn mark_dropped(
     statuses: &RwLock<BTreeMap<String, RouteStatus>>,
     route: &str,
     count: u64,
+    bytes: u64,
     message: &str,
 ) {
     let mut statuses = statuses.write();
     let status = statuses.entry(route.to_string()).or_default();
     status.available = false;
     status.queue_depth = status.queue_depth.saturating_sub(count);
+    status.queue_bytes = status.queue_bytes.saturating_sub(bytes);
     status.last_error = Some(message.to_string());
 }
 
@@ -804,6 +871,10 @@ fn sanitize_error(err: &anyhow::Error) -> String {
         message.push_str("...");
     }
     message
+}
+
+fn batch_text_bytes(batch: &[EmbedRequest]) -> u64 {
+    batch.iter().map(|request| request.text.len() as u64).sum()
 }
 
 struct FailingProvider {
@@ -920,10 +991,12 @@ mod tests {
         assert!(!status.available);
         assert_eq!(status.queue_depth, 0);
         assert_eq!(status.retried_count, u64::from(MAX_BATCH_RETRIES));
-        assert!(status
-            .last_error
-            .unwrap()
-            .contains("dropped after 3 retries"));
+        assert!(
+            status
+                .last_error
+                .unwrap()
+                .contains("dropped after 3 retries")
+        );
         queue.shutdown();
     }
 

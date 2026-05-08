@@ -1349,12 +1349,14 @@ impl TranscriptIndex {
         }
 
         let index_size = dir_size(self.config.meta_path.parent().unwrap_or(Path::new(".")));
+        let segments = segment_count(&self.index);
         let tool_call_edges = count_tool_call_edges(
             &crate::edge_index::edges_dir_from_projects_path(&self.config.projects_path),
         );
 
         format!(
             "Index documents: {total_docs}\n\
+             Index segments: {segments}\n\
              Index size: {}\n\
              Tool-call edges: {tool_call_edges}\n\
              Source files:\n\
@@ -1375,13 +1377,11 @@ impl TranscriptIndex {
 
     pub fn build_index(&mut self, full: bool) -> Result<String> {
         let mut writer: IndexWriter = self.index.writer(100_000_000)?;
-        // For incremental rebuilds, disable background segment merges to
-        // avoid the disk-I/O thrash documented in thread-3e2a0cfa. For
-        // explicit full rebuilds (`bbox_reindex full=true`), allow the
-        // default LogMergePolicy so the operator's intentional re-build
-        // also compacts the segment count.
+        // Incremental rebuilds use the same conservative policy as the
+        // background reindexer: bounded segment fanout without the default
+        // policy's aggressive large-segment churn.
         if !full {
-            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
         }
 
         let mut meta: HashMap<String, FileMeta> = if !full {
@@ -1393,7 +1393,8 @@ impl TranscriptIndex {
         if full {
             tracing::info!("Full reindex — clearing existing index");
             writer.delete_all_documents()?;
-            writer.commit()?;
+            // Don't commit yet — let the rebuild work and the trailing
+            // commit atomically commit delete+adds together.
         }
 
         let mut indexed_files = 0u64;
@@ -1511,6 +1512,9 @@ impl TranscriptIndex {
         }
 
         writer.commit()?;
+        if full {
+            writer.wait_merging_threads()?;
+        }
         self.reader.reload()?;
         save_meta(&self.config.meta_path, &meta)?;
 
@@ -1525,7 +1529,7 @@ impl TranscriptIndex {
                 indexed_files, indexed_docs, skipped
             )
         };
-        tracing::info!("{}", msg);
+        tracing::info!(segments = segment_count(&self.index), "{}", msg);
         Ok(msg)
     }
 
