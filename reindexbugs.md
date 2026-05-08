@@ -292,7 +292,10 @@ Fix:
 
 - Decouple vector warmup from project-file indexing.
 - Avoid doing startup incremental indexing immediately when an operator is
-  about to run explicit maintenance.
+  about to run explicit maintenance. Initial mitigation: the background
+  reindex startup delay now defaults to the normal reindex interval instead of
+  5 seconds, and can be overridden with
+  `BLACKBOX_REINDEX_STARTUP_DELAY_SECS`.
 - Add a maintenance-state route/tool that reports active phase and writer-lock
   holder.
 

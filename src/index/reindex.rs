@@ -19,6 +19,14 @@ use crate::parser;
 
 const DEFAULT_BACKGROUND_FULL_REINDEX_EVERY_TICKS: u64 = 0;
 
+fn background_startup_delay(interval: Duration) -> Duration {
+    std::env::var("BLACKBOX_REINDEX_STARTUP_DELAY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(interval)
+}
+
 pub(super) fn conservative_log_merge_policy() -> tantivy::merge_policy::LogMergePolicy {
     let mut policy = tantivy::merge_policy::LogMergePolicy::default();
     policy.set_min_num_segments(20);
@@ -437,8 +445,12 @@ pub fn spawn_reindex_thread(
                     "background full reindex enabled"
                 );
             }
-            // First tick fires after a short delay to let the MCP handshake complete
-            std::thread::sleep(Duration::from_secs(5));
+            let startup_delay = background_startup_delay(interval);
+            tracing::info!(
+                delay_secs = startup_delay.as_secs(),
+                "background reindex startup delay configured"
+            );
+            std::thread::sleep(startup_delay);
             let mut tick = 0_u64;
             loop {
                 tick = tick.wrapping_add(1);
