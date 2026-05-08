@@ -1583,8 +1583,7 @@ impl<'a> WorkflowRunner<'a> {
         } else {
             orch::timeout_snapshot_json(&task)
         };
-        self.ctx
-            .record_actor_result(node_id, result_json.clone());
+        self.ctx.record_actor_result(node_id, result_json.clone());
 
         let session_id = task.inner.lock().session_id.clone();
         if actor.durable {

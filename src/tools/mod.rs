@@ -1,5 +1,8 @@
 pub mod artifacts;
 pub mod attention;
+pub mod badgey_adapter;
+pub mod bro_helpers;
+pub mod bro_params;
 pub mod graph;
 pub mod knowledge;
 pub mod notes;

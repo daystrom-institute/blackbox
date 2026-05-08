@@ -1154,9 +1154,7 @@ fn exec_set_meta(args: &Value) -> Result<OpEffect> {
             };
             Ok(OpEffect::SetProjectDir(v))
         }
-        other => bail!(
-            "SetMeta: unsupported key '{other}' (mutable keys: worktree, project_dir)"
-        ),
+        other => bail!("SetMeta: unsupported key '{other}' (mutable keys: worktree, project_dir)"),
     }
 }
 
@@ -1313,10 +1311,7 @@ mod tests {
         match effect {
             OpEffect::SetVar { key, value } => {
                 assert_eq!(key, "parsed");
-                assert_eq!(
-                    value,
-                    json!({"scout_charters": [{"scout_id": "s1"}]})
-                );
+                assert_eq!(value, json!({"scout_charters": [{"scout_id": "s1"}]}));
             }
             _ => panic!("expected SetVar effect"),
         }
