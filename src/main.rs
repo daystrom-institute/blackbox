@@ -96,7 +96,10 @@ impl BlackboxServer {
     fn new(state: Arc<SharedState>) -> Self {
         Self {
             state,
-            tool_router: Self::bbox_tools() + Self::bro_tools() + tools::projects::router(),
+            tool_router: Self::bbox_tools()
+                + Self::bro_tools()
+                + tools::projects::router()
+                + tools::notes::router(),
         }
     }
 
@@ -3981,30 +3984,6 @@ impl BlackboxServer {
         Self::run("bbox_thread_list", || {
             self.state.threads.read().thread_list(&p)
         })
-    }
-
-    #[tool(
-        name = "bbox_note",
-        description = "Record a structured side-channel note while working."
-    )]
-    fn bbox_note(&self, Parameters(p): Parameters<NoteParams>) -> CallToolResult {
-        Self::run("bbox_note", || self.state.notes.write().create(&p))
-    }
-
-    #[tool(
-        name = "bbox_notes",
-        description = "List / filter notes by kind, project, session, thread, resolution."
-    )]
-    fn bbox_notes(&self, Parameters(p): Parameters<NoteListParams>) -> CallToolResult {
-        Self::run("bbox_notes", || self.state.notes.read().list(&p))
-    }
-
-    #[tool(
-        name = "bbox_note_resolve",
-        description = "Mark a note acknowledged or addressed."
-    )]
-    fn bbox_note_resolve(&self, Parameters(p): Parameters<NoteResolveParams>) -> CallToolResult {
-        Self::run("bbox_note_resolve", || self.state.notes.write().resolve(&p))
     }
 
     #[tool(
