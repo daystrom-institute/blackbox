@@ -106,7 +106,8 @@ impl BlackboxServer {
                 + tools::packets::router()
                 + tools::attention::router()
                 + tools::graph::router()
-                + tools::transcripts::router(),
+                + tools::transcripts::router()
+                + tools::sessions::router(),
         }
     }
 
@@ -3350,75 +3351,6 @@ use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
 impl BlackboxServer {
-    #[tool(
-        name = "bbox_session",
-        description = "Summary metadata for a single session."
-    )]
-    fn bbox_session(&self, Parameters(p): Parameters<SessionParams>) -> CallToolResult {
-        Self::run("bbox_session", || self.state.idx.read().session(&p))
-    }
-
-    #[tool(
-        name = "bbox_messages",
-        description = "Chronological messages from a session."
-    )]
-    fn bbox_messages(&self, Parameters(p): Parameters<MessagesParams>) -> CallToolResult {
-        Self::run("bbox_messages", || self.state.idx.read().messages(&p))
-    }
-
-    #[tool(
-        name = "bbox_reindex",
-        description = "Build or incrementally update the search index."
-    )]
-    fn bbox_reindex(&self, Parameters(p): Parameters<ReindexParams>) -> CallToolResult {
-        Self::run("bbox_reindex", || self.state.idx.write().reindex(&p))
-    }
-
-    #[tool(
-        name = "bbox_reembed",
-        description = "Request an embedding rebuild for a configured route."
-    )]
-    fn bbox_reembed(&self, Parameters(p): Parameters<ReembedParams>) -> CallToolResult {
-        let state = self.state.clone();
-        Self::run("bbox_reembed", || embed::reembed_start(&p, state))
-    }
-
-    #[tool(
-        name = "bbox_embed_status",
-        description = "Return per-route embedding queue health."
-    )]
-    fn bbox_embed_status(&self) -> CallToolResult {
-        Self::run("bbox_embed_status", || {
-            embed_queue::status_json_for_state(&self.state)
-        })
-    }
-
-    #[tool(
-        name = "bbox_topics",
-        description = "Top terms in a session by frequency."
-    )]
-    fn bbox_topics(&self, Parameters(p): Parameters<TopicsParams>) -> CallToolResult {
-        Self::run("bbox_topics", || self.state.idx.read().topics(&p))
-    }
-
-    #[tool(
-        name = "bbox_sessions_list",
-        description = "Browse sessions sorted by recency."
-    )]
-    fn bbox_sessions_list(&self, Parameters(p): Parameters<SessionsListParams>) -> CallToolResult {
-        Self::run("bbox_sessions_list", || {
-            self.state.idx.read().sessions_list(&p)
-        })
-    }
-
-    #[tool(
-        name = "bbox_stats",
-        description = "Corpus statistics (doc count, index size, file counts)."
-    )]
-    fn bbox_stats(&self) -> CallToolResult {
-        Self::run("bbox_stats", || self.state.idx.read().stats())
-    }
-
     #[tool(
         name = "bbox_learn",
         description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files. Use for narrative rules (\"we always X\", \"never Y\"). If the rule you're storing is actually a priority-ordered decision function, classification rubric, or structured mechanism — use `bbox_compile` instead; that produces a shareable packet any agent can apply deterministically."
