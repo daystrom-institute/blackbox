@@ -2894,7 +2894,10 @@ impl BlackboxServer {
     }
 
     fn rebuild_edge_index_from_stores(&self) {
-        rebuild_edge_index_from_shared(&self.state, true);
+        // Store mutations only affect structured edges. Re-projecting all
+        // Tantivy docs here is a multi-GB path and can stack under concurrent
+        // thread updates.
+        rebuild_edge_index_from_shared(&self.state, false);
     }
 
     /// Resolve a workflow by registry id (set via `bro_workflow_install`
