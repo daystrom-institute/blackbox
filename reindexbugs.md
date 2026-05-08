@@ -192,6 +192,10 @@ Fix:
 
 - Trigger graph rebuild only after a committed maintenance epoch completes.
 - Load from compacted/generated sidecars, not runaway append logs.
+- Initial mitigation: the watcher now keys rebuilds off edge sidecar
+  file/byte/mtime signatures instead of Tantivy doc-count growth, and skips
+  graph reloads when transcript-only indexing grows the corpus without changing
+  sidecars.
 - Add graph rebuild timing and sidecar byte/line counters to logs.
 
 ## 9. Vector Queue Side Effects Are Coupled To Reindex

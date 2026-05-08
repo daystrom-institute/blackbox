@@ -1205,11 +1205,55 @@ pub(crate) fn rebuild_edge_index_from_shared(
     *state.edge_index.write() = rebuilt;
 }
 
-/// Watcher thread that rebuilds the EdgeIndex when the underlying tantivy
-/// corpus has grown. The auto-reindex thread writes new docs + edge sidecars
-/// every interval, but it can't trigger a rebuild itself (it spawns before
-/// SharedState exists). The watcher uses sidecar-only rebuilds so background
-/// maintenance does not materialize every stored Tantivy document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EdgeSidecarSignature {
+    files: u64,
+    bytes: u64,
+    modified_nanos: u128,
+}
+
+fn edge_sidecar_signature(edges_dir: &std::path::Path) -> EdgeSidecarSignature {
+    let mut sig = EdgeSidecarSignature {
+        files: 0,
+        bytes: 0,
+        modified_nanos: 0,
+    };
+    let mut stack = vec![edges_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "jsonl") {
+                continue;
+            }
+            sig.files += 1;
+            sig.bytes = sig.bytes.saturating_add(meta.len());
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            sig.modified_nanos = sig.modified_nanos.wrapping_add(modified);
+        }
+    }
+    sig
+}
+
+/// Watcher thread that rebuilds the EdgeIndex when edge sidecars change.
+/// The auto-reindex thread writes new docs + edge sidecars every interval,
+/// but it can't trigger a rebuild itself (it spawns before SharedState exists).
+/// The watcher uses sidecar-only rebuilds so background maintenance does not
+/// materialize every stored Tantivy document.
 pub(crate) fn spawn_edge_index_rebuild_watcher(
     state: Arc<SharedState>,
     interval: std::time::Duration,
@@ -1220,18 +1264,34 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             // Initial settle so the boot-time rebuild already ran.
             std::thread::sleep(std::time::Duration::from_secs(20));
             let mut last_seen: u64 = state.idx.read().num_docs();
+            let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+            let mut last_signature = edge_sidecar_signature(&edges_dir);
             loop {
                 std::thread::sleep(interval);
                 let current = state.idx.read().num_docs();
-                if current > last_seen {
+                let signature = edge_sidecar_signature(&edges_dir);
+                if signature != last_signature {
                     let started = std::time::Instant::now();
                     rebuild_edge_index_from_shared(&state, false);
                     tracing::info!(
                         prev_docs = last_seen,
                         new_docs = current,
+                        sidecar_files = signature.files,
+                        sidecar_bytes = signature.bytes,
                         elapsed_ms = started.elapsed().as_millis(),
-                        "edge-index watcher: corpus grew, EdgeIndex rebuilt"
+                        "edge-index watcher: sidecars changed, EdgeIndex rebuilt"
                     );
+                    last_signature = signature;
+                } else if current > last_seen {
+                    tracing::debug!(
+                        prev_docs = last_seen,
+                        new_docs = current,
+                        sidecar_files = signature.files,
+                        sidecar_bytes = signature.bytes,
+                        "edge-index watcher: corpus grew without sidecar changes; rebuild skipped"
+                    );
+                }
+                if current > last_seen {
                     last_seen = current;
                 }
             }
