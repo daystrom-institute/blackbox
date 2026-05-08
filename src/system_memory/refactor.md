@@ -32,7 +32,10 @@ Writable structural plans are narrower:
   - `bbox_refactor_plan(kind="replace_text")` replaces exact `old_text` with
     `new_text` in `source`. By default the old text must match exactly once;
     pass `replace_all=true` for every occurrence. This is a literal edit
-    primitive, not symbolic rename or import repair.
+    primitive with transaction/rollback guardrails, not a semantic refactor
+    primitive. Treat it as grep-with-safety for hard-coded metadata, generated
+    fixtures, or other already-grounded literals. Do not present it as symbolic
+    rename, import repair, extraction, or move support.
   - `bbox_refactor_plan(kind="write_file")` replaces or creates `source` with
     complete `new_text`. Supported source files are parse-validated.
   - `bbox_refactor_plan(kind="ensure_toml_table")` ensures a top-level TOML

@@ -27,7 +27,7 @@ file names or tool prefixes, it does not count.
 | Add `[lib]` target to `Cargo.toml` | TOML table insertion/update with idempotent key checks | covered with `ensure_toml_table` | none for top-level table/string entries |
 | Create `src/lib.rs` from `mod` declarations in `main.rs` | extract/copy module declarations; transform copied declarations to `pub mod`; create file | covered for declaration copy/rewrite with `copy_rust_mod_decls`, `rewrite_rust_mod_visibility`, and `write_file` | none for declaration-driven lib bootstrap |
 | Delete `mod foo;` from `main.rs` after lib reparent | syntactic deletion of selected top-level `mod_item`s | covered with `delete_rust_items`; can participate in `bbox_refactor_run` | none for top-level declarations |
-| Rewrite binary crate references from `crate::foo` to `blackbox::foo` where needed | explicit path-prefix rewrite plus compiler validation | assisted with `replace_text(replace_all=true)` only after grounding exact intended text | not symbolic; use `rust_lsp_rename` for real symbol rename |
+| Rewrite binary crate references from `crate::foo` to `blackbox::foo` where needed | binding-aware rename or AST path rewrite plus compiler validation | not satisfied by `replace_text`; literal replacement is only acceptable for grounded non-code metadata | need a real AST path/import rewrite primitive when LSP rename is not the right operation |
 | Move inline `SharedState`, `BlackboxServer`, impls, routes, tests to `server/mod.rs` | top-level item extraction; impl extraction; route/helper extraction; test block extraction; exact file rewrite fallback | covered with extraction primitives plus `write_file` after grounding | no automatic dependency closure; plan must name moved items explicitly |
 | Shrink `main.rs` to bootstrap only | create replacement file from selected retained functions/imports | covered with `write_file` after grounding and command validation | none for checkpointed rewrite |
 | Split one tool domain per `tools/<domain>.rs` | extract selected `#[tool]` impl methods; create router helper; add module decl; wire router sum | covered with `extract_rust_impl_methods`, `add_rust_mod_decl`, `add_rust_router_to_sum`, `bbox_refactor_run` | grouping by attribute/name prefix remains agent-grounded, not automatic |
@@ -142,9 +142,10 @@ file names or tool prefixes, it does not count.
    - especially `src/packets.rs` -> `src/packets/mod.rs`
    - future: module-layout update helper and temp-worktree validated diff mode
 
-4. **Structured TOML and exact rewrite edits**
+4. **Structured TOML and bounded literal edits**
    - `ensure_toml_table` covers adding `[lib]`
-   - `replace_text` covers explicit literal text rewrites only
+   - `replace_text` covers explicit literal text rewrites only; this is
+     grep/replace with transaction guardrails, not refactor mechanization
    - `write_file` covers checkpointed bootstrap-file rewrites
 
 5. **Rust LSP adapter**

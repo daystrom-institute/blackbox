@@ -15,6 +15,14 @@ The worker must mutate files only through `bbox_refactor_plan`,
 inspect, format, test, or report. If a needed mutation cannot be represented as
 a plan, stop and report the missing operation.
 
+`replace_text` is not evidence of refactor mechanization. It is literal
+grep/replace wrapped in path scoping, dirty-file checks, transaction logging,
+validation, and rollback. Use it only for grounded textual residue such as
+hard-coded fixture metadata after a semantic move has already happened. A phase
+does not satisfy the benchmark if its essential restructuring depends on
+`replace_text` where a binding-aware rename, item extraction, import repair,
+visibility rewrite, module declaration, or file move is the real operation.
+
 ## Tool Rules
 
 Before each phase:
@@ -174,7 +182,9 @@ bbox_refactor_run(
 Notes:
 
 - The manifest updates are literal metadata repairs for a hard-coded eval
-  fixture. Do not generalize them into symbolic rename behavior.
+  fixture. This is grep-with-guardrails, not symbolic rename behavior, and it
+  is acceptable here only because the JSON stores exact source-path metadata
+  rather than code bindings.
 - The replacement `a1d21fdd` is the first 8 hex chars of
   `sha256("src/packets/mod.rs")`, matching the project-file relative path hash
   logic in `eval/check.rs`.

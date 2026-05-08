@@ -265,6 +265,9 @@ Use a narrower test command when the changed package has a clearer local test.
   rustdoc before moving when the comment must follow the method.
 - For symbolic rename, use `rust_lsp_rename`; do not substitute
   `replace_text` unless the intended edit is genuinely a literal text rewrite
-  rather than a binding-aware rename.
+  rather than a binding-aware rename. `replace_text` is effectively
+  grep/replace inside the refactor transaction envelope; it should only appear
+  for grounded string literals, fixture metadata, or similar textual residue
+  after the semantic operation is already done.
 - For broad autonomous restructuring, use a durable bro plus reviewer loop; the
   refactor tools supply mechanical edits, not architectural judgment.
