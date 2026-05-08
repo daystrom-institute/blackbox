@@ -211,7 +211,7 @@ bbox_refactor_run(
     {"op":"plan","kind":"add_rust_mod_decl","source":"src/packets/mod.rs","module_name":"ast"},
     {"op":"plan","kind":"extract_rust_items","source":"src/packets/mod.rs","target":"src/packets/coerce.rs","item_names":[...],"target_prelude":"use super::{Packet, Value};\n"},
     {"op":"plan","kind":"extract_rust_items","source":"src/packets/mod.rs","target":"src/packets/events.rs","item_names":[...],"target_prelude":"use anyhow::{Context, Result};\nuse serde::{Deserialize, Serialize};\nuse std::fs;\nuse std::path::{Path, PathBuf};\n"},
-    {"op":"plan","kind":"extract_rust_items","source":"src/packets/mod.rs","target":"src/packets/ast.rs","item_names":[...],"target_prelude":"use anyhow::Result;\nuse serde::{Deserialize, Serialize};\nuse std::collections::BTreeMap;\n"},
+    {"op":"plan","kind":"extract_rust_items","source":"src/packets/mod.rs","target":"src/packets/ast.rs","item_names":[...],"target_prelude":"use anyhow::{Context, Result};\nuse serde::{Deserialize, Serialize};\nuse std::collections::BTreeMap;\nuse super::Packet;\n"},
     {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/coerce.rs","item_names":[...],"item_kinds":["function_item"],"visibility":"pub(super)"},
     {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/events.rs","item_names":["packets_dir","scope_dir","packet_path","events_log_path","append_line"],"item_kinds":["function_item"],"visibility":"pub(super)"},
     {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/packets/events.rs","item_names":["now","with_packet_id","with_domain","with_details"],"item_kinds":["impl_method"],"impl_name":"impl PacketEvent","visibility":"pub(super)"},
