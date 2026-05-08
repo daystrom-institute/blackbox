@@ -349,6 +349,9 @@ Checkpoint: pause.
 
 Goal: create `src/tools/` and move one coherent tool domain at a time.
 
+Current constraint: like `server`, `tools` must be declared from `src/main.rs`
+until the binary-local module graph has moved into `lib.rs`.
+
 Grounding per domain:
 
 ```text
@@ -363,11 +366,11 @@ bbox_refactor_run(
   project_dir=<worktree>,
   confirm=true,
   steps=[
-    {"op":"plan","kind":"add_rust_mod_decl","source":"src/lib.rs","module_name":"tools","visibility":"pub"},
+    {"op":"plan","kind":"add_rust_mod_decl","source":"src/main.rs","module_name":"tools"},
     {"op":"plan","kind":"write_file","source":"src/tools/mod.rs","new_text":"pub mod <domain>;\n"},
     {"op":"plan","kind":"extract_rust_impl_methods","source":"src/main.rs","target":"src/tools/<domain>.rs","item_names":[...],"item_kinds":["impl_method"],"impl_name":"impl BlackboxServer","router_name":"<domain>_tools","router_export_name":"router","target_prelude":"use crate::*;\nuse crate::server::*;"},
     {"op":"plan","kind":"add_rust_router_to_sum","source":"src/main.rs","router_call":"tools::<domain>::router()"},
-    {"op":"command","command":"cargo","args":["fmt"],"touches":["src/lib.rs","src/tools/mod.rs","src/tools/<domain>.rs","src/main.rs"],"required":true},
+    {"op":"command","command":"cargo","args":["fmt"],"touches":["src/main.rs","src/tools/mod.rs","src/tools/<domain>.rs"],"required":true},
     {"op":"command","command":"cargo","args":["test","--bin","blackboxd"],"required":true}
   ]
 )
