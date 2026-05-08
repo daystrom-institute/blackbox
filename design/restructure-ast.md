@@ -369,6 +369,8 @@ bbox_refactor_run(
     {"op":"plan","kind":"add_rust_mod_decl","source":"src/main.rs","module_name":"tools"},
     {"op":"plan","kind":"write_file","source":"src/tools/mod.rs","new_text":"pub mod <domain>;\n"},
     {"op":"plan","kind":"extract_rust_impl_methods","source":"src/main.rs","target":"src/tools/<domain>.rs","item_names":[...],"item_kinds":["impl_method"],"impl_name":"impl BlackboxServer","router_name":"<domain>_tools","router_export_name":"router","target_prelude":"use crate::*;\nuse crate::server::*;"},
+    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/tools/<domain>.rs","item_names":["router"],"visibility":"pub(crate)"},
+    {"op":"plan","kind":"rewrite_rust_item_visibility","source":"src/tools/<domain>.rs","item_names":[...],"item_kinds":["impl_method"],"impl_name":"impl BlackboxServer","visibility":"pub(crate)"},
     {"op":"plan","kind":"add_rust_router_to_sum","source":"src/main.rs","router_call":"tools::<domain>::router()"},
     {"op":"command","command":"cargo","args":["fmt"],"touches":["src/main.rs","src/tools/mod.rs","src/tools/<domain>.rs"],"required":true},
     {"op":"command","command":"cargo","args":["test","--bin","blackboxd"],"required":true}
