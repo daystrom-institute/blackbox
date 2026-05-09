@@ -6,6 +6,7 @@ pub mod badgey_adapter;
 pub mod bro_helpers;
 pub mod bro_params;
 pub mod bro_runtime_params;
+pub mod config;
 pub mod councils;
 pub mod graph;
 pub mod knowledge;
