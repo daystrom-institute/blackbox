@@ -9,6 +9,7 @@ pub mod bro_runtime_params;
 pub mod graph;
 pub mod knowledge;
 pub mod notes;
+pub mod orchestrate;
 pub mod packets;
 pub mod projects;
 pub mod refactor;

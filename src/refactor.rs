@@ -2667,7 +2667,9 @@ fn rust_impl_methods_target_wrapper(
     if let Some(export_name) = router_export_name {
         let router_name =
             router_name.ok_or_else(|| anyhow!("router_export_name requires router_name"))?;
-        wrapper.push_str("pub(super) fn ");
+        let vis_str = visibility.map(|v| format!("{v} ")).unwrap_or_else(|| "pub(super) ".to_string());
+        wrapper.push_str(&vis_str);
+        wrapper.push_str("fn ");
         wrapper.push_str(export_name);
         wrapper.push_str("() -> ToolRouter<BlackboxServer> {\n    BlackboxServer::");
         wrapper.push_str(router_name);
@@ -2723,18 +2725,18 @@ fn rust_impl_methods_block(
         let text = if let Some(ref new_vis) = vis_prefix {
             let keyword = rust_visibility_keyword_byte(source, &method.item)?;
             let vis_start = rust_item_visibility_start_byte(source, &method.item, keyword);
-            
+
             let before = source
                 .get(method.item.leading_trivia_start..vis_start)
                 .unwrap_or_default();
-            
+
             let current_prefix = source.get(vis_start..keyword).unwrap_or_default();
             let qualifier_prefix = rust_strip_visibility_prefix(current_prefix);
-            
+
             let after = source
                 .get(keyword..method.item.byte_end)
                 .unwrap_or_default();
-                
+
             format!("{before}{new_vis}{qualifier_prefix}{after}")
         } else {
             original_text.to_string()
