@@ -105,6 +105,43 @@ pub struct CapturedVariable {
     pub source_visibility: String,
 }
 
+/// Single call site for an external or inherited method dependency
+/// reported by `extract_java_methods` analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct ExtractedCallSite {
+    pub line: usize,
+    pub column: usize,
+    pub in_method: String,
+    /// "direct" or "lambda" — `lambda` means the call is inside a
+    /// `lambda_expression` ancestor, before the enclosing method declaration.
+    pub context: String,
+}
+
+/// A method call inside the extracted set that resolves to a method on the
+/// source class but is NOT part of the extracted set. These calls become
+/// unresolved references on the target class after extraction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct ExternalCall {
+    pub method: String,
+    pub signature: String,
+    /// True when the signature was reconstructed best-effort because the
+    /// declaring method node could not be fully recovered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signature_partial: bool,
+    pub call_sites: Vec<ExtractedCallSite>,
+}
+
+/// A method call inside the extracted set that resolves to a method declared
+/// on a superclass / implemented interface in the project type index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct InheritedDependency {
+    pub method: String,
+    pub source: String,
+    /// "class" or "interface".
+    pub source_kind: String,
+    pub call_sites: Vec<ExtractedCallSite>,
+}
+
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
     /// Supported generic or language-scoped plan kind. Pull sm-refactor first.
@@ -309,6 +346,15 @@ pub struct RefactorPlan {
     pub leftovers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captured_variables: Vec<CapturedVariable>,
+    /// External method calls inside the extracted set that resolve to methods
+    /// on the source class but are not in the extracted set. Reported by
+    /// `extract_java_methods` and `extract_java_class`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_calls: Vec<ExternalCall>,
+    /// Methods called inside the extracted set that are inherited from a
+    /// superclass or implemented interface in the project type index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited_dependencies: Vec<InheritedDependency>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1228,6 +1274,8 @@ fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1296,6 +1344,8 @@ fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1328,6 +1378,8 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1374,6 +1426,8 @@ fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
