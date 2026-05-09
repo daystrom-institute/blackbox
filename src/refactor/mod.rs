@@ -16,6 +16,9 @@ use rust::*;
 mod java;
 use java::*;
 
+#[cfg(test)]
+mod tests;
+
 use crate::chunker;
 use crate::chunker::code::{language_for_path, parser_for_language};
 use crate::entity_ref;
@@ -166,7 +169,7 @@ pub struct InheritedDependency {
     pub call_sites: Vec<ExtractedCallSite>,
 }
 
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
     /// Supported generic or language-scoped plan kind. Pull sm-refactor first.
     pub kind: String,
