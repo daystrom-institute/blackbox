@@ -266,6 +266,17 @@ pub struct RefactorPlanParams {
     /// field references, missing inherited-method hookup) before apply.
     #[serde(default)]
     pub deep_analysis: Option<bool>,
+    /// Gap 18: when `extract_java_class` runs with `move_fields` non-empty
+    /// AND `deep_analysis: true`, also rewrite each remaining source-side
+    /// read/write of a moved field through the delegate's getter/setter,
+    /// and emit matching getter/setter declarations on the target. Defaults
+    /// to true when `deep_analysis` is true; defaults to false (no rewrite)
+    /// when `deep_analysis` is false. Set explicitly to false to keep the
+    /// `remaining_source_accessors` report but skip the rewrites — useful
+    /// when the operator wants to fix the call sites by hand or revisit the
+    /// move strategy.
+    #[serde(default)]
+    pub rewrite_remaining_accessors: Option<bool>,
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,

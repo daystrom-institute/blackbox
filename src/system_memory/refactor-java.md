@@ -248,6 +248,42 @@ Pass `deep_analysis: true` to also receive:
   apply. The shape is documented under `move_java_field` in step 7 below;
   the contract is the same.
 
+When `deep_analysis: true` AND `move_fields` non-empty, the planner also
+**rewrites every remaining source-side access through the delegate** and
+**generates matching getter/setter declarations on the target** (gap 18).
+Defaults to on; pass `rewrite_remaining_accessors: false` to opt out and
+keep only the report. Default summary:
+
+| `deep_analysis` | `rewrite_remaining_accessors` | Behavior                                  |
+|-----------------|-------------------------------|-------------------------------------------|
+| `true`          | unset / `true`                | Rewrite reads/writes + emit accessors     |
+| `true`          | `false`                       | Skip rewrites; report still populates     |
+| `false`         | (ignored)                     | Pre-Gap-18 behavior — silent miscompiles  |
+
+Rewrite shape:
+
+| Access kind                    | Before                  | After                                            |
+|--------------------------------|-------------------------|--------------------------------------------------|
+| Bare read                      | `meterGrid`             | `delegate.getMeterGrid()`                        |
+| `this.`-qualified read         | `this.meterGrid`        | `delegate.getMeterGrid()`                        |
+| Method-on-field receiver       | `meterGrid.refresh()`   | `delegate.getMeterGrid().refresh()`              |
+| Direct write                   | `items = list`          | `delegate.setItems(list)`                        |
+| Compound write (`+=`, `<<=`…)  | `counter += 5`          | `delegate.setCounter(delegate.getCounter() + 5)` |
+| Increment / decrement          | `counter++`             | `delegate.setCounter(delegate.getCounter() + 1)` |
+
+Generated accessors honour the same package/public visibility floor used
+for moved methods (`package` same-package, `public` cross-package).
+Boolean fields named `is*` / `has*` keep the bare name as their getter
+(`isPlantSelected()`, not `getIsPlantSelected()`); `final` fields get a
+getter only and writes against them are NOT rewritten — the original
+write stays in place so the compiler surfaces the immutability error,
+and the operator can decide whether to drop `final` or restructure.
+
+Limitation: the rewrite walks tree-sitter alone and cannot detect the
+narrow case where the field's type does not support the augmented
+operator (`&=` on a non-numeric type, etc.). It still emits the rewrite
+in setter form and lets the Java compiler complain.
+
 The composite plan also runs the tree-sitter `organize_imports` heuristic
 on the generated target file in-process before returning (gap 25). The
 target's import block ends up containing only imports whose simple name is
