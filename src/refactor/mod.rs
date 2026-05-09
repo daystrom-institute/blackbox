@@ -113,6 +113,16 @@ pub struct CapturedVariable {
     pub kind: String,
     pub source_type: String,
     pub source_visibility: String,
+    /// Captured field is declared with `final`. When false, promoting it to a
+    /// constructor parameter snapshots the value at construction time and the
+    /// target sees stale data after subsequent source-side mutations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source_mutable: bool,
+    /// Captured field is declared `static final`. The composite plan should
+    /// move it as a constant (initializer-preserving) rather than promote it
+    /// to an instance field on the target.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source_static_final: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]

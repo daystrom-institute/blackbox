@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, Clone)]
 pub(crate) struct JavaMethod {
@@ -721,16 +721,61 @@ fn java_modifier_text(node: Node<'_>, source: &str) -> String {
     }
 }
 
-fn collect_identifier_texts(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
+/// Direct-child `field_declaration` nodes of the outermost class body. Inner
+/// classes' field declarations are intentionally excluded — only the source
+/// class's own fields can be captured by extracted methods.
+fn outer_class_field_map(parsed: &ParsedSource) -> BTreeMap<String, JavaField> {
+    let mut map = BTreeMap::new();
+    let Some(class_node) = find_first_class_declaration(parsed.tree.root_node()) else {
+        return map;
+    };
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return map;
+    };
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if child.kind() != "field_declaration" {
+            continue;
+        }
+        if let (Some(name), Some(type_name)) = (
+            java_field_declaration_name(child, &parsed.source),
+            java_field_type_text(child, &parsed.source),
+        ) {
+            map.insert(
+                name.clone(),
+                JavaField {
+                    name,
+                    type_name,
+                    item: syntax_item_with_kind(parsed, child, "field_declaration"),
+                },
+            );
+        }
+    }
+    map
+}
+
+/// Walk every identifier inside `method_node` and return tuples of
+/// (name, identifier_node, is_qualified_this_access). The third bool is true
+/// when the identifier is the `field` part of a `this.<name>` field_access —
+/// such accesses are never shadowable by enclosing locals/parameters.
+fn collect_identifier_uses<'a>(
+    node: Node<'a>,
+    source: &str,
+    out: &mut Vec<(String, Node<'a>, bool)>,
+) {
     if node.kind() == "identifier" {
-        if let Ok(text) = node.utf8_text(source.as_bytes()) {
-            out.insert(text.to_string());
+        if let Some(access_node) = resolve_field_access(node) {
+            if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                let qualified_this = access_node.id() != node.id()
+                    && access_node.kind() == "field_access";
+                out.push((text.to_string(), node, qualified_this));
+            }
         }
         return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_identifier_texts(child, source, out);
+        collect_identifier_uses(child, source, out);
     }
 }
 
@@ -738,36 +783,65 @@ fn captured_fields_for_methods(
     parsed: &ParsedSource,
     selected: &[JavaMethod],
 ) -> Vec<CapturedVariable> {
-    let fields = java_fields(parsed)
-        .into_iter()
-        .map(|field| (field.name.clone(), field))
-        .collect::<BTreeMap<_, _>>();
-    let mut seen = HashSet::new();
+    // Source-class fields only. Inner-class field declarations are not
+    // captures of the source class — they are independent declarations.
+    let fields = outer_class_field_map(parsed);
+    if fields.is_empty() {
+        return Vec::new();
+    }
+
+    // Resolve each identifier inside the selected methods against the
+    // outer-class field map, applying the same shadowing rules used for
+    // remaining-source-accessor analysis. An identifier counts as a capture
+    // only when (a) its name maps to a source-class field AND (b) no
+    // enclosing local/parameter/enhanced-for variable shadows it before the
+    // method boundary.
+    let mut captured_names: BTreeSet<String> = BTreeSet::new();
     for method in selected {
-        if let Some(node) = find_node(parsed.tree.root_node(), |node| {
+        let Some(method_node) = find_node(parsed.tree.root_node(), |node| {
             (node.kind() == "method_declaration" || node.kind() == "constructor_declaration")
                 && node.start_byte() == method.item.byte_start
                 && node.end_byte() == method.item.byte_end
-        }) {
-            collect_identifier_texts(node, &parsed.source, &mut seen);
+        }) else {
+            continue;
+        };
+        let mut uses = Vec::new();
+        collect_identifier_uses(method_node, &parsed.source, &mut uses);
+        for (name, ident_node, qualified_this) in uses {
+            if !fields.contains_key(&name) {
+                continue;
+            }
+            // `this.X` always resolves to `this`'s field regardless of
+            // enclosing local/parameter shadows. Only bare-name reads can
+            // be shadowed.
+            if !qualified_this && is_shadowed(ident_node, &name, &parsed.source) {
+                continue;
+            }
+            captured_names.insert(name);
         }
     }
+
     fields
         .into_iter()
-        .filter(|(name, _)| seen.contains(name))
-        .map(|(name, field)| CapturedVariable {
-            name,
-            kind: "field".to_string(),
-            source_type: field.type_name,
-            source_visibility: java_modifier_text(
-                find_node(parsed.tree.root_node(), |node| {
-                    node.kind() == "field_declaration"
-                        && node.start_byte() == field.item.byte_start
-                        && node.end_byte() == field.item.byte_end
-                })
-                .unwrap_or(parsed.tree.root_node()),
-                &parsed.source,
-            ),
+        .filter(|(name, _)| captured_names.contains(name))
+        .map(|(name, field)| {
+            let field_node = find_node(parsed.tree.root_node(), |node| {
+                node.kind() == "field_declaration"
+                    && node.start_byte() == field.item.byte_start
+                    && node.end_byte() == field.item.byte_end
+            })
+            .unwrap_or(parsed.tree.root_node());
+            let mods = collect_java_modifiers(field_node);
+            let has_final = mods.iter().any(|(name, _, _)| name == "final");
+            let has_static = mods.iter().any(|(name, _, _)| name == "static");
+            CapturedVariable {
+                name,
+                kind: "field".to_string(),
+                source_type: field.type_name,
+                source_visibility: java_modifier_text(field_node, &parsed.source),
+                source_mutable: !has_final,
+                source_static_final: has_static && has_final,
+            }
         })
         .collect()
 }
@@ -4033,6 +4107,174 @@ mod tests {
                 && capture.source_type == "Grid"
                 && capture.source_visibility == "private"
         }));
+    }
+
+    // -----------------------------------------------------------------
+    // Gap 19: captured_variables must resolve identifiers against the
+    // source class's own field declarations, not parameters or
+    // inner-class fields.
+    // -----------------------------------------------------------------
+
+    fn captured_plan(source_text: &str, method_name: &str) -> RefactorPlan {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Composition.java");
+        let target = dir.path().join("Extracted.java");
+        fs::write(&source, source_text).unwrap();
+        let mut params = java_plan_params("extract_java_methods", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec![method_name.to_string()]);
+        let plan_text = plan_extract_java_methods(&params).unwrap();
+        // Keep the tempdir alive past parse — leak intentionally for the
+        // plan parse, the OS cleans up.
+        let _ = dir;
+        serde_json::from_str(&plan_text).unwrap()
+    }
+
+    #[test]
+    fn captured_variables_skip_method_parameter_with_field_shadow() {
+        // c3Variance is BOTH a real source-class field AND a parameter of
+        // the extracted method. Only field-resolved accesses (this.c3Variance,
+        // unshadowed reads) count — the `param + 1` arithmetic on the
+        // parameter alone must not promote the parameter back to a capture.
+        // This test pins the shadowing branch: when the only identifier
+        // text seen inside the method is shadowed by the formal parameter,
+        // we still capture the field iff some other access escapes the
+        // shadow (here `this.c3Variance`).
+        let plan = captured_plan(
+            "class Composition {\n\
+             \x20   private String c3Variance;\n\
+             \x20   void setupStatusBadge(String c3Variance) {\n\
+             \x20       String local = c3Variance + this.c3Variance;\n\
+             \x20   }\n\
+             }\n",
+            "setupStatusBadge",
+        );
+        // The only capture for the field must be reported once (via the
+        // unshadowed `this.c3Variance` access).
+        let hits = plan
+            .captured_variables
+            .iter()
+            .filter(|c| c.name == "c3Variance")
+            .count();
+        assert_eq!(hits, 1, "captured_variables: {:?}", plan.captured_variables);
+    }
+
+    #[test]
+    fn captured_variables_excludes_pure_parameter_with_no_field() {
+        // No source-class field named `c3Variance`; the identifier is only
+        // a method parameter. Must NOT appear as a captured variable.
+        let plan = captured_plan(
+            "class Composition {\n\
+             \x20   void setupStatusBadge(String c3Variance, int n) {\n\
+             \x20       String s = c3Variance + n;\n\
+             \x20   }\n\
+             }\n",
+            "setupStatusBadge",
+        );
+        assert!(
+            plan.captured_variables
+                .iter()
+                .all(|c| c.name != "c3Variance"),
+            "parameter leaked into captured_variables: {:?}",
+            plan.captured_variables
+        );
+    }
+
+    #[test]
+    fn captured_variables_excludes_inner_class_field_shadow() {
+        // Inner class declares a field `badgeId`; the outer class does not.
+        // An identifier `badgeId` inside an outer-class method must not
+        // be reported as a captured variable just because the inner class
+        // happens to declare a field by that name.
+        let plan = captured_plan(
+            "class Composition {\n\
+             \x20   void setupStatusBadge() {\n\
+             \x20       String s = badgeId;\n\
+             \x20   }\n\
+             \x20   class SamplePointItemView {\n\
+             \x20       private String badgeId;\n\
+             \x20   }\n\
+             }\n",
+            "setupStatusBadge",
+        );
+        assert!(
+            plan.captured_variables
+                .iter()
+                .all(|c| c.name != "badgeId"),
+            "inner-class field leaked into captured_variables: {:?}",
+            plan.captured_variables
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Gap 21: captured_variables must surface mutability indicators so
+    // composite plans can warn / treat constants specially.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn captured_variables_marks_non_final_field_as_mutable() {
+        let plan = captured_plan(
+            "class Composition {\n\
+             \x20   private boolean isPlantSelected;\n\
+             \x20   void render() { boolean v = isPlantSelected; }\n\
+             }\n",
+            "render",
+        );
+        let capture = plan
+            .captured_variables
+            .iter()
+            .find(|c| c.name == "isPlantSelected")
+            .expect("isPlantSelected should be captured");
+        assert!(capture.source_mutable, "non-final field must be mutable");
+        assert!(
+            !capture.source_static_final,
+            "non-final non-static field must not be flagged static_final"
+        );
+    }
+
+    #[test]
+    fn captured_variables_marks_private_final_as_immutable_instance() {
+        let plan = captured_plan(
+            "class Composition {\n\
+             \x20   private final String label = \"hello\";\n\
+             \x20   void render() { String v = label; }\n\
+             }\n",
+            "render",
+        );
+        let capture = plan
+            .captured_variables
+            .iter()
+            .find(|c| c.name == "label")
+            .expect("label should be captured");
+        assert!(!capture.source_mutable, "final field must not be mutable");
+        assert!(
+            !capture.source_static_final,
+            "non-static final field must not be flagged static_final"
+        );
+    }
+
+    #[test]
+    fn captured_variables_marks_static_final_as_constant() {
+        let plan = captured_plan(
+            "class Composition {\n\
+             \x20   private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";\n\
+             \x20   void render() { String v = SAMPLE_STATUS_OK; }\n\
+             }\n",
+            "render",
+        );
+        let capture = plan
+            .captured_variables
+            .iter()
+            .find(|c| c.name == "SAMPLE_STATUS_OK")
+            .expect("SAMPLE_STATUS_OK should be captured");
+        assert!(
+            !capture.source_mutable,
+            "static final field must not be mutable"
+        );
+        assert!(
+            capture.source_static_final,
+            "static final field must be flagged source_static_final"
+        );
     }
 
     // -----------------------------------------------------------------
