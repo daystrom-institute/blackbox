@@ -385,10 +385,64 @@ fn heuristic_java_organize_imports(
     if parsed.language != "java" {
         bail!("java_lsp_organize_imports fallback only supports java files");
     }
+    let Some((start, end, replacement)) =
+        compute_java_organize_imports_edit(project_dir, &parsed.source, &parsed.tree)?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![FileEdit {
+        path: path_string(source_path),
+        original_sha256: sha256_hex(parsed.source.as_bytes()),
+        edits: vec![TextEdit {
+            byte_start: start,
+            byte_end: end,
+            replacement,
+        }],
+    }])
+}
+
+/// In-memory variant of the organize-imports heuristic that operates on a
+/// Java source string. Returns the rewritten source with unused imports
+/// pruned and any project-local simple-name references imported. Used by
+/// composite plans (e.g. `extract_java_class`) to clean up generated target
+/// files before they hit disk — no LSP roundtrip, no temporary file.
+///
+/// Matches the same rules as `heuristic_java_organize_imports`: keeps
+/// `import static …` and wildcard imports verbatim, prunes regular imports
+/// whose simple name does not appear in `type_identifier` references in the
+/// AST, adds project-local imports for unresolved simple names, and skips
+/// inner-class simple names (gap 16). On parse failure or when no rewrite is
+/// needed the input string is returned unchanged.
+fn heuristic_java_organize_imports_text(
+    project_dir: &Path,
+    source: &str,
+) -> Result<String> {
+    let tree = parse_source("java", source)?;
+    let Some((start, end, replacement)) =
+        compute_java_organize_imports_edit(project_dir, source, &tree)?
+    else {
+        return Ok(source.to_string());
+    };
+    let mut out = String::with_capacity(source.len() + replacement.len());
+    out.push_str(&source[..start]);
+    out.push_str(&replacement);
+    out.push_str(&source[end..]);
+    Ok(out)
+}
+
+/// Shared core for the file-based and text-based organize-imports
+/// heuristics. Returns `Some((byte_start, byte_end, replacement))` describing
+/// the import-block rewrite, or `None` when the existing block already
+/// matches the desired output (i.e. no edit needed).
+fn compute_java_organize_imports_edit(
+    project_dir: &Path,
+    source: &str,
+    tree: &Tree,
+) -> Result<Option<(usize, usize, String)>> {
     let mut used_types = HashSet::new();
-    collect_java_type_references(parsed.tree.root_node(), &parsed.source, &mut used_types);
-    let current_package = extract_java_package(&parsed.source);
-    let existing_imports = extract_java_imports(&parsed.source);
+    collect_java_type_references(tree.root_node(), source, &mut used_types);
+    let current_package = extract_java_package(source);
+    let existing_imports = extract_java_imports(source);
     let mut imports = existing_imports
         .iter()
         .filter(|line| {
@@ -438,7 +492,7 @@ fn heuristic_java_organize_imports(
 
     let mut sorted = imports.into_iter().collect::<Vec<_>>();
     sorted.sort();
-    let (start, end, insert_at) = java_import_block_range(&parsed.source);
+    let (start, end, insert_at) = java_import_block_range(source);
     let replacement = if sorted.is_empty() {
         String::new()
     } else if start == end && insert_at == 0 {
@@ -448,18 +502,10 @@ fn heuristic_java_organize_imports(
     } else {
         sorted.join("\n")
     };
-    if parsed.source[start..end] == replacement {
-        return Ok(Vec::new());
+    if source[start..end] == replacement {
+        return Ok(None);
     }
-    Ok(vec![FileEdit {
-        path: path_string(source_path),
-        original_sha256: sha256_hex(parsed.source.as_bytes()),
-        edits: vec![TextEdit {
-            byte_start: start,
-            byte_end: end,
-            replacement,
-        }],
-    }])
+    Ok(Some((start, end, replacement)))
 }
 
 fn validate_java_type_identifier(name: &str, field: &str) -> Result<()> {
@@ -1815,7 +1861,30 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     if !original_target_bytes.is_empty() {
         bail!("extract_java_class currently requires a missing or empty target file");
     }
-    let target_content = java_class_wrapper(&target_class_name, &prelude, &target_body);
+    let raw_target_content = java_class_wrapper(&target_class_name, &prelude, &target_body);
+    // Gap 25: prune unused imports on the generated target. The prelude
+    // copies every import from the source; the heuristic walks the in-memory
+    // target AST and drops imports whose simple name is never referenced as
+    // a `type_identifier`. Best-effort — on any failure we keep the over-
+    // imported content rather than fail the whole extraction.
+    let project_dir_for_imports = p
+        .project_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| target_path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let target_content =
+        match heuristic_java_organize_imports_text(&project_dir_for_imports, &raw_target_content) {
+            Ok(pruned) => pruned,
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "extract_java_class: heuristic_java_organize_imports_text failed; \
+                     keeping unpruned target imports"
+                );
+                raw_target_content
+            }
+        };
 
     let mut source_edits = Vec::new();
     let removed_ranges = selected_methods
@@ -1874,6 +1943,29 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     source_edits.sort_by_key(|edit| edit.byte_start);
     ensure_non_overlapping(&source_edits)?;
 
+    // Gap 26: when fields are moved AND deep_analysis is on, surface every
+    // remaining read/write of the moved fields that still lives in the
+    // source class. Mirrors `plan_move_java_field`'s contract — operators
+    // get one shape across both plan kinds.
+    let remaining_source_accessors =
+        if !selected_fields.is_empty() && p.deep_analysis.unwrap_or(false) {
+            let moved_field_decl_ranges = selected_fields
+                .iter()
+                .map(|field| (field.item.byte_start, field.item.byte_end))
+                .collect::<Vec<_>>();
+            let moved_field_names_owned = selected_fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect::<Vec<_>>();
+            compute_remaining_source_accessors(
+                &parsed,
+                &moved_field_names_owned,
+                &moved_field_decl_ranges,
+            )
+        } else {
+            Vec::new()
+        };
+
     let plan = RefactorPlan {
         title: format!(
             "Extract Java class {} from {}",
@@ -1911,7 +2003,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             .collect(),
         leftovers: Vec::new(),
         captured_variables,
-        remaining_source_accessors: Vec::new(),
+        remaining_source_accessors,
         external_calls: class_dependency_report.external_calls,
         inherited_dependencies: class_dependency_report.inherited_dependencies,
     };
@@ -4942,5 +5034,235 @@ mod tests {
         assert!(idx.top_level.get("Outer").is_some());
         // Top-level set must NOT include the inner names.
         assert!(idx.top_level.get("Inner").is_none());
+    }
+
+    // ---------- Gap 26: extract_java_class remaining_source_accessors ----------
+
+    #[test]
+    fn extract_java_class_reports_remaining_field_accessors_with_deep_analysis() {
+        // The cluster moves `grid` and `items` to a target class but the
+        // source still reads/writes them in unrelated methods. With
+        // deep_analysis=true, the plan response must list every remaining
+        // access so the operator can decide before applying.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Extracted.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private Grid grid;\n\
+            \x20   private java.util.List<String> items;\n\
+            \x20   void buildGrid() { grid = new Grid(); items.clear(); }\n\
+            \x20   void other() {\n\
+            \x20       view.add(grid);\n\
+            \x20       grid.refresh();\n\
+            \x20       items = new java.util.ArrayList<>();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Extracted".to_string());
+        params.delegate_field = Some("extracted".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        params.move_fields = Some(vec!["grid".to_string(), "items".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+
+        let grid_report = plan
+            .remaining_source_accessors
+            .iter()
+            .find(|r| r.field == "grid")
+            .expect("grid entry missing from remaining_source_accessors");
+        // Two remaining reads of `grid`: view.add(grid) and grid.refresh().
+        // The grid = new Grid() write inside buildGrid is ignored because
+        // buildGrid is one of the moved declarations.
+        assert!(
+            grid_report.accesses.len() >= 2,
+            "expected >= 2 grid accesses, got {:?}",
+            grid_report.accesses
+        );
+        assert!(grid_report
+            .accesses
+            .iter()
+            .any(|a| a.context.contains("view.add(grid)")));
+        assert!(grid_report
+            .accesses
+            .iter()
+            .any(|a| a.context.contains("grid.refresh()")));
+
+        let items_report = plan
+            .remaining_source_accessors
+            .iter()
+            .find(|r| r.field == "items")
+            .expect("items entry missing from remaining_source_accessors");
+        assert!(
+            items_report
+                .accesses
+                .iter()
+                .any(|a| a.kind == "write" && a.context.contains("items =")),
+            "expected items write in `other`, got {:?}",
+            items_report.accesses
+        );
+    }
+
+    #[test]
+    fn extract_java_class_omits_remaining_accessors_without_deep_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Extracted.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private Grid grid;\n\
+            \x20   void buildGrid() { grid = new Grid(); }\n\
+            \x20   void other() { view.add(grid); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Extracted".to_string());
+        params.delegate_field = Some("extracted".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        params.move_fields = Some(vec!["grid".to_string()]);
+        // deep_analysis intentionally unset — default false.
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+
+        assert!(
+            plan.remaining_source_accessors.is_empty(),
+            "remaining_source_accessors must stay empty without deep_analysis: {:?}",
+            plan.remaining_source_accessors
+        );
+    }
+
+    // ---------- Gap 25: extract_java_class organizes target imports ----------
+
+    #[test]
+    fn extract_java_class_prunes_unused_target_imports() {
+        // Source imports two project-local types `B` and `C`; the extracted
+        // method body only references `B`. After extract_java_class, the
+        // target's import block must include `B` and exclude `C` —
+        // composite plan runs heuristic_java_organize_imports_text on the
+        // generated target text.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("B.java"),
+            "package a;\npublic class B { public void touch() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("C.java"),
+            "package a;\npublic class C { public void unused() {} }\n",
+        )
+        .unwrap();
+        let source = pkg.join("Source.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import a.B;\n\
+             import a.C;\n\
+             \n\
+             public class Source {\n\
+            \x20   void useB() { B b = new B(); b.touch(); }\n\
+            \x20   void useC() { new C().unused(); }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = pkg.join("Extracted.java");
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Extracted".to_string());
+        params.delegate_field = Some("extracted".to_string());
+        params.item_names = Some(vec!["useB".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+
+        let target_edit = &plan.edits[1];
+        assert_eq!(target_edit.path, path_string(&target));
+        let replacement = &target_edit.edits[0].replacement;
+        assert!(
+            replacement.contains("import a.B;"),
+            "expected `import a.B;` in target replacement: {replacement}"
+        );
+        assert!(
+            !replacement.contains("import a.C;"),
+            "expected `import a.C;` to be pruned from target: {replacement}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_keeps_used_import_and_adds_missing_for_simple_name() {
+        // Two project-local types live in package `b`: `Used` and
+        // `MaybeAdded`. The source declares only `import b.Used;` and
+        // references both via simple name in the extracted method body.
+        // The heuristic must keep the existing `Used` import (referenced)
+        // and add a fresh import for `MaybeAdded` (referenced by simple
+        // name but not yet imported).
+        let dir = tempfile::tempdir().unwrap();
+        let a_pkg = dir.path().join("src/main/java/a");
+        let b_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&a_pkg).unwrap();
+        fs::create_dir_all(&b_pkg).unwrap();
+        fs::write(
+            b_pkg.join("Used.java"),
+            "package b;\npublic class Used {}\n",
+        )
+        .unwrap();
+        fs::write(
+            b_pkg.join("MaybeAdded.java"),
+            "package b;\npublic class MaybeAdded {}\n",
+        )
+        .unwrap();
+        let source = a_pkg.join("Source.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import b.Used;\n\
+             \n\
+             public class Source {\n\
+            \x20   void useThem() { Used u = new Used(); MaybeAdded m = new MaybeAdded(); }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = a_pkg.join("Extracted.java");
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Extracted".to_string());
+        params.delegate_field = Some("extracted".to_string());
+        params.item_names = Some(vec!["useThem".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+
+        let target_replacement = &plan.edits[1].edits[0].replacement;
+        // Existing `Used` import preserved (referenced in body).
+        assert!(
+            target_replacement.contains("import b.Used;"),
+            "expected `import b.Used;` retained in target: {target_replacement}"
+        );
+        // Missing `MaybeAdded` import added by the heuristic.
+        assert!(
+            target_replacement.contains("import b.MaybeAdded;"),
+            "expected `import b.MaybeAdded;` added by heuristic: {target_replacement}"
+        );
     }
 }
