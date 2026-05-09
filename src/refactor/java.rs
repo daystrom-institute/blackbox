@@ -576,6 +576,217 @@ fn java_class_wrapper(class_name: &str, prelude: &str, body: &str) -> String {
     out
 }
 
+/// Inject `implements I1, I2` into the `public class <Name>` declaration of a
+/// generated target file produced by `java_class_wrapper`. Idempotent: if the
+/// declaration already lists implements, the new names are appended.
+fn java_inject_implements(target_text: &str, class_name: &str, interfaces: &[String]) -> String {
+    if interfaces.is_empty() {
+        return target_text.to_string();
+    }
+    let needle = format!("public class {class_name}");
+    let Some(decl_start) = target_text.find(&needle) else {
+        return target_text.to_string();
+    };
+    // Locate the `{` that opens the class body. Anything between needle's end
+    // and `{` is the (possibly empty) extends/implements clause area.
+    let after_needle = decl_start + needle.len();
+    let Some(brace_rel) = target_text[after_needle..].find('{') else {
+        return target_text.to_string();
+    };
+    let brace_at = after_needle + brace_rel;
+    let between = &target_text[after_needle..brace_at];
+    let trimmed = between.trim();
+    let new_clause = if let Some(rest) = trimmed.strip_prefix("implements") {
+        // Already has implements — append.
+        let existing = rest.trim_end().to_string();
+        let joined = interfaces.join(", ");
+        format!(" implements {existing}, {joined} ")
+    } else if let Some(rest) = trimmed.strip_prefix("extends") {
+        // extends X — preserve and add implements.
+        let joined = interfaces.join(", ");
+        format!(" extends {} implements {joined} ", rest.trim())
+    } else if trimmed.is_empty() {
+        let joined = interfaces.join(", ");
+        format!(" implements {joined} ")
+    } else {
+        // Unknown content — do not mangle.
+        return target_text.to_string();
+    };
+    let mut out = String::with_capacity(target_text.len() + new_clause.len());
+    out.push_str(&target_text[..after_needle]);
+    out.push_str(&new_clause);
+    out.push_str(&target_text[brace_at..]);
+    out
+}
+
+/// Insert an `import <fqcn>;` line into the import block of a Java target file.
+/// If an identical import already exists, returns the original text unchanged.
+fn java_inject_import(target_text: &str, fqcn: &str) -> String {
+    let import_line = format!("import {fqcn};");
+    if target_text
+        .lines()
+        .any(|line| line.trim() == import_line)
+    {
+        return target_text.to_string();
+    }
+    // Place after the last existing import; otherwise after the package line;
+    // otherwise at the top.
+    let mut last_import_end: Option<usize> = None;
+    let mut package_end: Option<usize> = None;
+    let mut offset = 0usize;
+    for line in target_text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let line_end = offset + line.len();
+        if trimmed.starts_with("package ") {
+            package_end = Some(line_end);
+        }
+        if trimmed.starts_with("import ") {
+            last_import_end = Some(line_end);
+        }
+        offset = line_end;
+    }
+    let (insert_at, prefix, suffix) = if let Some(end) = last_import_end {
+        (end, "", "\n")
+    } else if let Some(end) = package_end {
+        (end, "\n", "\n")
+    } else {
+        (0, "", "\n\n")
+    };
+    let mut out = String::with_capacity(target_text.len() + import_line.len() + 2);
+    out.push_str(&target_text[..insert_at]);
+    out.push_str(prefix);
+    out.push_str(&import_line);
+    out.push_str(suffix);
+    out.push_str(&target_text[insert_at..]);
+    out
+}
+
+/// Insert FIXME comment lines above each unqualified call site of `method` in
+/// `target_text`. The comment is indented to match the call site's column.
+/// Skips matches that are preceded by `.` or `::` (i.e. qualified by a
+/// receiver) or by an identifier character (e.g. `myMethod` is not a match
+/// for `method`). Returns `(new_text, count_inserted)`.
+fn java_insert_fixme_above_calls(
+    target_text: &str,
+    method: &str,
+    fixme_lines: &[String],
+) -> (String, usize) {
+    if fixme_lines.is_empty() {
+        return (target_text.to_string(), 0);
+    }
+    let mut out = String::with_capacity(target_text.len() + fixme_lines.len() * 80);
+    let bytes = target_text.as_bytes();
+    let needle = method.as_bytes();
+    let mut cursor = 0usize;
+    let mut inserted = 0usize;
+    let mut copy_from = 0usize;
+    while cursor + needle.len() <= bytes.len() {
+        let Some(rel) = target_text[cursor..].find(method) else {
+            break;
+        };
+        let pos = cursor + rel;
+        let after = pos + needle.len();
+        // Must be unqualified: the byte before, if any, is not `.`, `:` or an
+        // identifier-continuation char.
+        let prev_ok = if pos == 0 {
+            true
+        } else {
+            let prev = bytes[pos - 1] as char;
+            !(prev == '.'
+                || prev == ':'
+                || prev == '_'
+                || prev == '$'
+                || prev.is_ascii_alphanumeric())
+        };
+        // Must be followed by `(` (skip whitespace) — i.e. a call.
+        let mut tail = after;
+        while tail < bytes.len() && (bytes[tail] == b' ' || bytes[tail] == b'\t') {
+            tail += 1;
+        }
+        let next_ok = tail < bytes.len() && bytes[tail] == b'(';
+        // Avoid matching the method's own declaration (e.g. `void method(...)`).
+        // A declaration call site is preceded by a return type or modifier on
+        // the same line; detect by walking back and checking whether the line
+        // ends with `;` after the closing paren — skip when the line is a
+        // declaration. A simple heuristic: if the call is preceded by a
+        // return-type-shaped identifier on the same line, treat as decl. We
+        // approximate by checking whether the same line contains `{` after
+        // the call (decl bodies open with `{`) AND no `;` or `=`/`return`
+        // before the call. Since target text contains the *bodies* of
+        // extracted methods, declarations look like
+        // `    void runStuff() {` whereas call sites look like
+        // `        runStuff();` or `        x = runStuff();`.
+        // Find line bounds.
+        let line_start = target_text[..pos]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let line_end = target_text[pos..]
+            .find('\n')
+            .map(|i| pos + i)
+            .unwrap_or(bytes.len());
+        let line = &target_text[line_start..line_end];
+        // Heuristic: a method declaration line ends with `{` (after the
+        // closing paren / throws clause). A call site ends with `;` or has
+        // `;` somewhere after the `)`. Check the trimmed end.
+        let trimmed_end = line.trim_end();
+        let looks_like_decl = trimmed_end.ends_with('{');
+        if !prev_ok || !next_ok || looks_like_decl {
+            cursor = pos + needle.len();
+            continue;
+        }
+        // Compute indentation of the call's line.
+        let indent: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        // Insert FIXME comment lines above this line.
+        out.push_str(&target_text[copy_from..line_start]);
+        for fixme in fixme_lines {
+            out.push_str(&indent);
+            out.push_str(fixme);
+            out.push('\n');
+        }
+        copy_from = line_start;
+        inserted += 1;
+        // Advance cursor past this match so we don't double-process it.
+        cursor = line_end;
+    }
+    out.push_str(&target_text[copy_from..]);
+    (out, inserted)
+}
+
+/// Build the standard FIXME comment block for an unresolved external call.
+fn fixme_external_call(method: &str) -> Vec<String> {
+    vec![
+        format!("// FIXME: external call `{method}` — unresolved on target. Source-class method."),
+        "//   resolutions: add to extracted set, extract callback interface, or inject source instance.".to_string(),
+    ]
+}
+
+/// Build the standard FIXME comment block for an inherited dependency from a
+/// superclass that the target does not extend.
+fn fixme_inherited_class_call(method: &str, source: &str) -> Vec<String> {
+    vec![
+        format!("// FIXME: inherited call `{method}` — inherited from class {source} on the source. Extracted target does not extend {source}."),
+        "//   resolutions: extend the same superclass, inject the dependency, or move the call back to the source.".to_string(),
+    ]
+}
+
+/// Look up a Java type by simple name in the project, returning the simple
+/// names of methods declared on its body (top-level interface or class).
+/// Returns `None` if the type is not uniquely resolvable in the project.
+fn collect_interface_declared_methods(
+    project_dir: &Path,
+    interface_name: &str,
+) -> Option<HashSet<String>> {
+    let type_paths = project_java_type_paths(project_dir);
+    let path = type_paths.get(interface_name)?.as_ref()?;
+    let parsed = parse_source_file(path).ok()?;
+    let type_node = find_java_type_declaration_by_name(&parsed, interface_name)?;
+    Some(collect_java_type_method_names(&parsed, type_node))
+}
+
 fn java_class_name(class_node: Node<'_>, source: &str) -> String {
     class_node
         .child_by_field_name("name")
@@ -2026,7 +2237,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .map(PathBuf::from)
         .or_else(|| target_path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
-    let target_content =
+    let mut target_content =
         match heuristic_java_organize_imports_text(&project_dir_for_imports, &raw_target_content) {
             Ok(pruned) => pruned,
             Err(err) => {
@@ -2038,6 +2249,174 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 raw_target_content
             }
         };
+
+    // Gap 22 / Gap 23: scaffold unresolved deps in the generated target text.
+    // Only meaningful when deep_analysis was on (the report is empty otherwise).
+    if p.deep_analysis.unwrap_or(false) {
+        // Collect extracted method names (the methods that just moved to the
+        // target). Used to test interface satisfaction for Gap 23.
+        let extracted_method_names: HashSet<String> = selected_methods
+            .iter()
+            .filter_map(|m| m.item.name.clone())
+            .collect();
+
+        // Gap 23: pick interfaces to inject into the target's class declaration.
+        //
+        // Triggers (union):
+        //   1. Any interface that appears in `inherited_dependencies` (an
+        //      extracted method called a method declared on the interface).
+        //   2. Any interface from the source class's `implements` clause
+        //      whose declared methods are all present in the extracted set
+        //      — the source's interface contract migrated wholesale to the
+        //      target. This case can NOT surface in `inherited_dependencies`
+        //      because the analyzer drops calls to extracted methods, so the
+        //      `implements`-list scan is the only way to spot it.
+        let project_dir_path = p.project_dir.as_deref().map(Path::new);
+        let mut implements_to_add: Vec<String> = Vec::new();
+        let mut interface_imports: Vec<String> = Vec::new();
+        let mut unsatisfied_interfaces: Vec<(String, Vec<String>)> = Vec::new();
+        let mut interface_sources: BTreeMap<String, ()> = BTreeMap::new();
+        for dep in &class_dependency_report.inherited_dependencies {
+            if dep.source_kind == "interface" {
+                interface_sources.insert(dep.source.clone(), ());
+            }
+        }
+        // Trigger (2): scan source class's `implements` chain for interfaces
+        // whose method set is entirely extracted.
+        if let Some(project_dir) = project_dir_path {
+            for super_name in collect_java_super_type_names(class_node, &parsed.source) {
+                // Skip types we already have via inherited_dependencies.
+                if interface_sources.contains_key(&super_name) {
+                    continue;
+                }
+                let type_paths = project_java_type_paths(project_dir);
+                let Some(Some(path)) = type_paths.get(&super_name) else {
+                    continue;
+                };
+                let Ok(parsed_super) = parse_source_file(path) else {
+                    continue;
+                };
+                let Some(super_node) = find_java_type_declaration_by_name(&parsed_super, &super_name)
+                else {
+                    continue;
+                };
+                if java_type_kind_label(super_node) != "interface" {
+                    continue;
+                }
+                let declared = collect_java_type_method_names(&parsed_super, super_node);
+                if declared.is_empty() {
+                    continue;
+                }
+                // All declared methods must be in the extracted set.
+                let all_satisfied = declared
+                    .iter()
+                    .all(|m| extracted_method_names.contains(m));
+                if all_satisfied {
+                    interface_sources.insert(super_name, ());
+                }
+            }
+        }
+        for interface_name in interface_sources.keys() {
+            // Need a project_dir to resolve the interface for both the type
+            // index and the method-list lookup.
+            let Some(project_dir) = project_dir_path else {
+                continue;
+            };
+            // Gather the interface's declared methods. If the interface is
+            // not uniquely resolvable in the project, skip it — we can't
+            // safely add `implements` for a type we can't import.
+            let Some(declared_methods) =
+                collect_interface_declared_methods(project_dir, interface_name)
+            else {
+                continue;
+            };
+            // Satisfaction: every declared method on the interface must be
+            // in the extracted method set. Else the target is abstract.
+            let unsatisfied: Vec<String> = declared_methods
+                .iter()
+                .filter(|m| !extracted_method_names.contains(m.as_str()))
+                .cloned()
+                .collect();
+            // Look up FQCN to add a matching import when the interface lives
+            // in a different package.
+            let type_index = build_java_type_index(project_dir).ok();
+            let fqcn_opt = type_index
+                .as_ref()
+                .and_then(|idx| idx.top_level.get(interface_name))
+                .and_then(|slot| slot.clone());
+            if let Some(fqcn) = fqcn_opt.as_ref() {
+                let target_pkg = extract_java_package(&target_content);
+                let same_pkg = target_pkg
+                    .as_deref()
+                    .is_some_and(|pkg| fqcn.strip_suffix(&format!(".{interface_name}")) == Some(pkg));
+                if !same_pkg {
+                    interface_imports.push(fqcn.clone());
+                }
+            }
+            implements_to_add.push(interface_name.clone());
+            if !unsatisfied.is_empty() {
+                unsatisfied_interfaces.push((interface_name.clone(), unsatisfied));
+            }
+        }
+        for fqcn in &interface_imports {
+            target_content = java_inject_import(&target_content, fqcn);
+        }
+        if !implements_to_add.is_empty() {
+            target_content =
+                java_inject_implements(&target_content, &target_class_name, &implements_to_add);
+        }
+        // Insert FIXME marker above the class declaration for any
+        // implements that the target cannot satisfy.
+        if !unsatisfied_interfaces.is_empty() {
+            let needle = format!("public class {target_class_name}");
+            if let Some(decl_at) = target_content.find(&needle) {
+                let line_start = target_content[..decl_at]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let indent: String = target_content[line_start..decl_at]
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
+                let mut comment = String::new();
+                for (interface, missing) in &unsatisfied_interfaces {
+                    let names = missing.join(", ");
+                    comment.push_str(&format!(
+                        "{indent}// FIXME: target now implements {interface} but does not satisfy method(s) <{names}>;\n"
+                    ));
+                    comment.push_str(&format!(
+                        "{indent}// either also extract the listed method(s) or remove the implements clause.\n"
+                    ));
+                }
+                let mut patched = String::with_capacity(target_content.len() + comment.len());
+                patched.push_str(&target_content[..line_start]);
+                patched.push_str(&comment);
+                patched.push_str(&target_content[line_start..]);
+                target_content = patched;
+            }
+        }
+
+        // Gap 22: insert FIXME comment lines above each external_call site
+        // in the generated target body.
+        for call in &class_dependency_report.external_calls {
+            let fixme = fixme_external_call(&call.method);
+            let (next, _count) =
+                java_insert_fixme_above_calls(&target_content, &call.method, &fixme);
+            target_content = next;
+        }
+
+        // Gap 23 (class branch): for inherited deps with source_kind=="class",
+        // do NOT auto-add `extends`. Insert FIXMEs above each call site.
+        for dep in &class_dependency_report.inherited_dependencies {
+            if dep.source_kind != "class" {
+                continue;
+            }
+            let fixme = fixme_inherited_class_call(&dep.method, &dep.source);
+            let (next, _count) =
+                java_insert_fixme_above_calls(&target_content, &dep.method, &fixme);
+            target_content = next;
+        }
+    }
 
     let mut source_edits = Vec::new();
     let removed_ranges = selected_methods
@@ -4868,6 +5247,281 @@ mod tests {
         assert!(plan.edits[1].edits[0]
             .replacement
             .contains("private Grid grid;"));
+    }
+
+    fn extract_java_class_target_text(plan: &RefactorPlan) -> String {
+        plan.edits[1].edits[0].replacement.clone()
+    }
+
+    #[test]
+    fn extract_java_class_inserts_fixme_above_external_call_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("CompositionView.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass CompositionView {\n    void applyFilters() {}\n    void createMeterGrid() {\n        applyFilters();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.delegate_field = Some("compositionMeterGrid".to_string());
+        params.item_names = Some(vec!["createMeterGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = extract_java_class_target_text(&plan);
+        assert!(
+            target_text.contains("// FIXME: external call `applyFilters`"),
+            "expected FIXME in target text:\n{target_text}"
+        );
+        // The FIXME must immediately precede the call site (same indentation).
+        let fixme_idx = target_text
+            .find("// FIXME: external call `applyFilters`")
+            .unwrap();
+        let after = &target_text[fixme_idx..];
+        assert!(
+            after.lines().take(4).any(|l| l.trim_start() == "applyFilters();"),
+            "FIXME not directly above call site:\n{target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_skips_fixme_when_deep_analysis_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("CompositionView.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass CompositionView {\n    void applyFilters() {}\n    void createMeterGrid() {\n        applyFilters();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.delegate_field = Some("compositionMeterGrid".to_string());
+        params.item_names = Some(vec!["createMeterGrid".to_string()]);
+        // deep_analysis defaults to false.
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = extract_java_class_target_text(&plan);
+        assert!(
+            !target_text.contains("FIXME"),
+            "no FIXME expected when deep_analysis=false:\n{target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_inserts_fixme_for_each_call_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("CompositionView.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass CompositionView {\n    void applyFilters() {}\n    void createMeterGrid() {\n        applyFilters();\n        applyFilters();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.delegate_field = Some("compositionMeterGrid".to_string());
+        params.item_names = Some(vec!["createMeterGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = extract_java_class_target_text(&plan);
+        let fixme_count = target_text
+            .matches("// FIXME: external call `applyFilters`")
+            .count();
+        assert_eq!(
+            fixme_count, 2,
+            "expected one FIXME per call site, got {fixme_count}:\n{target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_auto_adds_implements_for_satisfied_interface() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("HasLogger.java"),
+            "package com.example;\npublic interface HasLogger {\n    void getLogger();\n}\n",
+        )
+        .unwrap();
+        let source = dir.path().join("CompositionView.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass CompositionView implements HasLogger {\n    public void getLogger() {}\n    void createMeterGrid() {\n        getLogger();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.delegate_field = Some("compositionMeterGrid".to_string());
+        // Extract both the interface method (so the target satisfies it) AND
+        // the caller. With both extracted the interface is satisfied.
+        params.item_names = Some(vec![
+            "createMeterGrid".to_string(),
+            "getLogger".to_string(),
+        ]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = extract_java_class_target_text(&plan);
+        assert!(
+            target_text.contains("public class CompositionMeterGrid implements HasLogger"),
+            "expected implements clause:\n{target_text}"
+        );
+        // Same package — no import needed.
+        assert!(
+            !target_text.contains("// FIXME: target now implements"),
+            "interface satisfied; should not emit unsatisfied FIXME:\n{target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_imports_interface_from_other_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger_dir = dir.path().join("logger");
+        let view_dir = dir.path().join("view");
+        fs::create_dir_all(&logger_dir).unwrap();
+        fs::create_dir_all(&view_dir).unwrap();
+        fs::write(
+            logger_dir.join("HasLogger.java"),
+            "package com.example.logger;\npublic interface HasLogger {\n    void getLogger();\n}\n",
+        )
+        .unwrap();
+        let source = view_dir.join("CompositionView.java");
+        let target = view_dir.join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example.view;\n\nimport com.example.logger.HasLogger;\n\nclass CompositionView implements HasLogger {\n    public void getLogger() {}\n    void createMeterGrid() {\n        getLogger();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.delegate_field = Some("compositionMeterGrid".to_string());
+        params.item_names = Some(vec![
+            "createMeterGrid".to_string(),
+            "getLogger".to_string(),
+        ]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = extract_java_class_target_text(&plan);
+        assert!(
+            target_text.contains("import com.example.logger.HasLogger;"),
+            "expected import:\n{target_text}"
+        );
+        assert!(
+            target_text.contains("public class CompositionMeterGrid implements HasLogger"),
+            "expected implements:\n{target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_emits_fixme_when_interface_unsatisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        // Interface declares both methods; only one has a default
+        // implementation, the other is abstract. The class doesn't redefine
+        // either, so the call inside the extracted method resolves through
+        // the interface and surfaces in `inherited_dependencies`.
+        fs::write(
+            dir.path().join("HasLogger.java"),
+            "package com.example;\npublic interface HasLogger {\n    default void otherRequired() {}\n    void getLogger();\n}\n",
+        )
+        .unwrap();
+        let source = dir.path().join("CompositionView.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass CompositionView implements HasLogger {\n    public void getLogger() {}\n    void createMeterGrid() {\n        otherRequired();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.delegate_field = Some("compositionMeterGrid".to_string());
+        // Extract only the caller — the interface methods stay on the source.
+        params.item_names = Some(vec!["createMeterGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = extract_java_class_target_text(&plan);
+        assert!(
+            target_text.contains("// FIXME: target now implements HasLogger but does not satisfy method"),
+            "expected unsatisfied FIXME:\n{target_text}"
+        );
+        assert!(
+            target_text.contains("otherRequired"),
+            "FIXME should name the unsatisfied method:\n{target_text}"
+        );
+        // Implements clause is still injected so the operator sees the
+        // mismatch flagged on the same declaration.
+        assert!(
+            target_text.contains("public class CompositionMeterGrid implements HasLogger"),
+            "expected implements clause + FIXME above it:\n{target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_does_not_add_extends_for_class_inheritance() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("BaseView.java"),
+            "package com.example;\npublic class BaseView {\n    public void applyFilters() {}\n}\n",
+        )
+        .unwrap();
+        let source = dir.path().join("CompositionView.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass CompositionView extends BaseView {\n    void createMeterGrid() {\n        applyFilters();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.delegate_field = Some("compositionMeterGrid".to_string());
+        params.item_names = Some(vec!["createMeterGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = extract_java_class_target_text(&plan);
+        assert!(
+            !target_text.contains("extends BaseView"),
+            "must not auto-add extends:\n{target_text}"
+        );
+        assert!(
+            target_text.contains("// FIXME: inherited call `applyFilters`"),
+            "expected inherited-class FIXME at call site:\n{target_text}"
+        );
+        assert!(
+            target_text.contains("inherited from class BaseView"),
+            "FIXME message should name the source class:\n{target_text}"
+        );
     }
 
     #[test]

@@ -139,6 +139,54 @@ dropped. Resolve each finding before applying:
 | `external_calls` | Add the method to `item_names`, extract a callback interface with `extract_java_interface`, or pass the source instance through. |
 | `inherited_dependencies` | Add the same `implements` / `extends` to the target, or inject the dependency (e.g. `Logger`) via the constructor. |
 
+### Generated FIXME markers in extract_java_class targets
+
+When `deep_analysis: true` is set on `extract_java_class`, the planner not only
+returns the structured reports but also scaffolds **FIXME comment markers** in
+the generated target file at every unresolved call site, so the operator can
+grep the target for `// FIXME: external call` / `// FIXME: inherited call` /
+`// FIXME: target now implements` rather than cross-referencing the JSON
+report against line numbers by hand.
+
+Marker formats (stable, greppable):
+
+- External call (Gap 22):
+  ```java
+  // FIXME: external call `applyFilters` — unresolved on target. Source-class method.
+  //   resolutions: add to extracted set, extract callback interface, or inject source instance.
+  applyFilters();
+  ```
+  Inserted directly above each unqualified call site of a source-class method
+  that is not in the extracted set. Multiple call sites for the same method
+  each receive their own marker.
+- Inherited class call (Gap 23, `source_kind: class`):
+  ```java
+  // FIXME: inherited call `applyFilters` — inherited from class BaseView on the source. Extracted target does not extend BaseView.
+  //   resolutions: extend the same superclass, inject the dependency, or move the call back to the source.
+  applyFilters();
+  ```
+  Superclass dependencies are NEVER auto-resolved with `extends`; the FIXME
+  marker is the only output.
+- Implements injection (Gap 23, `source_kind: interface`):
+  - When all interface-declared methods are present in the extracted set, the
+    target's class declaration is rewritten to `public class T implements I` and
+    the interface's import is added if needed.
+  - When the interface is referenced via inherited call but the extracted set
+    does not satisfy every declared method, the implements clause is still
+    added (so the operator sees the contract), with a FIXME above the
+    declaration:
+    ```java
+    // FIXME: target now implements HasLogger but does not satisfy method(s) <getLogger>;
+    // either also extract the listed method(s) or remove the implements clause.
+    public class CompositionMeterGrid implements HasLogger { ... }
+    ```
+
+FIXME markers are only inserted when `deep_analysis: true`. With the flag off
+the report is empty and the target file is generated bare. The marker format
+is intentionally stable so downstream tooling and reviewers can pattern-match
+on `// FIXME: external call \``, `// FIXME: inherited call \``, and
+`// FIXME: target now implements`.
+
 4. Extract a cohesive Java class in one plan:
 
 ```text
