@@ -1750,37 +1750,61 @@ fn java_caller_rewrite_edits(
     let mut edits = Vec::new();
     let mut stack = vec![parsed.tree.root_node()];
     while let Some(node) = stack.pop() {
-        if node.kind() == "method_invocation" {
-            if skip_ranges
-                .iter()
-                .any(|(start, end)| node.start_byte() >= *start && node.end_byte() <= *end)
-            {
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    stack.push(child);
-                }
-                continue;
-            }
-            if let Some(name_node) = node.child_by_field_name("name") {
-                if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
-                    if methods.contains(name) {
-                        let prefix =
-                            parsed.source[node.start_byte()..name_node.start_byte()].trim();
-                        if prefix.is_empty() {
-                            edits.push(TextEdit {
-                                byte_start: node.start_byte(),
-                                byte_end: node.start_byte(),
-                                replacement: format!("{delegate_field}."),
-                            });
-                        } else if prefix == "this." {
-                            edits.push(TextEdit {
-                                byte_start: node.start_byte(),
-                                byte_end: name_node.start_byte(),
-                                replacement: format!("{delegate_field}."),
-                            });
+        let in_skip = skip_ranges
+            .iter()
+            .any(|(start, end)| node.start_byte() >= *start && node.end_byte() <= *end);
+        if !in_skip {
+            match node.kind() {
+                "method_invocation" => {
+                    if let Some(name_node) = node.child_by_field_name("name") {
+                        if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
+                            if methods.contains(name) {
+                                let prefix = parsed.source
+                                    [node.start_byte()..name_node.start_byte()]
+                                    .trim();
+                                if prefix.is_empty() {
+                                    edits.push(TextEdit {
+                                        byte_start: node.start_byte(),
+                                        byte_end: node.start_byte(),
+                                        replacement: format!("{delegate_field}."),
+                                    });
+                                } else if prefix == "this." {
+                                    edits.push(TextEdit {
+                                        byte_start: node.start_byte(),
+                                        byte_end: name_node.start_byte(),
+                                        replacement: format!("{delegate_field}."),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
+                "method_reference" => {
+                    // tree-sitter-java emits a `method_reference` with two
+                    // named children: the qualifier (a `this` keyword,
+                    // `super` keyword, or type/expression node) and the
+                    // method `identifier`. We rewrite only when the
+                    // qualifier is `this` — `Foo::bar` and `super::method`
+                    // bind to different receivers and must be left alone.
+                    let mut cursor = node.walk();
+                    let children: Vec<_> = node.named_children(&mut cursor).collect();
+                    if children.len() == 2 {
+                        let qualifier = children[0];
+                        let name_node = children[1];
+                        if qualifier.kind() == "this" && name_node.kind() == "identifier" {
+                            if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
+                                if methods.contains(name) {
+                                    edits.push(TextEdit {
+                                        byte_start: qualifier.start_byte(),
+                                        byte_end: qualifier.end_byte(),
+                                        replacement: delegate_field.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         let mut cursor = node.walk();
@@ -2957,6 +2981,123 @@ mod tests {
         assert!(plan.edits[1].edits[0]
             .replacement
             .contains("private Grid grid;"));
+    }
+
+    #[test]
+    fn update_java_callers_rewrites_method_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Source.java");
+        fs::write(
+            &source,
+            "import java.util.List;\nimport java.util.stream.Stream;\n\
+             class Source {\n\
+            \x20   void wire(List<Integer> ints) {\n\
+            \x20       ints.forEach(this::extractedMethod);\n\
+            \x20       ints.stream().map(Foo::bar).count();\n\
+            \x20       ints.forEach(super::extractedMethod);\n\
+            \x20       extractedMethod(0);\n\
+            \x20       this.extractedMethod(1);\n\
+            \x20   }\n\
+            \x20   void extractedMethod(int i) {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut callers = java_plan_params("update_java_callers", &source);
+        callers.delegate_field = Some("delegate".to_string());
+        callers.item_names = Some(vec!["extractedMethod".to_string()]);
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_update_java_callers(&callers).unwrap()).unwrap();
+
+        // Apply the edits in reverse order to get the rewritten text.
+        let original = fs::read_to_string(&source).unwrap();
+        let mut bytes = original.clone().into_bytes();
+        let mut sorted = plan.edits[0].edits.clone();
+        sorted.sort_by_key(|e| e.byte_start);
+        for edit in sorted.iter().rev() {
+            bytes.splice(
+                edit.byte_start..edit.byte_end,
+                edit.replacement.bytes(),
+            );
+        }
+        let rewritten = String::from_utf8(bytes).unwrap();
+
+        // Method-invocation rewrites still happen.
+        assert!(
+            rewritten.contains("delegate.extractedMethod(0)"),
+            "unqualified call should be rewritten: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("delegate.extractedMethod(1)"),
+            "this-qualified call should be rewritten: {rewritten}"
+        );
+
+        // Method-reference: this::extractedMethod -> delegate::extractedMethod.
+        assert!(
+            rewritten.contains("delegate::extractedMethod"),
+            "this-qualified method reference should be rewritten: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("this::extractedMethod"),
+            "this::extractedMethod should be gone: {rewritten}"
+        );
+
+        // Foo::bar must remain untouched (different receiver type).
+        assert!(
+            rewritten.contains("Foo::bar"),
+            "static/external method reference must not be rewritten: {rewritten}"
+        );
+
+        // super::extractedMethod must remain untouched (super has different binding).
+        assert!(
+            rewritten.contains("super::extractedMethod"),
+            "super:: reference must not be rewritten: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn update_java_callers_method_reference_in_lambda_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Pipeline.java");
+        fs::write(
+            &source,
+            "import java.util.List;\n\
+             class Pipeline {\n\
+            \x20   void run(List<String> xs) {\n\
+            \x20       xs.stream().map(this::extractedMethod).forEach(System.out::println);\n\
+            \x20   }\n\
+            \x20   String extractedMethod(String s) { return s; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut callers = java_plan_params("update_java_callers", &source);
+        callers.delegate_field = Some("delegate".to_string());
+        callers.item_names = Some(vec!["extractedMethod".to_string()]);
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_update_java_callers(&callers).unwrap()).unwrap();
+
+        let original = fs::read_to_string(&source).unwrap();
+        let mut bytes = original.into_bytes();
+        let mut sorted = plan.edits[0].edits.clone();
+        sorted.sort_by_key(|e| e.byte_start);
+        for edit in sorted.iter().rev() {
+            bytes.splice(
+                edit.byte_start..edit.byte_end,
+                edit.replacement.bytes(),
+            );
+        }
+        let rewritten = String::from_utf8(bytes).unwrap();
+
+        assert!(
+            rewritten.contains("delegate::extractedMethod"),
+            "this-qualified method reference inside lambda pipeline should be rewritten: {rewritten}"
+        );
+        // Unrelated method reference must stay.
+        assert!(
+            rewritten.contains("System.out::println"),
+            "unrelated method reference must be preserved: {rewritten}"
+        );
     }
 
     #[test]
