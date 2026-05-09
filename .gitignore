@@ -4,7 +4,9 @@
 /.dev-agent/
 /.dev-agent-links
 /.direnv/
-/result
+/node_modules/
+/package.json
+/package-lock.json
 /daystrom/
 /.env
 /.env.bro-slack-dev
