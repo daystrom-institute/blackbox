@@ -150,6 +150,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -204,6 +205,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -263,6 +265,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -312,6 +315,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -370,6 +374,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -428,6 +433,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -480,6 +486,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -536,6 +543,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -589,6 +597,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -641,6 +650,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -690,6 +700,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("matched multiple impl blocks"));
@@ -722,6 +733,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err
@@ -759,6 +771,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -812,6 +825,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -863,6 +877,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -905,6 +920,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("matched multiple impl blocks"));
@@ -936,6 +952,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("requires non-empty item_names"));
@@ -967,6 +984,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("cannot mix impl_method"));
@@ -1004,6 +1022,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                     RefactorRunStep::Plan {
@@ -1027,6 +1046,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                 ],
@@ -1076,6 +1096,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                     RefactorRunStep::Plan {
@@ -1099,6 +1120,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                 ],
@@ -1150,6 +1172,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                     RefactorRunStep::Plan {
@@ -1173,6 +1196,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                 ],
@@ -1227,6 +1251,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                     RefactorRunStep::Plan {
@@ -1250,6 +1275,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                 ],
@@ -1299,6 +1325,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                     RefactorRunStep::Command {
@@ -1354,6 +1381,7 @@ mod tests {
                             toml_table: None,
                             toml_entries: None,
                             project_dir: None,
+                            ..Default::default()
                         },
                     },
                     RefactorRunStep::Command {
@@ -1454,6 +1482,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1504,6 +1533,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1554,6 +1584,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1604,6 +1635,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1654,6 +1686,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1705,6 +1738,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1756,6 +1790,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1803,6 +1838,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1854,6 +1890,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1901,6 +1938,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -1932,6 +1970,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -1985,6 +2024,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -2033,6 +2073,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("is inline"));
@@ -2065,6 +2106,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -2113,6 +2155,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -2160,6 +2203,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -2208,6 +2252,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -2257,6 +2302,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("target already exists"));
@@ -2288,6 +2334,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let response = apply(
@@ -2330,6 +2377,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let response = apply(
@@ -2380,6 +2428,7 @@ mod tests {
                 ("path".into(), serde_json::json!("src/lib.rs")),
             ])),
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let response = apply(
@@ -2443,6 +2492,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: Some(path_string(dir.path())),
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -2491,6 +2541,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -2538,6 +2589,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2573,6 +2625,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.to_string().contains("already contains"));
@@ -2629,6 +2682,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -2676,6 +2730,7 @@ mod tests {
             toml_table: None,
             toml_entries: None,
             project_dir: None,
+            ..Default::default()
         })
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
@@ -2769,6 +2824,10 @@ mod tests {
             validations: Vec::new(),
             items: Vec::new(),
             leftovers: Vec::new(),
+            captured_variables: Vec::new(),
+            remaining_source_accessors: Vec::new(),
+            external_calls: Vec::new(),
+            inherited_dependencies: Vec::new(),
         };
         let err = apply(
             &RefactorApplyParams {
@@ -2806,6 +2865,10 @@ mod tests {
             validations: Vec::new(),
             items: Vec::new(),
             leftovers: Vec::new(),
+            captured_variables: Vec::new(),
+            remaining_source_accessors: Vec::new(),
+            external_calls: Vec::new(),
+            inherited_dependencies: Vec::new(),
         };
 
         let response = apply(
