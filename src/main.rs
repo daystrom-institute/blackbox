@@ -21,6 +21,7 @@ mod git;
 mod inbox;
 mod index;
 mod knowledge;
+mod lsp;
 mod mcp_client;
 mod mcp_tools;
 mod notes;
@@ -1497,6 +1498,7 @@ async fn main() -> anyhow::Result<()> {
             slack_proposal_links::SlackProposalLinks::open(&store_dir)
                 .unwrap_or_else(|e| panic!("opening slack proposal links at {store_dir:?}: {e}")),
         ),
+        lsp_sessions: lsp::LspSessionManager::new(),
     });
     shared
         .agent_adapter_registry
@@ -1866,6 +1868,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Persist tasks on shutdown
     embed_queue::shutdown();
+    // Tear down long-lived LSP sessions before persistence so JDTLS
+    // and friends get a chance to write their workspace caches and
+    // exit cleanly. shutdown_all is best-effort and bounded.
+    shared.lsp_sessions.shutdown_all();
     shared.task_store.read().persist(&store_dir);
     // Best-effort vector-partition force-flush with a short timeout.
     // The earlier unconditional `vectors::global().flush_all()` could

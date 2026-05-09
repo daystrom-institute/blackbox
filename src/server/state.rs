@@ -122,6 +122,11 @@ pub(crate) struct SharedState {
     /// Reaction handlers resolve item_ts → proposal_id; thread-reply
     /// handlers resolve thread_ts → authoring_session_id.
     pub(crate) slack_proposal_links: Arc<slack_proposal_links::SlackProposalLinks>,
+    /// Lazy-spawned per-project LSP sessions (JDTLS, rust-analyzer).
+    /// Refactor tools call `with_session` instead of starting a fresh
+    /// child every call; the manager amortizes initialize cost and
+    /// idle-evicts sessions on a background tick.
+    pub(crate) lsp_sessions: lsp::LspSessionManager,
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;

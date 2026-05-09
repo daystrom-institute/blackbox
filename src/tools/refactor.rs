@@ -37,7 +37,10 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<RefactorPlanParams>,
     ) -> CallToolResult {
-        Self::run("bbox_refactor_plan", || refactor::plan(&p))
+        let ctx = refactor::PlanContext {
+            lsp: Some(self.state.lsp_sessions.clone()),
+        };
+        Self::run("bbox_refactor_plan", || refactor::plan_with_ctx(&p, &ctx))
     }
 
     #[tool(
@@ -64,7 +67,10 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_refactor_run", || {
             let projects = self.state.projects.read().list();
-            refactor::run(&p, &projects)
+            let ctx = refactor::PlanContext {
+                lsp: Some(self.state.lsp_sessions.clone()),
+            };
+            refactor::run_with_ctx(&p, &projects, &ctx)
         })
     }
 }

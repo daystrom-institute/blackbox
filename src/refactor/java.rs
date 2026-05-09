@@ -279,7 +279,26 @@ fn java_import_block_range(source: &str) -> (usize, usize, usize) {
 }
 
 fn project_java_type_index(project_dir: &Path) -> Result<BTreeMap<String, Option<String>>> {
-    let mut index: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let JavaTypeIndex { top_level, .. } = build_java_type_index(project_dir)?;
+    Ok(top_level)
+}
+
+#[derive(Default, Debug)]
+struct JavaTypeIndex {
+    /// Simple-name → uniquely-resolvable FQCN for *top-level* types,
+    /// or `None` when the simple name is ambiguous across packages.
+    /// Mirrors the historical `project_java_type_index` shape.
+    top_level: BTreeMap<String, Option<String>>,
+    /// Simple names of inner classes (members of class/interface/
+    /// record/enum bodies) discovered in the project. Inner-class
+    /// references must be left in qualified form (`Outer.Inner`)
+    /// rather than imported as a bare simple name; gap 16 lives
+    /// here.
+    inner_class_names: HashSet<String>,
+}
+
+fn build_java_type_index(project_dir: &Path) -> Result<JavaTypeIndex> {
+    let mut idx = JavaTypeIndex::default();
     for entry in walkdir::WalkDir::new(project_dir)
         .into_iter()
         .filter_map(|entry| entry.ok())
@@ -306,14 +325,56 @@ fn project_java_type_index(project_dir: &Path) -> Result<BTreeMap<String, Option
             continue;
         };
         let fqcn = format!("{package}.{simple}");
-        match index.get_mut(simple) {
+        match idx.top_level.get_mut(simple) {
             Some(slot) => *slot = None,
             None => {
-                index.insert(simple.to_string(), Some(fqcn));
+                idx.top_level.insert(simple.to_string(), Some(fqcn));
+            }
+        }
+        // Best-effort inner-class scan via tree-sitter. Skip on
+        // parse failure so a single malformed file doesn't poison
+        // the whole index.
+        if let Ok(parsed) = parse_source_file(path) {
+            collect_inner_class_simple_names(
+                parsed.tree.root_node(),
+                &parsed.source,
+                false,
+                &mut idx.inner_class_names,
+            );
+        }
+    }
+    Ok(idx)
+}
+
+/// Walk a Java parse tree adding nested class/interface/record/enum
+/// names to `out`. `inside_type_body` indicates whether the current
+/// node is contained in a type body (i.e. would yield an inner
+/// class on definition). Top-level types are skipped — gap 16 only
+/// cares about nested ones.
+fn collect_inner_class_simple_names(
+    node: Node<'_>,
+    source: &str,
+    inside_type_body: bool,
+    out: &mut HashSet<String>,
+) {
+    let kind = node.kind();
+    let is_type_decl = matches!(
+        kind,
+        "class_declaration" | "interface_declaration" | "record_declaration" | "enum_declaration"
+    );
+    if is_type_decl && inside_type_body {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
+                out.insert(name.to_string());
             }
         }
     }
-    Ok(index)
+    let next_inside = inside_type_body
+        || matches!(kind, "class_body" | "enum_body" | "record_body" | "interface_body");
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_inner_class_simple_names(child, source, next_inside, out);
+    }
 }
 
 fn heuristic_java_organize_imports(
@@ -341,13 +402,26 @@ fn heuristic_java_organize_imports(
         .cloned()
         .collect::<HashSet<_>>();
 
-    let known_types = project_java_type_index(project_dir)?;
+    let JavaTypeIndex {
+        top_level: known_types,
+        inner_class_names,
+    } = build_java_type_index(project_dir)?;
     let existing_simple = imports
         .iter()
         .filter_map(|line| java_import_simple_name(line))
         .collect::<HashSet<_>>();
     for used in &used_types {
         if existing_simple.contains(used) {
+            continue;
+        }
+        // Gap 16: if this simple name corresponds to an inner class
+        // in the project but has no uniquely-resolvable top-level
+        // type, the reference must already be in qualified form
+        // (`Outer.Inner`). Skip generating any bare-name import for
+        // it — that would either fail to compile or silently bind
+        // to the wrong package's `Inner`.
+        let top_level_unique = matches!(known_types.get(used), Some(Some(_)));
+        if !top_level_unique && inner_class_names.contains(used) {
             continue;
         }
         let Some(Some(fqcn)) = known_types.get(used) else {
@@ -2516,85 +2590,27 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
 }
 
 use lsp_types::{
-    notification::{Exit, Initialized, Notification},
-    request::{CodeActionRequest, Initialize, Request, Shutdown},
-    ClientCapabilities, CodeActionClientCapabilities, CodeActionContext, CodeActionKind,
-    CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionParams, InitializeParams,
-    Position, Range, TextDocumentClientCapabilities, TextDocumentIdentifier,
-    WorkspaceClientCapabilities, WorkspaceEditClientCapabilities, WorkspaceFolder,
+    request::CodeActionRequest, CodeActionContext, CodeActionKind, CodeActionParams, Position,
+    Range, TextDocumentIdentifier,
 };
 
+use crate::lsp::{LspError, LspSessionManager};
+use crate::projects::Language;
+
+/// Ask JDTLS for `source.organizeImports` code actions on
+/// `source_path` using the shared session pool. The session is
+/// lazily spawned on first call for `(project_dir, Java)` and reused
+/// across subsequent calls.
 pub(crate) fn jdtls_organize_imports(
+    manager: &LspSessionManager,
     project_dir: &Path,
     source_path: &Path,
 ) -> Result<Vec<FileEdit>> {
-    let timeout_secs = std::env::var("BLACKBOX_JDTLS_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(20);
-    let mut child = std::process::Command::new("timeout")
-        .arg("--kill-after=2s")
-        .arg(format!("{timeout_secs}s"))
-        .arg("jdtls")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawning jdtls through timeout")?;
-    let mut stdin = child.stdin.take().context("jdtls stdin")?;
-    let stdout = child.stdout.take().context("jdtls stdout")?;
-    let mut reader = std::io::BufReader::new(stdout);
-
-    let root_uri = Url::from_directory_path(project_dir)
-        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?;
     let source_uri = Url::from_file_path(source_path)
         .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
-
-    let init_params = InitializeParams {
-        process_id: Some(std::process::id()),
-        root_uri: Some(root_uri.clone()),
-        root_path: Some(project_dir.to_string_lossy().to_string()),
-        capabilities: ClientCapabilities {
-            workspace: Some(WorkspaceClientCapabilities {
-                workspace_edit: Some(WorkspaceEditClientCapabilities {
-                    document_changes: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            text_document: Some(TextDocumentClientCapabilities {
-                code_action: Some(CodeActionClientCapabilities {
-                    code_action_literal_support: Some(CodeActionLiteralSupport {
-                        code_action_kind: CodeActionKindLiteralSupport {
-                            value_set: vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS
-                                .as_str()
-                                .to_string()],
-                        },
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        workspace_folders: Some(vec![WorkspaceFolder {
-            uri: root_uri,
-            name: "refactor-root".to_string(),
-        }]),
-        ..Default::default()
-    };
-
-    send_lsp_request::<Initialize>(&mut stdin, 1, &init_params)?;
-    let _init_result = read_lsp_response::<Initialize>(&mut reader, 1)?;
-    send_lsp_notification::<Initialized>(&mut stdin, &lsp_types::InitializedParams {})?;
-
     let source = fs::read_to_string(source_path)
         .with_context(|| format!("reading {}", source_path.display()))?;
     let end_position = byte_to_lsp_position(&source, source.len());
-
-    std::thread::sleep(std::time::Duration::from_millis(5000));
-
     let code_action_params = CodeActionParams {
         text_document: TextDocumentIdentifier { uri: source_uri },
         range: Range {
@@ -2613,38 +2629,41 @@ pub(crate) fn jdtls_organize_imports(
         partial_result_params: Default::default(),
     };
 
-    send_lsp_request::<CodeActionRequest>(&mut stdin, 2, &code_action_params)?;
-    let response = read_lsp_response::<CodeActionRequest>(&mut reader, 2)?;
-
-    let _ = send_lsp_request::<Shutdown>(&mut stdin, 3, &());
-    let _ = send_lsp_notification::<Exit>(&mut stdin, &());
-    let _ = child.wait();
+    let response = manager.with_session(project_dir, Language::Java, |mut client| {
+        let id = client.send_request::<CodeActionRequest>(&code_action_params)?;
+        client
+            .read_response::<CodeActionRequest>(id)
+            .map_err(|e| match e {
+                LspError::Broken(b) => LspError::Broken(b),
+                LspError::Other(o) => LspError::Other(o),
+            })
+    })?;
 
     let mut all_edits = Vec::new();
     if let Some(actions) = response {
         for action in actions {
-            match action {
-                lsp_types::CodeActionOrCommand::CodeAction(ca) => {
-                    let kind = ca
-                        .kind
-                        .clone()
-                        .unwrap_or_else(|| lsp_types::CodeActionKind::from(""));
-                    if kind == CodeActionKind::SOURCE_ORGANIZE_IMPORTS
-                        || ca.title.to_ascii_lowercase().contains("organize")
-                    {
-                        if let Some(edit) = ca.edit {
-                            all_edits.extend(workspace_edit_to_file_edits(edit)?);
-                        }
+            if let lsp_types::CodeActionOrCommand::CodeAction(ca) = action {
+                let kind = ca
+                    .kind
+                    .clone()
+                    .unwrap_or_else(|| lsp_types::CodeActionKind::from(""));
+                if kind == CodeActionKind::SOURCE_ORGANIZE_IMPORTS
+                    || ca.title.to_ascii_lowercase().contains("organize")
+                {
+                    if let Some(edit) = ca.edit {
+                        all_edits.extend(workspace_edit_to_file_edits(edit)?);
                     }
                 }
-                _ => {}
             }
         }
     }
     Ok(all_edits)
 }
 
-pub(crate) fn plan_java_lsp_organize_imports(p: &RefactorPlanParams) -> Result<String> {
+pub(crate) fn plan_java_lsp_organize_imports(
+    p: &RefactorPlanParams,
+    ctx: &PlanContext,
+) -> Result<String> {
     let project_dir = p
         .project_dir
         .as_deref()
@@ -2653,12 +2672,21 @@ pub(crate) fn plan_java_lsp_organize_imports(p: &RefactorPlanParams) -> Result<S
     let project_dir_str = project_dir.to_string_lossy();
     let source_path = resolve_path(Some(&project_dir_str), &p.source)?;
 
-    let (file_edits, semantic_status) = match jdtls_organize_imports(&project_dir, &source_path) {
-        Ok(edits) if !edits.is_empty() => (edits, SemanticStatus::LspVerified),
-        Ok(_) | Err(_) => (
-            heuristic_java_organize_imports(&project_dir, &source_path)?,
-            SemanticStatus::StructuralOnly,
-        ),
+    let lsp_attempt = ctx
+        .lsp
+        .as_ref()
+        .map(|mgr| jdtls_organize_imports(mgr, &project_dir, &source_path));
+    let (file_edits, semantic_status) = match lsp_attempt {
+        Some(Ok(edits)) if !edits.is_empty() => (edits, SemanticStatus::LspVerified),
+        _ => {
+            if let Some(Err(err)) = &lsp_attempt {
+                tracing::debug!(error = %err, "JDTLS organize_imports failed; falling back to heuristic");
+            }
+            (
+                heuristic_java_organize_imports(&project_dir, &source_path)?,
+                SemanticStatus::StructuralOnly,
+            )
+        }
     };
     if file_edits.is_empty() {
         bail!("no Java import organization edits needed");
@@ -2702,6 +2730,7 @@ mod tests {
                 .into_owned(),
             registered_at: "2026-05-09T00:00:00Z".to_string(),
             is_git_repo: false,
+            languages: Default::default(),
         }
     }
 
@@ -2981,11 +3010,78 @@ mod tests {
         let mut params = java_plan_params("java_lsp_organize_imports", &source);
         params.project_dir = Some(path_string(dir.path()));
 
-        let plan_text = plan_java_lsp_organize_imports(&params).unwrap();
+        let plan_text =
+            plan_java_lsp_organize_imports(&params, &PlanContext::default()).unwrap();
         let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
         assert_eq!(plan.kind, "java_lsp_organize_imports");
         assert!(plan.edits[0].edits[0]
             .replacement
             .contains("import com.example.model.FooThing;"));
+    }
+
+    #[test]
+    fn java_organize_imports_skips_inner_class_simple_name_import() {
+        // Gap 16: `Outer.Inner` references must keep the qualified
+        // form. The fallback must not synthesize `import x.Inner;`
+        // when `Inner` only exists as a member of `Outer`'s body.
+        let dir = tempfile::tempdir().unwrap();
+        let view_dir = dir.path().join("src/main/java/com/example/view");
+        let model_dir = dir.path().join("src/main/java/com/example/model");
+        fs::create_dir_all(&view_dir).unwrap();
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(
+            view_dir.join("CompositionView.java"),
+            "package com.example.view;\n\npublic class CompositionView {\n    public static class SamplePointItemView {}\n}\n",
+        )
+        .unwrap();
+        let source = model_dir.join("Helper.java");
+        fs::write(
+            &source,
+            "package com.example.model;\n\nimport com.example.view.CompositionView;\n\npublic class Helper {\n    void use(CompositionView.SamplePointItemView item) {}\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("java_lsp_organize_imports", &source);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan_result = plan_java_lsp_organize_imports(&params, &PlanContext::default());
+        match plan_result {
+            Ok(plan_text) => {
+                let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+                let replacement = &plan.edits[0].edits[0].replacement;
+                // No bare import for the inner class.
+                assert!(
+                    !replacement.contains("import com.example.model.SamplePointItemView;")
+                        && !replacement.contains("import com.example.view.SamplePointItemView;"),
+                    "fallback fabricated an inner-class import: {replacement}"
+                );
+                // The legitimate outer import is preserved.
+                assert!(replacement.contains("import com.example.view.CompositionView;"));
+            }
+            Err(err) => {
+                // The fallback may decide there are no edits to make
+                // (which is the correct behavior here — the existing
+                // outer import already covers the qualified ref).
+                assert!(err.to_string().contains("no Java import organization edits needed"));
+            }
+        }
+    }
+
+    #[test]
+    fn build_java_type_index_records_inner_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let view_dir = dir.path().join("src/com/x/view");
+        fs::create_dir_all(&view_dir).unwrap();
+        fs::write(
+            view_dir.join("Outer.java"),
+            "package com.x.view;\npublic class Outer { public static class Inner {} public interface IFoo {} }\n",
+        )
+        .unwrap();
+        let idx = build_java_type_index(dir.path()).unwrap();
+        assert!(idx.inner_class_names.contains("Inner"));
+        assert!(idx.inner_class_names.contains("IFoo"));
+        assert!(idx.top_level.get("Outer").is_some());
+        // Top-level set must NOT include the inner names.
+        assert!(idx.top_level.get("Inner").is_none());
     }
 }
