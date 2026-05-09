@@ -8,6 +8,7 @@ pub mod bro_params;
 pub mod bro_runtime_params;
 pub mod config;
 pub mod councils;
+pub mod dispatch;
 pub mod graph;
 pub mod knowledge;
 pub mod notes;
