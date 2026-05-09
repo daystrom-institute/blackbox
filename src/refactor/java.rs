@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub(crate) struct JavaMethod {
@@ -24,6 +24,7 @@ struct JavaField {
     name: String,
     type_name: String,
     item: SyntaxItem,
+    is_final: bool,
 }
 
 pub(crate) fn java_methods(parsed: &ParsedSource) -> Vec<JavaMethod> {
@@ -840,10 +841,14 @@ fn java_fields(parsed: &ParsedSource) -> Vec<JavaField> {
                 java_field_declaration_name(node, &parsed.source),
                 java_field_type_text(node, &parsed.source),
             ) {
+                let is_final = collect_java_modifiers(node)
+                    .iter()
+                    .any(|(name, _, _)| name == "final");
                 fields.push(JavaField {
                     name,
                     type_name,
                     item: syntax_item_with_kind(parsed, node, "field_declaration"),
+                    is_final,
                 });
             }
             continue;
@@ -998,12 +1003,16 @@ fn outer_class_field_map(parsed: &ParsedSource) -> BTreeMap<String, JavaField> {
             java_field_declaration_name(child, &parsed.source),
             java_field_type_text(child, &parsed.source),
         ) {
+            let is_final = collect_java_modifiers(child)
+                .iter()
+                .any(|(name, _, _)| name == "final");
             map.insert(
                 name.clone(),
                 JavaField {
                     name,
                     type_name,
                     item: syntax_item_with_kind(parsed, child, "field_declaration"),
+                    is_final,
                 },
             );
         }
@@ -2205,12 +2214,41 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     } else {
         java_constructor_decl(&target_class_name, "public", &dependency_params, true, None)?
     };
+
+    // Gap 18: when the operator opted in (deep_analysis on, plus the
+    // `rewrite_remaining_accessors` toggle which defaults to true under
+    // deep_analysis), generate getter/setter methods on the target for
+    // each moved field so the source-side rewrites have something to call.
+    // Generated accessors honour the same visibility floor used for the
+    // moved methods (`package` same-package, `public` cross-package).
+    let rewrite_remaining = p.deep_analysis.unwrap_or(false)
+        && p.rewrite_remaining_accessors.unwrap_or(true);
+    let accessor_specs: Vec<DelegateAccessorSpec> = if rewrite_remaining {
+        selected_fields
+            .iter()
+            .map(DelegateAccessorSpec::from_field)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let accessor_visibility = if cross_package { "public" } else { "package" };
+    let accessor_text = if accessor_specs.is_empty() {
+        String::new()
+    } else {
+        accessor_specs
+            .iter()
+            .map(|spec| render_delegate_accessors(spec, accessor_visibility))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let target_body = [
         moved_constants_text,
         dependency_field_text,
         moved_field_text,
         constructor_text,
         method_text,
+        accessor_text,
     ]
     .into_iter()
     .filter(|part| !part.trim().is_empty())
@@ -2477,6 +2515,34 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         delegate_field,
         &removed_ranges,
     )?);
+
+    // Gap 18: rewrite each remaining source-side read/write of a moved
+    // field through the delegate's generated getter/setter. Skipped when
+    // either deep_analysis is off (no analysis to drive it) OR the operator
+    // opted out via rewrite_remaining_accessors=false.
+    if rewrite_remaining && !accessor_specs.is_empty() {
+        // Skip ranges include both the moved field declarations AND the
+        // moved method bodies — accesses inside moved methods are about to
+        // be deleted as part of the extraction, so rewriting them would
+        // overlap with the deletion edit.
+        let mut skip_ranges: Vec<(usize, usize)> = selected_fields
+            .iter()
+            .map(|field| (field.item.byte_start, field.item.byte_end))
+            .collect();
+        skip_ranges.extend(
+            selected_methods
+                .iter()
+                .map(|method| (method.item.byte_start, method.item.byte_end)),
+        );
+        let rewrite_edits = compute_remaining_accessor_rewrite_edits(
+            &parsed,
+            &accessor_specs,
+            &skip_ranges,
+            delegate_field,
+        );
+        source_edits.extend(rewrite_edits);
+    }
+
     source_edits.sort_by_key(|edit| edit.byte_start);
     ensure_non_overlapping(&source_edits)?;
 
@@ -3258,6 +3324,302 @@ fn compute_remaining_source_accessors(
             .unwrap_or(usize::MAX)
     });
     report
+}
+
+// ---------------------------------------------------------------------------
+// Gap 18: rewrite remaining source-side accesses through the delegate.
+// ---------------------------------------------------------------------------
+
+/// Per-field metadata used to drive accessor generation on the target and
+/// rewrite the source-side accesses through the delegate.
+#[derive(Debug, Clone)]
+struct DelegateAccessorSpec {
+    field_name: String,
+    type_name: String,
+    is_final: bool,
+}
+
+impl DelegateAccessorSpec {
+    fn from_field(field: &JavaField) -> Self {
+        Self {
+            field_name: field.name.clone(),
+            type_name: field.type_name.clone(),
+            is_final: field.is_final,
+        }
+    }
+
+    /// Method-name fragment used after `get`/`set`. PascalCases the field
+    /// name unless the field already starts with an accessor-style prefix
+    /// (`is*` / `has*`), in which case the bare field name is the getter.
+    fn boolean_accessor(&self) -> Option<&'static str> {
+        let name = self.field_name.as_str();
+        let is_boolean = matches!(self.type_name.as_str(), "boolean" | "Boolean");
+        if !is_boolean {
+            return None;
+        }
+        if let Some(rest) = name.strip_prefix("is") {
+            if rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+            {
+                return Some("is");
+            }
+        }
+        if let Some(rest) = name.strip_prefix("has") {
+            if rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+            {
+                return Some("has");
+            }
+        }
+        None
+    }
+
+    /// Getter method name, no parens.
+    fn getter_name(&self) -> String {
+        if self.boolean_accessor().is_some() {
+            return self.field_name.clone();
+        }
+        format!("get{}", capitalize_first(&self.field_name))
+    }
+
+    /// Setter method name, no parens. Returns None when the field is
+    /// `final` (no setter is generated and writes can't be rewritten).
+    fn setter_name(&self) -> Option<String> {
+        if self.is_final {
+            return None;
+        }
+        // Boolean is/has prefix: setter name uses the simple-name form
+        // (set + capitalised full name) per Java bean conventions.
+        Some(format!("set{}", capitalize_first(&self.field_name)))
+    }
+}
+
+fn capitalize_first(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Render the getter (and optionally setter) method declarations for one
+/// moved field, using the visibility floor decided by the caller.
+fn render_delegate_accessors(spec: &DelegateAccessorSpec, visibility: &str) -> String {
+    let prefix = if visibility == "package" {
+        String::new()
+    } else {
+        format!("{visibility} ")
+    };
+    let mut out = String::new();
+    let getter = spec.getter_name();
+    out.push_str(&format!(
+        "    {prefix}{ty} {getter}() {{\n        return this.{field};\n    }}\n",
+        ty = spec.type_name,
+        field = spec.field_name,
+    ));
+    if let Some(setter) = spec.setter_name() {
+        out.push('\n');
+        out.push_str(&format!(
+            "    {prefix}void {setter}({ty} {field}) {{\n        this.{field} = {field};\n    }}\n",
+            ty = spec.type_name,
+            field = spec.field_name,
+        ));
+    }
+    out
+}
+
+/// Walk the source AST exactly like `compute_remaining_source_accessors`
+/// but emit a TextEdit per access, rewriting the bare/qualified field name
+/// (or its enclosing assignment / update_expression) through the delegate's
+/// getter/setter. Skips entries we can't rewrite (e.g. write to a `final`
+/// field — the underlying setter doesn't exist).
+fn compute_remaining_accessor_rewrite_edits(
+    parsed: &ParsedSource,
+    specs: &[DelegateAccessorSpec],
+    moved_decl_ranges: &[(usize, usize)],
+    delegate_field: &str,
+) -> Vec<TextEdit> {
+    let spec_by_name: HashMap<&str, &DelegateAccessorSpec> = specs
+        .iter()
+        .map(|spec| (spec.field_name.as_str(), spec))
+        .collect();
+    let name_set: HashSet<&str> = spec_by_name.keys().copied().collect();
+    let mut edits: Vec<TextEdit> = Vec::new();
+    let mut emitted_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "identifier" {
+            continue;
+        }
+        let Ok(text) = node.utf8_text(parsed.source.as_bytes()) else {
+            continue;
+        };
+        if !name_set.contains(text) {
+            continue;
+        }
+        if moved_decl_ranges
+            .iter()
+            .any(|(s, e)| node.start_byte() >= *s && node.end_byte() <= *e)
+        {
+            continue;
+        }
+        let access_node = match resolve_field_access(node) {
+            Some(n) => n,
+            None => continue,
+        };
+        if is_shadowed(node, text, &parsed.source) {
+            continue;
+        }
+        let spec = match spec_by_name.get(text) {
+            Some(s) => *s,
+            None => continue,
+        };
+        let getter_call = format!("{delegate_field}.{}()", spec.getter_name());
+
+        // Walk past parenthesized/cast wrappers when classifying writes,
+        // mirroring classify_access_kind.
+        let mut classify_target = access_node;
+        let mut top_paren = access_node;
+        while let Some(parent) = classify_target.parent() {
+            if matches!(parent.kind(), "parenthesized_expression" | "cast_expression") {
+                classify_target = parent;
+                top_paren = parent;
+                continue;
+            }
+            break;
+        }
+        let parent = classify_target.parent();
+
+        // Helper to register an edit if it does not overlap a prior one.
+        let mut push_edit = |start: usize, end: usize, replacement: String| {
+            if emitted_ranges
+                .iter()
+                .any(|(s, e)| ranges_overlap((*s, *e), (start, end)))
+            {
+                return;
+            }
+            emitted_ranges.push((start, end));
+            edits.push(TextEdit {
+                byte_start: start,
+                byte_end: end,
+                replacement,
+            });
+        };
+
+        match parent.map(|p| p.kind()) {
+            Some("assignment_expression") => {
+                let assign = parent.unwrap();
+                let left_id = assign.child_by_field_name("left").map(|c| c.id());
+                if left_id != Some(classify_target.id()) {
+                    // RHS of an assignment — same as a read.
+                    push_edit(access_node.start_byte(), access_node.end_byte(), getter_call);
+                    continue;
+                }
+                let Some(setter) = spec.setter_name() else {
+                    // final field — can't synthesize a setter call. Leave
+                    // the original write in place (compiler will catch it)
+                    // and skip the rewrite.
+                    continue;
+                };
+                let Some(rhs_node) = assign.child_by_field_name("right") else {
+                    continue;
+                };
+                // Operator slot: the assignment_expression node has children
+                // [left, operator_token, right]; tree-sitter exposes the
+                // operator either via field "operator" or via the unnamed
+                // child between left and right. Slice from source.
+                let op_text = assignment_operator_text(assign, &parsed.source);
+                let rhs_text = parsed.source[rhs_node.start_byte()..rhs_node.end_byte()].to_string();
+                let replacement = match op_text.as_deref() {
+                    Some("=") | None => {
+                        format!("{delegate_field}.{setter}({rhs_text})")
+                    }
+                    Some(compound) => {
+                        // Strip trailing '=' from "+=" -> "+".
+                        let bin_op = compound.trim_end_matches('=');
+                        format!(
+                            "{delegate_field}.{setter}({getter_call} {bin_op} {rhs_text})"
+                        )
+                    }
+                };
+                push_edit(assign.start_byte(), assign.end_byte(), replacement);
+            }
+            Some("update_expression") => {
+                let upd = parent.unwrap();
+                let Some(setter) = spec.setter_name() else {
+                    continue;
+                };
+                let op_text = update_operator_text(upd, &parsed.source);
+                let bin_op = match op_text.as_deref() {
+                    Some("++") => "+",
+                    Some("--") => "-",
+                    _ => continue,
+                };
+                let replacement =
+                    format!("{delegate_field}.{setter}({getter_call} {bin_op} 1)");
+                push_edit(upd.start_byte(), upd.end_byte(), replacement);
+            }
+            _ => {
+                // Pure read — replace the bare identifier or `this.field`
+                // span with the getter call. `top_paren` is unused here:
+                // we only rewrite the inner read site; surrounding parens
+                // / casts are still legal around a method call.
+                let _ = top_paren;
+                push_edit(access_node.start_byte(), access_node.end_byte(), getter_call);
+            }
+        }
+    }
+    edits.sort_by_key(|e| e.byte_start);
+    edits
+}
+
+fn ranges_overlap(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 < b.1 && b.0 < a.1
+}
+
+/// Return the operator token text of an `assignment_expression` (e.g. `=`,
+/// `+=`, `<<=`, `>>>=`). tree-sitter-java exposes it as an unnamed child
+/// between the `left` and `right` field children.
+fn assignment_operator_text(assign: Node<'_>, source: &str) -> Option<String> {
+    let left = assign.child_by_field_name("left")?;
+    let right = assign.child_by_field_name("right")?;
+    let mut cursor = assign.walk();
+    let mut op = None;
+    for child in assign.children(&mut cursor) {
+        if child.id() == left.id() || child.id() == right.id() {
+            continue;
+        }
+        if !child.is_named() {
+            // unnamed child — likely the operator token.
+            if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                op = Some(text.to_string());
+            }
+        }
+    }
+    op
+}
+
+/// Return the operator text of an `update_expression` — `++` or `--`.
+fn update_operator_text(upd: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = upd.walk();
+    for child in upd.children(&mut cursor) {
+        if !child.is_named() {
+            if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                if text == "++" || text == "--" {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// If `node` is an identifier, return the access expression we should
@@ -4611,6 +4973,7 @@ mod tests {
             delegate_type: None,
             keep_copy: None,
             deep_analysis: None,
+            rewrite_remaining_accessors: None,
             project_dir: None,
         }
     }
@@ -6448,6 +6811,530 @@ mod tests {
             plan.remaining_source_accessors.is_empty(),
             "remaining_source_accessors must stay empty without deep_analysis: {:?}",
             plan.remaining_source_accessors
+        );
+    }
+
+    // ---------- Gap 18: rewrite remaining accesses through delegate ----------
+
+    /// Helper that materialises the source-side replacement for an
+    /// `extract_java_class` plan: applies every `edit` in the source
+    /// FileEdit to the original source content, returning the post-apply
+    /// string. Edits are pre-sorted by `byte_start` and verified
+    /// non-overlapping by `plan_extract_java_class`, so a simple
+    /// last-to-first pass is correct.
+    fn apply_source_edits(plan: &RefactorPlan, source_path: &Path) -> String {
+        let original = fs::read_to_string(source_path).unwrap();
+        let source_edit = plan
+            .edits
+            .iter()
+            .find(|e| e.path == path_string(source_path))
+            .expect("source edit missing");
+        let mut buf = original;
+        let mut edits = source_edit.edits.clone();
+        edits.sort_by_key(|e| e.byte_start);
+        for edit in edits.iter().rev() {
+            buf.replace_range(edit.byte_start..edit.byte_end, &edit.replacement);
+        }
+        buf
+    }
+
+    fn target_replacement(plan: &RefactorPlan) -> &str {
+        &plan.edits[1].edits[0].replacement
+    }
+
+    #[test]
+    fn extract_java_class_rewrites_bare_read_through_delegate() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private Grid meterGrid;\n\
+            \x20   void buildGrid() { meterGrid = new Grid(); }\n\
+            \x20   void layout() { add(meterGrid); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        params.move_fields = Some(vec!["meterGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("add(delegate.getMeterGrid())"),
+            "expected bare read rewritten through delegate: {rewritten}"
+        );
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("Grid getMeterGrid()"),
+            "expected getter on target: {target_text}"
+        );
+        assert!(
+            target_text.contains("void setMeterGrid(Grid meterGrid)"),
+            "expected setter on target: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_rewrites_this_qualified_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private Grid meterGrid;\n\
+            \x20   void buildGrid() { meterGrid = new Grid(); }\n\
+            \x20   Grid current() { return this.meterGrid; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        params.move_fields = Some(vec!["meterGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("return delegate.getMeterGrid();"),
+            "expected this.meterGrid rewritten via delegate: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("this.meterGrid"),
+            "this.meterGrid still present after rewrite: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_rewrites_method_call_on_field_receiver() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private Grid meterGrid;\n\
+            \x20   void buildGrid() { meterGrid = new Grid(); }\n\
+            \x20   void redraw() { meterGrid.refresh(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        params.move_fields = Some(vec!["meterGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("delegate.getMeterGrid().refresh()"),
+            "expected method-on-field rewritten through getter: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_rewrites_direct_write_through_setter() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.List;\n\
+             class View {\n\
+            \x20   private List<String> meterItems;\n\
+            \x20   void setup() { meterItems = new java.util.ArrayList<>(); }\n\
+            \x20   void replace(List<String> newList) { meterItems = newList; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["setup".to_string()]);
+        params.move_fields = Some(vec!["meterItems".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("delegate.setMeterItems(newList)"),
+            "expected direct write rewritten via setter: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_rewrites_compound_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Counter.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private int counter;\n\
+            \x20   void reset() { counter = 0; }\n\
+            \x20   void bump() { counter += 5; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Counter".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["reset".to_string()]);
+        params.move_fields = Some(vec!["counter".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("delegate.setCounter(delegate.getCounter() + 5)"),
+            "expected compound assign rewritten: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_rewrites_increment() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Counter.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private int counter;\n\
+            \x20   void reset() { counter = 0; }\n\
+            \x20   void tick() { counter++; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Counter".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["reset".to_string()]);
+        params.move_fields = Some(vec!["counter".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("delegate.setCounter(delegate.getCounter() + 1)"),
+            "expected ++ rewritten: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_boolean_final_field_uses_is_getter_no_setter() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Selection.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private final boolean isPlantSelected;\n\
+            \x20   View() { this.isPlantSelected = true; }\n\
+            \x20   void noop() { /* marker */ }\n\
+            \x20   boolean visible() { return isPlantSelected; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Selection".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["noop".to_string()]);
+        params.move_fields = Some(vec!["isPlantSelected".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        // is-prefixed boolean: no double-prefix; getter is the bare name.
+        assert!(
+            target_text.contains("boolean isPlantSelected()"),
+            "expected boolean is-prefix getter, got: {target_text}"
+        );
+        assert!(
+            !target_text.contains("getIsPlantSelected"),
+            "must not double-prefix to getIsPlantSelected: {target_text}"
+        );
+        // final field — no setter generated.
+        assert!(
+            !target_text.contains("setIsPlantSelected"),
+            "must not generate setter for final field: {target_text}"
+        );
+        // Read of the final field still rewrites through the getter.
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("return delegate.isPlantSelected();"),
+            "expected boolean getter rewrite: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_boolean_has_field_non_final_emits_setter() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("State.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private boolean hasError;\n\
+            \x20   void clear() { hasError = false; }\n\
+            \x20   void mark() { hasError = true; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("State".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["clear".to_string()]);
+        params.move_fields = Some(vec!["hasError".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("boolean hasError()"),
+            "expected has-prefix getter: {target_text}"
+        );
+        assert!(
+            target_text.contains("void setHasError(boolean hasError)"),
+            "expected setter on non-final has* field: {target_text}"
+        );
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("delegate.setHasError(true)"),
+            "expected has* setter rewrite: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_skips_write_rewrite_for_final_field() {
+        // A `final` field has no synthesized setter. Any remaining write
+        // must NOT be silently rewritten — the original source-side write
+        // stays in place so the compiler surfaces the immutability error,
+        // and the operator can decide whether to drop `final` or restructure.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Box.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private final String label;\n\
+            \x20   View() { this.label = \"\"; }\n\
+            \x20   void noop() { /* marker */ }\n\
+            \x20   void mutate() { label = \"x\"; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Box".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["noop".to_string()]);
+        params.move_fields = Some(vec!["label".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            !target_text.contains("setLabel"),
+            "must not emit setter for final field: {target_text}"
+        );
+        // Source-side write stays untouched; no setter call introduced.
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            !rewritten.contains("delegate.setLabel"),
+            "must not synthesize setter call for final write: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_accessors_public_when_cross_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/a");
+        let tgt_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&tgt_pkg).unwrap();
+        let source = src_pkg.join("View.java");
+        let target = tgt_pkg.join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             class View {\n\
+            \x20   private String tag;\n\
+            \x20   void initTag() { tag = \"x\"; }\n\
+            \x20   String tag() { return tag; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["initTag".to_string()]);
+        params.move_fields = Some(vec!["tag".to_string()]);
+        params.deep_analysis = Some(true);
+        params.target_prelude = Some("package b;\n".to_string());
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("public String getTag()"),
+            "cross-package accessor must be public: {target_text}"
+        );
+        assert!(
+            target_text.contains("public void setTag(String tag)"),
+            "cross-package accessor must be public: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_rewrite_disabled_keeps_report_drops_edits() {
+        // deep_analysis: true with rewrite_remaining_accessors: false —
+        // operator wants the report, not the rewrites.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private Grid meterGrid;\n\
+            \x20   void buildGrid() { meterGrid = new Grid(); }\n\
+            \x20   void layout() { add(meterGrid); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        params.move_fields = Some(vec!["meterGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.rewrite_remaining_accessors = Some(false);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        // Report still surfaces the breakage.
+        assert!(
+            !plan.remaining_source_accessors.is_empty(),
+            "report must still populate when rewrite is disabled"
+        );
+        // No rewrites in the source — the bare `meterGrid` reference
+        // survives.
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("add(meterGrid)"),
+            "raw bare-name access must stay when rewrite disabled: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("delegate.getMeterGrid"),
+            "must not insert getter call when rewrite disabled: {rewritten}"
+        );
+        // No accessor declarations on the target either.
+        let target_text = target_replacement(&plan);
+        assert!(
+            !target_text.contains("getMeterGrid"),
+            "target must not gain accessors when rewrite disabled: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_no_deep_analysis_no_rewrites_no_report() {
+        // Without deep_analysis the report is empty AND no rewrites are
+        // emitted (matches pre-Gap-18 behavior).
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private Grid meterGrid;\n\
+            \x20   void buildGrid() { meterGrid = new Grid(); }\n\
+            \x20   void layout() { add(meterGrid); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        params.move_fields = Some(vec!["meterGrid".to_string()]);
+        // deep_analysis intentionally unset (default false).
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        assert!(plan.remaining_source_accessors.is_empty());
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            !rewritten.contains("delegate.getMeterGrid"),
+            "no rewrite without deep_analysis: {rewritten}"
+        );
+        let target_text = target_replacement(&plan);
+        assert!(
+            !target_text.contains("getMeterGrid"),
+            "no accessors on target without deep_analysis: {target_text}"
         );
     }
 
