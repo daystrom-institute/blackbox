@@ -5,6 +5,26 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::knowledge_tools()
 }
 
+fn has_runtime_knowledge_filter(p: &KnowledgeListParams) -> bool {
+    p.category.is_some()
+        || p.scope.is_some()
+        || p.project.is_some()
+        || p.provider.is_some()
+        || p.status.is_some()
+        || p.approval.is_some()
+}
+
+fn exact_system_memory_response(p: &KnowledgeListParams) -> Option<String> {
+    if has_runtime_knowledge_filter(p) {
+        return None;
+    }
+    let memory = system_memory::exact_query(p.query.as_deref())?;
+    let mut out = String::new();
+    out.push_str("── System memories ──────────────────────────\n");
+    out.push_str(&system_memory::format_for_listing(memory));
+    Some(out)
+}
+
 #[tool_router(router = knowledge_tools)]
 impl BlackboxServer {
     #[tool(
@@ -109,6 +129,10 @@ impl BlackboxServer {
         Parameters(p): Parameters<KnowledgeListParams>,
     ) -> CallToolResult {
         Self::run("bbox_knowledge", || {
+            if let Some(out) = exact_system_memory_response(&p) {
+                return Ok(out);
+            }
+
             let mut combined = self.state.kb.write().list(&p)?;
 
             // Surface matching packets. Uses the same match semantics as
@@ -200,5 +224,35 @@ impl BlackboxServer {
             self.tombstone_knowledge_entry_in_index(&p.id)?;
             Ok(message)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_system_memory_response_returns_only_exact_memory() {
+        let out = exact_system_memory_response(&KnowledgeListParams {
+            query: Some("sm-refactor".into()),
+            ..Default::default()
+        })
+        .expect("exact canonical system memory query should short-circuit");
+
+        assert!(out.contains("[system] sm-refactor"));
+        assert!(!out.contains("[system] sm-refactor-rust"));
+        assert!(!out.contains("[bb-tool-reference]"));
+        assert!(!out.contains("No entries found."));
+    }
+
+    #[test]
+    fn exact_system_memory_response_respects_runtime_filters() {
+        let out = exact_system_memory_response(&KnowledgeListParams {
+            category: Some("tool".into()),
+            query: Some("sm-refactor".into()),
+            ..Default::default()
+        });
+
+        assert!(out.is_none());
     }
 }

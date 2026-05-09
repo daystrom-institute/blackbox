@@ -596,6 +596,32 @@ pub fn get(id: &str) -> Option<&'static SystemMemory> {
         .find(|m| m.id == id || m.id.strip_prefix("sm-") == Some(id))
 }
 
+fn normalize_exact_query(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let unquoted = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    unquoted.trim()
+}
+
+/// Lookup by exact canonical query. This is intentionally narrower than `get`:
+/// bare slugs such as `refactor` remain searchable terms, while canonical
+/// `sm-refactor` fetches exactly that memory.
+pub fn exact_query(query: Option<&str>) -> Option<&'static SystemMemory> {
+    let candidate = normalize_exact_query(query?);
+    if !candidate
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sm-"))
+    {
+        return None;
+    }
+    SYSTEM_MEMORIES
+        .iter()
+        .find(|m| m.id.eq_ignore_ascii_case(candidate))
+}
+
 #[derive(Debug, Clone)]
 struct MemoryCorpus {
     id: String,
@@ -650,6 +676,9 @@ pub fn search(query: Option<&str>) -> Vec<&'static SystemMemory> {
     };
     if raw_query.is_empty() {
         return SYSTEM_MEMORIES.iter().collect();
+    }
+    if let Some(memory) = exact_query(Some(raw_query)) {
+        return vec![memory];
     }
     let Some(ast) = parse_query(raw_query) else {
         return SYSTEM_MEMORIES.iter().collect();
@@ -732,7 +761,26 @@ mod tests {
     #[test]
     fn search_finds_by_id_query() {
         let hits = search(Some("sm-rule-packets"));
-        assert!(hits.iter().any(|m| m.id == "sm-rule-packets"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "sm-rule-packets");
+    }
+
+    #[test]
+    fn search_exact_canonical_id_does_not_expand_prefix_family() {
+        let hits = search(Some("sm-refactor"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "sm-refactor");
+
+        let quoted = search(Some("\"sm-refactor\""));
+        assert_eq!(quoted.len(), 1);
+        assert_eq!(quoted[0].id, "sm-refactor");
+    }
+
+    #[test]
+    fn search_bare_slug_still_behaves_as_search_term() {
+        let hits = search(Some("refactor"));
+        assert!(hits.iter().any(|m| m.id == "sm-refactor"));
+        assert!(hits.iter().any(|m| m.id == "sm-refactor-rust"));
     }
 
     #[test]
