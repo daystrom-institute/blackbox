@@ -177,6 +177,10 @@ pub struct RefactorPlanParams {
     /// Java delegate type for source-side delegate wiring.
     #[serde(default)]
     pub delegate_type: Option<String>,
+    /// Whether move_java_constant should leave a copy of the constant in the
+    /// source file. Default false.
+    #[serde(default)]
+    pub keep_copy: Option<bool>,
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
@@ -563,6 +567,7 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "add_java_fields" => plan_add_java_fields(p),
         "add_java_constructor" => plan_add_java_constructor(p),
         "move_java_field" => plan_move_java_field(p),
+        "move_java_constant" => plan_move_java_constant(p),
         "update_java_callers" => plan_update_java_callers(p),
         "add_java_delegate_field" => plan_add_java_delegate_field(p),
         "rewrite_java_visibility" => plan_rewrite_java_visibility(p),
@@ -575,7 +580,7 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
