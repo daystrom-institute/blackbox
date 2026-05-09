@@ -1,0 +1,2215 @@
+use super::*;
+
+#[derive(Debug, Clone)]
+pub(crate) struct RustImplMethod {
+    impl_name: String,
+    impl_byte_start: usize,
+    item: SyntaxItem,
+}
+
+
+#[derive(Debug, Clone)]
+pub(crate) struct RustStructField {
+    name_byte_start: usize,
+    item: SyntaxItem,
+}
+
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TargetImplInsertion {
+    byte: usize,
+    body_is_empty: bool,
+}
+
+
+pub(crate) fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let target_path = p
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("target is required for extract_rust_items"))
+        .and_then(|target| resolve_path(p.project_dir.as_deref(), target))?;
+    if source_path == target_path {
+        bail!("source and target must be different files");
+    }
+
+    let parsed = parse_rust_file(&source_path)?;
+    let items = rust_items(&parsed);
+    let selected = select_items(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
+    let selected_ids: HashSet<_> = selected
+        .iter()
+        .map(|item| item.plan_local_id.clone())
+        .collect();
+    let leftovers = items
+        .iter()
+        .filter(|item| !selected_ids.contains(&item.plan_local_id))
+        .map(|item| {
+            format!(
+                "{} {} bytes {}..{}",
+                item.kind,
+                item.name.as_deref().unwrap_or("(unnamed)"),
+                item.byte_start,
+                item.byte_end
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut moved = String::new();
+    for item in &selected {
+        let text = parsed
+            .source
+            .get(item.leading_trivia_start..item.byte_end)
+            .ok_or_else(|| anyhow!("invalid item range for {}", item.plan_local_id))?
+            .trim_matches('\n');
+        if !moved.is_empty() {
+            moved.push_str("\n\n");
+        }
+        moved.push_str(text);
+        moved.push('\n');
+    }
+
+    let target_source = fs::read_to_string(&target_path).unwrap_or_default();
+    let moved_insert = if target_source.trim().is_empty() {
+        moved
+    } else {
+        format!(
+            "{}{}",
+            if target_source.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            },
+            moved
+        )
+    };
+    let target_prelude = p
+        .target_prelude
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .filter(|text| !rust_prelude_present(&target_source, text));
+
+    let source_edits = selected
+        .iter()
+        .map(|item| TextEdit {
+            byte_start: item.leading_trivia_start,
+            byte_end: item.trailing_trivia_end,
+            replacement: String::new(),
+        })
+        .collect::<Vec<_>>();
+    ensure_non_overlapping(&source_edits)?;
+
+    let mut target_edits = Vec::new();
+    if let Some(prelude) = target_prelude {
+        if target_source.trim().is_empty() {
+            target_edits.push(TextEdit {
+                byte_start: 0,
+                byte_end: 0,
+                replacement: format!("{prelude}\n\n{moved_insert}"),
+            });
+        } else {
+            let prelude_insert = rust_prelude_insert_byte(&target_source);
+            target_edits.push(TextEdit {
+                byte_start: prelude_insert,
+                byte_end: prelude_insert,
+                replacement: format!("{prelude}\n"),
+            });
+            if !moved_insert.is_empty() {
+                target_edits.push(TextEdit {
+                    byte_start: target_source.len(),
+                    byte_end: target_source.len(),
+                    replacement: moved_insert,
+                });
+            }
+        }
+    } else if !moved_insert.is_empty() {
+        target_edits.push(TextEdit {
+            byte_start: target_source.len(),
+            byte_end: target_source.len(),
+            replacement: moved_insert,
+        });
+    }
+    ensure_non_overlapping(&target_edits)?;
+
+    let plan = RefactorPlan {
+        title: format!(
+            "extract {} Rust item(s) from {} to {}",
+            selected.len(),
+            path_string(&source_path),
+            path_string(&target_path)
+        ),
+        kind: "extract_rust_items".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![
+            FileEdit {
+                path: path_string(&source_path),
+                original_sha256: sha256_hex(parsed.source.as_bytes()),
+                edits: source_edits,
+            },
+            FileEdit {
+                path: path_string(&target_path),
+                original_sha256: sha256_hex(target_source.as_bytes()),
+                edits: target_edits,
+            },
+        ],
+        validations: vec![
+            ValidationStep::TreeSitterNoErrors {
+                path: path_string(&source_path),
+                byte_range: None,
+            },
+            ValidationStep::TreeSitterNoErrors {
+                path: path_string(&target_path),
+                byte_range: None,
+            },
+        ],
+        items: selected.into_iter().cloned().collect(),
+        leftovers,
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let target_path = p
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("target is required for extract_rust_impl_methods"))
+        .and_then(|target| resolve_path(p.project_dir.as_deref(), target))?;
+    if source_path == target_path {
+        bail!("source and target must be different files");
+    }
+    if let Some(router_name) = p.router_name.as_deref() {
+        validate_rust_identifier(router_name, "router_name")?;
+    }
+    if let Some(export_name) = p.router_export_name.as_deref() {
+        validate_rust_identifier(export_name, "router_export_name")?;
+        if p.router_name.is_none() {
+            bail!("router_export_name requires router_name");
+        }
+    }
+    if let Some(kinds) = p.item_kinds.as_deref() {
+        if !kinds.iter().all(|kind| kind == "impl_method") {
+            bail!("extract_rust_impl_methods only supports item_kinds impl_method");
+        }
+    }
+
+    let names = p
+        .item_names
+        .as_deref()
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| anyhow!("item_names is required for extract_rust_impl_methods"))?;
+
+    let parsed = parse_rust_file(&source_path)?;
+    let methods = rust_impl_methods(&parsed);
+    let candidates = methods
+        .iter()
+        .filter(|method| {
+            p.impl_name
+                .as_deref()
+                .is_none_or(|impl_name| method.impl_name == impl_name)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        if let Some(impl_name) = p.impl_name.as_deref() {
+            bail!("no impl block matching `{impl_name}` found");
+        }
+        bail!("no Rust impl methods found");
+    }
+
+    let mut selected = Vec::new();
+    for expected in names {
+        let matches = candidates
+            .iter()
+            .copied()
+            .filter(|method| method.item.name.as_deref() == Some(expected.as_str()))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => bail!("requested impl method `{expected}` was not found"),
+            [method] => selected.push((*method).clone()),
+            _ => bail!(
+                "requested impl method `{expected}` matched multiple impl blocks; pass impl_name"
+            ),
+        }
+    }
+
+    let impl_starts = selected
+        .iter()
+        .map(|method| method.impl_byte_start)
+        .collect::<HashSet<_>>();
+    if impl_starts.len() > 1 {
+        bail!("extract_rust_impl_methods can only extract methods from one impl block per plan");
+    }
+
+    let selected_ids = selected
+        .iter()
+        .map(|method| method.item.plan_local_id.clone())
+        .collect::<HashSet<_>>();
+    let leftovers = methods
+        .iter()
+        .filter(|method| !selected_ids.contains(&method.item.plan_local_id))
+        .map(|method| {
+            format!(
+                "impl_method {} in {} bytes {}..{}",
+                method.item.name.as_deref().unwrap_or("(unnamed)"),
+                method.impl_name,
+                method.item.byte_start,
+                method.item.byte_end
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let target_source = fs::read_to_string(&target_path).unwrap_or_default();
+    let target_edits = rust_impl_methods_target_edits(
+        &target_path,
+        &target_source,
+        p.target_prelude.as_deref(),
+        p.router_name.as_deref(),
+        p.router_export_name.as_deref(),
+        &selected[0].impl_name,
+        &parsed.source,
+        &selected,
+        p.visibility.as_deref(),
+    )?;
+
+    let source_edits = selected
+        .iter()
+        .map(|method| TextEdit {
+            byte_start: method.item.leading_trivia_start,
+            byte_end: method.item.trailing_trivia_end,
+            replacement: String::new(),
+        })
+        .collect::<Vec<_>>();
+    ensure_non_overlapping(&source_edits)?;
+
+    let plan = RefactorPlan {
+        title: format!(
+            "extract {} Rust impl method(s) from {} to {}",
+            selected.len(),
+            path_string(&source_path),
+            path_string(&target_path)
+        ),
+        kind: "extract_rust_impl_methods".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![
+            FileEdit {
+                path: path_string(&source_path),
+                original_sha256: sha256_hex(parsed.source.as_bytes()),
+                edits: source_edits,
+            },
+            FileEdit {
+                path: path_string(&target_path),
+                original_sha256: sha256_hex(target_source.as_bytes()),
+                edits: target_edits,
+            },
+        ],
+        validations: vec![
+            ValidationStep::TreeSitterNoErrors {
+                path: path_string(&source_path),
+                byte_range: None,
+            },
+            ValidationStep::TreeSitterNoErrors {
+                path: path_string(&target_path),
+                byte_range: None,
+            },
+        ],
+        items: selected.into_iter().map(|method| method.item).collect(),
+        leftovers,
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_delete_rust_items(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let has_names = p
+        .item_names
+        .as_deref()
+        .is_some_and(|names| !names.is_empty());
+    if !has_names {
+        bail!("delete_rust_items requires non-empty item_names; use item_kinds only to narrow deletion matches");
+    }
+    let wants_impl_methods = p
+        .item_kinds
+        .as_deref()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "impl_method"));
+    if wants_impl_methods {
+        plan_delete_rust_impl_methods(p, &source_path)
+    } else {
+        plan_delete_rust_top_level_items(p, &source_path)
+    }
+}
+
+
+pub(crate) fn plan_delete_rust_top_level_items(p: &RefactorPlanParams, source_path: &Path) -> Result<String> {
+    if let Some(kinds) = p.item_kinds.as_deref() {
+        if kinds.iter().any(|kind| kind == "impl_method") {
+            bail!("delete_rust_items cannot mix impl_method with top-level item kinds");
+        }
+    }
+    let parsed = parse_rust_file(source_path)?;
+    let items = rust_items(&parsed);
+    let selected = select_items(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
+    build_delete_rust_plan(&parsed, "top-level Rust item(s)", &items, selected)
+}
+
+
+pub(crate) fn plan_delete_rust_impl_methods(p: &RefactorPlanParams, source_path: &Path) -> Result<String> {
+    if let Some(kinds) = p.item_kinds.as_deref() {
+        if !kinds.iter().all(|kind| kind == "impl_method") {
+            bail!("delete_rust_items cannot mix impl_method with top-level item kinds");
+        }
+    }
+    let parsed = parse_rust_file(source_path)?;
+    let methods = rust_impl_methods(&parsed);
+    let candidates = methods
+        .iter()
+        .filter(|method| {
+            p.impl_name
+                .as_deref()
+                .is_none_or(|impl_name| method.impl_name == impl_name)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        if let Some(impl_name) = p.impl_name.as_deref() {
+            bail!("no impl block matching `{impl_name}` found");
+        }
+        bail!("no Rust impl methods found");
+    }
+
+    let items = candidates
+        .iter()
+        .map(|method| method.item.clone())
+        .collect::<Vec<_>>();
+    let selected = select_items(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
+    if p.impl_name.is_none() {
+        if let Some(names) = p.item_names.as_deref() {
+            for name in names {
+                let matches = selected
+                    .iter()
+                    .filter(|item| item.name.as_deref() == Some(name.as_str()))
+                    .count();
+                if matches > 1 {
+                    bail!(
+                        "requested impl method `{name}` matched multiple impl blocks; pass impl_name"
+                    );
+                }
+            }
+        }
+    }
+    build_delete_rust_plan(&parsed, "Rust impl method(s)", &items, selected)
+}
+
+
+pub(crate) fn build_delete_rust_plan(
+    parsed: &ParsedSource,
+    label: &str,
+    all_items: &[SyntaxItem],
+    selected: Vec<&SyntaxItem>,
+) -> Result<String> {
+    let selected_ids: HashSet<_> = selected
+        .iter()
+        .map(|item| item.plan_local_id.clone())
+        .collect();
+    let leftovers = all_items
+        .iter()
+        .filter(|item| !selected_ids.contains(&item.plan_local_id))
+        .map(|item| {
+            format!(
+                "{} {} bytes {}..{}",
+                item.kind,
+                item.name.as_deref().unwrap_or("(unnamed)"),
+                item.byte_start,
+                item.byte_end
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_edits = selected
+        .iter()
+        .map(|item| TextEdit {
+            byte_start: item.leading_trivia_start,
+            byte_end: item.trailing_trivia_end,
+            replacement: String::new(),
+        })
+        .collect::<Vec<_>>();
+    ensure_non_overlapping(&source_edits)?;
+
+    let plan = RefactorPlan {
+        title: format!(
+            "delete {} {} from {}",
+            selected.len(),
+            label,
+            path_string(&parsed.path)
+        ),
+        kind: "delete_rust_items".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&parsed.path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: source_edits,
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&parsed.path),
+            byte_range: None,
+        }],
+        items: selected.into_iter().cloned().collect(),
+        leftovers,
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let router_call = if let Some(router_call) = p.router_call.as_deref() {
+        validate_rust_router_call(router_call, "router_call")?;
+        router_call.to_string()
+    } else {
+        let router_name = p
+            .router_name
+            .as_deref()
+            .ok_or_else(|| anyhow!("router_name is required for add_rust_router_to_sum"))?;
+        validate_rust_identifier(router_name, "router_name")?;
+        format!("Self::{router_name}()")
+    };
+
+    let parsed = parse_rust_file(&source_path)?;
+    let field = find_rust_field_initializer(&parsed, "tool_router")
+        .ok_or_else(|| anyhow!("no `tool_router:` field initializer found"))?;
+    let field_text = parsed
+        .source
+        .get(field.start_byte()..field.end_byte())
+        .ok_or_else(|| anyhow!("invalid tool_router field range"))?;
+    if field_text.contains(&router_call) {
+        bail!("tool_router already contains {router_call}");
+    }
+    let expr_end = rust_field_value_end(&parsed.source, field)
+        .ok_or_else(|| anyhow!("could not locate tool_router expression end"))?;
+
+    let edit = TextEdit {
+        byte_start: expr_end,
+        byte_end: expr_end,
+        replacement: format!(" + {router_call}"),
+    };
+    let plan = RefactorPlan {
+        title: format!(
+            "add Rust router call {router_call} to tool_router sum in {}",
+            path_string(&source_path)
+        ),
+        kind: "add_rust_router_to_sum".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: vec![edit],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: Vec::new(),
+        leftovers: vec![format!("existing tool_router field: {}", field_text.trim())],
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let module_name = p
+        .module_name
+        .as_deref()
+        .or_else(|| {
+            p.item_names
+                .as_deref()
+                .and_then(|names| names.first().map(String::as_str))
+        })
+        .ok_or_else(|| anyhow!("module_name is required for add_rust_mod_decl"))?;
+    validate_rust_identifier(module_name, "module_name")?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let declaration = format!("{visibility}mod {module_name};");
+
+    let parsed = parse_rust_file(&source_path)?;
+    let items = rust_items(&parsed);
+    if items
+        .iter()
+        .any(|item| item.kind == "mod_item" && item.name.as_deref() == Some(module_name))
+    {
+        bail!("module declaration `{module_name}` already exists");
+    }
+
+    let last_mod = items
+        .iter()
+        .filter(|item| item.kind == "mod_item")
+        .filter(|item| ensure_rust_mod_declaration(&parsed.source, item).is_ok())
+        .max_by_key(|item| item.byte_end);
+    let (insert_at, replacement) = if let Some(item) = last_mod {
+        (item.byte_end, format!("\n{declaration}"))
+    } else {
+        (
+            rust_module_decl_fallback_insert_byte(&parsed.source),
+            format!("{declaration}\n"),
+        )
+    };
+    let plan = RefactorPlan {
+        title: format!(
+            "add Rust module declaration {declaration} to {}",
+            path_string(&source_path)
+        ),
+        kind: "add_rust_mod_decl".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: insert_at,
+                byte_end: insert_at,
+                replacement,
+            }],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let use_path = p
+        .use_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("use_path is required for add_rust_use_decl"))?;
+    validate_rust_use_path(use_path)?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let declaration = format!("{visibility}use {use_path};");
+
+    let parsed = parse_rust_file(&source_path)?;
+    if parsed.source.lines().any(|line| line.trim() == declaration) {
+        bail!("use declaration `{declaration}` already exists");
+    }
+    let items = rust_items(&parsed);
+    let insert_at = items
+        .iter()
+        .filter(|item| item.kind == "use_declaration")
+        .max_by_key(|item| item.byte_end)
+        .map(|item| item.byte_end)
+        .or_else(|| {
+            items
+                .iter()
+                .filter(|item| item.kind == "mod_item")
+                .max_by_key(|item| item.byte_end)
+                .map(|item| item.trailing_trivia_end)
+        })
+        .unwrap_or_else(|| rust_module_decl_fallback_insert_byte(&parsed.source));
+    let replacement = if parsed.source[insert_at..].starts_with('\n') {
+        format!("\n{declaration}")
+    } else if insert_at == parsed.source.len() || parsed.source[..insert_at].ends_with('\n') {
+        format!("{declaration}\n")
+    } else {
+        format!("\n{declaration}\n")
+    };
+    let plan = RefactorPlan {
+        title: format!(
+            "add Rust use declaration {declaration} to {}",
+            path_string(&source_path)
+        ),
+        kind: "add_rust_use_decl".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: insert_at,
+                byte_end: insert_at,
+                replacement,
+            }],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let target_path = p
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("target is required for copy_rust_mod_decls"))
+        .and_then(|target| resolve_path(p.project_dir.as_deref(), target))?;
+    if source_path == target_path {
+        bail!("source and target must be different files");
+    }
+    let parsed = parse_rust_file(&source_path)?;
+    let source_items = rust_items(&parsed);
+    let mod_items = source_items
+        .iter()
+        .filter(|item| item.kind == "mod_item")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mod_kind = vec!["mod_item".to_string()];
+    let selected = select_items(&mod_items, p.item_names.as_deref(), Some(&mod_kind))?;
+    let mut declarations = Vec::new();
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    for item in &selected {
+        ensure_rust_mod_declaration(&parsed.source, item)?;
+        let name = item
+            .name
+            .as_deref()
+            .ok_or_else(|| anyhow!("selected mod_item has no module name"))?;
+        declarations.push(format!("{visibility}mod {name};"));
+    }
+
+    let target_source = fs::read_to_string(&target_path).unwrap_or_default();
+    let existing = rust_existing_mod_decl_names(&target_path, &target_source)?;
+    let declarations = declarations
+        .into_iter()
+        .filter(|declaration| {
+            let name = declaration
+                .trim_end_matches(';')
+                .split_whitespace()
+                .last()
+                .unwrap_or_default();
+            !existing.contains(name)
+        })
+        .collect::<Vec<_>>();
+    if declarations.is_empty() {
+        bail!("all selected module declarations already exist in target");
+    }
+
+    let insert_at = rust_mod_decl_insert_byte(&target_path, &target_source)?;
+    let replacement = rust_decl_batch_insert_text(&target_source, insert_at, &declarations);
+    let plan = RefactorPlan {
+        title: format!(
+            "copy {} Rust module declaration(s) from {} to {}",
+            declarations.len(),
+            path_string(&source_path),
+            path_string(&target_path)
+        ),
+        kind: "copy_rust_mod_decls".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&target_path),
+            original_sha256: sha256_hex(target_source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: insert_at,
+                byte_end: insert_at,
+                replacement,
+            }],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&target_path),
+            byte_range: None,
+        }],
+        items: selected.into_iter().cloned().collect(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let module_name = p
+        .module_name
+        .as_deref()
+        .or_else(|| {
+            p.item_names
+                .as_deref()
+                .and_then(|names| names.first().map(String::as_str))
+        })
+        .ok_or_else(|| {
+            anyhow!("module_name or item_names[0] is required for rewrite_rust_mod_visibility")
+        })?;
+    validate_rust_identifier(module_name, "module_name")?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+
+    let parsed = parse_rust_file(&source_path)?;
+    let items = rust_items(&parsed);
+    let selected = items
+        .iter()
+        .filter(|item| item.kind == "mod_item" && item.name.as_deref() == Some(module_name))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        bail!("module declaration `{module_name}` was not found");
+    }
+    if selected.len() > 1 {
+        bail!("module declaration `{module_name}` matched multiple items");
+    }
+    let item = selected[0];
+    ensure_rust_mod_declaration(&parsed.source, item)?;
+    let mod_keyword = rust_mod_keyword_byte(&parsed.source, item)?;
+    let visibility_start = rust_mod_visibility_start_byte(&parsed.source, mod_keyword);
+    let current_prefix = &parsed.source[visibility_start..mod_keyword];
+    if current_prefix == visibility {
+        bail!("module declaration `{module_name}` already has requested visibility");
+    }
+    let plan = RefactorPlan {
+        title: format!(
+            "rewrite Rust module declaration {module_name} visibility in {}",
+            path_string(&source_path)
+        ),
+        kind: "rewrite_rust_mod_visibility".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: vec![TextEdit {
+                byte_start: visibility_start,
+                byte_end: mod_keyword,
+                replacement: visibility.to_string(),
+            }],
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: vec![item.clone()],
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_rewrite_rust_item_visibility(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let parsed = parse_rust_file(&source_path)?;
+    let wants_impl_methods = p
+        .item_kinds
+        .as_deref()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "impl_method"));
+    let items = if wants_impl_methods {
+        if let Some(kinds) = p.item_kinds.as_deref() {
+            if !kinds.iter().all(|kind| kind == "impl_method") {
+                bail!(
+                    "rewrite_rust_item_visibility cannot mix impl_method with top-level item kinds"
+                );
+            }
+        }
+        let methods = rust_impl_methods(&parsed);
+        let candidates = methods
+            .iter()
+            .filter(|method| {
+                p.impl_name
+                    .as_deref()
+                    .is_none_or(|impl_name| method.impl_name == impl_name)
+            })
+            .map(|method| method.item.clone())
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            if let Some(impl_name) = p.impl_name.as_deref() {
+                bail!("no impl block matching `{impl_name}` found");
+            }
+            bail!("no Rust impl methods found");
+        }
+        candidates
+    } else {
+        if p.impl_name.is_some() {
+            bail!("impl_name requires item_kinds=[\"impl_method\"]");
+        }
+        rust_items(&parsed)
+    };
+    let selected = select_items(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
+    if wants_impl_methods && p.impl_name.is_none() {
+        if let Some(names) = p.item_names.as_deref() {
+            for name in names {
+                let matches = selected
+                    .iter()
+                    .filter(|item| item.name.as_deref() == Some(name.as_str()))
+                    .count();
+                if matches > 1 {
+                    bail!(
+                        "requested impl method `{name}` matched multiple impl blocks; pass impl_name"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut edits = Vec::new();
+    for item in &selected {
+        let keyword = rust_visibility_keyword_byte(&parsed.source, item)?;
+        let visibility_start = rust_item_visibility_start_byte(&parsed.source, item, keyword);
+        let current_prefix = &parsed.source[visibility_start..keyword];
+        let qualifier_prefix = rust_strip_visibility_prefix(current_prefix);
+        let replacement = format!("{visibility}{qualifier_prefix}");
+        if current_prefix == replacement {
+            continue;
+        }
+        edits.push(TextEdit {
+            byte_start: visibility_start,
+            byte_end: keyword,
+            replacement,
+        });
+    }
+    if edits.is_empty() {
+        bail!("all selected Rust items already have requested visibility");
+    }
+    ensure_non_overlapping(&edits)?;
+    let plan = RefactorPlan {
+        title: format!(
+            "rewrite visibility for {} Rust item(s) in {}",
+            selected.len(),
+            path_string(&source_path)
+        ),
+        kind: "rewrite_rust_item_visibility".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits,
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: selected.into_iter().cloned().collect(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_rewrite_rust_field_visibility(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let parsed = parse_rust_file(&source_path)?;
+    let struct_names = p
+        .item_names
+        .as_deref()
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| anyhow!("item_names must name one or more Rust structs"))?;
+    let struct_name_set = struct_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let struct_items = rust_items(&parsed)
+        .into_iter()
+        .filter(|item| {
+            item.kind == "struct_item"
+                && item
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| struct_name_set.contains(name))
+        })
+        .collect::<Vec<_>>();
+    if struct_items.is_empty() {
+        bail!("no matching Rust structs found");
+    }
+    for name in struct_names {
+        if !struct_items
+            .iter()
+            .any(|item| item.name.as_deref() == Some(name.as_str()))
+        {
+            bail!("requested struct `{name}` was not found");
+        }
+    }
+
+    let mut fields = Vec::new();
+    for struct_item in &struct_items {
+        fields.extend(rust_named_struct_fields(&parsed, struct_item)?);
+    }
+    if fields.is_empty() {
+        bail!("no named struct fields found");
+    }
+
+    let mut edits = Vec::new();
+    for field in &fields {
+        let visibility_start =
+            rust_item_visibility_start_byte(&parsed.source, &field.item, field.name_byte_start);
+        let current_prefix = &parsed.source[visibility_start..field.name_byte_start];
+        if current_prefix == visibility {
+            continue;
+        }
+        edits.push(TextEdit {
+            byte_start: visibility_start,
+            byte_end: field.name_byte_start,
+            replacement: visibility.to_string(),
+        });
+    }
+    if edits.is_empty() {
+        bail!("all selected Rust fields already have requested visibility");
+    }
+    ensure_non_overlapping(&edits)?;
+    let plan = RefactorPlan {
+        title: format!(
+            "rewrite visibility for {} Rust struct field(s) in {}",
+            fields.len(),
+            path_string(&source_path)
+        ),
+        kind: "rewrite_rust_field_visibility".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits,
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: fields.into_iter().map(|field| field.item).collect(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_rust_lsp_rename(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let project_dir = p
+        .project_dir
+        .as_deref()
+        .map(|dir| resolve_path(None, dir))
+        .transpose()?
+        .unwrap_or_else(|| {
+            crate::entity_ref::git_root_for_path(&source_path)
+                .unwrap_or_else(|| source_path.parent().unwrap_or(Path::new(".")).to_path_buf())
+        });
+    let old_name = p
+        .item_names
+        .as_deref()
+        .and_then(|names| names.first())
+        .map(String::as_str)
+        .or(p.old_text.as_deref())
+        .ok_or_else(|| anyhow!("item_names[0] or old_text is required for rust_lsp_rename"))?;
+    validate_rust_identifier(old_name, "item_names[0]")?;
+    let new_name = p
+        .new_text
+        .as_deref()
+        .ok_or_else(|| anyhow!("new_text is required for rust_lsp_rename"))?;
+    validate_rust_identifier(new_name, "new_text")?;
+    if old_name == new_name {
+        bail!("rust_lsp_rename requires different old and new names");
+    }
+    let parsed = parse_rust_file(&source_path)?;
+    let position_byte = rust_rename_position_byte(&parsed, old_name)?;
+    let position = byte_to_lsp_position(&parsed.source, position_byte);
+    let lsp_edits = rust_analyzer_rename(&project_dir, &source_path, position, new_name)?;
+    if lsp_edits.is_empty() {
+        bail!("rust-analyzer returned no edits for rename `{old_name}`");
+    }
+    let file_edits = lsp_edits_to_file_edits(lsp_edits)?;
+    let validations = file_edits
+        .iter()
+        .flat_map(|edit| parse_validation_step_for_path(Path::new(&edit.path)))
+        .collect::<Vec<_>>();
+    let plan = RefactorPlan {
+        title: format!("rust-analyzer rename {old_name} to {new_name}"),
+        kind: "rust_lsp_rename".to_string(),
+        semantic_status: SemanticStatus::LspVerified,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: file_edits,
+        validations,
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn plan_rust_organize_imports(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let project_dir = p
+        .project_dir
+        .as_deref()
+        .map(|dir| resolve_path(None, dir))
+        .transpose()?
+        .unwrap_or_else(|| {
+            crate::entity_ref::git_root_for_path(&source_path)
+                .unwrap_or_else(|| source_path.parent().unwrap_or(Path::new(".")).to_path_buf())
+        });
+    parse_rust_file(&source_path)?;
+    let lsp_edits = rust_analyzer_organize_imports(&project_dir, &source_path)?;
+    if lsp_edits.is_empty() {
+        bail!("rust-analyzer returned no import organization edits");
+    }
+    let file_edits = lsp_edits_to_file_edits(lsp_edits)?;
+    let validations = file_edits
+        .iter()
+        .flat_map(|edit| parse_validation_step_for_path(Path::new(&edit.path)))
+        .collect::<Vec<_>>();
+    let plan = RefactorPlan {
+        title: format!(
+            "rust-analyzer organize imports in {}",
+            path_string(&source_path)
+        ),
+        kind: "rust_organize_imports".to_string(),
+        semantic_status: SemanticStatus::LspVerified,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: file_edits,
+        validations,
+        items: Vec::new(),
+        leftovers: Vec::new(),
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+
+pub(crate) fn rust_impl_methods_target_edits(
+    target_path: &Path,
+    target_source: &str,
+    target_prelude: Option<&str>,
+    router_name: Option<&str>,
+    router_export_name: Option<&str>,
+    impl_name: &str,
+    source: &str,
+    selected: &[RustImplMethod],
+    visibility: Option<&str>,
+) -> Result<Vec<TextEdit>> {
+    if let Some(insertion) =
+        existing_target_impl_insert_byte(target_path, target_source, impl_name, router_name)?
+    {
+        let mut replacement = String::new();
+        if !insertion.body_is_empty {
+            replacement.push('\n');
+        }
+        replacement.push_str(&rust_impl_methods_block(source, selected, visibility)?);
+        return Ok(vec![TextEdit {
+            byte_start: insertion.byte,
+            byte_end: insertion.byte,
+            replacement,
+        }]);
+    }
+
+    let wrapper = rust_impl_methods_target_wrapper(
+        target_source,
+        router_name,
+        router_export_name,
+        impl_name,
+        source,
+        selected,
+        visibility,
+    )?;
+    let Some(prelude) = target_prelude
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .filter(|text| !rust_prelude_present(target_source, text))
+    else {
+        return Ok(vec![TextEdit {
+            byte_start: target_source.len(),
+            byte_end: target_source.len(),
+            replacement: wrapper,
+        }]);
+    };
+
+    if target_source.trim().is_empty() {
+        return Ok(vec![TextEdit {
+            byte_start: 0,
+            byte_end: 0,
+            replacement: format!("{prelude}\n\n{wrapper}"),
+        }]);
+    }
+
+    let prelude_insert = rust_prelude_insert_byte(target_source);
+    if prelude_insert == target_source.len() {
+        return Ok(vec![TextEdit {
+            byte_start: target_source.len(),
+            byte_end: target_source.len(),
+            replacement: format!("{prelude}\n\n{wrapper}"),
+        }]);
+    }
+
+    Ok(vec![
+        TextEdit {
+            byte_start: prelude_insert,
+            byte_end: prelude_insert,
+            replacement: format!("{prelude}\n\n"),
+        },
+        TextEdit {
+            byte_start: target_source.len(),
+            byte_end: target_source.len(),
+            replacement: wrapper,
+        },
+    ])
+}
+
+
+pub(crate) fn find_rust_field_initializer<'a>(parsed: &'a ParsedSource, field_name: &str) -> Option<Node<'a>> {
+    find_node(parsed.tree.root_node(), |node| {
+        node.kind() == "field_initializer"
+            && rust_field_initializer_name(node, &parsed.source).as_deref() == Some(field_name)
+    })
+}
+
+
+pub(crate) fn rust_field_initializer_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("field"))
+        .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+        .map(str::to_string)
+        .or_else(|| {
+            node.utf8_text(source.as_bytes())
+                .ok()
+                .and_then(|text| text.split(':').next())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
+}
+
+
+pub(crate) fn rust_field_value_end(source: &str, node: Node<'_>) -> Option<usize> {
+    if let Some(value) = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("body"))
+    {
+        return Some(value.end_byte());
+    }
+    let text = source.get(node.start_byte()..node.end_byte())?;
+    let colon = text.find(':')?;
+    let mut end = node.end_byte();
+    let value = &text[colon + 1..];
+    let trimmed_len = value.trim_end().len();
+    end -= value.len().saturating_sub(trimmed_len);
+    Some(end)
+}
+
+
+pub(crate) fn rust_prelude_present(target_source: &str, prelude: &str) -> bool {
+    let prelude = prelude.trim();
+    if prelude.contains('\n') {
+        return target_source.contains(prelude);
+    }
+    target_source.lines().any(|line| line.trim() == prelude)
+}
+
+
+pub(crate) fn rust_prelude_insert_byte(target_source: &str) -> usize {
+    let bytes = target_source.as_bytes();
+    let mut idx = 0usize;
+    while idx < target_source.len() {
+        let line_end = target_source[idx..]
+            .find('\n')
+            .map(|offset| idx + offset + 1)
+            .unwrap_or(target_source.len());
+        let line = &target_source[idx..line_end];
+        let trimmed = line.trim();
+        let is_shebang = idx == 0 && trimmed.starts_with("#!") && !trimmed.starts_with("#![");
+        if trimmed.starts_with("/*!") {
+            let Some(close) = target_source[idx..].find("*/") else {
+                return target_source.len();
+            };
+            idx += close + 2;
+            while idx < bytes.len() && matches!(bytes[idx], b'\n' | b'\r') {
+                idx += 1;
+            }
+            continue;
+        }
+        let is_inner = trimmed.starts_with("#![") || trimmed.starts_with("//!");
+        if trimmed.is_empty() || is_shebang || is_inner {
+            idx = line_end;
+            continue;
+        }
+        break;
+    }
+    while idx < bytes.len() && matches!(bytes[idx], b'\n' | b'\r') {
+        idx += 1;
+    }
+    idx
+}
+
+
+pub(crate) fn rust_module_decl_fallback_insert_byte(source: &str) -> usize {
+    rust_prelude_insert_byte(source)
+}
+
+
+pub(crate) fn rust_impl_methods_target_wrapper(
+    target_source: &str,
+    router_name: Option<&str>,
+    router_export_name: Option<&str>,
+    impl_name: &str,
+    source: &str,
+    selected: &[RustImplMethod],
+    visibility: Option<&str>,
+) -> Result<String> {
+    let mut wrapper = String::new();
+    if let Some(export_name) = router_export_name {
+        let router_name =
+            router_name.ok_or_else(|| anyhow!("router_export_name requires router_name"))?;
+        let vis_str = visibility
+            .map(|v| format!("{v} "))
+            .unwrap_or_else(|| "pub(super) ".to_string());
+        wrapper.push_str(&vis_str);
+        wrapper.push_str("fn ");
+        wrapper.push_str(export_name);
+        wrapper.push_str("() -> ToolRouter<BlackboxServer> {\n    BlackboxServer::");
+        wrapper.push_str(router_name);
+        wrapper.push_str("()\n}\n\n");
+    }
+    if let Some(router_name) = router_name {
+        wrapper.push_str("#[tool_router(router = ");
+        wrapper.push_str(router_name);
+        wrapper.push_str(")]\n");
+    }
+    wrapper.push_str(impl_name);
+    wrapper.push_str(" {\n");
+    wrapper.push_str(&rust_impl_methods_block(source, selected, visibility)?);
+    wrapper.push_str("}\n");
+
+    if target_source.trim().is_empty() {
+        Ok(wrapper)
+    } else {
+        Ok(format!(
+            "{}{}",
+            if target_source.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            },
+            wrapper
+        ))
+    }
+}
+
+
+pub(crate) fn rust_impl_methods_block(
+    source: &str,
+    selected: &[RustImplMethod],
+    visibility: Option<&str>,
+) -> Result<String> {
+    let mut block = String::new();
+    let vis_prefix = if let Some(v) = visibility {
+        Some(rust_decl_visibility_prefix(Some(v))?)
+    } else {
+        None
+    };
+
+    for (idx, method) in selected.iter().enumerate() {
+        let original_text = source
+            .get(method.item.leading_trivia_start..method.item.byte_end)
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid impl method range for {}",
+                    method.item.plan_local_id
+                )
+            })?;
+
+        let text = if let Some(ref new_vis) = vis_prefix {
+            let keyword = rust_visibility_keyword_byte(source, &method.item)?;
+            let vis_start = rust_item_visibility_start_byte(source, &method.item, keyword);
+
+            let before = source
+                .get(method.item.leading_trivia_start..vis_start)
+                .unwrap_or_default();
+
+            let current_prefix = source.get(vis_start..keyword).unwrap_or_default();
+            let qualifier_prefix = rust_strip_visibility_prefix(current_prefix);
+
+            let after = source
+                .get(keyword..method.item.byte_end)
+                .unwrap_or_default();
+
+            format!("{before}{new_vis}{qualifier_prefix}{after}")
+        } else {
+            original_text.to_string()
+        };
+
+        if idx > 0 {
+            block.push('\n');
+        }
+        block.push_str(text.trim_matches('\n'));
+        block.push('\n');
+    }
+    Ok(block)
+}
+
+
+pub(crate) fn validate_rust_identifier(value: &str, field: &str) -> Result<()> {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        bail!("{field} must not be empty");
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        bail!("{field} must be a Rust identifier");
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        bail!("{field} must be a Rust identifier");
+    }
+    Ok(())
+}
+
+
+pub(crate) fn validate_rust_router_call(value: &str, field: &str) -> Result<()> {
+    if value.trim() != value {
+        bail!("{field} must not have leading or trailing whitespace");
+    }
+    let Some(path) = value.strip_suffix("()") else {
+        bail!("{field} must be a zero-argument Rust path call");
+    };
+    if path.is_empty() {
+        bail!("{field} must be a zero-argument Rust path call");
+    }
+    for segment in path.split("::") {
+        validate_rust_identifier(segment, field)?;
+    }
+    Ok(())
+}
+
+
+pub(crate) fn rust_decl_visibility_prefix(visibility: Option<&str>) -> Result<&'static str> {
+    match visibility.unwrap_or("").trim() {
+        "" | "private" => Ok(""),
+        "pub" => Ok("pub "),
+        "pub(crate)" => Ok("pub(crate) "),
+        "pub(super)" => Ok("pub(super) "),
+        other => {
+            bail!("unsupported Rust visibility `{other}`; supported: pub, pub(crate), pub(super)")
+        }
+    }
+}
+
+
+pub(crate) fn rust_strip_visibility_prefix(prefix: &str) -> &str {
+    for visibility in ["pub ", "pub(crate) ", "pub(super) "] {
+        if let Some(rest) = prefix.strip_prefix(visibility) {
+            return rest;
+        }
+    }
+    if let Some(rest) = prefix.strip_prefix("pub(") {
+        if let Some(close) = rest.find(')') {
+            let after_close = close + 1;
+            if rest[after_close..].starts_with(' ') {
+                return &rest[after_close + 1..];
+            }
+        }
+    }
+    prefix
+}
+
+
+pub(crate) fn rust_visibility_keyword_byte(source: &str, item: &SyntaxItem) -> Result<usize> {
+    let keyword = match item.kind.as_str() {
+        "function_item" | "impl_method" => "fn",
+        "struct_item" => "struct",
+        "enum_item" => "enum",
+        "trait_item" => "trait",
+        "const_item" => "const",
+        "static_item" => "static",
+        "type_item" => "type",
+        "mod_item" => "mod",
+        other => bail!("visibility rewrite does not support Rust item kind `{other}`"),
+    };
+    let text = source
+        .get(item.byte_start..item.byte_end)
+        .ok_or_else(|| anyhow!("invalid item range for {}", item.plan_local_id))?;
+    for (idx, _) in text.match_indices(keyword) {
+        let before = idx
+            .checked_sub(1)
+            .and_then(|pos| text.as_bytes().get(pos))
+            .copied();
+        let after = text.as_bytes().get(idx + keyword.len()).copied();
+        let before_boundary = before.is_none_or(|byte| !rust_ident_byte(byte));
+        let after_boundary = after.is_none_or(|byte| !rust_ident_byte(byte));
+        if before_boundary && after_boundary {
+            return Ok(item.byte_start + idx);
+        }
+    }
+    bail!(
+        "could not locate `{keyword}` keyword for {}",
+        item.plan_local_id
+    )
+}
+
+
+pub(crate) fn rust_visibility_start_byte(source: &str, keyword: usize) -> usize {
+    let line_start = line_start_before(source, keyword);
+    let leading = source[line_start..keyword]
+        .bytes()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    line_start + leading
+}
+
+
+pub(crate) fn rust_item_visibility_start_byte(source: &str, item: &SyntaxItem, keyword: usize) -> usize {
+    rust_visibility_start_byte(source, keyword).max(item.byte_start)
+}
+
+
+pub(crate) fn rust_mod_keyword_byte(source: &str, item: &SyntaxItem) -> Result<usize> {
+    let text = source
+        .get(item.byte_start..item.byte_end)
+        .ok_or_else(|| anyhow!("invalid mod_item range for {}", item.plan_local_id))?;
+    let name = item
+        .name
+        .as_deref()
+        .ok_or_else(|| anyhow!("selected mod_item has no module name"))?;
+    for (idx, _) in text.match_indices("mod") {
+        let before = idx
+            .checked_sub(1)
+            .and_then(|pos| text.as_bytes().get(pos))
+            .copied();
+        let after = text.as_bytes().get(idx + 3).copied();
+        let before_boundary = before.is_none_or(|byte| !rust_ident_byte(byte));
+        let after_boundary = after.is_none_or(|byte| !rust_ident_byte(byte));
+        if !before_boundary || !after_boundary {
+            continue;
+        }
+        let rest = &text[idx + 3..];
+        let trimmed = rest.trim_start();
+        if trimmed
+            .strip_prefix(name)
+            .and_then(|suffix| suffix.as_bytes().first().copied())
+            .is_some_and(|byte| rust_ident_byte(byte))
+        {
+            continue;
+        }
+        if trimmed.starts_with(name) {
+            return Ok(item.byte_start + idx);
+        }
+    }
+    bail!("could not locate `mod` keyword for {}", item.plan_local_id)
+}
+
+
+pub(crate) fn rust_mod_visibility_start_byte(source: &str, mod_keyword: usize) -> usize {
+    let line_start = line_start_before(source, mod_keyword);
+    let leading = source[line_start..mod_keyword]
+        .bytes()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    line_start + leading
+}
+
+
+pub(crate) fn rust_ident_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+
+pub(crate) fn ensure_rust_mod_declaration(source: &str, item: &SyntaxItem) -> Result<()> {
+    let text = source
+        .get(item.byte_start..item.byte_end)
+        .ok_or_else(|| anyhow!("invalid mod_item range for {}", item.plan_local_id))?;
+    let semicolon = text.find(';');
+    let brace = text.find('{');
+    match (semicolon, brace) {
+        (Some(_), None) => Ok(()),
+        (Some(semi), Some(brace)) if semi < brace => Ok(()),
+        _ => bail!(
+            "module `{}` is inline; only `mod name;` declarations are supported",
+            item.name.as_deref().unwrap_or("(unnamed)")
+        ),
+    }
+}
+
+
+pub(crate) fn rust_existing_mod_decl_names(path: &Path, source: &str) -> Result<HashSet<String>> {
+    if source.trim().is_empty() {
+        return Ok(HashSet::new());
+    }
+    let tree = parse_source("rust", source)?;
+    let parsed = ParsedSource {
+        path: path.to_path_buf(),
+        language: "rust",
+        source: source.to_string(),
+        tree,
+    };
+    let names = rust_items(&parsed)
+        .into_iter()
+        .filter(|item| item.kind == "mod_item")
+        .filter_map(|item| {
+            ensure_rust_mod_declaration(source, &item)
+                .ok()
+                .and_then(|_| item.name)
+        })
+        .collect::<HashSet<_>>();
+    Ok(names)
+}
+
+
+pub(crate) fn rust_mod_decl_insert_byte(path: &Path, source: &str) -> Result<usize> {
+    if source.trim().is_empty() {
+        return Ok(0);
+    }
+    let tree = parse_source("rust", source)?;
+    let parsed = ParsedSource {
+        path: path.to_path_buf(),
+        language: "rust",
+        source: source.to_string(),
+        tree,
+    };
+    Ok(rust_items(&parsed)
+        .iter()
+        .filter(|item| item.kind == "mod_item")
+        .filter(|item| ensure_rust_mod_declaration(source, item).is_ok())
+        .max_by_key(|item| item.byte_end)
+        .map(|item| item.byte_end)
+        .unwrap_or_else(|| rust_module_decl_fallback_insert_byte(source)))
+}
+
+
+pub(crate) fn rust_decl_batch_insert_text(source: &str, insert_at: usize, declarations: &[String]) -> String {
+    let mut text = declarations.join("\n");
+    if source.trim().is_empty() || insert_at == 0 {
+        text.push('\n');
+        text
+    } else if source[..insert_at].ends_with('\n') {
+        if !source[insert_at..].starts_with('\n') {
+            text.push('\n');
+        }
+        text
+    } else {
+        format!("\n{text}")
+    }
+}
+
+
+pub(crate) fn validate_rust_use_path(value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("use_path must not be empty");
+    }
+    if trimmed != value {
+        bail!("use_path must not have leading or trailing whitespace");
+    }
+    if value.contains('\n') || value.contains('\r') || value.contains(';') {
+        bail!("use_path must be a single Rust use path without a trailing semicolon");
+    }
+    Ok(())
+}
+
+
+pub(crate) fn parse_rust_file(path: &Path) -> Result<ParsedSource> {
+    let parsed = parse_source_file(path)?;
+    if parsed.language != "rust" {
+        bail!("{} is not a Rust source file", path.display());
+    }
+    Ok(parsed)
+}
+
+
+pub(crate) fn rust_items(parsed: &ParsedSource) -> Vec<SyntaxItem> {
+    let root = parsed.tree.root_node();
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .filter(|node| is_top_level_item(node.kind()))
+        .map(|node| syntax_item(parsed, node))
+        .collect()
+}
+
+
+pub(crate) fn rust_status_items(parsed: &ParsedSource) -> Vec<SyntaxItem> {
+    let mut items = rust_items(parsed);
+    items.extend(
+        rust_impl_methods(parsed)
+            .into_iter()
+            .map(|method| method.item),
+    );
+    items
+}
+
+
+pub(crate) fn rust_impl_methods(parsed: &ParsedSource) -> Vec<RustImplMethod> {
+    let root = parsed.tree.root_node();
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .filter(|node| node.kind() == "impl_item")
+        .flat_map(|impl_node| rust_impl_methods_in(parsed, impl_node))
+        .collect()
+}
+
+
+pub(crate) fn rust_impl_methods_in(parsed: &ParsedSource, impl_node: Node<'_>) -> Vec<RustImplMethod> {
+    let impl_name = item_name(impl_node, &parsed.source, parsed.language)
+        .unwrap_or_else(|| "(unnamed impl)".to_string());
+    let mut cursor = impl_node.walk();
+    impl_node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "declaration_list")
+        .flat_map(|body| {
+            let mut body_cursor = body.walk();
+            body.named_children(&mut body_cursor)
+                .filter(|member| member.kind() == "function_item")
+                .map(|member| RustImplMethod {
+                    impl_name: impl_name.clone(),
+                    impl_byte_start: impl_node.start_byte(),
+                    item: syntax_item_with_kind(parsed, member, "impl_method"),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+
+pub(crate) fn rust_named_struct_fields(
+    parsed: &ParsedSource,
+    struct_item: &SyntaxItem,
+) -> Result<Vec<RustStructField>> {
+    let struct_name = struct_item
+        .name
+        .clone()
+        .ok_or_else(|| anyhow!("selected struct has no name"))?;
+    let struct_node = rust_node_by_range(
+        parsed.tree.root_node(),
+        "struct_item",
+        struct_item.byte_start,
+        struct_item.byte_end,
+    )
+    .ok_or_else(|| anyhow!("could not locate tree-sitter node for struct `{struct_name}`"))?;
+    let mut fields = Vec::new();
+    collect_rust_named_struct_fields(parsed, struct_node, &mut fields)?;
+    Ok(fields)
+}
+
+
+pub(crate) fn collect_rust_named_struct_fields(
+    parsed: &ParsedSource,
+    node: Node<'_>,
+    fields: &mut Vec<RustStructField>,
+) -> Result<()> {
+    if node.kind() == "field_declaration" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let mut item = syntax_item_with_kind(parsed, node, "field_declaration");
+            item.name = Some(name_node.utf8_text(parsed.source.as_bytes())?.to_string());
+            fields.push(RustStructField {
+                name_byte_start: name_node.start_byte(),
+                item,
+            });
+        }
+        return Ok(());
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_rust_named_struct_fields(parsed, child, fields)?;
+    }
+    Ok(())
+}
+
+
+pub(crate) fn rust_node_by_range<'a>(
+    node: Node<'a>,
+    kind: &str,
+    byte_start: usize,
+    byte_end: usize,
+) -> Option<Node<'a>> {
+    if node.kind() == kind && node.start_byte() == byte_start && node.end_byte() == byte_end {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() > byte_start || child.end_byte() < byte_end {
+            continue;
+        }
+        if let Some(found) = rust_node_by_range(child, kind, byte_start, byte_end) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+
+#[derive(Debug, Clone)]
+pub(crate) struct LspTextEdit {
+    path: PathBuf,
+    start_line: u64,
+    start_character: u64,
+    end_line: u64,
+    end_character: u64,
+    new_text: String,
+}
+
+
+pub(crate) fn rust_rename_position_byte(parsed: &ParsedSource, old_name: &str) -> Result<usize> {
+    let mut candidates = rust_status_items(parsed)
+        .into_iter()
+        .filter(|item| item.name.as_deref() == Some(old_name))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        bail!(
+            "no Rust item named `{old_name}` found in {}",
+            parsed.path.display()
+        );
+    }
+    candidates.sort_by_key(|item| item.byte_start);
+    let item = &candidates[0];
+    let item_source = parsed
+        .source
+        .get(item.byte_start..item.byte_end)
+        .ok_or_else(|| anyhow!("invalid item range for `{old_name}`"))?;
+    let relative = item_source
+        .find(old_name)
+        .ok_or_else(|| anyhow!("could not find `{old_name}` text inside selected item"))?;
+    Ok(item.byte_start + relative + old_name.len().saturating_sub(1) / 2)
+}
+
+
+pub(crate) fn byte_to_lsp_position(source: &str, byte: usize) -> serde_json::Value {
+    let line = source[..byte].bytes().filter(|b| *b == b'\n').count() as u64;
+    let line_start = line_start_before(source, byte);
+    let character = source[line_start..byte].encode_utf16().count() as u64;
+    serde_json::json!({ "line": line, "character": character })
+}
+
+
+pub(crate) fn lsp_position_to_byte(source: &str, line: u64, character: u64) -> Result<usize> {
+    let mut current_line = 0u64;
+    let mut line_start = 0usize;
+    for (idx, byte) in source.bytes().enumerate() {
+        if current_line == line {
+            break;
+        }
+        if byte == b'\n' {
+            current_line += 1;
+            line_start = idx + 1;
+        }
+    }
+    if current_line != line {
+        bail!("line {line} is outside source");
+    }
+    let line_end = source[line_start..]
+        .find('\n')
+        .map(|offset| line_start + offset)
+        .unwrap_or(source.len());
+    let mut utf16 = 0u64;
+    for (offset, ch) in source[line_start..line_end].char_indices() {
+        if utf16 == character {
+            return Ok(line_start + offset);
+        }
+        utf16 += ch.len_utf16() as u64;
+        if utf16 > character {
+            bail!("character {character} is not on a UTF-16 boundary");
+        }
+    }
+    if utf16 == character {
+        return Ok(line_end);
+    }
+    bail!("character {character} is outside line {line}");
+}
+
+
+pub(crate) fn lsp_edits_to_file_edits(lsp_edits: Vec<LspTextEdit>) -> Result<Vec<FileEdit>> {
+    let mut grouped: BTreeMap<PathBuf, Vec<LspTextEdit>> = BTreeMap::new();
+    for edit in lsp_edits {
+        grouped.entry(edit.path.clone()).or_default().push(edit);
+    }
+    let mut file_edits = Vec::new();
+    for (path, edits) in grouped {
+        let source = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read LSP edit target {}", path.display()))?;
+        let mut text_edits = Vec::new();
+        for edit in edits {
+            let byte_start =
+                lsp_position_to_byte(&source, edit.start_line, edit.start_character)
+                    .with_context(|| format!("invalid LSP start range for {}", path.display()))?;
+            let byte_end = lsp_position_to_byte(&source, edit.end_line, edit.end_character)
+                .with_context(|| format!("invalid LSP end range for {}", path.display()))?;
+            text_edits.push(TextEdit {
+                byte_start,
+                byte_end,
+                replacement: edit.new_text,
+            });
+        }
+        file_edits.push(FileEdit {
+            path: path_string(&path),
+            original_sha256: sha256_hex(source.as_bytes()),
+            edits: text_edits,
+        });
+    }
+    Ok(file_edits)
+}
+
+
+pub(crate) fn rust_analyzer_rename(
+    project_dir: &Path,
+    source_path: &Path,
+    position: serde_json::Value,
+    new_name: &str,
+) -> Result<Vec<LspTextEdit>> {
+    let mut child = Command::new("rust-analyzer")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning rust-analyzer")?;
+    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
+    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let root_uri = Url::from_directory_path(project_dir)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?
+        .to_string();
+    let source_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?
+        .to_string();
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "rootPath": project_dir.to_string_lossy(),
+                "workspaceFolders": [{"uri": root_uri, "name": "refactor-root"}],
+                "capabilities": {
+                    "workspace": {
+                        "applyEdit": false,
+                        "workspaceEdit": {
+                            "documentChanges": true,
+                            "resourceOperations": ["create", "rename", "delete"]
+                        }
+                    }
+                }
+            }
+        }),
+    )?;
+    read_lsp_response(&mut reader, 1)?;
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"textDocument/rename",
+            "params":{
+                "textDocument":{"uri":source_uri},
+                "position": position,
+                "newName": new_name
+            }
+        }),
+    )?;
+    let response = read_lsp_response(&mut reader, 2)?;
+    let _ = send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+    );
+    let _ = send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","method":"exit"}),
+    );
+    let _ = child.wait();
+    workspace_edit_to_text_edits(&response["result"])
+}
+
+
+pub(crate) fn rust_analyzer_organize_imports(
+    project_dir: &Path,
+    source_path: &Path,
+) -> Result<Vec<LspTextEdit>> {
+    let mut child = Command::new("rust-analyzer")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning rust-analyzer")?;
+    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
+    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let root_uri = Url::from_directory_path(project_dir)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?
+        .to_string();
+    let source_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?
+        .to_string();
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "rootPath": project_dir.to_string_lossy(),
+                "workspaceFolders": [{"uri": root_uri, "name": "refactor-root"}],
+                "capabilities": {
+                    "textDocument": {
+                        "codeAction": {
+                            "codeActionLiteralSupport": {
+                                "codeActionKind": {"valueSet": ["source.organizeImports"]}
+                            }
+                        }
+                    },
+                    "workspace": {
+                        "workspaceEdit": {"documentChanges": true}
+                    }
+                }
+            }
+        }),
+    )?;
+    read_lsp_response(&mut reader, 1)?;
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    )?;
+    let source = fs::read_to_string(source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
+    let end_position = byte_to_lsp_position(&source, source.len());
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    send_lsp(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"textDocument/codeAction",
+            "params":{
+                "textDocument":{"uri":source_uri},
+                "range":{"start":{"line":0,"character":0},"end":end_position},
+                "context":{"diagnostics":[],"only":["source.organizeImports"]}
+            }
+        }),
+    )?;
+    let response = read_lsp_response(&mut reader, 2)?;
+    let _ = send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+    );
+    let _ = send_lsp(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc":"2.0","method":"exit"}),
+    );
+    let _ = child.wait();
+    code_actions_to_text_edits(&response["result"])
+}
+
+
+pub(crate) fn send_lsp(stdin: &mut impl Write, value: &serde_json::Value) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
+    write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
+    stdin.write_all(&body)?;
+    stdin.flush()?;
+    Ok(())
+}
+
+
+pub(crate) fn read_lsp_response(reader: &mut impl BufRead, expected_id: u64) -> Result<serde_json::Value> {
+    loop {
+        let value = read_lsp_message(reader)?;
+        if value.get("id").and_then(serde_json::Value::as_u64) != Some(expected_id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            bail!("rust-analyzer returned error: {error}");
+        }
+        return Ok(value);
+    }
+}
+
+
+pub(crate) fn read_lsp_message(reader: &mut impl BufRead) -> Result<serde_json::Value> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            bail!("rust-analyzer closed stdout");
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(value.trim().parse::<usize>()?);
+        }
+    }
+    let len = content_length.context("LSP message missing Content-Length")?;
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+
+pub(crate) fn workspace_edit_to_text_edits(value: &serde_json::Value) -> Result<Vec<LspTextEdit>> {
+    let mut edits = Vec::new();
+    if let Some(changes) = value.get("changes").and_then(serde_json::Value::as_object) {
+        for (uri, uri_edits) in changes {
+            collect_lsp_text_edits(uri, uri_edits, &mut edits)?;
+        }
+    }
+    if let Some(document_changes) = value
+        .get("documentChanges")
+        .and_then(serde_json::Value::as_array)
+    {
+        for change in document_changes {
+            if let Some(uri) = change
+                .get("textDocument")
+                .and_then(|td| td.get("uri"))
+                .and_then(serde_json::Value::as_str)
+            {
+                collect_lsp_text_edits(uri, &change["edits"], &mut edits)?;
+            }
+        }
+    }
+    Ok(edits)
+}
+
+
+pub(crate) fn code_actions_to_text_edits(value: &serde_json::Value) -> Result<Vec<LspTextEdit>> {
+    let actions = value
+        .as_array()
+        .ok_or_else(|| anyhow!("LSP codeAction result is not an array"))?;
+    let mut edits = Vec::new();
+    for action in actions {
+        let kind = action
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let title = action
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if kind != "source.organizeImports" && !title.to_ascii_lowercase().contains("organize") {
+            continue;
+        }
+        if let Some(edit) = action.get("edit") {
+            edits.extend(workspace_edit_to_text_edits(edit)?);
+        }
+    }
+    Ok(edits)
+}
+
+
+pub(crate) fn collect_lsp_text_edits(
+    uri: &str,
+    edit_value: &serde_json::Value,
+    edits: &mut Vec<LspTextEdit>,
+) -> Result<()> {
+    let url = Url::parse(uri).with_context(|| format!("invalid LSP uri {uri}"))?;
+    let path = url
+        .to_file_path()
+        .map_err(|_| anyhow!("LSP uri is not a file path: {uri}"))?;
+    let edit_array = edit_value
+        .as_array()
+        .ok_or_else(|| anyhow!("LSP edits for {uri} are not an array"))?;
+    for edit in edit_array {
+        let range = edit
+            .get("range")
+            .ok_or_else(|| anyhow!("LSP edit missing range"))?;
+        edits.push(LspTextEdit {
+            path: path.clone(),
+            start_line: lsp_range_num(range, "start", "line")?,
+            start_character: lsp_range_num(range, "start", "character")?,
+            end_line: lsp_range_num(range, "end", "line")?,
+            end_character: lsp_range_num(range, "end", "character")?,
+            new_text: edit
+                .get("newText")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+
+pub(crate) fn lsp_range_num(range: &serde_json::Value, endpoint: &str, field: &str) -> Result<u64> {
+    range
+        .get(endpoint)
+        .and_then(|value| value.get(field))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("LSP range missing {endpoint}.{field}"))
+}
+
+pub(crate) fn existing_target_impl_insert_byte(
+    target_path: &Path,
+    target_source: &str,
+    impl_name: &str,
+    router_name: Option<&str>,
+) -> Result<Option<TargetImplInsertion>> {
+    if target_source.trim().is_empty() {
+        return Ok(None);
+    }
+    let tree = parse_source("rust", target_source)
+        .with_context(|| format!("parsing target {}", target_path.display()))?;
+    let parsed = ParsedSource {
+        path: target_path.to_path_buf(),
+        language: "rust",
+        source: target_source.to_string(),
+        tree,
+    };
+    let root = parsed.tree.root_node();
+    let mut cursor = root.walk();
+    for impl_node in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "impl_item")
+    {
+        let Some(name) = item_name(impl_node, &parsed.source, parsed.language) else {
+            continue;
+        };
+        if name != impl_name {
+            continue;
+        }
+        if !router_matches(&parsed, impl_node, router_name) {
+            continue;
+        }
+        let Some(body) = impl_declaration_list(impl_node) else {
+            continue;
+        };
+        let close = parsed
+            .source
+            .get(body.start_byte()..body.end_byte())
+            .and_then(|text| text.rfind('}').map(|offset| body.start_byte() + offset))
+            .ok_or_else(|| anyhow!("matching target impl has no closing brace"))?;
+        return Ok(Some(TargetImplInsertion {
+            byte: close,
+            body_is_empty: parsed.source[body.start_byte() + 1..close]
+                .trim()
+                .is_empty(),
+        }));
+    }
+    Ok(None)
+}
