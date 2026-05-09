@@ -13,10 +13,7 @@ use crate::entity_ref::{EntityRef, PARSER_VERSION};
 use crate::roadmap::{Roadmap, RoadmapItem};
 
 pub(crate) fn roadmap_entity_id(id: &str) -> String {
-    EntityRef::RoadmapItem {
-        id: id.to_string(),
-    }
-    .to_string()
+    EntityRef::RoadmapItem { id: id.to_string() }.to_string()
 }
 
 pub(crate) fn roadmap_chunk_hash(item: &RoadmapItem) -> String {

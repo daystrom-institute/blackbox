@@ -2667,7 +2667,9 @@ fn rust_impl_methods_target_wrapper(
     if let Some(export_name) = router_export_name {
         let router_name =
             router_name.ok_or_else(|| anyhow!("router_export_name requires router_name"))?;
-        let vis_str = visibility.map(|v| format!("{v} ")).unwrap_or_else(|| "pub(super) ".to_string());
+        let vis_str = visibility
+            .map(|v| format!("{v} "))
+            .unwrap_or_else(|| "pub(super) ".to_string());
         wrapper.push_str(&vis_str);
         wrapper.push_str("fn ");
         wrapper.push_str(export_name);

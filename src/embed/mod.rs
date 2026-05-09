@@ -8,17 +8,17 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::SharedState;
 use crate::chunker::Chunk;
 use crate::entity_ref::EntityRef;
 use crate::index::EmbeddingSourceDoc;
+use crate::SharedState;
 
 pub const VOYAGE_PROVIDER_ID: &str = "voyage";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";

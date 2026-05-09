@@ -11,7 +11,10 @@ impl BlackboxServer {
         name = "bro_agent_list",
         description = "List installed agents from the registry. Optional filters for cost_class, provenance_kind, include_superseded, and limit."
     )]
-    pub(crate) fn bro_agent_list(&self, Parameters(p): Parameters<AgentListParams>) -> CallToolResult {
+    pub(crate) fn bro_agent_list(
+        &self,
+        Parameters(p): Parameters<AgentListParams>,
+    ) -> CallToolResult {
         use orchestration::agents::registry::{AgentRegistry, ListFilter};
         use orchestration::agents::types::AgentCostClass;
         let catalog = self.state.artifacts.read();
@@ -86,7 +89,10 @@ impl BlackboxServer {
         name = "bro_agent_get",
         description = "Read full details for a single agent by name or agent-ref (name@vN or agent:name@vN). Returns manifest, metadata, and lifecycle state."
     )]
-    pub(crate) fn bro_agent_get(&self, Parameters(p): Parameters<AgentGetParams>) -> CallToolResult {
+    pub(crate) fn bro_agent_get(
+        &self,
+        Parameters(p): Parameters<AgentGetParams>,
+    ) -> CallToolResult {
         use orchestration::agents::registry::AgentRegistry;
         let catalog = self.state.artifacts.read();
         let reg = AgentRegistry::new(&catalog);
@@ -156,7 +162,7 @@ impl BlackboxServer {
         result
     }
 
-pub(crate) fn embed_agent_query(query: &str) -> anyhow::Result<Vec<f32>> {
+    pub(crate) fn embed_agent_query(query: &str) -> anyhow::Result<Vec<f32>> {
         let router = embed::EmbeddingRouter::load_default()?;
         let route = router.route(embed::Bucket::AgentManifest, None)?;
         let cache_key = format!("{}:{}:{}", route.provider_id, route.model, query);
@@ -219,7 +225,10 @@ pub(crate) fn embed_agent_query(query: &str) -> anyhow::Result<Vec<f32>> {
         name = "bro_agent_describe",
         description = "Full manifest + resolved brofile + merged filters for one agent. Returns the computed dispatch surface (deny-wins filter merge of brofile + overlay), brofile info, embedding status, and any warnings."
     )]
-    pub(crate) fn bro_agent_describe(&self, Parameters(p): Parameters<AgentDescribeParams>) -> CallToolResult {
+    pub(crate) fn bro_agent_describe(
+        &self,
+        Parameters(p): Parameters<AgentDescribeParams>,
+    ) -> CallToolResult {
         use orchestration::agents::registry::AgentRegistry;
         use orchestration::agents::types::MergedFilters;
         let catalog = self.state.artifacts.read();
@@ -377,7 +386,10 @@ pub(crate) fn embed_agent_query(query: &str) -> anyhow::Result<Vec<f32>> {
         name = "bro_agent_search",
         description = "Search installed agents by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and matched anti-patterns."
     )]
-    pub(crate) fn bro_agent_search(&self, Parameters(p): Parameters<AgentSearchParams>) -> CallToolResult {
+    pub(crate) fn bro_agent_search(
+        &self,
+        Parameters(p): Parameters<AgentSearchParams>,
+    ) -> CallToolResult {
         use orchestration::agents::registry::{AgentRegistry, AgentVectorSearch, SearchFilter};
         use orchestration::agents::types::AgentCostClass;
         let query = p.query.trim();

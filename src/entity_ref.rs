@@ -219,11 +219,9 @@ impl EntityRef {
             }),
             EntityType::BashCall => parse_bash_call(input, rest),
             EntityType::Agent => parse_agent(input, rest),
-            EntityType::RoadmapItem => {
-                parse_single(input, rest, EntityType::RoadmapItem, |id| {
-                    EntityRef::RoadmapItem { id }
-                })
-            }
+            EntityType::RoadmapItem => parse_single(input, rest, EntityType::RoadmapItem, |id| {
+                EntityRef::RoadmapItem { id }
+            }),
         }
     }
 

@@ -138,10 +138,7 @@ impl BlackboxServer {
         name = "bbox_roadmap",
         description = "Manage the bbox roadmap — a prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Inbox is reactive (surprises, blockages); threads are active work; knowledge is atemporal. The roadmap tracks the *future*: accepted items awaiting promotion, deferred items with provenance, and proposed ideas awaiting review. Items link to design docs via ROADMAP_DESIGNED_IN edges and to threads via ROADMAP_SPAWNS edges."
     )]
-    pub(crate) fn bbox_roadmap(
-        &self,
-        Parameters(p): Parameters<RoadmapParams>,
-    ) -> CallToolResult {
+    pub(crate) fn bbox_roadmap(&self, Parameters(p): Parameters<RoadmapParams>) -> CallToolResult {
         let start = std::time::Instant::now();
         match (|| -> anyhow::Result<String> {
             let action = p.action.as_str();
@@ -183,8 +180,8 @@ impl BlackboxServer {
     fn roadmap_create(&self, p: RoadmapCreateParams) -> anyhow::Result<String> {
         let priority = roadmap::RoadmapPriority::parse(p.priority.as_deref().unwrap_or("medium"))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let category = roadmap::RoadmapCategory::parse(&p.category)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let category =
+            roadmap::RoadmapCategory::parse(&p.category).map_err(|e| anyhow::anyhow!("{e}"))?;
         let scope = p.scope.as_deref().unwrap_or("project").to_string();
         if scope != "global" && scope != "project" {
             anyhow::bail!("scope must be 'global' or 'project', got '{scope}'");
@@ -245,9 +242,9 @@ impl BlackboxServer {
             .iter()
             .map(|tid| {
                 let raw = tid.strip_prefix("thread:").unwrap_or(tid);
-                th.all()
-                    .iter()
-                    .any(|t| t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved))
+                th.all().iter().any(|t| {
+                    t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved)
+                })
             })
             .collect();
         drop(th);
@@ -302,9 +299,10 @@ impl BlackboxServer {
                     .iter()
                     .map(|tid| {
                         let raw = tid.strip_prefix("thread:").unwrap_or(tid);
-                        th.all()
-                            .iter()
-                            .any(|t| t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved))
+                        th.all().iter().any(|t| {
+                            t.id == raw
+                                && matches!(t.status, crate::threads::ThreadStatus::Resolved)
+                        })
                     })
                     .collect();
                 let (status_label, _) = rm.computed_status(&item, &resolved);
@@ -384,17 +382,13 @@ impl BlackboxServer {
 
     fn roadmap_update(&self, p: RoadmapUpdateParams) -> anyhow::Result<String> {
         let status = match p.status.as_deref() {
-            Some(s) => Some(
-                roadmap::RoadmapStatus::parse(s)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
-            ),
+            Some(s) => Some(roadmap::RoadmapStatus::parse(s).map_err(|e| anyhow::anyhow!("{e}"))?),
             None => None,
         };
         let category = match p.category.as_deref() {
-            Some(c) => Some(
-                roadmap::RoadmapCategory::parse(c)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
-            ),
+            Some(c) => {
+                Some(roadmap::RoadmapCategory::parse(c).map_err(|e| anyhow::anyhow!("{e}"))?)
+            }
             None => None,
         };
         let priority = match p.priority.as_deref() {
@@ -406,7 +400,9 @@ impl BlackboxServer {
         };
 
         let mut rm = self.state.roadmap.write();
-        let item = rm.update(&p.id, p.title, p.body, status, category, priority, None, None)?;
+        let item = rm.update(
+            &p.id, p.title, p.body, status, category, priority, None, None,
+        )?;
 
         // Sync to index
         let entity_id = crate::index::roadmap_entity_id(&item.id);
@@ -552,8 +548,8 @@ impl BlackboxServer {
     }
 
     fn roadmap_link(&self, p: RoadmapLinkParams) -> anyhow::Result<String> {
-        let edge_kind = roadmap::RoadmapEdgeKind::parse(&p.link_type)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let edge_kind =
+            roadmap::RoadmapEdgeKind::parse(&p.link_type).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Domain validation using EntityRef::parse
         let target_ref = crate::entity_ref::EntityRef::parse(&p.link_target)
@@ -566,10 +562,14 @@ impl BlackboxServer {
                 }
             }
             roadmap::RoadmapEdgeKind::DeferredFrom => {
-                if !matches!(target_ref,
-                    crate::entity_ref::EntityRef::Thread { .. } | crate::entity_ref::EntityRef::Knowledge { .. }
+                if !matches!(
+                    target_ref,
+                    crate::entity_ref::EntityRef::Thread { .. }
+                        | crate::entity_ref::EntityRef::Knowledge { .. }
                 ) {
-                    anyhow::bail!("deferred_from link target must be a thread or knowledge entity ref");
+                    anyhow::bail!(
+                        "deferred_from link target must be a thread or knowledge entity ref"
+                    );
                 }
             }
             roadmap::RoadmapEdgeKind::DesignedIn => {
@@ -625,8 +625,8 @@ impl BlackboxServer {
     }
 
     fn roadmap_unlink(&self, p: RoadmapUnlinkParams) -> anyhow::Result<String> {
-        let edge_kind = roadmap::RoadmapEdgeKind::parse(&p.link_type)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let edge_kind =
+            roadmap::RoadmapEdgeKind::parse(&p.link_type).map_err(|e| anyhow::anyhow!("{e}"))?;
         let canonical_from = format!("roadmap_item:{}", p.id);
         let mut rm = self.state.roadmap.write();
         rm.remove_edge(&canonical_from, &p.link_target, edge_kind)?;
@@ -653,10 +653,15 @@ impl BlackboxServer {
         let mut unresolved = 0;
 
         // Fetch all project_file docs once
-        let project_docs = self.state.idx.read().embedding_source_docs_for_doc_types(
-            &["project_file"],
-            None, // no limit — scan all
-        ).unwrap_or_default();
+        let project_docs = self
+            .state
+            .idx
+            .read()
+            .embedding_source_docs_for_doc_types(
+                &["project_file"],
+                None, // no limit — scan all
+            )
+            .unwrap_or_default();
 
         for edge in &edges {
             // Refuse repair without a stored file_path or entity ref
@@ -673,7 +678,8 @@ impl BlackboxServer {
                     if !p.dry_run {
                         let mut rm2 = self.state.roadmap.write();
                         rm2.update_edge_metadata(
-                            &edge.from, &edge.to,
+                            &edge.from,
+                            &edge.to,
                             matched.entity_id.clone(),
                             Some(matched.file_path.clone()),
                             None,
@@ -696,7 +702,8 @@ impl BlackboxServer {
                 if !p.dry_run {
                     let mut rm2 = self.state.roadmap.write();
                     rm2.update_edge_metadata(
-                        &edge.from, &edge.to,
+                        &edge.from,
+                        &edge.to,
                         matched.entity_id.clone(),
                         Some(matched.file_path.clone()),
                         None,
@@ -718,7 +725,10 @@ impl BlackboxServer {
     }
 
     fn roadmap_render(&self, p: serde_json::Value) -> anyhow::Result<String> {
-        let project = p.get("project").and_then(|v| v.as_str()).unwrap_or("blackbox");
+        let project = p
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("blackbox");
         let write_path = p.get("write_path").and_then(|v| v.as_str());
 
         let rm = self.state.roadmap.read();
@@ -736,10 +746,9 @@ impl BlackboxServer {
                 let mut resolved = Vec::new();
                 for tid in &thread_ids {
                     let raw = tid.strip_prefix("thread:").unwrap_or(tid);
-                    let is_resolved = th
-                        .all()
-                        .iter()
-                        .any(|t| t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved));
+                    let is_resolved = th.all().iter().any(|t| {
+                        t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved)
+                    });
                     resolved.push((tid.clone(), is_resolved));
                 }
                 (item.id.clone(), resolved)
@@ -748,7 +757,11 @@ impl BlackboxServer {
 
         let spawn = |id: &str| -> Option<Vec<(String, bool)>> {
             let data = spawn_data.get(id)?;
-            if data.is_empty() { None } else { Some(data.clone()) }
+            if data.is_empty() {
+                None
+            } else {
+                Some(data.clone())
+            }
         };
 
         let md = rm.render_markdown(project, &spawn);
@@ -768,11 +781,15 @@ impl BlackboxServer {
 }
 
 /// Resolve a project_file entity ref to its file path by querying the tantivy index.
-fn resolve_project_file_path(state: &crate::SharedState, entity_ref: &str) -> anyhow::Result<Option<String>> {
-    if let Ok(results) = state.idx.read().embedding_source_docs_for_doc_types(
-        &["project_file"],
-        Some(5),
-    ) {
+fn resolve_project_file_path(
+    state: &crate::SharedState,
+    entity_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Ok(results) = state
+        .idx
+        .read()
+        .embedding_source_docs_for_doc_types(&["project_file"], Some(5))
+    {
         for doc in &results {
             if doc.entity_id.as_deref() == Some(entity_ref) {
                 return Ok(Some(doc.file_path.clone()));

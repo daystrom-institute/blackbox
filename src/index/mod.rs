@@ -228,10 +228,7 @@ impl TranscriptIndex {
         Ok(())
     }
 
-    pub(crate) fn index_roadmap_item(
-        &mut self,
-        item: &crate::roadmap::RoadmapItem,
-    ) -> Result<()> {
+    pub(crate) fn index_roadmap_item(&mut self, item: &crate::roadmap::RoadmapItem) -> Result<()> {
         roadmap_docs::upsert_roadmap_item(
             &self.index,
             self.fields,
@@ -816,8 +813,8 @@ mod tool_edges;
 
 pub use helpers::find_session_file;
 pub(crate) use knowledge_docs::{knowledge_chunk_hash, knowledge_entity_id};
-pub(crate) use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};
 pub use reindex::spawn_reindex_thread;
+pub(crate) use roadmap_docs::{roadmap_chunk_hash, roadmap_entity_id};
 pub use search::{
     CiteParams, ContextParams, HybridBm25Hit, MessagesParams, ReindexParams, SearchParams,
     SessionParams, SessionsListParams, TopicsParams,

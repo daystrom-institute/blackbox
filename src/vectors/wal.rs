@@ -179,10 +179,7 @@ pub fn for_each(path: &Path, mut f: impl FnMut(WalRecord) -> Result<()>) -> Resu
     Ok(())
 }
 
-pub fn rewrite(
-    path: &Path,
-    records: impl IntoIterator<Item = WalRecord>,
-) -> Result<()> {
+pub fn rewrite(path: &Path, records: impl IntoIterator<Item = WalRecord>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating vector WAL dir {}", parent.display()))?;
@@ -198,8 +195,7 @@ pub fn rewrite(
             .with_context(|| format!("opening vector WAL temp {}", tmp_path.display()))?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
         for record in records.into_iter() {
-            serde_json::to_writer(&mut writer, &record)
-                .context("serializing vector WAL record")?;
+            serde_json::to_writer(&mut writer, &record).context("serializing vector WAL record")?;
             writer
                 .write_all(b"\n")
                 .context("writing vector WAL newline")?;
@@ -213,15 +209,13 @@ pub fn rewrite(
     })();
     match result {
         Ok(()) => {
-            if let Err(e) =
-                fs::rename(&tmp_path, path).with_context(|| {
-                    format!(
-                        "renaming compacted vector WAL {} to {}",
-                        tmp_path.display(),
-                        path.display()
-                    )
-                })
-            {
+            if let Err(e) = fs::rename(&tmp_path, path).with_context(|| {
+                format!(
+                    "renaming compacted vector WAL {} to {}",
+                    tmp_path.display(),
+                    path.display()
+                )
+            }) {
                 let _ = fs::remove_file(&tmp_path);
                 return Err(e);
             }

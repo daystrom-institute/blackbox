@@ -125,7 +125,11 @@ pub(crate) fn tombstone_knowledge(entity_id: &str) {
     }
 }
 
-pub(crate) fn enqueue_roadmap(item: &crate::roadmap::RoadmapItem, entity_id: &str, chunk_hash: &str) {
+pub(crate) fn enqueue_roadmap(
+    item: &crate::roadmap::RoadmapItem,
+    entity_id: &str,
+    chunk_hash: &str,
+) {
     enqueue(EmbedRequest {
         bucket: Bucket::Knowledge, // reuses knowledge bucket for vector search
         project_id: None,
