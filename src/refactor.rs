@@ -1395,6 +1395,7 @@ fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<String> {
         &selected[0].impl_name,
         &parsed.source,
         &selected,
+        p.visibility.as_deref(),
     )?;
 
     let source_edits = selected
@@ -2405,6 +2406,7 @@ fn rust_impl_methods_target_edits(
     impl_name: &str,
     source: &str,
     selected: &[RustImplMethod],
+    visibility: Option<&str>,
 ) -> Result<Vec<TextEdit>> {
     if let Some(insertion) =
         existing_target_impl_insert_byte(target_path, target_source, impl_name, router_name)?
@@ -2413,7 +2415,7 @@ fn rust_impl_methods_target_edits(
         if !insertion.body_is_empty {
             replacement.push('\n');
         }
-        replacement.push_str(&rust_impl_methods_block(source, selected)?);
+        replacement.push_str(&rust_impl_methods_block(source, selected, visibility)?);
         return Ok(vec![TextEdit {
             byte_start: insertion.byte,
             byte_end: insertion.byte,
@@ -2428,6 +2430,7 @@ fn rust_impl_methods_target_edits(
         impl_name,
         source,
         selected,
+        visibility,
     )?;
     let Some(prelude) = target_prelude
         .map(str::trim)
@@ -2658,6 +2661,7 @@ fn rust_impl_methods_target_wrapper(
     impl_name: &str,
     source: &str,
     selected: &[RustImplMethod],
+    visibility: Option<&str>,
 ) -> Result<String> {
     let mut wrapper = String::new();
     if let Some(export_name) = router_export_name {
@@ -2676,7 +2680,7 @@ fn rust_impl_methods_target_wrapper(
     }
     wrapper.push_str(impl_name);
     wrapper.push_str(" {\n");
-    wrapper.push_str(&rust_impl_methods_block(source, selected)?);
+    wrapper.push_str(&rust_impl_methods_block(source, selected, visibility)?);
     wrapper.push_str("}\n");
 
     if target_source.trim().is_empty() {
@@ -2694,22 +2698,52 @@ fn rust_impl_methods_target_wrapper(
     }
 }
 
-fn rust_impl_methods_block(source: &str, selected: &[RustImplMethod]) -> Result<String> {
+fn rust_impl_methods_block(
+    source: &str,
+    selected: &[RustImplMethod],
+    visibility: Option<&str>,
+) -> Result<String> {
     let mut block = String::new();
+    let vis_prefix = if let Some(v) = visibility {
+        Some(rust_decl_visibility_prefix(Some(v))?)
+    } else {
+        None
+    };
+
     for (idx, method) in selected.iter().enumerate() {
-        let text = source
+        let original_text = source
             .get(method.item.leading_trivia_start..method.item.byte_end)
             .ok_or_else(|| {
                 anyhow!(
                     "invalid impl method range for {}",
                     method.item.plan_local_id
                 )
-            })?
-            .trim_matches('\n');
+            })?;
+
+        let text = if let Some(ref new_vis) = vis_prefix {
+            let keyword = rust_visibility_keyword_byte(source, &method.item)?;
+            let vis_start = rust_item_visibility_start_byte(source, &method.item, keyword);
+            
+            let before = source
+                .get(method.item.leading_trivia_start..vis_start)
+                .unwrap_or_default();
+            
+            let current_prefix = source.get(vis_start..keyword).unwrap_or_default();
+            let qualifier_prefix = rust_strip_visibility_prefix(current_prefix);
+            
+            let after = source
+                .get(keyword..method.item.byte_end)
+                .unwrap_or_default();
+                
+            format!("{before}{new_vis}{qualifier_prefix}{after}")
+        } else {
+            original_text.to_string()
+        };
+
         if idx > 0 {
             block.push('\n');
         }
-        block.push_str(text);
+        block.push_str(text.trim_matches('\n'));
         block.push('\n');
     }
     Ok(block)
