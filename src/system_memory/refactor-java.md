@@ -181,7 +181,12 @@ bbox_refactor_plan(
 
 This rewrites unqualified calls such as `getPipelinePressuresGrid()` and
 explicit `this.getPipelinePressuresGrid()` calls to
-`pipelinePressureGrid.getPipelinePressuresGrid()`.
+`pipelinePressureGrid.getPipelinePressuresGrid()`. It also rewrites
+`this`-qualified Java method-reference syntax: `this::getPipelinePressuresGrid`
+becomes `pipelinePressureGrid::getPipelinePressuresGrid`. Method references
+qualified by a different receiver (e.g. `Foo::bar`, `super::bar`) are left
+untouched, since they bind to a different instance and the rewrite would change
+semantics.
 
 10. Extract an interface from a class:
 
