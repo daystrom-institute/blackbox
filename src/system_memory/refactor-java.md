@@ -80,8 +80,14 @@ by moved methods. Use that report to decide which fields to move, which fields
 to recreate on the target, and which dependencies should become constructor
 parameters.
 
-The plan additionally reports `external_calls` and `inherited_dependencies` so
-the target class doesn't ship with silently unresolved references:
+Pass `deep_analysis: true` on the plan call to also receive `external_calls`
+and `inherited_dependencies`. The flag is opt-in because the inherited-method
+walk crosses files via the project type index; default `false` keeps the
+response lean for self-contained clusters where the operator already knows
+the extraction is clean. Set it to `true` whenever the cluster touches
+methods from the source class, lambdas that capture `this`, or methods from
+a superclass / implemented interface — those are the silent-miscompile
+risks the report surfaces:
 
 - `external_calls` lists method invocations inside the extracted set that
   resolve to methods on the source class but are NOT in the extracted set.
@@ -177,9 +183,13 @@ bbox_refactor_plan(
 )
 ```
 
-The plan response includes `remaining_source_accessors`: for each moved field,
-every read/write of that field that still lives in the source class after the
-declaration is removed. Each entry carries `line`, `column` (1-indexed),
+Pass `deep_analysis: true` on the plan call to receive
+`remaining_source_accessors`: for each moved field, every read/write of that
+field that still lives in the source class after the declaration is removed.
+The flag is opt-in (default `false`) because the scan walks every identifier
+in the source body; on small classes the cost is negligible but on large
+classes it's worth skipping when the operator knows the field is unique to
+the moved cluster. Each entry carries `line`, `column` (1-indexed),
 `kind` (`read` or `write`), and a trimmed `context` snippet of the line.
 Empty `accesses` for a field means the source class no longer references it
 and the move is clean. Non-empty `accesses` flag the lines that will fail to

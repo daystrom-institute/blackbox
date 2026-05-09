@@ -1620,11 +1620,15 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
     let names = p.item_names.as_deref().unwrap_or_default();
     let mut selected = select_java_methods_by_name(&parsed, names)?;
     let captured_variables = captured_fields_for_methods(&parsed, &selected);
-    let dependency_report = analyze_extracted_dependencies(
-        &parsed,
-        &selected,
-        p.project_dir.as_deref().map(Path::new),
-    );
+    let dependency_report = if p.deep_analysis.unwrap_or(false) {
+        analyze_extracted_dependencies(
+            &parsed,
+            &selected,
+            p.project_dir.as_deref().map(Path::new),
+        )
+    } else {
+        Default::default()
+    };
 
     selected.sort_by_key(|m| std::cmp::Reverse(m.item.byte_start));
 
@@ -1745,11 +1749,15 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .map(|field| field.name.as_str())
         .collect::<HashSet<_>>();
     let captured_variables = captured_fields_for_methods(&parsed, &selected_methods);
-    let class_dependency_report = analyze_extracted_dependencies(
-        &parsed,
-        &selected_methods,
-        p.project_dir.as_deref().map(Path::new),
-    );
+    let class_dependency_report = if p.deep_analysis.unwrap_or(false) {
+        analyze_extracted_dependencies(
+            &parsed,
+            &selected_methods,
+            p.project_dir.as_deref().map(Path::new),
+        )
+    } else {
+        Default::default()
+    };
     let dependency_params = captured_variables
         .iter()
         .filter(|capture| !moved_field_set.contains(capture.name.as_str()))
@@ -2196,8 +2204,11 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
         .iter()
         .map(|field| field.name.clone())
         .collect::<Vec<_>>();
-    let remaining_source_accessors =
-        compute_remaining_source_accessors(&source_parsed, &moved_field_names, &moved_decl_ranges);
+    let remaining_source_accessors = if p.deep_analysis.unwrap_or(false) {
+        compute_remaining_source_accessors(&source_parsed, &moved_field_names, &moved_decl_ranges)
+    } else {
+        Vec::new()
+    };
     let plan = RefactorPlan {
         title: format!(
             "Move {} Java field(s) from {} to {}",
@@ -3919,6 +3930,7 @@ mod tests {
             delegate_field: None,
             delegate_type: None,
             keep_copy: None,
+            deep_analysis: None,
             project_dir: None,
         }
     }
@@ -4037,6 +4049,7 @@ mod tests {
         params.target = Some(path_string(target));
         params.item_names = Some(item_names.iter().map(|n| n.to_string()).collect());
         params.project_dir = Some(path_string(project_dir));
+        params.deep_analysis = Some(true);
         let plan_text = plan_extract_java_methods(&params).unwrap();
         serde_json::from_str(&plan_text).unwrap()
     }
@@ -4770,6 +4783,7 @@ mod tests {
         let mut params = java_plan_params("move_java_field", &source);
         params.target = Some(path_string(&target));
         params.item_names = Some(field_names.iter().map(|s| s.to_string()).collect());
+        params.deep_analysis = Some(true);
         let plan_text = plan_move_java_field(&params).unwrap();
         let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
         // Keep tempdir alive for the duration of the test by leaking it; tests

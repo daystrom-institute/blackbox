@@ -242,6 +242,17 @@ pub struct RefactorPlanParams {
     /// source file. Default false.
     #[serde(default)]
     pub keep_copy: Option<bool>,
+    /// Pessimistic-analysis umbrella for Java extraction/move plans. When
+    /// true, populates `remaining_source_accessors` (move_java_field),
+    /// `external_calls` and `inherited_dependencies` (extract_java_methods,
+    /// extract_java_class). Default false keeps the response lean for simple
+    /// extractions where the operator already knows the cluster is
+    /// self-contained. Set true for complex clusters that touch shared
+    /// fields, source-class methods, or inherited members — the reports
+    /// surface silent-miscompile risks (wrong-instance calls, undeclared
+    /// field references, missing inherited-method hookup) before apply.
+    #[serde(default)]
+    pub deep_analysis: Option<bool>,
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
