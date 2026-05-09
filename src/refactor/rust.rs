@@ -1,11 +1,13 @@
 use super::*;
 
+
 #[derive(Debug, Clone)]
 pub(crate) struct RustImplMethod {
     impl_name: String,
     impl_byte_start: usize,
     item: SyntaxItem,
 }
+
 
 
 #[derive(Debug, Clone)]
@@ -221,7 +223,7 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
         bail!("no Rust impl methods found");
     }
 
-    let mut selected = Vec::new();
+    let mut selected: Vec<RustImplMethod> = Vec::new();
     for expected in names {
         let matches = candidates
             .iter()
@@ -230,7 +232,7 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [] => bail!("requested impl method `{expected}` was not found"),
-            [method] => selected.push((*method).clone()),
+            [method] => selected.push((**method).clone()),
             _ => bail!(
                 "requested impl method `{expected}` matched multiple impl blocks; pass impl_name"
             ),
@@ -1036,11 +1038,10 @@ pub(crate) fn plan_rust_lsp_rename(p: &RefactorPlanParams) -> Result<String> {
     let parsed = parse_rust_file(&source_path)?;
     let position_byte = rust_rename_position_byte(&parsed, old_name)?;
     let position = byte_to_lsp_position(&parsed.source, position_byte);
-    let lsp_edits = rust_analyzer_rename(&project_dir, &source_path, position, new_name)?;
-    if lsp_edits.is_empty() {
+    let file_edits = rust_analyzer_rename(&project_dir, &source_path, position, new_name)?;
+    if file_edits.is_empty() {
         bail!("rust-analyzer returned no edits for rename `{old_name}`");
     }
-    let file_edits = lsp_edits_to_file_edits(lsp_edits)?;
     let validations = file_edits
         .iter()
         .flat_map(|edit| parse_validation_step_for_path(Path::new(&edit.path)))
@@ -1074,11 +1075,10 @@ pub(crate) fn plan_rust_organize_imports(p: &RefactorPlanParams) -> Result<Strin
                 .unwrap_or_else(|| source_path.parent().unwrap_or(Path::new(".")).to_path_buf())
         });
     parse_rust_file(&source_path)?;
-    let lsp_edits = rust_analyzer_organize_imports(&project_dir, &source_path)?;
-    if lsp_edits.is_empty() {
+    let file_edits = rust_analyzer_organize_imports(&project_dir, &source_path)?;
+    if file_edits.is_empty() {
         bail!("rust-analyzer returned no import organization edits");
     }
-    let file_edits = lsp_edits_to_file_edits(lsp_edits)?;
     let validations = file_edits
         .iter()
         .flat_map(|edit| parse_validation_step_for_path(Path::new(&edit.path)))
@@ -1758,16 +1758,17 @@ pub(crate) fn rust_node_by_range<'a>(
 }
 
 
-#[derive(Debug, Clone)]
-pub(crate) struct LspTextEdit {
-    path: PathBuf,
-    start_line: u64,
-    start_character: u64,
-    end_line: u64,
-    end_character: u64,
-    new_text: String,
-}
 
+
+use lsp_types::{
+    ClientCapabilities, CodeActionClientCapabilities, CodeActionContext, CodeActionKind,
+    CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionParams, DocumentChanges,
+    InitializeParams, Position, Range, RenameParams, ResourceOperationKind,
+    TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    WorkspaceClientCapabilities, WorkspaceEdit, WorkspaceEditClientCapabilities, WorkspaceFolder,
+    request::{CodeActionRequest, Initialize, Rename, Request, Shutdown},
+    notification::{Exit, Initialized, Notification},
+};
 
 pub(crate) fn rust_rename_position_byte(parsed: &ParsedSource, old_name: &str) -> Result<usize> {
     let mut candidates = rust_status_items(parsed)
@@ -1792,17 +1793,15 @@ pub(crate) fn rust_rename_position_byte(parsed: &ParsedSource, old_name: &str) -
     Ok(item.byte_start + relative + old_name.len().saturating_sub(1) / 2)
 }
 
-
-pub(crate) fn byte_to_lsp_position(source: &str, byte: usize) -> serde_json::Value {
-    let line = source[..byte].bytes().filter(|b| *b == b'\n').count() as u64;
+pub(crate) fn byte_to_lsp_position(source: &str, byte: usize) -> Position {
+    let line = source[..byte].bytes().filter(|b| *b == b'\n').count() as u32;
     let line_start = line_start_before(source, byte);
-    let character = source[line_start..byte].encode_utf16().count() as u64;
-    serde_json::json!({ "line": line, "character": character })
+    let character = source[line_start..byte].encode_utf16().count() as u32;
+    Position { line, character }
 }
 
-
-pub(crate) fn lsp_position_to_byte(source: &str, line: u64, character: u64) -> Result<usize> {
-    let mut current_line = 0u64;
+pub(crate) fn lsp_position_to_byte(source: &str, line: u32, character: u32) -> Result<usize> {
+    let mut current_line = 0u32;
     let mut line_start = 0usize;
     for (idx, byte) in source.bytes().enumerate() {
         if current_line == line {
@@ -1820,12 +1819,12 @@ pub(crate) fn lsp_position_to_byte(source: &str, line: u64, character: u64) -> R
         .find('\n')
         .map(|offset| line_start + offset)
         .unwrap_or(source.len());
-    let mut utf16 = 0u64;
+    let mut utf16 = 0u32;
     for (offset, ch) in source[line_start..line_end].char_indices() {
         if utf16 == character {
             return Ok(line_start + offset);
         }
-        utf16 += ch.len_utf16() as u64;
+        utf16 += ch.len_utf16() as u32;
         if utf16 > character {
             bail!("character {character} is not on a UTF-16 boundary");
         }
@@ -1836,12 +1835,54 @@ pub(crate) fn lsp_position_to_byte(source: &str, line: u64, character: u64) -> R
     bail!("character {character} is outside line {line}");
 }
 
-
-pub(crate) fn lsp_edits_to_file_edits(lsp_edits: Vec<LspTextEdit>) -> Result<Vec<FileEdit>> {
-    let mut grouped: BTreeMap<PathBuf, Vec<LspTextEdit>> = BTreeMap::new();
-    for edit in lsp_edits {
-        grouped.entry(edit.path.clone()).or_default().push(edit);
+pub(crate) fn workspace_edit_to_file_edits(
+    workspace_edit: WorkspaceEdit,
+) -> Result<Vec<FileEdit>> {
+    let mut grouped: BTreeMap<PathBuf, Vec<lsp_types::TextEdit>> = BTreeMap::new();
+    
+    if let Some(changes) = workspace_edit.changes {
+        for (url, edits) in changes {
+            if let Ok(path) = url.to_file_path() {
+                grouped.entry(path).or_default().extend(edits);
+            }
+        }
     }
+    
+    if let Some(document_changes) = workspace_edit.document_changes {
+        match document_changes {
+            DocumentChanges::Edits(doc_edits) => {
+                for doc_edit in doc_edits {
+                    if let Ok(path) = doc_edit.text_document.uri.to_file_path() {
+                        let edits = doc_edit.edits.into_iter().map(|e| match e {
+                            lsp_types::OneOf::Left(te) => te,
+                            lsp_types::OneOf::Right(ate) => lsp_types::TextEdit {
+                                range: ate.text_edit.range,
+                                new_text: ate.text_edit.new_text,
+                            },
+                        });
+                        grouped.entry(path).or_default().extend(edits);
+                    }
+                }
+            }
+            DocumentChanges::Operations(ops) => {
+                for op in ops {
+                    if let lsp_types::DocumentChangeOperation::Edit(doc_edit) = op {
+                        if let Ok(path) = doc_edit.text_document.uri.to_file_path() {
+                            let edits = doc_edit.edits.into_iter().map(|e| match e {
+                                lsp_types::OneOf::Left(te) => te,
+                                lsp_types::OneOf::Right(ate) => lsp_types::TextEdit {
+                                    range: ate.text_edit.range,
+                                    new_text: ate.text_edit.new_text,
+                                },
+                            });
+                            grouped.entry(path).or_default().extend(edits);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut file_edits = Vec::new();
     for (path, edits) in grouped {
         let source = fs::read_to_string(&path)
@@ -1849,9 +1890,9 @@ pub(crate) fn lsp_edits_to_file_edits(lsp_edits: Vec<LspTextEdit>) -> Result<Vec
         let mut text_edits = Vec::new();
         for edit in edits {
             let byte_start =
-                lsp_position_to_byte(&source, edit.start_line, edit.start_character)
+                lsp_position_to_byte(&source, edit.range.start.line, edit.range.start.character)
                     .with_context(|| format!("invalid LSP start range for {}", path.display()))?;
-            let byte_end = lsp_position_to_byte(&source, edit.end_line, edit.end_character)
+            let byte_end = lsp_position_to_byte(&source, edit.range.end.line, edit.range.end.character)
                 .with_context(|| format!("invalid LSP end range for {}", path.display()))?;
             text_edits.push(TextEdit {
                 byte_start,
@@ -1868,187 +1909,58 @@ pub(crate) fn lsp_edits_to_file_edits(lsp_edits: Vec<LspTextEdit>) -> Result<Vec
     Ok(file_edits)
 }
 
-
-pub(crate) fn rust_analyzer_rename(
-    project_dir: &Path,
-    source_path: &Path,
-    position: serde_json::Value,
-    new_name: &str,
-) -> Result<Vec<LspTextEdit>> {
-    let mut child = Command::new("rust-analyzer")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawning rust-analyzer")?;
-    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
-    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
-    let mut reader = std::io::BufReader::new(stdout);
-    let root_uri = Url::from_directory_path(project_dir)
-        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?
-        .to_string();
-    let source_uri = Url::from_file_path(source_path)
-        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?
-        .to_string();
-    send_lsp(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{
-                "processId": std::process::id(),
-                "rootUri": root_uri,
-                "rootPath": project_dir.to_string_lossy(),
-                "workspaceFolders": [{"uri": root_uri, "name": "refactor-root"}],
-                "capabilities": {
-                    "workspace": {
-                        "applyEdit": false,
-                        "workspaceEdit": {
-                            "documentChanges": true,
-                            "resourceOperations": ["create", "rename", "delete"]
-                        }
-                    }
-                }
-            }
-        }),
-    )?;
-    read_lsp_response(&mut reader, 1)?;
-    send_lsp(
-        &mut stdin,
-        &serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
-    )?;
-    std::thread::sleep(std::time::Duration::from_millis(2000));
-    send_lsp(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"textDocument/rename",
-            "params":{
-                "textDocument":{"uri":source_uri},
-                "position": position,
-                "newName": new_name
-            }
-        }),
-    )?;
-    let response = read_lsp_response(&mut reader, 2)?;
-    let _ = send_lsp(
-        &mut stdin,
-        &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
-    );
-    let _ = send_lsp(
-        &mut stdin,
-        &serde_json::json!({"jsonrpc":"2.0","method":"exit"}),
-    );
-    let _ = child.wait();
-    workspace_edit_to_text_edits(&response["result"])
-}
-
-
-pub(crate) fn rust_analyzer_organize_imports(
-    project_dir: &Path,
-    source_path: &Path,
-) -> Result<Vec<LspTextEdit>> {
-    let mut child = Command::new("rust-analyzer")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawning rust-analyzer")?;
-    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
-    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
-    let mut reader = std::io::BufReader::new(stdout);
-    let root_uri = Url::from_directory_path(project_dir)
-        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?
-        .to_string();
-    let source_uri = Url::from_file_path(source_path)
-        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?
-        .to_string();
-    send_lsp(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"initialize",
-            "params":{
-                "processId": std::process::id(),
-                "rootUri": root_uri,
-                "rootPath": project_dir.to_string_lossy(),
-                "workspaceFolders": [{"uri": root_uri, "name": "refactor-root"}],
-                "capabilities": {
-                    "textDocument": {
-                        "codeAction": {
-                            "codeActionLiteralSupport": {
-                                "codeActionKind": {"valueSet": ["source.organizeImports"]}
-                            }
-                        }
-                    },
-                    "workspace": {
-                        "workspaceEdit": {"documentChanges": true}
-                    }
-                }
-            }
-        }),
-    )?;
-    read_lsp_response(&mut reader, 1)?;
-    send_lsp(
-        &mut stdin,
-        &serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
-    )?;
-    let source = fs::read_to_string(source_path)
-        .with_context(|| format!("reading {}", source_path.display()))?;
-    let end_position = byte_to_lsp_position(&source, source.len());
-    std::thread::sleep(std::time::Duration::from_millis(2000));
-    send_lsp(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"textDocument/codeAction",
-            "params":{
-                "textDocument":{"uri":source_uri},
-                "range":{"start":{"line":0,"character":0},"end":end_position},
-                "context":{"diagnostics":[],"only":["source.organizeImports"]}
-            }
-        }),
-    )?;
-    let response = read_lsp_response(&mut reader, 2)?;
-    let _ = send_lsp(
-        &mut stdin,
-        &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
-    );
-    let _ = send_lsp(
-        &mut stdin,
-        &serde_json::json!({"jsonrpc":"2.0","method":"exit"}),
-    );
-    let _ = child.wait();
-    code_actions_to_text_edits(&response["result"])
-}
-
-
-pub(crate) fn send_lsp(stdin: &mut impl Write, value: &serde_json::Value) -> Result<()> {
-    let body = serde_json::to_vec(value)?;
+pub(crate) fn send_lsp_request<R: Request>(
+    stdin: &mut impl Write,
+    id: u64,
+    params: &R::Params,
+) -> Result<()> {
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": R::METHOD,
+        "params": params
+    });
+    let body = serde_json::to_vec(&req)?;
     write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
     stdin.write_all(&body)?;
     stdin.flush()?;
     Ok(())
 }
 
+pub(crate) fn send_lsp_notification<N: Notification>(
+    stdin: &mut impl Write,
+    params: &N::Params,
+) -> Result<()> {
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": N::METHOD,
+        "params": params
+    });
+    let body = serde_json::to_vec(&req)?;
+    write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
+    stdin.write_all(&body)?;
+    stdin.flush()?;
+    Ok(())
+}
 
-pub(crate) fn read_lsp_response(reader: &mut impl BufRead, expected_id: u64) -> Result<serde_json::Value> {
+pub(crate) fn read_lsp_response<R: Request>(
+    reader: &mut impl BufRead,
+    expected_id: u64,
+) -> Result<R::Result> {
     loop {
         let value = read_lsp_message(reader)?;
         if value.get("id").and_then(serde_json::Value::as_u64) != Some(expected_id) {
             continue;
         }
         if let Some(error) = value.get("error") {
-            bail!("rust-analyzer returned error: {error}");
+            bail!("LSP server returned error: {error}");
         }
-        return Ok(value);
+        let result = value
+            .get("result")
+            .ok_or_else(|| anyhow!("LSP response missing result"))?;
+        return Ok(serde_json::from_value(result.clone())?);
     }
 }
-
 
 pub(crate) fn read_lsp_message(reader: &mut impl BufRead) -> Result<serde_json::Value> {
     let mut content_length = None;
@@ -2072,96 +1984,184 @@ pub(crate) fn read_lsp_message(reader: &mut impl BufRead) -> Result<serde_json::
     Ok(serde_json::from_slice(&body)?)
 }
 
+pub(crate) fn rust_analyzer_rename(
+    project_dir: &Path,
+    source_path: &Path,
+    position: Position,
+    new_name: &str,
+) -> Result<Vec<FileEdit>> {
+    let mut child = Command::new("rust-analyzer")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning rust-analyzer")?;
+    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
+    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
+    let mut reader = std::io::BufReader::new(stdout);
+    
+    let root_uri = Url::from_directory_path(project_dir)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?;
+    let source_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
+        
+    let init_params = InitializeParams {
+        process_id: Some(std::process::id()),
+        root_uri: Some(root_uri.clone()),
+        root_path: Some(project_dir.to_string_lossy().to_string()),
+        capabilities: ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                apply_edit: Some(false),
+                workspace_edit: Some(WorkspaceEditClientCapabilities {
+                    document_changes: Some(true),
+                    resource_operations: Some(vec![
+                        ResourceOperationKind::Create,
+                        ResourceOperationKind::Rename,
+                        ResourceOperationKind::Delete,
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        workspace_folders: Some(vec![WorkspaceFolder {
+            uri: root_uri,
+            name: "refactor-root".to_string(),
+        }]),
+        ..Default::default()
+    };
 
-pub(crate) fn workspace_edit_to_text_edits(value: &serde_json::Value) -> Result<Vec<LspTextEdit>> {
-    let mut edits = Vec::new();
-    if let Some(changes) = value.get("changes").and_then(serde_json::Value::as_object) {
-        for (uri, uri_edits) in changes {
-            collect_lsp_text_edits(uri, uri_edits, &mut edits)?;
-        }
+    send_lsp_request::<Initialize>(&mut stdin, 1, &init_params)?;
+    let _init_result = read_lsp_response::<Initialize>(&mut reader, 1)?;
+    send_lsp_notification::<Initialized>(&mut stdin, &lsp_types::InitializedParams {})?;
+    
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    
+    let rename_params = RenameParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: source_uri },
+            position,
+        },
+        new_name: new_name.to_string(),
+        work_done_progress_params: Default::default(),
+    };
+    
+    send_lsp_request::<Rename>(&mut stdin, 2, &rename_params)?;
+    let response = read_lsp_response::<Rename>(&mut reader, 2)?;
+    
+    let _ = send_lsp_request::<Shutdown>(&mut stdin, 3, &());
+    let _ = send_lsp_notification::<Exit>(&mut stdin, &());
+    let _ = child.wait();
+    
+    if let Some(edit) = response {
+        workspace_edit_to_file_edits(edit)
+    } else {
+        Ok(Vec::new())
     }
-    if let Some(document_changes) = value
-        .get("documentChanges")
-        .and_then(serde_json::Value::as_array)
-    {
-        for change in document_changes {
-            if let Some(uri) = change
-                .get("textDocument")
-                .and_then(|td| td.get("uri"))
-                .and_then(serde_json::Value::as_str)
-            {
-                collect_lsp_text_edits(uri, &change["edits"], &mut edits)?;
+}
+
+pub(crate) fn rust_analyzer_organize_imports(
+    project_dir: &Path,
+    source_path: &Path,
+) -> Result<Vec<FileEdit>> {
+    let mut child = Command::new("rust-analyzer")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning rust-analyzer")?;
+    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
+    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
+    let mut reader = std::io::BufReader::new(stdout);
+    
+    let root_uri = Url::from_directory_path(project_dir)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?;
+    let source_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
+        
+    let init_params = InitializeParams {
+        process_id: Some(std::process::id()),
+        root_uri: Some(root_uri.clone()),
+        root_path: Some(project_dir.to_string_lossy().to_string()),
+        capabilities: ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                workspace_edit: Some(WorkspaceEditClientCapabilities {
+                    document_changes: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            text_document: Some(TextDocumentClientCapabilities {
+                code_action: Some(CodeActionClientCapabilities {
+                    code_action_literal_support: Some(CodeActionLiteralSupport {
+                        code_action_kind: CodeActionKindLiteralSupport {
+                            value_set: vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS.as_str().to_string()],
+                        },
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        workspace_folders: Some(vec![WorkspaceFolder {
+            uri: root_uri,
+            name: "refactor-root".to_string(),
+        }]),
+        ..Default::default()
+    };
+
+    send_lsp_request::<Initialize>(&mut stdin, 1, &init_params)?;
+    let _init_result = read_lsp_response::<Initialize>(&mut reader, 1)?;
+    send_lsp_notification::<Initialized>(&mut stdin, &lsp_types::InitializedParams {})?;
+    
+    let source = fs::read_to_string(source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
+    let end_position = byte_to_lsp_position(&source, source.len());
+    
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    
+    let code_action_params = CodeActionParams {
+        text_document: TextDocumentIdentifier { uri: source_uri },
+        range: Range {
+            start: Position { line: 0, character: 0 },
+            end: end_position,
+        },
+        context: CodeActionContext {
+            diagnostics: vec![],
+            only: Some(vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS]),
+            trigger_kind: None,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+    
+    send_lsp_request::<CodeActionRequest>(&mut stdin, 2, &code_action_params)?;
+    let response = read_lsp_response::<CodeActionRequest>(&mut reader, 2)?;
+    
+    let _ = send_lsp_request::<Shutdown>(&mut stdin, 3, &());
+    let _ = send_lsp_notification::<Exit>(&mut stdin, &());
+    let _ = child.wait();
+    
+    let mut all_edits = Vec::new();
+    if let Some(actions) = response {
+        for action in actions {
+            match action {
+                lsp_types::CodeActionOrCommand::CodeAction(ca) => {
+                    let kind = ca.kind.clone().unwrap_or_else(|| lsp_types::CodeActionKind::from(""));
+                    if kind != CodeActionKind::SOURCE_ORGANIZE_IMPORTS && !ca.title.to_ascii_lowercase().contains("organize") {
+                        continue;
+                    }
+                    if let Some(edit) = ca.edit {
+                        all_edits.extend(workspace_edit_to_file_edits(edit)?);
+                    }
+                }
+                _ => {}
             }
         }
     }
-    Ok(edits)
-}
-
-
-pub(crate) fn code_actions_to_text_edits(value: &serde_json::Value) -> Result<Vec<LspTextEdit>> {
-    let actions = value
-        .as_array()
-        .ok_or_else(|| anyhow!("LSP codeAction result is not an array"))?;
-    let mut edits = Vec::new();
-    for action in actions {
-        let kind = action
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let title = action
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if kind != "source.organizeImports" && !title.to_ascii_lowercase().contains("organize") {
-            continue;
-        }
-        if let Some(edit) = action.get("edit") {
-            edits.extend(workspace_edit_to_text_edits(edit)?);
-        }
-    }
-    Ok(edits)
-}
-
-
-pub(crate) fn collect_lsp_text_edits(
-    uri: &str,
-    edit_value: &serde_json::Value,
-    edits: &mut Vec<LspTextEdit>,
-) -> Result<()> {
-    let url = Url::parse(uri).with_context(|| format!("invalid LSP uri {uri}"))?;
-    let path = url
-        .to_file_path()
-        .map_err(|_| anyhow!("LSP uri is not a file path: {uri}"))?;
-    let edit_array = edit_value
-        .as_array()
-        .ok_or_else(|| anyhow!("LSP edits for {uri} are not an array"))?;
-    for edit in edit_array {
-        let range = edit
-            .get("range")
-            .ok_or_else(|| anyhow!("LSP edit missing range"))?;
-        edits.push(LspTextEdit {
-            path: path.clone(),
-            start_line: lsp_range_num(range, "start", "line")?,
-            start_character: lsp_range_num(range, "start", "character")?,
-            end_line: lsp_range_num(range, "end", "line")?,
-            end_character: lsp_range_num(range, "end", "character")?,
-            new_text: edit
-                .get("newText")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        });
-    }
-    Ok(())
-}
-
-
-pub(crate) fn lsp_range_num(range: &serde_json::Value, endpoint: &str, field: &str) -> Result<u64> {
-    range
-        .get(endpoint)
-        .and_then(|value| value.get(field))
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| anyhow!("LSP range missing {endpoint}.{field}"))
+    Ok(all_edits)
 }
 
 pub(crate) fn existing_target_impl_insert_byte(

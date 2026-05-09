@@ -138,6 +138,8 @@ jsonschema = { version = "0.17", default-features = false, features = ["draft202
 # write_atomic) and tests. Production usage requires this be a real
 # dependency, not dev-only.
 tempfile = "3"
+lsp-types = "0.94.1"
+url = "2.5.8"
 
 [dev-dependencies]
 
