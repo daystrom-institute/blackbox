@@ -165,6 +165,8 @@ pub(crate) fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> 
         leftovers,
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -321,6 +323,8 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
         leftovers,
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -468,6 +472,8 @@ pub(crate) fn build_delete_rust_plan(
         leftovers,
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -528,6 +534,8 @@ pub(crate) fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<Stri
         leftovers: vec![format!("existing tool_router field: {}", field_text.trim())],
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -597,6 +605,8 @@ pub(crate) fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -664,6 +674,8 @@ pub(crate) fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -747,6 +759,8 @@ pub(crate) fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String>
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -815,6 +829,8 @@ pub(crate) fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -920,6 +936,8 @@ pub(crate) fn plan_rewrite_rust_item_visibility(p: &RefactorPlanParams) -> Resul
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1010,6 +1028,8 @@ pub(crate) fn plan_rewrite_rust_field_visibility(p: &RefactorPlanParams) -> Resu
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1066,6 +1086,8 @@ pub(crate) fn plan_rust_lsp_rename(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1107,6 +1129,8 @@ pub(crate) fn plan_rust_organize_imports(p: &RefactorPlanParams) -> Result<Strin
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;

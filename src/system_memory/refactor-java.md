@@ -78,6 +78,34 @@ by moved methods. Use that report to decide which fields to move, which fields
 to recreate on the target, and which dependencies should become constructor
 parameters.
 
+The plan additionally reports `external_calls` and `inherited_dependencies` so
+the target class doesn't ship with silently unresolved references:
+
+- `external_calls` lists method invocations inside the extracted set that
+  resolve to methods on the source class but are NOT in the extracted set.
+  Each entry carries `method`, a best-effort `signature` (with
+  `signature_partial: true` when the declaring node could not be cleanly
+  recovered), and `call_sites`. Each call site has `line`, `column`,
+  `in_method`, and `context` (`"direct"` or `"lambda"` — Gap 14: lambdas
+  capture `this` differently and may need a closure over a parent reference
+  rather than a simple delegate).
+- `inherited_dependencies` lists method invocations that resolve to a
+  superclass or implemented-interface method declared elsewhere in the
+  project type index (BFS through `extends`/`implements`, cycle-guarded).
+  Each entry carries `method`, `source` (declaring type name), `source_kind`
+  (`"class"` or `"interface"`), and the same `call_sites` shape with
+  `context`.
+
+Calls that don't resolve in the project type index are dropped — they're
+likely JDK or third-party library methods, and the target file's existing
+imports already cover them. Calls with explicit non-`this` receivers are also
+dropped. Resolve each finding before applying:
+
+| Finding | Resolution |
+|---------|-----------|
+| `external_calls` | Add the method to `item_names`, extract a callback interface with `extract_java_interface`, or pass the source instance through. |
+| `inherited_dependencies` | Add the same `implements` / `extends` to the target, or inject the dependency (e.g. `Logger`) via the constructor. |
+
 4. Extract a cohesive Java class in one plan:
 
 ```text

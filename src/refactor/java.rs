@@ -698,6 +698,437 @@ fn captured_fields_for_methods(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Extracted-dependency analysis (closes Java refactor gaps 12, 14, 15).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub(crate) struct ExtractionDependencyReport {
+    pub external_calls: Vec<ExternalCall>,
+    pub inherited_dependencies: Vec<InheritedDependency>,
+}
+
+/// File-path index for the project's Java types. Distinct from
+/// `project_java_type_index` (which yields fqcns) because we need the file
+/// path to lazily reparse ancestor types when resolving inherited calls.
+fn project_java_type_paths(project_dir: &Path) -> BTreeMap<String, Option<PathBuf>> {
+    let mut index: BTreeMap<String, Option<PathBuf>> = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(project_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("java") {
+            continue;
+        }
+        if path.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some("target" | "build" | ".gradle")
+            )
+        }) {
+            continue;
+        }
+        let Some(simple) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        match index.get_mut(simple) {
+            Some(slot) => *slot = None,
+            None => {
+                index.insert(simple.to_string(), Some(path.to_path_buf()));
+            }
+        }
+    }
+    index
+}
+
+/// Collect the simple names of `extends` superclasses and `implements`
+/// interfaces declared on a class node (one hop).
+fn collect_java_super_type_names(class_node: Node<'_>, source: &str) -> Vec<String> {
+    fn collect_type_identifiers(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+        if node.kind() == "type_identifier" {
+            if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                out.push(text.to_string());
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_type_identifiers(child, source, out);
+        }
+    }
+    let mut out = Vec::new();
+    let mut cursor = class_node.walk();
+    for child in class_node.children(&mut cursor) {
+        let kind = child.kind();
+        if kind == "superclass" || kind == "interfaces" || kind == "super_interfaces" {
+            collect_type_identifiers(child, source, &mut out);
+        }
+    }
+    out
+}
+
+/// Collect public/protected/package method names declared directly on a
+/// type (class, interface, abstract class) body. Includes default-impl
+/// interface methods. Static methods are included — call resolution at the
+/// extraction site can't tell static from instance without semantic data.
+fn collect_java_type_method_names(parsed: &ParsedSource, type_node: Node<'_>) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let body = type_node
+        .child_by_field_name("body")
+        .unwrap_or(type_node);
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            if let Some(name) = child.child_by_field_name("name") {
+                if let Ok(text) = name.utf8_text(parsed.source.as_bytes()) {
+                    names.insert(text.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Find any top-level type declaration with the given simple name in `parsed`.
+fn find_java_type_declaration_by_name<'a>(
+    parsed: &'a ParsedSource,
+    type_name: &str,
+) -> Option<Node<'a>> {
+    let root = parsed.tree.root_node();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        if matches!(
+            kind,
+            "class_declaration"
+                | "interface_declaration"
+                | "record_declaration"
+                | "enum_declaration"
+        ) {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
+                    if name == type_name {
+                        return Some(node);
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    None
+}
+
+fn java_type_kind_label(node: Node<'_>) -> &'static str {
+    match node.kind() {
+        "interface_declaration" => "interface",
+        _ => "class",
+    }
+}
+
+/// Method invocation discovered inside an extracted method body.
+struct InvocationHit<'a> {
+    name: String,
+    /// True if the call has an explicit receiver (foo.bar(), this.bar(),
+    /// SomeType.bar()). Only unqualified calls and `this.`-qualified calls
+    /// can resolve to source-class methods, so we filter on this.
+    has_explicit_other_receiver: bool,
+    line: usize,
+    column: usize,
+    in_method: String,
+    inside_lambda: bool,
+    #[allow(dead_code)]
+    node: Node<'a>,
+}
+
+/// Walk a method declaration's body and collect every method_invocation,
+/// noting the enclosing method name and whether the call is inside a
+/// lambda_expression ancestor before reaching the enclosing method.
+fn collect_method_invocations<'a>(
+    method_node: Node<'a>,
+    enclosing_method_name: &str,
+    parsed: &'a ParsedSource,
+    out: &mut Vec<InvocationHit<'a>>,
+) {
+    fn walk<'a>(
+        node: Node<'a>,
+        enclosing_method_name: &str,
+        method_start_byte: usize,
+        parsed: &'a ParsedSource,
+        in_lambda_depth: usize,
+        out: &mut Vec<InvocationHit<'a>>,
+    ) {
+        let kind = node.kind();
+        // Don't recurse into nested method declarations (anonymous inner
+        // class methods); their bodies are their own enclosing method.
+        if (kind == "method_declaration" || kind == "constructor_declaration")
+            && node.start_byte() != method_start_byte
+        {
+            return;
+        }
+        let next_lambda_depth = if kind == "lambda_expression" {
+            in_lambda_depth + 1
+        } else {
+            in_lambda_depth
+        };
+        if kind == "method_invocation" {
+            // Detect explicit non-this receiver: object field is set and is
+            // not `this`. Also cover identifier-only receivers.
+            let mut has_explicit_other_receiver = false;
+            if let Some(obj) = node.child_by_field_name("object") {
+                let receiver_text = obj
+                    .utf8_text(parsed.source.as_bytes())
+                    .unwrap_or("")
+                    .trim();
+                if receiver_text != "this" {
+                    has_explicit_other_receiver = true;
+                }
+            }
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
+                    let (line, column) = line_col(&parsed.source, name_node.start_byte());
+                    out.push(InvocationHit {
+                        name: name.to_string(),
+                        has_explicit_other_receiver,
+                        line,
+                        column,
+                        in_method: enclosing_method_name.to_string(),
+                        inside_lambda: in_lambda_depth > 0,
+                        node,
+                    });
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(
+                child,
+                enclosing_method_name,
+                method_start_byte,
+                parsed,
+                next_lambda_depth,
+                out,
+            );
+        }
+    }
+    walk(
+        method_node,
+        enclosing_method_name,
+        method_node.start_byte(),
+        parsed,
+        0,
+        out,
+    );
+}
+
+/// Build a lightweight signature for a method declaration on the source
+/// class. Returns (signature, partial). Partial is true when key fields
+/// (return_type, parameters) couldn't be recovered cleanly.
+fn java_method_signature_text(method_node: Node<'_>, source: &str) -> (String, bool) {
+    let mut partial = false;
+    let return_type = method_node
+        .child_by_field_name("type")
+        .or_else(|| method_node.child_by_field_name("return_type"))
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| {
+            partial = true;
+            "?".to_string()
+        });
+    let name = method_node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        .unwrap_or_else(|| {
+            partial = true;
+            "?"
+        });
+    let params = method_node
+        .child_by_field_name("parameters")
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| {
+            partial = true;
+            "(?)".to_string()
+        });
+    (format!("{return_type} {name}{params}"), partial)
+}
+
+/// For every method on the source class, return a map from method name to
+/// (signature, partial). Constructors are intentionally excluded — they're
+/// resolved via `new`, not method invocation.
+fn java_source_class_method_signatures(
+    parsed: &ParsedSource,
+    class_node: Node<'_>,
+) -> BTreeMap<String, (String, bool)> {
+    let mut out: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    let body = class_node
+        .child_by_field_name("body")
+        .unwrap_or(class_node);
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if child.kind() == "method_declaration" {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
+                    let (sig, partial) = java_method_signature_text(child, &parsed.source);
+                    // First definition wins; overloads collapse to one entry
+                    // since we can't distinguish them at the call site without
+                    // full type resolution.
+                    out.entry(name.to_string()).or_insert((sig, partial));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Walk `extends` / `implements` chains starting from a source class to
+/// build a map of inherited method name -> (declaring type name, kind).
+/// The first declaration found along BFS wins, mirroring Java's nearest-
+/// ancestor resolution. Cycles are guarded via a visited set.
+fn collect_inherited_method_declarations(
+    project_dir: &Path,
+    source_class_node: Node<'_>,
+    parsed: &ParsedSource,
+) -> BTreeMap<String, (String, String)> {
+    let type_paths = project_java_type_paths(project_dir);
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut out: BTreeMap<String, (String, String)> = BTreeMap::new();
+
+    // BFS: queue holds simple type names to expand.
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let class_name = java_class_name(source_class_node, &parsed.source);
+    visited.insert(class_name);
+    for super_name in collect_java_super_type_names(source_class_node, &parsed.source) {
+        if visited.insert(super_name.clone()) {
+            queue.push_back(super_name);
+        }
+    }
+
+    while let Some(simple) = queue.pop_front() {
+        let Some(Some(path)) = type_paths.get(&simple) else {
+            continue; // Ambiguous (None) or absent — JDK / library / unknown.
+        };
+        let Ok(parsed_ancestor) = parse_source_file(path) else {
+            continue;
+        };
+        let Some(type_node) = find_java_type_declaration_by_name(&parsed_ancestor, &simple) else {
+            continue;
+        };
+        let kind_label = java_type_kind_label(type_node);
+        for method in collect_java_type_method_names(&parsed_ancestor, type_node) {
+            out.entry(method)
+                .or_insert((simple.clone(), kind_label.to_string()));
+        }
+        for next in collect_java_super_type_names(type_node, &parsed_ancestor.source) {
+            if visited.insert(next.clone()) {
+                queue.push_back(next);
+            }
+        }
+    }
+
+    out
+}
+
+/// Top-level analysis entry point. Walks the bodies of `selected` methods,
+/// classifies every method invocation, and returns external + inherited
+/// dependency reports. Internal calls (inside the extracted set) are
+/// dropped. Library/JDK calls (unresolved against the project type index)
+/// are also dropped.
+pub(crate) fn analyze_extracted_dependencies(
+    parsed: &ParsedSource,
+    selected: &[JavaMethod],
+    project_dir: Option<&Path>,
+) -> ExtractionDependencyReport {
+    let mut report = ExtractionDependencyReport::default();
+    if selected.is_empty() {
+        return report;
+    }
+    let Some(source_class_node) = find_first_class_declaration(parsed.tree.root_node()) else {
+        return report;
+    };
+
+    let extracted_names: HashSet<String> = selected
+        .iter()
+        .filter_map(|m| m.item.name.clone())
+        .collect();
+
+    let source_methods = java_source_class_method_signatures(parsed, source_class_node);
+
+    let inherited_methods: BTreeMap<String, (String, String)> = match project_dir {
+        Some(dir) => collect_inherited_method_declarations(dir, source_class_node, parsed),
+        None => BTreeMap::new(),
+    };
+
+    // Walk every selected method body once and collect invocations.
+    let mut invocations: Vec<InvocationHit<'_>> = Vec::new();
+    for method in selected {
+        let Some(method_node) = find_node(parsed.tree.root_node(), |node| {
+            (node.kind() == "method_declaration" || node.kind() == "constructor_declaration")
+                && node.start_byte() == method.item.byte_start
+                && node.end_byte() == method.item.byte_end
+        }) else {
+            continue;
+        };
+        let enclosing_name = method.item.name.clone().unwrap_or_default();
+        collect_method_invocations(method_node, &enclosing_name, parsed, &mut invocations);
+    }
+
+    let mut external: BTreeMap<String, ExternalCall> = BTreeMap::new();
+    let mut inherited: BTreeMap<String, InheritedDependency> = BTreeMap::new();
+
+    for hit in invocations {
+        // Calls with explicit non-this receivers cannot bind to the source
+        // class's own methods or to the source class's inherited methods; skip.
+        if hit.has_explicit_other_receiver {
+            continue;
+        }
+        // Internal: in extracted set. Drop.
+        if extracted_names.contains(&hit.name) {
+            continue;
+        }
+        let context = if hit.inside_lambda { "lambda" } else { "direct" };
+        let site = ExtractedCallSite {
+            line: hit.line,
+            column: hit.column,
+            in_method: hit.in_method.clone(),
+            context: context.to_string(),
+        };
+        if let Some((sig, partial)) = source_methods.get(&hit.name) {
+            // External: declared on source class body.
+            let entry = external
+                .entry(hit.name.clone())
+                .or_insert_with(|| ExternalCall {
+                    method: hit.name.clone(),
+                    signature: sig.clone(),
+                    signature_partial: *partial,
+                    call_sites: Vec::new(),
+                });
+            entry.call_sites.push(site);
+        } else if let Some((source, kind)) = inherited_methods.get(&hit.name) {
+            let entry = inherited
+                .entry(hit.name.clone())
+                .or_insert_with(|| InheritedDependency {
+                    method: hit.name.clone(),
+                    source: source.clone(),
+                    source_kind: kind.clone(),
+                    call_sites: Vec::new(),
+                });
+            entry.call_sites.push(site);
+        }
+        // Else: unresolved → JDK / library / unknown. Drop.
+    }
+
+    report.external_calls = external.into_values().collect();
+    report.inherited_dependencies = inherited.into_values().collect();
+    report
+}
+
 fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Result<Vec<JavaMethod>> {
     if names.is_empty() {
         bail!("item_names (method names) must be provided");
@@ -1115,6 +1546,11 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
     let names = p.item_names.as_deref().unwrap_or_default();
     let mut selected = select_java_methods_by_name(&parsed, names)?;
     let captured_variables = captured_fields_for_methods(&parsed, &selected);
+    let dependency_report = analyze_extracted_dependencies(
+        &parsed,
+        &selected,
+        p.project_dir.as_deref().map(Path::new),
+    );
 
     selected.sort_by_key(|m| std::cmp::Reverse(m.item.byte_start));
 
@@ -1195,6 +1631,8 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         leftovers: Vec::new(),
         captured_variables,
         remaining_source_accessors: Vec::new(),
+        external_calls: dependency_report.external_calls,
+        inherited_dependencies: dependency_report.inherited_dependencies,
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -1233,6 +1671,11 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .map(|field| field.name.as_str())
         .collect::<HashSet<_>>();
     let captured_variables = captured_fields_for_methods(&parsed, &selected_methods);
+    let class_dependency_report = analyze_extracted_dependencies(
+        &parsed,
+        &selected_methods,
+        p.project_dir.as_deref().map(Path::new),
+    );
     let dependency_params = captured_variables
         .iter()
         .filter(|capture| !moved_field_set.contains(capture.name.as_str()))
@@ -1387,6 +1830,8 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         leftovers: Vec::new(),
         captured_variables,
         remaining_source_accessors: Vec::new(),
+        external_calls: class_dependency_report.external_calls,
+        inherited_dependencies: class_dependency_report.inherited_dependencies,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1490,6 +1935,8 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -1564,6 +2011,8 @@ pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1616,6 +2065,8 @@ pub(crate) fn plan_add_java_constructor(p: &RefactorPlanParams) -> Result<String
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1708,6 +2159,8 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors,
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1845,6 +2298,8 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -2395,6 +2850,8 @@ pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String>
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -2561,6 +3018,8 @@ pub(crate) fn plan_add_java_delegate_field(p: &RefactorPlanParams) -> Result<Str
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -2670,6 +3129,8 @@ pub(crate) fn plan_rewrite_java_visibility(p: &RefactorPlanParams) -> Result<Str
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -2846,6 +3307,8 @@ pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String>
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -3116,6 +3579,8 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -3198,6 +3663,8 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -3371,6 +3838,8 @@ pub(crate) fn plan_java_lsp_organize_imports(p: &RefactorPlanParams) -> Result<S
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -3523,6 +3992,247 @@ mod tests {
                 && capture.source_type == "Grid"
                 && capture.source_visibility == "private"
         }));
+    }
+
+    // -----------------------------------------------------------------
+    // Gaps 12, 14, 15: external_calls + inherited_dependencies reports.
+    // -----------------------------------------------------------------
+
+    fn extract_dependency_plan(
+        project_dir: &Path,
+        source: &Path,
+        target: &Path,
+        item_names: &[&str],
+    ) -> RefactorPlan {
+        let mut params = java_plan_params("extract_java_methods", source);
+        params.target = Some(path_string(target));
+        params.item_names = Some(item_names.iter().map(|n| n.to_string()).collect());
+        params.project_dir = Some(path_string(project_dir));
+        let plan_text = plan_extract_java_methods(&params).unwrap();
+        serde_json::from_str(&plan_text).unwrap()
+    }
+
+    #[test]
+    fn extract_java_methods_reports_external_call_to_source_class_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("CompositionView.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class CompositionView {\n\
+            \x20   List<Item> getHistoryItemsBySamplePoint(Point p) { return List.of(); }\n\
+            \x20   void createSamplePointStatusBadge() {\n\
+            \x20       List<Item> items = getHistoryItemsBySamplePoint(null);\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let plan =
+            extract_dependency_plan(dir.path(), &source, &target, &["createSamplePointStatusBadge"]);
+        let call = plan
+            .external_calls
+            .iter()
+            .find(|c| c.method == "getHistoryItemsBySamplePoint")
+            .expect("external call missing");
+        assert!(
+            call.signature.contains("List<Item>")
+                && call.signature.contains("getHistoryItemsBySamplePoint")
+                && call.signature.contains("(Point p)"),
+            "signature was {}",
+            call.signature
+        );
+        assert!(!call.signature_partial);
+        assert_eq!(call.call_sites.len(), 1);
+        assert_eq!(call.call_sites[0].in_method, "createSamplePointStatusBadge");
+        assert_eq!(call.call_sites[0].context, "direct");
+    }
+
+    #[test]
+    fn extract_java_methods_reports_inherited_interface_method() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("HasLogger.java"),
+            "package p;\npublic interface HasLogger {\n    Logger getLogger();\n}\n",
+        )
+        .unwrap();
+        let source = dir.path().join("CompositionView.java");
+        fs::write(
+            &source,
+            "package p;\n\
+             public class CompositionView implements HasLogger {\n\
+            \x20   void createSamplePointStatusBadge() { getLogger().info(\"x\"); }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = dir.path().join("MeterGrid.java");
+        let plan =
+            extract_dependency_plan(dir.path(), &source, &target, &["createSamplePointStatusBadge"]);
+        let inherited = plan
+            .inherited_dependencies
+            .iter()
+            .find(|d| d.method == "getLogger")
+            .expect("inherited getLogger missing");
+        assert_eq!(inherited.source, "HasLogger");
+        assert_eq!(inherited.source_kind, "interface");
+        assert_eq!(inherited.call_sites.len(), 1);
+        assert_eq!(inherited.call_sites[0].context, "direct");
+    }
+
+    #[test]
+    fn extract_java_methods_reports_inherited_superclass_method() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("BaseView.java"),
+            "package p;\npublic class BaseView {\n    public void applyFilters() {}\n}\n",
+        )
+        .unwrap();
+        let source = dir.path().join("CompositionView.java");
+        fs::write(
+            &source,
+            "package p;\n\
+             public class CompositionView extends BaseView {\n\
+            \x20   void createMeterGrid() { applyFilters(); }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = dir.path().join("MeterGrid.java");
+        let plan = extract_dependency_plan(dir.path(), &source, &target, &["createMeterGrid"]);
+        let inherited = plan
+            .inherited_dependencies
+            .iter()
+            .find(|d| d.method == "applyFilters")
+            .expect("inherited applyFilters missing");
+        assert_eq!(inherited.source, "BaseView");
+        assert_eq!(inherited.source_kind, "class");
+    }
+
+    #[test]
+    fn extract_java_methods_resolves_multi_hop_inheritance_to_actual_declarer() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Base.java"),
+            "package p;\npublic class Base {\n    public void rootHook() {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Mid.java"),
+            "package p;\npublic class Mid extends Base {}\n",
+        )
+        .unwrap();
+        let source = dir.path().join("Leaf.java");
+        fs::write(
+            &source,
+            "package p;\n\
+             public class Leaf extends Mid {\n\
+            \x20   void doIt() { rootHook(); }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = dir.path().join("Other.java");
+        let plan = extract_dependency_plan(dir.path(), &source, &target, &["doIt"]);
+        let inherited = plan
+            .inherited_dependencies
+            .iter()
+            .find(|d| d.method == "rootHook")
+            .expect("inherited rootHook missing");
+        assert_eq!(inherited.source, "Base");
+        assert_eq!(inherited.source_kind, "class");
+    }
+
+    #[test]
+    fn extract_java_methods_marks_lambda_calls_with_lambda_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        fs::write(
+            &source,
+            "package p;\n\
+             class View {\n\
+            \x20   void refreshSamplePointItem() {}\n\
+            \x20   void createTrackChangeDialog() {\n\
+            \x20       Runnable r = () -> refreshSamplePointItem();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = dir.path().join("Other.java");
+        let plan = extract_dependency_plan(dir.path(), &source, &target, &["createTrackChangeDialog"]);
+        let call = plan
+            .external_calls
+            .iter()
+            .find(|c| c.method == "refreshSamplePointItem")
+            .expect("expected refreshSamplePointItem in external_calls");
+        assert_eq!(call.call_sites.len(), 1);
+        assert_eq!(call.call_sites[0].context, "lambda");
+    }
+
+    #[test]
+    fn extract_java_methods_marks_direct_calls_with_direct_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        fs::write(
+            &source,
+            "package p;\n\
+             class View {\n\
+            \x20   void refresh() {}\n\
+            \x20   void run() { refresh(); }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = dir.path().join("Other.java");
+        let plan = extract_dependency_plan(dir.path(), &source, &target, &["run"]);
+        let call = plan
+            .external_calls
+            .iter()
+            .find(|c| c.method == "refresh")
+            .expect("refresh missing");
+        assert_eq!(call.call_sites[0].context, "direct");
+    }
+
+    #[test]
+    fn extract_java_methods_omits_jdk_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        fs::write(
+            &source,
+            "package p;\n\
+             class View {\n\
+            \x20   void run() { System.out.println(\"hi\"); String.valueOf(1); }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = dir.path().join("Other.java");
+        let plan = extract_dependency_plan(dir.path(), &source, &target, &["run"]);
+        assert!(
+            plan.external_calls.is_empty(),
+            "expected empty external_calls, got {:?}",
+            plan.external_calls
+        );
+        assert!(plan.inherited_dependencies.is_empty());
+    }
+
+    #[test]
+    fn extract_java_methods_omits_calls_to_other_extracted_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        fs::write(
+            &source,
+            "package p;\n\
+             class View {\n\
+            \x20   void run() { helper(); }\n\
+            \x20   void helper() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let target = dir.path().join("Other.java");
+        let plan = extract_dependency_plan(dir.path(), &source, &target, &["run", "helper"]);
+        assert!(
+            plan.external_calls
+                .iter()
+                .all(|c| c.method != "helper"),
+            "helper should be internal, not external: {:?}",
+            plan.external_calls
+        );
     }
 
     #[test]
