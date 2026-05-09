@@ -1194,6 +1194,7 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables,
+        remaining_source_accessors: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -1385,6 +1386,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             .collect(),
         leftovers: Vec::new(),
         captured_variables,
+        remaining_source_accessors: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1487,6 +1489,7 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -1560,6 +1563,7 @@ pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1611,6 +1615,7 @@ pub(crate) fn plan_add_java_constructor(p: &RefactorPlanParams) -> Result<String
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1658,6 +1663,16 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
         .collect::<Vec<_>>();
     source_edits.sort_by_key(|edit| edit.byte_start);
     ensure_non_overlapping(&source_edits)?;
+    let moved_decl_ranges = selected
+        .iter()
+        .map(|field| (field.item.byte_start, field.item.byte_end))
+        .collect::<Vec<_>>();
+    let moved_field_names = selected
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    let remaining_source_accessors =
+        compute_remaining_source_accessors(&source_parsed, &moved_field_names, &moved_decl_ranges);
     let plan = RefactorPlan {
         title: format!(
             "Move {} Java field(s) from {} to {}",
@@ -1692,6 +1707,7 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
         items: selected.into_iter().map(|field| field.item).collect(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1828,6 +1844,7 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
         items: selected.into_iter().map(|info| info.field.item).collect(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1991,6 +2008,352 @@ fn widen_static_final_visibility_edit(
     })
 }
 
+/// Walk the source AST after the moved field declarations are known, and
+/// collect every remaining identifier read/write of those fields that stays
+/// in the source class. Skips occurrences inside the moved declarations
+/// themselves and identifiers shadowed by an enclosing local variable or
+/// formal parameter of the same name.
+fn compute_remaining_source_accessors(
+    parsed: &ParsedSource,
+    field_names: &[String],
+    moved_decl_ranges: &[(usize, usize)],
+) -> Vec<RemainingFieldAccessor> {
+    let name_set: HashSet<&str> = field_names.iter().map(String::as_str).collect();
+    let mut by_field: BTreeMap<String, Vec<FieldAccessSite>> = BTreeMap::new();
+    for name in field_names {
+        by_field.insert(name.clone(), Vec::new());
+    }
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "identifier" {
+            continue;
+        }
+        let Ok(text) = node.utf8_text(parsed.source.as_bytes()) else {
+            continue;
+        };
+        if !name_set.contains(text) {
+            continue;
+        }
+        // Filter occurrences inside the moved declarations.
+        if moved_decl_ranges
+            .iter()
+            .any(|(s, e)| node.start_byte() >= *s && node.end_byte() <= *e)
+        {
+            continue;
+        }
+        // Resolve to a field-access expression: either the bare identifier or
+        // an enclosing `this.<name>` field_access. Reject all other contexts
+        // (method names, type names, declarators, qualified accesses on other
+        // objects, etc.).
+        let access_node = match resolve_field_access(node) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Shadowing check: walk up looking for a local variable or formal
+        // parameter with the same name in scope, stopping at class_body.
+        if is_shadowed(node, text, &parsed.source) {
+            continue;
+        }
+        let kind = classify_access_kind(access_node);
+        let (line, column) = line_col(&parsed.source, access_node.start_byte());
+        let context = surrounding_context(&parsed.source, access_node.start_byte());
+        if let Some(list) = by_field.get_mut(text) {
+            list.push(FieldAccessSite {
+                line,
+                column,
+                kind: kind.to_string(),
+                context,
+            });
+        }
+    }
+    let mut report: Vec<RemainingFieldAccessor> = field_names
+        .iter()
+        .map(|name| {
+            let mut accesses = by_field.remove(name).unwrap_or_default();
+            accesses.sort_by(|a, b| a.line.cmp(&b.line).then(a.column.cmp(&b.column)));
+            RemainingFieldAccessor {
+                field: name.clone(),
+                accesses,
+            }
+        })
+        .collect();
+    // Stable: order matches input order.
+    report.sort_by_key(|r| {
+        field_names
+            .iter()
+            .position(|name| name == &r.field)
+            .unwrap_or(usize::MAX)
+    });
+    report
+}
+
+/// If `node` is an identifier, return the access expression we should
+/// consider for kind classification: either the identifier itself (bare
+/// access) or the enclosing `field_access` when the identifier sits in the
+/// `field` position of a `this.<name>` or `(...).<name>` expression where
+/// the object is `this`. Returns None when the identifier is not actually a
+/// field-resolved access (method names, type names, declarators, accesses
+/// on other objects, etc.).
+fn resolve_field_access<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    let parent = node.parent()?;
+    let parent_kind = parent.kind();
+
+    // Reject identifiers that are *names* of declarations or invocations.
+    match parent_kind {
+        "variable_declarator" => {
+            if parent.child_by_field_name("name").map(|c| c.id()) == Some(node.id()) {
+                return None;
+            }
+        }
+        "formal_parameter"
+        | "spread_parameter"
+        | "catch_formal_parameter"
+        | "method_declaration"
+        | "constructor_declaration"
+        | "class_declaration"
+        | "interface_declaration"
+        | "record_declaration"
+        | "enum_declaration"
+        | "annotation_type_declaration"
+        | "labeled_statement"
+        | "type_parameter"
+        | "marker_annotation"
+        | "annotation"
+        | "enum_constant" => {
+            if parent.child_by_field_name("name").map(|c| c.id()) == Some(node.id()) {
+                return None;
+            }
+        }
+        "method_invocation" => {
+            // Reject when the identifier *is* the method name.
+            if parent.child_by_field_name("name").map(|c| c.id()) == Some(node.id()) {
+                return None;
+            }
+            // Otherwise (object position, etc.) it's a field/variable read.
+        }
+        "method_reference" => {
+            // `Foo::bar` — `Foo` could be a class type (skip) or an instance
+            // field; tree-sitter labels both as identifiers. Instance field
+            // followed by `::method` is rare for a moved field; skip to avoid
+            // false positives. The method-name part (after ::) is not an
+            // identifier in the field-name sense either.
+            return None;
+        }
+        "field_access" => {
+            // If this identifier is the `field` part of a field_access, then
+            // the qualifying object decides whether this is *our* field.
+            if parent.child_by_field_name("field").map(|c| c.id()) == Some(node.id()) {
+                let object = parent.child_by_field_name("object")?;
+                if object.kind() == "this" || object.kind() == "this_expression" {
+                    return Some(parent);
+                }
+                // `something.fieldName` where `something` isn't `this` — not
+                // our field.
+                return None;
+            }
+            // Otherwise the identifier is in the `object` position — a bare
+            // read of the field as the qualifier of a further access.
+        }
+        "scoped_identifier"
+        | "scoped_type_identifier"
+        | "type_identifier"
+        | "generic_type" => {
+            return None;
+        }
+        _ => {}
+    }
+    Some(node)
+}
+
+fn classify_access_kind(access_node: Node<'_>) -> &'static str {
+    let mut current = access_node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "assignment_expression" => {
+                if parent.child_by_field_name("left").map(|c| c.id()) == Some(current.id()) {
+                    return "write";
+                }
+                return "read";
+            }
+            "update_expression" => {
+                return "write";
+            }
+            "parenthesized_expression" | "cast_expression" => {
+                current = parent;
+                continue;
+            }
+            _ => return "read",
+        }
+    }
+    "read"
+}
+
+fn is_shadowed(ident_node: Node<'_>, name: &str, source: &str) -> bool {
+    let target_id = ident_node.id();
+    let target_start = ident_node.start_byte();
+    let mut current = ident_node;
+    while let Some(parent) = current.parent() {
+        let kind = parent.kind();
+        if kind == "class_body" || kind == "interface_body" || kind == "enum_body" {
+            return false;
+        }
+        if matches!(
+            kind,
+            "block"
+                | "method_declaration"
+                | "constructor_declaration"
+                | "lambda_expression"
+                | "for_statement"
+                | "enhanced_for_statement"
+                | "catch_clause"
+                | "try_with_resources_statement"
+                | "switch_block_statement_group"
+                | "switch_block"
+        ) {
+            if scope_declares_name(parent, name, target_start, target_id, source) {
+                return true;
+            }
+        }
+        current = parent;
+    }
+    false
+}
+
+fn scope_declares_name(
+    scope: Node<'_>,
+    name: &str,
+    target_start: usize,
+    target_id: usize,
+    source: &str,
+) -> bool {
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        // Don't descend into nested scopes (a local declared in a sibling
+        // block doesn't shadow us).
+        if node.id() != scope.id()
+            && matches!(
+                kind,
+                "method_declaration"
+                    | "constructor_declaration"
+                    | "lambda_expression"
+                    | "class_body"
+                    | "interface_body"
+                    | "enum_body"
+                    | "class_declaration"
+                    | "interface_declaration"
+                    | "record_declaration"
+                    | "enum_declaration"
+            )
+        {
+            continue;
+        }
+        if matches!(
+            kind,
+            "local_variable_declaration"
+                | "formal_parameter"
+                | "spread_parameter"
+                | "catch_formal_parameter"
+                | "resource"
+                | "enhanced_for_variable"
+        ) {
+            if declaration_name_matches(node, name, source) && node.start_byte() <= target_start {
+                // Don't treat the target identifier itself as shadowing.
+                if !node_contains_id(node, target_id) {
+                    return true;
+                }
+            }
+        }
+        if kind == "lambda_expression" && node.id() != scope.id() {
+            // Already handled above by skipping; keep here for clarity.
+            continue;
+        }
+        if kind == "enhanced_for_statement" && node.id() != scope.id() {
+            // `for (X x : ...)` declares `x` in the body's scope but the
+            // declaration node lives at the for-statement level. Still need
+            // to check it.
+            if for_each_declares_name(node, name, source) && node.start_byte() <= target_start {
+                if !node_contains_id(node, target_id) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+fn for_each_declares_name(for_node: Node<'_>, name: &str, source: &str) -> bool {
+    if let Some(name_node) = for_node.child_by_field_name("name") {
+        if let Ok(text) = name_node.utf8_text(source.as_bytes()) {
+            return text == name;
+        }
+    }
+    false
+}
+
+fn declaration_name_matches(node: Node<'_>, name: &str, source: &str) -> bool {
+    match node.kind() {
+        "local_variable_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "variable_declarator" {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        if name_node.utf8_text(source.as_bytes()) == Ok(name) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        "formal_parameter" | "spread_parameter" | "catch_formal_parameter" | "resource" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                return name_node.utf8_text(source.as_bytes()) == Ok(name);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn node_contains_id(node: Node<'_>, target_id: usize) -> bool {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if n.id() == target_id {
+            return true;
+        }
+        let mut cursor = n.walk();
+        for child in n.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+fn surrounding_context(source: &str, idx: usize) -> String {
+    let line_start = source[..idx.min(source.len())]
+        .rfind('\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let after = &source[idx.min(source.len())..];
+    let line_end_offset = after.find('\n').unwrap_or(after.len());
+    let line_end = idx + line_end_offset;
+    let line = source[line_start..line_end].trim();
+    if line.chars().count() <= 80 {
+        return line.to_string();
+    }
+    line.chars().take(77).collect::<String>() + "..."
+}
+
 pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let parsed = parse_source_file(&source_path)?;
@@ -2031,6 +2394,7 @@ pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String>
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -2196,6 +2560,7 @@ pub(crate) fn plan_add_java_delegate_field(p: &RefactorPlanParams) -> Result<Str
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -2304,6 +2669,7 @@ pub(crate) fn plan_rewrite_java_visibility(p: &RefactorPlanParams) -> Result<Str
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -2479,6 +2845,7 @@ pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String>
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -2748,6 +3115,7 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -2829,6 +3197,7 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -3001,6 +3370,7 @@ pub(crate) fn plan_java_lsp_organize_imports(p: &RefactorPlanParams) -> Result<S
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -3645,5 +4015,112 @@ mod tests {
         // Constant inserted with the requested visibility.
         assert!(target_text
             .contains("public static final String SAMPLE_STATUS_OK = \"UP TO DATE\";"));
+    }
+
+    fn move_field_plan_for(
+        source_text: &str,
+        target_text: &str,
+        field_names: &[&str],
+    ) -> RefactorPlan {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Source.java");
+        let target = dir.path().join("Target.java");
+        fs::write(&source, source_text).unwrap();
+        fs::write(&target, target_text).unwrap();
+        let mut params = java_plan_params("move_java_field", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(field_names.iter().map(|s| s.to_string()).collect());
+        let plan_text = plan_move_java_field(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        // Keep tempdir alive for the duration of the test by leaking it; tests
+        // are short-lived and cleanup happens on process exit.
+        std::mem::forget(dir);
+        plan
+    }
+
+    #[test]
+    fn move_java_field_reports_remaining_reads_only() {
+        let source = "class Source {\n    private Grid grid;\n    void show() {\n        view.add(grid);\n        render(grid);\n    }\n    void render(Grid g) {}\n}\n";
+        let target = "class Target {\n}\n";
+        let plan = move_field_plan_for(source, target, &["grid"]);
+        let report = plan
+            .remaining_source_accessors
+            .iter()
+            .find(|r| r.field == "grid")
+            .expect("grid entry");
+        assert_eq!(report.accesses.len(), 2);
+        assert!(report.accesses.iter().all(|a| a.kind == "read"));
+        assert_eq!(report.accesses[0].line, 4);
+        assert!(report.accesses[0].context.contains("view.add(grid)"));
+        assert_eq!(report.accesses[1].line, 5);
+        assert!(report.accesses[1].context.contains("render(grid)"));
+    }
+
+    #[test]
+    fn move_java_field_distinguishes_reads_and_writes() {
+        let source = "class Source {\n    private int counter;\n    void bump() {\n        counter = counter + 1;\n        counter += 5;\n        counter++;\n        log(counter);\n    }\n    void log(int v) {}\n}\n";
+        let target = "class Target {\n}\n";
+        let plan = move_field_plan_for(source, target, &["counter"]);
+        let report = plan
+            .remaining_source_accessors
+            .iter()
+            .find(|r| r.field == "counter")
+            .expect("counter entry");
+        let writes = report
+            .accesses
+            .iter()
+            .filter(|a| a.kind == "write")
+            .count();
+        let reads = report.accesses.iter().filter(|a| a.kind == "read").count();
+        // 3 writes: `counter =`, `counter +=`, `counter++`.
+        // 3 reads: rhs of `counter + 1`, log(counter), and (debatable) the
+        // read embedded in `+=`. We only require classification of the LHS
+        // positions reported as `write`, not the synthetic read of compound
+        // assignment.
+        assert!(writes >= 3, "expected >= 3 writes, got {writes} ({reads} reads)");
+        assert!(reads >= 2, "expected >= 2 reads, got {reads} ({writes} writes)");
+    }
+
+    #[test]
+    fn move_java_field_skips_local_shadowing() {
+        let source = "class Source {\n    private int value;\n    void shadowed() {\n        int value = 7;\n        use(value);\n    }\n    void unshadowed() {\n        use(value);\n    }\n    void use(int v) {}\n}\n";
+        let target = "class Target {\n}\n";
+        let plan = move_field_plan_for(source, target, &["value"]);
+        let report = plan
+            .remaining_source_accessors
+            .iter()
+            .find(|r| r.field == "value")
+            .expect("value entry");
+        // Only the unshadowed read should be reported.
+        assert_eq!(report.accesses.len(), 1, "report: {:?}", report.accesses);
+        assert_eq!(report.accesses[0].line, 8);
+    }
+
+    #[test]
+    fn move_java_field_reports_both_this_and_bare_access() {
+        let source = "class Source {\n    private Grid grid;\n    void run() {\n        this.grid.refresh();\n        grid.show();\n    }\n}\n";
+        let target = "class Target {\n}\n";
+        let plan = move_field_plan_for(source, target, &["grid"]);
+        let report = plan
+            .remaining_source_accessors
+            .iter()
+            .find(|r| r.field == "grid")
+            .expect("grid entry");
+        assert_eq!(report.accesses.len(), 2);
+        assert_eq!(report.accesses[0].line, 4);
+        assert!(report.accesses[0].context.contains("this.grid.refresh()"));
+        assert_eq!(report.accesses[1].line, 5);
+        assert!(report.accesses[1].context.contains("grid.show()"));
+    }
+
+    #[test]
+    fn move_java_field_with_no_remaining_accesses_reports_empty_list() {
+        let source = "class Source {\n    private Grid grid;\n    void run() {}\n}\n";
+        let target = "class Target {\n}\n";
+        let plan = move_field_plan_for(source, target, &["grid"]);
+        assert_eq!(plan.remaining_source_accessors.len(), 1);
+        let report = &plan.remaining_source_accessors[0];
+        assert_eq!(report.field, "grid");
+        assert!(report.accesses.is_empty());
     }
 }

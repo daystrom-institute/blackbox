@@ -147,6 +147,33 @@ bbox_refactor_plan(
 )
 ```
 
+The plan response includes `remaining_source_accessors`: for each moved field,
+every read/write of that field that still lives in the source class after the
+declaration is removed. Each entry carries `line`, `column` (1-indexed),
+`kind` (`read` or `write`), and a trimmed `context` snippet of the line.
+Empty `accesses` for a field means the source class no longer references it
+and the move is clean. Non-empty `accesses` flag the lines that will fail to
+compile until you rewrite them (commonly via `update_java_callers` with a
+delegate or by moving more code along with the field). Shape:
+
+```json
+{
+  "remaining_source_accessors": [
+    {
+      "field": "meterGrid",
+      "accesses": [
+        {"line": 270, "column": 36, "kind": "read",  "context": "viewContent.remove(meterGrid);"},
+        {"line": 322, "column": 8,  "kind": "write", "context": "meterGrid = newGrid;"}
+      ]
+    }
+  ]
+}
+```
+
+Local variables and formal parameters that shadow the field name are
+correctly skipped; bare `meterGrid` and `this.meterGrid` are both reported
+when they resolve to the moved field.
+
 7b. Move static final constants that travel with the extracted methods:
 
 ```text
