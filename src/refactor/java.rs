@@ -491,6 +491,50 @@ fn compute_java_organize_imports_edit(
         imports.insert(format!("import {fqcn};"));
     }
 
+    // Gap 28: drop explicit single-type imports already covered by a
+    // wildcard import for the same package. The wildcard provides them, so
+    // listing them again is redundant. `import static …` lines are NEVER
+    // dropped (they bring members, not types — wildcards on types do not
+    // cover them) and explicit imports from packages without a matching
+    // wildcard are left alone.
+    let wildcard_packages: HashSet<String> = imports
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            // Only TYPE wildcards qualify: `import x.y.z.*;` — not
+            // `import static x.y.Z.*;` which is a member wildcard.
+            if trimmed.starts_with("import static ") {
+                return None;
+            }
+            let body = trimmed
+                .strip_prefix("import ")?
+                .trim_end_matches(';')
+                .trim();
+            body.strip_suffix(".*").map(str::to_string)
+        })
+        .collect();
+    if !wildcard_packages.is_empty() {
+        imports.retain(|line| {
+            let trimmed = line.trim();
+            // Keep wildcards and static imports verbatim.
+            if trimmed.starts_with("import static ") || trimmed.ends_with(".*;") {
+                return true;
+            }
+            // Explicit single-type import: drop if its package is covered.
+            let Some(body) = trimmed
+                .strip_prefix("import ")
+                .and_then(|s| s.strip_suffix(';'))
+                .map(str::trim)
+            else {
+                return true;
+            };
+            let Some((pkg, _simple)) = body.rsplit_once('.') else {
+                return true;
+            };
+            !wildcard_packages.contains(pkg)
+        });
+    }
+
     let mut sorted = imports.into_iter().collect::<Vec<_>>();
     sorted.sort();
     let (start, end, insert_at) = java_import_block_range(source);
@@ -772,6 +816,80 @@ fn fixme_inherited_class_call(method: &str, source: &str) -> Vec<String> {
         format!("// FIXME: inherited call `{method}` — inherited from class {source} on the source. Extracted target does not extend {source}."),
         "//   resolutions: extend the same superclass, inject the dependency, or move the call back to the source.".to_string(),
     ]
+}
+
+/// Gap 29: insert a FIXME comment block above the generated
+/// `private final <Type> <name>;` line in the target text, warning the
+/// operator that the source field is non-final and the target only sees a
+/// snapshot of the value taken at construction time. Idempotent: if the
+/// FIXME marker already lives directly above the field declaration, the
+/// input is returned unchanged. Greppable prefix: `// FIXME: mutable
+/// capture `<name>``.
+fn java_insert_fixme_above_mutable_capture(
+    target_text: &str,
+    capture: &CapturedVariable,
+) -> String {
+    // Locate the generated field line. The target body renders captures as
+    // `    private final <Type> <Name>;` (see dependency_field_text). We
+    // search for the substring ending in ` <name>;` that is preceded by
+    // `final ` so we don't accidentally hit some other `final` site.
+    let needle = format!("final {} {};", capture.source_type, capture.name);
+    let Some(decl_at) = target_text.find(&needle) else {
+        return target_text.to_string();
+    };
+    // Walk back to the line start to capture the indent.
+    let line_start = target_text[..decl_at]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let indent: String = target_text[line_start..decl_at]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+
+    // Idempotency: if the line directly above this declaration already
+    // carries our FIXME marker for this capture, do nothing.
+    let marker = format!("// FIXME: mutable capture `{}`", capture.name);
+    if line_start > 0 {
+        let preceding = &target_text[..line_start];
+        if let Some(prev_line_start) = preceding[..preceding.len() - 1].rfind('\n') {
+            if target_text[prev_line_start + 1..line_start].contains(&marker) {
+                return target_text.to_string();
+            }
+        } else if preceding.contains(&marker) {
+            return target_text.to_string();
+        }
+    }
+
+    let comment = format!(
+        "{indent}// FIXME: mutable capture `{name}` (source field is non-final). Promoted to `final` constructor param — value snapshotted at construction.\n\
+         {indent}//   resolutions: use Supplier<{ty}>, shared holder, or keep on source and access via reference.\n",
+        indent = indent,
+        name = capture.name,
+        ty = boxed_for_supplier(&capture.source_type),
+    );
+    let mut out = String::with_capacity(target_text.len() + comment.len());
+    out.push_str(&target_text[..line_start]);
+    out.push_str(&comment);
+    out.push_str(&target_text[line_start..]);
+    out
+}
+
+/// Render a Java type for use as the parameter of `Supplier<…>` — primitive
+/// types must be boxed (Supplier doesn't accept primitives). Non-primitive
+/// types pass through unchanged.
+fn boxed_for_supplier(java_type: &str) -> String {
+    match java_type.trim() {
+        "boolean" => "Boolean".to_string(),
+        "byte" => "Byte".to_string(),
+        "short" => "Short".to_string(),
+        "int" => "Integer".to_string(),
+        "long" => "Long".to_string(),
+        "float" => "Float".to_string(),
+        "double" => "Double".to_string(),
+        "char" => "Character".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Look up a Java type by simple name in the project, returning the simple
@@ -2454,6 +2572,30 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 java_insert_fixme_above_calls(&target_content, &dep.method, &fixme);
             target_content = next;
         }
+
+        // Gap 29: warn the operator about mutable captures that were
+        // promoted to `final` constructor params on the target. The source
+        // field is non-final (its value can change at runtime); the target
+        // only sees a snapshot taken at construction time. This is a silent
+        // semantic bug — surface it as a FIXME directly above the
+        // generated `private final <Type> <name>;` line so it travels with
+        // the target file rather than getting buried in JSON.
+        for capture in &captured_variables {
+            if !capture.source_mutable {
+                continue;
+            }
+            if capture.source_static_final {
+                // Static-finals route through the Gap 20 constants path —
+                // they aren't constructor params and can't be "snapshotted".
+                continue;
+            }
+            if moved_field_set.contains(capture.name.as_str()) {
+                // Field is being moved, not captured as a param.
+                continue;
+            }
+            target_content =
+                java_insert_fixme_above_mutable_capture(&target_content, capture);
+        }
     }
 
     let mut source_edits = Vec::new();
@@ -3437,6 +3579,18 @@ fn render_delegate_accessors(spec: &DelegateAccessorSpec, visibility: &str) -> S
 /// (or its enclosing assignment / update_expression) through the delegate's
 /// getter/setter. Skips entries we can't rewrite (e.g. write to a `final`
 /// field — the underlying setter doesn't exist).
+///
+/// Two-pass design (Gap 27): an assignment of the form
+/// `field = field.transform()` requires the LHS-write rewrite to consume the
+/// WHOLE assignment (`field = ...` → `delegate.setField(...)`) while the RHS
+/// reads inside the `...` still need to be rewritten through the getter.
+/// A single-pass walk that emits LHS and RHS edits independently silently
+/// drops one of them through the non-overlap guard. Pass 1 collects the set
+/// of LHS-write sites; pass 2 emits all other access rewrites BUT skips any
+/// access that lives inside one of those sites' RHS (those edits are folded
+/// into the LHS write rewrite at the end). For each LHS-write site we then
+/// materialize a single edit that spans the entire `assignment_expression`,
+/// with replacement = `delegate.setX(<read-rewritten rhs text>)`.
 fn compute_remaining_accessor_rewrite_edits(
     parsed: &ParsedSource,
     specs: &[DelegateAccessorSpec],
@@ -3448,8 +3602,131 @@ fn compute_remaining_accessor_rewrite_edits(
         .map(|spec| (spec.field_name.as_str(), spec))
         .collect();
     let name_set: HashSet<&str> = spec_by_name.keys().copied().collect();
+
+    // ---------------- Pass 1: identify LHS-write sites ---------------------
+    //
+    // An LHS-write site is an `assignment_expression` whose `left` field
+    // resolves to a moved field (bare identifier or `this.field`) AND for
+    // which a setter is available. Each site is recorded with the full
+    // assignment range, the RHS range, the setter name, and the operator
+    // text — everything pass 2 needs to materialize the single combined edit.
+    struct LhsWriteSite<'a> {
+        assign: Node<'a>,
+        rhs: Node<'a>,
+        setter: String,
+        op_text: Option<String>,
+        getter_call: String,
+    }
+    let mut lhs_write_sites: Vec<LhsWriteSite> = Vec::new();
+    {
+        let mut stack = vec![parsed.tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+            if node.kind() != "identifier" {
+                continue;
+            }
+            let Ok(text) = node.utf8_text(parsed.source.as_bytes()) else {
+                continue;
+            };
+            if !name_set.contains(text) {
+                continue;
+            }
+            if moved_decl_ranges
+                .iter()
+                .any(|(s, e)| node.start_byte() >= *s && node.end_byte() <= *e)
+            {
+                continue;
+            }
+            let access_node = match resolve_field_access(node) {
+                Some(n) => n,
+                None => continue,
+            };
+            if is_shadowed(node, text, &parsed.source) {
+                continue;
+            }
+            let Some(spec) = spec_by_name.get(text).copied() else {
+                continue;
+            };
+            // Walk past parenthesized/cast wrappers, mirroring classify.
+            let mut classify_target = access_node;
+            while let Some(parent) = classify_target.parent() {
+                if matches!(parent.kind(), "parenthesized_expression" | "cast_expression") {
+                    classify_target = parent;
+                    continue;
+                }
+                break;
+            }
+            let Some(parent) = classify_target.parent() else {
+                continue;
+            };
+            if parent.kind() != "assignment_expression" {
+                continue;
+            }
+            let left_id = parent.child_by_field_name("left").map(|c| c.id());
+            if left_id != Some(classify_target.id()) {
+                continue;
+            }
+            let Some(setter) = spec.setter_name() else {
+                // final field — no setter, so we can't fold this into a
+                // write rewrite. Pass 2 will see the LHS access and silently
+                // skip it (matching prior behavior on final-field writes).
+                continue;
+            };
+            let Some(rhs) = parent.child_by_field_name("right") else {
+                continue;
+            };
+            lhs_write_sites.push(LhsWriteSite {
+                assign: parent,
+                rhs,
+                setter,
+                op_text: assignment_operator_text(parent, &parsed.source),
+                getter_call: format!("{delegate_field}.{}()", spec.getter_name()),
+            });
+        }
+    }
+
+    // Quick range-containment helper: is `(s,e)` strictly inside any LHS
+    // site's RHS? Used by pass 2 to defer RHS edits into the per-site sub-
+    // edit collection.
+    let in_any_rhs = |start: usize, end: usize| -> Option<usize> {
+        lhs_write_sites
+            .iter()
+            .position(|site| start >= site.rhs.start_byte() && end <= site.rhs.end_byte())
+    };
+    // The LHS access ranges themselves — pass 2 must skip them entirely;
+    // they are consumed by the per-site write rewrite emitted at the end.
+    let lhs_access_ranges: Vec<(usize, usize)> = lhs_write_sites
+        .iter()
+        .map(|site| {
+            let left = site
+                .assign
+                .child_by_field_name("left")
+                .unwrap_or(site.assign);
+            (left.start_byte(), left.end_byte())
+        })
+        .collect();
+
+    // ---------------- Pass 2: emit per-access edits ------------------------
+    //
+    // Each access falls into one of three buckets:
+    //   (a) inside an LHS-write site's RHS  → record as a sub-edit on that
+    //       site (will be applied to the RHS source text when we render the
+    //       combined write rewrite).
+    //   (b) IS the LHS access of an LHS-write site → skip (consumed by the
+    //       combined write rewrite).
+    //   (c) anywhere else → emit a normal edit into the global list.
     let mut edits: Vec<TextEdit> = Vec::new();
     let mut emitted_ranges: Vec<(usize, usize)> = Vec::new();
+    // Per-site RHS sub-edits. Indexed by lhs_write_sites position. Sub-edits
+    // are stored in absolute source-byte coordinates and translated to RHS-
+    // local indices at render time.
+    let mut rhs_sub_edits: Vec<Vec<TextEdit>> = (0..lhs_write_sites.len())
+        .map(|_| Vec::new())
+        .collect();
+
     let mut stack = vec![parsed.tree.root_node()];
     while let Some(node) = stack.pop() {
         let mut cursor = node.walk();
@@ -3478,105 +3755,166 @@ fn compute_remaining_accessor_rewrite_edits(
         if is_shadowed(node, text, &parsed.source) {
             continue;
         }
-        let spec = match spec_by_name.get(text) {
-            Some(s) => *s,
-            None => continue,
+        let Some(spec) = spec_by_name.get(text).copied() else {
+            continue;
         };
         let getter_call = format!("{delegate_field}.{}()", spec.getter_name());
 
         // Walk past parenthesized/cast wrappers when classifying writes,
         // mirroring classify_access_kind.
         let mut classify_target = access_node;
-        let mut top_paren = access_node;
         while let Some(parent) = classify_target.parent() {
             if matches!(parent.kind(), "parenthesized_expression" | "cast_expression") {
                 classify_target = parent;
-                top_paren = parent;
                 continue;
             }
             break;
         }
         let parent = classify_target.parent();
 
-        // Helper to register an edit if it does not overlap a prior one.
-        let mut push_edit = |start: usize, end: usize, replacement: String| {
-            if emitted_ranges
-                .iter()
-                .any(|(s, e)| ranges_overlap((*s, *e), (start, end)))
-            {
-                return;
-            }
-            emitted_ranges.push((start, end));
-            edits.push(TextEdit {
-                byte_start: start,
-                byte_end: end,
-                replacement,
-            });
-        };
+        // Bucket (b): is this access THE LHS of an LHS-write site? Skip;
+        // the combined write rewrite at the end consumes it.
+        if lhs_access_ranges
+            .iter()
+            .any(|(s, e)| access_node.start_byte() == *s && access_node.end_byte() == *e)
+        {
+            continue;
+        }
 
-        match parent.map(|p| p.kind()) {
+        // Compute the edit this access would produce in isolation
+        // (start, end, replacement). For non-LHS-of-write assignments and
+        // update_expressions the edit covers a wider span than the bare
+        // identifier; for plain reads it covers just the access.
+        let edit = match parent.map(|p| p.kind()) {
             Some("assignment_expression") => {
                 let assign = parent.unwrap();
                 let left_id = assign.child_by_field_name("left").map(|c| c.id());
-                if left_id != Some(classify_target.id()) {
+                if left_id == Some(classify_target.id()) {
+                    // LHS-of-write but no setter (handled above as a skip
+                    // via lhs_access_ranges) — defensive: emit nothing.
+                    None
+                } else {
                     // RHS of an assignment — same as a read.
-                    push_edit(access_node.start_byte(), access_node.end_byte(), getter_call);
-                    continue;
+                    Some((
+                        access_node.start_byte(),
+                        access_node.end_byte(),
+                        getter_call.clone(),
+                    ))
                 }
-                let Some(setter) = spec.setter_name() else {
-                    // final field — can't synthesize a setter call. Leave
-                    // the original write in place (compiler will catch it)
-                    // and skip the rewrite.
-                    continue;
-                };
-                let Some(rhs_node) = assign.child_by_field_name("right") else {
-                    continue;
-                };
-                // Operator slot: the assignment_expression node has children
-                // [left, operator_token, right]; tree-sitter exposes the
-                // operator either via field "operator" or via the unnamed
-                // child between left and right. Slice from source.
-                let op_text = assignment_operator_text(assign, &parsed.source);
-                let rhs_text = parsed.source[rhs_node.start_byte()..rhs_node.end_byte()].to_string();
-                let replacement = match op_text.as_deref() {
-                    Some("=") | None => {
-                        format!("{delegate_field}.{setter}({rhs_text})")
-                    }
-                    Some(compound) => {
-                        // Strip trailing '=' from "+=" -> "+".
-                        let bin_op = compound.trim_end_matches('=');
-                        format!(
-                            "{delegate_field}.{setter}({getter_call} {bin_op} {rhs_text})"
-                        )
-                    }
-                };
-                push_edit(assign.start_byte(), assign.end_byte(), replacement);
             }
             Some("update_expression") => {
                 let upd = parent.unwrap();
-                let Some(setter) = spec.setter_name() else {
-                    continue;
+                let setter = match spec.setter_name() {
+                    Some(s) => s,
+                    None => {
+                        continue;
+                    }
                 };
                 let op_text = update_operator_text(upd, &parsed.source);
                 let bin_op = match op_text.as_deref() {
                     Some("++") => "+",
                     Some("--") => "-",
-                    _ => continue,
+                    _ => {
+                        continue;
+                    }
                 };
-                let replacement =
-                    format!("{delegate_field}.{setter}({getter_call} {bin_op} 1)");
-                push_edit(upd.start_byte(), upd.end_byte(), replacement);
+                Some((
+                    upd.start_byte(),
+                    upd.end_byte(),
+                    format!("{delegate_field}.{setter}({getter_call} {bin_op} 1)"),
+                ))
             }
-            _ => {
-                // Pure read — replace the bare identifier or `this.field`
-                // span with the getter call. `top_paren` is unused here:
-                // we only rewrite the inner read site; surrounding parens
-                // / casts are still legal around a method call.
-                let _ = top_paren;
-                push_edit(access_node.start_byte(), access_node.end_byte(), getter_call);
+            _ => Some((
+                access_node.start_byte(),
+                access_node.end_byte(),
+                getter_call,
+            )),
+        };
+        let Some((start, end, replacement)) = edit else {
+            continue;
+        };
+
+        // Bucket (a): edit lives inside an LHS-write site's RHS — defer it
+        // into the per-site sub-edits, do NOT add to the global edit list.
+        if let Some(site_idx) = in_any_rhs(start, end) {
+            // Defensive: if this edit happens to span outside the RHS
+            // (shouldn't with current node kinds, but cheap to check),
+            // fall through to the global path.
+            let site = &lhs_write_sites[site_idx];
+            if start >= site.rhs.start_byte() && end <= site.rhs.end_byte() {
+                rhs_sub_edits[site_idx].push(TextEdit {
+                    byte_start: start,
+                    byte_end: end,
+                    replacement,
+                });
+                continue;
             }
+            // else fall through to the global push below.
         }
+
+        // Bucket (c): non-overlap-guarded global edit list.
+        if emitted_ranges
+            .iter()
+            .any(|(s, e)| ranges_overlap((*s, *e), (start, end)))
+        {
+            continue;
+        }
+        emitted_ranges.push((start, end));
+        edits.push(TextEdit {
+            byte_start: start,
+            byte_end: end,
+            replacement,
+        });
     }
+
+    // ---------------- Render LHS-write sites -------------------------------
+    //
+    // For each site, apply its accumulated RHS sub-edits to the original
+    // RHS source text (last-to-first so byte indices stay valid), then
+    // wrap the result in `delegate.setX(...)` (or compound form for `+=`,
+    // etc.). Emit one edit covering the full assignment_expression range.
+    for (site_idx, site) in lhs_write_sites.iter().enumerate() {
+        let mut sub = rhs_sub_edits[site_idx].clone();
+        sub.sort_by_key(|e| e.byte_start);
+        // Reject sub-edits that overlap each other (defensive — shouldn't
+        // happen, but be safe).
+        let mut prev_end: Option<usize> = None;
+        let mut clean_sub: Vec<TextEdit> = Vec::new();
+        for e in sub {
+            if let Some(pe) = prev_end {
+                if e.byte_start < pe {
+                    continue;
+                }
+            }
+            prev_end = Some(e.byte_end);
+            clean_sub.push(e);
+        }
+        let mut rhs_text =
+            parsed.source[site.rhs.start_byte()..site.rhs.end_byte()].to_string();
+        let rhs_base = site.rhs.start_byte();
+        for e in clean_sub.iter().rev() {
+            let local_start = e.byte_start - rhs_base;
+            let local_end = e.byte_end - rhs_base;
+            rhs_text.replace_range(local_start..local_end, &e.replacement);
+        }
+        let setter = &site.setter;
+        let getter_call = &site.getter_call;
+        let replacement = match site.op_text.as_deref() {
+            Some("=") | None => {
+                format!("{delegate_field}.{setter}({rhs_text})")
+            }
+            Some(compound) => {
+                let bin_op = compound.trim_end_matches('=');
+                format!("{delegate_field}.{setter}({getter_call} {bin_op} {rhs_text})")
+            }
+        };
+        edits.push(TextEdit {
+            byte_start: site.assign.start_byte(),
+            byte_end: site.assign.end_byte(),
+            replacement,
+        });
+    }
+
     edits.sort_by_key(|e| e.byte_start);
     edits
 }
@@ -6035,6 +6373,197 @@ mod tests {
             .contains("import com.example.model.FooThing;"));
     }
 
+    // Gap 28: drop explicit single-type imports already covered by a
+    // wildcard from the same package. Wildcard provides them, so listing
+    // them again is redundant.
+    #[test]
+    fn java_organize_imports_drops_explicit_covered_by_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin_dir = dir.path().join("src/main/java/com/x/admin");
+        let ui_dir = dir.path().join("src/main/java/com/x/ui");
+        fs::create_dir_all(&admin_dir).unwrap();
+        fs::create_dir_all(&ui_dir).unwrap();
+        fs::write(
+            admin_dir.join("MeterAdmin.java"),
+            "package com.x.admin;\npublic class MeterAdmin {}\n",
+        )
+        .unwrap();
+        let source = ui_dir.join("View.java");
+        fs::write(
+            &source,
+            "package com.x.ui;\n\
+             import com.x.admin.*;\n\
+             import com.x.admin.MeterAdmin;\n\
+             public class View {\n\
+            \x20   private MeterAdmin admin;\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("java_lsp_organize_imports", &source);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan_text =
+            plan_java_lsp_organize_imports(&params, &PlanContext::default()).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        let replacement = &plan.edits[0].edits[0].replacement;
+        assert!(
+            replacement.contains("import com.x.admin.*;"),
+            "wildcard kept: {replacement}"
+        );
+        assert!(
+            !replacement.contains("import com.x.admin.MeterAdmin;"),
+            "explicit covered by wildcard must be dropped: {replacement}"
+        );
+    }
+
+    // Gap 28: source has only an explicit import (no wildcard) — explicit
+    // is preserved.
+    #[test]
+    fn java_organize_imports_keeps_explicit_when_no_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin_dir = dir.path().join("src/main/java/com/x/admin");
+        let ui_dir = dir.path().join("src/main/java/com/x/ui");
+        fs::create_dir_all(&admin_dir).unwrap();
+        fs::create_dir_all(&ui_dir).unwrap();
+        fs::write(
+            admin_dir.join("MeterAdmin.java"),
+            "package com.x.admin;\npublic class MeterAdmin {}\n",
+        )
+        .unwrap();
+        let source = ui_dir.join("View.java");
+        fs::write(
+            &source,
+            "package com.x.ui;\n\
+             import com.x.admin.MeterAdmin;\n\
+             public class View {\n\
+            \x20   private MeterAdmin admin;\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("java_lsp_organize_imports", &source);
+        params.project_dir = Some(path_string(dir.path()));
+        // When there's nothing to change the planner returns no edits;
+        // accept either no plan-edits OR a plan that preserves the import.
+        let plan_text =
+            plan_java_lsp_organize_imports(&params, &PlanContext::default()).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        if let Some(file_edit) = plan.edits.first() {
+            if let Some(edit) = file_edit.edits.first() {
+                assert!(
+                    edit.replacement.contains("import com.x.admin.MeterAdmin;"),
+                    "explicit without wildcard must survive: {}",
+                    edit.replacement
+                );
+            }
+        }
+        // If no edit was emitted at all, that means the heuristic decided
+        // the existing import block is fine — which already preserves the
+        // explicit import.
+    }
+
+    // Gap 28: two unrelated wildcards plus a standalone explicit from a
+    // third (uncovered) package — all three preserved.
+    #[test]
+    fn java_organize_imports_keeps_explicit_from_uncovered_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin_dir = dir.path().join("src/main/java/com/x/admin");
+        let dto_dir = dir.path().join("src/main/java/com/x/dto");
+        let other_dir = dir.path().join("src/main/java/com/y/other");
+        let ui_dir = dir.path().join("src/main/java/com/x/ui");
+        fs::create_dir_all(&admin_dir).unwrap();
+        fs::create_dir_all(&dto_dir).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::create_dir_all(&ui_dir).unwrap();
+        fs::write(
+            admin_dir.join("MeterAdmin.java"),
+            "package com.x.admin;\npublic class MeterAdmin {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dto_dir.join("MeterDto.java"),
+            "package com.x.dto;\npublic class MeterDto {}\n",
+        )
+        .unwrap();
+        fs::write(
+            other_dir.join("Standalone.java"),
+            "package com.y.other;\npublic class Standalone {}\n",
+        )
+        .unwrap();
+        let source = ui_dir.join("View.java");
+        fs::write(
+            &source,
+            "package com.x.ui;\n\
+             import com.x.admin.*;\n\
+             import com.x.dto.*;\n\
+             import com.y.other.Standalone;\n\
+             public class View {\n\
+            \x20   private MeterAdmin admin;\n\
+            \x20   private MeterDto dto;\n\
+            \x20   private Standalone s;\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("java_lsp_organize_imports", &source);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan_text =
+            plan_java_lsp_organize_imports(&params, &PlanContext::default()).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        if let Some(file_edit) = plan.edits.first() {
+            if let Some(edit) = file_edit.edits.first() {
+                let r = &edit.replacement;
+                assert!(r.contains("import com.x.admin.*;"), "wildcard 1: {r}");
+                assert!(r.contains("import com.x.dto.*;"), "wildcard 2: {r}");
+                assert!(
+                    r.contains("import com.y.other.Standalone;"),
+                    "uncovered explicit: {r}"
+                );
+            }
+        }
+    }
+
+    // Gap 28: `import static …` lines are NEVER dropped, even if a TYPE
+    // wildcard exists for the same package — static imports bring members,
+    // type wildcards do not cover them.
+    #[test]
+    fn java_organize_imports_keeps_static_imports_under_type_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin_dir = dir.path().join("src/main/java/com/x/admin");
+        let ui_dir = dir.path().join("src/main/java/com/x/ui");
+        fs::create_dir_all(&admin_dir).unwrap();
+        fs::create_dir_all(&ui_dir).unwrap();
+        // Static import lines refer to static members; the heuristic never
+        // touches them. Use a synthetic name; existing-import filter
+        // accepts `import static …` verbatim regardless of resolution.
+        let source = ui_dir.join("View.java");
+        fs::write(
+            &source,
+            "package com.x.ui;\n\
+             import com.x.admin.*;\n\
+             import static com.x.admin.MeterAdmin.SOME_CONST;\n\
+             public class View {\n\
+            \x20   void keep() {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("java_lsp_organize_imports", &source);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan_text =
+            plan_java_lsp_organize_imports(&params, &PlanContext::default()).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        if let Some(file_edit) = plan.edits.first() {
+            if let Some(edit) = file_edit.edits.first() {
+                let r = &edit.replacement;
+                assert!(
+                    r.contains("import static com.x.admin.MeterAdmin.SOME_CONST;"),
+                    "static import must never be dropped: {r}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn move_java_constant_moves_three_constants_to_new_target() {
         let dir = tempfile::tempdir().unwrap();
@@ -6573,6 +7102,158 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Gap 29: when a captured field is non-final on the source, promoting
+    // it to a `final` constructor param on the target is a silent
+    // semantic bug — the value is snapshotted at construction time. We
+    // surface the issue inline in the generated target with a FIXME above
+    // the field declaration so the operator sees it during review.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn extract_java_class_inserts_fixme_for_mutable_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Selection.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private boolean isPlantSelected;\n\
+            \x20   void render() { boolean v = isPlantSelected; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Selection".to_string());
+        params.delegate_field = Some("selection".to_string());
+        params.item_names = Some(vec!["render".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("// FIXME: mutable capture `isPlantSelected`"),
+            "expected mutable-capture FIXME on target: {target_text}"
+        );
+        assert!(
+            target_text.contains("Supplier<Boolean>"),
+            "FIXME should mention boxed Supplier hint for primitive: {target_text}"
+        );
+        // The FIXME must sit directly above the promoted final field.
+        let fixme_at = target_text
+            .find("// FIXME: mutable capture `isPlantSelected`")
+            .unwrap();
+        let field_at = target_text
+            .find("private final boolean isPlantSelected;")
+            .unwrap();
+        assert!(
+            fixme_at < field_at,
+            "FIXME must precede the field decl: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_omits_fixme_for_final_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Selection.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private final boolean isPlantSelected = true;\n\
+            \x20   void render() { boolean v = isPlantSelected; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Selection".to_string());
+        params.delegate_field = Some("selection".to_string());
+        params.item_names = Some(vec!["render".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            !target_text.contains("// FIXME: mutable capture"),
+            "final capture must not emit mutable-capture FIXME: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_omits_fixme_for_static_final_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Selection.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private static final String FOO = \"bar\";\n\
+            \x20   void render() { String v = FOO; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Selection".to_string());
+        params.delegate_field = Some("selection".to_string());
+        params.item_names = Some(vec!["render".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            !target_text.contains("// FIXME: mutable capture"),
+            "static-final capture routes through constants path, not constructor — no FIXME: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_omits_fixme_when_deep_analysis_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Selection.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private boolean isPlantSelected;\n\
+            \x20   void render() { boolean v = isPlantSelected; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Selection".to_string());
+        params.delegate_field = Some("selection".to_string());
+        params.item_names = Some(vec!["render".to_string()]);
+        // deep_analysis off — no FIXME emission gate.
+        params.deep_analysis = Some(false);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            !target_text.contains("// FIXME: mutable capture"),
+            "deep_analysis=false must skip FIXME emission: {target_text}"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Gap 24: extract_java_class widens extracted-method visibility on the
     // target to at least `package` (or `public` when target is in a
     // different package than the source).
@@ -7057,6 +7738,141 @@ mod tests {
         assert!(
             rewritten.contains("delegate.setCounter(delegate.getCounter() + 1)"),
             "expected ++ rewritten: {rewritten}"
+        );
+    }
+
+    // Gap 27: when the moved field appears on BOTH sides of an assignment
+    // (`field = field.transform()`), the LHS write must consume the whole
+    // assignment AND the RHS reads must still rewrite through the getter.
+    // Previously the read-rewrite pass fired first and the write-rewrite
+    // was silently dropped through the non-overlap guard.
+    #[test]
+    fn extract_java_class_rewrites_lhs_write_with_rhs_read_through_setter() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.List;\n\
+             import java.util.stream.Collectors;\n\
+             class View {\n\
+            \x20   private List<String> meterItems;\n\
+            \x20   void setup() { meterItems = new java.util.ArrayList<>(); }\n\
+            \x20   void replaceFirst(String replacement) {\n\
+            \x20       meterItems = meterItems.stream()\n\
+            \x20           .map(m -> replacement)\n\
+            \x20           .collect(Collectors.toList());\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["setup".to_string()]);
+        params.move_fields = Some(vec!["meterItems".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        // LHS write must be wrapped in a setter call; RHS reads must still
+        // route through the getter.
+        assert!(
+            rewritten.contains("delegate.setMeterItems(delegate.getMeterItems().stream()"),
+            "expected LHS write + RHS read rewrite combined: {rewritten}"
+        );
+        // No bare LHS `meterItems =` may remain.
+        assert!(
+            !rewritten.contains("meterItems = meterItems"),
+            "bare LHS field name must not survive: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("meterItems ="),
+            "bare LHS field name must not survive: {rewritten}"
+        );
+    }
+
+    // Gap 27: assignment where RHS does NOT reference the moved field — the
+    // single-edit write rewrite must still cover the whole assignment.
+    #[test]
+    fn extract_java_class_rewrites_lhs_write_with_independent_rhs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.List;\n\
+             class View {\n\
+            \x20   private List<String> meterItems;\n\
+            \x20   private List<String> otherField;\n\
+            \x20   void setup() { meterItems = new java.util.ArrayList<>(); }\n\
+            \x20   void copy() { meterItems = otherField; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["setup".to_string()]);
+        params.move_fields = Some(vec!["meterItems".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("delegate.setMeterItems(otherField)"),
+            "expected setter call wrapping RHS: {rewritten}"
+        );
+    }
+
+    // Gap 27: `this.field = expr` form — qualified LHS still triggers the
+    // write rewrite covering the whole `this.field = expr` span.
+    #[test]
+    fn extract_java_class_rewrites_this_qualified_lhs_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.List;\n\
+             class View {\n\
+            \x20   private List<String> meterItems;\n\
+            \x20   void setup() { meterItems = new java.util.ArrayList<>(); }\n\
+            \x20   void replace(List<String> incoming) { this.meterItems = incoming; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["setup".to_string()]);
+        params.move_fields = Some(vec!["meterItems".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("delegate.setMeterItems(incoming)"),
+            "expected this-qualified LHS rewritten: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("this.meterItems"),
+            "this.field LHS must not survive: {rewritten}"
         );
     }
 
