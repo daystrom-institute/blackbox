@@ -105,6 +105,20 @@ pub struct CapturedVariable {
     pub source_visibility: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct FieldAccessSite {
+    pub line: usize,
+    pub column: usize,
+    pub kind: String,
+    pub context: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct RemainingFieldAccessor {
+    pub field: String,
+    pub accesses: Vec<FieldAccessSite>,
+}
+
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
     /// Supported generic or language-scoped plan kind. Pull sm-refactor first.
@@ -309,6 +323,8 @@ pub struct RefactorPlan {
     pub leftovers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captured_variables: Vec<CapturedVariable>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remaining_source_accessors: Vec<RemainingFieldAccessor>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1228,6 +1244,7 @@ fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1296,6 +1313,7 @@ fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1328,6 +1346,7 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1374,6 +1393,7 @@ fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1733,7 +1753,7 @@ fn line_start_before(source: &str, idx: usize) -> usize {
         .unwrap_or(0)
 }
 
-fn line_col(source: &str, idx: usize) -> (usize, usize) {
+pub(super) fn line_col(source: &str, idx: usize) -> (usize, usize) {
     let idx = idx.min(source.len());
     let line = source[..idx].bytes().filter(|b| *b == b'\n').count() + 1;
     let col = idx - line_start_before(source, idx) + 1;
