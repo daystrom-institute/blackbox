@@ -80,6 +80,31 @@ by moved methods. Use that report to decide which fields to move, which fields
 to recreate on the target, and which dependencies should become constructor
 parameters.
 
+Capture resolution rules (Gap 19): `captured_variables` only contains
+identifiers that resolve to a direct `field_declaration` of the **outer
+source class**. Method parameters, local variables, enhanced-for variables,
+and inner-class fields are not captures — they either travel with the method
+or live in a separate scope. Bare-name reads inside the method body are
+shadowing-checked against enclosing locals/parameters; only `this.<name>`
+accesses bypass shadowing. This stops false captures like a method parameter
+named the same as an inner-class field from being promoted into a constructor
+parameter on the target.
+
+Each capture also carries two mutability indicators (Gap 21):
+- `source_mutable: true` when the source field is declared without `final`.
+  Promoting a mutable field to a `final` constructor parameter snapshots its
+  value at construction time and the target sees stale data after later
+  source-side writes — surface a warning to the operator.
+- `source_static_final: true` when the source field is `static final`. The
+  composite plan should treat these as constants (move with initializer
+  preserved via `move_java_constant`) rather than promoting them to instance
+  fields on the target.
+
+Both flags default to `false` when omitted from the JSON (serialization
+elides `false` via `skip_serializing_if`). Defaulting to `false` matches the
+common case of plain `private` instance fields and keeps the safer "treat as
+mutable" warning live whenever the modifier walk fails.
+
 Pass `deep_analysis: true` on the plan call to also receive `external_calls`
 and `inherited_dependencies`. The flag is opt-in because the inherited-method
 walk crosses files via the project type index; default `false` keeps the
