@@ -161,10 +161,35 @@ and constructor assignment, and source-local calls to moved methods are
 rewritten through that delegate. The response includes `captured_variables` so
 you can review the dependency boundary before applying.
 
+`captured_variables` entries carry `source_static_final` and `source_mutable`
+booleans alongside `name`, `kind`, `source_type`, and `source_visibility`.
+- `source_static_final: true` means the field is `private static final` (or
+  any other-visibility static-final). The composite plan moves these as
+  constants — declaration plus initializer is preserved on the target and
+  the source declaration is removed. They do **not** become constructor
+  parameters and the source-side delegate call does not pass them. (Gap 20)
+- `source_mutable: true` means the field is non-`final`. Promoting it to a
+  `final` constructor parameter snapshots the value at construction time —
+  flag it for review before applying. (Gap 21 — companion field; the
+  composite plan still promotes mutable captures to constructor params, but
+  the boolean lets the operator decide whether to refactor through a
+  `Supplier` / holder / shared reference instead.)
+
+The composite plan also widens visibility on extracted methods so the
+source-side delegate calls produced by `update_java_callers` compile. The
+floor is `package` for same-package extractions and `public` when the
+target ends up in a different package than the source. Methods already at
+or above the floor (e.g. `public`, or `protected` in same-package mode)
+are emitted unchanged. The package decision uses the explicit
+`target_prelude` first, then the existing target file's `package`, then
+the source's package as a fallback (mirroring `java_default_target_prelude`).
+An explicit `visibility` parameter on the plan acts as an additional floor
+— the planner widens further if you ask for `public`, but never narrows
+below the cross-package requirement. (Gap 24)
+
 This is structural, not semantic: it does not reason about overloads, static
-context, visibility across packages, inherited members, or framework injection.
-After applying it, run `java_lsp_organize_imports` and the project compile/test
-command.
+context, inherited members, or framework injection. After applying it, run
+`java_lsp_organize_imports` and the project compile/test command.
 
 5. Add fields to the extracted class:
 

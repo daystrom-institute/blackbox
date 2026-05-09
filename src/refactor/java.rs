@@ -1832,26 +1832,104 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     } else {
         Default::default()
     };
+
+    // Gap 20: split captures into static-final constants vs instance
+    // captures. Constants are moved declaration-and-initializer onto the
+    // target (mirroring move_java_constant semantics), instance captures
+    // become constructor parameters.
+    let static_final_capture_names: HashSet<&str> = captured_variables
+        .iter()
+        .filter(|capture| capture.source_static_final)
+        .filter(|capture| !moved_field_set.contains(capture.name.as_str()))
+        .map(|capture| capture.name.as_str())
+        .collect();
     let dependency_params = captured_variables
         .iter()
         .filter(|capture| !moved_field_set.contains(capture.name.as_str()))
+        .filter(|capture| !static_final_capture_names.contains(capture.name.as_str()))
         .map(|capture| JavaParameterSpec {
             type_name: capture.source_type.clone(),
             name: capture.name.clone(),
         })
         .collect::<Vec<_>>();
 
+    // Locate the source-side `field_declaration` node for each static-final
+    // capture so we can (a) render the original declaration verbatim onto
+    // the target and (b) emit a removal edit on the source.
+    let mut moved_constant_fields: Vec<JavaField> = Vec::new();
+    for name in static_final_capture_names.iter() {
+        let field = java_fields(&parsed)
+            .into_iter()
+            .find(|field| field.name == *name);
+        if let Some(field) = field {
+            moved_constant_fields.push(field);
+        }
+    }
+    moved_constant_fields.sort_by_key(|field| field.item.byte_start);
+
+    // Gap 24: decide the visibility floor for delegate-rewritten methods.
+    // Default floor is `package` (`update_java_callers` rewrites local calls
+    // through the delegate, which only requires package-visible access);
+    // if the target ends up in a different package than the source, the
+    // floor escalates to `public`.
+    let source_package = extract_java_package(&parsed.source);
+    let target_existing_package = if target_path.exists() {
+        fs::read_to_string(&target_path)
+            .ok()
+            .and_then(|content| extract_java_package(&content))
+    } else {
+        None
+    };
+    let target_package_from_prelude = p
+        .target_prelude
+        .as_deref()
+        .and_then(extract_java_package);
+    // Target package resolution mirrors java_default_target_prelude:
+    // 1. explicit target_prelude wins, 2. existing target file's package,
+    // 3. fallback to the source's package (the prelude inheritance path).
+    let target_package = target_package_from_prelude
+        .or(target_existing_package)
+        .or_else(|| source_package.clone());
+    let cross_package = match (source_package.as_deref(), target_package.as_deref()) {
+        (Some(src), Some(tgt)) => src != tgt,
+        _ => false,
+    };
+    let mut visibility_floor = if cross_package { "public" } else { "package" };
+    if let Some(requested) = p.visibility.as_deref() {
+        validate_java_visibility(requested)?;
+        if java_visibility_rank(requested) > java_visibility_rank(visibility_floor) {
+            visibility_floor = match requested {
+                "public" => "public",
+                "protected" => "protected",
+                "package" => "package",
+                "private" => "private",
+                _ => visibility_floor,
+            };
+        }
+    }
+
     selected_methods.sort_by_key(|method| method.item.byte_start);
     let method_text = selected_methods
         .iter()
         .map(|method| {
-            parsed.source[method.item.leading_trivia_start..method.item.byte_end]
-                .trim_matches('\n')
-                .to_string()
+            extract_method_text_with_visibility_floor(
+                &parsed,
+                method,
+                visibility_floor,
+            )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
     let moved_field_text = selected_fields
+        .iter()
+        .map(|field| {
+            parsed.source[field.item.leading_trivia_start..field.item.byte_end]
+                .trim_matches('\n')
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let moved_constants_text = moved_constant_fields
         .iter()
         .map(|field| {
             parsed.source[field.item.leading_trivia_start..field.item.byte_end]
@@ -1871,6 +1949,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         java_constructor_decl(&target_class_name, "public", &dependency_params, true, None)?
     };
     let target_body = [
+        moved_constants_text,
         dependency_field_text,
         moved_field_text,
         constructor_text,
@@ -1897,6 +1976,11 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .map(|method| (method.item.leading_trivia_start, method.item.byte_end))
         .chain(
             selected_fields
+                .iter()
+                .map(|field| (field.item.leading_trivia_start, field.item.byte_end)),
+        )
+        .chain(
+            moved_constant_fields
                 .iter()
                 .map(|field| (field.item.leading_trivia_start, field.item.byte_end)),
         )
@@ -3090,6 +3174,57 @@ fn java_caller_rewrite_edits(
     edits.sort_by_key(|edit| edit.byte_start);
     ensure_non_overlapping(&edits)?;
     Ok(edits)
+}
+
+/// Gap 24: Render an extracted method as text destined for the target file,
+/// widening its visibility modifier to at least `visibility_floor` so the
+/// source-side delegate calls produced by `update_java_callers` can reach
+/// it. Visibility ranks: private(0) < package(1) < protected(2) < public(3).
+/// A method already at or above the floor is emitted unchanged. The floor
+/// itself is `package` for same-package extractions and `public` when the
+/// target ends up in a different package than the source.
+fn extract_method_text_with_visibility_floor(
+    parsed: &ParsedSource,
+    method: &JavaMethod,
+    visibility_floor: &str,
+) -> String {
+    let original = parsed.source[method.item.leading_trivia_start..method.item.byte_end]
+        .trim_matches('\n')
+        .to_string();
+    let method_node = find_node(parsed.tree.root_node(), |node| {
+        (node.kind() == "method_declaration" || node.kind() == "constructor_declaration")
+            && node.start_byte() == method.item.byte_start
+            && node.end_byte() == method.item.byte_end
+    });
+    let Some(method_node) = method_node else {
+        return original;
+    };
+    let mods = collect_java_modifiers(method_node);
+    let current = java_visibility_from_mods(&mods);
+    if java_visibility_rank(current) >= java_visibility_rank(visibility_floor) {
+        return original;
+    }
+    let new_visibility = if visibility_floor == "package" {
+        None
+    } else {
+        Some(visibility_floor)
+    };
+    let edit = build_visibility_rewrite_edit(method_node, &mods, new_visibility, &parsed.source);
+    // Edits are in absolute source coordinates. Re-base into the
+    // leading_trivia_start..byte_end window we sliced for `original`.
+    let window_start = method.item.leading_trivia_start;
+    let window_end = method.item.byte_end;
+    if edit.byte_start < window_start || edit.byte_end > window_end {
+        return original;
+    }
+    let local_start = edit.byte_start - window_start;
+    let local_end = edit.byte_end - window_start;
+    let raw = &parsed.source[window_start..window_end];
+    let mut rewritten = String::with_capacity(raw.len() + edit.replacement.len());
+    rewritten.push_str(&raw[..local_start]);
+    rewritten.push_str(&edit.replacement);
+    rewritten.push_str(&raw[local_end..]);
+    rewritten.trim_matches('\n').to_string()
 }
 
 pub(crate) fn plan_add_java_delegate_field(p: &RefactorPlanParams) -> Result<String> {
@@ -5184,5 +5319,278 @@ mod tests {
         assert!(idx.top_level.get("Outer").is_some());
         // Top-level set must NOT include the inner names.
         assert!(idx.top_level.get("Inner").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Gap 20: extract_java_class moves static-final captures as constants
+    // (preserving `static final` and the initializer) rather than promoting
+    // them to instance fields + constructor parameters.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn extract_java_class_moves_static_final_capture_as_constant() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Composition.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Composition {\n    private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";\n    void render() { String s = SAMPLE_STATUS_OK; }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.delegate_field = Some("compositionMeterGrid".to_string());
+        params.item_names = Some(vec!["render".to_string()]);
+
+        let plan_text = plan_extract_java_class(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+
+        // Captured variable carries source_static_final = true.
+        let captured = plan
+            .captured_variables
+            .iter()
+            .find(|c| c.name == "SAMPLE_STATUS_OK")
+            .expect("SAMPLE_STATUS_OK should be in captured_variables");
+        assert!(captured.source_static_final);
+
+        // Target body contains the constant declaration with `static final`
+        // and the original initializer literal.
+        let target_replacement = &plan.edits[1].edits[0].replacement;
+        assert!(
+            target_replacement
+                .contains("private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";"),
+            "target should keep static final + initializer: {target_replacement}"
+        );
+
+        // No constructor parameter for the constant. The body should not
+        // contain a `private final String SAMPLE_STATUS_OK;` instance field
+        // line, and there should be no constructor at all (no other
+        // captures).
+        assert!(
+            !target_replacement.contains("private final String SAMPLE_STATUS_OK;"),
+            "target must not promote constant to instance field: {target_replacement}"
+        );
+        assert!(
+            !target_replacement.contains("public CompositionMeterGrid("),
+            "target must not synthesize a constructor for static-final captures: {target_replacement}"
+        );
+
+        // Source side: SAMPLE_STATUS_OK declaration is removed, and the
+        // delegate constructor call does NOT pass SAMPLE_STATUS_OK.
+        let original = fs::read_to_string(&source).unwrap();
+        let mut bytes = original.into_bytes();
+        let mut sorted = plan.edits[0].edits.clone();
+        sorted.sort_by_key(|e| e.byte_start);
+        for edit in sorted.iter().rev() {
+            bytes.splice(edit.byte_start..edit.byte_end, edit.replacement.bytes());
+        }
+        let rewritten = String::from_utf8(bytes).unwrap();
+        assert!(
+            !rewritten.contains("private static final String SAMPLE_STATUS_OK"),
+            "source should no longer declare the constant: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("new CompositionMeterGrid(SAMPLE_STATUS_OK"),
+            "source delegate call must not pass the constant: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_separates_static_final_from_instance_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Mixed.java");
+        let target = dir.path().join("MixedExtract.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Mixed {\n    private static final String LABEL = \"ok\";\n    private final Helper helper;\n    Mixed(Helper helper) { this.helper = helper; }\n    void render() { helper.use(LABEL); }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MixedExtract".to_string());
+        params.delegate_field = Some("mixedExtract".to_string());
+        params.item_names = Some(vec!["render".to_string()]);
+
+        let plan_text = plan_extract_java_class(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        let target_replacement = &plan.edits[1].edits[0].replacement;
+
+        // Constant: emitted as static final with initializer.
+        assert!(
+            target_replacement
+                .contains("private static final String LABEL = \"ok\";"),
+            "target should keep LABEL as static final constant: {target_replacement}"
+        );
+        assert!(
+            !target_replacement.contains("private final String LABEL;"),
+            "target must not promote LABEL to instance field: {target_replacement}"
+        );
+
+        // Instance capture `helper` becomes a constructor parameter and
+        // assigned-to instance field on the target.
+        assert!(
+            target_replacement.contains("private final Helper helper;"),
+            "target should hold helper as instance field: {target_replacement}"
+        );
+        assert!(
+            target_replacement.contains("public MixedExtract(Helper helper)"),
+            "target constructor should take Helper helper: {target_replacement}"
+        );
+        assert!(
+            !target_replacement.contains("MixedExtract(String LABEL"),
+            "target constructor must not include LABEL: {target_replacement}"
+        );
+
+        // Source-side constructor call passes only `helper`, not LABEL.
+        let original = fs::read_to_string(&source).unwrap();
+        let mut bytes = original.into_bytes();
+        let mut sorted = plan.edits[0].edits.clone();
+        sorted.sort_by_key(|e| e.byte_start);
+        for edit in sorted.iter().rev() {
+            bytes.splice(edit.byte_start..edit.byte_end, edit.replacement.bytes());
+        }
+        let rewritten = String::from_utf8(bytes).unwrap();
+        assert!(
+            rewritten.contains("new MixedExtract(helper)"),
+            "source delegate call should pass only helper: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("LABEL"),
+            "source should no longer reference LABEL: {rewritten}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Gap 24: extract_java_class widens extracted-method visibility on the
+    // target to at least `package` (or `public` when target is in a
+    // different package than the source).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn extract_java_class_widens_private_method_to_package_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Same.java");
+        let target = dir.path().join("SameExtract.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Same {\n    private Grid createMeterGrid() { return new Grid(); }\n    void wire() { Grid g = createMeterGrid(); }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("SameExtract".to_string());
+        params.delegate_field = Some("sameExtract".to_string());
+        params.item_names = Some(vec!["createMeterGrid".to_string()]);
+
+        let plan_text = plan_extract_java_class(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        let target_replacement = &plan.edits[1].edits[0].replacement;
+
+        // The extracted method's `private` modifier is dropped (default
+        // package visibility) so the source-side delegate call compiles.
+        assert!(
+            target_replacement.contains("Grid createMeterGrid()"),
+            "method should still be present on target: {target_replacement}"
+        );
+        assert!(
+            !target_replacement.contains("private Grid createMeterGrid()"),
+            "private modifier should be widened to package: {target_replacement}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_widens_private_method_to_public_cross_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("a");
+        let target_dir = dir.path().join("b");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        let source = source_dir.join("Cross.java");
+        let target = target_dir.join("CrossExtract.java");
+        fs::write(
+            &source,
+            "package com.a;\n\nclass Cross {\n    private Grid createGrid() { return new Grid(); }\n    void wire() { Grid g = createGrid(); }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CrossExtract".to_string());
+        params.delegate_field = Some("crossExtract".to_string());
+        params.item_names = Some(vec!["createGrid".to_string()]);
+        params.target_prelude = Some("package com.b;\n".to_string());
+
+        let plan_text = plan_extract_java_class(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        let target_replacement = &plan.edits[1].edits[0].replacement;
+
+        assert!(
+            target_replacement.contains("public Grid createGrid()"),
+            "cross-package extraction should widen private to public: {target_replacement}"
+        );
+        assert!(
+            !target_replacement.contains("private Grid createGrid()"),
+            "private modifier must not survive cross-package extraction: {target_replacement}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_leaves_already_public_method_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Pub.java");
+        let target = dir.path().join("PubExtract.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Pub {\n    public Grid createGrid() { return new Grid(); }\n    void wire() { Grid g = createGrid(); }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("PubExtract".to_string());
+        params.delegate_field = Some("pubExtract".to_string());
+        params.item_names = Some(vec!["createGrid".to_string()]);
+
+        let plan_text = plan_extract_java_class(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        let target_replacement = &plan.edits[1].edits[0].replacement;
+
+        assert!(
+            target_replacement.contains("public Grid createGrid()"),
+            "public method should be preserved verbatim: {target_replacement}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_keeps_protected_in_same_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Prot.java");
+        let target = dir.path().join("ProtExtract.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Prot {\n    protected Grid createGrid() { return new Grid(); }\n    void wire() { Grid g = createGrid(); }\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("ProtExtract".to_string());
+        params.delegate_field = Some("protExtract".to_string());
+        params.item_names = Some(vec!["createGrid".to_string()]);
+
+        let plan_text = plan_extract_java_class(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        let target_replacement = &plan.edits[1].edits[0].replacement;
+
+        // protected (rank 2) is already above the package floor (1) — must
+        // not be narrowed.
+        assert!(
+            target_replacement.contains("protected Grid createGrid()"),
+            "protected should be preserved in same-package extraction: {target_replacement}"
+        );
     }
 }
