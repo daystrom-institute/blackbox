@@ -4,13 +4,13 @@ Use this memory before operating on Java files with blackbox refactor tools.
 
 ## Current Capability
 
-Java is an inspect-first backend today.
+Java is an inspect-and-extract backend, with JDTLS integration for import organization.
 
 - Inspect: supported with `bbox_refactor_status`.
-- Plan/apply: no Java-specific mutation plan is currently supported.
-- Semantic rename: not supported by blackbox yet; use JDT, IntelliJ, Eclipse,
+- Plan/apply: supports method and nested class extraction, plus JDTLS-backed import organization.
+- Semantic rename: not supported natively by blackbox yet; use JDT, IntelliJ, Eclipse,
   or another Java language-server/refactoring workflow.
-- Import/package repair: not automatic; use the project build tool and IDE/LSP.
+- Import/package repair: automatic via JDTLS (`java_lsp_organize_imports`).
 
 Tree-sitter language: `java`.
 
@@ -30,19 +30,43 @@ names where tree-sitter exposes them, byte ranges, and line ranges. Use this to
 map packages, imports, classes, interfaces, enums, records, and candidate move
 ranges.
 
-2. Search and inspect neighbors:
+2. Extract methods or nested classes:
 
+To extract one or more methods into a target file:
 ```text
-bbox_hybrid_search(
-  query="class or method name",
-  project="/absolute/project/root",
-  doc_type="project_file",
-  vector_weight=0.0
+bbox_refactor_plan(
+  kind="extract_java_methods",
+  source="src/main/java/com/example/GodClass.java",
+  target="src/main/java/com/example/ExtractedMethods.java",
+  item_names=["myMethod1", "myMethod2"],
+  project_dir="/absolute/project/root"
 )
 ```
 
-3. Make edits with the normal code editing path, then validate with project
-commands. Common commands:
+To extract nested classes:
+```text
+bbox_refactor_plan(
+  kind="extract_java_nested_classes",
+  source="src/main/java/com/example/GodClass.java",
+  target="src/main/java/com/example/ExtractedClass.java",
+  item_names=["NestedDto"],
+  project_dir="/absolute/project/root"
+)
+```
+
+3. Organize imports via JDTLS:
+
+After extraction, you can organize imports in the source or target file using the JDTLS-backed planner:
+```text
+bbox_refactor_plan(
+  kind="java_lsp_organize_imports",
+  source="src/main/java/com/example/Thing.java",
+  project_dir="/absolute/project/root"
+)
+```
+Then use `bbox_refactor_apply` as usual.
+
+4. Validate with project commands:
 
 ```text
 mvn test
@@ -58,6 +82,5 @@ Use the wrapper and targets actually present in the repository.
 - Do not apply Rust plan kinds to Java files.
 - Tree-sitter does not enforce package/path consistency, generic type binding,
   annotation processing, Lombok/generated code, or classpath semantics.
-- For rename, move type, extract interface, or package changes, use JDT/IDE
-  tooling or compiler-verified manual edits.
-
+- `jdtls` execution requires `jdtls` to be installed and available in the system path. It runs locally and may take a few seconds to boot per organization command.
+- For rename, move type, extract interface, or package changes beyond simple extraction and import management, use JDT/IDE tooling or compiler-verified manual edits.
