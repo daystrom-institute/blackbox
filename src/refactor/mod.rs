@@ -113,6 +113,18 @@ pub struct CapturedVariable {
     pub kind: String,
     pub source_type: String,
     pub source_visibility: String,
+    /// `true` if the source-class field is `static final` (a constant). These
+    /// captures should be moved as constants (declaration + initializer)
+    /// rather than promoted to instance fields on the target.
+    #[serde(default)]
+    pub source_static_final: bool,
+    /// `true` if the source-class field is mutable (no `final` modifier).
+    /// Promoting a mutable field to a `final` constructor parameter
+    /// snapshots its value at construction time and produces a silent
+    /// semantic bug; surface this so the operator can pick a different
+    /// strategy.
+    #[serde(default)]
+    pub source_mutable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
