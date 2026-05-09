@@ -187,9 +187,33 @@ An explicit `visibility` parameter on the plan acts as an additional floor
 — the planner widens further if you ask for `public`, but never narrows
 below the cross-package requirement. (Gap 24)
 
+Pass `deep_analysis: true` to also receive:
+
+- `external_calls` and `inherited_dependencies` (same shape as in step 3
+  above), plus
+- `remaining_source_accessors` — populated identically to
+  `move_java_field`'s `deep_analysis` output (gap 26). When `move_fields` is
+  non-empty AND `deep_analysis: true`, the plan response lists every read or
+  write of each moved field that still lives in the source class after the
+  declaration is removed. Empty `accesses` for a field means the move is
+  clean; non-empty `accesses` flag the lines that will fail to compile after
+  apply. The shape is documented under `move_java_field` in step 7 below;
+  the contract is the same.
+
+The composite plan also runs the tree-sitter `organize_imports` heuristic
+on the generated target file in-process before returning (gap 25). The
+target's import block ends up containing only imports whose simple name is
+referenced as a `type_identifier` in the extracted method bodies; project-
+local types referenced by simple name get a fresh import added when the
+type index can resolve them uniquely. `import static …` and wildcard
+imports are kept verbatim. This means the operator no longer needs a
+follow-up `java_lsp_organize_imports` call solely to prune Vaadin-`@Route`
+or CSV-writer-style noise — though running JDTLS-backed `organize_imports`
+afterward is still a good idea for full semantic verification.
+
 This is structural, not semantic: it does not reason about overloads, static
 context, inherited members, or framework injection. After applying it, run
-`java_lsp_organize_imports` and the project compile/test command.
+the project compile/test command.
 
 5. Add fields to the extracted class:
 

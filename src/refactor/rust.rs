@@ -1945,9 +1945,13 @@ pub(crate) fn rust_analyzer_rename(
 ) -> Result<Vec<FileEdit>> {
     let source_uri = Url::from_file_path(source_path)
         .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
+    let source_text = fs::read_to_string(source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
     let rename_params = RenameParams {
         text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri: source_uri },
+            text_document: TextDocumentIdentifier {
+                uri: source_uri.clone(),
+            },
             position,
         },
         new_name: new_name.to_string(),
@@ -1955,6 +1959,16 @@ pub(crate) fn rust_analyzer_rename(
     };
 
     let response = manager.with_session(project_dir, Language::Rust, |mut client| {
+        client.send_notification::<lsp_types::notification::DidOpenTextDocument>(
+            &lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: source_uri.clone(),
+                    language_id: "rust".to_string(),
+                    version: 0,
+                    text: source_text.clone(),
+                },
+            },
+        )?;
         let id = client.send_request::<Rename>(&rename_params)?;
         client.read_response::<Rename>(id)
     })?;
@@ -1998,7 +2012,19 @@ pub(crate) fn rust_analyzer_organize_imports(
         partial_result_params: Default::default(),
     };
 
+    let did_open_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
     let response = manager.with_session(project_dir, Language::Rust, |mut client| {
+        client.send_notification::<lsp_types::notification::DidOpenTextDocument>(
+            &lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: did_open_uri.clone(),
+                    language_id: "rust".to_string(),
+                    version: 0,
+                    text: source.clone(),
+                },
+            },
+        )?;
         let id = client.send_request::<CodeActionRequest>(&code_action_params)?;
         client.read_response::<CodeActionRequest>(id)
     })?;
