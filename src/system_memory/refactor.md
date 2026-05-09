@@ -69,7 +69,7 @@ Writable structural plans are narrower:
 - TypeScript / JavaScript: inspect-only today. Use `sm-refactor-typescript`.
 - C#: inspect-only today. Use `sm-refactor-csharp`.
 - Python: inspect-only today. Use `sm-refactor-python`.
-- Java: supports extract methods/classes and JDTLS import organize. Use `sm-refactor-java`.
+- Java: supports extract methods/classes, extract interface, add implements, visibility rewriting, type-use migration, and JDTLS import organize. Use `sm-refactor-java`.
 - Go: inspect-only today. Use `sm-refactor-go`.
 - C / C++: inspect-only today. Use `sm-refactor-c-cpp`.
 - Other supported tree-sitter languages: inspect-only today unless a newer

@@ -87,7 +87,7 @@ pub(crate) struct ToolSurfaceDecision {
   7. Convert allow/disallow into `McpFilters` via `normalize_filter_pattern`.
 
 - Add `load_latest_by_domain(domain, project: Option<&str>) -> Result<Option<Packet>>`
-  on `Packets`:
+  on `Packets` in `src/packets/mod.rs`:
   1. Iterate newest-first.
   2. If `project` present: first match where `domain` matches AND `scope == "project"` AND `project` matches. Else fall back to newest global packet with same domain.
   3. If no project passed: use global only.
@@ -153,7 +153,7 @@ without needing live MCP sessions.
 
 **Scope:**
 
-- Add `surface: OnceLock<Arc<str>>` to `BlackboxServer` (set during `initialize`):
+- Add `surface: OnceLock<Arc<str>>` to `BlackboxServer` in `src/server/state.rs` (set during `initialize`):
   ```rust
   pub(crate) struct BlackboxServer {
       pub(crate) state: Arc<SharedState>,
@@ -282,7 +282,7 @@ bros inherit the correct tool boundary. Provider configs gain surface aliases.
 
 **Scope:**
 
-- Extend `resolve_dispatch_filters` to accept `surface: Option<&str>`:
+- Extend `resolve_dispatch_filters` in `src/server/progress.rs` to accept `surface: Option<&str>`:
   - When present, evaluate the surface packet and merge the resulting
     `McpFilters` into the effective filter set.
   - **Allow-intersection fix:** `McpFilters::merge_from` currently appends

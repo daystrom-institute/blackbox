@@ -515,12 +515,15 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "extract_java_nested_classes" => plan_extract_java_nested_classes(p),
         "rewrite_java_visibility" => plan_rewrite_java_visibility(p),
         "java_lsp_organize_imports" => plan_java_lsp_organize_imports(p),
+        "add_java_implements" => plan_add_java_implements(p),
+        "extract_java_interface" => plan_extract_java_interface(p),
+        "migrate_java_type_usages" => plan_migrate_java_type_usages(p),
         "move_file" => plan_move_file(p),
         "replace_text" => plan_replace_text(p),
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_nested_classes, rewrite_java_visibility, java_lsp_organize_imports, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_nested_classes, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
