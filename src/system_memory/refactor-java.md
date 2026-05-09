@@ -181,11 +181,24 @@ Marker formats (stable, greppable):
     public class CompositionMeterGrid implements HasLogger { ... }
     ```
 
+- Mutable capture (Gap 29):
+  ```java
+  // FIXME: mutable capture `isPlantSelected` (source field is non-final). Promoted to `final` constructor param — value snapshotted at construction.
+  //   resolutions: use Supplier<Boolean>, shared holder, or keep on source and access via reference.
+  private final boolean isPlantSelected;
+  ```
+  Inserted directly above each generated `private final <Type> <name>;`
+  field on the target whose corresponding capture has `source_mutable: true`
+  AND `source_static_final: false`. Static-final captures route through the
+  Gap 20 constants path and never become constructor params, so they don't
+  receive this FIXME. Primitive types in the resolution hint are boxed for
+  `Supplier<…>` (e.g. `boolean` → `Supplier<Boolean>`).
+
 FIXME markers are only inserted when `deep_analysis: true`. With the flag off
 the report is empty and the target file is generated bare. The marker format
 is intentionally stable so downstream tooling and reviewers can pattern-match
-on `// FIXME: external call \``, `// FIXME: inherited call \``, and
-`// FIXME: target now implements`.
+on `// FIXME: external call \``, `// FIXME: inherited call \``,
+`// FIXME: target now implements`, and `// FIXME: mutable capture \``.
 
 4. Extract a cohesive Java class in one plan:
 
@@ -221,7 +234,10 @@ booleans alongside `name`, `kind`, `source_type`, and `source_visibility`.
   flag it for review before applying. (Gap 21 — companion field; the
   composite plan still promotes mutable captures to constructor params, but
   the boolean lets the operator decide whether to refactor through a
-  `Supplier` / holder / shared reference instead.)
+  `Supplier` / holder / shared reference instead.) When `deep_analysis: true`,
+  the planner ALSO scaffolds a `// FIXME: mutable capture …` comment block
+  directly above the promoted field on the target file, so the warning is
+  visible in the generated source rather than buried in JSON (Gap 29).
 
 The composite plan also widens visibility on extracted methods so the
 source-side delegate calls produced by `update_java_callers` compile. The
@@ -268,8 +284,20 @@ Rewrite shape:
 | `this.`-qualified read         | `this.meterGrid`        | `delegate.getMeterGrid()`                        |
 | Method-on-field receiver       | `meterGrid.refresh()`   | `delegate.getMeterGrid().refresh()`              |
 | Direct write                   | `items = list`          | `delegate.setItems(list)`                        |
+| LHS-write whose RHS reads field| `items = items.stream()…`| `delegate.setItems(delegate.getItems().stream()…)`|
 | Compound write (`+=`, `<<=`…)  | `counter += 5`          | `delegate.setCounter(delegate.getCounter() + 5)` |
 | Increment / decrement          | `counter++`             | `delegate.setCounter(delegate.getCounter() + 1)` |
+
+**LHS-write rewrite (Gap 27).** When a moved field appears on both sides of
+an assignment (`field = field.transform()`), the planner emits a SINGLE
+edit that spans the whole `assignment_expression` and replaces it with
+`delegate.setField(<read-rewritten rhs>)`. The RHS reads are still rewritten
+through the getter — they live INSIDE the setter argument. Implementation
+detail: a two-pass walk over the AST first identifies LHS-write sites, then
+collects RHS sub-edits per site and folds them into the combined write
+rewrite at the end. This is non-overlapping with respect to the global edit
+list: bucket-(a) reads inside an LHS-write's RHS are never emitted as
+standalone edits — they only exist inside the rendered setter call.
 
 Generated accessors honour the same package/public visibility floor used
 for moved methods (`package` same-package, `public` cross-package).
@@ -294,6 +322,14 @@ imports are kept verbatim. This means the operator no longer needs a
 follow-up `java_lsp_organize_imports` call solely to prune Vaadin-`@Route`
 or CSV-writer-style noise — though running JDTLS-backed `organize_imports`
 afterward is still a good idea for full semantic verification.
+
+**Wildcard coverage (Gap 28).** The same heuristic also drops explicit
+single-type imports already covered by a wildcard from the same package.
+Rule: after computing the final import set, group existing wildcard
+imports (`import x.y.z.*;`) by package, then drop any explicit
+`import x.y.z.SomeType;` whose package is `x.y.z`. `import static …` is
+NEVER dropped — type wildcards do not cover static members. Explicit
+imports from packages without a matching wildcard are also preserved.
 
 This is structural, not semantic: it does not reason about overloads, static
 context, inherited members, or framework injection. After applying it, run
