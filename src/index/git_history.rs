@@ -301,6 +301,7 @@ mod tests {
             canonical_path: "/tmp/repo".into(),
             registered_at: "2026-05-05T17:30:00Z".into(),
             is_git_repo: true,
+            languages: Default::default(),
         }
     }
 
@@ -394,6 +395,7 @@ mod tests {
             canonical_path: repo.path().to_string_lossy().to_string(),
             registered_at: "2026-05-05T17:30:00Z".into(),
             is_git_repo: true,
+            languages: Default::default(),
         };
         let mut meta: HashMap<String, FileMeta> = HashMap::new();
         let edges_dir = state.path().join("edges");
