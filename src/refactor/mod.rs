@@ -19,7 +19,17 @@ use java::*;
 use crate::chunker;
 use crate::chunker::code::{language_for_path, parser_for_language};
 use crate::entity_ref;
+use crate::lsp::LspSessionManager;
 use crate::projects::ProjectRecord;
+
+/// Cross-cutting context threaded through `plan` so language-scoped
+/// plan kinds can reach long-lived services (currently the LSP
+/// session pool). Optional fields keep the entry points usable from
+/// tests and one-off CLIs that don't bring up the daemon.
+#[derive(Default, Clone)]
+pub struct PlanContext {
+    pub lsp: Option<LspSessionManager>,
+}
 
 const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
     "BBOX_PORT",
@@ -610,6 +620,10 @@ pub fn project_refs(p: &RefactorProjectRefsParams) -> Result<String> {
 }
 
 pub fn plan(p: &RefactorPlanParams) -> Result<String> {
+    plan_with_ctx(p, &PlanContext::default())
+}
+
+pub fn plan_with_ctx(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
     match p.kind.as_str() {
         "extract_rust_items" => plan_extract_rust_items(p),
         "extract_rust_impl_methods" => plan_extract_rust_impl_methods(p),
@@ -633,7 +647,7 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "update_java_callers" => plan_update_java_callers(p),
         "add_java_delegate_field" => plan_add_java_delegate_field(p),
         "rewrite_java_visibility" => plan_rewrite_java_visibility(p),
-        "java_lsp_organize_imports" => plan_java_lsp_organize_imports(p),
+        "java_lsp_organize_imports" => plan_java_lsp_organize_imports(p, ctx),
         "add_java_implements" => plan_add_java_implements(p),
         "extract_java_interface" => plan_extract_java_interface(p),
         "migrate_java_type_usages" => plan_migrate_java_type_usages(p),
@@ -829,6 +843,14 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
 }
 
 pub fn run(p: &RefactorRunParams, projects: &[ProjectRecord]) -> Result<String> {
+    run_with_ctx(p, projects, &PlanContext::default())
+}
+
+pub fn run_with_ctx(
+    p: &RefactorRunParams,
+    projects: &[ProjectRecord],
+    ctx: &PlanContext,
+) -> Result<String> {
     let project_dir = resolve_path(None, &p.project_dir)?;
     if !project_dir.is_dir() {
         bail!(
@@ -849,7 +871,7 @@ pub fn run(p: &RefactorRunParams, projects: &[ProjectRecord]) -> Result<String> 
                 if step_params.project_dir.is_none() {
                     step_params.project_dir = Some(path_string(&project_dir));
                 }
-                let plan_text = match plan(&step_params) {
+                let plan_text = match plan_with_ctx(&step_params, ctx) {
                     Ok(plan_text) => plan_text,
                     Err(err) => {
                         let rollback_errors = restore_snapshots(&snapshots);

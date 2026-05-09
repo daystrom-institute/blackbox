@@ -11,9 +11,11 @@ rewriting, type migration, and import organization.
 - Inspect: supported with `bbox_refactor_status`.
 - Plan/apply: method extraction, composite class extraction, nested class extraction, field moves/adds, constructor creation, delegate-field wiring, caller delegation, interface extraction, visibility rewriting, implements clause injection, type-use migration, and import organization.
 - Semantic rename: not supported natively by blackbox yet; use JDT, IntelliJ, Eclipse, or another Java language-server/refactoring workflow.
-- Import/package repair: `java_lsp_organize_imports` prefers JDTLS and falls
-  back to tree-sitter plus project type scanning when JDTLS is unavailable or
-  returns no edits.
+- Import/package repair: `java_lsp_organize_imports` prefers a warm
+  per-project JDTLS session (lazy-spawned, reused across calls, idle-evicted
+  by the daemon) and falls back to tree-sitter plus project type scanning
+  when JDTLS is unavailable or returns no edits. The fallback also keeps
+  inner-class references in qualified `Outer.Inner` form.
 
 Tree-sitter language: `java`.
 
@@ -346,15 +348,23 @@ bbox_refactor_plan(
 )
 ```
 
-The planner first asks JDTLS for workspace-aware organize-import edits through
-a bounded best-effort stdio session. JDTLS is a long-lived workspace server, so
-this one-shot lifecycle may time out or return no actions while a project is
-still importing/indexing. If JDTLS does not produce edits, the tool falls back
-to a structural project scan: removes plain imports whose simple names are no
+The planner asks JDTLS for workspace-aware organize-import edits through a
+shared per-project session pool. The first call for a `(project_dir, java)`
+pair lazily spawns JDTLS, awaits a real `initialize` response (no fixed
+sleep), and sends `initialized`; subsequent calls reuse the same long-lived
+child. Idle sessions are evicted on a 60s tick after `BLACKBOX_LSP_IDLE_SECS`
+(default 600) of inactivity, and the daemon shuts every session down on stop.
+Tunables: `BLACKBOX_JDTLS_INIT_TIMEOUT_SECS` (default 60) for the cold-start
+window, `BLACKBOX_JDTLS_TIMEOUT_SECS` (default 30) per request,
+`BLACKBOX_JDTLS_BIN` to point at a non-default binary. If JDTLS is absent, the
+session is broken, or the request returns no edits, the tool falls back to a
+structural project scan: removes plain imports whose simple names are no
 longer referenced, keeps static and wildcard imports, and adds imports for
 uniquely named Java source files in the same `project_dir` when their simple
-type name is referenced. The fallback is useful for local extraction handoffs,
-but it is not a full classpath resolver.
+type name is referenced. The fallback also detects inner-class-only simple
+names and skips synthesizing imports for them — references like
+`Outer.Inner` keep their qualified form rather than producing a non-resolving
+`import x.Inner;`. It is not a full classpath resolver.
 
 15. Compound run — full extract-interface flow with rollback:
 
@@ -385,8 +395,10 @@ gradle test
 - Do not apply Rust plan kinds to Java files.
 - Tree-sitter does not enforce package/path consistency, generic type binding, annotation processing, Lombok/generated code, or classpath semantics.
 - `java_lsp_organize_imports` is strongest with `jdtls` installed and available
-  in the system path, but the current implementation starts JDTLS per call and
-  bounds the wait. Without a ready JDTLS response, its fallback is source-tree
-  heuristic only.
+  in the system path. JDTLS is now run as a warm per-project session reused
+  across calls, so cold-start cost is paid once per `(project_dir, java)`
+  pair. Without a working JDTLS, the source-tree heuristic fallback is used —
+  it now also handles inner-class references (`Outer.Inner`) by leaving them
+  qualified rather than fabricating an import.
 - `migrate_java_type_usages` uses structural heuristics to distinguish type-use from constructor/call positions; always compile-verify after migration.
 - For rename, move type, or package changes beyond the supported plan kinds, use JDT/IDE tooling or compiler-verified manual edits.

@@ -679,6 +679,7 @@ mod tests {
             canonical_path: "/tmp/repo".into(),
             registered_at: "2026-05-05T17:30:00Z".into(),
             is_git_repo: true,
+            languages: Default::default(),
         };
         let chunk = crate::chunker::Chunk {
             project_id: "proj1234".into(),

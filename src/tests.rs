@@ -69,6 +69,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         slack_proposal_links: Arc::new(
             slack_proposal_links::SlackProposalLinks::open(&tmp.path().join("bro")).unwrap(),
         ),
+        lsp_sessions: lsp::LspSessionManager::new(),
     });
     BlackboxServer::new(state)
 }

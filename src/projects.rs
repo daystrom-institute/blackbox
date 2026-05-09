@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::entity_ref;
 use crate::util;
+
+/// Languages auto-detected on a project root. Used by polyglot-aware
+/// services (LSP session manager, refactor dispatch) to pick which
+/// per-language backend to lazily spawn for a given canonical project
+/// directory. Extensible — add a variant + detector to grow the set.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    Java,
+    Rust,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProjectRegisterParams {
@@ -38,6 +62,11 @@ pub struct ProjectRecord {
     pub canonical_path: String,
     pub registered_at: String,
     pub is_git_repo: bool,
+    /// Languages auto-detected at registration. Empty when the
+    /// directory predates the polyglot field — `ProjectRegistry::open`
+    /// re-detects empty entries on load and persists the result.
+    #[serde(default)]
+    pub languages: BTreeSet<Language>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -77,8 +106,27 @@ pub struct ProjectRegistry {
 impl ProjectRegistry {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let store = load_store(&path)?;
-        Ok(Self { path, store })
+        let mut store = load_store(&path)?;
+        let mut dirty = false;
+        for record in store.projects.iter_mut() {
+            if !record.languages.is_empty() {
+                continue;
+            }
+            let canonical = PathBuf::from(&record.canonical_path);
+            if !canonical.is_dir() {
+                continue;
+            }
+            let detected = detect_languages(&canonical);
+            if !detected.is_empty() {
+                record.languages = detected;
+                dirty = true;
+            }
+        }
+        let registry = Self { path, store };
+        if dirty {
+            registry.save()?;
+        }
+        Ok(registry)
     }
 
     pub fn register_path(&mut self, path: impl AsRef<Path>) -> Result<ProjectRecord> {
@@ -108,12 +156,14 @@ impl ProjectRegistry {
             .map(entity_ref::repo_id_for_root)
             .transpose()?;
         let is_git_repo = git_root.is_some();
+        let languages = detect_languages(&canonical);
         let record = ProjectRecord {
             project_id,
             repo_id,
             canonical_path,
             registered_at: util::now_iso(),
             is_git_repo,
+            languages,
         };
         self.store.projects.push(record.clone());
         self.store
@@ -198,6 +248,15 @@ impl ProjectRegistry {
         record.canonical_path = canonical_path;
         record.repo_id = repo_id;
         record.is_git_repo = is_git_repo;
+        if !(dry_run && move_on_disk) {
+            // Re-detect against the new canonical path. Skip during
+            // `dry_run + move_on_disk` because the filesystem hasn't
+            // been touched yet — we have nothing to walk.
+            let canonical_pb = PathBuf::from(&record.canonical_path);
+            if canonical_pb.is_dir() {
+                record.languages = detect_languages(&canonical_pb);
+            }
+        }
 
         if !dry_run {
             self.store.projects[idx] = record.clone();
@@ -286,6 +345,71 @@ fn load_store(path: &Path) -> Result<ProjectStore> {
 
 fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(entity_ref::canonical_input_path(path)?)
+}
+
+/// Walk a project root (capped at depth 4) collecting language
+/// fingerprints. Skips heavy build/output directories so a polyglot
+/// monorepo doesn't pay an O(everything) cost on registration.
+pub fn detect_languages(root: &Path) -> BTreeSet<Language> {
+    const MAX_DEPTH: usize = 4;
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        "target",
+        "node_modules",
+        "build",
+        "out",
+        ".gradle",
+        ".idea",
+        ".vscode",
+        "dist",
+        ".bbox",
+        ".bloop",
+        ".metals",
+    ];
+
+    let mut found = BTreeSet::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if found.len() >= 2 {
+            // All known languages detected; stop early.
+            break;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if file_type.is_file() {
+                match name_str.as_ref() {
+                    "Cargo.toml" => {
+                        found.insert(Language::Rust);
+                    }
+                    "pom.xml" | "build.gradle" | "build.gradle.kts" | "settings.gradle"
+                    | "settings.gradle.kts" => {
+                        found.insert(Language::Java);
+                    }
+                    other => {
+                        if other.ends_with(".java") {
+                            found.insert(Language::Java);
+                        }
+                    }
+                }
+            } else if file_type.is_dir() && depth + 1 < MAX_DEPTH {
+                if SKIP_DIRS.iter().any(|skip| skip == &name_str) {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    found
 }
 
 fn canonical_nonexistent_absolute_path(path: &Path) -> Result<PathBuf> {
@@ -409,6 +533,96 @@ mod tests {
         let registered_again = registry.register_path(&new_path).unwrap();
         assert_eq!(registered_again.project_id, old_record.project_id);
         assert_eq!(registry.list().len(), 1);
+    }
+
+    #[test]
+    fn detect_languages_rust_cargo_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let langs = detect_languages(dir.path());
+        assert!(langs.contains(&Language::Rust));
+        assert!(!langs.contains(&Language::Java));
+    }
+
+    #[test]
+    fn detect_languages_maven_pom() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pom.xml"), "<project/>").unwrap();
+        let langs = detect_languages(dir.path());
+        assert!(langs.contains(&Language::Java));
+        assert!(!langs.contains(&Language::Rust));
+    }
+
+    #[test]
+    fn detect_languages_gradle() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("build.gradle.kts"), "// gradle\n").unwrap();
+        let langs = detect_languages(dir.path());
+        assert!(langs.contains(&Language::Java));
+    }
+
+    #[test]
+    fn detect_languages_plain_java_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src/com/x")).unwrap();
+        fs::write(
+            dir.path().join("src/com/x/A.java"),
+            "package com.x; class A {}\n",
+        )
+        .unwrap();
+        let langs = detect_languages(dir.path());
+        assert!(langs.contains(&Language::Java));
+    }
+
+    #[test]
+    fn detect_languages_polyglot() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::write(dir.path().join("pom.xml"), "<project/>").unwrap();
+        let langs = detect_languages(dir.path());
+        assert!(langs.contains(&Language::Rust));
+        assert!(langs.contains(&Language::Java));
+    }
+
+    #[test]
+    fn detect_languages_unsupported_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("README.md"), "hello").unwrap();
+        fs::write(dir.path().join("script.py"), "print(1)\n").unwrap();
+        let langs = detect_languages(dir.path());
+        assert!(langs.is_empty());
+    }
+
+    #[test]
+    fn open_redetects_languages_for_legacy_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("legacy");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+
+        // Write a legacy-shaped store JSON without the languages field.
+        let store_path = dir.path().join("projects.json");
+        let canonical = fs::canonicalize(&project).unwrap();
+        let raw = serde_json::json!({
+            "version": 1,
+            "projects": [{
+                "project_id": "test-id",
+                "repo_id": null,
+                "canonical_path": canonical.to_string_lossy(),
+                "registered_at": "2026-01-01T00:00:00Z",
+                "is_git_repo": false,
+            }],
+        });
+        fs::write(&store_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let registry = ProjectRegistry::open(&store_path).unwrap();
+        let recs = registry.list();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].languages.contains(&Language::Rust));
+
+        // Persisted on disk so subsequent loads skip the walk.
+        let raw2 = fs::read_to_string(&store_path).unwrap();
+        assert!(raw2.contains("\"languages\""));
     }
 
     fn init_git_repo(path: &Path) {
