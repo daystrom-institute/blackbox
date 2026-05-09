@@ -80,6 +80,32 @@ pub struct RefactorProjectRefsParams {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct JavaFieldSpec {
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub name: String,
+    #[serde(default, rename = "final")]
+    pub final_field: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct JavaParameterSpec {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct CapturedVariable {
+    pub name: String,
+    pub kind: String,
+    pub source_type: String,
+    pub source_visibility: String,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RefactorPlanParams {
     /// Supported generic or language-scoped plan kind. Pull sm-refactor first.
     pub kind: String,
@@ -133,6 +159,24 @@ pub struct RefactorPlanParams {
     /// Optional TOML key/value entries for structured TOML edit plans.
     #[serde(default)]
     pub toml_entries: Option<BTreeMap<String, serde_json::Value>>,
+    /// Java field declarations for add_java_fields.
+    #[serde(default)]
+    pub fields: Option<Vec<JavaFieldSpec>>,
+    /// Java constructor parameters for add_java_constructor.
+    #[serde(default)]
+    pub parameters: Option<Vec<JavaParameterSpec>>,
+    /// Java constructor helper: assign this.<param> = <param>.
+    #[serde(default)]
+    pub assign_to_fields: Option<bool>,
+    /// Java field names to move with extract_java_class.
+    #[serde(default)]
+    pub move_fields: Option<Vec<String>>,
+    /// Java delegate field name for caller rewrites or source-side delegate wiring.
+    #[serde(default)]
+    pub delegate_field: Option<String>,
+    /// Java delegate type for source-side delegate wiring.
+    #[serde(default)]
+    pub delegate_type: Option<String>,
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
@@ -263,6 +307,8 @@ pub struct RefactorPlan {
     pub items: Vec<SyntaxItem>,
     #[serde(default)]
     pub leftovers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captured_variables: Vec<CapturedVariable>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -379,10 +425,10 @@ pub fn status(p: &RefactorStatusParams) -> Result<String> {
     let path = resolve_path(p.project_dir.as_deref(), &p.file)?;
     let parsed = parse_source_file(&path)?;
     let report = parse_report(parsed.tree.root_node());
-    let mut items = if parsed.language == "rust" {
-        rust_status_items(&parsed)
-    } else {
-        generic_top_level_items(&parsed)
+    let mut items = match parsed.language {
+        "rust" => rust_status_items(&parsed),
+        "java" => java_status_items(&parsed),
+        _ => generic_top_level_items(&parsed),
     };
     let total_items = items.len();
     if let Some(kinds) = p.item_kinds.as_deref().filter(|kinds| !kinds.is_empty()) {
@@ -512,7 +558,13 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "rust_lsp_rename" => plan_rust_lsp_rename(p),
         "rust_organize_imports" => plan_rust_organize_imports(p),
         "extract_java_methods" => plan_extract_java_methods(p),
+        "extract_java_class" => plan_extract_java_class(p),
         "extract_java_nested_classes" => plan_extract_java_nested_classes(p),
+        "add_java_fields" => plan_add_java_fields(p),
+        "add_java_constructor" => plan_add_java_constructor(p),
+        "move_java_field" => plan_move_java_field(p),
+        "update_java_callers" => plan_update_java_callers(p),
+        "add_java_delegate_field" => plan_add_java_delegate_field(p),
         "rewrite_java_visibility" => plan_rewrite_java_visibility(p),
         "java_lsp_organize_imports" => plan_java_lsp_organize_imports(p),
         "add_java_implements" => plan_add_java_implements(p),
@@ -523,7 +575,7 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_nested_classes, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
@@ -1175,6 +1227,7 @@ fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
         validations,
         items: Vec::new(),
         leftovers: Vec::new(),
+        captured_variables: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1242,6 +1295,7 @@ fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
         leftovers: Vec::new(),
+        captured_variables: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1273,6 +1327,7 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
         leftovers: Vec::new(),
+        captured_variables: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1318,6 +1373,7 @@ fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
         validations: Vec::new(),
         items: Vec::new(),
         leftovers: Vec::new(),
+        captured_variables: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1369,7 +1425,7 @@ fn impl_declaration_list(impl_node: Node<'_>) -> Option<Node<'_>> {
     body
 }
 
-fn resolve_path(project_dir: Option<&str>, path: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_path(project_dir: Option<&str>, path: &str) -> Result<PathBuf> {
     let path = PathBuf::from(path);
     let full = if path.is_absolute() {
         path
@@ -2060,7 +2116,7 @@ fn validate_rewritten_files(files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<ParseVal
         .collect()
 }
 
-fn parse_report(root: Node<'_>) -> ParseReport {
+pub(crate) fn parse_report(root: Node<'_>) -> ParseReport {
     let mut report = ParseReport {
         has_error: root.has_error(),
         error_nodes: 0,
@@ -2108,4 +2164,3 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
-

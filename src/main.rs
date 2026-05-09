@@ -6,6 +6,7 @@ mod artifacts;
 #[path = "../eval/badgey/check.rs"]
 mod badgey_eval_check;
 mod chunker;
+pub mod code_nav;
 mod council;
 mod crons;
 mod edge_index;
@@ -106,6 +107,7 @@ impl BlackboxServer {
                 + tools::notes::router()
                 + tools::threads::router()
                 + tools::refactor::router()
+                + tools::code_nav::router()
                 + tools::artifacts::router()
                 + tools::packets::router()
                 + tools::attention::router()

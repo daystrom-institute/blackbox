@@ -1,0 +1,46 @@
+use crate::code_nav::{
+    code_node_describe, code_query, code_symbols, CodeNodeDescribeParams, CodeQueryParams,
+    CodeSymbolSearchParams,
+};
+use crate::server::*;
+use crate::*;
+
+pub(crate) fn router() -> ToolRouter<BlackboxServer> {
+    BlackboxServer::code_nav_tools()
+}
+
+#[tool_router(router = code_nav_tools)]
+impl BlackboxServer {
+    #[tool(
+        name = "bbox_code_query",
+        description = "Run a tree-sitter query against one source file. Return syntactic matches plus handoff hints for refactor/status grounding."
+    )]
+    pub(crate) fn bbox_code_query(
+        &self,
+        Parameters(p): Parameters<CodeQueryParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_code_query", || code_query(&p))
+    }
+
+    #[tool(
+        name = "bbox_code_symbols",
+        description = "Find refactorable syntax symbols across a project and return exact line ranges plus refactor/project-ref handoff hints."
+    )]
+    pub(crate) fn bbox_code_symbols(
+        &self,
+        Parameters(p): Parameters<CodeSymbolSearchParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_code_symbols", || code_symbols(&p))
+    }
+
+    #[tool(
+        name = "bbox_code_node_describe",
+        description = "Describe the smallest named AST node at a source position and suggest the next refactor/status grounding call."
+    )]
+    pub(crate) fn bbox_code_node_describe(
+        &self,
+        Parameters(p): Parameters<CodeNodeDescribeParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_code_node_describe", || code_node_describe(&p))
+    }
+}

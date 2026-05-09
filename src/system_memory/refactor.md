@@ -5,10 +5,24 @@ picked a language-specific runbook.
 
 ## Support Matrix
 
-Inspection uses `bbox_refactor_status` and is available for any source file
-whose extension maps to a supported tree-sitter parser in `CodeChunker`. The
-operational runbooks below cover the common application languages; additional
-mapped languages are inspect-only unless a newer language memory says otherwise.
+Project-scoped symbol lookup uses `bbox_code_symbols`. Single-file syntax
+exploration uses `bbox_code_node_describe` and `bbox_code_query`. Refactor
+inventory uses `bbox_refactor_status` and is available for any source file
+whose extension maps to a supported tree-sitter parser in `CodeChunker`.
+The operational runbooks below cover the common application languages;
+additional mapped languages are inspect-only unless a newer language memory
+says otherwise.
+
+`bbox_code_symbols`, `bbox_code_node_describe`, and `bbox_code_query` are syntax
+locators, not refactor planners. Use `bbox_code_symbols` instead of shell
+`rg -n` when you need method/function/type line numbers, candidate files for a
+symbol, or exact refactorable item names. Use `bbox_code_node_describe` when you
+have a line/column and need local grammar shape. Use `bbox_code_query` when the
+file is known and you need a custom tree-sitter pattern. Their responses include
+a `handoff` block with suggested `bbox_refactor_status` and
+`bbox_refactor_project_refs` calls. Treat those suggestions as the bridge into
+the guarded refactor surfaces; do not turn raw query captures directly into
+edits unless the edit is a generic literal plan such as `replace_text`.
 
 `bbox_refactor_project_refs` is a grounding-only companion for metadata and
 provenance repairs. It returns current
@@ -69,7 +83,7 @@ Writable structural plans are narrower:
 - TypeScript / JavaScript: inspect-only today. Use `sm-refactor-typescript`.
 - C#: inspect-only today. Use `sm-refactor-csharp`.
 - Python: inspect-only today. Use `sm-refactor-python`.
-- Java: supports extract methods/classes, extract interface, add implements, visibility rewriting, type-use migration, and JDTLS import organize. Use `sm-refactor-java`.
+- Java: supports extract methods/classes, composite extract-class handoffs, field/constructor/delegate wiring, caller delegation, extract interface, add implements, visibility rewriting, type-use migration, and JDTLS/fallback import organize. Use `sm-refactor-java`.
 - Go: inspect-only today. Use `sm-refactor-go`.
 - C / C++: inspect-only today. Use `sm-refactor-c-cpp`.
 - Other supported tree-sitter languages: inspect-only today unless a newer
@@ -91,7 +105,61 @@ Writable structural plans are narrower:
 
 ## Common Protocol
 
-1. Inspect first:
+1. Find symbols and line ranges structurally before reaching for `rg`:
+
+```text
+bbox_code_symbols(
+  project_dir="/absolute/project/root",
+  query="methodOrTypeName",
+  languages=["java"],
+  item_kinds=["method_declaration"],
+  limit=20
+)
+```
+
+Use this for the common "where is this method?" and "what line range is this
+symbol on?" cases. The response returns `file`, `kind`, `name`, `byte_range`,
+`line_range`, truncation metadata, and handoff calls. The default scan budget is
+large enough for normal monorepos; if `truncated=true`, narrow with
+`path_contains`, `languages`, `item_kinds`, or pass a more deliberate
+`file_limit`. `rg` is still fine for unsupported file types, literal
+prose/config search, or broad text audits, but it should not be the first tool
+for supported source-code symbol line numbers.
+
+2. Explore local syntax when the target is unclear:
+
+```text
+bbox_code_node_describe(
+  file="path/to/file",
+  project_dir="/absolute/project/root",
+  line=42,
+  column=12,
+  include_text=true,
+  include_siblings=true
+)
+```
+
+Use `bbox_code_node_describe` to learn the local grammar: node kind, named
+fields, parent chain, siblings, parse health, and the nearest refactor-like
+ancestor. Then use `bbox_code_query` for broader single-file pattern searches:
+
+```text
+bbox_code_query(
+  file="path/to/file",
+  project_dir="/absolute/project/root",
+  query="(function_item name: (identifier) @name)",
+  limit=50,
+  include_text=true
+)
+```
+
+Code-nav output is `semantic_status="syntax_only"`. It may locate syntax that
+looks relevant, but it does not prove binding, import paths, macro expansion, or
+type correctness. Follow the response's `handoff.refactor_status` suggestion
+when you need a refactorable item name/kind; follow
+`handoff.project_refs` when you need current `project_file` entity refs.
+
+3. Inspect refactorable items before planning:
 
 ```text
 bbox_refactor_status(
@@ -108,17 +176,21 @@ can copy exact method names before planning an impl extraction. Omit filters for
 small files only; status defaults to at most 200 returned items and reports
 `total_items`, `matching_items`, `returned_items`, and `truncated`.
 
-2. Only call `bbox_refactor_plan` for a generic plan kind listed here or for a
+4. Only call `bbox_refactor_plan` for a generic plan kind listed here or for a
    language-scoped plan kind that the language memory says is writable.
 
-3. Only call `bbox_refactor_apply` after reviewing the JSON plan. Apply requires
+5. Only call `bbox_refactor_apply` after reviewing the JSON plan. Apply requires
    `confirm=true`, registered-project path scope, clean git files by default
    unless `allow_dirty_worktree=true`, hash checks, non-overlapping edits, parse
    validation, and atomic writes. For disposable practice worktrees or isolated
    smoke tests, `allow_unregistered_paths=true` bypasses the registered-project
    requirement without disabling hash, syntax, or dirty-file checks.
+   Missing target files are not inherently dirty: supported extraction plans
+   that create a target should model that as an empty-original `FileEdit`.
+   Do not pre-create placeholder files or pass `allow_dirty_worktree=true` just
+   to let an extraction produce a new type.
 
-4. Run the language toolchain after apply. Tree-sitter proves syntax shape, not
+6. Run the language toolchain after apply. Tree-sitter proves syntax shape, not
    semantic binding. For compound phases, add command validation steps directly
    to `bbox_refactor_run`:
 
@@ -132,6 +204,6 @@ small files only; status defaults to at most 200 returned items and reports
    touches are snapshotted before the command and are rolled back with prior
    plan writes on required command failure.
 
-5. Dispatched agents normally cannot see `bbox_refactor_*` because those tools
+7. Dispatched agents normally cannot see `bbox_refactor_*` because those tools
    are in the default recursion guard. The orchestrator must deliberately use
    `allow_recursion=true` when delegating a refactor task that needs these tools.

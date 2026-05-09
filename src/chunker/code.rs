@@ -81,6 +81,24 @@ fn log_language_pack_failure(language: &'static str, err: &dyn std::fmt::Display
     }
 }
 
+pub(crate) fn ts_language_for_name(language: &str) -> Result<tree_sitter::Language> {
+    if let Ok(language) = tree_sitter_language_pack::get_language(language) {
+        return Ok(language);
+    }
+    match language {
+        "rust" => Ok(tree_sitter_rust::LANGUAGE.into()),
+        "python" => Ok(tree_sitter_python::LANGUAGE.into()),
+        "csharp" => Ok(tree_sitter_c_sharp::LANGUAGE.into()),
+        "java" => Ok(tree_sitter_java::LANGUAGE.into()),
+        "go" => Ok(tree_sitter_go::LANGUAGE.into()),
+        "typescript" => Ok(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "javascript" => Ok(tree_sitter_javascript::LANGUAGE.into()),
+        "c" => Ok(tree_sitter_c::LANGUAGE.into()),
+        "cpp" => Ok(tree_sitter_cpp::LANGUAGE.into()),
+        _ => Err(anyhow!("unsupported language {language}")),
+    }
+}
+
 pub(crate) fn parser_for_language(language: &str) -> Result<tree_sitter::Parser> {
     if let Ok(parser) = get_parser(language) {
         return Ok(parser);

@@ -308,6 +308,27 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     },
     // ── Refactor mechanization ───────────────────────────────────────
     ToolDoc {
+        name: "bbox_code_symbols",
+        category: ToolCategory::Refactor,
+        summary: "Find refactorable syntax symbols across a project and return exact line ranges plus refactor/project-ref handoff hints.",
+        when_to_use: "Use instead of `rg -n` when you need method/function/type line numbers, refactorable item names, or candidate files for a symbol. Filters by project_dir, language, item kind, path substring, symbol/name substring, and file_limit; returns file, language, kind, name, byte range, line range, and `handoff` suggestions for bbox_refactor_status / bbox_refactor_project_refs. This is syntax inventory, not reference resolution.",
+        example: Some(r#"bbox_code_symbols(project_dir="/repo/x", query="readFromProperties", languages=["java"], item_kinds=["method_declaration"], limit=20)"#),
+    },
+    ToolDoc {
+        name: "bbox_code_query",
+        category: ToolCategory::Refactor,
+        summary: "Run a tree-sitter query against one source file. Return syntactic matches plus handoff hints for refactor/status grounding.",
+        when_to_use: "Use after the file is known to find AST patterns, block ranges, or specific syntactic constructs using tree-sitter S-expressions. For method/function/type line numbers across a project, use bbox_code_symbols first instead of shell `rg`. Returns matched nodes, byte/line ranges, optional text, parse diagnostics, and `handoff` suggestions for bbox_refactor_status / bbox_refactor_project_refs. The matches are syntax-only, not semantic bindings.",
+        example: Some(r#"bbox_code_query(file="src/foo.rs", query="(function_item name: (identifier) @name)")"#),
+    },
+    ToolDoc {
+        name: "bbox_code_node_describe",
+        category: ToolCategory::Refactor,
+        summary: "Describe the smallest named AST node at a source position and suggest the next refactor/status grounding call.",
+        when_to_use: "Use to discover grammar shape and field names before writing a tree-sitter query. Point it at a line/column and get the node kind, parent chain, named children, sibling summaries, parse diagnostics, and `handoff` suggestions for bbox_refactor_status / bbox_refactor_project_refs.",
+        example: Some(r#"bbox_code_node_describe(file="src/foo.rs", line=42, column=12)"#),
+    },
+    ToolDoc {
         name: "bbox_refactor_status",
         category: ToolCategory::Refactor,
         summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",
@@ -325,7 +346,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
         summary: "Create a dry-run structural refactor plan using a supported generic or language-scoped plan kind.",
-        when_to_use: "Use after `sm-refactor` identifies an exact supported plan kind. For syntax-item operations, inspect with bbox_refactor_status first and use the relevant language memory for exact item kinds and extra arguments. Generic plans cover file moves, exact text replacement, whole-file writes, and simple TOML table ensures; exact text replacement is not semantic rename. The plan is reviewable JSON with hash checks, file moves or text edits, parse validations, selected items, and leftovers where applicable. Keep this generic surface free of language-specific assumptions; semantic rename/import repair belongs to LSP, compiler validation, or language-scoped surfaces.",
+        when_to_use: "Use after `sm-refactor` identifies an exact supported plan kind. For syntax-item operations, inspect with bbox_refactor_status first and use the relevant language memory for exact item kinds and extra arguments. Supported Java extraction/wiring plans include extract_java_methods, extract_java_class, add_java_fields, add_java_constructor, move_java_field, add_java_delegate_field, and update_java_callers; use them instead of write_file/replace_text for the normal extract-class follow-through. Supported extraction plans may create a missing target as an empty-original FileEdit; do not pre-create placeholder files or use allow_dirty_worktree=true for normal target creation. Java import repair uses java_lsp_organize_imports, preferring JDTLS and falling back to source-tree heuristics. Generic plans cover file moves, exact text replacement, whole-file writes, and simple TOML table ensures; exact text replacement is not semantic rename. The plan is reviewable JSON with hash checks, file moves or text edits, parse validations, selected items, and leftovers where applicable. Keep this generic surface free of language-specific assumptions; semantic rename belongs to LSP, compiler validation, or language-scoped surfaces.",
         example: Some(r#"bbox_refactor_plan(kind="<supported_plan_kind>", source="src/path/to/file.ext", target="src/path/to/target.ext", item_names=["Thing"], old_text="exact before", new_text="exact after", project_dir="/repo/x")"#),
     },
     ToolDoc {
