@@ -44,8 +44,9 @@ use lsp_types::{
     notification::{Exit, Initialized, Notification},
     request::{Initialize, Request, Shutdown},
     ClientCapabilities, CodeActionClientCapabilities, CodeActionKind, CodeActionKindLiteralSupport,
-    CodeActionLiteralSupport, InitializeParams, TextDocumentClientCapabilities,
-    WorkspaceClientCapabilities, WorkspaceEditClientCapabilities, WorkspaceFolder,
+    CodeActionLiteralSupport, InitializeParams, ResourceOperationKind,
+    TextDocumentClientCapabilities, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+    WorkspaceFolder,
 };
 use parking_lot::Mutex;
 use reqwest::Url;
@@ -70,7 +71,6 @@ struct ManagerInner {
 
 #[derive(Clone, Debug)]
 struct Config {
-    init_timeout: Duration,
     idle_timeout: Duration,
     request_timeout: Duration,
 }
@@ -78,10 +78,6 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            init_timeout: Duration::from_secs(env_u64(
-                "BLACKBOX_JDTLS_INIT_TIMEOUT_SECS",
-                60,
-            )),
             idle_timeout: Duration::from_secs(env_u64("BLACKBOX_LSP_IDLE_SECS", 600)),
             request_timeout: Duration::from_secs(env_u64(
                 "BLACKBOX_JDTLS_TIMEOUT_SECS",
@@ -89,6 +85,17 @@ impl Default for Config {
             )),
         }
     }
+}
+
+/// Per-language `initialize` timeout. JDTLS and rust-analyzer both
+/// pay multi-second cold-start (workspace import, crate graph build);
+/// each gets its own knob with a 60s default.
+fn init_timeout_for(language: Language) -> Duration {
+    let secs = match language {
+        Language::Java => env_u64("BLACKBOX_JDTLS_INIT_TIMEOUT_SECS", 60),
+        Language::Rust => env_u64("BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS", 60),
+    };
+    Duration::from_secs(secs)
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -400,10 +407,10 @@ fn spawn_session(key: &SessionKey, config: &Config) -> Result<Session> {
     session.next_id += 1;
     write_request(&mut session.stdin, Initialize::METHOD, init_id, &init_params)
         .context("sending initialize")?;
-    let value = read_response(&mut session, init_id, config.init_timeout).map_err(|e| {
+    let init_timeout = init_timeout_for(key.language);
+    let value = read_response(&mut session, init_id, init_timeout).map_err(|e| {
         anyhow!(
-            "LSP `initialize` did not return within {:?}: {e}",
-            config.init_timeout
+            "LSP `initialize` did not return within {init_timeout:?}: {e}"
         )
     })?;
     if let Some(error) = value.get("error") {
@@ -430,7 +437,8 @@ fn launch_argv(language: Language) -> Result<Vec<String>> {
             Ok(vec![bin])
         }
         Language::Rust => {
-            let bin = std::env::var("BLACKBOX_RUST_ANALYZER_BIN")
+            let bin = std::env::var("RUST_ANALYZER_BIN")
+                .or_else(|_| std::env::var("BLACKBOX_RUST_ANALYZER_BIN"))
                 .unwrap_or_else(|_| "rust-analyzer".to_string());
             Ok(vec![bin])
         }
@@ -443,11 +451,15 @@ fn build_init_params(project_root: &Path) -> Result<InitializeParams> {
     Ok(InitializeParams {
         process_id: Some(std::process::id()),
         root_uri: Some(root_uri.clone()),
-        root_path: Some(project_root.to_string_lossy().to_string()),
         capabilities: ClientCapabilities {
             workspace: Some(WorkspaceClientCapabilities {
                 workspace_edit: Some(WorkspaceEditClientCapabilities {
                     document_changes: Some(true),
+                    resource_operations: Some(vec![
+                        ResourceOperationKind::Create,
+                        ResourceOperationKind::Rename,
+                        ResourceOperationKind::Delete,
+                    ]),
                     ..Default::default()
                 }),
                 ..Default::default()
