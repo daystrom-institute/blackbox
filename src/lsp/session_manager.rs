@@ -191,6 +191,44 @@ impl<'a> LspClient<'a> {
         serde_json::from_value(result.clone())
             .map_err(|e| LspError::Other(anyhow!("decoding LSP result: {e}")))
     }
+
+    /// Drain server messages until we see a `textDocument/publishDiagnostics`
+    /// notification for `uri`, or the timeout elapses. Used after a
+    /// `didOpen` to wait for the language server to have actually analyzed
+    /// the file — indexing is lazy in rust-analyzer, so the immediate next
+    /// request can otherwise see "no references found" even on a long-warm
+    /// session. Stashes any responses-by-id seen along the way into the
+    /// pending map; ignores other notifications. On timeout, returns
+    /// quietly so the caller can proceed (the worst case is that the
+    /// caller's request fails the same way it would have before).
+    pub fn wait_for_diagnostics(&mut self, uri: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if Instant::now() >= deadline {
+                return;
+            }
+            let value = match read_message(&mut self.session.reader) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            if let Some(other) = value.get("id").and_then(Value::as_u64) {
+                self.session.pending.insert(other, value);
+                continue;
+            }
+            if value.get("method").and_then(Value::as_str)
+                == Some("textDocument/publishDiagnostics")
+            {
+                let matched = value
+                    .get("params")
+                    .and_then(|p| p.get("uri"))
+                    .and_then(Value::as_str)
+                    == Some(uri);
+                if matched {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl LspSessionManager {
@@ -422,12 +460,83 @@ fn spawn_session(key: &SessionKey, config: &Config) -> Result<Session> {
         &lsp_types::InitializedParams {},
     )
     .context("sending initialized notification")?;
+    if matches!(key.language, Language::Rust) {
+        // rust-analyzer's `initialize` returns BEFORE `cargo metadata` and
+        // workspace indexing finish, so the very first textDocument request
+        // against a fresh session reliably comes back "no references". Drain
+        // notifications until rust-analyzer either signals ready
+        // (`experimental/serverStatus { quiescent: true }`) or emits its
+        // first `textDocument/publishDiagnostics` (broader fallback for
+        // builds that don't ship the experimental notification). Bounded by
+        // BLACKBOX_RUST_ANALYZER_READY_TIMEOUT_SECS (default 30s); on
+        // timeout we proceed anyway and let the request fail naturally —
+        // the session manager isn't a stop-the-world critical path.
+        let ready_timeout = Duration::from_secs(env_u64(
+            "BLACKBOX_RUST_ANALYZER_READY_TIMEOUT_SECS",
+            30,
+        ));
+        wait_for_rust_analyzer_ready(&mut session, ready_timeout);
+    }
     tracing::info!(
         project = %key.project_root.display(),
         language = ?key.language,
         "spawned + initialized LSP session"
     );
     Ok(session)
+}
+
+/// Block until rust-analyzer signals it has finished workspace indexing
+/// (or until `timeout` elapses). Stashes any responses-by-id encountered
+/// along the way into `session.pending` so a subsequent `read_response`
+/// call won't lose them.
+fn wait_for_rust_analyzer_ready(session: &mut Session, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            tracing::debug!(
+                "rust-analyzer didn't signal ready within {timeout:?}; proceeding"
+            );
+            return;
+        }
+        let value = match read_message(&mut session.reader) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("rust-analyzer ready-wait read error: {e}");
+                return;
+            }
+        };
+        if let Some(other) = value.get("id").and_then(Value::as_u64) {
+            // Server-sent response to a request we made — stash it for the
+            // matching caller.
+            session.pending.insert(other, value);
+            continue;
+        }
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        match method {
+            "experimental/serverStatus" => {
+                let quiescent = value
+                    .get("params")
+                    .and_then(|p| p.get("quiescent"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if quiescent {
+                    tracing::debug!("rust-analyzer reported quiescent");
+                    return;
+                }
+            }
+            "textDocument/publishDiagnostics" => {
+                // First diagnostics implies rust-analyzer has analyzed at
+                // least one file — workspace is loaded enough to answer.
+                tracing::debug!("rust-analyzer emitted publishDiagnostics");
+                return;
+            }
+            _ => {
+                // Other notifications (window/showMessage, $/progress, etc.)
+                // are noise for our purposes. Drop and continue.
+            }
+        }
+    }
 }
 
 fn launch_argv(language: Language) -> Result<Vec<String>> {

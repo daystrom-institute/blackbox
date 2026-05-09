@@ -1969,6 +1969,10 @@ pub(crate) fn rust_analyzer_rename(
                 },
             },
         )?;
+        // rust-analyzer indexes lazily on didOpen. Drain until we see
+        // diagnostics for this file, otherwise the rename request below
+        // arrives before symbol analysis is ready.
+        client.wait_for_diagnostics(source_uri.as_str(), std::time::Duration::from_secs(60));
         let id = client.send_request::<Rename>(&rename_params)?;
         client.read_response::<Rename>(id)
     })?;
@@ -2025,6 +2029,7 @@ pub(crate) fn rust_analyzer_organize_imports(
                 },
             },
         )?;
+        client.wait_for_diagnostics(did_open_uri.as_str(), std::time::Duration::from_secs(60));
         let id = client.send_request::<CodeActionRequest>(&code_action_params)?;
         client.read_response::<CodeActionRequest>(id)
     })?;

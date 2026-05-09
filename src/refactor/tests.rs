@@ -2448,16 +2448,16 @@ mod tests {
         updated.parse::<toml::Value>().unwrap();
     }
 
-    // TODO(post-Task-10): rust-analyzer needs the workspace fully indexed before
-    // it can resolve references. The warm session manager doesn't wait for
-    // `rust-analyzer/serverStatus` (or equivalent) after `initialize`, so a
-    // freshly-spawned session against a brand-new Cargo tempdir returns
-    // "No references found at position" before indexing completes. Possible
-    // fixes: (a) poll for `experimental/serverStatus`, (b) add a brief sleep
-    // after init for rust-analyzer specifically, (c) wait for the first
-    // `textDocument/publishDiagnostics` notification. Skipping until one of
-    // those is implemented; the rest of the rust-analyzer integration is
-    // exercised by `rust_organize_imports` callers in production.
+    // Cold-start rust-analyzer against a fresh tempdir is timing-fragile in
+    // CI: cargo metadata + crate-graph build runs silently for several
+    // seconds before rust-analyzer starts emitting serverStatus or
+    // publishDiagnostics. The session manager has both wait paths
+    // (`wait_for_rust_analyzer_ready` post-init, `wait_for_diagnostics`
+    // post-`didOpen`) so production warm sessions work, but this unit test
+    // sees the rename request hit before any analysis signal fires and
+    // returns "No references found at position". Keep #[ignore] until we
+    // either (a) drive a deterministic ready signal from rust-analyzer or
+    // (b) accept a fixed cold-start sleep.
     #[test]
     #[ignore]
     fn rust_lsp_rename_renames_references() {
