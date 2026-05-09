@@ -1696,6 +1696,301 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let target_path = p
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("target is required for move_java_constant"))
+        .and_then(|target| resolve_path(p.project_dir.as_deref(), target))?;
+    if source_path == target_path {
+        bail!("source and target must be different files");
+    }
+    let source_parsed = parse_source_file(&source_path)?;
+    if source_parsed.language != "java" {
+        bail!("move_java_constant only supports java files");
+    }
+    let names = p
+        .item_names
+        .as_deref()
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| anyhow!("item_names (constant names) is required for move_java_constant"))?;
+    let visibility = p.visibility.as_deref().unwrap_or("private").to_string();
+    validate_java_visibility(&visibility)?;
+    let keep_copy = p.keep_copy.unwrap_or(false);
+
+    // Match each name against a static-final field_declaration.
+    let selected = select_java_static_final_fields_by_name(&source_parsed, names)?;
+
+    // Build moved constant text(s) with the requested visibility.
+    let moved_text = selected
+        .iter()
+        .map(|info| render_java_static_final_with_visibility(info, &visibility))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Source-side edits: either remove the declaration or rewrite its
+    // visibility (when keep_copy is true and current visibility is tighter
+    // than `package`).
+    let mut source_edits = Vec::new();
+    for info in &selected {
+        if keep_copy {
+            if let Some(edit) = widen_static_final_visibility_edit(info, &source_parsed.source) {
+                source_edits.push(edit);
+            }
+        } else {
+            // Use leading_trivia_start..(end-of-line-after-byte_end) so back-to-back
+            // declarations produce adjacent (not overlapping) edits — trailing_trivia_end
+            // greedily consumes the next line's indentation and would overlap the
+            // following declaration's leading_trivia_start.
+            let end = end_of_line_after(&source_parsed.source, info.field.item.byte_end);
+            source_edits.push(TextEdit {
+                byte_start: info.field.item.leading_trivia_start,
+                byte_end: end,
+                replacement: String::new(),
+            });
+        }
+    }
+    source_edits.sort_by_key(|edit| edit.byte_start);
+    ensure_non_overlapping(&source_edits)?;
+
+    // Target file: create-if-missing, mirroring extract_java_methods.
+    let original_target_bytes = if target_path.exists() {
+        fs::read(&target_path)?
+    } else {
+        Vec::new()
+    };
+    let target_content = if !original_target_bytes.is_empty() {
+        let target_parsed = parse_source_file(&target_path)?;
+        if target_parsed.language != "java" {
+            bail!("move_java_constant only supports java files");
+        }
+        let target_class = find_first_class_declaration(target_parsed.tree.root_node())
+            .ok_or_else(|| {
+                anyhow!("no class declaration found in {}", target_path.display())
+            })?;
+        let insert_at = java_after_fields_insert_position(target_class, &target_parsed.source);
+        let mut text = target_parsed.source.clone();
+        text.insert_str(insert_at, &format!("\n{}", moved_text));
+        text
+    } else {
+        let class_name = java_target_type_name(p, &target_path)?;
+        let prelude = java_default_target_prelude(p, &source_parsed.source);
+        // Indent constant declarations to match class-body conventions.
+        let body = moved_text
+            .lines()
+            .map(|line| {
+                if line.is_empty() {
+                    line.to_string()
+                } else {
+                    format!("    {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        java_class_wrapper(&class_name, &prelude, &body)
+    };
+
+    let mut edits = Vec::new();
+    if !source_edits.is_empty() {
+        edits.push(FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(source_parsed.source.as_bytes()),
+            edits: source_edits,
+        });
+    }
+    edits.push(FileEdit {
+        path: path_string(&target_path),
+        original_sha256: sha256_hex(&original_target_bytes),
+        edits: vec![TextEdit {
+            byte_start: 0,
+            byte_end: original_target_bytes.len(),
+            replacement: target_content,
+        }],
+    });
+
+    let plan = RefactorPlan {
+        title: format!(
+            "Move {} Java constant(s) from {} to {}",
+            selected.len(),
+            source_path.display(),
+            target_path.display()
+        ),
+        kind: "move_java_constant".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: false,
+        file_moves: Vec::new(),
+        edits,
+        validations: parse_validation_step_for_path(&source_path)
+            .into_iter()
+            .chain(parse_validation_step_for_path(&target_path))
+            .collect(),
+        items: selected.into_iter().map(|info| info.field.item).collect(),
+        leftovers: Vec::new(),
+        captured_variables: Vec::new(),
+    };
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+#[derive(Debug, Clone)]
+struct JavaStaticFinalField {
+    field: JavaField,
+    type_text: String,
+    declarator_text: String,
+    visibility: String,
+}
+
+fn select_java_static_final_fields_by_name(
+    parsed: &ParsedSource,
+    names: &[String],
+) -> Result<Vec<JavaStaticFinalField>> {
+    let fields = java_fields(parsed);
+    let mut selected = Vec::new();
+    for expected in names {
+        let matches: Vec<&JavaField> = fields
+            .iter()
+            .filter(|field| field.name == *expected)
+            .collect();
+        let field = match matches.as_slice() {
+            [] => bail!("requested constant `{expected}` was not found"),
+            [field] => (*field).clone(),
+            _ => bail!("requested constant `{expected}` matched multiple field declarations"),
+        };
+        let node = find_node(parsed.tree.root_node(), |n| {
+            n.kind() == "field_declaration"
+                && n.start_byte() == field.item.byte_start
+                && n.end_byte() == field.item.byte_end
+        })
+        .ok_or_else(|| anyhow!("could not locate AST node for constant `{expected}`"))?;
+        let mods = collect_java_modifiers(node);
+        let has_static = mods.iter().any(|(name, _, _)| name == "static");
+        let has_final = mods.iter().any(|(name, _, _)| name == "final");
+        if !(has_static && has_final) {
+            bail!(
+                "constant `{expected}` is not declared as `static final`; use move_java_field for instance fields"
+            );
+        }
+        let type_node = node
+            .child_by_field_name("type")
+            .or_else(|| {
+                let mut cursor = node.walk();
+                let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+                children.into_iter().find(|child| {
+                    !matches!(
+                        child.kind(),
+                        "modifiers" | "variable_declarator" | "variable_declarator_id"
+                    )
+                })
+            })
+            .ok_or_else(|| anyhow!("could not locate type node for constant `{expected}`"))?;
+        let type_text = type_node
+            .utf8_text(parsed.source.as_bytes())
+            .map(|t| t.trim().to_string())
+            .map_err(|e| anyhow!("invalid utf8 in type for `{expected}`: {e}"))?;
+        let declarator_node = {
+            let mut cursor = node.walk();
+            let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+            children.into_iter().find(|child| {
+                child.kind() == "variable_declarator"
+                    || child.kind() == "variable_declarator_id"
+            })
+        }
+        .ok_or_else(|| anyhow!("could not locate declarator for constant `{expected}`"))?;
+        let declarator_text = declarator_node
+            .utf8_text(parsed.source.as_bytes())
+            .map(|t| t.trim().to_string())
+            .map_err(|e| anyhow!("invalid utf8 in declarator for `{expected}`: {e}"))?;
+        selected.push(JavaStaticFinalField {
+            field,
+            type_text,
+            declarator_text,
+            visibility: java_visibility_from_mods(&mods).to_string(),
+        });
+    }
+    Ok(selected)
+}
+
+fn render_java_static_final_with_visibility(
+    info: &JavaStaticFinalField,
+    visibility: &str,
+) -> String {
+    let mut parts = Vec::new();
+    if visibility != "package" {
+        parts.push(visibility.to_string());
+    }
+    parts.push("static".to_string());
+    parts.push("final".to_string());
+    parts.push(info.type_text.clone());
+    parts.push(format!("{};", info.declarator_text));
+    parts.join(" ")
+}
+
+/// Return the byte offset of the position right after the first `\n` at or
+/// after `start` (or `source.len()` if no newline is found). This stops at
+/// the line boundary instead of greedily consuming the next line's
+/// indentation, which keeps consecutive removals from overlapping.
+fn end_of_line_after(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut idx = start;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        idx += 1;
+        if b == b'\n' {
+            return idx;
+        }
+    }
+    bytes.len()
+}
+
+/// Visibility ranking — higher means more visible to outside callers.
+fn java_visibility_rank(v: &str) -> u8 {
+    match v {
+        "private" => 0,
+        "package" => 1,
+        "protected" => 2,
+        "public" => 3,
+        _ => 0,
+    }
+}
+
+/// When keep_copy=true and the source-side declaration is tighter than
+/// `package`, rewrite its visibility to `package` so siblings in the source
+/// class continue to compile.
+fn widen_static_final_visibility_edit(
+    info: &JavaStaticFinalField,
+    source: &str,
+) -> Option<TextEdit> {
+    if java_visibility_rank(&info.visibility) >= java_visibility_rank("package") {
+        return None;
+    }
+    // Find the field_declaration node so we can collect modifiers.
+    // We re-derive modifiers from the source slice rather than re-parsing —
+    // collect_java_modifiers only needs the node, but here we already know
+    // the byte range and visibility. Build a TextEdit that strips the
+    // explicit `private` / `protected` token and any trailing space.
+    let item_start = info.field.item.byte_start;
+    let item_end = info.field.item.byte_end;
+    let bytes = source.as_bytes();
+    let slice = &source[item_start..item_end];
+    let needle = info.visibility.as_str(); // "private" or "protected"
+    let local_pos = slice.find(needle)?;
+    let abs_start = item_start + local_pos;
+    let mut abs_end = abs_start + needle.len();
+    if bytes
+        .get(abs_end)
+        .copied()
+        .map(|b| b == b' ' || b == b'\t')
+        .unwrap_or(false)
+    {
+        abs_end += 1;
+    }
+    Some(TextEdit {
+        byte_start: abs_start,
+        byte_end: abs_end,
+        replacement: String::new(),
+    })
+}
+
 pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let parsed = parse_source_file(&source_path)?;
@@ -2755,6 +3050,7 @@ mod tests {
             move_fields: None,
             delegate_field: None,
             delegate_type: None,
+            keep_copy: None,
             project_dir: None,
         }
     }
@@ -3128,5 +3424,226 @@ mod tests {
         assert!(plan.edits[0].edits[0]
             .replacement
             .contains("import com.example.model.FooThing;"));
+    }
+
+    #[test]
+    fn move_java_constant_moves_three_constants_to_new_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Composition.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Composition {\n    private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";\n    private static final String SAMPLE_STATUS_NOT_OK = \"OUT OF DATE\";\n    private static final String SAMPLE_STATUS_NO_DATASOURCE = \"NONE ASSIGNED\";\n    void keep() {}\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("move_java_constant", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec![
+            "SAMPLE_STATUS_OK".to_string(),
+            "SAMPLE_STATUS_NOT_OK".to_string(),
+            "SAMPLE_STATUS_NO_DATASOURCE".to_string(),
+        ]);
+        params.visibility = Some("private".to_string());
+        params.module_name = Some("CompositionMeterGrid".to_string());
+
+        let plan_text = plan_move_java_constant(&params).unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let source_text = fs::read_to_string(&source).unwrap();
+        assert!(!source_text.contains("SAMPLE_STATUS_OK"));
+        assert!(!source_text.contains("SAMPLE_STATUS_NOT_OK"));
+        assert!(!source_text.contains("SAMPLE_STATUS_NO_DATASOURCE"));
+        assert!(source_text.contains("void keep()"));
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.contains("public class CompositionMeterGrid"));
+        assert!(target_text
+            .contains("private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";"));
+        assert!(target_text
+            .contains("private static final String SAMPLE_STATUS_NOT_OK = \"OUT OF DATE\";"));
+        assert!(target_text.contains(
+            "private static final String SAMPLE_STATUS_NO_DATASOURCE = \"NONE ASSIGNED\";"
+        ));
+    }
+
+    #[test]
+    fn move_java_constant_keep_copy_widens_source_visibility_and_copies_to_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Composition.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Composition {\n    private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";\n    void keep() {}\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("move_java_constant", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["SAMPLE_STATUS_OK".to_string()]);
+        params.visibility = Some("private".to_string());
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.keep_copy = Some(true);
+
+        let plan_text = plan_move_java_constant(&params).unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let source_text = fs::read_to_string(&source).unwrap();
+        // Constant remains in source, but visibility was widened from
+        // private to package (i.e. no visibility keyword).
+        assert!(source_text.contains("static final String SAMPLE_STATUS_OK"));
+        assert!(!source_text.contains("private static final String SAMPLE_STATUS_OK"));
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text
+            .contains("private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";"));
+    }
+
+    #[test]
+    fn move_java_constant_does_not_widen_when_keep_copy_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Composition.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Composition {\n    private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";\n    private static final String OTHER = \"X\";\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("move_java_constant", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["SAMPLE_STATUS_OK".to_string()]);
+        params.visibility = Some("private".to_string());
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        // keep_copy default false.
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_move_java_constant(&params).unwrap()).unwrap();
+        // Source-side edits should remove the declaration (one removal edit),
+        // not rewrite visibility on the surviving sibling.
+        let source_edits = &plan.edits[0].edits;
+        assert!(source_edits.iter().all(|edit| edit.replacement.is_empty()));
+        // OTHER must remain untouched: no edit byte range covers it.
+        let original = fs::read_to_string(&source).unwrap();
+        let other_pos = original.find("OTHER").unwrap();
+        assert!(source_edits.iter().all(|edit| {
+            !(edit.byte_start <= other_pos && other_pos < edit.byte_end)
+        }));
+    }
+
+    #[test]
+    fn move_java_constant_rejects_non_static_final_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Composition.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Composition {\n    private String NOT_A_CONSTANT = \"x\";\n    private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("move_java_constant", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["NOT_A_CONSTANT".to_string()]);
+        params.visibility = Some("private".to_string());
+        params.module_name = Some("CompositionMeterGrid".to_string());
+
+        let err = plan_move_java_constant(&params).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not declared as `static final`"), "got: {msg}");
+        // Source unchanged on disk (plan returned an error before any apply).
+        let source_text = fs::read_to_string(&source).unwrap();
+        assert!(source_text.contains("NOT_A_CONSTANT"));
+    }
+
+    #[test]
+    fn move_java_constant_rejects_missing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Composition.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Composition {\n    private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("move_java_constant", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["DOES_NOT_EXIST".to_string()]);
+        params.visibility = Some("private".to_string());
+        params.module_name = Some("CompositionMeterGrid".to_string());
+
+        let err = plan_move_java_constant(&params).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("DOES_NOT_EXIST"), "got: {msg}");
+    }
+
+    #[test]
+    fn move_java_constant_appends_to_existing_target_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Composition.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\nclass Composition {\n    private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &target,
+            "package com.example;\n\npublic class CompositionMeterGrid {\n    private final Foo foo = new Foo();\n    void existing() {}\n}\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("move_java_constant", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["SAMPLE_STATUS_OK".to_string()]);
+        params.visibility = Some("public".to_string());
+
+        let plan_text = plan_move_java_constant(&params).unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        // Existing declarations preserved.
+        assert!(target_text.contains("private final Foo foo = new Foo();"));
+        assert!(target_text.contains("void existing()"));
+        // Constant inserted with the requested visibility.
+        assert!(target_text
+            .contains("public static final String SAMPLE_STATUS_OK = \"UP TO DATE\";"));
     }
 }

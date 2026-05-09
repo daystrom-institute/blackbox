@@ -147,6 +147,33 @@ bbox_refactor_plan(
 )
 ```
 
+7b. Move static final constants that travel with the extracted methods:
+
+```text
+bbox_refactor_plan(
+  kind="move_java_constant",
+  source="src/main/java/com/example/CompositionView.java",
+  target="src/main/java/com/example/CompositionMeterGrid.java",
+  item_names=["SAMPLE_STATUS_OK","SAMPLE_STATUS_NOT_OK","SAMPLE_STATUS_NO_DATASOURCE"],
+  visibility="private",
+  keep_copy=false,
+  project_dir="/absolute/project/root"
+)
+```
+
+This plan kind operates only on `field_declaration` nodes that have **both**
+`static` **and** `final` modifiers. It removes the matched declarations from
+the source and inserts them in the target with the configured `visibility`
+(`private`, `package`, `protected`, or `public`), preserving the type, name,
+and initializer verbatim. If `keep_copy=true`, the declarations stay in the
+source and the source-side visibility is widened to at least `package` so
+remaining source-class code can still see them; the target copy uses the
+`visibility` you passed. The target file may be missing — it is created with
+a `public class` wrapper using `module_name` (or the target file stem).
+
+Use this when constants are referenced exclusively by methods that just moved
+to another class. For instance fields, use `move_java_field` instead.
+
 8. Add a delegate field to the original class and wire the first constructor:
 
 ```text
