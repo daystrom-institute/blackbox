@@ -1036,7 +1036,7 @@ pub(crate) fn plan_rewrite_rust_field_visibility(p: &RefactorPlanParams) -> Resu
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
-pub(crate) fn plan_rust_lsp_rename(p: &RefactorPlanParams) -> Result<String> {
+pub(crate) fn plan_rust_lsp_rename(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let project_dir = p
         .project_dir
@@ -1066,7 +1066,11 @@ pub(crate) fn plan_rust_lsp_rename(p: &RefactorPlanParams) -> Result<String> {
     let parsed = parse_rust_file(&source_path)?;
     let position_byte = rust_rename_position_byte(&parsed, old_name)?;
     let position = byte_to_lsp_position(&parsed.source, position_byte);
-    let file_edits = rust_analyzer_rename(&project_dir, &source_path, position, new_name)?;
+    let manager = ctx
+        .lsp
+        .as_ref()
+        .ok_or_else(|| anyhow!("rust_lsp_rename requires the LSP session manager"))?;
+    let file_edits = rust_analyzer_rename(manager, &project_dir, &source_path, position, new_name)?;
     if file_edits.is_empty() {
         bail!("rust-analyzer returned no edits for rename `{old_name}`");
     }
@@ -1094,7 +1098,10 @@ pub(crate) fn plan_rust_lsp_rename(p: &RefactorPlanParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
-pub(crate) fn plan_rust_organize_imports(p: &RefactorPlanParams) -> Result<String> {
+pub(crate) fn plan_rust_organize_imports(
+    p: &RefactorPlanParams,
+    ctx: &PlanContext,
+) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let project_dir = p
         .project_dir
@@ -1106,7 +1113,11 @@ pub(crate) fn plan_rust_organize_imports(p: &RefactorPlanParams) -> Result<Strin
                 .unwrap_or_else(|| source_path.parent().unwrap_or(Path::new(".")).to_path_buf())
         });
     parse_rust_file(&source_path)?;
-    let file_edits = rust_analyzer_organize_imports(&project_dir, &source_path)?;
+    let manager = ctx
+        .lsp
+        .as_ref()
+        .ok_or_else(|| anyhow!("rust_organize_imports requires the LSP session manager"))?;
+    let file_edits = rust_analyzer_organize_imports(manager, &project_dir, &source_path)?;
     if file_edits.is_empty() {
         bail!("rust-analyzer returned no import organization edits");
     }
@@ -1775,14 +1786,13 @@ pub(crate) fn rust_node_by_range<'a>(
 }
 
 use lsp_types::{
-    notification::{Exit, Initialized, Notification},
-    request::{CodeActionRequest, Initialize, Rename, Request, Shutdown},
-    ClientCapabilities, CodeActionClientCapabilities, CodeActionContext, CodeActionKind,
-    CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionParams, DocumentChanges,
-    InitializeParams, Position, Range, RenameParams, ResourceOperationKind,
-    TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, Url,
-    WorkspaceClientCapabilities, WorkspaceEdit, WorkspaceEditClientCapabilities, WorkspaceFolder,
+    request::{CodeActionRequest, Rename},
+    CodeActionContext, CodeActionKind, CodeActionParams, DocumentChanges, Position, Range,
+    RenameParams, TextDocumentIdentifier, TextDocumentPositionParams, Url, WorkspaceEdit,
 };
+
+use crate::lsp::LspSessionManager;
+use crate::projects::Language;
 
 pub(crate) fn rust_rename_position_byte(parsed: &ParsedSource, old_name: &str) -> Result<usize> {
     let mut candidates = rust_status_items(parsed)
@@ -1922,135 +1932,19 @@ pub(crate) fn workspace_edit_to_file_edits(workspace_edit: WorkspaceEdit) -> Res
     Ok(file_edits)
 }
 
-pub(crate) fn send_lsp_request<R: Request>(
-    stdin: &mut impl Write,
-    id: u64,
-    params: &R::Params,
-) -> Result<()> {
-    let req = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": R::METHOD,
-        "params": params
-    });
-    let body = serde_json::to_vec(&req)?;
-    write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
-    stdin.write_all(&body)?;
-    stdin.flush()?;
-    Ok(())
-}
-
-pub(crate) fn send_lsp_notification<N: Notification>(
-    stdin: &mut impl Write,
-    params: &N::Params,
-) -> Result<()> {
-    let req = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": N::METHOD,
-        "params": params
-    });
-    let body = serde_json::to_vec(&req)?;
-    write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
-    stdin.write_all(&body)?;
-    stdin.flush()?;
-    Ok(())
-}
-
-pub(crate) fn read_lsp_response<R: Request>(
-    reader: &mut impl BufRead,
-    expected_id: u64,
-) -> Result<R::Result> {
-    loop {
-        let value = read_lsp_message(reader)?;
-        if value.get("id").and_then(serde_json::Value::as_u64) != Some(expected_id) {
-            continue;
-        }
-        if let Some(error) = value.get("error") {
-            bail!("LSP server returned error: {error}");
-        }
-        let result = value
-            .get("result")
-            .ok_or_else(|| anyhow!("LSP response missing result"))?;
-        return Ok(serde_json::from_value(result.clone())?);
-    }
-}
-
-pub(crate) fn read_lsp_message(reader: &mut impl BufRead) -> Result<serde_json::Value> {
-    let mut content_length = None;
-    loop {
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            bail!("rust-analyzer closed stdout");
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            content_length = Some(value.trim().parse::<usize>()?);
-        }
-    }
-    let len = content_length.context("LSP message missing Content-Length")?;
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body)?;
-    Ok(serde_json::from_slice(&body)?)
-}
-
+/// Ask rust-analyzer for a workspace rename via the shared session
+/// pool. The session is lazily spawned on first call for
+/// `(project_dir, Rust)` and reused across subsequent calls; no
+/// per-call init/shutdown handshake.
 pub(crate) fn rust_analyzer_rename(
+    manager: &LspSessionManager,
     project_dir: &Path,
     source_path: &Path,
     position: Position,
     new_name: &str,
 ) -> Result<Vec<FileEdit>> {
-    let mut child = Command::new("rust-analyzer")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawning rust-analyzer")?;
-    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
-    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
-    let mut reader = std::io::BufReader::new(stdout);
-
-    let root_uri = Url::from_directory_path(project_dir)
-        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?;
     let source_uri = Url::from_file_path(source_path)
         .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
-
-    let init_params = InitializeParams {
-        process_id: Some(std::process::id()),
-        root_uri: Some(root_uri.clone()),
-        root_path: Some(project_dir.to_string_lossy().to_string()),
-        capabilities: ClientCapabilities {
-            workspace: Some(WorkspaceClientCapabilities {
-                apply_edit: Some(false),
-                workspace_edit: Some(WorkspaceEditClientCapabilities {
-                    document_changes: Some(true),
-                    resource_operations: Some(vec![
-                        ResourceOperationKind::Create,
-                        ResourceOperationKind::Rename,
-                        ResourceOperationKind::Delete,
-                    ]),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        workspace_folders: Some(vec![WorkspaceFolder {
-            uri: root_uri,
-            name: "refactor-root".to_string(),
-        }]),
-        ..Default::default()
-    };
-
-    send_lsp_request::<Initialize>(&mut stdin, 1, &init_params)?;
-    let _init_result = read_lsp_response::<Initialize>(&mut reader, 1)?;
-    send_lsp_notification::<Initialized>(&mut stdin, &lsp_types::InitializedParams {})?;
-
-    std::thread::sleep(std::time::Duration::from_millis(2000));
-
     let rename_params = RenameParams {
         text_document_position: TextDocumentPositionParams {
             text_document: TextDocumentIdentifier { uri: source_uri },
@@ -2060,12 +1954,10 @@ pub(crate) fn rust_analyzer_rename(
         work_done_progress_params: Default::default(),
     };
 
-    send_lsp_request::<Rename>(&mut stdin, 2, &rename_params)?;
-    let response = read_lsp_response::<Rename>(&mut reader, 2)?;
-
-    let _ = send_lsp_request::<Shutdown>(&mut stdin, 3, &());
-    let _ = send_lsp_notification::<Exit>(&mut stdin, &());
-    let _ = child.wait();
+    let response = manager.with_session(project_dir, Language::Rust, |mut client| {
+        let id = client.send_request::<Rename>(&rename_params)?;
+        client.read_response::<Rename>(id)
+    })?;
 
     if let Some(edit) = response {
         workspace_edit_to_file_edits(edit)
@@ -2074,69 +1966,20 @@ pub(crate) fn rust_analyzer_rename(
     }
 }
 
+/// Ask rust-analyzer for `source.organizeImports` code actions on
+/// `source_path` using the shared session pool. The session is
+/// lazily spawned on first call for `(project_dir, Rust)` and reused
+/// across subsequent calls.
 pub(crate) fn rust_analyzer_organize_imports(
+    manager: &LspSessionManager,
     project_dir: &Path,
     source_path: &Path,
 ) -> Result<Vec<FileEdit>> {
-    let mut child = Command::new("rust-analyzer")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawning rust-analyzer")?;
-    let mut stdin = child.stdin.take().context("rust-analyzer stdin")?;
-    let stdout = child.stdout.take().context("rust-analyzer stdout")?;
-    let mut reader = std::io::BufReader::new(stdout);
-
-    let root_uri = Url::from_directory_path(project_dir)
-        .map_err(|_| anyhow!("failed to convert {} to file URL", project_dir.display()))?;
     let source_uri = Url::from_file_path(source_path)
         .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
-
-    let init_params = InitializeParams {
-        process_id: Some(std::process::id()),
-        root_uri: Some(root_uri.clone()),
-        root_path: Some(project_dir.to_string_lossy().to_string()),
-        capabilities: ClientCapabilities {
-            workspace: Some(WorkspaceClientCapabilities {
-                workspace_edit: Some(WorkspaceEditClientCapabilities {
-                    document_changes: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            text_document: Some(TextDocumentClientCapabilities {
-                code_action: Some(CodeActionClientCapabilities {
-                    code_action_literal_support: Some(CodeActionLiteralSupport {
-                        code_action_kind: CodeActionKindLiteralSupport {
-                            value_set: vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS
-                                .as_str()
-                                .to_string()],
-                        },
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        workspace_folders: Some(vec![WorkspaceFolder {
-            uri: root_uri,
-            name: "refactor-root".to_string(),
-        }]),
-        ..Default::default()
-    };
-
-    send_lsp_request::<Initialize>(&mut stdin, 1, &init_params)?;
-    let _init_result = read_lsp_response::<Initialize>(&mut reader, 1)?;
-    send_lsp_notification::<Initialized>(&mut stdin, &lsp_types::InitializedParams {})?;
-
     let source = fs::read_to_string(source_path)
         .with_context(|| format!("reading {}", source_path.display()))?;
     let end_position = byte_to_lsp_position(&source, source.len());
-
-    std::thread::sleep(std::time::Duration::from_millis(2000));
-
     let code_action_params = CodeActionParams {
         text_document: TextDocumentIdentifier { uri: source_uri },
         range: Range {
@@ -2155,32 +1998,27 @@ pub(crate) fn rust_analyzer_organize_imports(
         partial_result_params: Default::default(),
     };
 
-    send_lsp_request::<CodeActionRequest>(&mut stdin, 2, &code_action_params)?;
-    let response = read_lsp_response::<CodeActionRequest>(&mut reader, 2)?;
-
-    let _ = send_lsp_request::<Shutdown>(&mut stdin, 3, &());
-    let _ = send_lsp_notification::<Exit>(&mut stdin, &());
-    let _ = child.wait();
+    let response = manager.with_session(project_dir, Language::Rust, |mut client| {
+        let id = client.send_request::<CodeActionRequest>(&code_action_params)?;
+        client.read_response::<CodeActionRequest>(id)
+    })?;
 
     let mut all_edits = Vec::new();
     if let Some(actions) = response {
         for action in actions {
-            match action {
-                lsp_types::CodeActionOrCommand::CodeAction(ca) => {
-                    let kind = ca
-                        .kind
-                        .clone()
-                        .unwrap_or_else(|| lsp_types::CodeActionKind::from(""));
-                    if kind != CodeActionKind::SOURCE_ORGANIZE_IMPORTS
-                        && !ca.title.to_ascii_lowercase().contains("organize")
-                    {
-                        continue;
-                    }
-                    if let Some(edit) = ca.edit {
-                        all_edits.extend(workspace_edit_to_file_edits(edit)?);
-                    }
+            if let lsp_types::CodeActionOrCommand::CodeAction(ca) = action {
+                let kind = ca
+                    .kind
+                    .clone()
+                    .unwrap_or_else(|| lsp_types::CodeActionKind::from(""));
+                if kind != CodeActionKind::SOURCE_ORGANIZE_IMPORTS
+                    && !ca.title.to_ascii_lowercase().contains("organize")
+                {
+                    continue;
                 }
-                _ => {}
+                if let Some(edit) = ca.edit {
+                    all_edits.extend(workspace_edit_to_file_edits(edit)?);
+                }
             }
         }
     }
