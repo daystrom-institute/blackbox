@@ -441,3 +441,46 @@ pub(crate) fn plan_java_lsp_organize_imports(p: &RefactorPlanParams) -> Result<S
 
     Ok(serde_json::to_string_pretty(&plan)?)
 }
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use crate::refactor::{RefactorPlanParams, java::plan_extract_java_methods};
+
+    #[test]
+    fn test_extract_methods() {
+        let source_code = "
+public class GodClass {
+    public void methodA() { System.out.println(\"A\"); }
+    public void methodB() { System.out.println(\"B\"); }
+}
+";
+        std::fs::write("/tmp/GodClass.java", source_code).unwrap();
+        std::fs::write("/tmp/TargetClass.java", "public class TargetClass {\n}\n").unwrap();
+        
+        let p = RefactorPlanParams {
+            kind: "extract_java_methods".to_string(),
+            source: "GodClass.java".to_string(),
+            target: Some("TargetClass.java".to_string()),
+            project_dir: Some("/tmp".to_string()),
+            item_names: Some(vec!["methodA".to_string()]),
+            item_kinds: None,
+            target_prelude: None,
+            old_text: None,
+            new_text: None,
+            replace_all: None,
+            module_name: None,
+            router_name: None,
+            router_export_name: None,
+            router_call: None,
+            impl_name: None,
+            use_path: None,
+            visibility: None,
+            toml_table: None,
+            toml_entries: None,
+        };
+        
+        let plan = plan_extract_java_methods(&p).unwrap();
+        assert!(plan.contains("methodA"));
+        println!("{}", plan);
+    }
+}
