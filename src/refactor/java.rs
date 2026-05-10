@@ -5926,6 +5926,209 @@ fn detect_apache_tostring(method: Node<'_>, source: &str) -> Option<Vec<String>>
     Some(field_names)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstructorKind {
+    NoArgs,
+    AllArgs,
+    RequiredArgs,
+}
+
+/// Extract the (type, name) for each formal parameter of a method/ctor node.
+fn formal_parameters(method: Node<'_>, source: &str) -> Vec<(String, String)> {
+    let Some(params) = method.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        if child.kind() != "formal_parameter" {
+            continue;
+        }
+        let ty = child
+            .child_by_field_name("type")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let name = child
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(str::to_string)
+            .unwrap_or_default();
+        out.push((ty, name));
+    }
+    out
+}
+
+/// True iff `body` is a sequence of N `this.field_i = paramName_i;`
+/// statements covering exactly `expected` (field name list in order),
+/// where each paramName_i matches the corresponding `param_names[i]`.
+fn body_matches_canonical_assignments(
+    body: Node<'_>,
+    expected: &[String],
+    param_names: &[String],
+    source: &str,
+) -> bool {
+    // tree-sitter-java uses `block` for method bodies and `constructor_body`
+    // for constructor bodies. Both wrap a sequence of statements.
+    if !matches!(body.kind(), "block" | "constructor_body") {
+        return false;
+    }
+    let mut cursor = body.walk();
+    let stmts: Vec<Node<'_>> = body
+        .named_children(&mut cursor)
+        .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+        .collect();
+    if stmts.len() != expected.len() {
+        return false;
+    }
+    for (i, stmt) in stmts.iter().enumerate() {
+        if stmt.kind() != "expression_statement" {
+            return false;
+        }
+        let Some(expr) = stmt.named_child(0) else {
+            return false;
+        };
+        if expr.kind() != "assignment_expression" {
+            return false;
+        }
+        let Some(lhs) = expr.child_by_field_name("left") else {
+            return false;
+        };
+        let Some(rhs) = expr.child_by_field_name("right") else {
+            return false;
+        };
+        // LHS must be `this.field_i`.
+        if lhs.kind() != "field_access" {
+            return false;
+        }
+        let object = lhs.child_by_field_name("object");
+        let field = lhs.child_by_field_name("field");
+        let lhs_ok = matches!(
+            (object, field),
+            (Some(o), Some(f))
+                if o.kind() == "this"
+                    && f.utf8_text(source.as_bytes()).ok() == Some(&expected[i])
+        );
+        if !lhs_ok {
+            return false;
+        }
+        // RHS must be the matching parameter identifier.
+        if rhs.kind() != "identifier" {
+            return false;
+        }
+        let Ok(rhs_name) = rhs.utf8_text(source.as_bytes()) else {
+            return false;
+        };
+        if rhs_name != param_names[i] {
+            return false;
+        }
+    }
+    true
+}
+
+/// True iff `body` is empty or contains only a `super(...)` call with no
+/// arguments.
+fn body_is_empty_or_default_super(body: Node<'_>) -> bool {
+    if !matches!(body.kind(), "block" | "constructor_body") {
+        return false;
+    }
+    let mut cursor = body.walk();
+    let stmts: Vec<Node<'_>> = body
+        .named_children(&mut cursor)
+        .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+        .collect();
+    if stmts.is_empty() {
+        return true;
+    }
+    if stmts.len() != 1 {
+        return false;
+    }
+    // Look for `super();` — tree-sitter parses this as either an
+    // explicit_constructor_invocation or expression_statement around a
+    // method_invocation whose target is `super`.
+    let stmt = stmts[0];
+    if stmt.kind() == "explicit_constructor_invocation" {
+        // Verify zero arguments
+        if let Some(args) = stmt.child_by_field_name("arguments") {
+            return args.named_child_count() == 0;
+        }
+        return true;
+    }
+    false
+}
+
+/// Classify a constructor against the class's instance-field set.
+/// Returns `Some(kind)` when the ctor matches the Lombok-generated shape
+/// for that kind, else None.
+fn classify_constructor(
+    ctor: Node<'_>,
+    instance_fields: &[&PojoField],
+    source: &str,
+) -> Option<ConstructorKind> {
+    if !is_public_method_node(ctor) {
+        return None;
+    }
+    if has_preceding_javadoc(ctor, source) {
+        return None;
+    }
+    let body = ctor.child_by_field_name("body")?;
+    let params = formal_parameters(ctor, source);
+
+    // No-args case.
+    if params.is_empty() {
+        if body_is_empty_or_default_super(body) {
+            return Some(ConstructorKind::NoArgs);
+        }
+        return None;
+    }
+
+    // Build the per-kind expected (type, name) list to match against params.
+    let all_pairs: Vec<(String, String)> = instance_fields
+        .iter()
+        .map(|f| (normalize_type_text(&f.type_name), f.name.clone()))
+        .collect();
+    let required_pairs: Vec<(String, String)> = instance_fields
+        .iter()
+        .filter(|f| f.is_final)
+        .map(|f| (normalize_type_text(&f.type_name), f.name.clone()))
+        .collect();
+    let actual_pairs: Vec<(String, String)> = params
+        .iter()
+        .map(|(t, _)| (normalize_type_text(t), String::new()))
+        .collect();
+
+    let try_kind = |target: &[(String, String)]| -> bool {
+        if actual_pairs.len() != target.len() {
+            return false;
+        }
+        actual_pairs
+            .iter()
+            .zip(target.iter())
+            .all(|(a, b)| a.0 == b.0)
+    };
+
+    let param_names: Vec<String> = params.iter().map(|(_, n)| n.clone()).collect();
+    let expected_field_names: Vec<String> = if try_kind(&all_pairs) {
+        all_pairs.iter().map(|(_, n)| n.clone()).collect()
+    } else if try_kind(&required_pairs) && !required_pairs.is_empty() {
+        required_pairs.iter().map(|(_, n)| n.clone()).collect()
+    } else {
+        return None;
+    };
+
+    if !body_matches_canonical_assignments(body, &expected_field_names, &param_names, source) {
+        return None;
+    }
+
+    if expected_field_names.len() == all_pairs.len() {
+        // If every instance field happens to be final, AllArgs and RequiredArgs
+        // are the same shape. Prefer AllArgs as the more explicit annotation.
+        Some(ConstructorKind::AllArgs)
+    } else {
+        Some(ConstructorKind::RequiredArgs)
+    }
+}
+
 /// Compute the byte range to delete for a method declaration, including
 /// trailing whitespace + one newline so the deletion doesn't leave orphan
 /// blank lines behind. Walks back over leading whitespace on the method's
@@ -6073,6 +6276,49 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
             _ => {}
         }
     }
+    // Phase 4: constructor classification. Walk every constructor; classify
+    // each against the instance-field set. We can emit at most one of each
+    // kind (NoArgs, AllArgs, RequiredArgs). Two ctors classifying as the
+    // same kind would mean the source has duplicate ctors — refuse to
+    // touch either.
+    let mut noargs_ctor: Option<Node<'_>> = None;
+    let mut allargs_ctor: Option<Node<'_>> = None;
+    let mut requiredargs_ctor: Option<Node<'_>> = None;
+    let mut ctor_collision = false;
+    for m in &methods {
+        if !m.is_constructor {
+            continue;
+        }
+        match classify_constructor(m.node, &instance_fields, &parsed.source) {
+            Some(ConstructorKind::NoArgs) => {
+                if noargs_ctor.replace(m.node).is_some() {
+                    ctor_collision = true;
+                }
+            }
+            Some(ConstructorKind::AllArgs) => {
+                if allargs_ctor.replace(m.node).is_some() {
+                    ctor_collision = true;
+                }
+            }
+            Some(ConstructorKind::RequiredArgs) => {
+                if requiredargs_ctor.replace(m.node).is_some() {
+                    ctor_collision = true;
+                }
+            }
+            None => {}
+        }
+    }
+    if ctor_collision {
+        // Multiple ctors classify as the same Lombok kind — bail rather
+        // than risk dropping the wrong one.
+        noargs_ctor = None;
+        allargs_ctor = None;
+        requiredargs_ctor = None;
+    }
+    // If the same field set qualifies for both AllArgs and RequiredArgs
+    // (i.e., every instance field is final), we picked AllArgs above and
+    // requiredargs_ctor is None — no further dedup needed.
+
     // @EqualsAndHashCode generates BOTH equals and hashCode together — only
     // emit when both are detected. Detecting just one would create an
     // unpaired method (Lombok writes both, the user's surviving method
@@ -6080,13 +6326,16 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     let emit_equals_and_hashcode = equals_method.is_some() && hashcode_method.is_some();
     let emit_tostring = tostring_method.is_some();
 
+    let any_ctor_match =
+        noargs_ctor.is_some() || allargs_ctor.is_some() || requiredargs_ctor.is_some();
     if field_to_getter.is_empty()
         && field_to_setter.is_empty()
         && !emit_equals_and_hashcode
         && !emit_tostring
+        && !any_ctor_match
     {
         bail!(
-            "{class_name} has no trivial getters/setters/equals/hashCode/toString to replace"
+            "{class_name} has no lombokifiable boilerplate (trivial getters/setters/equals/hashCode/toString/canonical constructors)"
         );
     }
 
@@ -6148,6 +6397,15 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
             drop_method(&mut text_edits, &mut method_drops_seen, ts);
         }
     }
+    if let Some(c) = noargs_ctor {
+        drop_method(&mut text_edits, &mut method_drops_seen, c);
+    }
+    if let Some(c) = allargs_ctor {
+        drop_method(&mut text_edits, &mut method_drops_seen, c);
+    }
+    if let Some(c) = requiredargs_ctor {
+        drop_method(&mut text_edits, &mut method_drops_seen, c);
+    }
 
     // Class-level annotations are stacked one per line, alphabetical for
     // deterministic output. We compose them into a single insert so the
@@ -6164,6 +6422,15 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     }
     if emit_tostring {
         class_level_annotations.push("@ToString");
+    }
+    if noargs_ctor.is_some() {
+        class_level_annotations.push("@NoArgsConstructor");
+    }
+    if allargs_ctor.is_some() {
+        class_level_annotations.push("@AllArgsConstructor");
+    }
+    if requiredargs_ctor.is_some() {
+        class_level_annotations.push("@RequiredArgsConstructor");
     }
     if !class_level_annotations.is_empty() {
         let mut block = String::new();
@@ -6221,6 +6488,15 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     if emit_tostring {
         needed_imports.push("lombok.ToString");
     }
+    if noargs_ctor.is_some() {
+        needed_imports.push("lombok.NoArgsConstructor");
+    }
+    if allargs_ctor.is_some() {
+        needed_imports.push("lombok.AllArgsConstructor");
+    }
+    if requiredargs_ctor.is_some() {
+        needed_imports.push("lombok.RequiredArgsConstructor");
+    }
     let mut import_block = String::new();
     for fqcn in &needed_imports {
         let already = imports.iter().any(|i| {
@@ -6265,6 +6541,19 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     }
     if emit_tostring {
         summary_parts.push("toString".to_string());
+    }
+    let mut ctor_kinds: Vec<&str> = Vec::new();
+    if noargs_ctor.is_some() {
+        ctor_kinds.push("@NoArgsConstructor");
+    }
+    if allargs_ctor.is_some() {
+        ctor_kinds.push("@AllArgsConstructor");
+    }
+    if requiredargs_ctor.is_some() {
+        ctor_kinds.push("@RequiredArgsConstructor");
+    }
+    if !ctor_kinds.is_empty() {
+        summary_parts.push(ctor_kinds.join("/"));
     }
     let summary = summary_parts.join(" + ");
     let plan = RefactorPlan {
@@ -9351,9 +9640,12 @@ mod tests {
             rewritten.contains("import lombok.Getter;"),
             "expected lombok import:\n{rewritten}"
         );
+        assert!(rewritten.contains("import lombok.AllArgsConstructor;"));
+        // Phase 4 also picks up the canonical all-args constructor:
+        // expect class-level @Getter and @AllArgsConstructor stacked.
         assert!(
-            rewritten.contains("@Getter\npublic class Pair"),
-            "expected class-level @Getter:\n{rewritten}"
+            rewritten.contains("@Getter\n@AllArgsConstructor\npublic class Pair"),
+            "expected stacked @Getter + @AllArgsConstructor:\n{rewritten}"
         );
         assert!(
             !rewritten.contains("public F getFirst()"),
@@ -9363,8 +9655,10 @@ mod tests {
             !rewritten.contains("public S getSecond()"),
             "getSecond should be removed:\n{rewritten}"
         );
-        // Constructor and fields preserved.
-        assert!(rewritten.contains("public Pair(final F first"));
+        assert!(
+            !rewritten.contains("public Pair(final F first"),
+            "canonical all-args ctor should be dropped:\n{rewritten}"
+        );
         assert!(rewritten.contains("private F first;"));
     }
 
@@ -9434,7 +9728,7 @@ mod tests {
         let params = java_plan_params("lombokify_java_class", &path);
         let err = plan_lombokify_java_class(&params).unwrap_err();
         assert!(
-            err.to_string().contains("no trivial getters"),
+            err.to_string().contains("no lombokifiable boilerplate"),
             "expected refusal explaining no trivial getters; got: {err}"
         );
     }
@@ -9484,7 +9778,7 @@ mod tests {
         let params = java_plan_params("lombokify_java_class", &path);
         let err = plan_lombokify_java_class(&params).unwrap_err();
         assert!(
-            err.to_string().contains("no trivial getters"),
+            err.to_string().contains("no lombokifiable boilerplate"),
             "expected refusal; got: {err}"
         );
     }
@@ -9560,17 +9854,22 @@ mod tests {
         let rewritten = apply_plan_to_source(&plan_text, &path);
         assert!(rewritten.contains("import lombok.Getter;"));
         assert!(rewritten.contains("import lombok.Setter;"));
+        assert!(rewritten.contains("import lombok.AllArgsConstructor;"));
         assert!(
-            rewritten.contains("@Getter\n@Setter\npublic class Pair"),
-            "expected class-level @Getter + @Setter:\n{rewritten}"
+            rewritten.contains(
+                "@Getter\n@Setter\n@AllArgsConstructor\npublic class Pair"
+            ),
+            "expected class-level @Getter + @Setter + @AllArgsConstructor:\n{rewritten}"
         );
-        // All four accessors removed.
+        // All four accessors and the canonical ctor removed.
         assert!(!rewritten.contains("public F getFirst()"));
         assert!(!rewritten.contains("public S getSecond()"));
         assert!(!rewritten.contains("public void setFirst("));
         assert!(!rewritten.contains("public void setSecond("));
-        // Constructor preserved (Phase 4 will lombokify it).
-        assert!(rewritten.contains("public Pair(final F first"));
+        assert!(
+            !rewritten.contains("public Pair(final F first"),
+            "canonical all-args ctor should be dropped:\n{rewritten}"
+        );
     }
 
     #[test]
@@ -9594,7 +9893,7 @@ mod tests {
         let params = java_plan_params("lombokify_java_class", &path);
         let err = plan_lombokify_java_class(&params).unwrap_err();
         assert!(
-            err.to_string().contains("no trivial"),
+            err.to_string().contains("no lombokifiable boilerplate"),
             "expected refusal; got: {err}"
         );
     }
@@ -9623,7 +9922,7 @@ mod tests {
         // lombokify in this class.
         let err = plan_lombokify_java_class(&params).unwrap_err();
         assert!(
-            err.to_string().contains("no trivial"),
+            err.to_string().contains("no lombokifiable boilerplate"),
             "expected refusal; got: {err}"
         );
     }
@@ -9661,13 +9960,18 @@ mod tests {
         let rewritten = apply_plan_to_source(&plan_text, &path);
         // class-level @Setter is correct — every NON-FINAL instance field
         // (label) has a deletable setter; final fields are excluded from
-        // coverage by definition.
+        // coverage by definition. Phase 4 also picks up the canonical
+        // single-final-arg ctor → @RequiredArgsConstructor.
         assert!(
-            rewritten.contains("@Setter\npublic class Frozen"),
-            "expected class-level @Setter on label-only class:\n{rewritten}"
+            rewritten.contains(
+                "@Setter\n@RequiredArgsConstructor\npublic class Frozen"
+            ),
+            "expected stacked @Setter + @RequiredArgsConstructor:\n{rewritten}"
         );
         assert!(rewritten.contains("import lombok.Setter;"));
+        assert!(rewritten.contains("import lombok.RequiredArgsConstructor;"));
         assert!(!rewritten.contains("public void setLabel("));
+        assert!(!rewritten.contains("public Frozen(final String id)"));
     }
 
     #[test]
@@ -9894,6 +10198,97 @@ mod tests {
         let result = plan_lombokify_java_class(&params);
         // No accessors and unpaired hashCode → bail.
         assert!(result.is_err(), "expected refusal; got: {result:?}");
+    }
+
+    #[test]
+    fn lombokify_noargs_ctor_emits_noargsconstructor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Empty.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Empty {\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   public Empty() {}\n\
+            \n\
+            \x20   public String getName() { return name; }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(rewritten.contains("import lombok.NoArgsConstructor;"));
+        assert!(rewritten.contains("@Getter\n@NoArgsConstructor\npublic class Empty"));
+        assert!(!rewritten.contains("public Empty() {}"));
+    }
+
+    #[test]
+    fn lombokify_skips_ctor_with_validation() {
+        // Constructor body has more than the canonical N assignments —
+        // detector refuses. A no-arg getter still lombokifies.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Validating.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Validating {\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   public Validating(String name) {\n\
+            \x20       if (name == null) throw new IllegalArgumentException();\n\
+            \x20       this.name = name;\n\
+            \x20   }\n\
+            \n\
+            \x20   public String getName() { return name; }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        // Getter lombokified; ctor preserved.
+        assert!(rewritten.contains("@Getter\npublic class Validating"));
+        assert!(
+            rewritten.contains("public Validating(String name)"),
+            "validation-bearing ctor must be preserved:\n{rewritten}"
+        );
+        assert!(!rewritten.contains("@AllArgsConstructor"));
+    }
+
+    #[test]
+    fn lombokify_skips_ctor_with_wrong_param_order() {
+        // Params don't match field declaration order → not canonical.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Reordered.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Reordered {\n\
+            \x20   private String first;\n\
+            \x20   private String second;\n\
+            \n\
+            \x20   public Reordered(String second, String first) {\n\
+            \x20       this.first = first;\n\
+            \x20       this.second = second;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        // Type signature still matches (both are String), but the body
+        // assignment order doesn't match parameter order — body iterates
+        // `this.first = first` (first param is `second` → mismatch).
+        // Detector refuses.
+        let result = plan_lombokify_java_class(&params);
+        assert!(
+            result.is_err(),
+            "wrong-order ctor should refuse; got: {result:?}"
+        );
     }
 
     #[test]
