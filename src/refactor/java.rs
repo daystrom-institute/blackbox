@@ -5264,6 +5264,412 @@ pub(crate) fn plan_java_lsp_organize_imports(
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// POJO DOJO — lombokify_java_class
+// Replace hand-rolled boilerplate (getters/setters/equals/hashCode/toString
+// /constructors) with Lombok annotations of equivalent semantics. Phase 1
+// ships getters → @Getter only; later phases add @Setter, @EqualsAndHashCode,
+// @ToString, @AllArgsConstructor / @RequiredArgsConstructor / @NoArgsConstructor,
+// and @Data/@Value collapse + @Slf4j.
+// ──────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct PojoField {
+    name: String,
+    type_name: String,
+    is_static: bool,
+    #[allow(dead_code)]
+    is_final: bool,
+    field_node_byte_start: usize,
+    #[allow(dead_code)]
+    field_node_byte_end: usize,
+}
+
+fn collect_pojo_fields(class_body: Node<'_>, source: &str) -> Vec<PojoField> {
+    let mut out = Vec::new();
+    let mut cursor = class_body.walk();
+    for child in class_body.named_children(&mut cursor) {
+        if child.kind() != "field_declaration" {
+            continue;
+        }
+        let Some(name) = java_field_declaration_name(child, source) else {
+            continue;
+        };
+        let Some(type_name) = java_field_type_text(child, source) else {
+            continue;
+        };
+        let mods = collect_java_modifiers(child);
+        let is_static = mods.iter().any(|(m, _, _)| m == "static");
+        let is_final = mods.iter().any(|(m, _, _)| m == "final");
+        out.push(PojoField {
+            name,
+            type_name,
+            is_static,
+            is_final,
+            field_node_byte_start: child.start_byte(),
+            field_node_byte_end: child.end_byte(),
+        });
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+struct ClassMethodInfo<'a> {
+    node: Node<'a>,
+    name: String,
+    return_type: Option<String>,
+    is_constructor: bool,
+}
+
+fn collect_direct_class_methods<'a>(
+    class_body: Node<'a>,
+    source: &str,
+) -> Vec<ClassMethodInfo<'a>> {
+    let mut out = Vec::new();
+    let mut cursor = class_body.walk();
+    for child in class_body.named_children(&mut cursor) {
+        let kind = child.kind();
+        if kind != "method_declaration" && kind != "constructor_declaration" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(name) = name_node.utf8_text(source.as_bytes()) else {
+            continue;
+        };
+        let return_type = child
+            .child_by_field_name("type")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(|s| s.trim().to_string());
+        out.push(ClassMethodInfo {
+            node: child,
+            name: name.to_string(),
+            return_type,
+            is_constructor: kind == "constructor_declaration",
+        });
+    }
+    out
+}
+
+fn normalize_type_text(t: &str) -> String {
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_public_method_node(method: Node<'_>) -> bool {
+    collect_java_modifiers(method)
+        .iter()
+        .any(|(m, _, _)| m == "public")
+}
+
+/// True iff `body` is a single-statement block returning the field value
+/// (`return name;` or `return this.name;`). Whitespace and comments inside
+/// the block are tolerated; anything else (logging, transforms, null
+/// coalescing, caching) disqualifies.
+fn is_trivial_field_return(body: Node<'_>, field_name: &str, source: &str) -> bool {
+    if body.kind() != "block" {
+        return false;
+    }
+    let mut cursor = body.walk();
+    let stmts: Vec<Node<'_>> = body
+        .named_children(&mut cursor)
+        .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+        .collect();
+    if stmts.len() != 1 {
+        return false;
+    }
+    let stmt = stmts[0];
+    if stmt.kind() != "return_statement" {
+        return false;
+    }
+    let Some(expr) = stmt.named_child(0) else {
+        return false;
+    };
+    match expr.kind() {
+        "identifier" => expr
+            .utf8_text(source.as_bytes())
+            .ok()
+            .is_some_and(|t| t == field_name),
+        "field_access" => {
+            let object = expr.child_by_field_name("object");
+            let field = expr.child_by_field_name("field");
+            match (object, field) {
+                (Some(o), Some(f)) => {
+                    o.kind() == "this"
+                        && f.utf8_text(source.as_bytes()).ok() == Some(field_name)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// True iff `node` is directly preceded in the source by a /** ... */
+/// Javadoc-style block comment with only whitespace between them. The
+/// tree-sitter `class_body` node lists block_comment as a sibling of the
+/// method, so we walk siblings to find the immediate preceding non-trivia
+/// node.
+fn has_preceding_javadoc(node: Node<'_>, source: &str) -> bool {
+    let Some(prev) = node.prev_named_sibling() else {
+        return false;
+    };
+    if prev.kind() != "block_comment" {
+        return false;
+    }
+    let Ok(text) = prev.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    if !text.starts_with("/**") {
+        return false;
+    }
+    let between = &source.as_bytes()[prev.end_byte()..node.start_byte()];
+    between.iter().all(|b| b.is_ascii_whitespace())
+}
+
+/// Detect the trivial-getter method for `field` among `methods`. Returns
+/// the matched method node, or None if no method qualifies.
+///
+/// A getter qualifies iff:
+///   * its name is `getFoo` (or `isFoo` for boolean fields, accepted in
+///     addition to `getFoo`)
+///   * it takes no parameters
+///   * its declared return type matches the field's type
+///   * it is `public`
+///   * its body is exactly `return field;` or `return this.field;`
+///   * it is not preceded by a Javadoc block (we don't want to silently
+///     drop documentation)
+fn detect_trivial_getter<'a>(
+    methods: &[ClassMethodInfo<'a>],
+    field: &PojoField,
+    source: &str,
+) -> Option<Node<'a>> {
+    let cap = capitalize_first(&field.name);
+    let primary = format!("get{}", cap);
+    let boolean_alt = (field.type_name == "boolean" || field.type_name == "Boolean")
+        .then(|| format!("is{}", cap));
+
+    for m in methods {
+        if m.is_constructor {
+            continue;
+        }
+        if m.name != primary && Some(&m.name) != boolean_alt.as_ref() {
+            continue;
+        }
+        let Some(params) = m.node.child_by_field_name("parameters") else {
+            continue;
+        };
+        if params.named_child_count() != 0 {
+            continue;
+        }
+        let Some(rt) = m.return_type.as_deref() else {
+            continue;
+        };
+        if normalize_type_text(rt) != normalize_type_text(&field.type_name) {
+            continue;
+        }
+        if !is_public_method_node(m.node) {
+            continue;
+        }
+        let Some(body) = m.node.child_by_field_name("body") else {
+            continue;
+        };
+        if !is_trivial_field_return(body, &field.name, source) {
+            continue;
+        }
+        if has_preceding_javadoc(m.node, source) {
+            continue;
+        }
+        return Some(m.node);
+    }
+    None
+}
+
+/// Compute the byte range to delete for a method declaration, including
+/// trailing whitespace + one newline so the deletion doesn't leave orphan
+/// blank lines behind. Walks back over leading whitespace on the method's
+/// own line; if the resulting line is now empty, also pulls back over a
+/// single preceding blank line.
+fn method_drop_range(method: Node<'_>, source: &str) -> (usize, usize) {
+    let bytes = source.as_bytes();
+    let mut start = method.start_byte();
+    while start > 0 && bytes[start - 1] != b'\n' && bytes[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    if start > 0 && bytes[start - 1] == b'\n' {
+        let mut probe = start - 1;
+        let line_start = bytes[..probe]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        if bytes[line_start..probe].iter().all(|&b| b.is_ascii_whitespace()) {
+            probe = line_start;
+            start = probe;
+        }
+    }
+    let mut end = method.end_byte();
+    while end < bytes.len() && bytes[end] != b'\n' && bytes[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    if end < bytes.len() && bytes[end] == b'\n' {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Compute the byte position and indentation prefix for inserting a
+/// per-field annotation immediately before the field declaration. Returns
+/// (insert_at, indent) where `indent` is the leading whitespace on the
+/// field's own line — annotations are emitted as `{ANN}\n{indent}`.
+fn field_annotation_insert(field: &PojoField, source: &str) -> (usize, String) {
+    let bytes = source.as_bytes();
+    let mut probe = field.field_node_byte_start;
+    while probe > 0 && bytes[probe - 1] != b'\n' && bytes[probe - 1].is_ascii_whitespace() {
+        probe -= 1;
+    }
+    let indent = String::from_utf8_lossy(&bytes[probe..field.field_node_byte_start]).to_string();
+    (field.field_node_byte_start, indent)
+}
+
+pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let parsed = parse_source_file(&source_path)?;
+    if parsed.language != "java" {
+        bail!("lombokify_java_class only supports java files");
+    }
+
+    let class_node = match p.item_names.as_deref().and_then(|n| n.first()) {
+        Some(name) => find_class_declaration_by_name(&parsed, name).ok_or_else(|| {
+            anyhow!(
+                "class `{name}` not found in {}",
+                source_path.display()
+            )
+        })?,
+        None => find_first_class_declaration(parsed.tree.root_node())
+            .ok_or_else(|| anyhow!("no class declaration found in {}", source_path.display()))?,
+    };
+    if class_node.kind() != "class_declaration" {
+        bail!(
+            "lombokify_java_class only supports class_declaration; got `{}`",
+            class_node.kind()
+        );
+    }
+    let class_name = java_class_name(class_node, &parsed.source);
+    let body = class_node
+        .child_by_field_name("body")
+        .ok_or_else(|| anyhow!("{class_name} has no class body"))?;
+
+    let fields = collect_pojo_fields(body, &parsed.source);
+    let instance_fields: Vec<&PojoField> = fields.iter().filter(|f| !f.is_static).collect();
+    if instance_fields.is_empty() {
+        bail!("{class_name} has no instance fields; nothing to lombokify");
+    }
+
+    let methods = collect_direct_class_methods(body, &parsed.source);
+
+    let mut field_to_getter: std::collections::BTreeMap<String, Node<'_>> =
+        std::collections::BTreeMap::new();
+    for field in &instance_fields {
+        if let Some(method_node) = detect_trivial_getter(&methods, field, &parsed.source) {
+            field_to_getter.insert(field.name.clone(), method_node);
+        }
+    }
+    if field_to_getter.is_empty() {
+        bail!(
+            "{class_name} has no trivial getters to replace with @Getter (Phase 1 supports only `return field;` / `return this.field;` bodies)"
+        );
+    }
+
+    let all_fields_have_getter = instance_fields
+        .iter()
+        .all(|f| field_to_getter.contains_key(&f.name));
+
+    let mut text_edits: Vec<TextEdit> = Vec::new();
+
+    // Drop each matched getter method (with surrounding whitespace cleanup).
+    for method_node in field_to_getter.values() {
+        let (start, end) = method_drop_range(*method_node, &parsed.source);
+        text_edits.push(TextEdit {
+            byte_start: start,
+            byte_end: end,
+            replacement: String::new(),
+        });
+    }
+
+    // Add @Getter — class-level when every instance field is covered, else
+    // per-field on the matched ones. (Class-level @Getter on a class that
+    // still has a hand-rolled getter for an unmatched field would conflict
+    // at compile time, so partial coverage forces per-field.)
+    if all_fields_have_getter {
+        text_edits.push(TextEdit {
+            byte_start: class_node.start_byte(),
+            byte_end: class_node.start_byte(),
+            replacement: "@Getter\n".to_string(),
+        });
+    } else {
+        for field in &instance_fields {
+            if !field_to_getter.contains_key(&field.name) {
+                continue;
+            }
+            let (insert_at, indent) = field_annotation_insert(field, &parsed.source);
+            text_edits.push(TextEdit {
+                byte_start: insert_at,
+                byte_end: insert_at,
+                replacement: format!("@Getter\n{indent}"),
+            });
+        }
+    }
+
+    // Inject `import lombok.Getter;` when not already present.
+    let imports = extract_java_imports(&parsed.source);
+    let already_has_import = imports.iter().any(|i| {
+        let body = i.trim().strip_prefix("import ").unwrap_or("").trim_end_matches(';').trim();
+        body == "lombok.Getter" || body == "lombok.*"
+    });
+    if !already_has_import {
+        let (_first_import, last_import_end, package_end) =
+            java_import_block_range(&parsed.source);
+        let (insert_at, replacement) = if last_import_end > 0 {
+            (last_import_end, "import lombok.Getter;\n".to_string())
+        } else {
+            (package_end, "\nimport lombok.Getter;\n".to_string())
+        };
+        text_edits.push(TextEdit {
+            byte_start: insert_at,
+            byte_end: insert_at,
+            replacement,
+        });
+    }
+
+    text_edits.sort_by_key(|e| (e.byte_start, e.byte_end));
+
+    let plan = RefactorPlan {
+        title: format!(
+            "Lombokify {} trivial getter(s) on `{class_name}` in {}",
+            field_to_getter.len(),
+            source_path.display()
+        ),
+        kind: "lombokify_java_class".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: false,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: text_edits,
+        }],
+        validations: parse_validation_step_for_path(&source_path),
+        items: Vec::new(),
+        leftovers: Vec::new(),
+        captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
+    };
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8271,5 +8677,267 @@ mod tests {
             target_replacement.contains("import b.MaybeAdded;"),
             "expected `import b.MaybeAdded;` added by heuristic: {target_replacement}"
         );
+    }
+
+    /// Apply the in-memory plan to the source text (single-file Phase 1
+    /// helper) and return the rewritten source. Mirrors how
+    /// `apply()` would write the file at byte offsets, sorted descending
+    /// so earlier offsets stay valid.
+    fn apply_plan_to_source(plan_text: &str, source_path: &Path) -> String {
+        let plan: RefactorPlan = serde_json::from_str(plan_text).unwrap();
+        assert_eq!(plan.edits.len(), 1, "Phase 1 emits one FileEdit");
+        let mut text = fs::read_to_string(source_path).unwrap();
+        let mut edits = plan.edits[0].edits.clone();
+        edits.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
+        for e in edits {
+            text.replace_range(e.byte_start..e.byte_end, &e.replacement);
+        }
+        text
+    }
+
+    #[test]
+    fn lombokify_full_coverage_emits_class_level_getter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Pair.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Pair<F, S> {\n\
+            \x20   private F first;\n\
+            \x20   private S second;\n\
+            \n\
+            \x20   public Pair(final F first, final S second) {\n\
+            \x20       this.first = first;\n\
+            \x20       this.second = second;\n\
+            \x20   }\n\
+            \n\
+            \x20   public F getFirst() {\n\
+            \x20       return first;\n\
+            \x20   }\n\
+            \n\
+            \x20   public S getSecond() {\n\
+            \x20       return second;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(
+            rewritten.contains("import lombok.Getter;"),
+            "expected lombok import:\n{rewritten}"
+        );
+        assert!(
+            rewritten.contains("@Getter\npublic class Pair"),
+            "expected class-level @Getter:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("public F getFirst()"),
+            "getFirst should be removed:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("public S getSecond()"),
+            "getSecond should be removed:\n{rewritten}"
+        );
+        // Constructor and fields preserved.
+        assert!(rewritten.contains("public Pair(final F first"));
+        assert!(rewritten.contains("private F first;"));
+    }
+
+    #[test]
+    fn lombokify_partial_coverage_emits_per_field_getter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Mixed.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Mixed {\n\
+            \x20   private String name;\n\
+            \x20   private int count;\n\
+            \n\
+            \x20   public String getName() {\n\
+            \x20       return name;\n\
+            \x20   }\n\
+            \n\
+            \x20   public int getCount() {\n\
+            \x20       return count == 0 ? -1 : count;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(rewritten.contains("import lombok.Getter;"));
+        // Per-field annotation on `name` only; non-trivial getCount kept.
+        assert!(
+            rewritten.contains("@Getter\n    private String name;"),
+            "expected per-field @Getter on name:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("@Getter\npublic class"),
+            "should NOT emit class-level @Getter when coverage is partial:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("public String getName()"),
+            "getName removed:\n{rewritten}"
+        );
+        assert!(
+            rewritten.contains("public int getCount()"),
+            "non-trivial getCount preserved:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    fn lombokify_skips_javadoc_bearing_getter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Doc.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Doc {\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   /** Returns the name. */\n\
+            \x20   public String getName() {\n\
+            \x20       return name;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let err = plan_lombokify_java_class(&params).unwrap_err();
+        assert!(
+            err.to_string().contains("no trivial getters"),
+            "expected refusal explaining no trivial getters; got: {err}"
+        );
+    }
+
+    #[test]
+    fn lombokify_boolean_field_accepts_is_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Flag.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Flag {\n\
+            \x20   private boolean active;\n\
+            \n\
+            \x20   public boolean isActive() {\n\
+            \x20       return active;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(rewritten.contains("@Getter\npublic class Flag"));
+        assert!(!rewritten.contains("public boolean isActive()"));
+    }
+
+    #[test]
+    fn lombokify_skips_non_trivial_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Lazy.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Lazy {\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   public String getName() {\n\
+            \x20       if (name == null) name = \"\";\n\
+            \x20       return name;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let err = plan_lombokify_java_class(&params).unwrap_err();
+        assert!(
+            err.to_string().contains("no trivial getters"),
+            "expected refusal; got: {err}"
+        );
+    }
+
+    #[test]
+    fn lombokify_preserves_existing_lombok_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Pre.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             import lombok.Getter;\n\
+             \n\
+             public class Pre {\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   public String getName() {\n\
+            \x20       return this.name;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        // Exactly one Getter import line, not duplicated.
+        assert_eq!(
+            rewritten.matches("import lombok.Getter;").count(),
+            1,
+            "import should not be duplicated:\n{rewritten}"
+        );
+        assert!(rewritten.contains("@Getter\npublic class Pre"));
+    }
+
+    #[test]
+    fn lombokify_apply_writes_clean_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Pair.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Pair {\n\
+            \x20   private String first;\n\
+            \x20   private String second;\n\
+            \n\
+            \x20   public String getFirst() { return first; }\n\
+            \x20   public String getSecond() { return second; }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok", "apply should succeed: {response}");
+        assert!(
+            applied.validations.iter().all(|v| !v.has_error),
+            "rewritten file must parse cleanly: {response}"
+        );
+        let final_text = fs::read_to_string(&path).unwrap();
+        assert!(final_text.contains("@Getter\npublic class Pair"));
+        assert!(final_text.contains("import lombok.Getter;"));
+        assert!(!final_text.contains("getFirst()"));
+        assert!(!final_text.contains("getSecond()"));
     }
 }
