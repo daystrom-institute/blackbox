@@ -47,6 +47,7 @@ nav:
     - Agent System: agent-system.md
     - Badgey: badgey.md
     - Councils & Whiteboards: councils-whiteboards.md
+    - MCP Surfaces: mcp-surfaces.md
     - Roadmap Tool: roadmap-tool.md
   - Integrations:
     - Ingress Paths: ingress-paths.md
