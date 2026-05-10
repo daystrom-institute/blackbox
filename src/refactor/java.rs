@@ -5427,33 +5427,71 @@ fn has_preceding_javadoc(node: Node<'_>, source: &str) -> bool {
     between.iter().all(|b| b.is_ascii_whitespace())
 }
 
+/// Compute the getter method name Lombok's `@Getter` would generate for a
+/// given field, applying Lombok's primitive-`boolean` `is-` prefix rule
+/// (vs the default `get-` for everything else, including boxed `Boolean`).
+/// If the field name already begins with `is` followed by a capital
+/// letter, Lombok's primitive-boolean form preserves the field name as-is
+/// rather than producing `isIsCap`.
+fn lombok_generated_getter_name(field: &PojoField) -> String {
+    let cap = capitalize_first(&field.name);
+    if field.type_name == "boolean" {
+        let starts_with_is = field.name.starts_with("is")
+            && field
+                .name
+                .chars()
+                .nth(2)
+                .is_some_and(|c| c.is_ascii_uppercase());
+        if starts_with_is {
+            field.name.clone()
+        } else {
+            format!("is{cap}")
+        }
+    } else {
+        format!("get{cap}")
+    }
+}
+
 /// Detect the trivial-getter method for `field` among `methods`. Returns
-/// the matched method node, or None if no method qualifies.
+/// `Some((node, matched_name))` when a method qualifies, or None.
 ///
 /// A getter qualifies iff:
-///   * its name is `getFoo` (or `isFoo` for boolean fields, accepted in
-///     addition to `getFoo`)
+///   * its name is `getFoo` (or `isFoo` when the field type accepts the
+///     `is-` prefix — primitive `boolean` always, boxed `Boolean`
+///     accepted as a tolerant alternate)
 ///   * it takes no parameters
 ///   * its declared return type matches the field's type
 ///   * it is `public`
 ///   * its body is exactly `return field;` or `return this.field;`
-///   * it is not preceded by a Javadoc block (we don't want to silently
-///     drop documentation)
+///   * it is not preceded by a Javadoc block
+///
+/// The returned `matched_name` is the original method's name as written
+/// in source. Caller compares it to `lombok_generated_getter_name(field)`
+/// to decide whether dropping this method changes the public API
+/// (Gap 1: primitive `boolean` field with hand-rolled `getFoo()` → Lombok
+/// generates `isFoo()`, every caller of `getFoo()` breaks silently).
 fn detect_trivial_getter<'a>(
     methods: &[ClassMethodInfo<'a>],
     field: &PojoField,
     source: &str,
-) -> Option<Node<'a>> {
+) -> Option<(Node<'a>, String)> {
     let cap = capitalize_first(&field.name);
     let primary = format!("get{}", cap);
     let boolean_alt = (field.type_name == "boolean" || field.type_name == "Boolean")
         .then(|| format!("is{}", cap));
+    // Lombok's generated form for THIS field — needed when the field
+    // already starts with `is` (e.g., `boolean isActive` → `isActive()`,
+    // not the double-prefixed `isIsActive()`).
+    let lombok_form = lombok_generated_getter_name(field);
 
     for m in methods {
         if m.is_constructor {
             continue;
         }
-        if m.name != primary && Some(&m.name) != boolean_alt.as_ref() {
+        let name_matches = m.name == primary
+            || Some(&m.name) == boolean_alt.as_ref()
+            || m.name == lombok_form;
+        if !name_matches {
             continue;
         }
         let Some(params) = m.node.child_by_field_name("parameters") else {
@@ -5480,9 +5518,59 @@ fn detect_trivial_getter<'a>(
         if has_preceding_javadoc(m.node, source) {
             continue;
         }
-        return Some(m.node);
+        return Some((m.node, m.name.clone()));
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BooleanGetterStrategy {
+    Skip,
+    Bridge,
+    Rename,
+}
+
+fn parse_boolean_getter_strategy(s: Option<&str>) -> Result<BooleanGetterStrategy> {
+    match s.unwrap_or("skip") {
+        "skip" => Ok(BooleanGetterStrategy::Skip),
+        "bridge" => Ok(BooleanGetterStrategy::Bridge),
+        "rename" => Ok(BooleanGetterStrategy::Rename),
+        other => bail!(
+            "boolean_getter_strategy must be one of: skip, bridge, rename; got `{other}`"
+        ),
+    }
+}
+
+/// Render a one-line bridge method preserving the original getter name.
+/// Used by `BooleanGetterStrategy::Bridge` so callers of the original
+/// getter continue to compile after Lombok's @Getter generates a
+/// differently-named accessor.
+///
+/// Output format (with the original method's leading indent):
+/// ```text
+///     public boolean getXxx() {
+///         return isXxx();
+///     }
+/// ```
+fn render_getter_bridge(
+    field: &PojoField,
+    original_name: &str,
+    lombok_name: &str,
+    original_getter: Node<'_>,
+    source: &str,
+) -> String {
+    let bytes = source.as_bytes();
+    let mut probe = original_getter.start_byte();
+    while probe > 0 && bytes[probe - 1] != b'\n' && bytes[probe - 1].is_ascii_whitespace() {
+        probe -= 1;
+    }
+    let indent = String::from_utf8_lossy(&bytes[probe..original_getter.start_byte()]).to_string();
+    format!(
+        "\n{indent}public {ret} {orig}() {{\n{indent}    return {lombok}();\n{indent}}}\n",
+        ret = field.type_name,
+        orig = original_name,
+        lombok = lombok_name,
+    )
 }
 
 /// True iff `body` is a single-statement block of the form
@@ -6412,13 +6500,44 @@ fn plan_lombokify_java_class_single(
 
     let methods = collect_direct_class_methods(body, &parsed.source);
 
+    let bool_strategy = parse_boolean_getter_strategy(p.boolean_getter_strategy.as_deref())?;
     let mut field_to_getter: std::collections::BTreeMap<String, Node<'_>> =
         std::collections::BTreeMap::new();
+    // Per-getter bridge replacement text — populated only for fields where
+    // the original getter name diverges from what Lombok would generate
+    // AND `boolean_getter_strategy` is `bridge`. Keyed by method
+    // start_byte (matches the dedupe set in `drop_method`).
+    let mut bridge_replacements: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     let mut field_to_setter: std::collections::BTreeMap<String, Node<'_>> =
         std::collections::BTreeMap::new();
     for field in &instance_fields {
-        if let Some(method_node) = detect_trivial_getter(&methods, field, &parsed.source) {
-            field_to_getter.insert(field.name.clone(), method_node);
+        if let Some((method_node, matched_name)) =
+            detect_trivial_getter(&methods, field, &parsed.source)
+        {
+            let lombok_name = lombok_generated_getter_name(field);
+            let api_mismatch = matched_name != lombok_name;
+            match (api_mismatch, bool_strategy) {
+                (true, BooleanGetterStrategy::Skip) => {
+                    // Leave this field's getter intact: don't add to
+                    // field_to_getter so no @Getter is emitted for it,
+                    // and the hand-rolled method survives.
+                }
+                (true, BooleanGetterStrategy::Bridge) => {
+                    let bridge = render_getter_bridge(
+                        field,
+                        &matched_name,
+                        &lombok_name,
+                        method_node,
+                        &parsed.source,
+                    );
+                    bridge_replacements.insert(method_node.start_byte(), bridge);
+                    field_to_getter.insert(field.name.clone(), method_node);
+                }
+                (true, BooleanGetterStrategy::Rename) | (false, _) => {
+                    field_to_getter.insert(field.name.clone(), method_node);
+                }
+            }
         }
         if let Some(method_node) = detect_trivial_setter(&methods, field, &parsed.source) {
             field_to_setter.insert(field.name.clone(), method_node);
@@ -6601,48 +6720,52 @@ fn plan_lombokify_java_class_single(
     let mut method_drops_seen: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
 
-    // Drop each matched accessor method exactly once (a method can only be
-    // a getter OR a setter, never both, but defensive dedupe is cheap).
-    let drop_method = |text_edits: &mut Vec<TextEdit>,
-                       seen: &mut std::collections::HashSet<usize>,
-                       node: Node<'_>| {
-        if !seen.insert(node.start_byte()) {
-            return;
-        }
-        let (start, end) = method_drop_range(node, &parsed.source);
-        text_edits.push(TextEdit {
-            byte_start: start,
-            byte_end: end,
-            replacement: String::new(),
-        });
-    };
+    // Drop each matched accessor method exactly once. If the method's
+    // start_byte is registered in `bridge_replacements`, emit the bridge
+    // method text as the replacement instead of empty string.
+    let drop_method =
+        |text_edits: &mut Vec<TextEdit>,
+         seen: &mut std::collections::HashSet<usize>,
+         node: Node<'_>,
+         replacement: Option<&String>| {
+            if !seen.insert(node.start_byte()) {
+                return;
+            }
+            let (start, end) = method_drop_range(node, &parsed.source);
+            text_edits.push(TextEdit {
+                byte_start: start,
+                byte_end: end,
+                replacement: replacement.cloned().unwrap_or_default(),
+            });
+        };
     for method_node in field_to_getter.values() {
-        drop_method(&mut text_edits, &mut method_drops_seen, *method_node);
+        let bridge = bridge_replacements.get(&method_node.start_byte());
+        drop_method(&mut text_edits, &mut method_drops_seen, *method_node, bridge);
     }
     for method_node in field_to_setter.values() {
-        drop_method(&mut text_edits, &mut method_drops_seen, *method_node);
+        drop_method(&mut text_edits, &mut method_drops_seen, *method_node, None);
     }
     if emit_equals_and_hashcode {
         if let Some(eq) = equals_method {
-            drop_method(&mut text_edits, &mut method_drops_seen, eq);
+            drop_method(&mut text_edits, &mut method_drops_seen, eq, None);
         }
         if let Some(hc) = hashcode_method {
-            drop_method(&mut text_edits, &mut method_drops_seen, hc);
+            drop_method(&mut text_edits, &mut method_drops_seen, hc, None);
         }
     }
     if emit_tostring {
         if let Some(ts) = tostring_method {
-            drop_method(&mut text_edits, &mut method_drops_seen, ts);
+            drop_method(&mut text_edits, &mut method_drops_seen, ts, None);
         }
     }
     if let Some(c) = noargs_ctor {
-        drop_method(&mut text_edits, &mut method_drops_seen, c);
+        drop_method(&mut text_edits, &mut method_drops_seen, c, None);
     }
     if let Some(c) = allargs_ctor {
-        drop_method(&mut text_edits, &mut method_drops_seen, c);
+        drop_method(&mut text_edits, &mut method_drops_seen, c, None);
     }
     if let Some(c) = requiredargs_ctor {
-        drop_method(&mut text_edits, &mut method_drops_seen, c);
+        drop_method(&mut text_edits, &mut method_drops_seen, c, None);
     }
     if let Some(field_node) = slf4j_field {
         let (start, end) = field_drop_range(field_node, &parsed.source);
@@ -6911,6 +7034,7 @@ mod tests {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             project_dir: None,
+            boolean_getter_strategy: None,
         }
     }
 
@@ -10916,6 +11040,167 @@ mod tests {
         for skip in plan.leftovers.iter().take(5) {
             eprintln!("    - {skip}");
         }
+    }
+
+    #[test]
+    fn lombokify_boolean_with_get_prefix_skipped_by_default() {
+        // Gap 1 case: `boolean showColumn` with hand-rolled `getShowColumn()`.
+        // Lombok @Getter would generate `isShowColumn()`, so dropping the
+        // hand-rolled getter would silently break callers. Default
+        // boolean_getter_strategy=skip preserves the original method and
+        // refuses class-level @Getter (since one field would be uncovered).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Report.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Report {\n\
+            \x20   private boolean showColumn;\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   public boolean getShowColumn() { return showColumn; }\n\
+            \x20   public String getName() { return name; }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        // showColumn's hand-rolled `getShowColumn()` survives.
+        assert!(
+            rewritten.contains("public boolean getShowColumn()"),
+            "boolean getter with get-prefix must be preserved by default:\n{rewritten}"
+        );
+        // name still gets per-field @Getter.
+        assert!(
+            rewritten.contains("@Getter\n    private String name;"),
+            "non-conflicting getter still lombokifies per-field:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("@Getter\npublic class Report"),
+            "class-level @Getter must NOT fire when one field would mismatch:\n{rewritten}"
+        );
+        assert!(!rewritten.contains("public String getName()"));
+    }
+
+    #[test]
+    fn lombokify_boolean_get_prefix_bridge_strategy() {
+        // boolean_getter_strategy=bridge: drop original, emit bridge so
+        // callers using `getShowColumn()` still compile alongside Lombok's
+        // `isShowColumn()`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Report.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Report {\n\
+            \x20   private boolean showColumn;\n\
+            \n\
+            \x20   public boolean getShowColumn() { return showColumn; }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("lombokify_java_class", &path);
+        params.boolean_getter_strategy = Some("bridge".to_string());
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        // Class-level @Getter fires (full coverage now); the original
+        // method body is replaced with a bridge that delegates to
+        // Lombok's generated `isShowColumn()`.
+        assert!(
+            rewritten.contains("@Getter\npublic class Report"),
+            "class-level @Getter expected:\n{rewritten}"
+        );
+        assert!(
+            rewritten.contains("public boolean getShowColumn() {")
+                && rewritten.contains("return isShowColumn();"),
+            "bridge method must preserve get-prefix name and call lombok form:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    fn lombokify_boolean_get_prefix_rename_strategy() {
+        // boolean_getter_strategy=rename: drop original, accept Lombok's
+        // name change. Caller-breaking but explicit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Report.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Report {\n\
+            \x20   private boolean showColumn;\n\
+            \n\
+            \x20   public boolean getShowColumn() { return showColumn; }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("lombokify_java_class", &path);
+        params.boolean_getter_strategy = Some("rename".to_string());
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(
+            rewritten.contains("@Getter\npublic class Report"),
+            "expected class-level @Getter:\n{rewritten}"
+        );
+        // No bridge — original is gone, Lombok's generated isShowColumn() will surface.
+        assert!(
+            !rewritten.contains("public boolean getShowColumn()"),
+            "rename strategy drops the original; got:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("return isShowColumn();"),
+            "rename strategy must NOT emit bridge:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    fn lombokify_boolean_with_is_prefix_field_no_mismatch() {
+        // Field name `isActive` with getter `isActive()` — Lombok would
+        // also generate `isActive()` (no double-prefix), so no API
+        // mismatch. Default strategy still applies normally.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Flag.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Flag {\n\
+            \x20   private boolean isActive;\n\
+            \n\
+            \x20   public boolean isActive() { return isActive; }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(
+            rewritten.contains("@Getter\npublic class Flag"),
+            "no-mismatch case lombokifies normally:\n{rewritten}"
+        );
+        assert!(!rewritten.contains("public boolean isActive()"));
+    }
+
+    #[test]
+    fn lombokify_invalid_strategy_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("X.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             public class X { private String name; public String getName() { return name; } }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("lombokify_java_class", &path);
+        params.boolean_getter_strategy = Some("nonsense".to_string());
+        let err = plan_lombokify_java_class(&params).unwrap_err();
+        assert!(
+            err.to_string().contains("boolean_getter_strategy"),
+            "expected param-validation error: {err}"
+        );
     }
 
     /// End-to-end probe: copies LOMBOKIFY_PROBE_FILE into a tempdir,

@@ -280,6 +280,20 @@ pub struct RefactorPlanParams {
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
+    /// `lombokify_java_class`: how to handle a primitive `boolean` field
+    /// whose hand-rolled getter uses `get-` prefix (e.g., `getShowFlag()`
+    /// for `boolean showFlag`). Lombok's @Getter generates `isShowFlag()`,
+    /// so dropping the original would break every caller of the get-prefix
+    /// form. Values: `skip` (default — leave the field alone, fall back to
+    /// per-field placement on others), `bridge` (drop original, emit
+    /// `public boolean getXxx() { return isXxx(); }` after @Getter so
+    /// callers continue to compile), `rename` (drop original and accept
+    /// Lombok's name change — only safe when callers don't exist or are
+    /// being rewritten in the same pass). The same logic applies in
+    /// reverse for boxed `Boolean` fields whose hand-rolled getter uses
+    /// `is-` prefix (Lombok generates `getXxx()` for boxed types).
+    #[serde(default)]
+    pub boolean_getter_strategy: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
