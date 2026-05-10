@@ -644,6 +644,31 @@ emits `Foo@hash[field=value, ...]`; Lombok `@ToString` emits
 (matching field set + matching order); toString output FORMAT changes.
 Callers that depend on a specific toString format should opt out.
 
+**Boolean-getter API safety (Gap 1).** When a primitive `boolean`
+field has a hand-rolled `getXxx()` getter, dropping it would silently
+break callers because Lombok's `@Getter` generates `isXxx()`. The
+default `boolean_getter_strategy: "skip"` preserves the original
+getter and falls back to per-field placement on the rest of the
+class. Pass `boolean_getter_strategy: "bridge"` to drop the original
+and emit a one-line bridge `public boolean getXxx() { return isXxx(); }`
+so callers continue to compile alongside Lombok's generated form.
+Pass `"rename"` to drop without a bridge — only when callers don't
+exist or are being rewritten in the same pass. Symmetric for boxed
+`Boolean` with `is-`prefix getters (Lombok generates `getXxx()` for
+boxed types).
+
+**Plan-to-file (Gap 3 + response-size).** Pass
+`output_path: "<filepath>"` to write the full RefactorPlan JSON to
+disk and receive a compact `RefactorPlanSummary` instead of the full
+plan body inline. Required for large refactors whose plan JSON
+exceeds the MCP transport's parameter-string limit (e.g., a class
+with hundreds of trivial accessors). Apply the saved plan via
+`bbox_refactor_apply(plan_path="<filepath>", confirm=true)` — the
+apply path reads from disk and runs the same transactional pipeline
+as inline plans. Summary contains: `plan_path`, kind, file/edit
+counts, per-file (`path`, `edit_count`, `original_sha256`), and the
+full `leftovers` list (already small).
+
 **Bulk mode.** When `source` resolves to a directory, the planner
 walks every `.java` file beneath it (skipping `target/`, `build/`,
 `out/`, hidden dirs), runs the single-file lombokifier per class, and
@@ -669,6 +694,30 @@ In bulk mode `item_names` is ignored — every file targets its first
 top-level class (the standard `Foo.java` contains class `Foo`
 convention). Inner classes are not converted in bulk mode; invoke
 single-file mode with `item_names=[<inner>]` if you need that.
+
+14c. Curated-batch lombokification with per-step skip:
+
+```text
+bbox_refactor_run(
+  title="lombokify curated batch",
+  project_dir="/absolute/project/root",
+  confirm=true,
+  steps=[
+    {"op":"plan","kind":"lombokify_java_class","source":"src/.../A.java","optional":true},
+    {"op":"plan","kind":"lombokify_java_class","source":"src/.../B.java","optional":true},
+    {"op":"plan","kind":"lombokify_java_class","source":"src/.../C.java","optional":true},
+    {"op":"command","command":"./gradlew","args":["compileJava"]}
+  ]
+)
+```
+
+`optional: true` on plan steps converts plan-time failures (e.g., "no
+lombokifiable boilerplate") into per-step `skipped` entries in the run
+report rather than aborting the whole batch (Gap 2 from
+JAVA_TOOL_GAPS — a single non-POJO file in a 7-file batch was rolling
+back 4 successfully-written prior steps). Default `optional: false`
+preserves strict batch semantics for refactors where every step must
+succeed.
 
 15. Compound run — full extract-interface flow with rollback:
 
