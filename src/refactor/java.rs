@@ -6129,6 +6129,104 @@ fn classify_constructor(
     }
 }
 
+/// Detect a Lombok-equivalent SLF4J logger field of the form
+/// `private static final Logger log = LoggerFactory.getLogger(<class>.class);`
+/// and return its `field_declaration` node when matched.
+///
+/// Strict requirements (matching Lombok's `@Slf4j` generated field):
+///   * field name `log` (exact)
+///   * type `Logger` (we don't resolve `org.slf4j.Logger` qualification —
+///     the user's existing imports are trusted)
+///   * modifiers `private static final`
+///   * initializer is `LoggerFactory.getLogger(<ThisClass>.class)` where
+///     `<ThisClass>` matches the enclosing class's name
+fn detect_slf4j_logger_field<'a>(
+    class_body: Node<'a>,
+    class_name: &str,
+    source: &str,
+) -> Option<Node<'a>> {
+    let mut cursor = class_body.walk();
+    for child in class_body.named_children(&mut cursor) {
+        if child.kind() != "field_declaration" {
+            continue;
+        }
+        let mods: std::collections::HashSet<String> = collect_java_modifiers(child)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        if !mods.contains("private") || !mods.contains("static") || !mods.contains("final") {
+            continue;
+        }
+        let Some(type_text) = java_field_type_text(child, source) else {
+            continue;
+        };
+        if type_text != "Logger" {
+            continue;
+        }
+        // Inspect the variable_declarator: name and value (initializer).
+        let mut decls = child.walk();
+        let declarator = child
+            .named_children(&mut decls)
+            .find(|n| n.kind() == "variable_declarator");
+        let Some(declarator) = declarator else {
+            continue;
+        };
+        let name_ok = declarator
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            == Some("log");
+        if !name_ok {
+            continue;
+        }
+        let Some(value) = declarator.child_by_field_name("value") else {
+            continue;
+        };
+        if value.kind() != "method_invocation" {
+            continue;
+        }
+        // value: LoggerFactory.getLogger(<ThisClass>.class)
+        let object = value.child_by_field_name("object");
+        let method = value.child_by_field_name("name");
+        let object_ok = object
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            == Some("LoggerFactory");
+        let method_ok = method
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            == Some("getLogger");
+        if !object_ok || !method_ok {
+            continue;
+        }
+        let Some(args) = value.child_by_field_name("arguments") else {
+            continue;
+        };
+        if args.named_child_count() != 1 {
+            continue;
+        }
+        let arg = args.named_child(0).unwrap();
+        // expected: `<class_name>.class` parses as a class_literal
+        if arg.kind() != "class_literal" {
+            continue;
+        }
+        let arg_text = arg
+            .utf8_text(source.as_bytes())
+            .ok()
+            .unwrap_or("")
+            .trim();
+        let expected = format!("{class_name}.class");
+        if arg_text != expected {
+            continue;
+        }
+        return Some(child);
+    }
+    None
+}
+
+/// Compute the byte range to delete for a field declaration, with the
+/// same trailing-newline cleanup as `method_drop_range`.
+fn field_drop_range(field: Node<'_>, source: &str) -> (usize, usize) {
+    method_drop_range(field, source)
+}
+
 /// Compute the byte range to delete for a method declaration, including
 /// trailing whitespace + one newline so the deletion doesn't leave orphan
 /// blank lines behind. Walks back over leading whitespace on the method's
@@ -6328,14 +6426,20 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
 
     let any_ctor_match =
         noargs_ctor.is_some() || allargs_ctor.is_some() || requiredargs_ctor.is_some();
+
+    // Phase 5: @Slf4j logger field detection. Independent of all the other
+    // shapes — fires whenever a canonical SLF4J Logger field is present.
+    let slf4j_field = detect_slf4j_logger_field(body, &class_name, &parsed.source);
+
     if field_to_getter.is_empty()
         && field_to_setter.is_empty()
         && !emit_equals_and_hashcode
         && !emit_tostring
         && !any_ctor_match
+        && slf4j_field.is_none()
     {
         bail!(
-            "{class_name} has no lombokifiable boilerplate (trivial getters/setters/equals/hashCode/toString/canonical constructors)"
+            "{class_name} has no lombokifiable boilerplate (trivial getters/setters/equals/hashCode/toString/canonical constructors/SLF4J logger)"
         );
     }
 
@@ -6358,6 +6462,38 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
             .iter()
             .filter(|f| !f.is_final)
             .all(|f| field_to_setter.contains_key(&f.name));
+
+    // Phase 5: collapse to @Data when the full mutable-POJO set is covered.
+    //   @Data implies @Getter @Setter @ToString @EqualsAndHashCode
+    //   @RequiredArgsConstructor.
+    // On a class with no final fields, @RequiredArgsConstructor generates a
+    // no-arg ctor (same shape we matched as @NoArgsConstructor), so accept
+    // either NoArgs or RequiredArgs as the ctor signal.
+    let has_final_field = instance_fields.iter().any(|f| f.is_final);
+    let all_fields_final = !instance_fields.is_empty()
+        && instance_fields.iter().all(|f| f.is_final);
+    let data_eligible = getter_class_level
+        && setter_class_level
+        && emit_equals_and_hashcode
+        && emit_tostring
+        && (if has_final_field {
+            requiredargs_ctor.is_some()
+        } else {
+            noargs_ctor.is_some()
+        });
+
+    // Phase 5: collapse to @Value (Lombok's immutable variant) when every
+    // instance field is final, no setters were emitted, and the immutable
+    // method set is covered. @Value implies @Getter @ToString
+    // @EqualsAndHashCode @AllArgsConstructor and field-final-ness.
+    let value_eligible = !data_eligible
+        && all_fields_final
+        && getter_class_level
+        && !setter_class_level
+        && field_to_setter.is_empty()
+        && emit_equals_and_hashcode
+        && emit_tostring
+        && allargs_ctor.is_some();
 
     let mut text_edits: Vec<TextEdit> = Vec::new();
     let mut method_drops_seen: std::collections::HashSet<usize> =
@@ -6406,31 +6542,52 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     if let Some(c) = requiredargs_ctor {
         drop_method(&mut text_edits, &mut method_drops_seen, c);
     }
+    if let Some(field_node) = slf4j_field {
+        let (start, end) = field_drop_range(field_node, &parsed.source);
+        text_edits.push(TextEdit {
+            byte_start: start,
+            byte_end: end,
+            replacement: String::new(),
+        });
+    }
 
     // Class-level annotations are stacked one per line, alphabetical for
     // deterministic output. We compose them into a single insert so the
     // emitted edit list stays compact.
     let mut class_level_annotations: Vec<&'static str> = Vec::new();
-    if getter_class_level {
-        class_level_annotations.push("@Getter");
+    if data_eligible {
+        class_level_annotations.push("@Data");
+        // @AllArgsConstructor is independent of @Data and stacks if matched.
+        if allargs_ctor.is_some() {
+            class_level_annotations.push("@AllArgsConstructor");
+        }
+    } else if value_eligible {
+        class_level_annotations.push("@Value");
+    } else {
+        if getter_class_level {
+            class_level_annotations.push("@Getter");
+        }
+        if setter_class_level {
+            class_level_annotations.push("@Setter");
+        }
+        if emit_equals_and_hashcode {
+            class_level_annotations.push("@EqualsAndHashCode");
+        }
+        if emit_tostring {
+            class_level_annotations.push("@ToString");
+        }
+        if noargs_ctor.is_some() {
+            class_level_annotations.push("@NoArgsConstructor");
+        }
+        if allargs_ctor.is_some() {
+            class_level_annotations.push("@AllArgsConstructor");
+        }
+        if requiredargs_ctor.is_some() {
+            class_level_annotations.push("@RequiredArgsConstructor");
+        }
     }
-    if setter_class_level {
-        class_level_annotations.push("@Setter");
-    }
-    if emit_equals_and_hashcode {
-        class_level_annotations.push("@EqualsAndHashCode");
-    }
-    if emit_tostring {
-        class_level_annotations.push("@ToString");
-    }
-    if noargs_ctor.is_some() {
-        class_level_annotations.push("@NoArgsConstructor");
-    }
-    if allargs_ctor.is_some() {
-        class_level_annotations.push("@AllArgsConstructor");
-    }
-    if requiredargs_ctor.is_some() {
-        class_level_annotations.push("@RequiredArgsConstructor");
+    if slf4j_field.is_some() {
+        class_level_annotations.push("@Slf4j");
     }
     if !class_level_annotations.is_empty() {
         let mut block = String::new();
@@ -6476,26 +6633,38 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     // Import injection — every applied annotation needs its FQCN imported.
     let imports = extract_java_imports(&parsed.source);
     let mut needed_imports: Vec<&'static str> = Vec::new();
-    if !field_to_getter.is_empty() {
-        needed_imports.push("lombok.Getter");
+    if data_eligible {
+        needed_imports.push("lombok.Data");
+        if allargs_ctor.is_some() {
+            needed_imports.push("lombok.AllArgsConstructor");
+        }
+    } else if value_eligible {
+        needed_imports.push("lombok.Value");
+    } else {
+        if !field_to_getter.is_empty() {
+            needed_imports.push("lombok.Getter");
+        }
+        if !field_to_setter.is_empty() {
+            needed_imports.push("lombok.Setter");
+        }
+        if emit_equals_and_hashcode {
+            needed_imports.push("lombok.EqualsAndHashCode");
+        }
+        if emit_tostring {
+            needed_imports.push("lombok.ToString");
+        }
+        if noargs_ctor.is_some() {
+            needed_imports.push("lombok.NoArgsConstructor");
+        }
+        if allargs_ctor.is_some() {
+            needed_imports.push("lombok.AllArgsConstructor");
+        }
+        if requiredargs_ctor.is_some() {
+            needed_imports.push("lombok.RequiredArgsConstructor");
+        }
     }
-    if !field_to_setter.is_empty() {
-        needed_imports.push("lombok.Setter");
-    }
-    if emit_equals_and_hashcode {
-        needed_imports.push("lombok.EqualsAndHashCode");
-    }
-    if emit_tostring {
-        needed_imports.push("lombok.ToString");
-    }
-    if noargs_ctor.is_some() {
-        needed_imports.push("lombok.NoArgsConstructor");
-    }
-    if allargs_ctor.is_some() {
-        needed_imports.push("lombok.AllArgsConstructor");
-    }
-    if requiredargs_ctor.is_some() {
-        needed_imports.push("lombok.RequiredArgsConstructor");
+    if slf4j_field.is_some() {
+        needed_imports.push("lombok.extern.slf4j.Slf4j");
     }
     let mut import_block = String::new();
     for fqcn in &needed_imports {
@@ -6555,7 +6724,17 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     if !ctor_kinds.is_empty() {
         summary_parts.push(ctor_kinds.join("/"));
     }
-    let summary = summary_parts.join(" + ");
+    if slf4j_field.is_some() {
+        summary_parts.push("Slf4j logger".to_string());
+    }
+    let summary_inner = summary_parts.join(" + ");
+    let summary = if data_eligible {
+        format!("collapse to @Data ({summary_inner})")
+    } else if value_eligible {
+        format!("collapse to @Value ({summary_inner})")
+    } else {
+        summary_inner
+    };
     let plan = RefactorPlan {
         title: format!(
             "Lombokify {summary} on `{class_name}` in {}",
@@ -10289,6 +10468,200 @@ mod tests {
             result.is_err(),
             "wrong-order ctor should refuse; got: {result:?}"
         );
+    }
+
+    #[test]
+    fn lombokify_collapses_to_data() {
+        // Mutable POJO with full @Getter+@Setter+@EqualsAndHashCode+@ToString
+        // + (matching) @RequiredArgsConstructor (which on a class with NO
+        // final fields means a no-arg ctor) → collapse to @Data.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Bean.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             import org.apache.commons.lang3.builder.EqualsBuilder;\n\
+             import org.apache.commons.lang3.builder.HashCodeBuilder;\n\
+             import org.apache.commons.lang3.builder.ToStringBuilder;\n\
+             \n\
+             public class Bean {\n\
+            \x20   private String name;\n\
+            \x20   private int count;\n\
+            \n\
+            \x20   public Bean() {}\n\
+            \n\
+            \x20   public String getName() { return name; }\n\
+            \x20   public int getCount() { return count; }\n\
+            \x20   public void setName(String name) { this.name = name; }\n\
+            \x20   public void setCount(int count) { this.count = count; }\n\
+            \n\
+            \x20   public boolean equals(Object other) {\n\
+            \x20       if (this == other) return true;\n\
+            \x20       if (other == null || getClass() != other.getClass()) return false;\n\
+            \x20       Bean that = (Bean) other;\n\
+            \x20       return new EqualsBuilder()\n\
+            \x20               .append(name, that.name)\n\
+            \x20               .append(count, that.count)\n\
+            \x20               .isEquals();\n\
+            \x20   }\n\
+            \n\
+            \x20   public int hashCode() {\n\
+            \x20       return new HashCodeBuilder().append(name).append(count).toHashCode();\n\
+            \x20   }\n\
+            \n\
+            \x20   public String toString() {\n\
+            \x20       return new ToStringBuilder(this).append(\"name\", name).append(\"count\", count).toString();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        // Single @Data annotation, not the five individual ones.
+        assert!(
+            rewritten.contains("@Data\npublic class Bean"),
+            "expected collapsed @Data:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("@Getter"),
+            "individual annotations should be elided:\n{rewritten}"
+        );
+        assert!(!rewritten.contains("@Setter"));
+        assert!(!rewritten.contains("@EqualsAndHashCode"));
+        assert!(!rewritten.contains("@ToString"));
+        assert!(!rewritten.contains("@NoArgsConstructor"));
+        assert!(!rewritten.contains("@RequiredArgsConstructor"));
+        // Lone import for @Data, not five separate.
+        assert!(rewritten.contains("import lombok.Data;"));
+        assert!(!rewritten.contains("import lombok.Getter;"));
+        assert!(!rewritten.contains("import lombok.Setter;"));
+        // All accessors and ctor + e/h/ts dropped.
+        assert!(!rewritten.contains("public String getName()"));
+        assert!(!rewritten.contains("public Bean()"));
+        assert!(!rewritten.contains("public boolean equals("));
+    }
+
+    #[test]
+    fn lombokify_collapses_to_value() {
+        // Immutable POJO: every field final, all-args ctor, getters,
+        // equals/hashCode/toString. No setters.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Immutable.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             import org.apache.commons.lang3.builder.EqualsBuilder;\n\
+             import org.apache.commons.lang3.builder.HashCodeBuilder;\n\
+             import org.apache.commons.lang3.builder.ToStringBuilder;\n\
+             \n\
+             public class Immutable {\n\
+            \x20   private final String name;\n\
+            \x20   private final int count;\n\
+            \n\
+            \x20   public Immutable(String name, int count) {\n\
+            \x20       this.name = name;\n\
+            \x20       this.count = count;\n\
+            \x20   }\n\
+            \n\
+            \x20   public String getName() { return name; }\n\
+            \x20   public int getCount() { return count; }\n\
+            \n\
+            \x20   public boolean equals(Object other) {\n\
+            \x20       if (this == other) return true;\n\
+            \x20       if (other == null || getClass() != other.getClass()) return false;\n\
+            \x20       Immutable that = (Immutable) other;\n\
+            \x20       return new EqualsBuilder().append(name, that.name).append(count, that.count).isEquals();\n\
+            \x20   }\n\
+            \n\
+            \x20   public int hashCode() {\n\
+            \x20       return new HashCodeBuilder().append(name).append(count).toHashCode();\n\
+            \x20   }\n\
+            \n\
+            \x20   public String toString() {\n\
+            \x20       return new ToStringBuilder(this).append(\"name\", name).append(\"count\", count).toString();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(
+            rewritten.contains("@Value\npublic class Immutable"),
+            "expected collapsed @Value:\n{rewritten}"
+        );
+        assert!(rewritten.contains("import lombok.Value;"));
+        assert!(!rewritten.contains("@Getter"));
+        assert!(!rewritten.contains("@AllArgsConstructor"));
+    }
+
+    #[test]
+    fn lombokify_detects_slf4j_logger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Loud.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             import org.slf4j.Logger;\n\
+             import org.slf4j.LoggerFactory;\n\
+             \n\
+             public class Loud {\n\
+            \x20   private static final Logger log = LoggerFactory.getLogger(Loud.class);\n\
+             \n\
+            \x20   private String name;\n\
+             \n\
+            \x20   public String getName() { return name; }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(
+            rewritten.contains("@Slf4j"),
+            "expected @Slf4j:\n{rewritten}"
+        );
+        assert!(rewritten.contains("import lombok.extern.slf4j.Slf4j;"));
+        assert!(
+            !rewritten.contains("private static final Logger log"),
+            "logger field should be dropped:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    fn lombokify_skips_slf4j_with_wrong_field_name() {
+        // Lombok @Slf4j requires field name `log` exactly. Field named
+        // `logger` doesn't match — preserved.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("WrongName.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             import org.slf4j.Logger;\n\
+             import org.slf4j.LoggerFactory;\n\
+             \n\
+             public class WrongName {\n\
+            \x20   private static final Logger logger = LoggerFactory.getLogger(WrongName.class);\n\
+             \n\
+            \x20   private String name;\n\
+             \n\
+            \x20   public String getName() { return name; }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(
+            !rewritten.contains("@Slf4j"),
+            "should NOT detect logger named `logger`:\n{rewritten}"
+        );
+        assert!(rewritten.contains("private static final Logger logger"));
     }
 
     #[test]
