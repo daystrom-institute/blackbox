@@ -197,23 +197,114 @@ Use `bbox_artifact_list` to inspect what's installed.
 
 ## Workflow pattern catalog
 
-`examples/workflows/`
+`examples/workflows/` and `examples/agents/workflows/`
 
-Minimal standalone workflow specs that demonstrate individual engine
-primitives. Use as copy-paste starting points before reaching for a full
-example like Keystone.
+Minimal standalone specs that demonstrate individual engine primitives.
+Use as copy-paste starting points before reaching for a full example
+like Keystone.
+
+### Core patterns (`examples/workflows/`)
+
+| File | Pattern | Key primitives |
+|---|---|---|
+| `e2e-smoke.json` | Linear two-turn durable actor | `durable: true`, `${NodeName.output}` substitution |
+| `e2e-gated.json` | Gate packet + branch | `gate`, `branch` transition, `cases` routing |
+| `e2e-async-review.json` | Fork + fire-and-forget + late_inject | `fork`, `fire_and_forget`, `late_inject.from` |
+| `e2e-fork-join.json` | Fork + explicit fan-in | `fork`, `wait_for: [...]` at downstream node |
+| `e2e-ensemble-vote.json` | Concurrent ensemble + aggregation | `ensemble` actor, `bro_broadcast`, stable output ordering |
+| `e2e-composition.json` | Inline sub-workflow as a node | `subworkflow` field, sub-arc output concatenation |
+| `e2e-policy.json` | Workflow-level policy packet | `policy_packet`, arc-state entity, halt/escalate/warn verdicts |
+| `e2e-self-audit.json` | Multi-phase back-edge critique loop | `retry.max_generations`, durable auditor, `branch` back-edge |
+| `e2e-review-mode.json` | Gate applied to actor output (review mode) | `gate_mode: "all"` — runs ALL packet rules, not just first match |
+| `e2e-combo.json` | Gated retry loop + inline sub-workflow | Combines `retry`, `branch`, and inline `subworkflow` in one arc |
+| `blind.json` | Blind-convergence deliberation | Ensemble critique → converged branch → executor implements → fresh review |
+| `optimistic.json` | Async ensemble steering | `fork` + `fire_and_forget` + `late_inject` with ensemble actor |
+
+### `foreach` — bounded parallel iteration over a list
+
+A `foreach` node fans out a sub-workflow once per item in an array
+variable, runs up to `parallelism` items concurrently, and collects
+results into a `vars` key. No actor declared on the node — iteration
+is pure engine machinery.
+
+```json
+{
+  "ForeachBinding": {
+    "actor": "",
+    "foreach": {
+      "items": "${vars.bindings_response.bindings}",
+      "as_var": "binding",
+      "subworkflow_ref": "badgey-triage-channel-arc",
+      "imports": [],
+      "exports": [],
+      "parallelism": 2,
+      "on_item_failure": "continue",
+      "collect": { "into_var": "channel_results" }
+    },
+    "next": { "type": "terminal" }
+  }
+}
+```
+
+`on_item_failure` values:
+
+| Value | Behaviour |
+|---|---|
+| `continue` | Failed item's result is `{status: "failed", error: "..."}` in the collect array; remaining items keep running |
+| `collect_then_halt` | Let all in-flight items finish, collect results, then halt the arc |
+| `halt` | Cancel in-flight items, halt immediately |
+
+`collect.into_var` must be declared `kind: "array"` in `vars_schema`.
+The collected array entries have shape `{item: <input>, result: <sub-arc output>, status: "ok"|"failed"}`.
+
+Live example: `examples/badgey/workflows/badgey-triage-fanout-arc.json`
+(channel bindings fanout) and `badgey-triage-channel-arc.json` (scout
+fanout at `parallelism: 3`, proposal posting at `parallelism: 1`).
+
+### `matrix` — Cartesian product fanout over multiple axes
+
+A `matrix` node runs a sub-workflow for every combination of values
+across two or more named axes. Axis values can be literal arrays or
+`${vars.X}` runtime references.
+
+```json
+{
+  "Grid": {
+    "actor": "",
+    "matrix": {
+      "axes": [
+        { "name": "query",    "values": "${vars.queries}" },
+        { "name": "strategy", "values": ["search-only", "agentic"] }
+      ],
+      "as_var": "case",
+      "collect": { "into_var": "results" },
+      "subworkflow_ref": "eval-child"
+    },
+    "next": { "type": "terminal" }
+  }
+}
+```
+
+Inside the child sub-workflow, `${vars.case.query}` and
+`${vars.case.strategy}` resolve to the axis values for that combination.
+Same `on_item_failure` and `collect` semantics as `foreach`.
+
+Constraints: `foreach` and `matrix` are mutually exclusive on a node;
+neither can declare an actor, a node-level subworkflow, a wait, or
+`fire_and_forget` mode. Item ceiling is enforced at runtime (default 200).
+
+### Agent dispatch workflows (`examples/agents/workflows/`)
+
+Patterns for composing named installed agents (`bro_agent_dispatch` +
+`bro_wait`) via hook-only nodes and `mcp_call` ops:
 
 | File | Pattern |
 |---|---|
-| `e2e-smoke.json` | Two-turn durable actor, prompt substitution |
-| `e2e-gated.json` | Gate packet + `branch` transition |
-| `e2e-async-review.json` | `fork` + `fire_and_forget` + `late_inject` |
-| `e2e-composition.json` | Sub-workflow as a node |
-| `e2e-policy.json` | Workflow-level policy packet |
-| `e2e-fork-join.json` | Fork + join fan-out/fan-in |
-| `e2e-ensemble-vote.json` | Ensemble broadcast + vote aggregate |
-| `blind.json` | Blind-convergence deliberation pattern |
-| `optimistic.json` | Optimistic-review (fire-and-steer) pattern |
+| `chain.json` | Serial agent dispatch — diff-narrator feeds code-reviewer |
+| `fan-out.json` | Parallel agent dispatch — both dispatched, `bro_wait` collected separately |
+| `escalation.json` | Cheap-first escalation — gate packet decides whether to invoke the expensive agent |
+| `agent-eval-arc.json` | Nightly evaluation arc over installed agents |
+| `agent-cuing-eval-arc.json` | Cuing evaluation variant |
 
 ## Skills
 
