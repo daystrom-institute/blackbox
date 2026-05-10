@@ -1,6 +1,7 @@
 /target/
 /site/
-/.claude/
+/.claude/*
+!/.claude/agents/
 /.dev-agent/
 /.dev-agent-links
 /.direnv/
