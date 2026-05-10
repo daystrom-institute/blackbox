@@ -219,7 +219,5 @@ example like Keystone.
 
 `examples/skills/`
 
-Claude Code skill files for the [crucible](../examples/skills/crucible.md),
-[overmind](../examples/skills/overmind.md), and
-[takeover](../examples/skills/takeover.md) orchestration patterns.
-Install via Claude Code's skill registration.
+Claude Code skill files for the `crucible`, `overmind`, and `takeover`
+orchestration patterns. Install via Claude Code's skill registration.
