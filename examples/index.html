@@ -1,0 +1,1478 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+      
+      
+      
+      
+        <link rel="prev" href="../roadmap-tool/">
+      
+      
+        <link rel="next" href="../roadmap/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Reference Implementations - blackbox</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#reference-implementations" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="blackbox" class="md-header__button md-logo" aria-label="blackbox" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            blackbox
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Reference Implementations
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-hidden="true"  type="radio" name="__palette" id="__palette_0">
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-hidden="true"  type="radio" name="__palette" id="__palette_1">
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/invidious9000/transcript-search" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="blackbox" class="md-nav__button md-logo" aria-label="blackbox" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    blackbox
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/invidious9000/transcript-search" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../workflows/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workflow Engine
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../rule-packets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rule Packets
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../refactor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Refactor Tools
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agent-system/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Agent System
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../badgey/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Badgey
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ingress-paths/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Ingress Paths
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../slack-bridge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Slack Bridge
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../irc-bridge/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    IRC Bridge
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../councils-whiteboards/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Councils & Whiteboards
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../roadmap-tool/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap Tool
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference Implementations
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference Implementations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#keystone-issue-pr-review-merge" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keystone — issue → PR → review → merge
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Keystone — issue → PR → review → merge">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-it-exercises" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it exercises
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quick-start" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quick start
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Layout
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sastquatch-cron-sast-fix-pr-review-merge" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SASTquatch — cron → SAST → fix → PR → review → merge
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="SASTquatch — cron → SAST → fix → PR → review → merge">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-it-exercises_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it exercises
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#prerequisites" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prerequisites
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quick-start_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quick start
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#layout_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Layout
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#agentic-corpus-producer-machinery" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Agentic Corpus — producer machinery
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Agentic Corpus — producer machinery">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#workflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Workflows
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#brofile-panels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Brofile panels
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#install" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Install
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#workflow-pattern-catalog" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Workflow pattern catalog
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#skills" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Skills
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../roadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#keystone-issue-pr-review-merge" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keystone — issue → PR → review → merge
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Keystone — issue → PR → review → merge">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-it-exercises" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it exercises
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quick-start" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quick start
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Layout
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sastquatch-cron-sast-fix-pr-review-merge" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SASTquatch — cron → SAST → fix → PR → review → merge
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="SASTquatch — cron → SAST → fix → PR → review → merge">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-it-exercises_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it exercises
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#prerequisites" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prerequisites
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quick-start_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quick start
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#layout_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Layout
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#agentic-corpus-producer-machinery" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Agentic Corpus — producer machinery
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Agentic Corpus — producer machinery">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#workflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Workflows
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#brofile-panels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Brofile panels
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#install" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Install
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#workflow-pattern-catalog" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Workflow pattern catalog
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#skills" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Skills
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="reference-implementations">Reference Implementations<a class="headerlink" href="#reference-implementations" title="Permanent link">&para;</a></h1>
+<p>Three end-to-end examples ship with the daemon. Each one is a complete,
+runnable stack: routing packets, workflow specs, brofiles, install
+scripts, and a Docker environment where needed. Copy and adapt — the
+daemon doesn't read <code>examples/</code> automatically; you install what you
+want.</p>
+<h2 id="keystone-issue-pr-review-merge">Keystone — issue → PR → review → merge<a class="headerlink" href="#keystone-issue-pr-review-merge" title="Permanent link">&para;</a></h2>
+<p><code>examples/keystone/</code></p>
+<p>A Forgejo webhook fires on <code>issue.opened</code>. The engine dispatches an
+implementer team to fix the bug and open a PR, waits on a <code>pr-ready</code>
+signal, spins up a reviewer ensemble, loops on <code>pr-feedback</code> until
+merged or the iteration cap is hit, then runs cleanup hooks at terminal
+state.</p>
+<p>This is the canonical workflow-engine reference: it exercises every
+major primitive in one connected arc.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>flowchart TB
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    Hook[&quot;Forgejo issue.opened&quot;] --&gt; Setup
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    subgraph issue-to-merged-pr
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>        Setup --&gt; Implement
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>        Implement --&gt; AwaitReview{{Wait pr-ready / pr-merged}}
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>        AwaitReview -- ready --&gt; Review
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>        AwaitReview -- merged --&gt; Done
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>        Review --&gt; AwaitFeedback{{Wait pr-feedback / pr-merged}}
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>        AwaitFeedback -- feedback --&gt; AddressFeedback
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>        AwaitFeedback -- merged --&gt; Done
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>        AddressFeedback --&gt; AwaitReview
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    end
+</code></pre></div>
+<h3 id="what-it-exercises">What it exercises<a class="headerlink" href="#what-it-exercises" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Subworkflow composition + import/export contract</td>
+<td><code>issue-to-merged-pr.json</code> calls <code>implementer-arc</code> and <code>reviewer-arc</code> by id</td>
+</tr>
+<tr>
+<td><code>vars_schema</code> seeded from webhook entity</td>
+<td>Every sub-workflow declares one</td>
+</tr>
+<tr>
+<td><code>${vars.x}</code> / <code>${env.X}</code> / <code>${last_signal.x}</code> templates</td>
+<td>Used throughout; env carries Forgejo credentials</td>
+</tr>
+<tr>
+<td>Hook ops: <code>set_var</code>, <code>inc_var</code>, <code>parse_json</code>, <code>worktree_create</code>, <code>worktree_remove</code>, <code>shell</code>, <code>http_json</code></td>
+<td>Setup, Wait on_exit, PushAndOpenPr, FetchDiff, PostReview, arc_exit</td>
+</tr>
+<tr>
+<td>Hook gating via <code>when: domain:...</code> packet</td>
+<td>Idempotent PR create-or-reopen, auto-merge on approve</td>
+</tr>
+<tr>
+<td><code>wait</code> with <code>any_of</code> race + <code>__timeout__</code> graceful-degrade</td>
+<td>AwaitReviewTrigger (24 h), AwaitFeedbackOrMerge (7 d)</td>
+</tr>
+<tr>
+<td><code>branch</code> transition routing on gate verdict</td>
+<td>Both Wait nodes</td>
+</tr>
+<tr>
+<td>Workflow-level policy packet (advisor-as-packet)</td>
+<td>Arc budget caps step count</td>
+</tr>
+<tr>
+<td>Generic <code>http_json</code> for all code-host calls</td>
+<td>Issue fetch, PR list/create, diff, review post, merge</td>
+</tr>
+<tr>
+<td><code>find_first</code> for client-side array filtering</td>
+<td>Finds existing open PR by branch without platform search API</td>
+</tr>
+<tr>
+<td>Typed correlation tuples</td>
+<td>Two concurrent arcs on different PRs don't cross-resume</td>
+</tr>
+<tr>
+<td>Poller inlet (alternative to webhook)</td>
+<td><code>pollers/forgejo-open-issues.json</code> (opt-in)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="quick-start">Quick start<a class="headerlink" href="#quick-start" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nb">cd</span><span class="w"> </span>examples/keystone
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>./scripts/run.sh<span class="w">                    </span><span class="c1"># docker up → bootstrap → install → wait for webhook</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>./scripts/run.sh<span class="w"> </span>--dispatch<span class="w">         </span><span class="c1"># skip webhook; dispatch arc directly against issue #1</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>./scripts/run.sh<span class="w"> </span>--skip-forgejo<span class="w">     </span><span class="c1"># if Forgejo is already running</span>
+</code></pre></div>
+<h3 id="layout">Layout<a class="headerlink" href="#layout" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>examples/keystone/
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>├── docker-compose.yaml
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>├── packets/          — routing-forgejo, gate-merge-or-review, gate-loop-or-exit, …
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>├── webhooks/         — forgejo.json (hmac_sha256 signature scheme)
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>├── pollers/          — forgejo-open-issues.json (opt-in alternative)
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>├── workflows/        — issue-to-merged-pr, implementer-arc, reviewer-arc, …
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>└── scripts/          — bootstrap.sh, install.sh, run.sh
+</code></pre></div>
+<hr />
+<h2 id="sastquatch-cron-sast-fix-pr-review-merge">SASTquatch — cron → SAST → fix → PR → review → merge<a class="headerlink" href="#sastquatch-cron-sast-fix-pr-review-merge" title="Permanent link">&para;</a></h2>
+<p><code>examples/sastquatch/</code></p>
+<p>A calendar-driven sibling of Keystone. A daily cron tick fires the arc;
+the analyzer discovers findings via biofilter's <code>sast_run</code>/<code>sast_summary</code>
+MCP calls, a triager picks the highest-value cluster, a fixer applies
+the fix and opens a PR, a reviewer ensemble votes, and the arc
+auto-merges on approval.</p>
+<p>SASTquatch inverts three Keystone axes simultaneously — cron vs. webhook
+trigger, analyst-discovered vs. operator-supplied input, triager actor
+vs. none — each inversion forcing a new engine primitive.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>flowchart TB
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    Cron[&quot;⏰ cron tick&quot;] --&gt; Setup
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    subgraph sastquatch-arc
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>        Setup --&gt; Analyze
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>        Analyze --&gt; Implement
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>        Implement --&gt; AwaitReview{{Wait pr-ready / pr-merged}}
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>        AwaitReview -- ready --&gt; Review
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>        AwaitReview -- merged --&gt; Done
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>        Review --&gt; AwaitFeedback{{Wait pr-feedback / pr-merged}}
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>        AwaitFeedback -- feedback --&gt; AddressFeedback
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>        AwaitFeedback -- merged --&gt; Done
+<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a>        AddressFeedback --&gt; AwaitReview
+<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a>        Done -.bbox_thread resolve.-&gt; bbox[(work-item thread)]
+<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a>    end
+<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>    subgraph Analyze[sastquatch-analyzer-arc]
+<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a>        RunSast[&quot;mcp_call sast_run&lt;br/&gt;+ sast_summary + sast_findings&quot;] --&gt; PickCluster[&quot;triager actor&lt;br/&gt;emits work_packet JSON&quot;]
+<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a>        PickCluster --&gt; OpenWorkItem[&quot;mcp_call bbox_thread(open)&lt;br/&gt;+ bbox_note(learned)&quot;]
+<a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a>    end
+</code></pre></div>
+<h3 id="what-it-exercises_1">What it exercises<a class="headerlink" href="#what-it-exercises_1" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cron inlet (calendar-driven, no upstream event)</td>
+<td><code>crons/sastquatch-daily.json</code>, <code>concurrency: 1</code> (skip ticks while in-flight)</td>
+</tr>
+<tr>
+<td><code>mcp_call</code> op (engine-level outbound MCP)</td>
+<td>Analyzer fires <code>sast_run</code> / <code>sast_summary</code> on biofilter (stdio MCP); arc hooks call <code>bbox_thread</code> / <code>bbox_note</code> on blackbox-self (HTTP MCP)</td>
+</tr>
+<tr>
+<td><code>triager</code> actor kind</td>
+<td><code>PickCluster</code> — emits structured JSON; <code>parse_json on_exit</code> enforces the contract</td>
+</tr>
+<tr>
+<td>Work-item thread as typed envelope</td>
+<td>Analyzer opens <code>bbox_thread(kind=work_item)</code>, threads <code>thread_id</code> through every sub-arc</td>
+</tr>
+<tr>
+<td>Subworkflow composition (5 specs)</td>
+<td>Analyzer, fixer, reviewer, feedback sub-arcs</td>
+</tr>
+<tr>
+<td>Hook-only nodes (no LLM dispatch)</td>
+<td>Setup, RunSast, OpenWorkItem, FetchDiff, PushAndOpenPr, PostReview, Done</td>
+</tr>
+<tr>
+<td><code>wait</code> nodes with typed correlation</td>
+<td>Two concurrent arcs on different PRs don't cross-resume</td>
+</tr>
+<tr>
+<td>SAST-regression guard</td>
+<td>Fixer's <code>on_exit</code> re-runs <code>sast_run</code>; result in <code>vars.sast_after_fix</code> for downstream</td>
+</tr>
+</tbody>
+</table>
+<h3 id="prerequisites">Prerequisites<a class="headerlink" href="#prerequisites" title="Permanent link">&para;</a></h3>
+<p>Same as Keystone, plus biofilter MCP server registered in <code>~/.bro/mcp.json</code>.
+Verify: <code>curl -s http://127.0.0.1:7264/mcp ... | jq '.result.tools[] | select(.name | startswith("mcp__plugin_biofilter"))'</code></p>
+<h3 id="quick-start_1">Quick start<a class="headerlink" href="#quick-start_1" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nb">cd</span><span class="w"> </span>examples/sastquatch
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>./scripts/run.sh<span class="w"> </span>--soon<span class="w">     </span><span class="c1"># rewrites cron to fire in ~30s; waits for tick</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>./scripts/run.sh<span class="w"> </span>--dispatch<span class="w"> </span><span class="c1"># immediate arc against the seeded crate, no cron wait</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>./scripts/run.sh<span class="w">            </span><span class="c1"># 9am daily schedule</span>
+</code></pre></div>
+<h3 id="layout_1">Layout<a class="headerlink" href="#layout_1" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>examples/sastquatch/
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>├── docker-compose.yaml
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>├── crons/         — sastquatch-daily.json (concurrency=1)
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>├── packets/       — routing-cron, routing-webhook, hook-when-has-work-item
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>├── webhooks/      — sastquatch.json (PR event extractor)
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>├── workflows/     — sastquatch-arc, analyzer-arc, fixer-arc, reviewer-arc, feedback-arc
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>└── scripts/       — bootstrap.sh (seeds buggy Rust crate + sast-bridge.json), install.sh, run.sh
+</code></pre></div>
+<hr />
+<h2 id="agentic-corpus-producer-machinery">Agentic Corpus — producer machinery<a class="headerlink" href="#agentic-corpus-producer-machinery" title="Permanent link">&para;</a></h2>
+<p><code>examples/agentic-corpus/</code></p>
+<p>Workflows, packets, brofiles, and crons that drive the daemon's own
+knowledge-maintenance arcs: auto-digesting sessions into knowledge
+candidates, proposing entity edges, detecting contradictions, and
+compacting the embedding index.</p>
+<p>These are the artifacts the daemon ships as sane defaults. They are
+functional but several depend on engine primitives still in progress
+(see the <code>examples/agentic-corpus/README.md</code> status section).</p>
+<h3 id="workflows">Workflows<a class="headerlink" href="#workflows" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Workflow</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>auto-digest-arc.json</code></td>
+<td>Distill a session into knowledge candidates via <code>digest-extractor</code> brofile, gate via entry-quality packet</td>
+</tr>
+<tr>
+<td><code>auto-edge-arc.json</code></td>
+<td>Propose knowledge↔knowledge / knowledge↔file edges via vote panels</td>
+</tr>
+<tr>
+<td><code>contradiction-review-arc.json</code></td>
+<td>Open a whiteboard, dispatch three specialist brofiles, synthesize a verdict</td>
+</tr>
+<tr>
+<td><code>embed-compaction-arc.json</code></td>
+<td>Re-embed + WAL compaction sweep</td>
+</tr>
+<tr>
+<td><code>schema-migration-arc.json</code></td>
+<td>Drain compaction targets after a schema bump</td>
+</tr>
+<tr>
+<td><code>project-bootstrap-arc.json</code></td>
+<td>Stub fired by <code>bbox_project_register</code> (stub — chunking wired in the reindex thread)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="brofile-panels">Brofile panels<a class="headerlink" href="#brofile-panels" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Auto-digest</strong>: <code>digest-extractor</code></li>
+<li><strong>Auto-edge</strong> DESCRIBES vote: <code>describe-narrative-cohesion</code>, <code>describe-prose-signal</code>, <code>describe-symbol-fit</code></li>
+<li><strong>Auto-edge</strong> REFERENCES vote: <code>reference-citation-precision</code>, <code>reference-context-fit</code>, <code>reference-target-existence</code></li>
+<li><strong>Contradiction-review</strong>: <code>contradiction-coherence</code>, <code>contradiction-lifecycle</code>, <code>contradiction-provenance</code> (specialists) + <code>contradiction-facilitator</code> (synthesizer)</li>
+</ul>
+<h3 id="install">Install<a class="headerlink" href="#install" title="Permanent link">&para;</a></h3>
+<p>The daemon does not auto-install these on startup. Install what you want:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>bbox_artifact_install(kind=&quot;workflow&quot;, source=&quot;examples/agentic-corpus/workflows/auto-digest-arc.json&quot;)
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>bbox_artifact_install(kind=&quot;packet&quot;,   source=&quot;examples/agentic-corpus/packets/auto-digest/entry-quality.json&quot;)
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>bro_cron_install(spec=&lt;contents of examples/agentic-corpus/crons/embed-compaction-nightly.json&gt;)
+</code></pre></div>
+<p>Use <code>bbox_artifact_list</code> to inspect what's installed.</p>
+<hr />
+<h2 id="workflow-pattern-catalog">Workflow pattern catalog<a class="headerlink" href="#workflow-pattern-catalog" title="Permanent link">&para;</a></h2>
+<p><code>examples/workflows/</code></p>
+<p>Minimal standalone workflow specs that demonstrate individual engine
+primitives. Use as copy-paste starting points before reaching for a full
+example like Keystone.</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>e2e-smoke.json</code></td>
+<td>Two-turn durable actor, prompt substitution</td>
+</tr>
+<tr>
+<td><code>e2e-gated.json</code></td>
+<td>Gate packet + <code>branch</code> transition</td>
+</tr>
+<tr>
+<td><code>e2e-async-review.json</code></td>
+<td><code>fork</code> + <code>fire_and_forget</code> + <code>late_inject</code></td>
+</tr>
+<tr>
+<td><code>e2e-composition.json</code></td>
+<td>Sub-workflow as a node</td>
+</tr>
+<tr>
+<td><code>e2e-policy.json</code></td>
+<td>Workflow-level policy packet</td>
+</tr>
+<tr>
+<td><code>e2e-fork-join.json</code></td>
+<td>Fork + join fan-out/fan-in</td>
+</tr>
+<tr>
+<td><code>e2e-ensemble-vote.json</code></td>
+<td>Ensemble broadcast + vote aggregate</td>
+</tr>
+<tr>
+<td><code>blind.json</code></td>
+<td>Blind-convergence deliberation pattern</td>
+</tr>
+<tr>
+<td><code>optimistic.json</code></td>
+<td>Optimistic-review (fire-and-steer) pattern</td>
+</tr>
+</tbody>
+</table>
+<h2 id="skills">Skills<a class="headerlink" href="#skills" title="Permanent link">&para;</a></h2>
+<p><code>examples/skills/</code></p>
+<p>Claude Code skill files for the <a href="../examples/skills/crucible.md">crucible</a>,
+<a href="../examples/skills/overmind.md">overmind</a>, and
+<a href="../examples/skills/takeover.md">takeover</a> orchestration patterns.
+Install via Claude Code's skill registration.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.indexes", "search.suggest", "search.highlight", "content.code.copy"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
