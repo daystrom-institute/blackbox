@@ -5622,6 +5622,310 @@ fn detect_trivial_setter<'a>(
     None
 }
 
+/// Walk the method-invocation chain that ends at `outer`, returning the
+/// list of `(method_name, args)` pairs from the innermost call to the
+/// outermost, plus the root expression at the bottom of the chain (the
+/// `object` of the innermost method invocation, e.g., `new EqualsBuilder()`
+/// or `Objects.hash`).
+fn invocation_chain<'a>(
+    outer: Node<'a>,
+    source: &str,
+) -> (Vec<(String, Vec<Node<'a>>)>, Option<Node<'a>>) {
+    let mut chain: Vec<(String, Vec<Node<'a>>)> = Vec::new();
+    let mut node = outer;
+    let mut root: Option<Node<'a>> = None;
+    loop {
+        if node.kind() != "method_invocation" {
+            root = Some(node);
+            break;
+        }
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .unwrap_or("")
+            .to_string();
+        let args = node
+            .child_by_field_name("arguments")
+            .map(|args| {
+                let mut cursor = args.walk();
+                args.named_children(&mut cursor).collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        chain.push((name, args));
+        if let Some(obj) = node.child_by_field_name("object") {
+            node = obj;
+        } else {
+            break;
+        }
+    }
+    chain.reverse();
+    (chain, root)
+}
+
+/// Extract the implied field name from an expression that should refer to
+/// `this.field` (with or without explicit `this.`, with or without an
+/// accessor wrapper). Returns Some(fieldName) when the expression is a
+/// recognizable field reference, None otherwise.
+///
+/// Accepts:
+///   * `field`                     → "field"
+///   * `this.field`                → "field"
+///   * `getField()` / `isField()`  → "field"
+///   * `this.getField()`           → "field"
+fn normalize_field_ref(expr: Node<'_>, source: &str) -> Option<String> {
+    match expr.kind() {
+        "identifier" => expr
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(str::to_string),
+        "field_access" => {
+            let object = expr.child_by_field_name("object")?;
+            let field = expr.child_by_field_name("field")?;
+            if object.kind() == "this" {
+                field.utf8_text(source.as_bytes()).ok().map(str::to_string)
+            } else {
+                None
+            }
+        }
+        "method_invocation" => {
+            let name_node = expr.child_by_field_name("name")?;
+            let name = name_node.utf8_text(source.as_bytes()).ok()?;
+            let args = expr.child_by_field_name("arguments")?;
+            if args.named_child_count() != 0 {
+                return None;
+            }
+            // No object means a same-class call; explicit `this` is also fine.
+            let local = match expr.child_by_field_name("object") {
+                None => true,
+                Some(o) => o.kind() == "this",
+            };
+            if !local {
+                return None;
+            }
+            let stripped = name
+                .strip_prefix("get")
+                .or_else(|| name.strip_prefix("is"))?;
+            let mut chars = stripped.chars();
+            let first = chars.next()?.to_ascii_lowercase();
+            Some(format!("{first}{}", chars.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// Strip a `final` modifier from a list of statements' string view; helper
+/// for detecting cast assignments like `final Foo cast = (Foo) other;`.
+/// Currently used only as documentation marker for the equals detector.
+#[allow(dead_code)]
+const APACHE_EQUALS_HINT: &str = "EqualsBuilder";
+
+/// Recognize an Apache Commons `EqualsBuilder`-style equals method.
+/// Returns Some(field_names_in_order) when matched.
+///
+/// Required body shape (statement count + order tolerated up to the final
+/// `return`):
+///   1. `if (this == other) return true;`
+///   2. `if (other == null || getClass() != other.getClass()) return false;`
+///   3. an optional cast local: `[final] T cast = (T) other;`
+///   4. `return new EqualsBuilder().append(a, b)...isEquals();`
+///
+/// We collect each `.append(thisSide, _)` first-argument and normalize via
+/// `normalize_field_ref`. The detector returns the extracted field-name
+/// sequence so the caller can compare to the class's declared fields.
+fn detect_apache_equals(
+    method: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    if !is_public_method_node(method) {
+        return None;
+    }
+    let body = method.child_by_field_name("body")?;
+    if body.kind() != "block" {
+        return None;
+    }
+    let mut cursor = body.walk();
+    let stmts: Vec<Node<'_>> = body
+        .named_children(&mut cursor)
+        .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+        .collect();
+    if stmts.is_empty() {
+        return None;
+    }
+    // Find the last return_statement; its expression is the EqualsBuilder chain.
+    let last = stmts.last()?;
+    if last.kind() != "return_statement" {
+        return None;
+    }
+    let expr = last.named_child(0)?;
+    let (chain, root) = invocation_chain(expr, source);
+    let root = root?;
+    // Root must be `new EqualsBuilder()`.
+    if root.kind() != "object_creation_expression" {
+        return None;
+    }
+    let root_type = root
+        .child_by_field_name("type")
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        .unwrap_or("");
+    if root_type.trim() != "EqualsBuilder" {
+        return None;
+    }
+    // Final method in chain must be `isEquals()`.
+    let last_call = chain.last()?;
+    if last_call.0 != "isEquals" || !last_call.1.is_empty() {
+        return None;
+    }
+    // Middle calls must all be `.append(thisSide, otherSide)`.
+    let mut field_names = Vec::new();
+    for (name, args) in chain.iter().take(chain.len().saturating_sub(1)) {
+        if name != "append" || args.len() != 2 {
+            return None;
+        }
+        let Some(field) = normalize_field_ref(args[0], source) else {
+            return None;
+        };
+        field_names.push(field);
+    }
+    if field_names.is_empty() {
+        return None;
+    }
+    Some(field_names)
+}
+
+/// Recognize an Apache Commons `HashCodeBuilder`-style hashCode method.
+/// Returns Some(field_names_in_order) when matched.
+fn detect_apache_hashcode(method: Node<'_>, source: &str) -> Option<Vec<String>> {
+    if !is_public_method_node(method) {
+        return None;
+    }
+    let body = method.child_by_field_name("body")?;
+    if body.kind() != "block" {
+        return None;
+    }
+    let mut cursor = body.walk();
+    let stmts: Vec<Node<'_>> = body
+        .named_children(&mut cursor)
+        .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+        .collect();
+    if stmts.len() != 1 {
+        return None;
+    }
+    let stmt = stmts[0];
+    if stmt.kind() != "return_statement" {
+        return None;
+    }
+    let expr = stmt.named_child(0)?;
+    let (chain, root) = invocation_chain(expr, source);
+    let root = root?;
+    if root.kind() != "object_creation_expression" {
+        return None;
+    }
+    let root_type = root
+        .child_by_field_name("type")
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        .unwrap_or("");
+    if root_type.trim() != "HashCodeBuilder" {
+        return None;
+    }
+    let last_call = chain.last()?;
+    if last_call.0 != "toHashCode" || !last_call.1.is_empty() {
+        return None;
+    }
+    let mut field_names = Vec::new();
+    for (name, args) in chain.iter().take(chain.len().saturating_sub(1)) {
+        if name != "append" || args.len() != 1 {
+            return None;
+        }
+        let Some(field) = normalize_field_ref(args[0], source) else {
+            return None;
+        };
+        field_names.push(field);
+    }
+    if field_names.is_empty() {
+        return None;
+    }
+    Some(field_names)
+}
+
+/// Recognize an Apache Commons `ToStringBuilder`-style toString method.
+/// Returns Some(field_names_in_order) when matched. Accepts the two-arg
+/// form `.append("name", value)` (Lombok-equivalent label = field name)
+/// and the one-arg form `.append(value)` (label inferred from value).
+fn detect_apache_tostring(method: Node<'_>, source: &str) -> Option<Vec<String>> {
+    if !is_public_method_node(method) {
+        return None;
+    }
+    let body = method.child_by_field_name("body")?;
+    if body.kind() != "block" {
+        return None;
+    }
+    let mut cursor = body.walk();
+    let stmts: Vec<Node<'_>> = body
+        .named_children(&mut cursor)
+        .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+        .collect();
+    if stmts.len() != 1 {
+        return None;
+    }
+    let stmt = stmts[0];
+    if stmt.kind() != "return_statement" {
+        return None;
+    }
+    let expr = stmt.named_child(0)?;
+    let (chain, root) = invocation_chain(expr, source);
+    let root = root?;
+    if root.kind() != "object_creation_expression" {
+        return None;
+    }
+    let root_type = root
+        .child_by_field_name("type")
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        .unwrap_or("");
+    if root_type.trim() != "ToStringBuilder" {
+        return None;
+    }
+    let last_call = chain.last()?;
+    if last_call.0 != "toString" || !last_call.1.is_empty() {
+        return None;
+    }
+    let mut field_names = Vec::new();
+    for (name, args) in chain.iter().take(chain.len().saturating_sub(1)) {
+        if name != "append" {
+            return None;
+        }
+        match args.len() {
+            1 => {
+                let Some(field) = normalize_field_ref(args[0], source) else {
+                    return None;
+                };
+                field_names.push(field);
+            }
+            2 => {
+                // First arg should be a string literal naming the field;
+                // accept both `"name"` and `getName()`-style expressions
+                // for the value side. Lombok's @ToString labels each
+                // component with the field name.
+                let label = args[0]
+                    .utf8_text(source.as_bytes())
+                    .ok()?
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
+                let value_field = normalize_field_ref(args[1], source)?;
+                if label != value_field {
+                    return None;
+                }
+                field_names.push(value_field);
+            }
+            _ => return None,
+        }
+    }
+    if field_names.is_empty() {
+        return None;
+    }
+    Some(field_names)
+}
+
 /// Compute the byte range to delete for a method declaration, including
 /// trailing whitespace + one newline so the deletion doesn't leave orphan
 /// blank lines behind. Walks back over leading whitespace on the method's
@@ -5717,9 +6021,72 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
             field_to_setter.insert(field.name.clone(), method_node);
         }
     }
-    if field_to_getter.is_empty() && field_to_setter.is_empty() {
+    // Phase 3: equals / hashCode / toString detection. Apache Commons
+    // builder style only for now (planglobal idiom). Each method is matched
+    // independently; the field-name set returned by the detector must match
+    // the class's full instance-field set in declaration order, otherwise
+    // Lombok's generated method would change behavior (different field set
+    // or different traversal order → different hash values, different
+    // equality semantics, different toString format).
+    let field_decl_order: Vec<String> = instance_fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    let mut equals_method: Option<Node<'_>> = None;
+    let mut hashcode_method: Option<Node<'_>> = None;
+    let mut tostring_method: Option<Node<'_>> = None;
+    for m in &methods {
+        if m.is_constructor {
+            continue;
+        }
+        match m.name.as_str() {
+            "equals" => {
+                if has_preceding_javadoc(m.node, &parsed.source) {
+                    continue;
+                }
+                if let Some(fields) = detect_apache_equals(m.node, &parsed.source) {
+                    if fields == field_decl_order {
+                        equals_method = Some(m.node);
+                    }
+                }
+            }
+            "hashCode" => {
+                if has_preceding_javadoc(m.node, &parsed.source) {
+                    continue;
+                }
+                if let Some(fields) = detect_apache_hashcode(m.node, &parsed.source) {
+                    if fields == field_decl_order {
+                        hashcode_method = Some(m.node);
+                    }
+                }
+            }
+            "toString" => {
+                if has_preceding_javadoc(m.node, &parsed.source) {
+                    continue;
+                }
+                if let Some(fields) = detect_apache_tostring(m.node, &parsed.source) {
+                    if fields == field_decl_order {
+                        tostring_method = Some(m.node);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // @EqualsAndHashCode generates BOTH equals and hashCode together — only
+    // emit when both are detected. Detecting just one would create an
+    // unpaired method (Lombok writes both, the user's surviving method
+    // would clash).
+    let emit_equals_and_hashcode = equals_method.is_some() && hashcode_method.is_some();
+    let emit_tostring = tostring_method.is_some();
+
+    if field_to_getter.is_empty()
+        && field_to_setter.is_empty()
+        && !emit_equals_and_hashcode
+        && !emit_tostring
+    {
         bail!(
-            "{class_name} has no trivial getters/setters to replace (only `return field;` getters and `this.field = arg;` setters qualify)"
+            "{class_name} has no trivial getters/setters/equals/hashCode/toString to replace"
         );
     }
 
@@ -5768,6 +6135,19 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     for method_node in field_to_setter.values() {
         drop_method(&mut text_edits, &mut method_drops_seen, *method_node);
     }
+    if emit_equals_and_hashcode {
+        if let Some(eq) = equals_method {
+            drop_method(&mut text_edits, &mut method_drops_seen, eq);
+        }
+        if let Some(hc) = hashcode_method {
+            drop_method(&mut text_edits, &mut method_drops_seen, hc);
+        }
+    }
+    if emit_tostring {
+        if let Some(ts) = tostring_method {
+            drop_method(&mut text_edits, &mut method_drops_seen, ts);
+        }
+    }
 
     // Class-level annotations are stacked one per line, alphabetical for
     // deterministic output. We compose them into a single insert so the
@@ -5778,6 +6158,12 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     }
     if setter_class_level {
         class_level_annotations.push("@Setter");
+    }
+    if emit_equals_and_hashcode {
+        class_level_annotations.push("@EqualsAndHashCode");
+    }
+    if emit_tostring {
+        class_level_annotations.push("@ToString");
     }
     if !class_level_annotations.is_empty() {
         let mut block = String::new();
@@ -5829,6 +6215,12 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
     if !field_to_setter.is_empty() {
         needed_imports.push("lombok.Setter");
     }
+    if emit_equals_and_hashcode {
+        needed_imports.push("lombok.EqualsAndHashCode");
+    }
+    if emit_tostring {
+        needed_imports.push("lombok.ToString");
+    }
     let mut import_block = String::new();
     for fqcn in &needed_imports {
         let already = imports.iter().any(|i| {
@@ -5861,11 +6253,20 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
 
     text_edits.sort_by_key(|e| (e.byte_start, e.byte_end));
 
-    let summary = match (field_to_getter.len(), field_to_setter.len()) {
-        (g, 0) => format!("{g} trivial getter(s)"),
-        (0, s) => format!("{s} trivial setter(s)"),
-        (g, s) => format!("{g} trivial getter(s) + {s} trivial setter(s)"),
-    };
+    let mut summary_parts: Vec<String> = Vec::new();
+    if !field_to_getter.is_empty() {
+        summary_parts.push(format!("{} trivial getter(s)", field_to_getter.len()));
+    }
+    if !field_to_setter.is_empty() {
+        summary_parts.push(format!("{} trivial setter(s)", field_to_setter.len()));
+    }
+    if emit_equals_and_hashcode {
+        summary_parts.push("equals/hashCode".to_string());
+    }
+    if emit_tostring {
+        summary_parts.push("toString".to_string());
+    }
+    let summary = summary_parts.join(" + ");
     let plan = RefactorPlan {
         title: format!(
             "Lombokify {summary} on `{class_name}` in {}",
@@ -9343,6 +9744,156 @@ mod tests {
         );
         assert!(!rewritten.contains("public String getReadOnly()"));
         assert!(!rewritten.contains("public void setWriteOnly("));
+    }
+
+    #[test]
+    fn lombokify_apache_equals_hashcode_tostring() {
+        // Mirrors the planglobal idiom (Apache Commons Lang3 builders).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Input.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             import org.apache.commons.lang3.builder.EqualsBuilder;\n\
+             import org.apache.commons.lang3.builder.HashCodeBuilder;\n\
+             import org.apache.commons.lang3.builder.ToStringBuilder;\n\
+             \n\
+             public class Input {\n\
+            \x20   private String triggeredAt;\n\
+            \x20   private String triggeredBy;\n\
+            \n\
+            \x20   public String getTriggeredAt() { return triggeredAt; }\n\
+            \x20   public String getTriggeredBy() { return triggeredBy; }\n\
+            \n\
+            \x20   @Override\n\
+            \x20   public boolean equals(final Object other) {\n\
+            \x20       if (this == other) return true;\n\
+            \x20       if (other == null || getClass() != other.getClass()) return false;\n\
+            \x20       final Input otherCasted = (Input) other;\n\
+            \x20       return new EqualsBuilder()\n\
+            \x20               .append(getTriggeredAt(), otherCasted.getTriggeredAt())\n\
+            \x20               .append(getTriggeredBy(), otherCasted.getTriggeredBy())\n\
+            \x20               .isEquals();\n\
+            \x20   }\n\
+            \n\
+            \x20   @Override\n\
+            \x20   public int hashCode() {\n\
+            \x20       return new HashCodeBuilder(17, 37)\n\
+            \x20               .append(getTriggeredAt())\n\
+            \x20               .append(getTriggeredBy())\n\
+            \x20               .toHashCode();\n\
+            \x20   }\n\
+            \n\
+            \x20   @Override\n\
+            \x20   public String toString() {\n\
+            \x20       return new ToStringBuilder(this)\n\
+            \x20               .append(\"triggeredAt\", triggeredAt)\n\
+            \x20               .append(\"triggeredBy\", triggeredBy)\n\
+            \x20               .toString();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        // Class-level @Getter (full coverage) + @EqualsAndHashCode + @ToString.
+        assert!(
+            rewritten.contains("@Getter\n@EqualsAndHashCode\n@ToString\npublic class Input"),
+            "expected stacked class-level annotations:\n{rewritten}"
+        );
+        assert!(rewritten.contains("import lombok.Getter;"));
+        assert!(rewritten.contains("import lombok.EqualsAndHashCode;"));
+        assert!(rewritten.contains("import lombok.ToString;"));
+        // All four method bodies removed.
+        assert!(!rewritten.contains("public boolean equals("));
+        assert!(!rewritten.contains("public int hashCode()"));
+        assert!(!rewritten.contains("public String toString()"));
+        assert!(!rewritten.contains("public String getTriggeredAt()"));
+        // Apache imports still there (we don't touch them; user can run
+        // organize_imports separately to drop unused).
+        assert!(rewritten.contains("EqualsBuilder"));
+    }
+
+    #[test]
+    fn lombokify_skips_equals_with_subset_of_fields() {
+        // equals references only `name`, not `count` — Lombok @EqualsAndHashCode
+        // would generate equality over BOTH fields, changing semantics.
+        // Detector must refuse.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Subset.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             import org.apache.commons.lang3.builder.EqualsBuilder;\n\
+             import org.apache.commons.lang3.builder.HashCodeBuilder;\n\
+             \n\
+             public class Subset {\n\
+            \x20   private String name;\n\
+            \x20   private int count;\n\
+            \n\
+            \x20   public String getName() { return name; }\n\
+            \n\
+            \x20   public boolean equals(Object other) {\n\
+            \x20       if (this == other) return true;\n\
+            \x20       if (other == null || getClass() != other.getClass()) return false;\n\
+            \x20       Subset that = (Subset) other;\n\
+            \x20       return new EqualsBuilder().append(name, that.name).isEquals();\n\
+            \x20   }\n\
+            \n\
+            \x20   public int hashCode() {\n\
+            \x20       return new HashCodeBuilder().append(name).toHashCode();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        // Getter for `name` lombokified per-field; equals/hashCode preserved
+        // because they only cover a subset of fields.
+        assert!(
+            rewritten.contains("@Getter\n    private String name;"),
+            "expected per-field @Getter:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("@EqualsAndHashCode"),
+            "should NOT lombokify subset-coverage equals/hashCode:\n{rewritten}"
+        );
+        assert!(rewritten.contains("public boolean equals(Object other)"));
+        assert!(rewritten.contains("public int hashCode()"));
+    }
+
+    #[test]
+    fn lombokify_keeps_unpaired_equals_or_hashcode() {
+        // hashCode present, equals absent — @EqualsAndHashCode would generate
+        // BOTH so dropping just hashCode would leave Lombok's auto-generated
+        // equals colliding with nothing (fine) but breaking the user's
+        // current behavior (where equals defaults to identity but is now
+        // synthesized over fields). Detector refuses to touch it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Solo.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             import org.apache.commons.lang3.builder.HashCodeBuilder;\n\
+             \n\
+             public class Solo {\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   public int hashCode() {\n\
+            \x20       return new HashCodeBuilder().append(name).toHashCode();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let result = plan_lombokify_java_class(&params);
+        // No accessors and unpaired hashCode → bail.
+        assert!(result.is_err(), "expected refusal; got: {result:?}");
     }
 
     #[test]
