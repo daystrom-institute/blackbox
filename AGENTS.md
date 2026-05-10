@@ -196,4 +196,11 @@ Client config (all point to the same daemon):
 
 A surface is a caller-selected view of the daemon's MCP tool catalog, evaluated by packet-style routing at session initialization and dispatch time. Clients select a surface by appending `?surface=<id>` to the MCP URL. The daemon evaluates the named surface against a compiled packet with domain `mcp-surface/routing` (project-scoped with global fallback). A `Deny` verdict fails initialization; a `ToolSurface` verdict restricts visible tools via allow/disallow lists that intersect with existing dispatch filters.
 
-Install a surface packet via `bbox_compile` (or `bbox_artifact_install` from `examples/agentic-corpus/packets/mcp-surface/routing.json`). Register a surfaced provider alias via `bro_mcp(action=add, name="blackbox-readonly", url="http://127.0.0.1:7264/mcp", surface="readonly")`. Debug surface decisions with `bbox_mcp_surface(action=replay, surface="readonly")`.
+The shipped default packet at `examples/mcp-surfaces/routing.json` defines four named surfaces:
+
+- `default` — external clients (Claude Code, Codex CLI) doing day-to-day work; hides setup tools, workflow-internal coordination, admin lifecycle, and destructive refactor.
+- `readonly` — reviewers/evaluators/observer agents; explicit allow list, no writes/dispatch/admin.
+- `agent-internal` — dispatched bros inside a workflow; whiteboards, councils, when_all/any, signals, and broadcast are visible (workflow coordination); `bro_exec`/`resume`/`cancel` denied as a backstop to the mechanical recursion guard.
+- `ops` — operator/admin sessions; full daemon access including setup tools, lifecycle management, and destructive operations.
+
+Install via `bbox_compile path=examples/mcp-surfaces/routing.json scope=global`. Register a surfaced provider alias via `bro_mcp(action=add, name="blackbox-readonly", url="http://127.0.0.1:7264/mcp", surface="readonly")`. Debug surface decisions with `bbox_mcp_surface(action=replay, surface="readonly")`. See `examples/mcp-surfaces/README.md` for URL examples and customization notes.

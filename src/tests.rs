@@ -5576,14 +5576,18 @@ fn bro_mcp_add_without_surface_preserves_url() {
 #[test]
 fn example_surface_packet_parses_and_compiles() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/agentic-corpus/packets/mcp-surface/routing.json");
+        .join("examples/mcp-surfaces/routing.json");
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("example packet not found at {:?}: {e}", path));
     let value: serde_json::Value = serde_json::from_str(&raw).expect("example packet JSON parse");
     let domain = value["domain"].as_str().expect("domain field");
     assert_eq!(domain, "mcp-surface/routing");
     let rules = value["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 4, "expected 4 rules (readonly, ops, default, deny)");
+    assert_eq!(
+        rules.len(),
+        5,
+        "expected 5 rules (readonly, agent-internal, ops, default, deny)"
+    );
     let tmp = tempfile::TempDir::new().unwrap();
     let packets = packets::Packets::open(tmp.path()).unwrap();
     let _packet_id = packets.compile(&packets::CompileParams {
