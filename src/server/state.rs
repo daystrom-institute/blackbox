@@ -242,6 +242,71 @@ impl SharedState {
             None => false,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(store_dir: &std::path::Path) -> SharedState {
+        use std::collections::VecDeque;
+        let (tail_tx, _) = broadcast::channel(128);
+        let idx = TranscriptIndex::open_or_create(
+            &store_dir.join("idx"),
+            Vec::new(),
+            None,
+            store_dir.join("projects"),
+            store_dir.join("kb.json"),
+            store_dir.join("threads.json"),
+            store_dir.join("roadmap.json"),
+        )
+        .unwrap();
+        SharedState {
+            idx: RwLock::new(idx),
+            kb: RwLock::new(Knowledge::open(&store_dir.join("kb.json")).unwrap()),
+            roadmap: RwLock::new(Roadmap::open(&store_dir.join("roadmap.json")).unwrap()),
+            threads: RwLock::new(Threads::open(&store_dir.join("threads.json")).unwrap()),
+            notes: RwLock::new(Notes::open(&store_dir.join("notes.json")).unwrap()),
+            pins: RwLock::new(Pins::open(&store_dir.join("pins.json")).unwrap()),
+            projects: RwLock::new(ProjectRegistry::open(&store_dir.join("projects.json")).unwrap()),
+            packets: RwLock::new(Packets::open(store_dir).unwrap()),
+            artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
+            edge_index: RwLock::new(edge_index::EdgeIndex::default()),
+            path_cache: RwLock::new(path_cache::PathCache::default()),
+            task_store: Arc::new(RwLock::new(TaskStore::new())),
+            tail_tx,
+            store_dir: store_dir.to_path_buf(),
+            running_arcs: RwLock::new(HashMap::new()),
+            wait_store: Arc::new(workflow::wait::WaitStore::new()),
+            webhooks: Arc::new(webhooks::WebhookRegistry::new()),
+            pollers: Arc::new(pollers::PollerRegistry::new()),
+            crons: Arc::new(crons::CronRegistry::new()),
+            whiteboards: Arc::new(whiteboards::WhiteboardRegistry::new()),
+            workflow_registry: Arc::new(RwLock::new(HashMap::new())),
+            bind_is_loopback: true,
+            signal_log: RwLock::new(VecDeque::with_capacity(SIGNAL_LOG_CAP)),
+            webhook_delivery_log: RwLock::new(VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
+            arc_cancel_tokens: RwLock::new(HashMap::new()),
+            councils: Arc::new(council::CouncilRegistry::new()),
+            resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
+            agent_adapter_registry: Arc::new(RwLock::new(
+                orchestration::agents::adapter::AgentAdapterRegistry::new(),
+            )),
+            badgey_registry: Arc::new(orchestration::badgey::BadgeyRegistry::new()),
+            badgey_proposals: Arc::new(
+                orchestration::badgey::ProposalStore::new(store_dir.to_path_buf()).unwrap(),
+            ),
+            badgey_journal: Arc::new(
+                orchestration::badgey::ActionJournal::new(store_dir.to_path_buf()).unwrap(),
+            ),
+            slack_thread_store: Arc::new(
+                slack_thread_store::SlackThreadStore::open(store_dir).unwrap(),
+            ),
+            slack_channel_bindings: Arc::new(
+                slack_channel_bindings::SlackChannelBindings::open(store_dir).unwrap(),
+            ),
+            slack_proposal_links: Arc::new(
+                slack_proposal_links::SlackProposalLinks::open(store_dir).unwrap(),
+            ),
+            lsp_sessions: lsp::LspSessionManager::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -263,8 +328,13 @@ pub(crate) struct ArcSnapshot {
 // MCP Server Handler
 // ---------------------------------------------------------------------------
 
+use std::sync::OnceLock;
+
 #[derive(Clone)]
 pub(crate) struct BlackboxServer {
     pub(crate) state: Arc<SharedState>,
     pub(crate) tool_router: ToolRouter<Self>,
+    /// Session-scoped MCP tool surface selector. Set once during
+    /// MCP session initialization from the `?surface` query parameter.
+    pub(crate) surface: OnceLock<Arc<str>>,
 }

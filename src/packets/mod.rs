@@ -364,6 +364,52 @@ impl Packets {
         )
     }
 
+    /// Load the latest packet for a given domain, with project-scoped override.
+    /// 
+    /// Project-scoped packets take precedence: if a project is specified and
+    /// a packet with matching domain and scope="project" exists for that project,
+    /// it is returned. Otherwise, falls back to the latest global packet with
+    /// the matching domain.
+    pub fn load_latest_by_domain(
+        &self,
+        domain: &str,
+        project: Option<&str>,
+    ) -> Result<Option<Packet>> {
+        let all = self.list_all()?;
+        
+        // Collect matching packets
+        let mut matches: Vec<&Packet> = all
+            .iter()
+            .filter(|p| p.domain == domain)
+            .collect();
+        
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        
+        // Sort by created_at descending (newest first)
+        matches.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        
+        // If project specified, look for project-scoped packet first
+        if let Some(proj) = project {
+            for packet in &matches {
+                if packet.scope == "project" && packet.project.as_deref() == Some(proj) {
+                    return Ok(Some((*packet).clone()));
+                }
+            }
+        }
+        
+        // Fall back to global packet or first project packet without project match
+        for packet in &matches {
+            if packet.scope == "global" {
+                return Ok(Some((*packet).clone()));
+            }
+        }
+        
+        // Return the newest matching packet regardless of scope
+        Ok(Some((*matches[0]).clone()))
+    }
+
     pub fn list_all(&self) -> Result<Vec<Packet>> {
         let mut out = Vec::new();
         for scope in &["global", "project"] {

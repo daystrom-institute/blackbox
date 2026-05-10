@@ -10,7 +10,7 @@
     }
   ],
   "expected_entity_refs": [
-    "project_file:d723917f:3b317e2b:9e962df35fb0d350805331d9fd58dd98af72a31399cc7c97e320bf1bced3d29f:5"
+    "project_file:af6f7145:3b317e2b:9e962df35fb0d350805331d9fd58dd98af72a31399cc7c97e320bf1bced3d29f:5"
   ],
   "required_evidence": {
     "kind": "edge_family",

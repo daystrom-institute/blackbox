@@ -124,6 +124,57 @@ impl McpFilters {
         }
     }
 
+    /// Intersect allows from `other` into this filter set. Used by the
+    /// MCP surface layer: a surface allow *narrows* the effective set,
+    /// it does not widen it.
+    ///
+    /// Semantics:
+    /// - `other.disallow` is appended additively (same as `merge_from`).
+    /// - `other.allow` is intersected with `self.allow`:
+    ///   - both empty → result empty (passthrough)
+    ///   - self empty, other non-empty → result = expanded `other.allow`
+    ///   - self non-empty, other empty → result unchanged
+    ///   - both non-empty → expand both against `universe`, take set
+    ///     intersection, write back as patterns. Empty intersection means
+    ///     no tools pass the allow filter (everything denied).
+    pub fn intersect_allow_from(&mut self, other: &McpFilters, universe: &[&str]) {
+        // Disallow is always additive.
+        for p in &other.disallow {
+            let normalized = normalize_filter_pattern(p);
+            if !self.disallow.iter().any(|q| q == &normalized) {
+                self.disallow.push(normalized);
+            }
+        }
+        // Allow intersection.
+        if other.allow.is_empty() {
+            return;
+        }
+        if self.allow.is_empty() {
+            // Nothing to intersect with; adopt other's allow patterns.
+            for p in &other.allow {
+                let normalized = normalize_filter_pattern(p);
+                if !self.allow.iter().any(|q| q == &normalized) {
+                    self.allow.push(normalized);
+                }
+            }
+            return;
+        }
+        // Both non-empty: expand each set, intersect, write back.
+        let self_expanded: std::collections::BTreeSet<String> = self
+            .allow
+            .iter()
+            .flat_map(|p| expand_pattern(p, universe))
+            .collect();
+        let other_expanded: std::collections::BTreeSet<String> = other
+            .allow
+            .iter()
+            .flat_map(|p| expand_pattern(p, universe))
+            .collect();
+        let intersection: std::collections::BTreeSet<&String> =
+            self_expanded.intersection(&other_expanded).collect();
+        self.allow = intersection.into_iter().map(|s| (*s).clone()).collect();
+    }
+
     /// Default filter set: the mechanical recursion guard. Blocks every
     /// `bro_*` orchestration tool and every `bbox_refactor_*` structural
     /// rewrite tool so dispatched agents can't spawn sub-bros or rewrite
@@ -302,7 +353,7 @@ fn parse_copilot_mcp_pattern(pattern: &str) -> Option<(&str, &str)> {
 /// Simple recursive glob matcher: `*` = any sequence (incl. empty),
 /// `?` = exactly one char, everything else literal. No character
 /// classes or escapes — adequate for tool-name patterns we ship.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     glob_match_inner(&p, 0, &t, 0)
@@ -738,6 +789,10 @@ pub struct McpToolParams {
     /// by `action=sync`.
     #[serde(default)]
     pub headers: Option<BTreeMap<String, String>>,
+    /// MCP tool surface name. When set on `action=add`, appends
+    /// `?surface=<id>` to the registered URL.
+    #[serde(default)]
+    pub surface: Option<String>,
 }
 
 /// Dispatch a bro_mcp tool call. Returns a human-readable result string.
@@ -836,6 +891,14 @@ fn action_add(p: &McpToolParams) -> Result<String> {
     let headers = p.headers.clone().unwrap_or_default();
     let exclude = p.exclude_tools.clone().unwrap_or_default();
 
+    // Append ?surface= to URL when surface is specified.
+    let url = if let Some(surface) = &p.surface {
+        let separator = if url.contains('?') { "&" } else { "?" };
+        format!("{}{}surface={}", url, separator, surface)
+    } else {
+        url.to_string()
+    };
+
     let config = match transport {
         "http" => McpServerConfig::Http {
             url: url.to_string(),
@@ -869,7 +932,7 @@ fn action_add(p: &McpToolParams) -> Result<String> {
     let fanout_lines: Vec<String> = fanout_parallel(|provider| {
         let args = provider.build_mcp_add_http_args_full(
             name,
-            url,
+            &url,
             &exclude,
             &headers_for_cli,
             cli_scope,
@@ -1110,6 +1173,7 @@ mod tests {
             pattern: None,
             exclude_tools: Some(vec!["dangerous_tool".into(), "other_tool".into()]),
             headers: Some(headers),
+            surface: None,
         };
         let result = action_add(&params).unwrap();
         assert!(result.contains("Saved custom-mcp"));

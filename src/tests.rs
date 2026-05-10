@@ -5216,3 +5216,392 @@ fn bro_dashboard_emits_agent_label() {
     assert_eq!(agent_metrics["success_count"].as_u64(), Some(0));
     assert_eq!(agent_metrics["failure_count"].as_u64(), Some(0));
 }
+
+// ── Phase 2a: surface handler override tests ───────────────────────
+
+fn compile_surface_packet_for_test(
+    packets: &Packets,
+    rules: Vec<serde_json::Value>,
+    scope: &str,
+    project: Option<&str>,
+) -> String {
+    packets
+        .compile(&CompileParams {
+            domain: server::surface::SURFACE_ROUTING_DOMAIN.to_string(),
+            rules: serde_json::Value::Array(rules),
+            classification_lattice: Some(vec![
+                "tool_surface".to_string(),
+                "deny".to_string(),
+            ]),
+            prefix_inference: Some(Default::default()),
+            scope: Some(scope.to_string()),
+            project: project.map(|s| s.to_string()),
+            source_ids: None,
+            rank_lookup_key: None,
+            rank_table: None,
+            threshold_lookup_key: None,
+            threshold_table: None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn surface_get_tool_no_packet_returns_full_catalog() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let srv = test_server(&tmp);
+    assert!(
+        srv.get_tool("bbox_search").is_some(),
+        "bbox_search should be visible with no surface packet"
+    );
+    assert!(
+        srv.get_tool("bro_exec").is_some(),
+        "bro_exec should be visible with no surface packet"
+    );
+}
+
+#[test]
+fn surface_get_tool_with_packet_restricts_visibility() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let srv = test_server(&tmp);
+
+    let consequent = serde_json::json!({
+        "route": "tool_surface",
+        "allow": ["bbox_search", "bbox_stats"],
+        "disallow": [],
+    });
+    let deny_consequent = serde_json::json!({"route": "deny", "reason": "unknown surface"});
+    compile_surface_packet_for_test(
+        &srv.state.packets.read(),
+        vec![
+            serde_json::json!({
+                "id": "readonly",
+                "antecedent": {"op": "Eq", "field": "surface", "value": "default"},
+                "consequent": serde_json::to_string(&consequent).unwrap(),
+                "classification": "tool_surface",
+            }),
+            serde_json::json!({
+                "id": "deny_rest",
+                "antecedent": {"op": "True"},
+                "consequent": serde_json::to_string(&deny_consequent).unwrap(),
+                "classification": "deny",
+            }),
+        ],
+        "global",
+        None,
+    );
+
+    assert!(
+        srv.get_tool("bbox_search").is_some(),
+        "bbox_search should be visible on default surface"
+    );
+    assert!(
+        srv.get_tool("bbox_stats").is_some(),
+        "bbox_stats should be visible on default surface"
+    );
+    assert!(
+        srv.get_tool("bbox_forget").is_none(),
+        "bbox_forget should be hidden on default surface"
+    );
+    assert!(
+        srv.get_tool("bro_exec").is_none(),
+        "bro_exec should be hidden on default surface"
+    );
+}
+
+#[test]
+fn surface_get_tool_deny_verdict_hides_all() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let srv = test_server(&tmp);
+
+    let deny_consequent = serde_json::json!({"route": "deny", "reason": "locked"});
+    compile_surface_packet_for_test(
+        &srv.state.packets.read(),
+        vec![serde_json::json!({
+            "id": "deny_all",
+            "antecedent": {"op": "True"},
+            "consequent": serde_json::to_string(&deny_consequent).unwrap(),
+            "classification": "deny",
+        })],
+        "global",
+        None,
+    );
+
+    assert!(
+        srv.get_tool("bbox_search").is_none(),
+        "all tools should be hidden under deny verdict"
+    );
+}
+
+// ── Phase 2b: initialize + surface binding tests ───────────────────
+
+#[test]
+fn surface_once_lock_set_prevents_second_set() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let srv = test_server(&tmp);
+
+    let lock = &srv.surface;
+    assert!(lock.get().is_none(), "surface should start unset");
+    assert!(
+        lock.set(Arc::from("readonly")).is_ok(),
+        "first set should succeed"
+    );
+    assert_eq!(lock.get().unwrap().as_ref(), "readonly");
+    assert!(
+        lock.set(Arc::from("admin")).is_err(),
+        "second set should fail (OnceLock)"
+    );
+    assert_eq!(
+        lock.get().unwrap().as_ref(),
+        "readonly",
+        "value should remain unchanged"
+    );
+}
+
+#[test]
+fn surface_evaluate_deny_produces_correct_error_data() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let srv = test_server(&tmp);
+
+    let deny_consequent = serde_json::json!({"route": "deny", "reason": "locked out"});
+    compile_surface_packet_for_test(
+        &srv.state.packets.read(),
+        vec![
+            serde_json::json!({
+                "id": "deny_locked",
+                "antecedent": {
+                    "op": "Eq",
+                    "field": "surface",
+                    "value": "locked"
+                },
+                "consequent": serde_json::to_string(&deny_consequent).unwrap(),
+                "classification": "deny",
+            }),
+            serde_json::json!({
+                "id": "allow_rest",
+                "antecedent": {"op": "True"},
+                "consequent": serde_json::json!({
+                    "route": "tool_surface",
+                    "allow": ["bbox_search"],
+                    "disallow": [],
+                }).to_string(),
+                "classification": "tool_surface",
+            }),
+        ],
+        "global",
+        None,
+    );
+
+    let entity_locked = serde_json::json!({"surface": "locked"});
+    let decision = server::surface::evaluate_tool_surface(
+        &srv.state.packets.read(),
+        entity_locked,
+        None::<&str>,
+    );
+    assert!(decision.is_deny(), "locked surface should deny");
+    if let server::surface::ToolSurfaceVerdict::Deny { reason } = &decision.verdict {
+        assert_eq!(reason.as_deref(), Some("locked out"));
+    } else {
+        panic!("expected Deny variant");
+    }
+}
+
+// ── Phase 3: dispatch integration tests ─────────────────────────────
+
+#[test]
+fn intersect_allow_both_empty_passthrough() {
+    let mut a = orchestration::mcp::McpFilters::default();
+    let b = orchestration::mcp::McpFilters::default();
+    a.intersect_allow_from(&b, &[]);
+    assert!(a.allow.is_empty());
+}
+
+#[test]
+fn intersect_allow_self_empty_adopt_other() {
+    let mut a = orchestration::mcp::McpFilters::default();
+    let b = orchestration::mcp::McpFilters {
+        allow: vec!["mcp__blackbox__bbox_search".into()],
+        disallow: vec![],
+    };
+    let universe = &["mcp__blackbox__bbox_search", "mcp__blackbox__bbox_stats"];
+    a.intersect_allow_from(&b, universe);
+    assert_eq!(a.allow, vec!["mcp__blackbox__bbox_search"]);
+}
+
+#[test]
+fn intersect_allow_other_empty_unchanged() {
+    let mut a = orchestration::mcp::McpFilters {
+        allow: vec!["mcp__blackbox__bbox_search".into()],
+        disallow: vec![],
+    };
+    let b = orchestration::mcp::McpFilters::default();
+    a.intersect_allow_from(&b, &[]);
+    assert_eq!(a.allow, vec!["mcp__blackbox__bbox_search"]);
+}
+
+#[test]
+fn intersect_allow_both_nonempty_takes_intersection() {
+    let mut a = orchestration::mcp::McpFilters {
+        allow: vec![
+            "mcp__blackbox__bbox_search".into(),
+            "mcp__blackbox__bbox_stats".into(),
+            "mcp__blackbox__bbox_forget".into(),
+        ],
+        disallow: vec![],
+    };
+    let b = orchestration::mcp::McpFilters {
+        allow: vec![
+            "mcp__blackbox__bbox_stats".into(),
+            "mcp__blackbox__bbox_forget".into(),
+            "mcp__blackbox__bro_exec".into(),
+        ],
+        disallow: vec![],
+    };
+    let universe = &[
+        "mcp__blackbox__bbox_search",
+        "mcp__blackbox__bbox_stats",
+        "mcp__blackbox__bbox_forget",
+        "mcp__blackbox__bro_exec",
+    ];
+    a.intersect_allow_from(&b, universe);
+    let mut sorted = a.allow.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec!["mcp__blackbox__bbox_forget", "mcp__blackbox__bbox_stats"]
+    );
+}
+
+#[test]
+fn intersect_allow_empty_intersection_denies_all() {
+    let mut a = orchestration::mcp::McpFilters {
+        allow: vec!["mcp__blackbox__bbox_search".into()],
+        disallow: vec![],
+    };
+    let b = orchestration::mcp::McpFilters {
+        allow: vec!["mcp__blackbox__bro_exec".into()],
+        disallow: vec![],
+    };
+    let universe = &["mcp__blackbox__bbox_search", "mcp__blackbox__bro_exec"];
+    a.intersect_allow_from(&b, universe);
+    assert!(a.allow.is_empty(), "empty intersection should deny all");
+}
+
+#[test]
+fn intersect_disallow_is_additive() {
+    let mut a = orchestration::mcp::McpFilters {
+        allow: vec![],
+        disallow: vec!["mcp__blackbox__bro_exec".into()],
+    };
+    let b = orchestration::mcp::McpFilters {
+        allow: vec![],
+        disallow: vec!["mcp__blackbox__bbox_forget".into()],
+    };
+    a.intersect_allow_from(&b, &[]);
+    assert_eq!(a.disallow.len(), 2);
+    assert!(a.disallow.contains(&"mcp__blackbox__bro_exec".into()));
+    assert!(a.disallow.contains(&"mcp__blackbox__bbox_forget".into()));
+}
+
+#[test]
+fn bro_mcp_add_surface_appends_to_url() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().to_string_lossy().to_string();
+
+    let params = orchestration::mcp::McpToolParams {
+        action: orchestration::mcp::McpAction::Add,
+        name: Some("test-surface".into()),
+        url: Some("http://127.0.0.1:7264/mcp".into()),
+        transport: Some("http".into()),
+        scope: Some("project".into()),
+        project: Some(project.clone()),
+        pattern: None,
+        exclude_tools: None,
+        headers: None,
+        surface: Some("readonly".into()),
+    };
+
+    let result = orchestration::mcp::handle(&params).unwrap();
+    assert!(result.contains("added"), "add should succeed: {result}");
+
+    let store = orchestration::mcp::McpStore::load(
+        &orchestration::mcp::project_store_path(std::path::Path::new(&project)),
+    )
+    .unwrap();
+    let cfg = store.servers.get("test-surface").unwrap();
+    match cfg {
+        orchestration::mcp::McpServerConfig::Http { url, .. } => {
+            assert!(
+                url.contains("?surface=readonly"),
+                "URL should contain ?surface=readonly, got: {url}"
+            );
+        }
+        _ => panic!("expected HTTP config"),
+    }
+}
+
+#[test]
+fn bro_mcp_add_without_surface_preserves_url() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().to_string_lossy().to_string();
+
+    let params = orchestration::mcp::McpToolParams {
+        action: orchestration::mcp::McpAction::Add,
+        name: Some("test-no-surface".into()),
+        url: Some("http://127.0.0.1:7264/mcp".into()),
+        transport: Some("http".into()),
+        scope: Some("project".into()),
+        project: Some(project.clone()),
+        pattern: None,
+        exclude_tools: None,
+        headers: None,
+        surface: None,
+    };
+
+    let result = orchestration::mcp::handle(&params).unwrap();
+    assert!(result.contains("added"), "add should succeed: {result}");
+
+    let store = orchestration::mcp::McpStore::load(
+        &orchestration::mcp::project_store_path(std::path::Path::new(&project)),
+    )
+    .unwrap();
+    let cfg = store.servers.get("test-no-surface").unwrap();
+    match cfg {
+        orchestration::mcp::McpServerConfig::Http { url, .. } => {
+            assert_eq!(url, "http://127.0.0.1:7264/mcp");
+        }
+        _ => panic!("expected HTTP config"),
+    }
+}
+
+#[test]
+fn example_surface_packet_parses_and_compiles() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/mcp-surfaces/routing.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("example packet not found at {:?}: {e}", path));
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("example packet JSON parse");
+    let domain = value["domain"].as_str().expect("domain field");
+    assert_eq!(domain, "mcp-surface/routing");
+    let rules = value["rules"].as_array().expect("rules array");
+    assert_eq!(
+        rules.len(),
+        5,
+        "expected 5 rules (readonly, agent-internal, ops, default, deny)"
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let packets = packets::Packets::open(tmp.path()).unwrap();
+    let _packet_id = packets.compile(&packets::CompileParams {
+        domain: domain.to_string(),
+        rules: value["rules"].clone(),
+        classification_lattice: Some(vec!["tool_surface".into(), "deny".into()]),
+        prefix_inference: Some(Default::default()),
+        scope: Some("global".into()),
+        project: None,
+        source_ids: None,
+        rank_lookup_key: None,
+        rank_table: None,
+        threshold_lookup_key: None,
+        threshold_table: None,
+    })
+    .expect("example packet compiles");
+}

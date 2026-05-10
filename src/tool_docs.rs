@@ -584,6 +584,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bbox_packet_gap(description="wanted regex matching on log messages; no StringContains-like primitive", ast_feature_requested="StringMatches")"#,
         ),
     },
+    ToolDoc {
+        name: "bbox_mcp_surface",
+        category: ToolCategory::Packets,
+        summary: "MCP surface debugging, listing, and inspection. Actions: 'replay' evaluates a surface selector against the routing packet; 'list' shows installed surface packets; 'describe' shows packet rules plus verdict for a selected surface.",
+        when_to_use: "Reach here when authoring or debugging mcp-surface/routing packets. 'replay' evaluates a surface selector and shows verdict + visible tools. 'list' enumerates installed surface packets. 'describe' shows packet rules and the verdict for a selected surface.",
+        example: Some(
+            r#"bbox_mcp_surface(action="replay", surface="readonly", project="/home/user/repo")"#,
+        ),
+    },
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {
         name: "bro_exec",
@@ -1194,6 +1203,17 @@ pub fn orchestration_tool_names() -> Vec<&'static str> {
             d.category == ToolCategory::Orchestration || d.category == ToolCategory::Refactor
         })
         .map(|d| d.name)
+        .collect()
+}
+
+/// All tool names from the static TOOL_DOCS catalog, with MCP prefix
+/// prepended. Used as the universe for pattern expansion in surface
+/// filter intersection.
+pub fn all_tool_names_prefixed() -> Vec<String> {
+    let prefix = blackbox_mcp_prefix();
+    TOOL_DOCS
+        .iter()
+        .map(|d| format!("{}{}", prefix, d.name))
         .collect()
 }
 

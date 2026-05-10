@@ -331,6 +331,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "http",
  "ignore",
  "irc",
  "jsonschema",
