@@ -94,7 +94,7 @@ impl Provider {
             Provider::Inception => &[ToolUse, Resume],
             Provider::Copilot => &[ToolUse, Resume],
             Provider::Gemini => &[Vision, ToolUse],
-            Provider::Vibe => &[],
+            Provider::Vibe => &[ToolUse, Resume],
             Provider::Workflow => &[],
         };
         v.iter().copied().collect()
@@ -526,7 +526,8 @@ use super::mcp::McpFilters;
 
 impl Provider {
     /// Argv for `{provider} mcp add` registering an HTTP server.
-    /// Returns None if the provider has no MCP CRUD CLI (Vibe).
+    /// Returns None if the provider has no MCP CRUD CLI (Vibe uses
+    /// config-file based MCP server management via [[mcp_servers]]).
     ///
     /// `exclude_tools` is honored only by Gemini (persistent, set at
     /// registration time). Other providers ignore it — they apply tool
@@ -763,7 +764,7 @@ impl Provider {
 
     /// Argv SUFFIX appended to exec/resume for dispatch-time tool
     /// filters. Empty when the provider doesn't support such filtering
-    /// (Vibe — no MCP) or the filter set is empty.
+    /// or the filter set is empty.
     ///
     /// Provider translation rules:
     ///   - Claude: pass glob patterns directly to `--disallowedTools` /
@@ -778,6 +779,10 @@ impl Provider {
     ///   - Gemini: returns a placeholder; real policy file is generated
     ///     per-dispatch by the caller (see `write_gemini_policy_file`),
     ///     which appends `--policy <path>` to argv.
+    ///   - Vibe: uses `--enabled-tools` in programmatic mode (-p) to
+    ///     allow-list tools (disables all others). Only allow patterns
+    ///     are supported via CLI; disallow-only filters must be pre-configured
+    ///     in `~/.vibe/config.toml` using `disabled_tools`.
     pub fn build_filter_args(&self, filters: &McpFilters) -> Vec<String> {
         if filters.is_empty() {
             return Vec::new();
@@ -832,20 +837,31 @@ impl Provider {
             // generating the policy file. build_filter_args stays empty
             // so the caller knows whether to bother generating at all.
             Provider::Gemini => {}
-            // Vibe has no MCP at all.
-            Provider::Vibe | Provider::Workflow => {}
+            Provider::Vibe => {
+                // Vibe supports --enabled-tools in programmatic mode (-p).
+                // Each --enabled-tools can be a glob pattern, exact name, or regex.
+                // In -p mode, specifying enabled tools disables all others.
+                // We only apply allow patterns via CLI; disallow-only patterns
+                // cannot be expressed and are ignored (users should pre-configure
+                // disabled_tools in ~/.vibe/config.toml for persistent filtering).
+                for p in expand_filter_patterns(&filters.allow) {
+                    args.push("--enabled-tools".into());
+                    args.push(p);
+                }
+            }
+            Provider::Workflow => {}
         }
         args
     }
 
     /// Whether this provider honors dispatch-time filters (vs registration-
-    /// time or not at all). Claude, Copilot, Codex, and Gemini all
+    /// time or not at all). Claude, Copilot, Codex, Gemini, and Vibe all
     /// support per-invocation mechanical filtering via different
-    /// mechanisms. Only Vibe (no MCP) falls back to the text guard.
+    /// mechanisms (Vibe via --enabled-tools allow-list in programmatic mode).
     pub fn supports_dispatch_filter(&self) -> bool {
         matches!(
             self,
-            Provider::Claude | Provider::Copilot | Provider::Codex | Provider::Gemini
+            Provider::Claude | Provider::Copilot | Provider::Codex | Provider::Gemini | Provider::Vibe
         )
     }
 }
@@ -2140,10 +2156,10 @@ static COPILOT_EFFORTS: &[EffortInfo] = &[
     },
 ];
 
-// Vibe CLI does not expose per-invocation model selection (no --model
-// flag). Model is configured out-of-band via `--agent NAME`
-// (~/.vibe/agents/*.toml) or `vibe --setup`. Listing models here would
-// imply they're selectable through bro_exec/brofiles when they aren't.
+// Vibe CLI does not have a --model flag; model selection is via
+// `--agent NAME` (~/.vibe/agents/*.toml), `VIBE_AGENT` / `VIBE_ACTIVE_MODEL`
+// env vars, or `vibe --setup`. Listing models here would imply they're
+// selectable through bro_exec/brofiles CLI flags when they aren't.
 static VIBE_MODELS: &[ModelInfo] = &[];
 
 static GEMINI_MODELS: &[ModelInfo] = &[
@@ -2889,7 +2905,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vibe_ignores_filters() {
+    fn test_vibe_ignores_disallow_only_filters() {
+        // Vibe's --enabled-tools only supports allow patterns; disallow-only
+        // filters cannot be expressed via CLI (must be pre-configured in config.toml).
         let filters = McpFilters {
             disallow: vec!["anything".into()],
             allow: vec![],
@@ -2898,12 +2916,25 @@ mod tests {
     }
 
     #[test]
-    fn test_supports_dispatch_filter_all_but_vibe() {
+    fn test_vibe_uses_enabled_tools_for_allow() {
+        let filters = McpFilters {
+            disallow: vec![],
+            allow: vec!["mcp__blackbox__bro_*".into(), "bash".into()],
+        };
+        let args = Provider::Vibe.build_filter_args(&filters);
+        // Vibe expands patterns and emits --enabled-tools for each
+        assert!(args.contains(&"--enabled-tools".into()));
+        // Check that expanded patterns are present
+        assert!(args.iter().any(|a| a.contains("mcp__blackbox__bro_")));
+    }
+
+    #[test]
+    fn test_supports_dispatch_filter_includes_vibe() {
         assert!(Provider::Claude.supports_dispatch_filter());
         assert!(Provider::Copilot.supports_dispatch_filter());
         assert!(Provider::Codex.supports_dispatch_filter());
         assert!(Provider::Gemini.supports_dispatch_filter());
-        assert!(!Provider::Vibe.supports_dispatch_filter());
+        assert!(Provider::Vibe.supports_dispatch_filter());
     }
 
     #[test]
