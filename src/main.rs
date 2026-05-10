@@ -125,7 +125,8 @@ impl BlackboxServer {
                 + tools::councils::router()
                 + tools::roster::router()
                 + tools::config::router()
-                + tools::dispatch::router(),
+                + tools::dispatch::router()
+                + tools::mcp_surface::router(),
             surface: std::sync::OnceLock::new(),
         }
     }

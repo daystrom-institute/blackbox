@@ -584,6 +584,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bbox_packet_gap(description="wanted regex matching on log messages; no StringContains-like primitive", ast_feature_requested="StringMatches")"#,
         ),
     },
+    ToolDoc {
+        name: "bbox_mcp_surface",
+        category: ToolCategory::Packets,
+        summary: "MCP surface debugging and replay tool. Use action='replay' to evaluate a surface routing packet against a surface selector and see the resulting verdict plus visible tool list. Iterates on surface rules without restarting providers.",
+        when_to_use: "Reach here when authoring or debugging mcp-surface/routing packets. The 'replay' action lets you compile a packet, then test it with different surface selectors to verify the verdict and visible tools.",
+        example: Some(
+            r#"bbox_mcp_surface(action="replay", surface="readonly", project="/home/user/repo")"#,
+        ),
+    },
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {
         name: "bro_exec",
