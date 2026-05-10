@@ -1,138 +1,125 @@
 # Config and Artifact Locality
 
 **Status:** Draft  
-**Scope:** Daemon config strategy, secret management, project-local artifact home, migration from `~/.bro/`
+**Scope:** Daemon config file, secret management, project-local artifact home, `.bro/` zombie cleanup in project context
 
 ---
 
-## Problem
+## Current State (accurate as of 2026-05-10)
 
-Blackbox has no coherent configuration strategy. Config, secrets, and artifact definitions have grown independently, each feature inventing its own convention. The result:
+The XDG path migration has already run (`migrate_legacy_defaults`). The filesystem layout is largely settled:
 
-- No global config file — settings live in env vars, systemd drop-ins, and hardcoded paths
-- No project-local config surface — the only project-local convention is `.bro/mcp.json`
-- Brofiles, teams, workflows, and rule packets are daemon-first (created via MCP tool calls), not file-first — they aren't version-controlled with the projects they serve
-- `~/.bro/` is a zombie namespace from the old `bro.service` era, still hosting live state
-- "Where does render artifact destination go?" is unanswerable without first solving this
+```
+~/.local/state/blackbox/          # blackbox_state_dir ($BLACKBOX_STATE_DIR)
+    blackbox-knowledge.json
+    blackbox-threads.json
+    blackbox-roadmap.json
+    blackbox-notes.json
+    blackbox-pins.json
+    projects.json
+    events.jsonl                  # webhook event log
+    artifacts/                    # artifact catalog (bbox_artifact_install)
+    backups/                      # render snapshots
+    edges/                        # edge index JSONL sidecars
+    git_meta/                     # git provenance notes
+    logs/                         # daemon logs
+    packets/
+        global/                   # global rule packets
+        project/                  # project-scoped rule packets
+    vectors/                      # embedding vector store
+    bro/                          # bro_home_dir ($BRO_HOME = state_dir/bro)
+        tasks.json
+        mcp.json                  # global MCP registry (migrated from ~/.bro/)
+        brofiles/
+        teamplates/               # team templates
+        teams/
+        workflows/
+        councils/
+        whiteboards/
+        crons/
+        webhooks/
+        badgey/
+        generated/
+        slack-*.json
+        gemini-policies/          # ephemeral per-dispatch policy files
 
-The question "where do I put a project-local brofile definition so it's version-controlled?" has no answer today.
+~/.local/share/blackbox/
+    index/                        # tantivy full-text index ($TRANSCRIPT_SEARCH_INDEX_PATH)
 
----
+~/.blackbox/
+    BLACKBOX.md                   # provider-neutral global guidance ($BLACKBOX_GLOBAL_COMMON_MD)
+```
 
-## Current State
+### What's missing
 
-### Global config (scattered)
+**1. Config file** — all daemon settings are env-only. No `~/.config/blackbox/config.toml` exists. Settings that should be in a file:
 
-| What | Where | Problem |
-|------|-------|---------|
-| Daemon port | `$BBOX_PORT` env var | No file fallback, invisible to systemd unless in drop-in |
-| Provider binary paths | `$CLAUDE_BIN`, `$CODEX_BIN`, etc. | Env-only, not shareable |
-| Reindex interval | `$BLACKBOX_REINDEX_INTERVAL_SECS` | Env-only |
-| MCP server registry | `~/.bro/mcp.json` | Wrong namespace, no XDG |
-| Gemini dispatch policies | `~/.bro/gemini-policies/` | Ephemeral files in wrong namespace |
-| API keys / tokens | systemd drop-ins + env | No dedicated secrets surface |
+| Setting | Current | Gap |
+|---------|---------|-----|
+| Port / bind address | `$BBOX_PORT`, `$BBOX_BIND` | Invisible without reading systemd drop-in |
+| Reindex interval | `$BLACKBOX_REINDEX_INTERVAL_SECS` | Undiscoverable, not set → default silently |
+| Provider binary paths | `$CLAUDE_BIN` etc. | Env-only, not in any file |
+| MCP name override | `$BLACKBOX_MCP_NAME` | Env-only |
 
-### Global state (partially correct)
+**2. Secrets** — `BRO_SLACK_SHARED_SECRET` and API keys live in systemd drop-ins (`~/.config/systemd/user/blackbox.service.d/`). No dedicated secrets surface.
 
-| What | Where |
-|------|-------|
-| Knowledge store | `~/.claude-shared/blackbox-knowledge.json` |
-| Render backups | `~/.local/state/blackbox/backups/` |
-| Tantivy index | `$TRANSCRIPT_SEARCH_INDEX_PATH` or hardcoded |
+**3. Project-local namespace is `.bro/`, not cleaned up** — the global `~/.bro/` migration is done, but project-level MCP overlay is still hardcoded to `<project>/.bro/mcp.json` in `orchestration/mcp.rs:243`. There is no other project-local config.
 
-### Project-local (one convention, no others)
+**4. No project artifact locality** — brofiles, teams, workflows, packets, whiteboards are all daemon-state-only (under `bro/`). There is no answer to "where do I commit project-local agent definitions alongside the code?"
 
-| What | Where |
-|------|-------|
-| MCP overlay | `<project>/.bro/mcp.json` |
-| Brofiles | daemon state only — not on disk |
-| Teams | daemon state only — not on disk |
-| Workflows | daemon state only, or `examples/agentic-corpus/workflows/` for shipped ones |
-| Rule packets | daemon state only, or `examples/agentic-corpus/packets/` for shipped ones |
-| Render targets | nowhere |
-| Template paths | nowhere |
-
-### Artifact install convention
-
-`bbox_artifact_install` accepts a local file path or URL and installs into daemon state. There is no auto-discovery — every artifact must be explicitly installed. Uninstalled artifacts (new clone, fresh daemon) are invisible until someone runs the install commands again.
+**5. `state_dir` top-level vs `bro/` split is ad-hoc** — knowledge/threads/notes/edges/vectors sit directly under `state_dir`; orchestration state (brofiles/teams/workflows/councils/whiteboards) sits under `bro/`. The dividing line is historical, not principled.
 
 ---
 
 ## Proposed Design
 
-### 1. XDG-compliant global paths
+### 1. Config file: `~/.config/blackbox/config.toml`
 
-Migrate everything off `~/.bro/` onto XDG-standard paths:
-
-```
-~/.config/blackbox/
-    config.toml          # daemon config (replaces env vars where possible)
-    secrets.toml         # 0600 — API keys, tokens
-    mcp.json             # global MCP registry (migrated from ~/.bro/mcp.json)
-    brofiles/            # globally-installed brofile definitions
-    workflows/           # globally-installed workflow specs
-    packets/             # globally-installed rule packets
-    teams/               # global team definitions
-
-~/.local/share/blackbox/
-    knowledge.json
-    roadmap.json
-    threads.json
-    notes.json
-    pins.json
-    artifact-catalog.json
-    index/               # tantivy index
-
-~/.local/state/blackbox/
-    backups/             # render snapshots (already here)
-    gemini-policies/     # ephemeral per-dispatch Gemini policy files (migrated)
-```
-
-### 2. `config.toml` schema
+Introduce a config file parsed on daemon startup. All fields optional; env vars override. No behaviour changes — this is purely additive plumbing.
 
 ```toml
 [daemon]
 port = 7264
+bind = "127.0.0.1"
 reindex_interval_secs = 120
+mcp_name = "blackbox"
 
 [providers]
-claude_bin = ""       # empty = $PATH lookup
-codex_bin  = ""
-gemini_bin = ""
+# empty string = $PATH lookup
+claude_bin  = ""
+codex_bin   = ""
+gemini_bin  = ""
 copilot_bin = ""
 opencode_bin = ""
 
-[embedding]
-# future: named route config lives here
-
 [roadmap]
-# global render defaults (overridden per project)
-write_path = ""
+# project render defaults — overridden by .bbox/config.toml
+write_path    = ""
 template_path = ""
-scope = "global"
 ```
 
-Env vars remain valid and override file values. Precedence: **env > config.toml > compiled default**.
+Precedence: **env var > config.toml > compiled default** (same as every other well-behaved Unix daemon).
 
-### 3. `secrets.toml` (mode 0600)
+No hot reload in Phase 1. `SIGHUP`-triggered reload is Phase 2.
+
+### 2. Secrets file: `~/.config/blackbox/secrets.toml` (mode 0600)
 
 ```toml
-bbox_token = ""
-voyage_api_key = ""
-slack_bot_token = ""
-# etc.
+slack_shared_secret  = ""
+voyage_api_key       = ""
+# extend as new integrations land
 ```
 
-Never committed, never logged. Daemon warns at startup if the file is world-readable. Env vars override (same precedence as config).
+Daemon warns at startup if the file is world-readable. Env vars override (consistent with config.toml precedence). Systemd drop-ins remain valid but become the escape hatch, not the primary path.
 
-### 4. Project-local artifact home: `.bbox/`
+### 3. Project artifact home: `<project>/.bbox/`
 
-Every project that uses blackbox gets a `.bbox/` directory at its root:
+A single directory per project holds all blackbox-managed definitions for that project:
 
 ```
 <project>/.bbox/
     config.toml          # project config overlay
-    mcp.json             # MCP server overlay (migrated from .bro/mcp.json)
+    mcp.json             # MCP overlay (rename from .bro/mcp.json)
     brofiles/
         reviewer.json
         executor.json
@@ -144,117 +131,93 @@ Every project that uses blackbox gets a `.bbox/` directory at its root:
         core.json
 ```
 
-`.bbox/` is committed to the repo. It is the answer to "where does project-local blackbox config live?"
+`.bbox/` is committed to the repo. It answers "where does project-local blackbox config live?"
 
-#### `.bbox/config.toml` schema
+#### `.bbox/config.toml`
 
 ```toml
 [roadmap]
-write_path = "docs/roadmap.md"
+write_path    = "docs/roadmap.md"
 template_path = "roadmap.tera"
-scope = "project"
-
-[render]
-# future: per-artifact render targets
+scope         = "project"
 
 [brofiles]
-default = "executor"    # brofile to use when none specified for this project
+default = "executor"    # brofile used when none is specified for dispatches in this project
 ```
 
-### 5. Auto-discovery on project registration
+### 4. Project directory on registration
 
-When `bbox_project_register` is called (or when the daemon detects a project root via git), it:
-
-1. Checks for `<project>/.bbox/`
-2. If present, installs all artifacts found under `brofiles/`, `workflows/`, `packets/`, `teams/` into the artifact catalog, scoped to that project
-3. Watches the directory for changes (inotify/FSEvents) and reinstalls on modification
-4. Reads `.bbox/config.toml` and makes it available as the project config overlay
-
-Auto-discovery means a fresh clone + `bbox_project_register` is sufficient to restore the full project artifact state. No manual install steps.
-
-### 6. Artifact shadowing
-
-Artifacts are resolved by name with project scope taking priority over global:
+`bbox_project_register` gains an `init` action that creates a `.bbox/` skeleton (if absent) and writes `.gitignore` entries for anything that should stay local (nothing by default — all of `.bbox/` is version-controlled):
 
 ```
-project-scope artifact "reviewer" > global artifact "reviewer"
+bbox_project_register action=init project_dir=/path/to/repo
 ```
 
-A project can override a globally-installed brofile by shipping its own `.bbox/brofiles/reviewer.json`.
+On every `bbox_project_register` call, the daemon reads `.bbox/config.toml` (if present) and makes it available as the project config overlay.
 
-### 7. `~/.bro/` migration
+### 5. Artifact auto-discovery
 
-| Old path | New path | Action |
-|----------|----------|--------|
-| `~/.bro/mcp.json` | `~/.config/blackbox/mcp.json` | migrate on daemon startup (one-shot) |
-| `~/.bro/gemini-policies/` | `~/.local/state/blackbox/gemini-policies/` | migrate on daemon startup |
-| `<project>/.bro/mcp.json` | `<project>/.bbox/mcp.json` | migrate on project registration |
+On project registration the daemon scans `.bbox/{brofiles,workflows,packets,teams}/` and installs found artifacts into the artifact catalog, scoped to that project. The scan also runs when the daemon detects `.bbox/` has changed (inotify).
 
-Migration is automatic, one-shot, logged. Old paths are kept as symlinks for one release cycle, then removed.
+**Conflict policy:** file beats catalog. If a brofile exists in `.bbox/brofiles/reviewer.json` and also in the daemon catalog, the file version wins and the catalog is updated from the file. Rationale: the file is version-controlled truth; the catalog is a runtime cache.
 
----
+**Shadowing:** project-scope artifacts shadow global artifacts by name. A project can override a globally-installed brofile by shipping `.bbox/brofiles/<name>.json`.
 
-## Impact on Existing Features
+### 6. Migrate `.bro/` out of project context
 
-### Roadmap render targets
+`orchestration/mcp.rs:243` currently hardcodes `project_dir.join(".bro").join("mcp.json")` for the project MCP overlay. Change this to `project_dir.join(".bbox").join("mcp.json")`.
+
+Migration: on first access, if `<project>/.bro/mcp.json` exists and `<project>/.bbox/mcp.json` does not, auto-move it and log. One-shot per project.
+
+### 7. Render target config
 
 `bbox_roadmap action=render` with no explicit `write_path` or `template_path` reads from:
-1. `<project>/.bbox/config.toml` `[roadmap]` section (if project-scoped render)
+1. `<project>/.bbox/config.toml` `[roadmap]` section (project-scoped render)
 2. `~/.config/blackbox/config.toml` `[roadmap]` section (global fallback)
-3. No write (return text) if neither is set
-
-### MCP server management
-
-`bro_mcp` list/add/remove continues to work as-is. The backing store moves from `~/.bro/mcp.json` to `~/.config/blackbox/mcp.json`, project overlay from `<project>/.bro/mcp.json` to `<project>/.bbox/mcp.json`. No tool API change.
-
-### `bbox_artifact_install`
-
-Continues to work for explicit one-off installs. Auto-discovery supplements it — artifacts in `.bbox/` subdirs are installed automatically without an explicit call.
-
-### Brofile/team/workflow/packet CRUD tools
-
-No API change. The daemon continues to be authoritative. `.bbox/` files are the *source of truth for version-controlled definitions*; the daemon's artifact catalog is the *runtime representation*. On conflict (file vs catalog), file wins (daemon re-installs from file on detection).
+3. No write (return text only) if neither is configured
 
 ---
 
 ## Open Questions
 
-1. **Config file format**: TOML is idiomatic Rust and already used by Codex (`~/.codex/config.toml`). JSON would be consistent with the existing stores. Recommendation: TOML for human-authored config, JSON for machine-managed stores.
+**Config format: TOML vs JSON**  
+TOML for human-authored files (`config.toml`, `secrets.toml`, `.bbox/config.toml`). JSON stays for machine-managed stores (knowledge, threads, artifact catalog, task state). Codex already uses TOML for its config; this is consistent.
 
-2. **`.bbox/` vs `.blackbox/`**: `.bbox/` is short and matches the `bbox_*` tool prefix. `.blackbox/` is unambiguous. Recommendation: `.bbox/` — brevity wins, prefix is already established.
+**`.bbox/` vs `.blackbox/`**  
+`.bbox/` matches the `bbox_*` tool prefix and is short. `.blackbox/` is unambiguous but verbose. Recommendation: `.bbox/`. (Note: `~/.blackbox/` at home dir is a separate, pre-existing namespace for `BLACKBOX.md` — not the same as project `.bbox/`.)
 
-3. **Hot reload**: Should the daemon watch `config.toml` and reload without restart? In-scope for the implementation but adds complexity. Recommendation: reload on `SIGHUP`, file-watch as a follow-on.
+**`state_dir` top-level vs `bro/` split**  
+The current ad-hoc split (knowledge/edges/vectors at top level, orchestration under `bro/`) is not worth fixing now — migration cost is high, benefit is cosmetic. Document it as intentional: `state_dir/` root = user-facing stores; `bro/` = orchestration runtime state. Don't move files.
 
-4. **Secrets in `secrets.toml` vs OS keyring**: `secrets.toml` with 0600 is simple and portable. Keyring integration (libsecret/keychain) is more secure but platform-specific. Recommendation: `secrets.toml` now, keyring as opt-in later.
+**Hot reload**  
+Phase 2, triggered by `SIGHUP`. Out of scope for Phase 1.
 
-5. **Backwards compat window for `~/.bro/`**: One release cycle (symlink) or hard cut? Given this is a single-user daemon on a known host, a hard cut after auto-migration is probably fine.
+**Multi-instance coordination (prod + dev daemons)**  
+Both instances share the same `state_dir`. Config file reads are read-only so no lock is needed. `.bbox/` inotify watches: each daemon instance watches independently — idempotent installs make duplicate fires harmless (same file → same result). Gemini policy files: each task generates a unique filename so no collision risk.
 
-6. **`examples/agentic-corpus/` relationship**: This directory holds library/shipped artifacts. It remains as-is — the distinction is "shipped examples" vs "project-local definitions in `.bbox/`". Users can copy from `examples/` into `.bbox/` to customise.
+**Secrets vs keyring**  
+`secrets.toml` at 0600 now. OS keyring (libsecret) as opt-in later. Not blocking.
 
 ---
 
 ## Implementation Phases
 
-**Phase 1 — Config file foundation**
+**Phase 1 — Config file**
 - Parse `~/.config/blackbox/config.toml` on daemon startup (all fields optional, env overrides)
-- Parse `~/.config/blackbox/secrets.toml` (0600 check, warn if world-readable)
-- No behaviour change — just plumbing the file into the existing env-var resolution layer
+- Parse `~/.config/blackbox/secrets.toml` (0600 check + warn)
+- Wire `[roadmap]` section into `roadmap_render()` as fallback when no explicit params
+- No filesystem changes, no migration
 
-**Phase 2 — Path migration**
-- Migrate `~/.bro/mcp.json` → `~/.config/blackbox/mcp.json` on startup
-- Migrate `~/.bro/gemini-policies/` → `~/.local/state/blackbox/gemini-policies/`
-- Symlink old paths
+**Phase 2 — `.bbox/` project directory**
+- `bbox_project_register action=init` scaffolds `.bbox/` skeleton
+- `bbox_project_register` reads `.bbox/config.toml` on every call
+- Change `mcp.rs:243` from `.bro/mcp.json` to `.bbox/mcp.json` with one-shot migration
 
-**Phase 3 — Project `.bbox/` directory**
-- `bbox_project_register` creates `.bbox/` skeleton on first registration (if absent)
-- `bbox_project_register` reads `.bbox/config.toml` and merges as project overlay
-- Migrate `<project>/.bro/mcp.json` → `<project>/.bbox/mcp.json`
-
-**Phase 4 — Artifact auto-discovery**
-- On project registration, scan `.bbox/{brofiles,workflows,packets,teams}/` and install into artifact catalog
+**Phase 3 — Artifact auto-discovery**
+- On project registration, scan `.bbox/{brofiles,workflows,packets,teams}/` and install
 - inotify watch on `.bbox/` for live reload
-- File beats catalog on conflict
+- Shadowing: project artifact overrides global by name
 
-**Phase 5 — Render target config**
+**Phase 4 — Render target config**
 - `bbox_roadmap action=render` reads write_path/template_path from project then global config
-- `bro_exec` / `bro_resume` read default brofile from project config
+- `bro_exec`/`bro_resume` read default brofile from project `.bbox/config.toml`
