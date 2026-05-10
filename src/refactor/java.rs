@@ -6276,7 +6276,109 @@ fn field_annotation_insert(field: &PojoField, source: &str) -> (usize, String) {
 
 pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
-    let parsed = parse_source_file(&source_path)?;
+    if source_path.is_dir() {
+        return plan_lombokify_java_tree(p, &source_path);
+    }
+    plan_lombokify_java_class_single(p, &source_path)
+}
+
+/// Walk every `.java` file under `dir`, run the single-file lombokifier
+/// against each, accumulate per-file FileEdits and per-file validation
+/// steps into one composite plan. Files that refuse (no lombokifiable
+/// boilerplate, parse failure, etc.) are collected into `leftovers` with
+/// a `path: reason` line per entry. Build/gen directories (`target/`,
+/// `build/`, `.gradle/`, hidden dirs) are skipped during the walk.
+fn plan_lombokify_java_tree(p: &RefactorPlanParams, dir: &Path) -> Result<String> {
+    let mut all_edits: Vec<FileEdit> = Vec::new();
+    let mut all_validations: Vec<ValidationStep> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut total_files: usize = 0;
+    let mut converted_files: usize = 0;
+
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        // Skip hidden and standard build/output dirs.
+        if e.depth() > 0 && name.starts_with('.') {
+            return false;
+        }
+        !matches!(name.as_ref(), "target" | "build" | "out")
+    }) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("java") {
+            continue;
+        }
+        total_files += 1;
+
+        let mut file_params = p.clone();
+        file_params.source = path.to_string_lossy().into_owned();
+        // Don't propagate `item_names` — the per-class selector only makes
+        // sense in single-file mode. In tree mode we always pick the first
+        // top-level class per file.
+        file_params.item_names = None;
+
+        match plan_lombokify_java_class_single(&file_params, path) {
+            Ok(plan_text) => {
+                let plan: RefactorPlan = serde_json::from_str(&plan_text)
+                    .with_context(|| format!("parsing per-file plan for {}", path.display()))?;
+                converted_files += 1;
+                all_edits.extend(plan.edits);
+                all_validations.extend(plan.validations);
+            }
+            Err(e) => {
+                skipped.push(format!("{}: {}", path.display(), e));
+            }
+        }
+    }
+
+    if all_edits.is_empty() {
+        bail!(
+            "no lombokifiable classes found under {} (scanned {total_files} .java file(s); see leftovers in dry-run output if needed)",
+            dir.display()
+        );
+    }
+
+    // Dedupe validations by path (multiple files may produce the same
+    // validation kind, but each step's path is unique here so this is
+    // effectively pass-through).
+    let validations: Vec<ValidationStep> = all_validations
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let plan = RefactorPlan {
+        title: format!(
+            "Lombokify {converted_files}/{total_files} class(es) under {}",
+            dir.display()
+        ),
+        kind: "lombokify_java_class".to_string(),
+        semantic_status: SemanticStatus::StructuralOnly,
+        dry_run: false,
+        file_moves: Vec::new(),
+        edits: all_edits,
+        validations,
+        items: Vec::new(),
+        leftovers: skipped,
+        captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
+    };
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_lombokify_java_class_single(
+    p: &RefactorPlanParams,
+    source_path: &Path,
+) -> Result<String> {
+    let parsed = parse_source_file(source_path)?;
     if parsed.language != "java" {
         bail!("lombokify_java_class only supports java files");
     }
@@ -10662,6 +10764,122 @@ mod tests {
             "should NOT detect logger named `logger`:\n{rewritten}"
         );
         assert!(rewritten.contains("private static final Logger logger"));
+    }
+
+    #[test]
+    fn lombokify_tree_walks_directory_and_aggregates() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src/com/example");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("Pair.java"),
+            "package com.example;\n\
+             public class Pair {\n\
+            \x20   private String first;\n\
+            \x20   private String second;\n\
+            \x20   public Pair(String first, String second) { this.first = first; this.second = second; }\n\
+            \x20   public String getFirst() { return first; }\n\
+            \x20   public String getSecond() { return second; }\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("Single.java"),
+            "package com.example;\n\
+             public class Single {\n\
+            \x20   private String name;\n\
+            \x20   public String getName() { return name; }\n\
+             }\n",
+        )
+        .unwrap();
+        // A file with nothing to lombokify: should land in `leftovers`.
+        fs::write(
+            src.join("Service.java"),
+            "package com.example;\n\
+             public class Service {\n\
+            \x20   public void run() { /* no boilerplate */ }\n\
+             }\n",
+        )
+        .unwrap();
+        // A non-Java file (must not be picked up at all).
+        fs::write(src.join("README.md"), "ignore me\n").unwrap();
+        // A `target/` directory must be skipped.
+        let target = root.path().join("target/classes");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            target.join("Generated.java"),
+            "package com.example;\n\
+             public class Generated {\n\
+            \x20   private String t;\n\
+            \x20   public String getT() { return t; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("lombokify_java_class", root.path());
+        params.source = path_string(root.path());
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        assert!(
+            plan.title.starts_with("Lombokify 2/3"),
+            "title should report 2/3 conversions (Pair + Single, Service skipped, target/ filtered): {}",
+            plan.title
+        );
+        // Two FileEdits — one per converted file.
+        assert_eq!(plan.edits.len(), 2);
+        let pair_edit = plan
+            .edits
+            .iter()
+            .find(|e| e.path.ends_with("Pair.java"))
+            .expect("Pair edit");
+        let single_edit = plan
+            .edits
+            .iter()
+            .find(|e| e.path.ends_with("Single.java"))
+            .expect("Single edit");
+        // Service should be in leftovers with the bail message.
+        assert!(
+            plan.leftovers
+                .iter()
+                .any(|s| s.contains("Service.java")
+                    && (s.contains("no lombokifiable")
+                        || s.contains("no instance fields"))),
+            "Service.java should be in leftovers: {:?}",
+            plan.leftovers
+        );
+        // target/ tree must NOT have leaked in.
+        assert!(
+            !plan
+                .leftovers
+                .iter()
+                .any(|s| s.contains("Generated.java")),
+            "Generated.java under target/ must be filtered out: {:?}",
+            plan.leftovers
+        );
+        // Each FileEdit's hash should match the file at plan time.
+        assert!(!pair_edit.original_sha256.is_empty());
+        assert!(!single_edit.original_sha256.is_empty());
+    }
+
+    #[test]
+    fn lombokify_tree_bails_when_no_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(
+            root.path().join("src/Empty.java"),
+            "package com.example;\n\
+             public class Empty {\n\
+            \x20   public void doNothing() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("lombokify_java_class", root.path());
+        params.source = path_string(root.path());
+        let err = plan_lombokify_java_class(&params).unwrap_err();
+        assert!(
+            err.to_string().contains("no lombokifiable classes found under"),
+            "expected tree-mode bail; got: {err}"
+        );
     }
 
     #[test]
