@@ -832,6 +832,56 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Workflow pattern catalog">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#core-patterns-examplesworkflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Core patterns (examples/workflows/)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#foreach-bounded-parallel-iteration-over-a-list" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        foreach — bounded parallel iteration over a list
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#matrix-cartesian-product-fanout-over-multiple-axes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        matrix — Cartesian product fanout over multiple axes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#agent-dispatch-workflows-examplesagentsworkflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Agent dispatch workflows (examples/agents/workflows/)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1075,6 +1125,56 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Workflow pattern catalog">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#core-patterns-examplesworkflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Core patterns (examples/workflows/)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#foreach-bounded-parallel-iteration-over-a-list" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        foreach — bounded parallel iteration over a list
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#matrix-cartesian-product-fanout-over-multiple-axes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        matrix — Cartesian product fanout over multiple axes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#agent-dispatch-workflows-examplesagentsworkflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Agent dispatch workflows (examples/agents/workflows/)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1363,10 +1463,161 @@ functional but several depend on engine primitives still in progress
 <p>Use <code>bbox_artifact_list</code> to inspect what's installed.</p>
 <hr />
 <h2 id="workflow-pattern-catalog">Workflow pattern catalog<a class="headerlink" href="#workflow-pattern-catalog" title="Permanent link">&para;</a></h2>
-<p><code>examples/workflows/</code></p>
-<p>Minimal standalone workflow specs that demonstrate individual engine
-primitives. Use as copy-paste starting points before reaching for a full
-example like Keystone.</p>
+<p><code>examples/workflows/</code> and <code>examples/agents/workflows/</code></p>
+<p>Minimal standalone specs that demonstrate individual engine primitives.
+Use as copy-paste starting points before reaching for a full example
+like Keystone.</p>
+<h3 id="core-patterns-examplesworkflows">Core patterns (<code>examples/workflows/</code>)<a class="headerlink" href="#core-patterns-examplesworkflows" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Pattern</th>
+<th>Key primitives</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>e2e-smoke.json</code></td>
+<td>Linear two-turn durable actor</td>
+<td><code>durable: true</code>, <code>${NodeName.output}</code> substitution</td>
+</tr>
+<tr>
+<td><code>e2e-gated.json</code></td>
+<td>Gate packet + branch</td>
+<td><code>gate</code>, <code>branch</code> transition, <code>cases</code> routing</td>
+</tr>
+<tr>
+<td><code>e2e-async-review.json</code></td>
+<td>Fork + fire-and-forget + late_inject</td>
+<td><code>fork</code>, <code>fire_and_forget</code>, <code>late_inject.from</code></td>
+</tr>
+<tr>
+<td><code>e2e-fork-join.json</code></td>
+<td>Fork + explicit fan-in</td>
+<td><code>fork</code>, <code>wait_for: [...]</code> at downstream node</td>
+</tr>
+<tr>
+<td><code>e2e-ensemble-vote.json</code></td>
+<td>Concurrent ensemble + aggregation</td>
+<td><code>ensemble</code> actor, <code>bro_broadcast</code>, stable output ordering</td>
+</tr>
+<tr>
+<td><code>e2e-composition.json</code></td>
+<td>Inline sub-workflow as a node</td>
+<td><code>subworkflow</code> field, sub-arc output concatenation</td>
+</tr>
+<tr>
+<td><code>e2e-policy.json</code></td>
+<td>Workflow-level policy packet</td>
+<td><code>policy_packet</code>, arc-state entity, halt/escalate/warn verdicts</td>
+</tr>
+<tr>
+<td><code>e2e-self-audit.json</code></td>
+<td>Multi-phase back-edge critique loop</td>
+<td><code>retry.max_generations</code>, durable auditor, <code>branch</code> back-edge</td>
+</tr>
+<tr>
+<td><code>e2e-review-mode.json</code></td>
+<td>Gate applied to actor output (review mode)</td>
+<td><code>gate_mode: "all"</code> — runs ALL packet rules, not just first match</td>
+</tr>
+<tr>
+<td><code>e2e-combo.json</code></td>
+<td>Gated retry loop + inline sub-workflow</td>
+<td>Combines <code>retry</code>, <code>branch</code>, and inline <code>subworkflow</code> in one arc</td>
+</tr>
+<tr>
+<td><code>blind.json</code></td>
+<td>Blind-convergence deliberation</td>
+<td>Ensemble critique → converged branch → executor implements → fresh review</td>
+</tr>
+<tr>
+<td><code>optimistic.json</code></td>
+<td>Async ensemble steering</td>
+<td><code>fork</code> + <code>fire_and_forget</code> + <code>late_inject</code> with ensemble actor</td>
+</tr>
+</tbody>
+</table>
+<h3 id="foreach-bounded-parallel-iteration-over-a-list"><code>foreach</code> — bounded parallel iteration over a list<a class="headerlink" href="#foreach-bounded-parallel-iteration-over-a-list" title="Permanent link">&para;</a></h3>
+<p>A <code>foreach</code> node fans out a sub-workflow once per item in an array
+variable, runs up to <code>parallelism</code> items concurrently, and collects
+results into a <code>vars</code> key. No actor declared on the node — iteration
+is pure engine machinery.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="p">{</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span><span class="nt">&quot;ForeachBinding&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">    </span><span class="nt">&quot;actor&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="w">    </span><span class="nt">&quot;foreach&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">      </span><span class="nt">&quot;items&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;${vars.bindings_response.bindings}&quot;</span><span class="p">,</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">      </span><span class="nt">&quot;as_var&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;binding&quot;</span><span class="p">,</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="w">      </span><span class="nt">&quot;subworkflow_ref&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;badgey-triage-channel-arc&quot;</span><span class="p">,</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a><span class="w">      </span><span class="nt">&quot;imports&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[],</span>
+<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="w">      </span><span class="nt">&quot;exports&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[],</span>
+<a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="w">      </span><span class="nt">&quot;parallelism&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a><span class="w">      </span><span class="nt">&quot;on_item_failure&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;continue&quot;</span><span class="p">,</span>
+<a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a><span class="w">      </span><span class="nt">&quot;collect&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;into_var&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;channel_results&quot;</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="w">    </span><span class="p">},</span>
+<a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="w">    </span><span class="nt">&quot;next&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;terminal&quot;</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="p">}</span>
+</code></pre></div>
+<p><code>on_item_failure</code> values:</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>continue</code></td>
+<td>Failed item's result is <code>{status: "failed", error: "..."}</code> in the collect array; remaining items keep running</td>
+</tr>
+<tr>
+<td><code>collect_then_halt</code></td>
+<td>Let all in-flight items finish, collect results, then halt the arc</td>
+</tr>
+<tr>
+<td><code>halt</code></td>
+<td>Cancel in-flight items, halt immediately</td>
+</tr>
+</tbody>
+</table>
+<p><code>collect.into_var</code> must be declared <code>kind: "array"</code> in <code>vars_schema</code>.
+The collected array entries have shape <code>{item: &lt;input&gt;, result: &lt;sub-arc output&gt;, status: "ok"|"failed"}</code>.</p>
+<p>Live example: <code>examples/badgey/workflows/badgey-triage-fanout-arc.json</code>
+(channel bindings fanout) and <code>badgey-triage-channel-arc.json</code> (scout
+fanout at <code>parallelism: 3</code>, proposal posting at <code>parallelism: 1</code>).</p>
+<h3 id="matrix-cartesian-product-fanout-over-multiple-axes"><code>matrix</code> — Cartesian product fanout over multiple axes<a class="headerlink" href="#matrix-cartesian-product-fanout-over-multiple-axes" title="Permanent link">&para;</a></h3>
+<p>A <code>matrix</code> node runs a sub-workflow for every combination of values
+across two or more named axes. Axis values can be literal arrays or
+<code>${vars.X}</code> runtime references.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="p">{</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span><span class="nt">&quot;Grid&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">    </span><span class="nt">&quot;actor&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">    </span><span class="nt">&quot;matrix&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">      </span><span class="nt">&quot;axes&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="w">        </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;query&quot;</span><span class="p">,</span><span class="w">    </span><span class="nt">&quot;values&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;${vars.queries}&quot;</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="w">        </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;strategy&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;values&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;search-only&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;agentic&quot;</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="w">      </span><span class="p">],</span>
+<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="w">      </span><span class="nt">&quot;as_var&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;case&quot;</span><span class="p">,</span>
+<a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a><span class="w">      </span><span class="nt">&quot;collect&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;into_var&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;results&quot;</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a><span class="w">      </span><span class="nt">&quot;subworkflow_ref&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;eval-child&quot;</span>
+<a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a><span class="w">    </span><span class="p">},</span>
+<a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a><span class="w">    </span><span class="nt">&quot;next&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;terminal&quot;</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a><span class="p">}</span>
+</code></pre></div>
+<p>Inside the child sub-workflow, <code>${vars.case.query}</code> and
+<code>${vars.case.strategy}</code> resolve to the axis values for that combination.
+Same <code>on_item_failure</code> and <code>collect</code> semantics as <code>foreach</code>.</p>
+<p>Constraints: <code>foreach</code> and <code>matrix</code> are mutually exclusive on a node;
+neither can declare an actor, a node-level subworkflow, a wait, or
+<code>fire_and_forget</code> mode. Item ceiling is enforced at runtime (default 200).</p>
+<h3 id="agent-dispatch-workflows-examplesagentsworkflows">Agent dispatch workflows (<code>examples/agents/workflows/</code>)<a class="headerlink" href="#agent-dispatch-workflows-examplesagentsworkflows" title="Permanent link">&para;</a></h3>
+<p>Patterns for composing named installed agents (<code>bro_agent_dispatch</code> +
+<code>bro_wait</code>) via hook-only nodes and <code>mcp_call</code> ops:</p>
 <table>
 <thead>
 <tr>
@@ -1376,40 +1627,24 @@ example like Keystone.</p>
 </thead>
 <tbody>
 <tr>
-<td><code>e2e-smoke.json</code></td>
-<td>Two-turn durable actor, prompt substitution</td>
+<td><code>chain.json</code></td>
+<td>Serial agent dispatch — diff-narrator feeds code-reviewer</td>
 </tr>
 <tr>
-<td><code>e2e-gated.json</code></td>
-<td>Gate packet + <code>branch</code> transition</td>
+<td><code>fan-out.json</code></td>
+<td>Parallel agent dispatch — both dispatched, <code>bro_wait</code> collected separately</td>
 </tr>
 <tr>
-<td><code>e2e-async-review.json</code></td>
-<td><code>fork</code> + <code>fire_and_forget</code> + <code>late_inject</code></td>
+<td><code>escalation.json</code></td>
+<td>Cheap-first escalation — gate packet decides whether to invoke the expensive agent</td>
 </tr>
 <tr>
-<td><code>e2e-composition.json</code></td>
-<td>Sub-workflow as a node</td>
+<td><code>agent-eval-arc.json</code></td>
+<td>Nightly evaluation arc over installed agents</td>
 </tr>
 <tr>
-<td><code>e2e-policy.json</code></td>
-<td>Workflow-level policy packet</td>
-</tr>
-<tr>
-<td><code>e2e-fork-join.json</code></td>
-<td>Fork + join fan-out/fan-in</td>
-</tr>
-<tr>
-<td><code>e2e-ensemble-vote.json</code></td>
-<td>Ensemble broadcast + vote aggregate</td>
-</tr>
-<tr>
-<td><code>blind.json</code></td>
-<td>Blind-convergence deliberation pattern</td>
-</tr>
-<tr>
-<td><code>optimistic.json</code></td>
-<td>Optimistic-review (fire-and-steer) pattern</td>
+<td><code>agent-cuing-eval-arc.json</code></td>
+<td>Cuing evaluation variant</td>
 </tr>
 </tbody>
 </table>
