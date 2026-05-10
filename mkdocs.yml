@@ -37,7 +37,8 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
-  - Operating Guide: operating-blackbox.md
+  - Internals: internals.md
+  - Operations: operations.md
   - Workflow Engine: workflows.md
   - Rule Packets: rule-packets.md
   - Refactor Tools: refactor.md
