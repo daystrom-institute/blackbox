@@ -14,12 +14,6 @@ giving agents a structured traversal surface and a sequence of tool
 calls with interlocking shapes that carry evidence forward rather than
 starting each step from scratch.
 
-The tool shapes and the agentic opening sequence were derived
-experimentally in a donor project (AgenticTools / McpPoc spike). They
-are not arbitrary conventions. They exist because this specific
-combination of call shapes is what makes agents actually ground rather
-than hallucinate.
-
 ---
 
 ## Tool shapes and how they compose

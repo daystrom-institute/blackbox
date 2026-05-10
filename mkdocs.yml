@@ -37,20 +37,24 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
-  - Internals: internals.md
-  - Operations: operations.md
-  - Workflow Engine: workflows.md
-  - Rule Packets: rule-packets.md
-  - Refactor Tools: refactor.md
-  - Agent System: agent-system.md
-  - Badgey: badgey.md
-  - Ingress Paths: ingress-paths.md
-  - Slack Bridge: slack-bridge.md
-  - IRC Bridge: irc-bridge.md
-  - Councils & Whiteboards: councils-whiteboards.md
-  - Roadmap Tool: roadmap-tool.md
-  - Reference Implementations: examples.md
-  - Project Roadmap: roadmap.md
+  - How It Works:
+    - Internals: internals.md
+    - Operations: operations.md
+  - Toolbelt:
+    - Workflow Engine: workflows.md
+    - Rule Packets: rule-packets.md
+    - Refactor Tools: refactor.md
+    - Agent System: agent-system.md
+    - Badgey: badgey.md
+    - Councils & Whiteboards: councils-whiteboards.md
+    - Roadmap Tool: roadmap-tool.md
+  - Integrations:
+    - Ingress Paths: ingress-paths.md
+    - Slack Bridge: slack-bridge.md
+    - IRC Bridge: irc-bridge.md
+  - Reference:
+    - Examples: examples.md
+    - Project Roadmap: roadmap.md
 
 plugins:
   - search
