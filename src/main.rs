@@ -126,6 +126,7 @@ impl BlackboxServer {
                 + tools::roster::router()
                 + tools::config::router()
                 + tools::dispatch::router(),
+            surface: std::sync::OnceLock::new(),
         }
     }
 

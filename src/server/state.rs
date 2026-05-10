@@ -263,8 +263,13 @@ pub(crate) struct ArcSnapshot {
 // MCP Server Handler
 // ---------------------------------------------------------------------------
 
+use std::sync::OnceLock;
+
 #[derive(Clone)]
 pub(crate) struct BlackboxServer {
     pub(crate) state: Arc<SharedState>,
     pub(crate) tool_router: ToolRouter<Self>,
+    /// Session-scoped MCP tool surface selector. Set once during
+    /// MCP session initialization from the `?surface` query parameter.
+    pub(crate) surface: OnceLock<Arc<str>>,
 }

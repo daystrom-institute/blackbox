@@ -302,7 +302,7 @@ fn parse_copilot_mcp_pattern(pattern: &str) -> Option<(&str, &str)> {
 /// Simple recursive glob matcher: `*` = any sequence (incl. empty),
 /// `?` = exactly one char, everything else literal. No character
 /// classes or escapes — adequate for tool-name patterns we ship.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     glob_match_inner(&p, 0, &t, 0)
