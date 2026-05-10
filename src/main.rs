@@ -70,8 +70,8 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ErrorCode, IntoContents, ListToolsResult,
-    ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResult, ErrorCode, InitializeRequestParams, InitializeResult,
+    IntoContents, ListToolsResult, ServerCapabilities, ServerInfo,
 };
 use rmcp::schemars;
 use rmcp::service::RequestContext;
@@ -1149,7 +1149,42 @@ impl ServerHandler for BlackboxServer {
             .with_instructions("Blackbox: unified transcript search, knowledge management, and multi-provider agent orchestration")
     }
 
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        let surface_str = if let Some(parts) = context.extensions.get::<http::request::Parts>() {
+            server::surface::extract_surface_from_uri(parts.uri.query())
+        } else {
+            "default"
+        };
+        let entity = server::surface::build_surface_entity(surface_str, None);
+        let decision = {
+            let packets = self.state.packets.read();
+            server::surface::evaluate_tool_surface(&*packets, entity, None::<&str>)
+        };
+        if matches!(decision.verdict, server::surface::ToolSurfaceVerdict::Deny { .. }) {
+            let reason = match &decision.verdict {
+                server::surface::ToolSurfaceVerdict::Deny { reason } => {
+                    reason.as_deref().unwrap_or("surface denied")
+                }
+                _ => unreachable!(),
+            };
+            return Err(ErrorData::internal_error(
+                format!("tool surface denied: {}", reason),
+                None,
+            ));
+        }
+        let _ = self.surface.set(Arc::from(surface_str));
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request);
+        }
+        Ok(self.get_info())
+    }
+
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        // Canonical setter is `initialize`; fallback for paths that bypass it.
         let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
         let entity = server::surface::build_surface_entity(surface, None);
         let packets = self.state.packets.read();
@@ -1173,6 +1208,7 @@ impl ServerHandler for BlackboxServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        // Canonical setter is `initialize`; fallback for paths that bypass it.
         let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
         let entity = server::surface::build_surface_entity(surface, None);
         let packets = self.state.packets.read();
@@ -1199,6 +1235,7 @@ impl ServerHandler for BlackboxServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let (surface, decision, universe) = {
+            // Canonical setter is `initialize`; fallback for paths that bypass it.
             let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
             let entity = server::surface::build_surface_entity(surface, None);
             let packets = self.state.packets.read();

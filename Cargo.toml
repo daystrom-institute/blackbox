@@ -90,6 +90,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 
 # HTTP server (for /tail endpoint outside MCP)
 axum = { version = "0.8", features = ["macros"] }
+http = "1"
 
 # IDs
 uuid = { version = "1", features = ["v4"] }

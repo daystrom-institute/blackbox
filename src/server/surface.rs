@@ -231,6 +231,20 @@ pub fn filter_tools(
     }
 }
 
+/// Extract the `surface` query parameter from a URI query string.
+/// Returns `"default"` if no `surface=` parameter is present.
+pub fn extract_surface_from_uri(query: Option<&str>) -> &str {
+    let Some(q) = query else { return "default" };
+    for pair in q.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "surface" && !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    "default"
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -605,5 +619,46 @@ mod tests {
             evaluate_tool_surface(&packets, entity_global, None::<&str>);
         assert!(!decision_global.is_deny());
         assert!(!tool_visible("bbox_stats", &decision_global, &universe));
+    }
+
+    // ── extract_surface_from_uri tests ────────────────────────────
+
+    #[test]
+    fn extract_surface_no_query_returns_default() {
+        assert_eq!(extract_surface_from_uri(None), "default");
+    }
+
+    #[test]
+    fn extract_surface_empty_query_returns_default() {
+        assert_eq!(extract_surface_from_uri(Some("")), "default");
+    }
+
+    #[test]
+    fn extract_surface_param_present() {
+        assert_eq!(
+            extract_surface_from_uri(Some("surface=readonly&foo=bar")),
+            "readonly"
+        );
+    }
+
+    #[test]
+    fn extract_surface_trailing_param() {
+        assert_eq!(
+            extract_surface_from_uri(Some("foo=bar&surface=admin")),
+            "admin"
+        );
+    }
+
+    #[test]
+    fn extract_surface_empty_value_ignored() {
+        assert_eq!(extract_surface_from_uri(Some("surface=")), "default");
+    }
+
+    #[test]
+    fn extract_surface_no_match() {
+        assert_eq!(
+            extract_surface_from_uri(Some("foo=bar&baz=qux")),
+            "default"
+        );
     }
 }
