@@ -736,13 +736,18 @@ Next step: <one concrete steering suggestion>\n",
                 let wrapped_prompt = orch::apply_ambient(&prompt, &ambient_ctx);
                 let mut args =
                     provider.build_resume_args(session_id, &wrapped_prompt, exec_opts.as_ref());
-                let dispatch_filters = resolve_dispatch_filters(
+                let dispatch_filters = match resolve_dispatch_filters(
                     provider,
                     cwd.as_deref(),
                     false,
                     &task_id,
                     brofile.filters.as_ref(),
-                );
+                    None,
+                    &self.state.packets.read(),
+                ) {
+                    Ok(df) => df,
+                    Err(e) => return Err(e),
+                };
                 args.extend(dispatch_filters.args);
                 let task = orch::spawn_task(
                     task_id.clone(),
@@ -795,13 +800,18 @@ Next step: <one concrete steering suggestion>\n",
                     cwd.as_deref(),
                     exec_opts.as_ref(),
                 );
-                let dispatch_filters = resolve_dispatch_filters(
+                let dispatch_filters = match resolve_dispatch_filters(
                     provider,
                     cwd.as_deref(),
                     false,
                     &task_id,
                     brofile.filters.as_ref(),
-                );
+                    None,
+                    &self.state.packets.read(),
+                ) {
+                    Ok(df) => df,
+                    Err(e) => return Err(e),
+                };
                 args.extend(dispatch_filters.args);
                 let task = orch::spawn_task(
                     task_id.clone(),

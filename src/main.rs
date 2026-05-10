@@ -457,13 +457,18 @@ impl BlackboxServer {
             )
         };
 
-        let dispatch_filters = resolve_dispatch_filters(
+        let dispatch_filters = match resolve_dispatch_filters(
             provider,
             cwd.as_deref(),
             false,
             &task_id,
             brofile_filters.as_ref(),
-        );
+            None,
+            &self.state.packets.read(),
+        ) {
+            Ok(df) => df,
+            Err(e) => return Err(e),
+        };
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(

@@ -70,13 +70,18 @@ impl BlackboxServer {
         let params_extra =
             extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
         let extra = combine_dispatch_filters(brofile_filters.as_ref(), params_extra.as_ref());
-        let dispatch_filters = resolve_dispatch_filters(
+        let dispatch_filters = match resolve_dispatch_filters(
             provider,
             cwd.as_deref(),
             allow_recursion,
             &task_id,
             extra.as_ref(),
-        );
+            p.surface.as_deref(),
+            &self.state.packets.read(),
+        ) {
+            Ok(df) => df,
+            Err(e) => return Self::err_text(&e),
+        };
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
@@ -200,13 +205,18 @@ impl BlackboxServer {
         let params_extra =
             extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
         let extra = combine_dispatch_filters(brofile_filters.as_ref(), params_extra.as_ref());
-        let dispatch_filters = resolve_dispatch_filters(
+        let dispatch_filters = match resolve_dispatch_filters(
             provider,
             cwd.as_deref(),
             allow_recursion,
             &task_id,
             extra.as_ref(),
-        );
+            p.surface.as_deref(),
+            &self.state.packets.read(),
+        ) {
+            Ok(df) => df,
+            Err(e) => return Self::err_text(&e),
+        };
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
@@ -570,13 +580,18 @@ impl BlackboxServer {
                         brofile
                             .provider
                             .build_resume_args(sid, &p.prompt, exec_opts.as_ref());
-                    let df = resolve_dispatch_filters(
+                    let df = match resolve_dispatch_filters(
                         brofile.provider,
                         member_cwd.as_deref(),
                         allow_recursion,
                         &task_id,
                         extra.as_ref(),
-                    );
+                        None,
+                        &self.state.packets.read(),
+                    ) {
+                        Ok(df) => df,
+                        Err(e) => return Self::err_text(&e),
+                    };
                     args.extend(df.args);
                     let t = orch::spawn_task(
                         task_id,
@@ -615,13 +630,18 @@ impl BlackboxServer {
                     cwd.as_deref(),
                     exec_opts.as_ref(),
                 );
-                let df = resolve_dispatch_filters(
+                let df = match resolve_dispatch_filters(
                     brofile.provider,
                     cwd.as_deref(),
                     allow_recursion,
                     &task_id,
                     extra.as_ref(),
-                );
+                    None,
+                    &self.state.packets.read(),
+                ) {
+                    Ok(df) => df,
+                    Err(e) => return Self::err_text(&e),
+                };
                 args.extend(df.args);
                 let t = orch::spawn_task(
                     task_id,

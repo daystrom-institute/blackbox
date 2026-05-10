@@ -5404,3 +5404,171 @@ fn surface_evaluate_deny_produces_correct_error_data() {
         panic!("expected Deny variant");
     }
 }
+
+// ── Phase 3: dispatch integration tests ─────────────────────────────
+
+#[test]
+fn intersect_allow_both_empty_passthrough() {
+    let mut a = orchestration::mcp::McpFilters::default();
+    let b = orchestration::mcp::McpFilters::default();
+    a.intersect_allow_from(&b, &[]);
+    assert!(a.allow.is_empty());
+}
+
+#[test]
+fn intersect_allow_self_empty_adopt_other() {
+    let mut a = orchestration::mcp::McpFilters::default();
+    let b = orchestration::mcp::McpFilters {
+        allow: vec!["mcp__blackbox__bbox_search".into()],
+        disallow: vec![],
+    };
+    let universe = &["mcp__blackbox__bbox_search", "mcp__blackbox__bbox_stats"];
+    a.intersect_allow_from(&b, universe);
+    assert_eq!(a.allow, vec!["mcp__blackbox__bbox_search"]);
+}
+
+#[test]
+fn intersect_allow_other_empty_unchanged() {
+    let mut a = orchestration::mcp::McpFilters {
+        allow: vec!["mcp__blackbox__bbox_search".into()],
+        disallow: vec![],
+    };
+    let b = orchestration::mcp::McpFilters::default();
+    a.intersect_allow_from(&b, &[]);
+    assert_eq!(a.allow, vec!["mcp__blackbox__bbox_search"]);
+}
+
+#[test]
+fn intersect_allow_both_nonempty_takes_intersection() {
+    let mut a = orchestration::mcp::McpFilters {
+        allow: vec![
+            "mcp__blackbox__bbox_search".into(),
+            "mcp__blackbox__bbox_stats".into(),
+            "mcp__blackbox__bbox_forget".into(),
+        ],
+        disallow: vec![],
+    };
+    let b = orchestration::mcp::McpFilters {
+        allow: vec![
+            "mcp__blackbox__bbox_stats".into(),
+            "mcp__blackbox__bbox_forget".into(),
+            "mcp__blackbox__bro_exec".into(),
+        ],
+        disallow: vec![],
+    };
+    let universe = &[
+        "mcp__blackbox__bbox_search",
+        "mcp__blackbox__bbox_stats",
+        "mcp__blackbox__bbox_forget",
+        "mcp__blackbox__bro_exec",
+    ];
+    a.intersect_allow_from(&b, universe);
+    let mut sorted = a.allow.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec!["mcp__blackbox__bbox_forget", "mcp__blackbox__bbox_stats"]
+    );
+}
+
+#[test]
+fn intersect_allow_empty_intersection_denies_all() {
+    let mut a = orchestration::mcp::McpFilters {
+        allow: vec!["mcp__blackbox__bbox_search".into()],
+        disallow: vec![],
+    };
+    let b = orchestration::mcp::McpFilters {
+        allow: vec!["mcp__blackbox__bro_exec".into()],
+        disallow: vec![],
+    };
+    let universe = &["mcp__blackbox__bbox_search", "mcp__blackbox__bro_exec"];
+    a.intersect_allow_from(&b, universe);
+    assert!(a.allow.is_empty(), "empty intersection should deny all");
+}
+
+#[test]
+fn intersect_disallow_is_additive() {
+    let mut a = orchestration::mcp::McpFilters {
+        allow: vec![],
+        disallow: vec!["mcp__blackbox__bro_exec".into()],
+    };
+    let b = orchestration::mcp::McpFilters {
+        allow: vec![],
+        disallow: vec!["mcp__blackbox__bbox_forget".into()],
+    };
+    a.intersect_allow_from(&b, &[]);
+    assert_eq!(a.disallow.len(), 2);
+    assert!(a.disallow.contains(&"mcp__blackbox__bro_exec".into()));
+    assert!(a.disallow.contains(&"mcp__blackbox__bbox_forget".into()));
+}
+
+#[test]
+fn bro_mcp_add_surface_appends_to_url() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().to_string_lossy().to_string();
+
+    let params = orchestration::mcp::McpToolParams {
+        action: orchestration::mcp::McpAction::Add,
+        name: Some("test-surface".into()),
+        url: Some("http://127.0.0.1:7264/mcp".into()),
+        transport: Some("http".into()),
+        scope: Some("project".into()),
+        project: Some(project.clone()),
+        pattern: None,
+        exclude_tools: None,
+        headers: None,
+        surface: Some("readonly".into()),
+    };
+
+    let result = orchestration::mcp::handle(&params).unwrap();
+    assert!(result.contains("added"), "add should succeed: {result}");
+
+    let store = orchestration::mcp::McpStore::load(
+        &orchestration::mcp::project_store_path(std::path::Path::new(&project)),
+    )
+    .unwrap();
+    let cfg = store.servers.get("test-surface").unwrap();
+    match cfg {
+        orchestration::mcp::McpServerConfig::Http { url, .. } => {
+            assert!(
+                url.contains("?surface=readonly"),
+                "URL should contain ?surface=readonly, got: {url}"
+            );
+        }
+        _ => panic!("expected HTTP config"),
+    }
+}
+
+#[test]
+fn bro_mcp_add_without_surface_preserves_url() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().to_string_lossy().to_string();
+
+    let params = orchestration::mcp::McpToolParams {
+        action: orchestration::mcp::McpAction::Add,
+        name: Some("test-no-surface".into()),
+        url: Some("http://127.0.0.1:7264/mcp".into()),
+        transport: Some("http".into()),
+        scope: Some("project".into()),
+        project: Some(project.clone()),
+        pattern: None,
+        exclude_tools: None,
+        headers: None,
+        surface: None,
+    };
+
+    let result = orchestration::mcp::handle(&params).unwrap();
+    assert!(result.contains("added"), "add should succeed: {result}");
+
+    let store = orchestration::mcp::McpStore::load(
+        &orchestration::mcp::project_store_path(std::path::Path::new(&project)),
+    )
+    .unwrap();
+    let cfg = store.servers.get("test-no-surface").unwrap();
+    match cfg {
+        orchestration::mcp::McpServerConfig::Http { url, .. } => {
+            assert_eq!(url, "http://127.0.0.1:7264/mcp");
+        }
+        _ => panic!("expected HTTP config"),
+    }
+}
