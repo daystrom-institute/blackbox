@@ -40,11 +40,16 @@ nav:
   - Operating Guide: operating-blackbox.md
   - Workflow Engine: workflows.md
   - Rule Packets: rule-packets.md
+  - Refactor Tools: refactor.md
   - Agent System: agent-system.md
+  - Badgey: badgey.md
   - Ingress Paths: ingress-paths.md
   - Slack Bridge: slack-bridge.md
   - IRC Bridge: irc-bridge.md
   - Councils & Whiteboards: councils-whiteboards.md
+  - Roadmap Tool: roadmap-tool.md
+  - Reference Implementations: examples.md
+  - Project Roadmap: roadmap.md
 
 plugins:
   - search
