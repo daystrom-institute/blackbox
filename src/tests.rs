@@ -5216,3 +5216,118 @@ fn bro_dashboard_emits_agent_label() {
     assert_eq!(agent_metrics["success_count"].as_u64(), Some(0));
     assert_eq!(agent_metrics["failure_count"].as_u64(), Some(0));
 }
+
+// ── Phase 2a: surface handler override tests ───────────────────────
+
+fn compile_surface_packet_for_test(
+    packets: &Packets,
+    rules: Vec<serde_json::Value>,
+    scope: &str,
+    project: Option<&str>,
+) -> String {
+    packets
+        .compile(&CompileParams {
+            domain: server::surface::SURFACE_ROUTING_DOMAIN.to_string(),
+            rules: serde_json::Value::Array(rules),
+            classification_lattice: Some(vec![
+                "tool_surface".to_string(),
+                "deny".to_string(),
+            ]),
+            prefix_inference: Some(Default::default()),
+            scope: Some(scope.to_string()),
+            project: project.map(|s| s.to_string()),
+            source_ids: None,
+            rank_lookup_key: None,
+            rank_table: None,
+            threshold_lookup_key: None,
+            threshold_table: None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn surface_get_tool_no_packet_returns_full_catalog() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let srv = test_server(&tmp);
+    assert!(
+        srv.get_tool("bbox_search").is_some(),
+        "bbox_search should be visible with no surface packet"
+    );
+    assert!(
+        srv.get_tool("bro_exec").is_some(),
+        "bro_exec should be visible with no surface packet"
+    );
+}
+
+#[test]
+fn surface_get_tool_with_packet_restricts_visibility() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let srv = test_server(&tmp);
+
+    let consequent = serde_json::json!({
+        "route": "tool_surface",
+        "allow": ["bbox_search", "bbox_stats"],
+        "disallow": [],
+    });
+    let deny_consequent = serde_json::json!({"route": "deny", "reason": "unknown surface"});
+    compile_surface_packet_for_test(
+        &srv.state.packets.read(),
+        vec![
+            serde_json::json!({
+                "id": "readonly",
+                "antecedent": {"op": "Eq", "field": "surface", "value": "default"},
+                "consequent": serde_json::to_string(&consequent).unwrap(),
+                "classification": "tool_surface",
+            }),
+            serde_json::json!({
+                "id": "deny_rest",
+                "antecedent": {"op": "True"},
+                "consequent": serde_json::to_string(&deny_consequent).unwrap(),
+                "classification": "deny",
+            }),
+        ],
+        "global",
+        None,
+    );
+
+    assert!(
+        srv.get_tool("bbox_search").is_some(),
+        "bbox_search should be visible on default surface"
+    );
+    assert!(
+        srv.get_tool("bbox_stats").is_some(),
+        "bbox_stats should be visible on default surface"
+    );
+    assert!(
+        srv.get_tool("bbox_forget").is_none(),
+        "bbox_forget should be hidden on default surface"
+    );
+    assert!(
+        srv.get_tool("bro_exec").is_none(),
+        "bro_exec should be hidden on default surface"
+    );
+}
+
+#[test]
+fn surface_get_tool_deny_verdict_hides_all() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let srv = test_server(&tmp);
+
+    let deny_consequent = serde_json::json!({"route": "deny", "reason": "locked"});
+    compile_surface_packet_for_test(
+        &srv.state.packets.read(),
+        vec![serde_json::json!({
+            "id": "deny_all",
+            "antecedent": {"op": "True"},
+            "consequent": serde_json::to_string(&deny_consequent).unwrap(),
+            "classification": "deny",
+        })],
+        "global",
+        None,
+    );
+
+    assert!(
+        srv.get_tool("bbox_search").is_none(),
+        "all tools should be hidden under deny verdict"
+    );
+}
