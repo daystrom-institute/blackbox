@@ -17,7 +17,6 @@ The XDG path migration has already run (`migrate_legacy_defaults`). The filesyst
     blackbox-notes.json
     blackbox-pins.json
     projects.json
-    events.jsonl                  # webhook event log
     artifacts/                    # artifact catalog (bbox_artifact_install)
     backups/                      # render snapshots
     edges/                        # edge index JSONL sidecars
@@ -26,6 +25,7 @@ The XDG path migration has already run (`migrate_legacy_defaults`). The filesyst
     packets/
         global/                   # global rule packets
         project/                  # project-scoped rule packets
+        events.jsonl              # packet operation log (compile/apply/audit/gap events)
     vectors/                      # embedding vector store
     bro/                          # bro_home_dir ($BRO_HOME = state_dir/bro)
         tasks.json
