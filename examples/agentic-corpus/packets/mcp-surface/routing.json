@@ -1,0 +1,33 @@
+{
+  "domain": "mcp-surface/routing",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["tool_surface", "deny"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "readonly_surface",
+      "classification": "tool_surface",
+      "antecedent": { "op": "Eq", "field": "surface", "value": "readonly" },
+      "consequent": "{\"route\":\"tool_surface\",\"allow\":[\"mcp__blackbox__bbox_search\",\"mcp__blackbox__bbox_context\",\"mcp__blackbox__bbox_messages\",\"mcp__blackbox__bbox_session\",\"mcp__blackbox__bbox_sessions_list\",\"mcp__blackbox__bbox_stats\"],\"disallow\":[\"mcp__blackbox__bro_*\",\"mcp__blackbox__bbox_forget\"]}"
+    },
+    {
+      "id": "ops_surface",
+      "classification": "tool_surface",
+      "antecedent": { "op": "Eq", "field": "surface", "value": "ops" },
+      "consequent": "{\"route\":\"tool_surface\",\"allow\":[\"mcp__blackbox__bro_*\",\"mcp__blackbox__bbox_*\"],\"disallow\":[\"mcp__blackbox__bbox_refactor_apply\"]}"
+    },
+    {
+      "id": "default_surface",
+      "classification": "tool_surface",
+      "antecedent": { "op": "Eq", "field": "surface", "value": "default" },
+      "consequent": "{\"route\":\"tool_surface\",\"disallow\":[\"mcp__blackbox__bro_*\",\"mcp__blackbox__bbox_refactor_*\"]}"
+    },
+    {
+      "id": "deny_unknown_surface",
+      "classification": "deny",
+      "antecedent": { "op": "True" },
+      "consequent": "{\"route\":\"deny\",\"reason\":\"unknown MCP surface\"}"
+    }
+  ]
+}

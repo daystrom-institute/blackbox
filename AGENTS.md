@@ -191,3 +191,9 @@ Client config (all point to the same daemon):
 ## Design Docs
 
 - `design/knowledge-store.md` — knowledge store v2: layer architecture, absorption, entry schema, rendering pipeline, migration path.
+
+## MCP Tool Surfaces
+
+A surface is a caller-selected view of the daemon's MCP tool catalog, evaluated by packet-style routing at session initialization and dispatch time. Clients select a surface by appending `?surface=<id>` to the MCP URL. The daemon evaluates the named surface against a compiled packet with domain `mcp-surface/routing` (project-scoped with global fallback). A `Deny` verdict fails initialization; a `ToolSurface` verdict restricts visible tools via allow/disallow lists that intersect with existing dispatch filters.
+
+Install a surface packet via `bbox_compile` (or `bbox_artifact_install` from `examples/agentic-corpus/packets/mcp-surface/routing.json`). Register a surfaced provider alias via `bro_mcp(action=add, name="blackbox-readonly", url="http://127.0.0.1:7264/mcp", surface="readonly")`. Debug surface decisions with `bbox_mcp_surface(action=replay, surface="readonly")`.
