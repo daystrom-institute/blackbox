@@ -5485,6 +5485,143 @@ fn detect_trivial_getter<'a>(
     None
 }
 
+/// True iff `body` is a single-statement block of the form
+/// `this.field = paramName;`. Used by setter detection.
+fn is_trivial_field_assignment(body: Node<'_>, field_name: &str, param_name: &str, source: &str) -> bool {
+    if body.kind() != "block" {
+        return false;
+    }
+    let mut cursor = body.walk();
+    let stmts: Vec<Node<'_>> = body
+        .named_children(&mut cursor)
+        .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
+        .collect();
+    if stmts.len() != 1 {
+        return false;
+    }
+    let stmt = stmts[0];
+    if stmt.kind() != "expression_statement" {
+        return false;
+    }
+    let Some(expr) = stmt.named_child(0) else {
+        return false;
+    };
+    if expr.kind() != "assignment_expression" {
+        return false;
+    }
+    let Some(lhs) = expr.child_by_field_name("left") else {
+        return false;
+    };
+    let Some(rhs) = expr.child_by_field_name("right") else {
+        return false;
+    };
+    let lhs_ok = match lhs.kind() {
+        "field_access" => {
+            let object = lhs.child_by_field_name("object");
+            let field = lhs.child_by_field_name("field");
+            matches!(
+                (object, field),
+                (Some(o), Some(f))
+                    if o.kind() == "this"
+                        && f.utf8_text(source.as_bytes()).ok() == Some(field_name)
+            )
+        }
+        // Bare identifier on LHS would shadow the parameter — broken code,
+        // not a Lombok-equivalent setter. Refuse.
+        _ => false,
+    };
+    if !lhs_ok {
+        return false;
+    }
+    rhs.kind() == "identifier"
+        && rhs.utf8_text(source.as_bytes()).ok() == Some(param_name)
+}
+
+/// Detect the trivial-setter method for `field` among `methods`. Returns
+/// the matched method node, or None.
+///
+/// A setter qualifies iff:
+///   * its name is `setFoo`
+///   * the field is non-final (final fields cannot have setters)
+///   * it returns void
+///   * it takes exactly one parameter whose declared type matches the field
+///   * it is `public`
+///   * its body is exactly `this.field = paramName;`
+///   * it is not preceded by a Javadoc block
+///
+/// The Lombok-generated setter uses the field name as the parameter name;
+/// we accept any parameter name as long as the assignment uses that same
+/// name (i.e., the existing setter is semantically `field = arg`). The
+/// public method signature `void setFoo(T)` is unchanged after replacement.
+fn detect_trivial_setter<'a>(
+    methods: &[ClassMethodInfo<'a>],
+    field: &PojoField,
+    source: &str,
+) -> Option<Node<'a>> {
+    if field.is_final {
+        return None;
+    }
+    let cap = capitalize_first(&field.name);
+    let target = format!("set{}", cap);
+
+    for m in methods {
+        if m.is_constructor {
+            continue;
+        }
+        if m.name != target {
+            continue;
+        }
+        // void return: tree-sitter exposes the return type via the `type`
+        // field on method_declaration, which is "void" for void methods.
+        let Some(rt) = m.return_type.as_deref() else {
+            continue;
+        };
+        if rt.trim() != "void" {
+            continue;
+        }
+        if !is_public_method_node(m.node) {
+            continue;
+        }
+        let Some(params) = m.node.child_by_field_name("parameters") else {
+            continue;
+        };
+        if params.named_child_count() != 1 {
+            continue;
+        }
+        let Some(param) = params.named_child(0) else {
+            continue;
+        };
+        if param.kind() != "formal_parameter" {
+            continue;
+        }
+        let param_type = param
+            .child_by_field_name("type")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(str::trim)
+            .unwrap_or("");
+        if normalize_type_text(param_type) != normalize_type_text(&field.type_name) {
+            continue;
+        }
+        let Some(param_name_node) = param.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(param_name) = param_name_node.utf8_text(source.as_bytes()) else {
+            continue;
+        };
+        let Some(body) = m.node.child_by_field_name("body") else {
+            continue;
+        };
+        if !is_trivial_field_assignment(body, &field.name, param_name, source) {
+            continue;
+        }
+        if has_preceding_javadoc(m.node, source) {
+            continue;
+        }
+        return Some(m.node);
+    }
+    None
+}
+
 /// Compute the byte range to delete for a method declaration, including
 /// trailing whitespace + one newline so the deletion doesn't leave orphan
 /// blank lines behind. Walks back over leading whitespace on the method's
@@ -5570,70 +5707,150 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
 
     let mut field_to_getter: std::collections::BTreeMap<String, Node<'_>> =
         std::collections::BTreeMap::new();
+    let mut field_to_setter: std::collections::BTreeMap<String, Node<'_>> =
+        std::collections::BTreeMap::new();
     for field in &instance_fields {
         if let Some(method_node) = detect_trivial_getter(&methods, field, &parsed.source) {
             field_to_getter.insert(field.name.clone(), method_node);
         }
+        if let Some(method_node) = detect_trivial_setter(&methods, field, &parsed.source) {
+            field_to_setter.insert(field.name.clone(), method_node);
+        }
     }
-    if field_to_getter.is_empty() {
+    if field_to_getter.is_empty() && field_to_setter.is_empty() {
         bail!(
-            "{class_name} has no trivial getters to replace with @Getter (Phase 1 supports only `return field;` / `return this.field;` bodies)"
+            "{class_name} has no trivial getters/setters to replace (only `return field;` getters and `this.field = arg;` setters qualify)"
         );
     }
 
-    let all_fields_have_getter = instance_fields
-        .iter()
-        .all(|f| field_to_getter.contains_key(&f.name));
+    // Class-level annotation eligibility:
+    //   * `@Getter` covers all instance fields when every instance field has
+    //     a deletable trivial getter.
+    //   * `@Setter` covers all non-final instance fields when every non-final
+    //     instance field has a deletable trivial setter. Final fields don't
+    //     get setters generated so they don't count against coverage.
+    //   In either case partial coverage forces per-field placement on the
+    //   matched fields only — class-level `@Getter` on a class where one
+    //   field still has a hand-rolled getter would be a duplicate-method
+    //   compile error.
+    let getter_class_level = !field_to_getter.is_empty()
+        && instance_fields
+            .iter()
+            .all(|f| field_to_getter.contains_key(&f.name));
+    let setter_class_level = !field_to_setter.is_empty()
+        && instance_fields
+            .iter()
+            .filter(|f| !f.is_final)
+            .all(|f| field_to_setter.contains_key(&f.name));
 
     let mut text_edits: Vec<TextEdit> = Vec::new();
+    let mut method_drops_seen: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
 
-    // Drop each matched getter method (with surrounding whitespace cleanup).
-    for method_node in field_to_getter.values() {
-        let (start, end) = method_drop_range(*method_node, &parsed.source);
+    // Drop each matched accessor method exactly once (a method can only be
+    // a getter OR a setter, never both, but defensive dedupe is cheap).
+    let drop_method = |text_edits: &mut Vec<TextEdit>,
+                       seen: &mut std::collections::HashSet<usize>,
+                       node: Node<'_>| {
+        if !seen.insert(node.start_byte()) {
+            return;
+        }
+        let (start, end) = method_drop_range(node, &parsed.source);
         text_edits.push(TextEdit {
             byte_start: start,
             byte_end: end,
             replacement: String::new(),
         });
+    };
+    for method_node in field_to_getter.values() {
+        drop_method(&mut text_edits, &mut method_drops_seen, *method_node);
+    }
+    for method_node in field_to_setter.values() {
+        drop_method(&mut text_edits, &mut method_drops_seen, *method_node);
     }
 
-    // Add @Getter — class-level when every instance field is covered, else
-    // per-field on the matched ones. (Class-level @Getter on a class that
-    // still has a hand-rolled getter for an unmatched field would conflict
-    // at compile time, so partial coverage forces per-field.)
-    if all_fields_have_getter {
+    // Class-level annotations are stacked one per line, alphabetical for
+    // deterministic output. We compose them into a single insert so the
+    // emitted edit list stays compact.
+    let mut class_level_annotations: Vec<&'static str> = Vec::new();
+    if getter_class_level {
+        class_level_annotations.push("@Getter");
+    }
+    if setter_class_level {
+        class_level_annotations.push("@Setter");
+    }
+    if !class_level_annotations.is_empty() {
+        let mut block = String::new();
+        for ann in &class_level_annotations {
+            block.push_str(ann);
+            block.push('\n');
+        }
         text_edits.push(TextEdit {
             byte_start: class_node.start_byte(),
             byte_end: class_node.start_byte(),
-            replacement: "@Getter\n".to_string(),
+            replacement: block,
         });
-    } else {
+    }
+
+    // Per-field placement for accessor kinds that didn't go class-level.
+    // If a field qualifies for both Getter and Setter at the per-field tier,
+    // stack them on consecutive lines above the field.
+    if !getter_class_level || !setter_class_level {
         for field in &instance_fields {
-            if !field_to_getter.contains_key(&field.name) {
+            let want_getter =
+                !getter_class_level && field_to_getter.contains_key(&field.name);
+            let want_setter =
+                !setter_class_level && field_to_setter.contains_key(&field.name);
+            if !want_getter && !want_setter {
                 continue;
             }
             let (insert_at, indent) = field_annotation_insert(field, &parsed.source);
+            let mut block = String::new();
+            if want_getter {
+                block.push_str(&format!("@Getter\n{indent}"));
+            }
+            if want_setter {
+                block.push_str(&format!("@Setter\n{indent}"));
+            }
             text_edits.push(TextEdit {
                 byte_start: insert_at,
                 byte_end: insert_at,
-                replacement: format!("@Getter\n{indent}"),
+                replacement: block,
             });
         }
     }
 
-    // Inject `import lombok.Getter;` when not already present.
+    // Import injection — every applied annotation needs its FQCN imported.
     let imports = extract_java_imports(&parsed.source);
-    let already_has_import = imports.iter().any(|i| {
-        let body = i.trim().strip_prefix("import ").unwrap_or("").trim_end_matches(';').trim();
-        body == "lombok.Getter" || body == "lombok.*"
-    });
-    if !already_has_import {
+    let mut needed_imports: Vec<&'static str> = Vec::new();
+    if !field_to_getter.is_empty() {
+        needed_imports.push("lombok.Getter");
+    }
+    if !field_to_setter.is_empty() {
+        needed_imports.push("lombok.Setter");
+    }
+    let mut import_block = String::new();
+    for fqcn in &needed_imports {
+        let already = imports.iter().any(|i| {
+            let body = i
+                .trim()
+                .strip_prefix("import ")
+                .unwrap_or("")
+                .trim_end_matches(';')
+                .trim();
+            body == *fqcn || body == "lombok.*"
+        });
+        if !already {
+            import_block.push_str(&format!("import {fqcn};\n"));
+        }
+    }
+    if !import_block.is_empty() {
         let (_first_import, last_import_end, package_end) =
             java_import_block_range(&parsed.source);
         let (insert_at, replacement) = if last_import_end > 0 {
-            (last_import_end, "import lombok.Getter;\n".to_string())
+            (last_import_end, import_block)
         } else {
-            (package_end, "\nimport lombok.Getter;\n".to_string())
+            (package_end, format!("\n{import_block}"))
         };
         text_edits.push(TextEdit {
             byte_start: insert_at,
@@ -5644,10 +5861,14 @@ pub(crate) fn plan_lombokify_java_class(p: &RefactorPlanParams) -> Result<String
 
     text_edits.sort_by_key(|e| (e.byte_start, e.byte_end));
 
+    let summary = match (field_to_getter.len(), field_to_setter.len()) {
+        (g, 0) => format!("{g} trivial getter(s)"),
+        (0, s) => format!("{s} trivial setter(s)"),
+        (g, s) => format!("{g} trivial getter(s) + {s} trivial setter(s)"),
+    };
     let plan = RefactorPlan {
         title: format!(
-            "Lombokify {} trivial getter(s) on `{class_name}` in {}",
-            field_to_getter.len(),
+            "Lombokify {summary} on `{class_name}` in {}",
             source_path.display()
         ),
         kind: "lombokify_java_class".to_string(),
@@ -8896,6 +9117,232 @@ mod tests {
             "import should not be duplicated:\n{rewritten}"
         );
         assert!(rewritten.contains("@Getter\npublic class Pre"));
+    }
+
+    #[test]
+    fn lombokify_full_coverage_emits_class_level_getter_and_setter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Pair.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Pair<F, S> {\n\
+            \x20   private F first;\n\
+            \x20   private S second;\n\
+            \n\
+            \x20   public Pair(final F first, final S second) {\n\
+            \x20       this.first = first;\n\
+            \x20       this.second = second;\n\
+            \x20   }\n\
+            \n\
+            \x20   public void setFirst(final F first) {\n\
+            \x20       this.first = first;\n\
+            \x20   }\n\
+            \n\
+            \x20   public void setSecond(final S second) {\n\
+            \x20       this.second = second;\n\
+            \x20   }\n\
+            \n\
+            \x20   public F getFirst() {\n\
+            \x20       return first;\n\
+            \x20   }\n\
+            \n\
+            \x20   public S getSecond() {\n\
+            \x20       return second;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(rewritten.contains("import lombok.Getter;"));
+        assert!(rewritten.contains("import lombok.Setter;"));
+        assert!(
+            rewritten.contains("@Getter\n@Setter\npublic class Pair"),
+            "expected class-level @Getter + @Setter:\n{rewritten}"
+        );
+        // All four accessors removed.
+        assert!(!rewritten.contains("public F getFirst()"));
+        assert!(!rewritten.contains("public S getSecond()"));
+        assert!(!rewritten.contains("public void setFirst("));
+        assert!(!rewritten.contains("public void setSecond("));
+        // Constructor preserved (Phase 4 will lombokify it).
+        assert!(rewritten.contains("public Pair(final F first"));
+    }
+
+    #[test]
+    fn lombokify_skips_setter_with_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Validated.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Validated {\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   public void setName(String name) {\n\
+            \x20       if (name == null) throw new IllegalArgumentException();\n\
+            \x20       this.name = name;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let err = plan_lombokify_java_class(&params).unwrap_err();
+        assert!(
+            err.to_string().contains("no trivial"),
+            "expected refusal; got: {err}"
+        );
+    }
+
+    #[test]
+    fn lombokify_skips_setter_with_fluent_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Fluent.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Fluent {\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   public Fluent setName(String name) {\n\
+            \x20       this.name = name;\n\
+            \x20       return this;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        // Fluent setter has non-void return AND multi-statement body — both
+        // disqualify it. We expect refusal because there's nothing else to
+        // lombokify in this class.
+        let err = plan_lombokify_java_class(&params).unwrap_err();
+        assert!(
+            err.to_string().contains("no trivial"),
+            "expected refusal; got: {err}"
+        );
+    }
+
+    #[test]
+    fn lombokify_skips_setter_for_final_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Frozen.java");
+        // Java accepts a setter for a final field at parse time only if the
+        // field is non-final OR the field is initialized in the setter
+        // (which would be reassignment of a final and won't compile). To
+        // keep the test source parseable we use a non-final field with a
+        // matching setter and a final field WITHOUT a setter, then verify
+        // the planner only matches the non-final field.
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Frozen {\n\
+            \x20   private final String id;\n\
+            \x20   private String label;\n\
+            \n\
+            \x20   public Frozen(final String id) {\n\
+            \x20       this.id = id;\n\
+            \x20   }\n\
+            \n\
+            \x20   public void setLabel(final String label) {\n\
+            \x20       this.label = label;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        // class-level @Setter is correct — every NON-FINAL instance field
+        // (label) has a deletable setter; final fields are excluded from
+        // coverage by definition.
+        assert!(
+            rewritten.contains("@Setter\npublic class Frozen"),
+            "expected class-level @Setter on label-only class:\n{rewritten}"
+        );
+        assert!(rewritten.contains("import lombok.Setter;"));
+        assert!(!rewritten.contains("public void setLabel("));
+    }
+
+    #[test]
+    fn lombokify_partial_setter_coverage_emits_per_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MixedSetters.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class MixedSetters {\n\
+            \x20   private String name;\n\
+            \x20   private int count;\n\
+            \n\
+            \x20   public void setName(String name) {\n\
+            \x20       this.name = name;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        // Per-field — only `name` has a setter; `count` doesn't, so
+        // class-level @Setter would generate an unwanted setCount().
+        assert!(
+            rewritten.contains("@Setter\n    private String name;"),
+            "expected per-field @Setter on name:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("@Setter\npublic class"),
+            "should NOT emit class-level @Setter:\n{rewritten}"
+        );
+        assert!(!rewritten.contains("public void setName("));
+    }
+
+    #[test]
+    fn lombokify_stacks_per_field_getter_and_setter() {
+        // When neither @Getter nor @Setter qualifies for class-level
+        // placement (e.g., one field has setter only, another has getter
+        // only), each field gets its own annotation stack.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Asymmetric.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             \n\
+             public class Asymmetric {\n\
+            \x20   private String readOnly;\n\
+            \x20   private String writeOnly;\n\
+            \n\
+            \x20   public String getReadOnly() {\n\
+            \x20       return readOnly;\n\
+            \x20   }\n\
+            \n\
+            \x20   public void setWriteOnly(String writeOnly) {\n\
+            \x20       this.writeOnly = writeOnly;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let params = java_plan_params("lombokify_java_class", &path);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let rewritten = apply_plan_to_source(&plan_text, &path);
+        assert!(rewritten.contains("import lombok.Getter;"));
+        assert!(rewritten.contains("import lombok.Setter;"));
+        assert!(
+            rewritten.contains("@Getter\n    private String readOnly;"),
+            "expected per-field @Getter on readOnly:\n{rewritten}"
+        );
+        assert!(
+            rewritten.contains("@Setter\n    private String writeOnly;"),
+            "expected per-field @Setter on writeOnly:\n{rewritten}"
+        );
+        assert!(!rewritten.contains("public String getReadOnly()"));
+        assert!(!rewritten.contains("public void setWriteOnly("));
     }
 
     #[test]
