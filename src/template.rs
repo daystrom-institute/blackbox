@@ -26,3 +26,45 @@ pub fn render_file(path: &Path, ctx: &serde_json::Value) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("template file '{}': {e}", path.display()))?;
     render(&source, ctx)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn render_simple_substitution() {
+        let out = render("hello {{ name }}", &json!({"name": "world"})).unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn render_loop_and_condition() {
+        let tpl = "{% for x in items %}{% if x > 1 %}{{ x }} {% endif %}{% endfor %}";
+        let out = render(tpl, &json!({"items": [1, 2, 3]})).unwrap();
+        assert_eq!(out.trim(), "2 3");
+    }
+
+    #[test]
+    fn render_in_operator() {
+        let tpl = "{% set active = [\"a\", \"b\"] %}{% if val in active %}yes{% else %}no{% endif %}";
+        let yes = render(tpl, &json!({"val": "a"})).unwrap();
+        let no = render(tpl, &json!({"val": "c"})).unwrap();
+        assert_eq!(yes, "yes");
+        assert_eq!(no, "no");
+    }
+
+    #[test]
+    fn render_bad_template_returns_err() {
+        let err = render("{{ unclosed", &json!({}));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("template parse"));
+    }
+
+    #[test]
+    fn render_file_missing_path_returns_err() {
+        let err = render_file(Path::new("/nonexistent/path.tera"), &json!({}));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("template file"));
+    }
+}
