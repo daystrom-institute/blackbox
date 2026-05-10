@@ -38,6 +38,7 @@ mod refactor;
 mod render;
 mod roadmap;
 mod routing;
+mod template;
 mod search;
 mod server;
 mod slack_channel_bindings;

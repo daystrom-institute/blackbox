@@ -44,6 +44,16 @@ pub(crate) struct RoadmapParams {
     pub(crate) dry_run: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) write_path: Option<String>,
+    /// Inline Tera template source. When provided, the roadmap context is
+    /// rendered through this template instead of the built-in markdown emitter.
+    /// Use `action=default_template` to fetch the built-in template as a
+    /// starting point for customisation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) template: Option<String>,
+    /// Path to a Tera template file. Alternative to `template` (inline source).
+    /// File is read at render time; no caching — edits take effect immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) template_path: Option<String>,
 }
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
@@ -136,7 +146,7 @@ pub(crate) struct RoadmapSearchParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_roadmap",
-        description = "Manage the bbox roadmap — a prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Inbox is reactive (surprises, blockages); threads are active work; knowledge is atemporal. The roadmap tracks the *future*: accepted items awaiting promotion, deferred items with provenance, and proposed ideas awaiting review. Items link to design docs via ROADMAP_DESIGNED_IN edges and to threads via ROADMAP_SPAWNS edges."
+        description = "Manage the bbox roadmap — a prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Inbox is reactive (surprises, blockages); threads are active work; knowledge is atemporal. The roadmap tracks the *future*: accepted items awaiting promotion, deferred items with provenance, and proposed ideas awaiting review. Items link to design docs via ROADMAP_DESIGNED_IN edges and to threads via ROADMAP_SPAWNS edges. Status lifecycle: proposed → accepted → delivered (shipped) or rejected; accepted → deferred → accepted."
     )]
     pub(crate) fn bbox_roadmap(&self, Parameters(p): Parameters<RoadmapParams>) -> CallToolResult {
         let start = std::time::Instant::now();
@@ -157,8 +167,9 @@ impl BlackboxServer {
                 "unlink" => self.roadmap_unlink(serde_json::from_value(params)?),
                 "repair_links" => self.roadmap_repair_links(serde_json::from_value(params)?),
                 "render" => self.roadmap_render(serde_json::from_value(params)?),
+                "default_template" => Ok(crate::roadmap::DEFAULT_ROADMAP_TEMPLATE.to_string()),
                 other => anyhow::bail!(
-                    "unknown action '{other}'. Valid: create, get, list, search, update, delete, next, promote, link, unlink, repair_links, render"
+                    "unknown action '{other}'. Valid: create, get, list, search, update, delete, next, promote, link, unlink, repair_links, render, default_template"
                 ),
             }
         })() {
@@ -730,6 +741,8 @@ impl BlackboxServer {
             .and_then(|v| v.as_str())
             .unwrap_or("blackbox");
         let write_path = p.get("write_path").and_then(|v| v.as_str());
+        let inline_template = p.get("template").and_then(|v| v.as_str());
+        let template_path = p.get("template_path").and_then(|v| v.as_str());
 
         let rm = self.state.roadmap.read();
         let th = self.state.threads.read();
@@ -764,7 +777,15 @@ impl BlackboxServer {
             }
         };
 
-        let md = rm.render_markdown(project, &spawn);
+        let md = if let Some(src) = inline_template {
+            let ctx = rm.to_template_context(project, &spawn);
+            crate::template::render(src, &ctx)?
+        } else if let Some(path) = template_path {
+            let ctx = rm.to_template_context(project, &spawn);
+            crate::template::render_file(std::path::Path::new(path), &ctx)?
+        } else {
+            rm.render_markdown(project, &spawn)
+        };
 
         if let Some(path) = write_path {
             std::fs::write(path, &md)

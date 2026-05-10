@@ -15,6 +15,9 @@ pub enum RoadmapStatus {
     Accepted,
     Deferred,
     Rejected,
+    /// Shipped — feature is in main. Excluded from the default render
+    /// template; visible in `list` and custom templates.
+    Delivered,
 }
 
 impl RoadmapStatus {
@@ -24,6 +27,7 @@ impl RoadmapStatus {
             Self::Accepted => "accepted",
             Self::Deferred => "deferred",
             Self::Rejected => "rejected",
+            Self::Delivered => "delivered",
         }
     }
 
@@ -33,8 +37,9 @@ impl RoadmapStatus {
             "accepted" => Ok(Self::Accepted),
             "deferred" => Ok(Self::Deferred),
             "rejected" => Ok(Self::Rejected),
+            "delivered" => Ok(Self::Delivered),
             other => anyhow::bail!(
-                "unknown roadmap status '{other}'. Valid: proposed, accepted, deferred, rejected"
+                "unknown roadmap status '{other}'. Valid: proposed, accepted, deferred, rejected, delivered"
             ),
         }
     }
@@ -42,8 +47,8 @@ impl RoadmapStatus {
     pub fn can_transition_to(&self, target: &Self) -> bool {
         use RoadmapStatus::*;
         match (self, target) {
-            (Proposed, Accepted) | (Proposed, Rejected) => true,
-            (Accepted, Deferred) => true,
+            (Proposed, Accepted) | (Proposed, Rejected) | (Proposed, Delivered) => true,
+            (Accepted, Deferred) | (Accepted, Delivered) => true,
             (Deferred, Accepted) => true,
             (Rejected, Proposed) => true,
             _ => false,
@@ -853,7 +858,145 @@ impl Roadmap {
 
         md
     }
+
+    /// Build a Tera-ready JSON context from all items.
+    ///
+    /// Top-level keys:
+    /// - `project`: display name passed in
+    /// - `now`: ISO timestamp
+    /// - `all_items`: every item with computed metadata
+    /// - `sections`: pre-grouped by computed_status, ordered for active rendering;
+    ///   only includes `in_progress`, `accepted`, `proposed` by default so
+    ///   custom templates can override via `all_items` + their own grouping
+    pub fn to_template_context(
+        &self,
+        project_name: &str,
+        spawn_status: &dyn Fn(&str) -> Option<Vec<(String, bool)>>,
+    ) -> serde_json::Value {
+        let all_items: Vec<serde_json::Value> = self
+            .all_items()
+            .iter()
+            .map(|item| {
+                let spawn = spawn_status(&item.id);
+                let computed_status = match (&item.status, &spawn) {
+                    (RoadmapStatus::Accepted, Some(threads)) => {
+                        if threads.iter().all(|(_, resolved)| *resolved) {
+                            "done"
+                        } else {
+                            "in_progress"
+                        }
+                    }
+                    _ => item.status.as_str(),
+                };
+                let threads: Vec<serde_json::Value> = spawn
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, resolved)| serde_json::json!({ "id": id, "resolved": resolved }))
+                    .collect();
+                let design_docs: Vec<serde_json::Value> = self
+                    .store
+                    .edges
+                    .iter()
+                    .filter(|e| {
+                        e.from == format!("roadmap_item:{}", item.id)
+                            && e.kind == RoadmapEdgeKind::DesignedIn
+                    })
+                    .map(|e| {
+                        let path = e.file_path.as_deref().unwrap_or("");
+                        let exists = !path.is_empty() && std::path::Path::new(path).exists();
+                        serde_json::json!({
+                            "path": path,
+                            "anchor": e.section_anchor,
+                            "exists": exists,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "id": item.id,
+                    "title": item.title,
+                    "body": item.body.trim(),
+                    "status": item.status.as_str(),
+                    "computed_status": computed_status,
+                    "category": item.category.as_str(),
+                    "priority": item.priority.as_str(),
+                    "scope": item.scope,
+                    "project": item.project,
+                    "created_at": item.created_at,
+                    "updated_at": item.updated_at,
+                    "blockers": self.blocker_count(&item.id),
+                    "threads": threads,
+                    "design_docs": design_docs,
+                })
+            })
+            .collect();
+
+        // Pre-group into the default active sections so simple templates
+        // don't need to filter themselves. Custom templates can ignore
+        // this and use `all_items` with their own logic.
+        let section_defs: &[(&str, &str)] = &[
+            ("in_progress", "In Progress"),
+            ("accepted", "Accepted"),
+            ("proposed", "Proposed"),
+            ("deferred", "Deferred"),
+            ("done", "Done"),
+            ("delivered", "Delivered"),
+            ("rejected", "Rejected"),
+        ];
+        let sections: Vec<serde_json::Value> = section_defs
+            .iter()
+            .map(|(status, label)| {
+                let items: Vec<&serde_json::Value> = all_items
+                    .iter()
+                    .filter(|i| i["computed_status"].as_str() == Some(status))
+                    .collect();
+                serde_json::json!({ "status": status, "label": label, "items": items })
+            })
+            .filter(|s| !s["items"].as_array().map(|a| a.is_empty()).unwrap_or(true))
+            .collect();
+
+        serde_json::json!({
+            "project": project_name,
+            "now": crate::util::now_iso(),
+            "sections": sections,
+            "all_items": all_items,
+        })
+    }
 }
+
+/// Default Tera template used by `bbox_roadmap action=render` when no
+/// `template` or `template_path` is provided. Renders only the active
+/// sections (in_progress → accepted → proposed); delivered/rejected/done
+/// are omitted by default. Pass this as a starting point for customisation
+/// via `bbox_roadmap action=default_template`.
+pub const DEFAULT_ROADMAP_TEMPLATE: &str = r#"<!-- Generated by blackbox — do not edit. Regenerate with bbox_roadmap action=render. -->
+
+# Roadmap — {{ project }}
+{% set active = ["in_progress", "accepted", "proposed"] %}
+{% for section in sections %}
+{%- if active | contains(value=section.status) %}
+
+## {{ section.label }}
+
+{% for item in section.items %}
+### {{ item.category | title }}: {{ item.title }}
+- **Priority:** {{ item.priority }}
+{%- if item.project %}
+- **Project:** {{ item.project }}
+{%- endif %}
+{%- for doc in item.design_docs %}
+- **Designed in:** `{{ doc.path }}`{%- if not doc.exists %} [missing]{%- endif %}
+{%- endfor %}
+{%- for thread in item.threads %}
+- **Thread:** {%- if thread.resolved %} ✓{% endif %} {{ thread.id }}
+{%- endfor %}
+{%- if item.body %}
+
+{{ item.body }}
+{% endif %}
+{% endfor %}
+{%- endif %}
+{%- endfor %}
+"#;
 
 fn category_label(cat: &RoadmapCategory) -> &'static str {
     match cat {
