@@ -1,20 +1,150 @@
-# Internals — search, indexing, and the graph
+# Internals — graph grounding, search, and indexing
 
-How blackbox represents knowledge, how retrieval works, and what
-happens under the hood when you call `bbox_hybrid_search` or
-`bbox_inspect_entity`.
+## The grounding problem
 
-## Corpus entity types
+An LLM asked a cold-start question about a codebase it hasn't seen this
+session will answer from training priors — confidently, often wrong.
+Even with BM25 transcript search, naive rerank on the top-N results
+achieves around **23% recall** on questions that require tracing
+provenance or following a reasoning chain across multiple entities.
 
-The corpus is a typed graph. `bbox_describe_schema` returns the live
-population counts; the canonical types are:
+Blackbox's graph layer raises that to around **97%** on the same probe
+set. The improvement doesn't come from a better model — it comes from
+giving agents a structured traversal surface and a sequence of tool
+calls with interlocking shapes that carry evidence forward rather than
+starting each step from scratch.
 
-| Entity type | What it holds | Primary question answered |
+The tool shapes and the agentic opening sequence were derived
+experimentally in a donor project (AgenticTools / McpPoc spike). They
+are not arbitrary conventions. They exist because this specific
+combination of call shapes is what makes agents actually ground rather
+than hallucinate.
+
+---
+
+## Tool shapes and how they compose
+
+Each tool in the opening sequence was designed to feed the next. The
+output shape of step N is the required input shape of step N+1.
+
+### `bbox_hybrid_search` / `bbox_discover_seed_entities`
+
+**Output shape:** a ranked list of entity refs, each with a
+`notable_edges` preview — the highest-signal outgoing and incoming edges
+for that entity, prioritized semantic-first.
+
+**Why this shape:** the agent doesn't have to run a second call to know
+what to inspect next. The notable_edges are a pre-vetted traversal menu.
+`bbox_discover_seed_entities` is the same search but with notable_edges
+rendered inline for every result — use it when the next step is
+`bbox_inspect_entity` and you want the hop targets surfaced before you
+commit to one.
+
+The vector lane catches paraphrases — if the user's query wording
+doesn't match the corpus's wording, cosine similarity finds the
+canonical entity anyway. This is why the top seed is canonical for the
+query even when lexical matching would miss it.
+
+### `bbox_inspect_entity`
+
+**Input:** a canonical `<type>:<segments>` entity ref  
+**Output:** entity properties, targeted edges filtered by `edge_types`
+and `direction`, and a `recommended_next_hops` list ordered
+semantic-first (the hops most likely to carry meaningful context, not
+just structurally reachable nodes)
+
+**Why this shape:** one call returns both properties and edges.
+`recommended_next_hops` means the agent doesn't have to reason about
+which edges to follow — the index pre-ranks them. The `edge_types` and
+`direction` parameters exist so you can narrow from the orientation
+sweep (`direction=both`) to targeted reads (`direction=out,
+edge_types=SUPERSEDES`) as you understand the subgraph.
+
+Critical: entity refs are canonical strings. When a call returns
+`error.bad_input` with a `suggested_fix`, use the suggestion verbatim —
+don't guess a corrected ref. The ref format encodes path hashes and
+chunk positions that aren't reconstructible by inspection.
+
+### `bbox_find_paths`
+
+**Input:** a `from` entity ref, optional `to` ref or `to_type` target,
+optional `edge_types` filter  
+**Output:** BFS chains with **path_ids** — server-side identifiers for
+the validated traversal results
+
+**Why this shape:** path_ids are the key. They are opaque handles that
+the server holds — passing them to `bbox_bundle_evidence` lets you cite
+a multi-hop reasoning chain without reconstructing the path text from
+memory (which would be subject to hallucination). Direction is
+preserved; do not invert edges from memory.
+
+Skip this step entirely when the question is single-hop. It's only
+needed when the answer requires following a chain across entity
+boundaries.
+
+### `bbox_bundle_evidence`
+
+**Input:** selected entity refs + `path_ids` from `bbox_find_paths`  
+**Output:** a structured evidence bundle with cited refs and validated
+path text
+
+**Why this shape:** closing the loop. Before giving an answer that
+depends on graph traversal, packaging the evidence bundle lets the
+answer be re-queried, cited, and verified. It also surfaces the
+evidence to a human reviewer without them having to re-run the walk.
+
+---
+
+## The agentic opening sequence
+
+For any task that touches the codebase, prior decisions, or
+conversational history, run this sequence before falling back to
+filesystem search or training-prior answers:
+
+```
+1. bbox_describe_schema           # orient — entity types + edge families (once per session)
+2. bbox_hybrid_search(q, k=5)     # seed — ranked results with notable_edges
+3. bbox_inspect_entity(ref)       # confirm — properties + edges + recommended_next_hops
+4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS, returns path_ids
+5. bbox_bundle_evidence(...)      # close — package entity refs + path_ids before answering
+```
+
+Step 1 is one-time per session — cache the schema mentally, don't
+repeat it on every query. Step 4 is conditional — skip it when the
+answer is single-hop. Step 5 is the close-the-loop write.
+
+**What makes this work is the data flowing forward:**
+
+- Step 2 returns `notable_edges` → you know which entity to inspect
+  without guessing
+- Step 3 returns `recommended_next_hops` → you know which edges are
+  semantically relevant without enumerating all edges
+- Step 4 returns `path_ids` → you pass them directly to step 5, not
+  reconstructed text; the server validates the chain
+- Step 5 packages refs + path_ids → the answer is cite-able and the
+  evidence is round-trippable
+
+The failure mode when this sequence is skipped: agents use training
+priors to guess file names, function signatures, and decision rationale.
+They're confident and wrong at a rate that makes them unreliable for
+any task requiring accurate provenance.
+
+Full runbook with pattern recipes (where/what/who/why/how/replacement/
+historical/impact questions): `bbox_knowledge(query="sm-agentic-opening-sequence")`.
+
+---
+
+## The corpus: entity types
+
+The graph substrate. `bbox_describe_schema` returns live population
+counts for all types.
+
+| Entity type | What it holds | Question it answers |
 |---|---|---|
 | `knowledge` | Rules, decisions, conventions | "what's the policy on X?" |
-| `project_file` | Source / doc chunks (indexed at 10KB per chunk) | "where does X live in the code?" |
+| `project_file` | Source / doc chunks (up to 10KB per chunk) | "where does X live in the code?" |
 | `transcript` | One content block from one agent session | "what did this turn say?" |
-| `session` | A full agent conversation | "what was that session about?" |
+| `session` | A full agent conversation | "what was this session about?" |
 | `thread` | Persistent investigation spanning sessions | "what's the active arc for X?" |
 | `note` | Side-channel records (dispute/done/blocked/etc) | "what did the executor flag?" |
 | `symbol` | Named code symbols | "what calls this function?" |
@@ -24,11 +154,17 @@ population counts; the canonical types are:
 | `task` (virtual) | A `bro_exec` dispatch unit | "what produced this artifact?" |
 | `bash_call` (virtual) | One shell invocation in a transcript | "what did this command emit?" |
 
+One Tantivy document is indexed per content block — not per session.
+This enables role-based filtering (`role=user` vs `role=assistant`) and
+precise excerpt generation. Sessions with 50 turns produce 50+ documents,
+each independently searchable.
+
 ## Edge families
 
 Edges are directional and typed. `bbox_find_paths` follows them;
 `bbox_inspect_entity` returns them filtered by `edge_types` and
-`direction`.
+`direction`. Use `direction=out` or `direction=in` once you know what
+you're looking for — `direction=both` is for initial orientation only.
 
 | Family | Edge kinds |
 |---|---|
@@ -40,187 +176,168 @@ Edges are directional and typed. `bbox_find_paths` follows them;
 | **Format-specific** | LINKS_TO_FILE, LINKS_TO_SECTION, DESCRIBES, ON_PAGE, FIGURE_OF, TABLE_OF |
 | **Tool-call** | EDITED_FILE, EDITED_BY_SESSION, READ_FILE, RAN_BASH |
 
-## Agentic opening sequence
+The EdgeIndex is built from per-project JSONL edge sidecars
+(`~/.local/state/blackbox/edges/<project_id>.jsonl`) plus in-memory
+edges from the live knowledge/thread/note stores. A watcher thread
+auto-triggers a rebuild when the tantivy doc count grows.
 
-The standard pattern for any task that touches the codebase or prior
-decisions:
+---
 
-```
-1. bbox_describe_schema           # orient — entity types + edge families (once per session)
-2. bbox_hybrid_search(q, k=5)     # seed — mixed-modal results with notable_edges
-3. bbox_inspect_entity(ref)       # confirm — properties + edges in one call
-4. bbox_find_paths(from, to_*)    # traverse — BFS chains (when multi-hop)
-5. bbox_bundle_evidence(...)      # close — package refs + path_ids before answering
-```
-
-Full runbook: `bbox_knowledge(query="sm-agentic-opening-sequence")`.
-
-## Hybrid search
+## Hybrid search mechanics
 
 `bbox_hybrid_search` fuses three ranked lists via Reciprocal Rank
 Fusion (RRF), then applies four post-processing passes.
 
-### Ranked lists
+### The three lists
 
-**1. bm25** — chunk-level Tantivy BM25 over multiple fields.
-Field boosts:
+**BM25 (chunk-level)** — Tantivy BM25 over indexed fields, with boosts:
 
 | Field | Boost | Notes |
 |---|---|---|
 | `path_tokens` | 1.5× | Code tokenizer: splits on `/_-.:>` plus CamelCase |
 | `symbol` | 1.5× | Named code symbols |
-| `content` | 1.0× | Full text of the chunk |
-| `code_content` | 1.0× | Source code blocks |
-| `commit_author_name` | 1.0× | Git author |
+| `content` | 1.0× | Full chunk text |
+| `code_content` | 1.0× | Source code |
 
-**2. bm25_file** — file-level aggregation. Sums per-chunk BM25 scores
-for all chunks of the same file, then weights by `sum × √chunk_count`.
-Lifts high-coverage files (e.g. a STATUS.md with 21 sparse mentions)
-that would otherwise be invisible to per-chunk ranking.
+**BM25-file (file-level aggregation)** — sums per-chunk BM25 scores
+across all chunks of a file, weighted by `sum × √chunk_count`. Lifts
+files with many sparse mentions (e.g. a STATUS.md with 21 references to
+a topic) that per-chunk ranking buries.
 
-**3. vector** — HNSW approximate nearest neighbor over Voyage embeddings
-(1024d, `voyage-code-3` by default). Default RRF weight: 0.6 vector /
-0.4 BM25. Override via `vector_weight` parameter: `0.0` for BM25-only,
-`1.0` for vector-only.
+**Vector** — HNSW approximate nearest neighbor over Voyage embeddings
+(`voyage-code-3`, 1024d). Default RRF weight: 0.6 vector / 0.4 BM25.
+Override with `vector_weight`: `0.0` for BM25-only, `1.0` for
+vector-only.
 
 ### RRF fusion
 
-The three lists are combined with RRF (k=60 smoothing constant):
-
 ```
-score(d) = Σ  1 / (k + rank(d, list_i))
+score(d) = Σ  1 / (60 + rank(d, list_i))
 ```
 
-### Post-processing passes (in order)
+The k=60 smoothing constant prevents high-ranked items in one list from
+completely dominating results that appear consistently across all three.
 
-1. **Project filter** — when `project=<path or project_id>` is passed,
-   drop `project_file` refs from other projects. Commits, knowledge, and
-   transcripts pass through. This cuts cross-repo keyword pollution
-   (e.g. "voyage" returning `erlang-test/voyage.ex` above
-   `transcript-search/src/embed/voyage.rs`).
+### Post-processing passes
+
+Applied in order after fusion:
+
+1. **Project filter** — `project=<path or project_id>` drops
+   `project_file` refs from other projects while passing commits,
+   knowledge, and transcripts through. Without this, a query for
+   "voyage" in the transcript-search repo surfaces `erlang-test/voyage.ex`
+   ahead of `transcript-search/src/embed/voyage.rs`.
 
 2. **Per-file collapse** — only the highest-scoring chunk per file
-   survives. Mirrors an AgenticTools diversity-by-file pass.
+   survives. Ensures result diversity across files rather than returning
+   10 chunks from the same large file.
 
 3. **Modal diversification** — guarantees at least one `code_block`,
    `doc_section`, and `git_message` in top-N when the fetch set contains
-   them. Prevents a query like "triad implementation" from returning 10
-   doc chunks with the defining `.ex` file invisible.
+   them. Without this, a query like "triad implementation" can return 10
+   doc chunks with the defining `.ex` source file invisible.
 
 4. **Symbol_exact boost** — single-token queries (snake_case, CamelCase,
-   dotted paths) add a SHOULD clause against the `symbol_exact` field
-   with 6× boost, lifting the defining chunk above documents that only
-   mention the symbol in prose.
+   dotted paths) add a SHOULD clause on `symbol_exact` with 6× boost,
+   lifting the defining chunk above documents that only mention the
+   symbol in prose.
 
-`bbox_discover_seed_entities` runs the same pipeline but also renders
-`notable_edges` for each result — use it when the next step is
-`bbox_inspect_entity` and you want pre-vetted traversal hops.
+---
 
 ## Embedding pipeline
 
-Voyage embeddings (`voyage-code-3`, 1024d) power the vector lane.
-The daemon runs a per-route async queue: one worker per route with
-debounce, batching, and retry.
+Voyage embeddings power the vector lane. The daemon runs one async
+worker per route with debounce, batching, and retry.
 
 ### Routes
 
-| Route | What's embedded | Default provider |
+| Route | What's embedded | Provider |
 |---|---|---|
-| `code` | Source-file code chunks | voyage / voyage-code-3 |
-| `docs` | Source-file doc chunks (markdown, comments) | voyage / voyage-code-3 |
-| `git_message` | Commit subject + body | voyage / voyage-code-3 |
-| `knowledge` | Knowledge-store entries | voyage / voyage-code-3 |
-| `notes` | Side-channel notes | voyage / voyage-code-3 |
-| `transcripts` | Transcript event blocks | voyage / voyage-code-3 |
+| `code` | Source-file code chunks | voyage-code-3 |
+| `docs` | Source-file doc chunks (markdown, comments) | voyage-code-3 |
+| `git_message` | Commit subject + body | voyage-code-3 |
+| `knowledge` | Knowledge-store entries | voyage-code-3 |
+| `notes` | Side-channel notes | voyage-code-3 |
+| `transcripts` | Transcript event blocks | voyage-code-3 |
 
 Each route persists its own HNSW partition keyed on
-`(provider, model, dimensions)`. Switching provider or model requires a
-full re-embed of that route — existing partitions for other routes are
-unaffected.
+`(provider, model, dimensions)`. Switching a route's provider or model
+invalidates that partition; the others are unaffected.
 
-### Batch caps
+### Batch cap
 
-The queue caps at **64 documents** or **80KB total** per Voyage request
-(under the 128 doc / 120KB Voyage limits). Without this cap, a restart
-that re-fills the queue with thousands of pending chunks would send one
-oversized request, get rejected, retry 3×, and drop the entire batch.
+64 documents or 80KB total per Voyage request (Voyage limits: 128 / 120KB).
+The cap prevents a restart from flushing thousands of queued chunks in
+one oversized request, getting rejected, retrying 3×, and silently
+dropping the batch.
 
 ### Ollama fallback
 
-Set a route to `ollama` in `~/.config/blackbox/embed.toml` to use a
-local `nomic-embed-text` endpoint (768d) without an API key. Mixing
-Voyage and Ollama routes is fine; each maintains its own HNSW partition.
-Dimensions must not change within a partition — switching from 768d to
-1024d on the same route requires `bbox_reembed` to rebuild.
+Route to `ollama` in `~/.config/blackbox/embed.toml` to use
+`nomic-embed-text` (768d) without an API key. Mixed-provider setups work;
+each maintains its own HNSW partition. Changing dimensions within a
+route requires `bbox_reembed` to rebuild.
 
-### Status check
+### Status
 
 ```
 bbox_embed_status()
 ```
 
-Per-route fields: `available`, `provider`, `model`, `dim`,
-`indexed_count`, `queue_depth`, `retried_count`, `last_error`. A healthy
-daemon shows `available: true` and `last_error: null` on all routes.
-Non-zero `queue_depth` is normal during a reindex; watch for it to drain.
+Fields per route: `available`, `provider`, `model`, `dim`,
+`indexed_count`, `queue_depth`, `retried_count`, `last_error`. Healthy:
+`available: true`, `last_error: null`. Non-zero `queue_depth` is normal
+during reindex; watch for it to drain.
+
+---
 
 ## Tantivy index and schema versioning
 
-Blackbox indexes one Tantivy document per content block (not per
-session). This enables role-based filtering and precise excerpt
-generation. Schema version is tracked via `INDEX_SCHEMA_VERSION` in
-`src/index/mod.rs`.
+`INDEX_SCHEMA_VERSION` in `src/index/mod.rs` gates schema compatibility.
+On startup, if the stored marker doesn't match the binary's version, the
+index drops and rebuilds automatically (~5–7 minutes for 1M docs). The
+EdgeIndex watcher fires ~6 seconds after the doc count stabilizes.
 
-On daemon start: if the stored schema marker doesn't match the binary's
-version, the index is dropped and rebuilt automatically. A full rebuild
-on a 1M-doc corpus takes **5–7 minutes**. The EdgeIndex rebuild fires
-automatically via a watcher thread after the doc count stabilizes
-(~6 seconds after reindex completes).
+Schema version history:
 
-### Schema version history
-
-| Version tag | Change |
+| Tag | Change |
 |---|---|
 | `agentic-corpus-g1` | Initial agentic schema |
 | `agentic-corpus-g2-path-tokens` | Tokenized `path_tokens` field |
-| `agentic-corpus-g3-commit-subject-tokens` | `path_tokens` from commit subject so commits rank alongside project files |
+| `agentic-corpus-g3-commit-subject-tokens` | `path_tokens` from commit subjects so commits rank alongside project files |
 | `agentic-corpus-g4-elixir-symbols` | Elixir symbol extraction via tree-sitter |
-| `agentic-corpus-g5-symbol-tokenized` | `symbol` field switched to code_tokenizer so `Substrate.TriadClosure` matches both camelCase and snake_case queries |
+| `agentic-corpus-g5-symbol-tokenized` | `symbol` switched to code_tokenizer — `Substrate.TriadClosure` now matches both camelCase and snake_case queries |
 
-## EdgeIndex
-
-The EdgeIndex is a graph projection over the tantivy substrate. It's
-built from the JSONL edge sidecars under
-`~/.local/state/blackbox/edges/<project_id>.jsonl` plus in-memory edges
-from the live knowledge/thread/note stores. The watcher thread
-auto-triggers a rebuild when the tantivy doc count grows.
-
-Manual rebuild: `bbox_edge_compact` compresses a project's sidecar;
-`bbox_reindex(full=true)` forces a full tantivy rebuild which cascades
-to EdgeIndex.
+---
 
 ## Provider integration
 
-How well each CLI provider follows the agentic opening sequence when
-given a cold-start question:
+How well each CLI follows the agentic opening sequence from a cold start:
 
-| Provider | Honors AGENTS.md @-imports | Uses bbox_* tools | Notes |
+| Provider | Honors @-imports | Uses bbox_* | Notes |
 |---|---|---|---|
 | `claude` (Opus 4.7) | ✅ | ✅ first-class | Best cold-start reliability; follows the 5-step loop naturally |
-| `codex` (gpt-5.5) | ✅ | ✅ first-class | Quality high; latency tends 2× of Claude |
+| `codex` (gpt-5.5) | ✅ | ✅ first-class | Quality high; latency typically 2× Claude |
 | `gemini` (gemini-3.1-pro) | ✅ | Untested | Renders to GEMINI.md; expected to mirror Claude |
-| `glm` / `deepseek` (via opencode) | ❌ | Falls back to grep/read | opencode doesn't follow `@/path/...` @-imports in AGENTS.md; tracked in deferred thread |
+| `glm` / `deepseek` (opencode) | ❌ | Falls back to grep/read | opencode doesn't follow `@/path/...` @-imports in AGENTS.md |
+
+The opencode gap means GLM and DeepSeek bros operate without graph
+grounding, reducing them to filesystem search. Tracked in the deferred
+items thread.
+
+---
 
 ## System memories
 
-Code-embedded runbooks pulled on demand via `bbox_knowledge(query="sm-<id>")`.
-Not rendered into provider files — kept cold and fetched when needed.
+Code-embedded runbooks pulled on demand — not rendered into provider
+files, so they don't bloat every session's context. Fetch with
+`bbox_knowledge(query="sm-<id>")`.
 
 | ID | Topic |
 |---|---|
-| `sm-agentic-opening-sequence` | 5-step grounding pattern |
-| `sm-transcript-retrieval` | search / cite / context / session ladders |
-| `sm-persistence-taxonomy` | learn vs decide vs remember vs pin |
+| `sm-agentic-opening-sequence` | Full 5-step pattern with recipes for where/what/who/why/how questions |
+| `sm-transcript-retrieval` | search / cite / context / session retrieval ladders |
+| `sm-persistence-taxonomy` | learn vs decide vs remember vs pin lane selection |
 | `sm-render-lifecycle` | Render → review → revoke flow |
 | `sm-scoped-pins` | Active-arc context pins |
 | `sm-create-etiquette` | List-before-create dedupe hygiene |
