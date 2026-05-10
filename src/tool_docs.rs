@@ -587,8 +587,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_mcp_surface",
         category: ToolCategory::Packets,
-        summary: "MCP surface debugging and replay tool. Use action='replay' to evaluate a surface routing packet against a surface selector and see the resulting verdict plus visible tool list. Iterates on surface rules without restarting providers.",
-        when_to_use: "Reach here when authoring or debugging mcp-surface/routing packets. The 'replay' action lets you compile a packet, then test it with different surface selectors to verify the verdict and visible tools.",
+        summary: "MCP surface debugging, listing, and inspection. Actions: 'replay' evaluates a surface selector against the routing packet; 'list' shows installed surface packets; 'describe' shows packet rules plus verdict for a selected surface.",
+        when_to_use: "Reach here when authoring or debugging mcp-surface/routing packets. 'replay' evaluates a surface selector and shows verdict + visible tools. 'list' enumerates installed surface packets. 'describe' shows packet rules and the verdict for a selected surface.",
         example: Some(
             r#"bbox_mcp_surface(action="replay", surface="readonly", project="/home/user/repo")"#,
         ),

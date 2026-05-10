@@ -8,7 +8,8 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpSurfaceParams {
-    /// Action to perform. Currently only "replay" is supported.
+    /// Action to perform. "replay" evaluates a surface; "list" shows
+    /// installed surface packets; "describe" shows a surface packet's rules.
     pub action: String,
     /// Surface name to evaluate. Defaults to "default".
     #[serde(default)]
@@ -22,7 +23,7 @@ pub struct McpSurfaceParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_mcp_surface",
-        description = "MCP surface debugging and replay tool. Use action='replay' to evaluate a surface routing packet against a surface selector and see the resulting verdict plus visible tool list. Iterates on surface rules without restarting providers."
+        description = "MCP surface debugging, listing, and inspection. Actions: 'replay' evaluates a surface selector against the routing packet; 'list' shows installed surface packets; 'describe' shows packet rules plus verdict for a selected surface."
     )]
     pub(crate) fn bbox_mcp_surface(
         &self,
@@ -30,8 +31,10 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_mcp_surface", || match p.action.as_str() {
             "replay" => self.handle_mcp_surface_replay(&p),
+            "list" => self.handle_mcp_surface_list(),
+            "describe" => self.handle_mcp_surface_describe(&p),
             _ => Err(anyhow::anyhow!(
-                "unknown action '{}'. Valid actions: replay",
+                "unknown action '{}'. Valid actions: replay, list, describe",
                 p.action
             )),
         })
@@ -90,6 +93,111 @@ impl BlackboxServer {
             "verdict_consequent": consequent_json,
             "visible_tools": visible_tools,
             "visible_tool_count": visible_tools.len(),
+        }))?)
+    }
+
+    fn handle_mcp_surface_list(&self) -> anyhow::Result<String> {
+        let packets = self.state.packets.read();
+        let all = packets.list_all()?;
+        let surface_packets: Vec<serde_json::Value> = all
+            .into_iter()
+            .filter(|p| p.domain == surface::SURFACE_ROUTING_DOMAIN)
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "scope": p.scope,
+                    "project": p.project,
+                    "created_at": p.created_at,
+                    "rule_count": p.rules.len(),
+                })
+            })
+            .collect();
+        drop(packets);
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "surface_packets": surface_packets,
+            "count": surface_packets.len(),
+        }))?)
+    }
+
+    fn handle_mcp_surface_describe(&self, p: &McpSurfaceParams) -> anyhow::Result<String> {
+        let packets = self.state.packets.read();
+        let loaded = packets.load_latest_by_domain(
+            surface::SURFACE_ROUTING_DOMAIN,
+            p.project.as_deref(),
+        );
+        let packet = loaded?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no mcp-surface/routing packet found{}",
+                p.project
+                    .as_deref()
+                    .map(|pr| format!(" for project {pr}"))
+                    .unwrap_or_default()
+            )
+        })?;
+
+        let rules: Vec<serde_json::Value> = packet
+            .rules
+            .iter()
+            .map(|r| {
+                let classification = r.classification.as_str();
+                let matching_surface = match &r.antecedent {
+                    crate::packets::Predicate::Eq { field, value } if field == "surface" => {
+                        match value {
+                            crate::packets::Value::String(s) => s.clone(),
+                            other => format!("{:?}", other),
+                        }
+                    }
+                    _ => "*".to_string(),
+                };
+                serde_json::json!({
+                    "id": r.id,
+                    "classification": classification,
+                    "matches_surface": matching_surface,
+                })
+            })
+            .collect();
+
+        let packet_meta = serde_json::json!({
+            "id": packet.id,
+            "domain": packet.domain,
+            "scope": packet.scope,
+            "project": packet.project,
+            "rule_count": packet.rules.len(),
+        });
+        drop(packets);
+
+        let selected = p
+            .surface
+            .as_deref()
+            .unwrap_or("default");
+        let entity = surface::build_surface_entity(selected, p.project.as_deref());
+        let packets_guard = self.state.packets.read();
+        let decision =
+            surface::evaluate_tool_surface(&*packets_guard, entity, p.project.as_deref());
+        drop(packets_guard);
+
+        let verdict_summary = match &decision.verdict {
+            surface::ToolSurfaceVerdict::ToolSurface {
+                allow,
+                disallow,
+                ..
+            } => serde_json::json!({
+                "route": "tool_surface",
+                "allow": allow,
+                "disallow": disallow,
+            }),
+            surface::ToolSurfaceVerdict::Deny { reason } => serde_json::json!({
+                "route": "deny",
+                "reason": reason,
+            }),
+        };
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "packet": packet_meta,
+            "rules": rules,
+            "selected_surface": selected,
+            "verdict_for_selected": verdict_summary,
         }))?)
     }
 }
@@ -305,5 +413,88 @@ mod tests {
             "global packet should not allow bbox_stats: {:?}",
             visible_global
         );
+    }
+
+    #[test]
+    fn test_list_returns_surface_packets() {
+        let (_tmp, server) = make_server();
+        let packets = server.state.packets.read();
+
+        compile_surface_packet(
+            &packets,
+            vec![
+                surface_rule("readonly", "readonly", &["bbox_search"], &[], "tool_surface"),
+                catchall_deny(),
+            ],
+            "global",
+            None,
+        );
+        drop(packets);
+
+        let result = server.handle_mcp_surface_list().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 1);
+        let arr = parsed["surface_packets"].as_array().unwrap();
+        assert_eq!(arr[0]["rule_count"], 2);
+    }
+
+    #[test]
+    fn test_list_empty_when_no_packets() {
+        let (_tmp, server) = make_server();
+
+        let result = server.handle_mcp_surface_list().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["count"], 0);
+    }
+
+    #[test]
+    fn test_describe_returns_rules_and_verdict() {
+        let (_tmp, server) = make_server();
+        let packets = server.state.packets.read();
+
+        compile_surface_packet(
+            &packets,
+            vec![
+                surface_rule("readonly", "readonly", &["bbox_search"], &[], "tool_surface"),
+                catchall_deny(),
+            ],
+            "global",
+            None,
+        );
+        drop(packets);
+
+        let result = server.handle_mcp_surface_describe(&McpSurfaceParams {
+            action: "describe".to_string(),
+            surface: Some("readonly".to_string()),
+            project: None,
+        })
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["packet"]["rule_count"], 2);
+        assert_eq!(parsed["selected_surface"], "readonly");
+        assert_eq!(parsed["verdict_for_selected"]["route"], "tool_surface");
+
+        let rules = parsed["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["matches_surface"], "readonly");
+        assert_eq!(rules[0]["classification"], "tool_surface");
+        assert_eq!(rules[1]["matches_surface"], "*");
+        assert_eq!(rules[1]["classification"], "deny");
+    }
+
+    #[test]
+    fn test_describe_no_packet_returns_error() {
+        let (_tmp, server) = make_server();
+
+        let result = server.handle_mcp_surface_describe(&McpSurfaceParams {
+            action: "describe".to_string(),
+            surface: Some("readonly".to_string()),
+            project: None,
+        });
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("no mcp-surface/routing packet found"));
     }
 }
