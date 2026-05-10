@@ -280,6 +280,17 @@ pub struct RefactorPlanParams {
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
+    /// Optional path to write the full RefactorPlan JSON to. When set,
+    /// the planner writes the plan to disk and returns a compact
+    /// `RefactorPlanSummary` instead of the full plan body. Use this for
+    /// large refactors whose plan JSON exceeds the MCP transport limit
+    /// (the daemon stringifies large parameter values past some
+    /// threshold, breaking inline `bbox_refactor_apply(plan=...)` calls
+    /// — pass `plan_path` to apply with the same path instead). Relative
+    /// paths resolve against `project_dir` or cwd. Parent directories
+    /// are created automatically.
+    #[serde(default)]
+    pub output_path: Option<String>,
     /// `lombokify_java_class`: how to handle a primitive `boolean` field
     /// whose hand-rolled getter uses `get-` prefix (e.g., `getShowFlag()`
     /// for `boolean showFlag`). Lombok's @Getter generates `isShowFlag()`,
@@ -298,8 +309,16 @@ pub struct RefactorPlanParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RefactorApplyParams {
-    /// RefactorPlan JSON returned by bbox_refactor_plan.
+    /// RefactorPlan JSON returned by `bbox_refactor_plan`. Optional when
+    /// `plan_path` is set; mutually exclusive with `plan_path`.
+    #[serde(default)]
     pub plan: serde_json::Value,
+    /// Optional filesystem path to a RefactorPlan JSON file (the same
+    /// shape `bbox_refactor_plan` writes when `output_path` is set).
+    /// Use this for large plans that exceed the MCP transport's inline
+    /// parameter size limit. Mutually exclusive with `plan`.
+    #[serde(default)]
+    pub plan_path: Option<String>,
     /// Must be true. Prevents accidental writes from copied dry-run output.
     #[serde(default)]
     pub confirm: Option<bool>,
@@ -310,6 +329,57 @@ pub struct RefactorApplyParams {
     /// Use true only for disposable practice worktrees or isolated smoke tests.
     #[serde(default)]
     pub allow_unregistered_paths: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RefactorPlanSummary {
+    pub status: String,
+    pub plan_path: String,
+    pub title: String,
+    pub kind: String,
+    pub semantic_status: SemanticStatus,
+    pub file_count: usize,
+    pub total_edits: usize,
+    pub file_moves: usize,
+    pub files: Vec<RefactorPlanSummaryFile>,
+    pub leftovers_count: usize,
+    pub leftovers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RefactorPlanSummaryFile {
+    pub path: String,
+    pub edit_count: usize,
+    pub original_sha256: String,
+}
+
+fn build_plan_summary(plan_json: &str, plan_path: &Path) -> Result<RefactorPlanSummary> {
+    let plan: RefactorPlan = serde_json::from_str(plan_json)
+        .context("plan JSON written to output_path could not be parsed")?;
+    let total_edits: usize = plan.edits.iter().map(|f| f.edits.len()).sum();
+    let files = plan
+        .edits
+        .iter()
+        .map(|f| RefactorPlanSummaryFile {
+            path: f.path.clone(),
+            edit_count: f.edits.len(),
+            original_sha256: f.original_sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    let leftovers_count = plan.leftovers.len();
+    Ok(RefactorPlanSummary {
+        status: "ok".to_string(),
+        plan_path: path_string(plan_path),
+        title: plan.title,
+        kind: plan.kind,
+        semantic_status: plan.semantic_status,
+        file_count: plan.edits.len(),
+        total_edits,
+        file_moves: plan.file_moves.len(),
+        files,
+        leftovers_count,
+        leftovers: plan.leftovers,
+    })
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -673,6 +743,25 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
 }
 
 pub fn plan_with_ctx(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
+    let plan_json = plan_dispatch(p, ctx)?;
+    if let Some(output_path) = p.output_path.as_deref() {
+        let resolved = resolve_path(p.project_dir.as_deref(), output_path)?;
+        if let Some(parent) = resolved.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("creating parent directory for plan output: {}", parent.display())
+                })?;
+            }
+        }
+        fs::write(&resolved, &plan_json)
+            .with_context(|| format!("writing plan JSON to {}", resolved.display()))?;
+        let summary = build_plan_summary(&plan_json, &resolved)?;
+        return Ok(serde_json::to_string_pretty(&summary)?);
+    }
+    Ok(plan_json)
+}
+
+fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
     match p.kind.as_str() {
         "extract_rust_items" => plan_extract_rust_items(p),
         "extract_rust_impl_methods" => plan_extract_rust_impl_methods(p),
@@ -715,8 +804,24 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
     if p.confirm != Some(true) {
         bail!("confirm=true is required to apply a refactor plan");
     }
-    let plan: RefactorPlan = serde_json::from_value(p.plan.clone())
-        .context("plan must be a RefactorPlan JSON object returned by bbox_refactor_plan")?;
+    let plan: RefactorPlan = match (&p.plan, p.plan_path.as_deref()) {
+        (_, Some(path)) => {
+            let resolved = PathBuf::from(path);
+            let body = fs::read_to_string(&resolved)
+                .with_context(|| format!("reading plan_path {}", resolved.display()))?;
+            serde_json::from_str(&body).with_context(|| {
+                format!(
+                    "plan_path {} must contain a RefactorPlan JSON object",
+                    resolved.display()
+                )
+            })?
+        }
+        (value, None) if !value.is_null() => serde_json::from_value(value.clone())
+            .context("plan must be a RefactorPlan JSON object returned by bbox_refactor_plan")?,
+        (_, None) => {
+            bail!("either `plan` or `plan_path` must be provided")
+        }
+    };
     validate_plan_shape(&plan)?;
 
     let mut originals: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
@@ -1027,6 +1132,7 @@ pub fn run_with_ctx(
                     let apply_text = match apply(
                         &RefactorApplyParams {
                             plan: plan_value,
+                            plan_path: None,
                             confirm: Some(true),
                             allow_dirty_worktree: Some(true),
                             allow_unregistered_paths: p.allow_unregistered_paths,

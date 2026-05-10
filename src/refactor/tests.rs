@@ -157,6 +157,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -212,6 +213,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -272,6 +274,7 @@ mod tests {
         apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -322,6 +325,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -381,6 +385,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -440,6 +445,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -493,6 +499,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -550,6 +557,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -604,6 +612,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -657,6 +666,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -778,6 +788,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -832,6 +843,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1489,6 +1501,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1540,6 +1553,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1591,6 +1605,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1642,6 +1657,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1693,6 +1709,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1745,6 +1762,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1797,6 +1815,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1845,6 +1864,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1897,6 +1917,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -1977,6 +1998,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2031,6 +2053,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2113,6 +2136,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2162,6 +2186,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2210,6 +2235,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2261,6 +2287,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2340,6 +2367,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: serde_json::from_str(&plan_text).unwrap(),
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2383,6 +2411,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: serde_json::from_str(&plan_text).unwrap(),
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2434,6 +2463,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: serde_json::from_str(&plan_text).unwrap(),
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2517,6 +2547,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2565,6 +2596,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2706,6 +2738,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2754,6 +2787,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2849,6 +2883,7 @@ mod tests {
         let err = apply(
             &RefactorApplyParams {
                 plan: serde_json::to_value(plan).unwrap(),
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -2891,6 +2926,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: serde_json::to_value(plan).unwrap(),
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),

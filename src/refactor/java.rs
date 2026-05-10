@@ -5710,6 +5710,42 @@ fn detect_trivial_setter<'a>(
     None
 }
 
+/// Merge zero-width inserts (`byte_start == byte_end`) that share the
+/// same position into a single TextEdit whose replacement concatenates
+/// them in push order. Non-zero-width edits (drops, replacements) and
+/// inserts at distinct positions pass through unchanged. Preserves
+/// relative ordering otherwise.
+fn merge_colocated_inserts(edits: Vec<TextEdit>) -> Vec<TextEdit> {
+    let mut by_pos: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
+    let mut others: Vec<TextEdit> = Vec::new();
+    let mut insert_order: Vec<usize> = Vec::new();
+    for edit in edits {
+        if edit.byte_start == edit.byte_end {
+            if !by_pos.contains_key(&edit.byte_start) {
+                insert_order.push(edit.byte_start);
+            }
+            by_pos
+                .entry(edit.byte_start)
+                .and_modify(|s| s.push_str(&edit.replacement))
+                .or_insert(edit.replacement);
+        } else {
+            others.push(edit);
+        }
+    }
+    let mut out: Vec<TextEdit> = others;
+    for pos in insert_order {
+        if let Some(replacement) = by_pos.remove(&pos) {
+            out.push(TextEdit {
+                byte_start: pos,
+                byte_end: pos,
+                replacement,
+            });
+        }
+    }
+    out
+}
+
 /// Walk the method-invocation chain that ends at `outer`, returning the
 /// list of `(method_name, args)` pairs from the innermost call to the
 /// outermost, plus the root expression at the bottom of the chain (the
@@ -6814,18 +6850,20 @@ fn plan_lombokify_java_class_single(
     if slf4j_field.is_some() {
         class_level_annotations.push("@Slf4j");
     }
-    if !class_level_annotations.is_empty() {
+    // Build the class-level annotation block but DEFER pushing it until
+    // after the import edit. When the source has no blank line between
+    // `package` and `class`, both inserts land at the same byte; the
+    // apply pipeline iterates sorted-edits in reverse, which means the
+    // FIRST-pushed insert ends up rightmost in the merged stream. We want
+    // imports left of annotations, so push imports before annotations.
+    let class_level_replacement = {
         let mut block = String::new();
         for ann in &class_level_annotations {
             block.push_str(ann);
             block.push('\n');
         }
-        text_edits.push(TextEdit {
-            byte_start: class_node.start_byte(),
-            byte_end: class_node.start_byte(),
-            replacement: block,
-        });
-    }
+        block
+    };
 
     // Per-field placement for accessor kinds that didn't go class-level.
     // If a field qualifies for both Getter and Setter at the per-field tier,
@@ -6921,6 +6959,26 @@ fn plan_lombokify_java_class_single(
         });
     }
 
+    // Class-level annotation push happens AFTER the import push so that
+    // when both edits land at the same byte (no blank line between
+    // `package` and `class`), the merged-colocated-inserts pass keeps
+    // imports first, annotations second.
+    if !class_level_replacement.is_empty() {
+        text_edits.push(TextEdit {
+            byte_start: class_node.start_byte(),
+            byte_end: class_node.start_byte(),
+            replacement: class_level_replacement,
+        });
+    }
+
+    // Merge colocated zero-width inserts so they apply atomically in
+    // source order. Two `byte_start == byte_end` inserts at the same
+    // position would otherwise be applied in reverse-push order by the
+    // apply pipeline (which iterates sorted-edits-reversed), placing
+    // later pushes before earlier ones — corrupting `package; import;
+    // @Annotation; class` ordering when no blank line separates the
+    // package statement from the class declaration.
+    text_edits = merge_colocated_inserts(text_edits);
     text_edits.sort_by_key(|e| (e.byte_start, e.byte_end));
 
     let mut summary_parts: Vec<String> = Vec::new();
@@ -7035,6 +7093,7 @@ mod tests {
             rewrite_remaining_accessors: None,
             project_dir: None,
             boolean_getter_strategy: None,
+            output_path: None,
         }
     }
 
@@ -7090,6 +7149,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -8312,6 +8372,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -8362,6 +8423,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -8488,6 +8550,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
@@ -11203,6 +11266,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lombokify_output_path_writes_plan_and_returns_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Pair.java");
+        fs::write(
+            &path,
+            "package com.example;\n\
+             public class Pair {\n\
+            \x20   private String first;\n\
+            \x20   private String second;\n\
+            \x20   public String getFirst() { return first; }\n\
+            \x20   public String getSecond() { return second; }\n\
+             }\n",
+        )
+        .unwrap();
+        let plan_path = dir.path().join("plan.json");
+        let mut params = java_plan_params("lombokify_java_class", &path);
+        params.output_path = Some(path_string(&plan_path));
+        let response_text = plan(&params).unwrap();
+        // Response is a summary, not a full RefactorPlan.
+        let summary: RefactorPlanSummary = serde_json::from_str(&response_text).unwrap();
+        assert_eq!(summary.status, "ok");
+        assert_eq!(summary.kind, "lombokify_java_class");
+        assert_eq!(summary.file_count, 1);
+        assert!(summary.total_edits > 0);
+        assert_eq!(summary.files.len(), 1);
+        assert!(summary.files[0].path.ends_with("Pair.java"));
+        // Plan file written to disk.
+        assert!(plan_path.is_file(), "plan file should be written to disk");
+        let written = fs::read_to_string(&plan_path).unwrap();
+        let on_disk: RefactorPlan = serde_json::from_str(&written).unwrap();
+        assert_eq!(on_disk.kind, "lombokify_java_class");
+        assert_eq!(on_disk.edits.len(), 1);
+    }
+
+    #[test]
+    fn lombokify_apply_via_plan_path_roundtrip() {
+        // End-to-end: plan with output_path → apply with plan_path.
+        // This is the workflow that solves Gap 3 (large plans break the
+        // MCP transport when serialized inline).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Bean.java");
+        fs::write(
+            &src,
+            "package com.example;\n\
+             public class Bean {\n\
+            \x20   private String name;\n\
+            \x20   public String getName() { return name; }\n\
+             }\n",
+        )
+        .unwrap();
+        let plan_path = dir.path().join("plans/bean-plan.json");
+        let mut params = java_plan_params("lombokify_java_class", &src);
+        params.output_path = Some(path_string(&plan_path));
+        let summary_text = plan(&params).unwrap();
+        let summary: RefactorPlanSummary = serde_json::from_str(&summary_text).unwrap();
+        // Apply by reading the plan from disk.
+        let response = apply(
+            &RefactorApplyParams {
+                plan: serde_json::Value::Null,
+                plan_path: Some(summary.plan_path.clone()),
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert!(
+            applied.validations.iter().all(|v| !v.has_error),
+            "rewritten file must parse cleanly: {response}"
+        );
+        let final_text = fs::read_to_string(&src).unwrap();
+        assert!(final_text.contains("@Getter\npublic class Bean"));
+    }
+
+    #[test]
+    fn lombokify_apply_rejects_missing_plan_and_path() {
+        let err = apply(
+            &RefactorApplyParams {
+                plan: serde_json::Value::Null,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("plan") && err.to_string().contains("plan_path"),
+            "expected refusal naming both options: {err}"
+        );
+    }
+
     /// End-to-end probe: copies LOMBOKIFY_PROBE_FILE into a tempdir,
     /// runs the planner+apply pipeline, and confirms the rewritten file
     /// parses cleanly (no syntax errors). Skipped unless env var is set.
@@ -11225,6 +11385,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: Some(true),
                 allow_unregistered_paths: Some(true),
@@ -11293,6 +11454,7 @@ mod tests {
         let response = apply(
             &RefactorApplyParams {
                 plan: plan_value,
+                plan_path: None,
                 confirm: Some(true),
                 allow_dirty_worktree: Some(true),
                 allow_unregistered_paths: Some(true),
