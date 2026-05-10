@@ -407,6 +407,15 @@ pub enum RefactorRunStep {
     Plan {
         #[serde(flatten)]
         params: RefactorPlanParams,
+        /// When true, plan-time failure (e.g. "no boilerplate") is logged
+        /// as a `skipped` step in the run report rather than aborting the
+        /// batch and rolling back prior writes. Default false preserves
+        /// strict batch semantics. Use this when batching lombokify or
+        /// similar plans across many files where a subset will return
+        /// "no boilerplate" — those files become per-step skips, not
+        /// batch-failures (Gap 2 from JAVA_TOOL_GAPS).
+        #[serde(default)]
+        optional: bool,
     },
     Command {
         command: String,
@@ -1021,13 +1030,30 @@ pub fn run_with_ctx(
 
     for (idx, step) in p.steps.iter().enumerate() {
         match step {
-            RefactorRunStep::Plan { params } => {
+            RefactorRunStep::Plan { params, optional } => {
                 let mut step_params = params.clone();
                 if step_params.project_dir.is_none() {
                     step_params.project_dir = Some(path_string(&project_dir));
                 }
                 let plan_text = match plan_with_ctx(&step_params, ctx) {
                     Ok(plan_text) => plan_text,
+                    Err(err) if *optional => {
+                        // Optional step — log as skipped, keep prior writes,
+                        // continue to the next step. This is the bulk-batch
+                        // path: many files where a subset has nothing to
+                        // lombokify shouldn't kill the whole batch.
+                        reports.push(RefactorRunStepReport {
+                            index: idx,
+                            op: "plan".to_string(),
+                            status: "skipped".to_string(),
+                            kind: Some(step_params.kind),
+                            title: None,
+                            files: Vec::new(),
+                            validations: Vec::new(),
+                            error: Some(err.to_string()),
+                        });
+                        continue;
+                    }
                     Err(err) => {
                         let rollback_errors = restore_snapshots(&snapshots);
                         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {

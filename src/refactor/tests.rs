@@ -1014,6 +1014,7 @@ mod tests {
                 project_dir: path_string(dir.path()),
                 steps: vec![
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "add_rust_mod_decl".into(),
                             source: "lib.rs".into(),
@@ -1038,6 +1039,7 @@ mod tests {
                         },
                     },
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "delete_rust_items".into(),
                             source: "lib.rs".into(),
@@ -1088,6 +1090,7 @@ mod tests {
                 project_dir: path_string(dir.path()),
                 steps: vec![
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "add_rust_mod_decl".into(),
                             source: "lib.rs".into(),
@@ -1112,6 +1115,7 @@ mod tests {
                         },
                     },
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "delete_rust_items".into(),
                             source: "lib.rs".into(),
@@ -1150,6 +1154,122 @@ mod tests {
     }
 
     #[test]
+    fn refactor_run_optional_plan_skips_on_failure_keeps_prior_writes() {
+        // Gap 2: a batch where one step's plan returns "no boilerplate"
+        // should not undo earlier successful writes. Marking the failing
+        // step `optional: true` turns the failure into a logged skip
+        // and continues to the next step.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+
+        // Use `delete_rust_items` against a non-existent item as the
+        // failing plan kind — same shape as lombokify's "no boilerplate"
+        // bail in the wild but works in the rust-only test harness.
+        let response = run(
+            &RefactorRunParams {
+                title: "optional skip preserves prior writes".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    // Step 0: succeeds, writes to lib.rs.
+                    RefactorRunStep::Plan {
+                        optional: false,
+                        params: RefactorPlanParams {
+                            kind: "add_rust_mod_decl".into(),
+                            source: "lib.rs".into(),
+                            module_name: Some("preserved_mod".into()),
+                            ..Default::default()
+                        },
+                    },
+                    // Step 1: optional, fails (no item to delete) — should be skipped, not abort.
+                    RefactorRunStep::Plan {
+                        optional: true,
+                        params: RefactorPlanParams {
+                            kind: "delete_rust_items".into(),
+                            source: "lib.rs".into(),
+                            item_names: Some(vec!["nonexistent_item".into()]),
+                            item_kinds: Some(vec!["fn_item".into()]),
+                            ..Default::default()
+                        },
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "ok", "batch must succeed: {response}");
+        assert!(
+            !run_response.rolled_back,
+            "prior writes must be preserved, not rolled back"
+        );
+        assert_eq!(run_response.steps.len(), 2);
+        assert_eq!(run_response.steps[0].status, "ok");
+        assert_eq!(
+            run_response.steps[1].status, "skipped",
+            "optional failing step must be marked skipped"
+        );
+        assert!(
+            run_response.steps[1].error.is_some(),
+            "skipped step must carry the original error message"
+        );
+        // Step 0's write survived.
+        let final_text = fs::read_to_string(&source).unwrap();
+        assert!(
+            final_text.contains("mod preserved_mod"),
+            "step 0's write must survive optional skip: {final_text}"
+        );
+    }
+
+    #[test]
+    fn refactor_run_non_optional_plan_failure_still_rolls_back() {
+        // Default `optional: false` preserves the strict batch semantic.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "default strict batch".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Plan {
+                        optional: false,
+                        params: RefactorPlanParams {
+                            kind: "add_rust_mod_decl".into(),
+                            source: "lib.rs".into(),
+                            module_name: Some("transient".into()),
+                            ..Default::default()
+                        },
+                    },
+                    RefactorRunStep::Plan {
+                        optional: false, // explicit; same as default
+                        params: RefactorPlanParams {
+                            kind: "delete_rust_items".into(),
+                            source: "lib.rs".into(),
+                            item_names: Some(vec!["nonexistent_item".into()]),
+                            item_kinds: Some(vec!["fn_item".into()]),
+                            ..Default::default()
+                        },
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "step_failed");
+        assert!(run_response.rolled_back);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
+    }
+
+    #[test]
     fn refactor_run_rolls_back_when_later_path_is_out_of_scope() {
         let dir = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
@@ -1164,6 +1284,7 @@ mod tests {
                 project_dir: path_string(dir.path()),
                 steps: vec![
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "add_rust_mod_decl".into(),
                             source: "lib.rs".into(),
@@ -1188,6 +1309,7 @@ mod tests {
                         },
                     },
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "delete_rust_items".into(),
                             source: path_string(&outside),
@@ -1243,6 +1365,7 @@ mod tests {
                 project_dir: path_string(dir.path()),
                 steps: vec![
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "move_file".into(),
                             source: "packets.rs".into(),
@@ -1267,6 +1390,7 @@ mod tests {
                         },
                     },
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "delete_rust_items".into(),
                             source: "packets/mod.rs".into(),
@@ -1317,6 +1441,7 @@ mod tests {
                 project_dir: path_string(dir.path()),
                 steps: vec![
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "add_rust_mod_decl".into(),
                             source: "lib.rs".into(),
@@ -1373,6 +1498,7 @@ mod tests {
                 project_dir: path_string(dir.path()),
                 steps: vec![
                     RefactorRunStep::Plan {
+                        optional: false,
                         params: RefactorPlanParams {
                             kind: "add_rust_mod_decl".into(),
                             source: "lib.rs".into(),
