@@ -6,10 +6,11 @@ Use this memory before operating on Java files with blackbox refactor tools.
 
 Java has full inspect-and-extract support, plus composite class extraction,
 field/constructor wiring, caller delegation, interface extraction, visibility
-rewriting, type migration, and import organization.
+rewriting, type migration, import organization, and Lombok-ification of
+hand-rolled boilerplate (POJO DOJO).
 
 - Inspect: supported with `bbox_refactor_status`.
-- Plan/apply: method extraction, composite class extraction, nested class extraction, field moves/adds, constructor creation, delegate-field wiring, caller delegation, interface extraction, visibility rewriting, implements clause injection, type-use migration, and import organization.
+- Plan/apply: method extraction, composite class extraction, nested class extraction, field moves/adds, constructor creation, delegate-field wiring, caller delegation, interface extraction, visibility rewriting, implements clause injection, type-use migration, import organization, and `lombokify_java_class` (POJO boilerplate → Lombok annotations).
 - Semantic rename: not supported natively by blackbox yet; use JDT, IntelliJ, Eclipse, or another Java language-server/refactoring workflow.
 - Import/package repair: `java_lsp_organize_imports` prefers a warm
   per-project JDTLS session (lazy-spawned, reused across calls, idle-evicted
@@ -569,6 +570,105 @@ type name is referenced. The fallback also detects inner-class-only simple
 names and skips synthesizing imports for them — references like
 `Outer.Inner` keep their qualified form rather than producing a non-resolving
 `import x.Inner;`. It is not a full classpath resolver.
+
+14b. Lombokify hand-rolled POJO boilerplate (POJO DOJO):
+
+```text
+bbox_refactor_plan(
+  kind="lombokify_java_class",
+  source="src/main/java/com/example/Pair.java",
+  project_dir="/absolute/project/root"
+)
+```
+
+Or against a directory tree (bulk mode — recommended for modernize/strip
+runs against legacy POJO-heavy codebases):
+
+```text
+bbox_refactor_plan(
+  kind="lombokify_java_class",
+  source="src/main/java",
+  project_dir="/absolute/project/root"
+)
+```
+
+The planner detects six categories of canonical boilerplate and replaces
+each with a semantically equivalent Lombok annotation:
+
+| Hand-rolled shape | Replacement |
+|-------------------|-------------|
+| Trivial getter (`return field;` or `return this.field;`, public, no params, return-type matches field) | `@Getter` (class-level when every instance field qualifies; else per-field) |
+| Trivial setter (`this.field = arg;`, public void, single param of matching type, field non-final) | `@Setter` (class-level when every non-final field qualifies; else per-field) |
+| Apache Commons `EqualsBuilder` equals + `HashCodeBuilder` hashCode (BOTH must match the full instance-field set in declaration order; subset coverage refused) | `@EqualsAndHashCode` |
+| Apache Commons `ToStringBuilder` toString (full-set coverage required) | `@ToString` |
+| Canonical no-arg / all-args / required-args constructor (params match field set in declaration order, body is `this.field_i = param_i;` per field, public, no validation) | `@NoArgsConstructor` / `@AllArgsConstructor` / `@RequiredArgsConstructor` |
+| `private static final Logger log = LoggerFactory.getLogger(<ThisClass>.class);` (field name MUST be exactly `log`) | `@Slf4j` |
+
+**Collapsing.** When the full mutable-POJO set fires (class-level
+`@Getter` + class-level `@Setter` + `@EqualsAndHashCode` + `@ToString` +
+matching `@RequiredArgsConstructor` or `@NoArgsConstructor` on a
+no-final-fields class), the five annotations collapse to a single
+`@Data`. When every field is final, `@Getter` is class-level, no setters
+are emitted, equals/hashCode/toString match, and `@AllArgsConstructor`
+fires (== `@RequiredArgsConstructor` on all-final), the planner collapses
+to `@Value` (Lombok's immutable variant). `@AllArgsConstructor` stacks
+on top of `@Data` when both apply. `@Slf4j` stacks independently.
+
+**Conservative refusal rules.** The detector errs toward leaving code
+alone whenever Lombok-generated semantics would differ from the
+hand-rolled method:
+
+- Javadoc above a getter/setter/ctor disqualifies it (we don't silently
+  drop documented method contracts).
+- Setter with validation, normalization, or a fluent (`return this`)
+  return is preserved.
+- Fields with non-trivial getters (lazy init, null-coalescing, caching)
+  are preserved per-field; class-level `@Getter` is then NOT emitted
+  (would generate a duplicate-method compile error against the
+  hand-rolled accessor).
+- equals/hashCode that reference only a subset of fields is preserved
+  (Lombok's default would change equality semantics).
+- Unpaired equals OR hashCode is preserved (Lombok generates BOTH;
+  dropping one would leave a phantom-paired method).
+- Constructor with non-canonical body (validation, defaulting,
+  reordering) is preserved.
+- Multiple ctors classifying as the same Lombok kind (collision) →
+  refuse all ctor lombokification rather than risk dropping the wrong
+  one.
+- SLF4J detection requires field name `log` exactly. `logger` /
+  `LOG` / topic-named loggers are preserved.
+
+**Format-difference caveat.** Apache `ToStringBuilder` default style
+emits `Foo@hash[field=value, ...]`; Lombok `@ToString` emits
+`Foo(field=value, ...)`. equals/hashCode value parity is preserved
+(matching field set + matching order); toString output FORMAT changes.
+Callers that depend on a specific toString format should opt out.
+
+**Bulk mode.** When `source` resolves to a directory, the planner
+walks every `.java` file beneath it (skipping `target/`, `build/`,
+`out/`, hidden dirs), runs the single-file lombokifier per class, and
+aggregates per-file FileEdits into one composite plan. Files that
+refuse for any reason (no boilerplate, parse failure, validation-bearing
+ctor, etc.) appear in `plan.leftovers` as `<path>: <reason>` entries
+the operator can audit. The composite plan inherits the existing
+`bbox_refactor_apply` transactional semantics: any per-file
+parse-validation failure rolls the entire batch back.
+
+**Prerequisites.** Lombok must already be on the project's classpath
+(`compileOnly 'org.projectlombok:lombok'` + `annotationProcessor
+'org.projectlombok:lombok'` for Gradle, or the equivalent Maven
+dependency). The lombokifier does NOT add Lombok to the build — that
+is a separate one-time step the operator owns. Apache Commons Lang3
+imports (`EqualsBuilder`, `HashCodeBuilder`, `ToStringBuilder`)
+become unused after lombokification; run a follow-up
+`java_lsp_organize_imports` pass to prune them.
+
+**Class targeting.** In single-file mode the planner picks the first
+top-level class declaration unless `item_names=[<class>]` overrides it.
+In bulk mode `item_names` is ignored — every file targets its first
+top-level class (the standard `Foo.java` contains class `Foo`
+convention). Inner classes are not converted in bulk mode; invoke
+single-file mode with `item_names=[<inner>]` if you need that.
 
 15. Compound run — full extract-interface flow with rollback:
 

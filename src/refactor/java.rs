@@ -10882,6 +10882,109 @@ mod tests {
         );
     }
 
+    /// Practice-run probe against a real repo. Set `LOMBOKIFY_PRACTICE_DIR`
+    /// to a directory of Java sources; the test reports how many classes
+    /// the planner can convert. Skipped unless the env var is set so CI
+    /// doesn't depend on external paths.
+    #[test]
+    fn lombokify_practice_run() {
+        let Ok(dir) = std::env::var("LOMBOKIFY_PRACTICE_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        if !dir.is_dir() {
+            return;
+        }
+        let mut params = java_plan_params("lombokify_java_class", &dir);
+        params.source = path_string(&dir);
+        let plan_text = match plan_lombokify_java_class(&params) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("PRACTICE RUN: planner refused: {e}");
+                return;
+            }
+        };
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        eprintln!("PRACTICE RUN against {}", dir.display());
+        eprintln!("  title: {}", plan.title);
+        eprintln!("  files converted: {}", plan.edits.len());
+        eprintln!("  files skipped:   {}", plan.leftovers.len());
+        // Sample 5 conversions and 5 skips.
+        for edit in plan.edits.iter().take(5) {
+            eprintln!("    + {}: {} edits", edit.path, edit.edits.len());
+        }
+        for skip in plan.leftovers.iter().take(5) {
+            eprintln!("    - {skip}");
+        }
+    }
+
+    /// End-to-end probe: copies LOMBOKIFY_PROBE_FILE into a tempdir,
+    /// runs the planner+apply pipeline, and confirms the rewritten file
+    /// parses cleanly (no syntax errors). Skipped unless env var is set.
+    #[test]
+    fn lombokify_probe_apply_clean_parse() {
+        let Ok(path_str) = std::env::var("LOMBOKIFY_PROBE_FILE") else {
+            return;
+        };
+        let src = PathBuf::from(&path_str);
+        if !src.is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(src.file_name().unwrap());
+        fs::copy(&src, &dest).unwrap();
+        let mut params = java_plan_params("lombokify_java_class", &dest);
+        params.source = path_string(&dest);
+        let plan_text = plan_lombokify_java_class(&params).unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        eprintln!("APPLY RESULT: {applied:?}");
+        assert_eq!(applied.status, "ok", "apply should succeed");
+        assert!(
+            applied.validations.iter().all(|v| !v.has_error),
+            "rewritten file must parse cleanly: {response}"
+        );
+        eprintln!("=== rewritten ===");
+        eprintln!("{}", fs::read_to_string(&dest).unwrap());
+    }
+
+    /// Single-file probe: set `LOMBOKIFY_PROBE_FILE` to a path; the test
+    /// runs the planner and prints the rewritten source. Used for visual
+    /// verification of real-world conversions.
+    #[test]
+    fn lombokify_probe_single_file() {
+        let Ok(path_str) = std::env::var("LOMBOKIFY_PROBE_FILE") else {
+            return;
+        };
+        let path = PathBuf::from(&path_str);
+        if !path.is_file() {
+            return;
+        }
+        let mut params = java_plan_params("lombokify_java_class", &path);
+        params.source = path_string(&path);
+        match plan_lombokify_java_class(&params) {
+            Ok(plan_text) => {
+                let rewritten = apply_plan_to_source(&plan_text, &path);
+                eprintln!("=== {} ===", path.display());
+                eprintln!("--- before ---");
+                eprintln!("{}", fs::read_to_string(&path).unwrap());
+                eprintln!("--- after ---");
+                eprintln!("{rewritten}");
+            }
+            Err(e) => eprintln!("PROBE: {e}"),
+        }
+    }
+
     #[test]
     fn lombokify_apply_writes_clean_parse() {
         let dir = tempfile::tempdir().unwrap();
