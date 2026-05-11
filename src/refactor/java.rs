@@ -394,6 +394,7 @@ fn heuristic_java_organize_imports(
             byte_end: end,
             replacement,
         }],
+        new_text: None,
     }])
 }
 
@@ -2128,6 +2129,7 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
             byte_end: original_target_bytes.len(),
             replacement: target_content,
         }],
+        new_text: None,
     };
 
     let plan = RefactorPlan {
@@ -2145,6 +2147,7 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
                 path: path_string(&source_path),
                 original_sha256: sha256_hex(parsed.source.as_bytes()),
                 edits: source_edits,
+                new_text: None,
             },
             target_edit,
         ],
@@ -2164,6 +2167,9 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         remaining_source_accessors: Vec::new(),
         external_calls: dependency_report.external_calls,
         inherited_dependencies: dependency_report.inherited_dependencies,
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -2721,6 +2727,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 path: path_string(&source_path),
                 original_sha256: sha256_hex(parsed.source.as_bytes()),
                 edits: source_edits,
+                new_text: None,
             },
             FileEdit {
                 path: path_string(&target_path),
@@ -2730,6 +2737,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                     byte_end: original_target_bytes.len(),
                     replacement: target_content,
                 }],
+                new_text: None,
             },
         ],
         validations: parse_validation_step_for_path(&source_path)
@@ -2746,6 +2754,9 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         remaining_source_accessors,
         external_calls: class_dependency_report.external_calls,
         inherited_dependencies: class_dependency_report.inherited_dependencies,
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -2824,6 +2835,7 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
             byte_end: original_target_bytes.len(),
             replacement: target_content,
         }],
+        new_text: None,
     };
 
     let plan = RefactorPlan {
@@ -2841,6 +2853,7 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
                 path: path_string(&source_path),
                 original_sha256: sha256_hex(parsed.source.as_bytes()),
                 edits: source_edits,
+                new_text: None,
             },
             target_edit,
         ],
@@ -2851,6 +2864,9 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -2915,6 +2931,7 @@ pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
                 byte_end: insert_at,
                 replacement,
             }],
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
@@ -2923,6 +2940,9 @@ pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -2969,6 +2989,7 @@ pub(crate) fn plan_add_java_constructor(p: &RefactorPlanParams) -> Result<String
                 byte_end: insert_at,
                 replacement: format!("\n\n{}", constructor.trim_end()),
             }],
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
@@ -2977,6 +2998,9 @@ pub(crate) fn plan_add_java_constructor(p: &RefactorPlanParams) -> Result<String
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -3053,6 +3077,7 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
                 path: path_string(&source_path),
                 original_sha256: sha256_hex(source_parsed.source.as_bytes()),
                 edits: source_edits,
+                new_text: None,
             },
             FileEdit {
                 path: path_string(&target_path),
@@ -3062,6 +3087,7 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
                     byte_end: insert_at,
                     replacement: format!("\n{}", moved_text),
                 }],
+                new_text: None,
             },
         ],
         validations: parse_validation_step_for_path(&source_path)
@@ -3074,6 +3100,9 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
         remaining_source_accessors,
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -3179,6 +3208,7 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
             path: path_string(&source_path),
             original_sha256: sha256_hex(source_parsed.source.as_bytes()),
             edits: source_edits,
+            new_text: None,
         });
     }
     edits.push(FileEdit {
@@ -3189,6 +3219,7 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
             byte_end: original_target_bytes.len(),
             replacement: target_content,
         }],
+        new_text: None,
     });
 
     let plan = RefactorPlan {
@@ -3213,6 +3244,9 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -4241,6 +4275,7 @@ pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String>
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits,
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
@@ -4249,6 +4284,9 @@ pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String>
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -4460,6 +4498,7 @@ pub(crate) fn plan_add_java_delegate_field(p: &RefactorPlanParams) -> Result<Str
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits,
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
@@ -4468,6 +4507,9 @@ pub(crate) fn plan_add_java_delegate_field(p: &RefactorPlanParams) -> Result<Str
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -4571,6 +4613,7 @@ pub(crate) fn plan_rewrite_java_visibility(p: &RefactorPlanParams) -> Result<Str
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits,
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
@@ -4579,6 +4622,9 @@ pub(crate) fn plan_rewrite_java_visibility(p: &RefactorPlanParams) -> Result<Str
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -4749,6 +4795,7 @@ pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String>
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits: vec![edit],
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
@@ -4757,6 +4804,9 @@ pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String>
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -4959,6 +5009,7 @@ let ident = chunk.split_whitespace().last().unwrap_or("").trim();
             byte_end: 0,
             replacement: interface_content,
         }],
+        new_text: None,
     });
 
     let implements_pos = find_implements_position(class_node);
@@ -5003,6 +5054,7 @@ let ident = chunk.split_whitespace().last().unwrap_or("").trim();
         path: path_string(&source_path),
         original_sha256: sha256_hex(parsed.source.as_bytes()),
         edits: source_edits,
+        new_text: None,
     });
 
     let validations = parse_validation_step_for_path(&source_path)
@@ -5029,6 +5081,9 @@ let ident = chunk.split_whitespace().last().unwrap_or("").trim();
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -5105,6 +5160,7 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits,
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
@@ -5113,6 +5169,9 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -5242,6 +5301,9 @@ pub(crate) fn plan_java_lsp_organize_imports(
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -6471,6 +6533,9 @@ fn plan_lombokify_java_tree(p: &RefactorPlanParams, dir: &Path) -> Result<String
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -7002,6 +7067,7 @@ fn plan_lombokify_java_class_single(
             path: path_string(source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits: text_edits,
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(source_path),
         items: Vec::new(),
@@ -7010,6 +7076,9 @@ fn plan_lombokify_java_class_single(
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }

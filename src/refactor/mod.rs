@@ -18,6 +18,7 @@ use java::*;
 pub(crate) mod plan_slot;
 pub(crate) mod rust_partition;
 pub(crate) mod rust_public_api;
+pub(crate) mod rust_deep;
 
 #[cfg(test)]
 mod tests;
@@ -179,6 +180,50 @@ pub struct InheritedDependency {
     /// "class" or "interface".
     pub source_kind: String,
     pub call_sites: Vec<ExtractedCallSite>,
+}
+
+/// Rust deep-analysis output for `extract_rust_impl_methods` with `deep_analysis: true`.
+/// Populated when `semantic_status` is `indexed_hints`; all arrays are empty for
+/// `syntax_only` plans.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct DeepAnalysis {
+    /// Struct fields accessed through `self` in the extracted methods, with
+    /// borrow-context classification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captured_self_fields: Vec<CapturedSelfField>,
+    /// Calls to `self.m()` or `Self::m()` that are NOT in the extracted set
+    /// and therefore remain as unresolved dependencies after extraction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_callbacks: Vec<UnresolvedCallback>,
+    /// Names of impl-level generic type or const parameters that appear in the
+    /// extracted method signatures or bodies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited_generics: Vec<String>,
+    /// Bounds for the `inherited_generics` params (from the impl type_parameters).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited_bounds: Vec<String>,
+    /// Impl-level lifetime parameters referenced in the extracted methods.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captured_lifetimes: Vec<String>,
+}
+
+/// A struct field accessed through `self` in an extracted impl method.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct CapturedSelfField {
+    pub field_name: String,
+    pub field_type: String,
+    /// Borrow-context classification: `"copy"`, `"unique_ref"`, `"move"`,
+    /// `"unknown_copy"`, or `"interior_mutation_call"`.
+    pub borrow_context: String,
+}
+
+/// A call to a same-impl method that is NOT in the extracted set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct UnresolvedCallback {
+    /// Callee expression, e.g. `"self.helper"` or `"Self::build"`.
+    pub callee: String,
+    /// Number of call sites in the extracted methods.
+    pub count: usize,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, schemars::JsonSchema)]
@@ -345,6 +390,15 @@ pub struct RefactorPlanSummary {
     pub files: Vec<RefactorPlanSummaryFile>,
     pub leftovers_count: usize,
     pub leftovers: Vec<String>,
+    /// Propagated from the plan when `deep_analysis: true` was requested (RX-A1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_analysis: Option<DeepAnalysis>,
+    /// Plan lifecycle state propagated from the plan (RX-A2).
+    #[serde(default)]
+    pub plan_status: PlanStatus,
+    /// FIXME marker counts propagated from the plan (RX-A2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixme_count: Option<FixmeCount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -380,6 +434,9 @@ fn build_plan_summary(plan_json: &str, plan_path: &Path) -> Result<RefactorPlanS
         files,
         leftovers_count,
         leftovers: plan.leftovers,
+        deep_analysis: plan.deep_analysis,
+        plan_status: plan.plan_status,
+        fixme_count: plan.fixme_count,
     })
 }
 
@@ -507,6 +564,11 @@ pub struct FileEdit {
     pub path: String,
     pub original_sha256: String,
     pub edits: Vec<TextEdit>,
+    /// Pre-computed would-be file content (RX-A2). Populated for target files in
+    /// `Blocked` plans so callers can grep for `FIXME(refactor-plan-only):` markers
+    /// without re-applying the edits. Never written to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -523,6 +585,32 @@ pub enum SemanticStatus {
     #[serde(alias = "unverified")]
     IndexedHints,
     LspVerified,
+}
+
+/// Lifecycle state of a `RefactorPlan` (RX-A2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    /// Plan is ready to apply (default).
+    #[default]
+    Planned,
+    /// Plan has already been applied.
+    Applied,
+    /// Plan has deep-analysis findings that must be resolved before applying.
+    /// Apply is refused with `plan_blocked` when `plan_status` is this variant.
+    Blocked,
+    /// Plan encountered an error during generation.
+    Errored,
+}
+
+/// Count of FIXME markers emitted in the plan's target text (RX-A2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema)]
+pub struct FixmeCount {
+    /// `FIXME(refactor-plan-only):` markers — exist only in the saved plan JSON,
+    /// never on disk. Apply is refused when this is non-zero.
+    pub plan_only: usize,
+    /// `FIXME(refactor-warning):` markers (RX-W1, not yet emitted in A2).
+    pub warning: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, schemars::JsonSchema)]
@@ -561,6 +649,17 @@ pub struct RefactorPlan {
     /// superclass or implemented interface in the project type index.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inherited_dependencies: Vec<InheritedDependency>,
+    /// Populated when `deep_analysis: true` is passed to
+    /// `extract_rust_impl_methods` (RX-A1). Empty / absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_analysis: Option<DeepAnalysis>,
+    /// Plan lifecycle state (RX-A2). `Blocked` when deep-analysis found unresolved
+    /// dependencies; apply is refused in that state.
+    #[serde(default)]
+    pub plan_status: PlanStatus,
+    /// Counts of FIXME markers emitted in the target text (RX-A2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixme_count: Option<FixmeCount>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -889,6 +988,17 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
         }
     };
     validate_plan_shape(&plan)?;
+
+    // RX-A2: refuse blocked plans before touching any files.
+    if plan.plan_status == PlanStatus::Blocked {
+        bail!(
+            "plan_blocked: this plan has unresolved deep-analysis findings \
+             (fixme_count.plan_only = {}). \
+             Review the FIXME(refactor-plan-only) markers in the plan's target text, \
+             resolve the listed dependencies, then re-plan without deep_analysis findings.",
+            plan.fixme_count.as_ref().map_or(0, |c| c.plan_only)
+        );
+    }
 
     let mut originals: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     let mut moved_files = Vec::new();
@@ -1901,6 +2011,9 @@ fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -1964,6 +2077,7 @@ fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
             path: path_string(&source_path),
             original_sha256: sha256_hex(source.as_bytes()),
             edits,
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
@@ -1972,6 +2086,9 @@ fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -1999,6 +2116,7 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
                 byte_end: source.len(),
                 replacement: new_text.to_string(),
             }],
+            new_text: None,
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
@@ -2007,6 +2125,9 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -2048,6 +2169,7 @@ fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
                 byte_end: source.len(),
                 replacement,
             }],
+            new_text: None,
         }],
         validations: Vec::new(),
         items: Vec::new(),
@@ -2056,6 +2178,9 @@ fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -2685,7 +2810,7 @@ fn ensure_non_overlapping(edits: &[TextEdit]) -> Result<()> {
     Ok(())
 }
 
-fn apply_text_edits(source: &str, edits: &[TextEdit]) -> Result<String> {
+pub(crate) fn apply_text_edits(source: &str, edits: &[TextEdit]) -> Result<String> {
     ensure_non_overlapping(edits)?;
     let mut out = source.to_string();
     let mut sorted = edits.iter().collect::<Vec<_>>();

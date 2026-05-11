@@ -3003,6 +3003,7 @@ mod tests {
                 path: path_string(&source),
                 original_sha256: sha256_hex(b"fn f() {}\n"),
                 edits: Vec::new(),
+                new_text: None,
             }],
             validations: Vec::new(),
             items: Vec::new(),
@@ -3011,6 +3012,9 @@ mod tests {
             remaining_source_accessors: Vec::new(),
             external_calls: Vec::new(),
             inherited_dependencies: Vec::new(),
+            deep_analysis: None,
+            plan_status: PlanStatus::Planned,
+            fixme_count: None,
         };
         let err = apply(
             &RefactorApplyParams {
@@ -3045,6 +3049,7 @@ mod tests {
                     byte_end: 4,
                     replacement: "g".into(),
                 }],
+                new_text: None,
             }],
             validations: Vec::new(),
             items: Vec::new(),
@@ -3053,6 +3058,9 @@ mod tests {
             remaining_source_accessors: Vec::new(),
             external_calls: Vec::new(),
             inherited_dependencies: Vec::new(),
+            deep_analysis: None,
+            plan_status: PlanStatus::Planned,
+            fixme_count: None,
         };
 
         let response = apply(
@@ -3813,5 +3821,430 @@ mod rx_f2a_capture_tests {
             run_resp.steps[0].captured_diagnostics_summary.is_none(),
             "expected None when capture=None"
         );
+    }
+}
+
+#[cfg(test)]
+mod rx_a1_deep_tests {
+    use super::*;
+    use std::{fs, path::Path};
+
+    fn fixture_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/refactor/test_fixtures/rx_a1b_copy")
+    }
+
+    /// A1b: manifest-driven borrow_context classification for every fixture.
+    #[test]
+    fn borrow_context_manifest_fixtures() {
+        let dir = fixture_dir();
+        let manifest = fs::read_to_string(dir.join("manifest.txt")).unwrap();
+
+        for raw_line in manifest.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // Each line: fixture_file.rs: field_name: borrow_context: field_type
+            let parts: Vec<&str> = line.splitn(4, ": ").collect();
+            assert_eq!(parts.len(), 4, "bad manifest line: {line}");
+            let (fixture_file, field_name, expected_ctx) = (parts[0], parts[1], parts[2]);
+
+            let fixture_path = dir.join(fixture_file);
+
+            let parsed = parse_rust_file(&fixture_path)
+                .unwrap_or_else(|e| panic!("parse failed for {fixture_file}: {e}"));
+            let methods = rust_impl_methods(&parsed);
+            assert_eq!(
+                methods.len(),
+                1,
+                "expected exactly 1 method in {fixture_file}, got {}",
+                methods.len()
+            );
+            let impl_name = methods[0].impl_name.clone();
+            let method_name = methods[0].item.name.clone().unwrap_or_default();
+
+            let deep =
+                rust_deep::deep_analyze_extract(&fixture_path, &impl_name, &[&method_name])
+                    .unwrap_or_else(|e| {
+                        panic!("deep_analyze_extract failed for {fixture_file}: {e}")
+                    });
+
+            let field = deep
+                .captured_self_fields
+                .iter()
+                .find(|f| f.field_name == field_name)
+                .unwrap_or_else(|| {
+                    let names: Vec<_> =
+                        deep.captured_self_fields.iter().map(|f| &f.field_name).collect();
+                    panic!(
+                        "field `{field_name}` not found in {fixture_file}; got: {names:?}"
+                    )
+                });
+
+            assert_eq!(
+                field.borrow_context, expected_ctx,
+                "wrong borrow_context for field `{field_name}` in {fixture_file}"
+            );
+        }
+    }
+
+    /// A1c: self.method() and Self::method() calls that are NOT in the extraction
+    /// set are reported as unresolved_callbacks.
+    #[test]
+    fn unresolved_callbacks_self_and_static() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("service.rs");
+        fs::write(
+            &src,
+            r#"struct Service {
+    value: u32,
+}
+impl Service {
+    fn compute(&self) -> u32 {
+        let h = self.helper();
+        let b = Self::build();
+        h + b + self.value
+    }
+    fn helper(&self) -> u32 { 0 }
+    fn build() -> u32 { 1 }
+}
+"#,
+        )
+        .unwrap();
+
+        let deep = rust_deep::deep_analyze_extract(&src, "impl Service", &["compute"]).unwrap();
+
+        let callees: Vec<&str> = deep
+            .unresolved_callbacks
+            .iter()
+            .map(|c| c.callee.as_str())
+            .collect();
+        assert!(
+            callees.contains(&"self.helper"),
+            "expected self.helper in callbacks; got {callees:?}"
+        );
+        assert!(
+            callees.contains(&"Self::build"),
+            "expected Self::build in callbacks; got {callees:?}"
+        );
+    }
+
+    /// A1d: lifetime parameters from impl<'a> travel with the extracted methods.
+    #[test]
+    fn captured_lifetimes_from_impl_type_parameters() {
+        let dir = fixture_dir();
+        let src = dir.join("fixture_copy_whitelist_ref.rs");
+
+        let parsed = parse_rust_file(&src).unwrap();
+        let methods = rust_impl_methods(&parsed);
+        assert_eq!(methods.len(), 1);
+        let impl_name = methods[0].impl_name.clone();
+        let method_name = methods[0].item.name.clone().unwrap_or_default();
+
+        let deep = rust_deep::deep_analyze_extract(&src, &impl_name, &[&method_name]).unwrap();
+
+        assert!(
+            deep.captured_lifetimes.contains(&"'a".to_string()),
+            "expected 'a in captured_lifetimes; got {:?}",
+            deep.captured_lifetimes
+        );
+    }
+
+    /// A1a wiring: plan_extract_rust_impl_methods with deep_analysis=true sets
+    /// semantic_status=IndexedHints and populates deep_analysis on the plan.
+    #[test]
+    fn plan_extract_rust_impl_methods_with_deep_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.rs");
+        let tgt = dir.path().join("tgt.rs");
+
+        fs::write(
+            &src,
+            r#"use std::collections::HashMap;
+struct Cache {
+    map: HashMap<String, String>,
+}
+impl Cache {
+    pub fn insert(&mut self, k: String, v: String) {
+        self.map.insert(k, v);
+    }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(&tgt, "").unwrap();
+
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&src),
+            target: Some(path_string(&tgt)),
+            item_names: Some(vec!["insert".into()]),
+            deep_analysis: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert_eq!(
+            p.semantic_status,
+            SemanticStatus::IndexedHints,
+            "expected IndexedHints when deep_analysis=true"
+        );
+        let da = p
+            .deep_analysis
+            .as_ref()
+            .expect("deep_analysis should be present on the plan");
+        let field = da
+            .captured_self_fields
+            .iter()
+            .find(|f| f.field_name == "map")
+            .expect("expected captured field `map`");
+        assert_eq!(
+            field.borrow_context, "unique_ref",
+            "HashMap accessed via &mut self should be unique_ref"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rx_a2_fixme_marker_tests {
+    use super::*;
+    use std::{fs, path::Path};
+
+    fn fixture_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/refactor/test_fixtures/rx_a1b_copy")
+    }
+
+    /// Source with a unique_ref field — guarantees at least one blocking finding.
+    fn unique_ref_source() -> &'static str {
+        r#"use std::collections::HashMap;
+struct Cache {
+    map: HashMap<String, String>,
+}
+impl Cache {
+    pub fn get(&self, k: &str) -> Option<&String> {
+        self.map.get(k)
+    }
+}
+"#
+    }
+
+    /// A2-1: plan with a captured_self_field → plan_status=Blocked, fixme_count.plan_only ≥ 1.
+    #[test]
+    fn plan_with_captured_field_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.rs");
+        let tgt = dir.path().join("tgt.rs");
+        fs::write(&src, unique_ref_source()).unwrap();
+        fs::write(&tgt, "").unwrap();
+
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&src),
+            target: Some(path_string(&tgt)),
+            item_names: Some(vec!["get".into()]),
+            deep_analysis: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert_eq!(p.plan_status, PlanStatus::Blocked, "expected Blocked plan");
+        let fc = p
+            .fixme_count
+            .as_ref()
+            .expect("fixme_count should be present on Blocked plan");
+        assert!(
+            fc.plan_only >= 1,
+            "expected fixme_count.plan_only ≥ 1, got {}",
+            fc.plan_only
+        );
+    }
+
+    /// A2-2: apply attempt on a Blocked plan returns error "plan_blocked"; no files written.
+    #[test]
+    fn apply_blocked_plan_returns_error_and_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.rs");
+        let tgt = dir.path().join("tgt.rs");
+        fs::write(&src, unique_ref_source()).unwrap();
+        fs::write(&tgt, "").unwrap();
+        let original_src = fs::read_to_string(&src).unwrap();
+
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&src),
+            target: Some(path_string(&tgt)),
+            item_names: Some(vec!["get".into()]),
+            deep_analysis: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert_eq!(p.plan_status, PlanStatus::Blocked);
+
+        let project = tempfile::tempdir().unwrap();
+        let err = apply(
+            &RefactorApplyParams {
+                plan: serde_json::to_value(p).unwrap(),
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+            },
+            &[ProjectRecord {
+                project_id: "test".into(),
+                repo_id: None,
+                canonical_path: project.path().to_string_lossy().into_owned(),
+                registered_at: "2026-01-01T00:00:00Z".into(),
+                is_git_repo: false,
+                languages: Default::default(),
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("plan_blocked"),
+            "expected plan_blocked in error, got: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&src).unwrap(),
+            original_src,
+            "source file must not be modified by a blocked plan"
+        );
+    }
+
+    /// A2-3: target FileEdit new_text contains a FIXME(refactor-plan-only) marker.
+    #[test]
+    fn blocked_plan_file_edit_new_text_contains_fixme_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.rs");
+        let tgt = dir.path().join("tgt.rs");
+        fs::write(&src, unique_ref_source()).unwrap();
+        fs::write(&tgt, "").unwrap();
+
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&src),
+            target: Some(path_string(&tgt)),
+            item_names: Some(vec!["get".into()]),
+            deep_analysis: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        let target_edit = p
+            .edits
+            .iter()
+            .find(|e| e.path == path_string(&tgt))
+            .expect("target FileEdit not found");
+        let new_text = target_edit
+            .new_text
+            .as_deref()
+            .expect("new_text should be Some on the target FileEdit of a Blocked plan");
+        assert!(
+            new_text.contains("FIXME(refactor-plan-only)"),
+            "expected FIXME(refactor-plan-only) in new_text, got: {new_text:.200}"
+        );
+    }
+
+    /// A2-4: plan without deep_analysis stays Planned and applies cleanly (no FIXME in worktree).
+    #[test]
+    fn clean_plan_applies_without_fixme_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.rs");
+        let tgt = dir.path().join("tgt.rs");
+        fs::write(&src, unique_ref_source()).unwrap();
+        fs::write(&tgt, "").unwrap();
+
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&src),
+            target: Some(path_string(&tgt)),
+            item_names: Some(vec!["get".into()]),
+            deep_analysis: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert_eq!(p.plan_status, PlanStatus::Planned, "expected Planned (no deep_analysis)");
+
+        apply(
+            &RefactorApplyParams {
+                plan: serde_json::to_value(p).unwrap(),
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+            },
+            &[ProjectRecord {
+                project_id: "test".into(),
+                repo_id: None,
+                canonical_path: dir.path().to_string_lossy().into_owned(),
+                registered_at: "2026-01-01T00:00:00Z".into(),
+                is_git_repo: false,
+                languages: Default::default(),
+            }],
+        )
+        .unwrap();
+
+        let tgt_content = fs::read_to_string(&tgt).unwrap();
+        assert!(
+            !tgt_content.contains("FIXME(refactor-plan-only)"),
+            "FIXME markers must not appear in applied target file"
+        );
+        let src_content = fs::read_to_string(&src).unwrap();
+        assert!(
+            !src_content.contains("FIXME(refactor-plan-only)"),
+            "FIXME markers must not appear in applied source file"
+        );
+    }
+
+    /// A2-5: for each rx_a1b_copy fixture, generate_fixme_markers count equals total findings.
+    #[test]
+    fn fixture_loop_marker_count_equals_findings() {
+        let dir = fixture_dir();
+        let fixtures: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
+            .collect();
+        assert!(!fixtures.is_empty(), "no fixture files found in rx_a1b_copy");
+
+        for entry in fixtures {
+            let fixture_path = entry.path();
+            let fixture_name = fixture_path.file_name().unwrap().to_string_lossy();
+
+            let parsed = parse_rust_file(&fixture_path)
+                .unwrap_or_else(|e| panic!("parse failed for {fixture_name}: {e}"));
+            let methods = rust_impl_methods(&parsed);
+            assert!(!methods.is_empty(), "no methods in {fixture_name}");
+
+            let impl_name = methods[0].impl_name.clone();
+            let method_name = methods[0].item.name.clone().unwrap_or_default();
+
+            let da = rust_deep::deep_analyze_extract(
+                &fixture_path,
+                &impl_name,
+                &[method_name.as_str()],
+            )
+            .unwrap_or_else(|e| panic!("deep analysis failed for {fixture_name}: {e}"));
+
+            let expected_count = da.captured_self_fields.len()
+                + da.unresolved_callbacks.len()
+                + da.captured_lifetimes.len()
+                + da.inherited_generics.len();
+
+            let (_markers, count) = rust_deep::generate_fixme_markers(&da);
+            assert_eq!(
+                count,
+                expected_count,
+                "fixture {fixture_name}: marker count {count} != findings count {expected_count}"
+            );
+        }
     }
 }

@@ -2,9 +2,9 @@ use super::*;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RustImplMethod {
-    impl_name: String,
-    impl_byte_start: usize,
-    item: SyntaxItem,
+    pub(crate) impl_name: String,
+    pub(crate) impl_byte_start: usize,
+    pub(crate) item: SyntaxItem,
 }
 
 #[derive(Debug, Clone)]
@@ -144,11 +144,13 @@ pub(crate) fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> 
                 path: path_string(&source_path),
                 original_sha256: sha256_hex(parsed.source.as_bytes()),
                 edits: source_edits,
+                new_text: None,
             },
             FileEdit {
                 path: path_string(&target_path),
                 original_sha256: sha256_hex(target_source.as_bytes()),
                 edits: target_edits,
+                new_text: None,
             },
         ],
         validations: vec![
@@ -167,6 +169,9 @@ pub(crate) fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> 
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -286,6 +291,42 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
         .collect::<Vec<_>>();
     ensure_non_overlapping(&source_edits)?;
 
+    // RX-A1: run deep analysis before consuming `selected`.
+    let (semantic_status, deep_analysis) = if p.deep_analysis == Some(true) {
+        let method_name_strs: Vec<&str> = selected
+            .iter()
+            .filter_map(|m| m.item.name.as_deref())
+            .collect();
+        let impl_name = &selected[0].impl_name;
+        match super::rust_deep::deep_analyze_extract(&source_path, impl_name, &method_name_strs) {
+            Ok(da) => (SemanticStatus::IndexedHints, Some(da)),
+            Err(e) => {
+                eprintln!("deep_analyze_extract warning: {e}");
+                (SemanticStatus::SyntaxOnly, None)
+            }
+        }
+    } else {
+        (SemanticStatus::SyntaxOnly, None)
+    };
+
+    // RX-A2: generate FIXME markers when deep analysis found blocking dependencies.
+    let (target_new_text, plan_status, fixme_count) = if let Some(da) = &deep_analysis {
+        let (markers, count) = super::rust_deep::generate_fixme_markers(da);
+        if count > 0 {
+            let applied = apply_text_edits(&target_source, &target_edits)?;
+            let with_markers = format!("{markers}\n{applied}");
+            (
+                Some(with_markers),
+                PlanStatus::Blocked,
+                Some(FixmeCount { plan_only: count, warning: 0 }),
+            )
+        } else {
+            (None, PlanStatus::Planned, None)
+        }
+    } else {
+        (None, PlanStatus::Planned, None)
+    };
+
     let plan = RefactorPlan {
         title: format!(
             "extract {} Rust impl method(s) from {} to {}",
@@ -294,7 +335,7 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
             path_string(&target_path)
         ),
         kind: "extract_rust_impl_methods".to_string(),
-        semantic_status: SemanticStatus::SyntaxOnly,
+        semantic_status,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![
@@ -302,11 +343,13 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
                 path: path_string(&source_path),
                 original_sha256: sha256_hex(parsed.source.as_bytes()),
                 edits: source_edits,
+                new_text: None,
             },
             FileEdit {
                 path: path_string(&target_path),
                 original_sha256: sha256_hex(target_source.as_bytes()),
                 edits: target_edits,
+                new_text: target_new_text,
             },
         ],
         validations: vec![
@@ -325,6 +368,9 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis,
+        plan_status,
+        fixme_count,
     };
 
     validate_plan_shape(&plan)?;
@@ -463,6 +509,7 @@ pub(crate) fn build_delete_rust_plan(
             path: path_string(&parsed.path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits: source_edits,
+            new_text: None,
         }],
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(&parsed.path),
@@ -474,6 +521,9 @@ pub(crate) fn build_delete_rust_plan(
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -525,6 +575,7 @@ pub(crate) fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<Stri
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits: vec![edit],
+            new_text: None,
         }],
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(&source_path),
@@ -536,6 +587,9 @@ pub(crate) fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<Stri
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -596,6 +650,7 @@ pub(crate) fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
                 byte_end: insert_at,
                 replacement,
             }],
+            new_text: None,
         }],
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(&source_path),
@@ -607,6 +662,9 @@ pub(crate) fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -665,6 +723,7 @@ pub(crate) fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
                 byte_end: insert_at,
                 replacement,
             }],
+            new_text: None,
         }],
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(&source_path),
@@ -676,6 +735,9 @@ pub(crate) fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -750,6 +812,7 @@ pub(crate) fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String>
                 byte_end: insert_at,
                 replacement,
             }],
+            new_text: None,
         }],
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(&target_path),
@@ -761,6 +824,9 @@ pub(crate) fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String>
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -820,6 +886,7 @@ pub(crate) fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result
                 byte_end: mod_keyword,
                 replacement: visibility.to_string(),
             }],
+            new_text: None,
         }],
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(&source_path),
@@ -831,6 +898,9 @@ pub(crate) fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -927,6 +997,7 @@ pub(crate) fn plan_rewrite_rust_item_visibility(p: &RefactorPlanParams) -> Resul
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits,
+            new_text: None,
         }],
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(&source_path),
@@ -938,6 +1009,9 @@ pub(crate) fn plan_rewrite_rust_item_visibility(p: &RefactorPlanParams) -> Resul
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -1019,6 +1093,7 @@ pub(crate) fn plan_rewrite_rust_field_visibility(p: &RefactorPlanParams) -> Resu
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits,
+            new_text: None,
         }],
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(&source_path),
@@ -1030,6 +1105,9 @@ pub(crate) fn plan_rewrite_rust_field_visibility(p: &RefactorPlanParams) -> Resu
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -1092,6 +1170,9 @@ pub(crate) fn plan_rust_lsp_rename(p: &RefactorPlanParams, ctx: &PlanContext) ->
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -1142,6 +1223,9 @@ pub(crate) fn plan_rust_organize_imports(
         remaining_source_accessors: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
     };
 
     validate_plan_shape(&plan)?;
@@ -1927,6 +2011,7 @@ pub(crate) fn workspace_edit_to_file_edits(workspace_edit: WorkspaceEdit) -> Res
             path: path_string(&path),
             original_sha256: sha256_hex(source.as_bytes()),
             edits: text_edits,
+            new_text: None,
         });
     }
     Ok(file_edits)
