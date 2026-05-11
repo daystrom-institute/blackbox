@@ -172,6 +172,11 @@ pub(crate) fn changed_files_for_commit(root: &Path, sha: &str) -> Result<Vec<Str
 }
 
 pub(crate) fn notes_namespace() -> String {
+    if let Ok(cfg) = blackbox::config::load() {
+        if !cfg.provenance.git_notes_namespace.is_empty() {
+            return cfg.provenance.git_notes_namespace;
+        }
+    }
     std::env::var("BBOX_GIT_NOTES_NAMESPACE")
         .ok()
         .filter(|value| !value.trim().is_empty())

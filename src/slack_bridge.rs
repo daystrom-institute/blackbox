@@ -6,7 +6,7 @@
 //! endpoint. The daemon never links a Slack crate.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -15,6 +15,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+use blackbox::secrets;
 
 // ── CLI ────────────────────────────────────────────────────────────
 
@@ -53,8 +55,8 @@ struct Args {
     shared_secret_env: String,
 
     /// ACL mapping file
-    #[arg(long, default_value = "~/.bro/slack-identities.json")]
-    identities_file: String,
+    #[arg(long)]
+    identities_file: Option<String>,
 
     /// Optional loopback health endpoint port (off by default)
     #[arg(long)]
@@ -98,31 +100,19 @@ pub struct SlackIdentities {
 /// Load the identities file, expanding `~` to the user's home directory.
 /// Returns an empty default (anonymous-only) map if the file doesn't exist,
 /// so a missing file is not an error — it just means no users are mapped.
-pub fn load_identities(path: &str) -> Result<SlackIdentities> {
-    let resolved = resolve_tilde(path);
-    match std::fs::read_to_string(&resolved) {
+pub fn load_identities(path: &Path) -> Result<SlackIdentities> {
+    match std::fs::read_to_string(path) {
         Ok(text) => {
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", resolved.display()))
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!(
                 "identities file not found at {}; all users anonymous",
-                resolved.display()
+                path.display()
             );
             Ok(SlackIdentities::default())
         }
-        Err(e) => Err(e).with_context(|| format!("reading {}", resolved.display())),
-    }
-}
-
-/// Resolve a `~`-prefixed path to the user's home directory.
-fn resolve_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir().unwrap_or_default().join(rest)
-    } else if path == "~" {
-        dirs::home_dir().unwrap_or_default()
-    } else {
-        PathBuf::from(path)
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }
 
@@ -1307,7 +1297,20 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let identities = load_identities(&args.identities_file)?;
+    let cfg = blackbox::config::load()?;
+    let identities_path = if let Some(p) = args.identities_file {
+        blackbox::util::resolve_tilde(&p)
+    } else {
+        let home = dirs::home_dir().context("home directory not found")?;
+        let old = home.join(".bro").join("slack-identities.json");
+        let new = cfg.paths.bro_home.join("slack-identities.json");
+        if old.exists() && !new.exists() {
+            let _ = blackbox::util::migrate_legacy_file(&old, &new);
+        }
+        new
+    };
+
+    let identities = load_identities(&identities_path)?;
     let mapped_count: usize = identities.workspaces.values().map(|w| w.len()).sum();
     tracing::info!(
         "loaded identities: {mapped_count} users across {} workspaces",
@@ -1315,11 +1318,21 @@ async fn main() -> Result<()> {
     );
 
     let app_token = std::env::var(&args.app_token_env)
-        .with_context(|| format!("app token env var {} not set", args.app_token_env))?;
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            secrets::resolve("slack-app-token").ok().map(|sv| sv.expose().to_string())
+        })
+        .with_context(|| format!("app token env var {} not set and secret 'slack-app-token' not found", args.app_token_env))?;
     if !app_token.starts_with("xapp-") {
         tracing::warn!("SLACK_APP_TOKEN does not start with 'xapp-'; Socket Mode may fail");
     }
-    let _signing_secret = std::env::var(&args.signing_secret_env).ok();
+    let _signing_secret = std::env::var(&args.signing_secret_env)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            secrets::resolve("slack-signing-secret").ok().map(|sv| sv.expose().to_string())
+        });
     if _signing_secret.is_none() || _signing_secret.as_deref() == Some("") {
         tracing::info!(
             "signing secret not set ({}); Events API signature verification inactive",
@@ -2085,13 +2098,13 @@ mod tests {
     #[test]
     fn test_resolve_tilde() {
         let home = dirs::home_dir().unwrap_or_default();
-        let result = resolve_tilde("~/foo/bar.json");
+        let result = blackbox::util::resolve_tilde("~/foo/bar.json");
         assert_eq!(result, home.join("foo/bar.json"));
-        let result2 = resolve_tilde("~");
+        let result2 = blackbox::util::resolve_tilde("~");
         assert_eq!(result2, home);
-        let result3 = resolve_tilde("/absolute/path");
+        let result3 = blackbox::util::resolve_tilde("/absolute/path");
         assert_eq!(result3, PathBuf::from("/absolute/path"));
-        let result4 = resolve_tilde("relative/path");
+        let result4 = blackbox::util::resolve_tilde("relative/path");
         assert_eq!(result4, PathBuf::from("relative/path"));
     }
 

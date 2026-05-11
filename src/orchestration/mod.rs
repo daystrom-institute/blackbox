@@ -22,7 +22,6 @@ use providers::{EventSink, Provider, Usage};
 
 const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
     "BBOX_PORT",
-    "BRO_PORT",
     "BLACKBOX_MCP_NAME",
     "BLACKBOX_MCP_URL",
     "BLACKBOX_STATE_DIR",
@@ -925,7 +924,11 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
     // work even when the daemon was launched by launchctl/systemd with a
     // narrow PATH. Falls back to the bare name, which preserves the
     // existing error surface when the binary genuinely is not installed.
-    let raw_bin = provider.bin();
+    let raw_bin = if let Ok(cfg) = blackbox::config::load() {
+        provider.bin_with_config(&cfg.providers)
+    } else {
+        provider.bin()
+    };
     let bin = providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
     let mut cmd = Command::new(&bin);
     cmd.args(&args)

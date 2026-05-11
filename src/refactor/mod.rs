@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -36,7 +36,6 @@ pub struct PlanContext {
 
 const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
     "BBOX_PORT",
-    "BRO_PORT",
     "BLACKBOX_MCP_NAME",
     "BLACKBOX_MCP_URL",
     "BLACKBOX_STATE_DIR",

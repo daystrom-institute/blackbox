@@ -32,13 +32,7 @@ pub fn global_target_path(provider: &str) -> Option<Result<PathBuf>> {
 
     match provider {
         "claude" => Some(resolve("BLACKBOX_GLOBAL_CLAUDE_MD", &|| {
-            let h = home()?;
-            let shared = h.join(".claude-shared");
-            Ok(if shared.is_dir() {
-                shared.join("CLAUDE.md")
-            } else {
-                h.join(".claude").join("CLAUDE.md")
-            })
+            Ok(home()?.join(".claude").join("CLAUDE.md"))
         })),
         // "agents" is the render umbrella that produces AGENTS.md content;
         // globally, the only auto-loading consumer is Codex.

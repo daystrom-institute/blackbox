@@ -969,6 +969,9 @@ pub(crate) async fn install_artifact_value(
             let brofile: orchestration::brofile::Brofile = serde_json::from_value(value.clone())?;
             orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None);
         }
+        artifacts::ArtifactKind::Team => {
+            // Teams are stored as artifacts but have no additional validation at install time.
+        }
         artifacts::ArtifactKind::Agent => {
             if !value.is_object() {
                 anyhow::bail!("agent artifact must be a JSON object");
@@ -1178,6 +1181,9 @@ pub(crate) fn deactivate_artifact(
         }
         artifacts::ArtifactKind::Agent => {
             // No separate registry to deactivate for agents (yet).
+        }
+        artifacts::ArtifactKind::Team => {
+            // Teams are stored purely as artifacts; no separate registry to deactivate.
         }
     }
     Ok(())

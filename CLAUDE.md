@@ -131,7 +131,7 @@ Maintained in `src/orchestration/providers.rs`:
 - `TRANSCRIPT_SEARCH_CODEX_ROOT` — override Codex data dir
 - `TRANSCRIPT_SEARCH_INDEX_PATH` — override tantivy index location
 - `BLACKBOX_REINDEX_INTERVAL_SECS` — background reindex interval (default: 120)
-- `BBOX_PORT` / `BRO_PORT` — HTTP listener port for `/mcp`, `/tail`, `/roster` (default: 7264; 7263 is retired and avoided)
+- `BBOX_PORT` — HTTP listener port for `/mcp`, `/tail`, `/roster` (default: 7264; 7263 is retired and avoided)
 - `CLAUDE_BIN` / `OPENCODE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` — override provider binary paths
 - `RUST_LOG` — tracing filter (default: `transcript_search=info`)
 

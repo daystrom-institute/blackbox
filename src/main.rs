@@ -20,6 +20,7 @@ mod eval_check;
 mod git;
 mod inbox;
 mod index;
+mod json_store;
 mod knowledge;
 mod lsp;
 mod mcp_client;
@@ -50,11 +51,17 @@ mod tests;
 mod threads;
 mod tool_docs;
 mod tools;
-mod util;
 mod vectors;
+mod watcher;
 mod webhooks;
 mod whiteboards;
 mod workflow;
+
+use blackbox::{config, secrets};
+
+mod util {
+    pub use blackbox::util::*;
+}
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -1364,8 +1371,24 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("migrated legacy blackbox path: {msg}");
     }
 
-    // Transcript index roots
-    let roots: Vec<(String, PathBuf)> = if let Ok(val) = std::env::var("TRANSCRIPT_SEARCH_ROOTS") {
+    // Load configuration
+    let cfg = config::load()?;
+    let cfg_arc = Arc::new(RwLock::new(cfg.clone()));
+
+    // Transcript index roots - from config or env
+    let roots: Vec<(String, PathBuf)> = if let Some(ref roots_str) = cfg.transcripts.roots {
+        roots_str.split(',')
+            .filter_map(|entry| {
+                let (name, path) = entry.split_once('=')?;
+                let expanded = if path.starts_with('~') {
+                    home.join(&path[2..])
+                } else {
+                    PathBuf::from(path)
+                };
+                Some((name.to_string(), expanded))
+            })
+            .collect()
+    } else if let Ok(val) = std::env::var("TRANSCRIPT_SEARCH_ROOTS") {
         val.split(',')
             .filter_map(|entry| {
                 let (name, path) = entry.split_once('=')?;
@@ -1400,9 +1423,9 @@ async fn main() -> anyhow::Result<()> {
         found
     };
 
-    let codex_root = std::env::var("TRANSCRIPT_SEARCH_CODEX_ROOT")
-        .ok()
-        .map(PathBuf::from)
+    let codex_root = cfg.transcripts.codex_root
+        .map(|p| if p.to_string_lossy().starts_with('~') { home.join(&p.to_string_lossy()[2..]) } else { p })
+        .or_else(|| std::env::var("TRANSCRIPT_SEARCH_CODEX_ROOT").ok().map(PathBuf::from))
         .or_else(|| {
             let default = home.join(".codex");
             if default.join("sessions").exists() {
@@ -1412,7 +1435,7 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-    let index_path = util::blackbox_index_path(&home);
+    let index_path = cfg.paths.index_path.clone();
 
     tracing::info!(
         "Roots: {:?}",
@@ -1426,10 +1449,10 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("Index path: {}", index_path.display());
 
-    let projects_path = util::blackbox_projects_path(&home);
-    let kb_path = util::blackbox_knowledge_path(&home);
-    let th_path = util::blackbox_threads_path(&home);
-    let rm_path = util::blackbox_roadmap_path(&home);
+    let projects_path = cfg.paths.projects_path.clone();
+    let kb_path = cfg.paths.knowledge_path.clone();
+    let th_path = cfg.paths.threads_path.clone();
+    let rm_path = cfg.paths.roadmap_path.clone();
     let mut idx = TranscriptIndex::open_or_create(
         &index_path,
         roots,
@@ -1459,13 +1482,8 @@ async fn main() -> anyhow::Result<()> {
     // sessions) sees the daemon without requiring user-managed config.
     // Resolves the "subprocessed bros don't see bbox tools" gap
     // discovered in the self-test pass.
-    let bbox_port: u16 = std::env::var("BBOX_PORT")
-        .or_else(|_| std::env::var("BRO_PORT"))
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(7264);
-    let bbox_url = format!("http://127.0.0.1:{bbox_port}/mcp");
-    let bbox_mcp_name = util::blackbox_mcp_name();
+    let bbox_url = format!("http://{}:{}/mcp", cfg.daemon.bind, cfg.daemon.port);
+    let bbox_mcp_name = cfg.daemon.mcp_name.clone();
     // Export for provider arg-builders so they can inject `--mcp-config`
     // etc. at dispatch time — ensures dispatched subprocesses see
     // blackbox regardless of which config file their CLI inherits.
@@ -1501,34 +1519,39 @@ async fn main() -> anyhow::Result<()> {
     let roadmap_store = Roadmap::open(&rm_path)?;
     tracing::info!("Roadmap store: {}", rm_path.display());
 
-    let notes_path = util::blackbox_notes_path(&home);
+    let notes_path = cfg.paths.notes_path.clone();
     let notes_store = Notes::open(&notes_path)?;
     tracing::info!("Notes store: {}", notes_path.display());
 
-    let pins_path = util::blackbox_pins_path(&home);
+    let pins_path = cfg.paths.pins_path.clone();
     let pins_store = Pins::open(&pins_path)?;
     tracing::info!("Pins store: {}", pins_path.display());
 
-    let packets_dir = util::blackbox_packets_dir(&home);
+    let packets_dir = cfg.paths.packets_dir.clone();
     let packets_store = Packets::open(&packets_dir)?;
-    tracing::info!("Packets store: {}", packets_dir.join("packets").display());
+    tracing::info!("Packets store: {}", packets_dir.display());
 
-    let artifacts_dir = util::blackbox_artifacts_dir(&home);
+    let artifacts_dir = cfg.paths.artifacts_dir.clone();
     let agent_adapter_registry = Arc::new(RwLock::new(
         orchestration::agents::adapter::AgentAdapterRegistry::new(),
     ));
     let artifacts_store = artifacts::ArtifactCatalog::open(&artifacts_dir)?;
     tracing::info!("Artifact catalog: {}", artifacts_store.root().display());
+    match artifacts_store.backfill_content_hashes() {
+        Ok(r) => {
+            if r.active_updated > 0 || r.version_updated > 0 || r.missing_artifacts > 0 {
+                tracing::info!(
+                    "Artifact hash backfill: {} active updated, {} version updated, {} missing payloads",
+                    r.active_updated, r.version_updated, r.missing_artifacts
+                );
+            }
+        }
+        Err(e) => tracing::warn!("Artifact hash backfill failed: {e:#}"),
+    }
 
     // Orchestration state
-    let store_dir = PathBuf::from(
-        std::env::var("BRO_STORE")
-            .unwrap_or_else(|_| util::bro_home_dir(&home).to_string_lossy().to_string()),
-    );
-    let task_ttl = std::env::var("BRO_TASK_TTL_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(86_400_000u64);
+    let store_dir = cfg.paths.bro_home.clone();
+    let task_ttl = cfg.daemon.task_ttl_ms;
     let task_store = TaskStore::load(&store_dir, task_ttl);
     let badgey_proposals = Arc::new(orchestration::badgey::ProposalStore::new(
         store_dir.clone(),
@@ -1540,10 +1563,7 @@ async fn main() -> anyhow::Result<()> {
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);
 
     // Spawn background reindex thread
-    let reindex_interval = std::env::var("BLACKBOX_REINDEX_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120);
+    let reindex_interval = cfg.index.reindex_interval_secs;
     index::spawn_reindex_thread(
         idx.index_handle(),
         idx.reindex_config(),
@@ -1555,13 +1575,10 @@ async fn main() -> anyhow::Result<()> {
     // a definitive `bind_is_loopback` flag; the listener bind below
     // uses the same value. Default 127.0.0.1; BBOX_BIND=0.0.0.0 to
     // accept docker-bridged webhooks.
-    let bind_host = std::env::var("BBOX_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+    let bind_host = cfg.daemon.bind.clone();
     let bind_is_loopback = is_loopback_bind(&bind_host);
 
-    let edge_index = if std::env::var("BLACKBOX_EDGE_INDEX_BOOT_REBUILD")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    {
+    let edge_index = if cfg.index.edge_index_boot_rebuild {
         edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
             index: &idx,
             knowledge: &kb,
@@ -1589,6 +1606,7 @@ async fn main() -> anyhow::Result<()> {
         projects: RwLock::new(projects_store),
         packets: RwLock::new(packets_store),
         artifacts: RwLock::new(artifacts_store),
+        bbox_watcher: std::sync::Mutex::new(None),
         edge_index: RwLock::new(edge_index),
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(task_store)),
@@ -1625,7 +1643,8 @@ async fn main() -> anyhow::Result<()> {
             slack_proposal_links::SlackProposalLinks::open(&store_dir)
                 .unwrap_or_else(|e| panic!("opening slack proposal links at {store_dir:?}: {e}")),
         ),
-        lsp_sessions: lsp::LspSessionManager::new(),
+        lsp_sessions: lsp::LspSessionManager::with_lsp_config(&cfg.lsp),
+        config: cfg_arc.clone(),
     });
     shared
         .agent_adapter_registry
@@ -1655,6 +1674,25 @@ async fn main() -> anyhow::Result<()> {
     // land via the auto-reindex thread (60s poll interval is sufficient
     // since the reindex tick is 120s by default).
     spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
+
+    // Start .bbox/ filesystem watcher for all registered projects.
+    {
+        let project_roots: Vec<(String, std::path::PathBuf)> = shared
+            .projects
+            .read()
+            .list()
+            .into_iter()
+            .map(|r| (r.project_id, std::path::PathBuf::from(r.canonical_path)))
+            .collect();
+        let catalog = Arc::new(shared.artifacts.read().clone());
+        match watcher::BbxWatcher::start(project_roots, catalog) {
+            Ok(w) => {
+                *shared.bbox_watcher.lock().unwrap() = Some(w);
+                tracing::info!(".bbox/ artifact watcher started");
+            }
+            Err(e) => tracing::warn!(".bbox/ artifact watcher failed to start: {e:#}"),
+        }
+    }
 
     // Restore webhook + workflow registries from disk so installs
     // survive daemon restart. Re-run install_check at restore time —
@@ -1816,22 +1854,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // MCP service
-    let port: u16 = std::env::var("BBOX_PORT")
-        .or_else(|_| std::env::var("BRO_PORT"))
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(7264);
+    let port = cfg.daemon.port;
 
     let ct = CancellationToken::new();
-    let config = StreamableHttpServerConfig::default()
+    let server_config = StreamableHttpServerConfig::default()
         .with_cancellation_token(ct.child_token())
         .with_stateful_mode(true);
 
     let shared_for_mcp = shared.clone();
-    let session_keep_alive = std::env::var("BBOX_MCP_SESSION_KEEPALIVE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(6 * 60 * 60);
+    let session_keep_alive = cfg.daemon.mcp_session_keepalive_secs;
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.keep_alive =
         Some(std::time::Duration::from_secs(session_keep_alive));
@@ -1839,7 +1870,7 @@ async fn main() -> anyhow::Result<()> {
         StreamableHttpService::new(
             move || Ok(BlackboxServer::new(shared_for_mcp.clone())),
             session_manager.into(),
-            config,
+            server_config,
         );
 
     let app = axum::Router::new()
@@ -1948,12 +1979,42 @@ async fn main() -> anyhow::Result<()> {
         "blackboxd listening on http://{bind_host}:{port}/mcp (loopback={bind_is_loopback})"
     );
 
-    let shutdown_grace = std::env::var("BLACKBOX_SHUTDOWN_GRACE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(15));
+    let shutdown_grace = std::time::Duration::from_secs(cfg.daemon.shutdown_grace_secs);
     let signal_ct = ct.clone();
+    #[cfg(unix)]
+    {
+        let shared_for_hup = shared.clone();
+        tokio::spawn(async move {
+            let mut sighup =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                    .expect("install SIGHUP handler");
+            loop {
+                let _ = sighup.recv().await;
+                match config::load() {
+                    Ok(new_cfg) => {
+                        let old_cfg = shared_for_hup.config.read();
+                        if old_cfg.daemon.port != new_cfg.daemon.port
+                            || old_cfg.daemon.bind != new_cfg.daemon.bind
+                        {
+                            tracing::warn!(
+                                "SIGHUP reload changed bind/port; requires daemon restart"
+                            );
+                        }
+                        drop(old_cfg);
+                        *shared_for_hup.config.write() = new_cfg;
+                    }
+                    Err(e) => {
+                        tracing::warn!("SIGHUP reload failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::spawn(async {});
+    }
+
     tokio::spawn(async move {
         // Wait for either Ctrl-C (interactive) or SIGTERM (systemd
         // stop). Without the SIGTERM branch, `systemctl stop` would

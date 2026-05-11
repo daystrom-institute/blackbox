@@ -698,16 +698,16 @@ impl Knowledge {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.store_path.parent() {
-            fs::create_dir_all(parent)?;
+        crate::json_store::atomic_write_json_locked(&self.store_path, &self.store)
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        if self.store_path.exists() {
+            let raw = fs::read_to_string(&self.store_path)
+                .with_context(|| format!("reading {}", self.store_path.display()))?;
+            self.store = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing {}", self.store_path.display()))?;
         }
-        let raw = serde_json::to_string_pretty(&self.store)?;
-        let tmp = self.store_path.with_extension("json.tmp");
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(raw.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &self.store_path)?;
         Ok(())
     }
 
@@ -752,19 +752,23 @@ impl Knowledge {
     }
 
     pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
-        let mut updated = 0usize;
-        let now = Self::now_iso();
-        for entry in &mut self.store.entries {
-            if entry.project.as_deref() == Some(old_project) {
-                entry.project = Some(new_project.to_string());
-                entry.updated_at = now.clone();
-                updated += 1;
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            let mut updated = 0usize;
+            let now = Self::now_iso();
+            for entry in &mut self.store.entries {
+                if entry.project.as_deref() == Some(old_project) {
+                    entry.project = Some(new_project.to_string());
+                    entry.updated_at = now.clone();
+                    updated += 1;
+                }
             }
-        }
-        if updated > 0 {
-            self.save()?;
-        }
-        Ok(updated)
+            if updated > 0 {
+                self.save()?;
+            }
+            Ok(updated)
+        })
     }
 
     pub fn entry(&self, id: &str) -> Option<&KnowledgeEntry> {
@@ -772,43 +776,47 @@ impl Knowledge {
     }
 
     pub fn append_link(&mut self, p: &KnowledgeLinkParams) -> Result<KnowledgeEdge> {
-        let source_id = match EntityRef::parse(&p.source) {
-            Ok(EntityRef::Knowledge { id }) => id,
-            Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
-            Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
-        };
-        if source_id.trim().is_empty() {
-            anyhow::bail!("source knowledge id is required");
-        }
-        EntityRef::parse(&p.target)
-            .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
-        let kind = KnowledgeEdgeKind::parse(&p.kind)?;
-        let confidence = parse_edge_confidence(p.confidence.as_deref())?;
-        let edge = KnowledgeEdge {
-            target: p.target.clone(),
-            kind,
-            note: p.note.clone(),
-            source_arc: p.source_arc.clone(),
-            confidence,
-        };
-        let now = Self::now_iso();
-        let entry = self
-            .store
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == source_id)
-            .ok_or_else(|| anyhow::anyhow!("source knowledge entry not found: {source_id}"))?;
-        let duplicate = entry.links.iter().any(|existing| {
-            existing.target == edge.target
-                && existing.kind == edge.kind
-                && existing.source_arc == edge.source_arc
-        });
-        if !duplicate {
-            entry.links.push(edge.clone());
-            entry.updated_at = now;
-            self.save()?;
-        }
-        Ok(edge)
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            let source_id = match EntityRef::parse(&p.source) {
+                Ok(EntityRef::Knowledge { id }) => id,
+                Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
+                Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
+            };
+            if source_id.trim().is_empty() {
+                anyhow::bail!("source knowledge id is required");
+            }
+            EntityRef::parse(&p.target)
+                .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
+            let kind = KnowledgeEdgeKind::parse(&p.kind)?;
+            let confidence = parse_edge_confidence(p.confidence.as_deref())?;
+            let edge = KnowledgeEdge {
+                target: p.target.clone(),
+                kind,
+                note: p.note.clone(),
+                source_arc: p.source_arc.clone(),
+                confidence,
+            };
+            let now = Self::now_iso();
+            let entry = self
+                .store
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == source_id)
+                .ok_or_else(|| anyhow::anyhow!("source knowledge entry not found: {source_id}"))?;
+            let duplicate = entry.links.iter().any(|existing| {
+                existing.target == edge.target
+                    && existing.kind == edge.kind
+                    && existing.source_arc == edge.source_arc
+            });
+            if !duplicate {
+                entry.links.push(edge.clone());
+                entry.updated_at = now;
+                self.save()?;
+            }
+            Ok(edge)
+        })
     }
 
     /// Insert-or-replace a code-generated entry by its stable ID.
@@ -816,12 +824,16 @@ impl Knowledge {
     /// defaulting). Used by `tool_docs::sync_into_knowledge` to keep
     /// the auto-generated tool reference in sync with the binary.
     pub fn upsert_generated(&mut self, entry: KnowledgeEntry) -> Result<()> {
-        if let Some(existing) = self.store.entries.iter_mut().find(|e| e.id == entry.id) {
-            *existing = entry;
-        } else {
-            self.store.entries.push(entry);
-        }
-        self.save()
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            if let Some(existing) = self.store.entries.iter_mut().find(|e| e.id == entry.id) {
+                *existing = entry;
+            } else {
+                self.store.entries.push(entry);
+            }
+            self.save()
+        })
     }
 
     /// Active entries that should be rendered into markdown (excludes indexed-only).
@@ -832,6 +844,14 @@ impl Knowledge {
     // ── CRUD ───────────────────────────────────────────────────────
 
     pub fn learn_result(&mut self, p: &LearnParams, from_agent: bool) -> Result<LearnWriteResult> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            self.learn_result_locked(p, from_agent)
+        })
+    }
+
+    fn learn_result_locked(&mut self, p: &LearnParams, from_agent: bool) -> Result<LearnWriteResult> {
         let category = Category::from_str(&p.category)
             .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
@@ -1033,6 +1053,18 @@ impl Knowledge {
         p: &RememberParams,
         from_agent: bool,
     ) -> Result<KnowledgeWriteResult> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            self.remember_result_locked(p, from_agent)
+        })
+    }
+
+    fn remember_result_locked(
+        &mut self,
+        p: &RememberParams,
+        from_agent: bool,
+    ) -> Result<KnowledgeWriteResult> {
         // None → Memory (schema default). Some(invalid) → error rather than
         // silently landing the entry in the wrong bucket.
         let category = match p.category.as_deref() {
@@ -1100,6 +1132,18 @@ impl Knowledge {
     /// is set, marks the prior entry as superseded and records a link
     /// from the old to the new (via the existing `supersedes` field).
     pub fn decide_result(
+        &mut self,
+        p: &DecideParams,
+        from_agent: bool,
+    ) -> Result<KnowledgeWriteResult> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            self.decide_result_locked(p, from_agent)
+        })
+    }
+
+    fn decide_result_locked(
         &mut self,
         p: &DecideParams,
         from_agent: bool,
@@ -1192,21 +1236,25 @@ impl Knowledge {
     }
 
     pub fn forget(&mut self, p: &ForgetParams) -> Result<String> {
-        let id = &p.id;
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            let id = &p.id;
 
-        if let Some(entry) = self.store.entries.iter_mut().find(|e| &e.id == id) {
-            if let Some(by) = p.superseded_by.as_deref() {
-                entry.status = Status::Superseded;
-                entry.supersedes = Some(by.to_string());
+            if let Some(entry) = self.store.entries.iter_mut().find(|e| &e.id == id) {
+                if let Some(by) = p.superseded_by.as_deref() {
+                    entry.status = Status::Superseded;
+                    entry.supersedes = Some(by.to_string());
+                } else {
+                    entry.status = Status::Deleted;
+                }
+                entry.updated_at = Self::now_iso();
+                self.save()?;
+                Ok(format!("Removed entry {id}"))
             } else {
-                entry.status = Status::Deleted;
+                Ok(format!("Entry {id} not found"))
             }
-            entry.updated_at = Self::now_iso();
-            self.save()?;
-            Ok(format!("Removed entry {id}"))
-        } else {
-            Ok(format!("Entry {id} not found"))
-        }
+        })
     }
 
     pub fn list(&mut self, p: &KnowledgeListParams) -> Result<String> {
@@ -1704,6 +1752,14 @@ impl Knowledge {
     // ── Absorb ─────────────────────────────────────────────────────
 
     pub fn absorb(&mut self, p: &AbsorbParams) -> Result<String> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            self.absorb_locked(p)
+        })
+    }
+
+    fn absorb_locked(&mut self, p: &AbsorbParams) -> Result<String> {
         let scope = p.scope.as_deref().unwrap_or("project");
         match scope {
             "project" => {
@@ -1825,6 +1881,14 @@ impl Knowledge {
     // ── Review ─────────────────────────────────────────────────────
 
     pub fn review(&mut self, p: &ReviewParams) -> Result<String> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            self.review_locked(p)
+        })
+    }
+
+    fn review_locked(&mut self, p: &ReviewParams) -> Result<String> {
         let action = p.action.as_deref().unwrap_or("list");
         let id = p.id.as_deref();
 

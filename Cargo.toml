@@ -130,6 +130,13 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 regex = "1"
+
+# Configuration loading
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# File watching
+notify = "8"
+notify-debouncer-full = "0.6"
 ordered-float = "5"
 wide = "0.7"
 

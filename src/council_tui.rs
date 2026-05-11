@@ -256,7 +256,9 @@ impl App {
 
 pub async fn run(council_id: String, url: Option<String>) -> anyhow::Result<()> {
     let base_url = url.unwrap_or_else(|| {
-        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
+        let port = blackbox::config::load()
+            .map(|c| c.daemon.port.to_string())
+            .unwrap_or_else(|_| "7264".into());
         format!("http://127.0.0.1:{port}")
     });
     let base_url = base_url.trim_end_matches('/').to_string();

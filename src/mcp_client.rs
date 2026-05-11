@@ -90,12 +90,13 @@ async fn do_call(
     arguments: serde_json::Map<String, Value>,
     cwd: Option<&str>,
 ) -> Result<Value> {
+    let resolved = cfg.resolve_secrets()?;
     match cfg {
-        McpServerConfig::Stdio { command, args, env } => {
-            stdio_call(command, args, env, tool_name, arguments, cwd).await
+        McpServerConfig::Stdio { command, args, .. } => {
+            stdio_call(command, args, resolved.env, tool_name, arguments, cwd).await
         }
-        McpServerConfig::Http { url, headers, .. } | McpServerConfig::Sse { url, headers, .. } => {
-            http_call(url, headers, tool_name, arguments).await
+        McpServerConfig::Http { url, .. } | McpServerConfig::Sse { url, .. } => {
+            http_call(url, resolved.headers, tool_name, arguments).await
         }
     }
 }

@@ -15,7 +15,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -167,15 +166,17 @@ fn default_threshold_lookup_key() -> String {
 /// state directory directly (one file per packet, unlike notes which
 /// share a single JSON).
 pub struct Packets {
-    state_dir: PathBuf,
+    packets_dir: PathBuf,
 }
 
 impl Packets {
-    pub fn open(state_dir: &Path) -> Result<Self> {
-        fs::create_dir_all(packets_dir(state_dir))
-            .with_context(|| format!("creating {}", packets_dir(state_dir).display()))?;
+    pub fn open(packets_dir: &Path) -> Result<Self> {
+        let actual_dir = packets_dir.to_path_buf();
+
+        fs::create_dir_all(&actual_dir)
+            .with_context(|| format!("creating {}", actual_dir.display()))?;
         Ok(Self {
-            state_dir: state_dir.to_path_buf(),
+            packets_dir: actual_dir,
         })
     }
 
@@ -196,7 +197,7 @@ impl Packets {
     /// via tracing but never propagate, so event-log I/O can never
     /// break a compile/apply/audit operation.
     fn append_event(&self, event: &PacketEvent) {
-        let path = events_log_path(&self.state_dir);
+        let path = events_log_path(&self.packets_dir);
         if let Some(parent) = path.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 tracing::warn!(error = %e, "packet event log: create_dir_all failed");
@@ -224,7 +225,7 @@ impl Packets {
         since: Option<&str>,
         limit: usize,
     ) -> Result<Vec<PacketEvent>> {
-        let path = events_log_path(&self.state_dir);
+        let path = events_log_path(&self.packets_dir);
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -313,17 +314,10 @@ impl Packets {
     }
 
     fn save_packet(&self, packet: &Packet) -> Result<()> {
-        let dir = scope_dir(&self.state_dir, &packet.scope);
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = packet_path(&self.state_dir, &packet.scope, &packet.id);
-        let tmp = path.with_extension("json.tmp");
-        let raw = serde_json::to_string_pretty(packet)?;
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(raw.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        fs::rename(&tmp, &path)?;
-        Ok(())
+        let path = packet_path(&self.packets_dir, &packet.scope, &packet.id);
+        crate::json_store::with_store_lock(&path, || {
+            crate::json_store::atomic_write_json_locked(&path, packet)
+        })
     }
 
     /// Search both scopes for a packet by canonical ID or bare suffix.
@@ -350,7 +344,7 @@ impl Packets {
         }
         let needle = normalize_id(id);
         for scope in &["global", "project"] {
-            let path = packet_path(&self.state_dir, scope, &needle);
+            let path = packet_path(&self.packets_dir, scope, &needle);
             if path.exists() {
                 let raw = fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
@@ -413,7 +407,7 @@ impl Packets {
     pub fn list_all(&self) -> Result<Vec<Packet>> {
         let mut out = Vec::new();
         for scope in &["global", "project"] {
-            let dir = scope_dir(&self.state_dir, scope);
+            let dir = scope_dir(&self.packets_dir, scope);
             if !dir.exists() {
                 continue;
             }
@@ -454,7 +448,7 @@ impl Packets {
             .collect();
         let mut removed = 0usize;
         for packet in packets {
-            let path = packet_path(&self.state_dir, &packet.scope, &packet.id);
+            let path = packet_path(&self.packets_dir, &packet.scope, &packet.id);
             if path.exists() {
                 fs::remove_file(&path)
                     .with_context(|| format!("removing packet {}", path.display()))?;

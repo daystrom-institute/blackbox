@@ -273,16 +273,16 @@ impl Roadmap {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.store_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        crate::json_store::atomic_write_json_locked(&self.store_path, &self.store)
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        if self.store_path.exists() {
+            let raw = std::fs::read_to_string(&self.store_path)
+                .with_context(|| format!("reading {}", self.store_path.display()))?;
+            self.store = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing {}", self.store_path.display()))?;
         }
-        let raw = serde_json::to_string_pretty(&self.store)?;
-        let tmp = self.store_path.with_extension("json.tmp");
-        let mut file = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut file, raw.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &self.store_path)?;
         Ok(())
     }
 
@@ -332,24 +332,29 @@ impl Roadmap {
         project: Option<String>,
         actor: Option<String>,
     ) -> Result<&RoadmapItem> {
-        let now = Self::now_iso();
-        let id = Self::gen_id();
-        let mut item = RoadmapItem {
-            id,
-            title,
-            body,
-            status: RoadmapStatus::Proposed,
-            category,
-            priority,
-            scope,
-            project,
-            created_at: now.clone(),
-            updated_at: now,
-            transitions: Vec::new(),
-        };
-        item.push_transition(RoadmapStatus::Proposed, None, actor, None);
-        self.store.items.push(item);
-        self.save()?;
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            let now = Self::now_iso();
+            let id = Self::gen_id();
+            let mut item = RoadmapItem {
+                id,
+                title,
+                body,
+                status: RoadmapStatus::Proposed,
+                category,
+                priority,
+                scope,
+                project,
+                created_at: now.clone(),
+                updated_at: now,
+                transitions: Vec::new(),
+            };
+            item.push_transition(RoadmapStatus::Proposed, None, actor, None);
+            self.store.items.push(item);
+            self.save()?;
+            Ok(())
+        })?;
         Ok(self.store.items.last().unwrap())
     }
 
@@ -364,59 +369,67 @@ impl Roadmap {
         actor: Option<String>,
         source: Option<String>,
     ) -> Result<RoadmapItem> {
-        // Scoped block to drop mutable borrow before save
-        {
-            let item = self
-                .store
-                .items
-                .iter_mut()
-                .find(|i| i.id == id)
-                .ok_or_else(|| anyhow::anyhow!("roadmap item '{id}' not found"))?;
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            // Scoped block to drop mutable borrow before save
+            {
+                let item = self
+                    .store
+                    .items
+                    .iter_mut()
+                    .find(|i| i.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("roadmap item '{id}' not found"))?;
 
-            if let Some(t) = title {
-                item.title = t;
-            }
-            if let Some(b) = body {
-                item.body = b;
-            }
-            if let Some(c) = category {
-                item.category = c;
-            }
-            if let Some(p) = priority {
-                item.priority = p;
-            }
-            if let Some(s) = status {
-                if !item.status.can_transition_to(&s) {
-                    anyhow::bail!(
-                        "cannot transition from {} to {}",
-                        item.status.as_str(),
-                        s.as_str()
-                    );
+                if let Some(t) = title {
+                    item.title = t;
                 }
-                item.push_transition(s.clone(), None, actor, source);
-                item.status = s;
+                if let Some(b) = body {
+                    item.body = b;
+                }
+                if let Some(c) = category {
+                    item.category = c;
+                }
+                if let Some(p) = priority {
+                    item.priority = p;
+                }
+                if let Some(s) = status {
+                    if !item.status.can_transition_to(&s) {
+                        anyhow::bail!(
+                            "cannot transition from {} to {}",
+                            item.status.as_str(),
+                            s.as_str()
+                        );
+                    }
+                    item.push_transition(s.clone(), None, actor, source);
+                    item.status = s;
+                }
+                item.updated_at = Self::now_iso();
             }
-            item.updated_at = Self::now_iso();
-        }
-        self.save()?;
+            self.save()
+        })?;
         Ok(self.item(id).cloned().unwrap())
     }
 
     pub fn delete(&mut self, id: &str) -> Result<()> {
-        let idx = self
-            .store
-            .items
-            .iter()
-            .position(|i| i.id == id)
-            .ok_or_else(|| anyhow::anyhow!("roadmap item '{id}' not found"))?;
-        self.store.items.remove(idx);
-        // Remove all edges involving this item
-        let canonical = format!("roadmap_item:{id}");
-        self.store
-            .edges
-            .retain(|e| e.from != canonical && e.to != canonical);
-        self.save()?;
-        Ok(())
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            let idx = self
+                .store
+                .items
+                .iter()
+                .position(|i| i.id == id)
+                .ok_or_else(|| anyhow::anyhow!("roadmap item '{id}' not found"))?;
+            self.store.items.remove(idx);
+
+            // Remove all edges involving this item
+            let canonical = format!("roadmap_item:{id}");
+            self.store
+                .edges
+                .retain(|e| e.from != canonical && e.to != canonical);
+            self.save()
+        })
     }
 
     /// Search items by free-text query (title + body substring match).
@@ -503,41 +516,48 @@ impl Roadmap {
         file_path: Option<String>,
         section_anchor: Option<String>,
     ) -> Result<&RoadmapEdge> {
-        // Deduplicate
-        if self
-            .store
-            .edges
-            .iter()
-            .any(|e| e.from == from && e.to == to && e.kind == kind)
-        {
-            anyhow::bail!("edge from {from} to {to} of kind {kind:?} already exists");
-        }
-        let edge = RoadmapEdge {
-            from,
-            to,
-            kind,
-            note,
-            file_path,
-            section_anchor,
-            at: Self::now_iso(),
-        };
-        self.store.edges.push(edge);
-        self.save()?;
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            // Deduplicate
+            if self
+                .store
+                .edges
+                .iter()
+                .any(|e| e.from == from && e.to == to && e.kind == kind)
+            {
+                anyhow::bail!("edge from {from} to {to} of kind {kind:?} already exists");
+            }
+            let edge = RoadmapEdge {
+                from,
+                to,
+                kind,
+                note,
+                file_path,
+                section_anchor,
+                at: Self::now_iso(),
+            };
+            self.store.edges.push(edge);
+            self.save()?;
+            Ok(())
+        })?;
         Ok(self.store.edges.last().unwrap())
     }
-
     pub fn remove_edge(&mut self, from: &str, to: &str, kind: RoadmapEdgeKind) -> Result<()> {
-        let idx = self
-            .store
-            .edges
-            .iter()
-            .position(|e| e.from == from && e.to == to && e.kind == kind)
-            .ok_or_else(|| {
-                anyhow::anyhow!("edge from {from} to {to} of kind {kind:?} not found")
-            })?;
-        self.store.edges.remove(idx);
-        self.save()?;
-        Ok(())
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            let idx = self
+                .store
+                .edges
+                .iter()
+                .position(|e| e.from == from && e.to == to && e.kind == kind)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("edge from {from} to {to} of kind {kind:?} not found")
+                })?;
+            self.store.edges.remove(idx);
+            self.save()
+        })
     }
 
     pub fn edges_for(&self, id: &str) -> Vec<&RoadmapEdge> {

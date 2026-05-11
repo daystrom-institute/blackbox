@@ -258,10 +258,14 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &PollerSpec) ->
 /// responsible for storing the handle (registry.track_handle) so the
 /// task can be aborted on uninstall or replaced on reinstall.
 pub fn spawn_loop(state: Arc<crate::SharedState>, spec: PollerSpec) -> JoinHandle<()> {
-    let min_secs = std::env::var("BBOX_POLLER_MIN_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5u64);
+    let min_secs = if let Ok(cfg) = blackbox::config::load() {
+        cfg.daemon.poller_min_interval_secs
+    } else {
+        std::env::var("BBOX_POLLER_MIN_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5u64)
+    };
     let interval_secs = spec.every_seconds.max(min_secs);
     if interval_secs != spec.every_seconds {
         tracing::warn!(

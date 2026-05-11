@@ -15,6 +15,7 @@ pub(crate) struct SharedState {
     pub(crate) projects: RwLock<ProjectRegistry>,
     pub(crate) packets: RwLock<Packets>,
     pub(crate) artifacts: RwLock<artifacts::ArtifactCatalog>,
+    pub(crate) bbox_watcher: std::sync::Mutex<Option<crate::watcher::BbxWatcher>>,
     #[allow(dead_code)]
     pub(crate) edge_index: RwLock<edge_index::EdgeIndex>,
     pub(crate) path_cache: RwLock<path_cache::PathCache>,
@@ -101,7 +102,7 @@ pub(crate) struct SharedState {
     pub(crate) agent_adapter_registry:
         Arc<RwLock<orchestration::agents::adapter::AgentAdapterRegistry>>,
     /// Badgey wrapper state. W1 keeps the live badgey_id mapping in
-    /// memory; proposals and action journal are durable under BRO_STORE.
+    /// memory; proposals and action journal are durable in the state dir.
     pub(crate) badgey_registry: Arc<orchestration::badgey::BadgeyRegistry>,
     pub(crate) badgey_proposals: Arc<orchestration::badgey::ProposalStore>,
     pub(crate) badgey_journal: Arc<orchestration::badgey::ActionJournal>,
@@ -127,6 +128,7 @@ pub(crate) struct SharedState {
     /// child every call; the manager amortizes initialize cost and
     /// idle-evicts sessions on a background tick.
     pub(crate) lsp_sessions: lsp::LspSessionManager,
+    pub(crate) config: std::sync::Arc<parking_lot::RwLock<crate::config::Config>>,
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
@@ -267,6 +269,7 @@ impl SharedState {
             projects: RwLock::new(ProjectRegistry::open(&store_dir.join("projects.json")).unwrap()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
+            bbox_watcher: std::sync::Mutex::new(None),
             edge_index: RwLock::new(edge_index::EdgeIndex::default()),
             path_cache: RwLock::new(path_cache::PathCache::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),
@@ -305,6 +308,11 @@ impl SharedState {
                 slack_proposal_links::SlackProposalLinks::open(store_dir).unwrap(),
             ),
             lsp_sessions: lsp::LspSessionManager::new(),
+            config: Arc::new(RwLock::new(
+                crate::config::load().unwrap_or_else(|e| {
+                    panic!("loading config for test SharedState: {e}")
+                }),
+            )),
         }
     }
 }

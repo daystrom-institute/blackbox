@@ -1,0 +1,31 @@
+# blackbox daemon configuration (dev instance)
+# Place this file at ~/.config/blackbox-dev/config.toml
+# Or set BLACKBOX_CONFIG to point to a different path.
+# This config is referenced by deploy/blackbox-dev.service
+
+[daemon]
+port = 7265
+bind = "0.0.0.0"
+mcp_name = "blackbox-dev"
+mcp_session_keepalive_secs = 21600
+shutdown_grace_secs = 15
+task_ttl_ms = 86400000
+poller_min_interval_secs = 5
+
+[index]
+reindex_interval_secs = 120
+edge_index_boot_rebuild = true
+
+[provenance]
+git_notes_namespace = "bb"
+
+[lsp]
+idle_timeout_secs = 600
+request_timeout_secs = 30
+jdtls_init_timeout_secs = 60
+rust_analyzer_init_timeout_secs = 60
+
+# Path overrides for dev instance
+[paths]
+# Use absolute path or ~/... (tilde will be expanded relative to $HOME)
+state_dir = "~/.local/state/blackbox-dev"

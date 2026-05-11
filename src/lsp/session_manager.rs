@@ -73,6 +73,10 @@ struct ManagerInner {
 struct Config {
     idle_timeout: Duration,
     request_timeout: Duration,
+    jdtls_init_timeout: Duration,
+    rust_analyzer_init_timeout: Duration,
+    jdtls_bin: Option<String>,
+    rust_analyzer_bin: Option<String>,
 }
 
 impl Default for Config {
@@ -83,6 +87,28 @@ impl Default for Config {
                 "BLACKBOX_JDTLS_TIMEOUT_SECS",
                 30,
             )),
+            jdtls_init_timeout: Duration::from_secs(env_u64("BLACKBOX_JDTLS_INIT_TIMEOUT_SECS", 60)),
+            rust_analyzer_init_timeout: Duration::from_secs(env_u64(
+                "BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS",
+                60,
+            )),
+            jdtls_bin: std::env::var("BLACKBOX_JDTLS_BIN").ok().filter(|s| !s.trim().is_empty()),
+            rust_analyzer_bin: std::env::var("BLACKBOX_RUST_ANALYZER_BIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        }
+    }
+}
+
+impl Config {
+    fn from_lsp_config(cfg: &blackbox::config::LspConfig) -> Self {
+        Self {
+            idle_timeout: Duration::from_secs(cfg.idle_timeout_secs),
+            request_timeout: Duration::from_secs(cfg.request_timeout_secs),
+            jdtls_init_timeout: Duration::from_secs(cfg.jdtls_init_timeout_secs),
+            rust_analyzer_init_timeout: Duration::from_secs(cfg.rust_analyzer_init_timeout_secs),
+            jdtls_bin: cfg.jdtls_bin.clone(),
+            rust_analyzer_bin: cfg.rust_analyzer_bin.clone(),
         }
     }
 }
@@ -90,12 +116,11 @@ impl Default for Config {
 /// Per-language `initialize` timeout. JDTLS and rust-analyzer both
 /// pay multi-second cold-start (workspace import, crate graph build);
 /// each gets its own knob with a 60s default.
-fn init_timeout_for(language: Language) -> Duration {
-    let secs = match language {
-        Language::Java => env_u64("BLACKBOX_JDTLS_INIT_TIMEOUT_SECS", 60),
-        Language::Rust => env_u64("BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS", 60),
-    };
-    Duration::from_secs(secs)
+fn init_timeout_for(language: Language, config: &Config) -> Duration {
+    match language {
+        Language::Java => config.jdtls_init_timeout,
+        Language::Rust => config.rust_analyzer_init_timeout,
+    }
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -234,6 +259,10 @@ impl<'a> LspClient<'a> {
 impl LspSessionManager {
     pub fn new() -> Self {
         Self::with_config(Config::default())
+    }
+
+    pub fn with_lsp_config(cfg: &blackbox::config::LspConfig) -> Self {
+        Self::with_config(Config::from_lsp_config(cfg))
     }
 
     fn with_config(config: Config) -> Self {
@@ -421,7 +450,7 @@ fn shutdown_session(sess: &mut Session) {
 }
 
 fn spawn_session(key: &SessionKey, config: &Config) -> Result<Session> {
-    let argv = launch_argv(key.language)?;
+    let argv = launch_argv(key.language, config);
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())
@@ -445,7 +474,7 @@ fn spawn_session(key: &SessionKey, config: &Config) -> Result<Session> {
     session.next_id += 1;
     write_request(&mut session.stdin, Initialize::METHOD, init_id, &init_params)
         .context("sending initialize")?;
-    let init_timeout = init_timeout_for(key.language);
+    let init_timeout = init_timeout_for(key.language, config);
     let value = read_response(&mut session, init_id, init_timeout).map_err(|e| {
         anyhow!(
             "LSP `initialize` did not return within {init_timeout:?}: {e}"
@@ -539,17 +568,15 @@ fn wait_for_rust_analyzer_ready(session: &mut Session, timeout: Duration) {
     }
 }
 
-fn launch_argv(language: Language) -> Result<Vec<String>> {
+fn launch_argv(language: Language, config: &Config) -> Vec<String> {
     match language {
         Language::Java => {
-            let bin = std::env::var("BLACKBOX_JDTLS_BIN").unwrap_or_else(|_| "jdtls".to_string());
-            Ok(vec![bin])
+            let bin = config.jdtls_bin.clone().unwrap_or_else(|| "jdtls".to_string());
+            vec![bin]
         }
         Language::Rust => {
-            let bin = std::env::var("RUST_ANALYZER_BIN")
-                .or_else(|_| std::env::var("BLACKBOX_RUST_ANALYZER_BIN"))
-                .unwrap_or_else(|_| "rust-analyzer".to_string());
-            Ok(vec![bin])
+            let bin = config.rust_analyzer_bin.clone().unwrap_or_else(|| "rust-analyzer".to_string());
+            vec![bin]
         }
     }
 }
@@ -706,6 +733,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let res = m.with_session::<_, ()>(dir.path(), Language::Java, |_| Ok(()));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn rust_analyzer_alias_no_longer_used() {
+        let _guard = blackbox::util::test_env_lock();
+        let orig_prefixed = std::env::var("BLACKBOX_RUST_ANALYZER_BIN").ok();
+
+        std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN");
+        std::env::set_var("RUST_ANALYZER_BIN", "alias-path");
+
+        let config = Config::default();
+        assert_eq!(config.rust_analyzer_bin, None,
+            "RUST_ANALYZER_BIN should not be accepted after Phase 5");
+
+        std::env::remove_var("RUST_ANALYZER_BIN");
+        if let Some(v) = orig_prefixed { std::env::set_var("BLACKBOX_RUST_ANALYZER_BIN", v); } else { std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN"); }
     }
 }
 

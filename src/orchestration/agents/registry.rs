@@ -226,6 +226,7 @@ impl<'a> AgentRegistry<'a> {
     }
 
     pub fn load_manifest_degraded(&self, name: &str) -> (Option<AgentManifest>, Option<String>) {
+        // TODO(phase-4-shadowing): plumb project_id when caller has it to enable local shadowing.
         let value = match self.catalog.load_artifact_value(ArtifactKind::Agent, name) {
             Ok(Some(v)) => v,
             _ => return (None, None),

@@ -5,20 +5,20 @@ use std::path::{Path, PathBuf};
 
 // ── Storage ───────────────────────────────────────────────────────
 
-pub(super) fn packets_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("packets")
+pub(super) fn packets_dir(packets_dir: &Path) -> PathBuf {
+    packets_dir.to_path_buf()
 }
 
-pub(super) fn scope_dir(state_dir: &Path, scope: &str) -> PathBuf {
-    packets_dir(state_dir).join(scope)
+pub(super) fn scope_dir(packets_dir: &Path, scope: &str) -> PathBuf {
+    packets_dir.join(scope)
 }
 
-pub(super) fn packet_path(state_dir: &Path, scope: &str, id: &str) -> PathBuf {
-    scope_dir(state_dir, scope).join(format!("{id}.json"))
+pub(super) fn packet_path(packets_dir: &Path, scope: &str, id: &str) -> PathBuf {
+    scope_dir(packets_dir, scope).join(format!("{id}.json"))
 }
 
-pub(super) fn events_log_path(state_dir: &Path) -> PathBuf {
-    packets_dir(state_dir).join("events.jsonl")
+pub(super) fn events_log_path(packets_dir: &Path) -> PathBuf {
+    packets_dir.join("events.jsonl")
 }
 
 /// Atomic-ish append: opens the file in append mode and writes one

@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -82,6 +81,13 @@ pub struct ProjectRenameResponse {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ProjectInitParams {
+    pub path: String,
+    #[serde(default)]
+    pub force: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProjectStore {
     version: u32,
@@ -130,6 +136,15 @@ impl ProjectRegistry {
     }
 
     pub fn register_path(&mut self, path: impl AsRef<Path>) -> Result<ProjectRecord> {
+        let path = path.as_ref().to_path_buf();
+        let store_path = self.path.clone();
+        crate::json_store::with_store_lock(&store_path, || {
+            self.reload()?;
+            self.register_path_locked(&path)
+        })
+    }
+
+    fn register_path_locked(&mut self, path: &Path) -> Result<ProjectRecord> {
         let canonical = canonical_project_path(path)?;
         let canonical_path = canonical.to_string_lossy().into_owned();
         if let Some(existing) = self
@@ -174,6 +189,14 @@ impl ProjectRegistry {
     }
 
     pub fn rename_project(&mut self, p: &ProjectRenameParams) -> Result<ProjectRenameResponse> {
+        let store_path = self.path.clone();
+        crate::json_store::with_store_lock(&store_path, || {
+            self.reload()?;
+            self.rename_project_locked(p)
+        })
+    }
+
+    fn rename_project_locked(&mut self, p: &ProjectRenameParams) -> Result<ProjectRenameResponse> {
         let idx = self
             .resolve_project_index(&p.project)?
             .with_context(|| format!("project not registered: {}", p.project))?;
@@ -283,28 +306,16 @@ impl ProjectRegistry {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+        crate::json_store::atomic_write_json_locked(&self.path, &self.store)
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        if self.path.exists() {
+            let raw = fs::read_to_string(&self.path)
+                .with_context(|| format!("reading {}", self.path.display()))?;
+            self.store = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing {}", self.path.display()))?;
         }
-        let raw = serde_json::to_string_pretty(&self.store)?;
-        let file_name = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("projects.json");
-        let tmp = self.path.with_file_name(format!("{file_name}.tmp"));
-        let mut file =
-            fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        file.write_all(raw.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &self.path).with_context(|| {
-            format!(
-                "renaming {} to {}",
-                tmp.display(),
-                self.path.as_path().display()
-            )
-        })?;
         Ok(())
     }
 

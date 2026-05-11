@@ -30,6 +30,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         projects: RwLock::new(projects),
         packets: RwLock::new(packets),
         artifacts: RwLock::new(artifacts),
+        bbox_watcher: std::sync::Mutex::new(None),
         edge_index: RwLock::new(edge_index::EdgeIndex::default()),
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(TaskStore::new())),
@@ -70,6 +71,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             slack_proposal_links::SlackProposalLinks::open(&tmp.path().join("bro")).unwrap(),
         ),
         lsp_sessions: lsp::LspSessionManager::new(),
+        config: Arc::new(RwLock::new(crate::config::load().unwrap_or_else(|e| {
+            panic!("loading config for test SharedState: {e}")
+        }))),
     });
     BlackboxServer::new(state)
 }
@@ -1466,7 +1470,11 @@ fn bbox_project_rename_migrates_project_scoped_state() {
         .as_str()
         .unwrap()
         .to_string();
-    let registered: ProjectRecord = serde_json::from_str(&text).unwrap();
+    let registered: ProjectRecord = serde_json::from_value(
+        serde_json::to_value(&serde_json::from_str::<serde_json::Value>(&text).unwrap()["record"])
+            .unwrap(),
+    )
+    .unwrap();
 
     server
         .state

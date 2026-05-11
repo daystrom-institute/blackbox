@@ -620,6 +620,7 @@ fn record_agent_manifest_coverage(
         include_superseded: true,
     })?;
     for entry in entries {
+        // TODO(phase-4-shadowing): plumb project_id when caller has it to enable local shadowing.
         let Some(value) =
             catalog.load_artifact_value(crate::artifacts::ArtifactKind::Agent, &entry.name)?
         else {

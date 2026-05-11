@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -120,15 +119,16 @@ impl Pins {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.store_path.parent() {
-            fs::create_dir_all(parent)?;
+        crate::json_store::atomic_write_json_locked(&self.store_path, &self.store)
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        if self.store_path.exists() {
+            let raw = fs::read_to_string(&self.store_path)
+                .with_context(|| format!("reading {}", self.store_path.display()))?;
+            self.store = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing {}", self.store_path.display()))?;
         }
-        let raw = serde_json::to_string_pretty(&self.store)?;
-        let tmp = self.store_path.with_extension("json.tmp");
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(raw.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(tmp, &self.store_path)?;
         Ok(())
     }
 
@@ -159,17 +159,21 @@ impl Pins {
     }
 
     pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
-        let mut updated = 0usize;
-        for pin in &mut self.store.pins {
-            if pin.project.as_deref() == Some(old_project) {
-                pin.project = Some(new_project.to_string());
-                updated += 1;
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            let mut updated = 0usize;
+            for pin in &mut self.store.pins {
+                if pin.project.as_deref() == Some(old_project) {
+                    pin.project = Some(new_project.to_string());
+                    updated += 1;
+                }
             }
-        }
-        if updated > 0 {
-            self.save()?;
-        }
-        Ok(updated)
+            if updated > 0 {
+                self.save()?;
+            }
+            Ok(updated)
+        })
     }
 
     fn is_expired(pin: &Pin) -> bool {
@@ -179,6 +183,14 @@ impl Pins {
     }
 
     pub fn pin(&mut self, p: &PinParams) -> Result<String> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            self.pin_locked(p)
+        })
+    }
+
+    fn pin_locked(&mut self, p: &PinParams) -> Result<String> {
         match p.action.as_str() {
             "set" => self.set(p),
             "list" => self.list(p),

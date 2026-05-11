@@ -293,6 +293,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: None,
     },
     ToolDoc {
+        name: "bbox_project_init",
+        category: ToolCategory::Projects,
+        summary: "Initialize a project-local .bbox workspace. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories. Idempotent by default; set force=true to overwrite skeleton files while preserving subdirectory contents.",
+        when_to_use: "Run once for a new repo before local config edits or project-scoped MCP overlays; it is safe to run repeatedly and only touches empty files by default.",
+        example: Some(r#"bbox_project_init(path="/home/me/repos/blackbox", force=true)"#),
+    },
+    ToolDoc {
         name: "bbox_project_rename",
         category: ToolCategory::Projects,
         summary: "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, councils, whiteboards, pollers, and crons, then reindexes project files.",

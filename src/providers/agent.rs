@@ -30,6 +30,7 @@ impl InspectableEntityProvider for AgentProvider {
         properties.insert("version".into(), version.to_string());
         if let Some(state) = ctx.state() {
             let catalog = state.artifacts.read();
+            // TODO(phase-4-shadowing): plumb project_id when caller has it to enable local shadowing.
             if let Some(v) = catalog
                 .load_artifact_value(crate::artifacts::ArtifactKind::Agent, name)
                 .ok()

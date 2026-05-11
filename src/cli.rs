@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
+use blackbox::config;
+
 use clap::{Args, Parser, Subcommand};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -117,7 +119,7 @@ struct CouncilNewArgs {
     /// Project_dir override. Defaults to the team's project_dir.
     #[arg(long)]
     project: Option<String>,
-    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    /// Daemon URL. Defaults to http://127.0.0.1:${BBOX_PORT:-7264}.
     #[arg(long)]
     url: Option<String>,
 }
@@ -203,14 +205,14 @@ struct OrchestratePeekArgs {
     /// Arc thread ID to peek at. Omit to list all live arc snapshots.
     #[arg(value_name = "THREAD_ID")]
     thread_id: Option<String>,
-    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    /// Daemon URL. Defaults to http://127.0.0.1:${BBOX_PORT:-7264}.
     #[arg(long)]
     url: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct OrchestrateListArgs {
-    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    /// Daemon URL. Defaults to http://127.0.0.1:${BBOX_PORT:-7264}.
     #[arg(long)]
     url: Option<String>,
     /// Max entries to print (default: 20, most recent first).
@@ -224,7 +226,7 @@ struct OrchestrateStatusArgs {
     /// `run` invocation as `arc_thread_id`.
     #[arg(value_name = "THREAD_ID")]
     thread_id: String,
-    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    /// Daemon URL. Defaults to http://127.0.0.1:${BBOX_PORT:-7264}.
     #[arg(long)]
     url: Option<String>,
 }
@@ -234,7 +236,7 @@ struct OrchestrateRunArgs {
     /// Path to the workflow JSON file.
     #[arg(value_name = "WORKFLOW_JSON")]
     path: std::path::PathBuf,
-    /// Daemon URL. Defaults to http://127.0.0.1:${BRO_PORT:-7264}.
+    /// Daemon URL. Defaults to http://127.0.0.1:${BBOX_PORT:-7264}.
     #[arg(long)]
     url: Option<String>,
     /// Working directory passed to every dispatched bro.
@@ -340,9 +342,7 @@ enum LaneSignal {
 }
 
 async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
-    let port = std::env::var("BBOX_PORT")
-        .or_else(|_| std::env::var("BRO_PORT"))
-        .unwrap_or_else(|_| "7264".into());
+    let port = config::load().map(|c| c.daemon.port).unwrap_or(7264);
     let mut url = format!("http://127.0.0.1:{port}/tail");
     let mut params = Vec::new();
     if !sel.bros.is_empty() {
@@ -491,9 +491,7 @@ fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
 }
 
 async fn fetch_roster(sel: TailSelectors) -> anyhow::Result<Vec<RosterEntry>> {
-    let port = std::env::var("BBOX_PORT")
-        .or_else(|_| std::env::var("BRO_PORT"))
-        .unwrap_or_else(|_| "7264".into());
+    let port = config::load().map(|c| c.daemon.port).unwrap_or(7264);
     let mut url = format!("http://127.0.0.1:{port}/roster");
     let mut params = Vec::new();
     if !sel.bros.is_empty() {
@@ -907,10 +905,12 @@ async fn run_orchestrate(args: OrchestrateArgs) -> anyhow::Result<()> {
 }
 
 fn council_base_url(url: Option<String>) -> String {
-    url.unwrap_or_else(|| {
-        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
-        format!("http://127.0.0.1:{port}")
-    })
+    url.unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()))
+}
+
+fn default_base_url() -> anyhow::Result<String> {
+    let cfg = config::load()?;
+    Ok(format!("http://127.0.0.1:{}", cfg.daemon.port))
 }
 
 async fn run_council(args: CouncilArgs) -> anyhow::Result<()> {
@@ -1068,10 +1068,7 @@ async fn council_close(args: CouncilCloseArgs) -> anyhow::Result<()> {
 }
 
 async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
-    let base_url = args.url.unwrap_or_else(|| {
-        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
-        format!("http://127.0.0.1:{port}")
-    });
+    let base_url = args.url.unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
     let mut url = format!("{}/orchestrate/peek", base_url.trim_end_matches('/'));
     if let Some(tid) = &args.thread_id {
         url.push_str(&format!("?thread_id={}", urlencoding_lite(tid)));
@@ -1144,10 +1141,7 @@ async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
 }
 
 async fn orchestrate_list(args: OrchestrateListArgs) -> anyhow::Result<()> {
-    let base_url = args.url.unwrap_or_else(|| {
-        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
-        format!("http://127.0.0.1:{port}")
-    });
+    let base_url = args.url.unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
     let url = format!("{}/orchestrate/list", base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let resp = client.get(&url).send().await?;
@@ -1191,10 +1185,7 @@ async fn orchestrate_list(args: OrchestrateListArgs) -> anyhow::Result<()> {
 }
 
 async fn orchestrate_status(args: OrchestrateStatusArgs) -> anyhow::Result<()> {
-    let base_url = args.url.unwrap_or_else(|| {
-        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
-        format!("http://127.0.0.1:{port}")
-    });
+    let base_url = args.url.unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
     let url = format!(
         "{}/orchestrate/status?thread_id={}",
         base_url.trim_end_matches('/'),
@@ -1258,10 +1249,7 @@ async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
         .with_context(|| format!("reading {}", args.path.display()))?;
     let workflow: serde_json::Value = serde_json::from_str(&workflow_raw)
         .with_context(|| format!("parsing {} as JSON", args.path.display()))?;
-    let base_url = args.url.unwrap_or_else(|| {
-        let port = std::env::var("BRO_PORT").unwrap_or_else(|_| "7264".into());
-        format!("http://127.0.0.1:{port}")
-    });
+    let base_url = args.url.unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
     let mut body = serde_json::json!({ "workflow": workflow });
     if let Some(pd) = args.project_dir {
         body["project_dir"] = serde_json::Value::String(pd);

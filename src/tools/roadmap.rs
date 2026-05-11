@@ -2,6 +2,8 @@ use crate::server::*;
 use crate::*;
 use rmcp::schemars;
 
+use blackbox::config;
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct RoadmapParams {
     /// Roadmap operation: create, get, list, search, update, delete, next, promote, link, unlink, repair_links, or render.
@@ -736,13 +738,47 @@ impl BlackboxServer {
     }
 
     fn roadmap_render(&self, p: serde_json::Value) -> anyhow::Result<String> {
-        let project = p
-            .get("project")
-            .and_then(|v| v.as_str())
-            .unwrap_or("blackbox");
-        let write_path = p.get("write_path").and_then(|v| v.as_str());
+        let project = p.get("project").and_then(|v| v.as_str()).or_else(|| {
+            p.get("project_dir")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+        });
+        let write_path: Option<String> = p
+            .get("write_path")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .or_else(|| {
+                project.and_then(|project_root| {
+                    config::load_project(std::path::Path::new(project_root))
+                        .ok()
+                        .and_then(|c| c.roadmap.write_path.map(|p| p.to_string_lossy().into_owned()))
+                })
+            })
+            .or_else(|| {
+                config::load()
+                    .ok()
+                    .and_then(|c| c.roadmap.write_path.map(|p| p.to_string_lossy().into_owned()))
+            });
         let inline_template = p.get("template").and_then(|v| v.as_str());
-        let template_path = p.get("template_path").and_then(|v| v.as_str());
+        let template_path: Option<String> = p
+            .get("template_path")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .or_else(|| {
+                project.and_then(|project_root| {
+                    config::load_project(std::path::Path::new(project_root))
+                        .ok()
+                        .and_then(|c| {
+                            c.roadmap
+                                .template_path
+                                .map(|p| p.to_string_lossy().into_owned())
+                        })
+                })
+            })
+            .or_else(|| {
+                config::load()
+                    .ok()
+                    .and_then(|c| c.roadmap.template_path.map(|p| p.to_string_lossy().into_owned()))
+            });
+        let project = project.unwrap_or("blackbox");
 
         let rm = self.state.roadmap.read();
         let th = self.state.threads.read();
@@ -780,14 +816,14 @@ impl BlackboxServer {
         let md = if let Some(src) = inline_template {
             let ctx = rm.to_template_context(project, &spawn);
             crate::template::render(src, &ctx)?
-        } else if let Some(path) = template_path {
+        } else if let Some(ref path) = template_path {
             let ctx = rm.to_template_context(project, &spawn);
             crate::template::render_file(std::path::Path::new(path), &ctx)?
         } else {
             rm.render_markdown(project, &spawn)
         };
 
-        if let Some(path) = write_path {
+        if let Some(ref path) = write_path {
             std::fs::write(path, &md)
                 .map_err(|e| anyhow::anyhow!("failed to write ROADMAP.md to {path}: {e}"))?;
             Ok(serde_json::json!({

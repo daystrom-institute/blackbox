@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use std::str::FromStr;
@@ -211,16 +210,16 @@ impl Threads {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.store_path.parent() {
-            fs::create_dir_all(parent)?;
+        crate::json_store::atomic_write_json_locked(&self.store_path, &self.store)
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        if self.store_path.exists() {
+            let raw = fs::read_to_string(&self.store_path)
+                .with_context(|| format!("reading {}", self.store_path.display()))?;
+            self.store = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing {}", self.store_path.display()))?;
         }
-        let raw = serde_json::to_string_pretty(&self.store)?;
-        let tmp = self.store_path.with_extension("json.tmp");
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(raw.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, &self.store_path)?;
         Ok(())
     }
 
@@ -244,41 +243,51 @@ impl Threads {
     }
 
     pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
-        let mut updated = 0usize;
-        let now = Self::now_iso();
-        for thread in &mut self.store.threads {
-            if thread.project == old_project {
-                thread.project = new_project.to_string();
-                thread.last_activity = now.clone();
-                updated += 1;
-            }
-        }
-        if updated > 0 {
-            self.save()?;
-            for thread in &self.store.threads {
-                if thread.project == new_project {
-                    crate::embed_queue::enqueue_thread(thread);
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            let mut updated = 0usize;
+            let now = Self::now_iso();
+            for thread in &mut self.store.threads {
+                if thread.project == old_project {
+                    thread.project = new_project.to_string();
+                    thread.last_activity = now.clone();
+                    updated += 1;
                 }
             }
-        }
-        Ok(updated)
+            if updated > 0 {
+                self.save()?;
+                for thread in &self.store.threads {
+                    if thread.project == new_project {
+                        crate::embed_queue::enqueue_thread(thread);
+                    }
+                }
+            }
+            Ok(updated)
+        })
     }
 
     // ── blackbox_thread (CRUD) ─────────────────────────────────────
 
     pub fn thread(&mut self, p: &ThreadParams) -> Result<String> {
-        match p.action.as_str() {
-            "get" => self.thread_get(p),
-            "open" => self.thread_open(p),
-            "continue" => self.thread_continue(p),
-            "link" => self.thread_link(p),
-            "resolve" => self.thread_resolve(p),
-            "promote" => self.thread_promote(p),
-            "rename" => self.thread_rename(p),
-            other => anyhow::bail!(
-                "Unknown action: {other}. Use: get, open, continue, link, resolve, promote, rename"
-            ),
+        if p.action == "get" {
+            return self.thread_get(p);
         }
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            match p.action.as_str() {
+                "open" => self.thread_open(p),
+                "continue" => self.thread_continue(p),
+                "link" => self.thread_link(p),
+                "resolve" => self.thread_resolve(p),
+                "promote" => self.thread_promote(p),
+                "rename" => self.thread_rename(p),
+                other => anyhow::bail!(
+                    "Unknown action: {other}. Use: get, open, continue, link, resolve, promote, rename"
+                ),
+            }
+        })
     }
 
     fn thread_open(&mut self, p: &ThreadParams) -> Result<String> {

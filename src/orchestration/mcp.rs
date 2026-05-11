@@ -4,7 +4,7 @@
 //! dispatched bros should see, and which tool calls are allowed or
 //! disallowed. The registry lives under `BRO_HOME/mcp.json` (default:
 //! `~/.local/state/blackbox/bro/mcp.json`) with an optional project
-//! overlay at `<project>/.bro/mcp.json`.
+//! overlay at `<project>/.bbox/mcp.json`.
 //!
 //! At dispatch time, the effective set is (global entries) merged with
 //! (project entries override), and translated into provider-specific CLI
@@ -25,6 +25,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::os::unix::fs::symlink as make_file_symlink;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,65 @@ use super::providers::{MatchState, Provider};
 
 // ── Types ──────────────────────────────────────────────────────────
 
+/// A string value that may be stored inline or as a reference to an
+/// environment-variable secret.  The `#[serde(untagged)]` representation
+/// means existing `"plain string"` JSON deserializes as `Plain("plain
+/// string")` unchanged, while `{"$secret": "MY_ENV_VAR"}` deserializes as
+/// `Secret { name: "MY_ENV_VAR" }`.  Writeback of Plain values emits the
+/// bare string, so existing mcp.json files round-trip without modification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SecretString {
+    Plain(String),
+    Secret {
+        #[serde(rename = "$secret")]
+        name: String,
+    },
+}
+
+impl SecretString {
+    /// Resolve to a concrete string value.  Plain variant is identity; Secret
+    /// variant reads the named environment variable, failing hard if absent.
+    pub fn resolve(&self) -> anyhow::Result<String> {
+        match self {
+            Self::Plain(s) => Ok(s.clone()),
+            Self::Secret { name } => std::env::var(name)
+                .map_err(|_| anyhow::anyhow!("secret env var '{}' not set", name)),
+        }
+    }
+
+    /// True if `key` (case-insensitive) matches common sensitive header names
+    /// that must not be stored as inline plain text in project-local files.
+    pub fn is_sensitive_key(key: &str) -> bool {
+        let lower = key.to_lowercase();
+        lower.contains("authorization")
+            || lower.contains("token")
+            || lower.contains("secret")
+            || lower.contains("api_key")
+            || lower.contains("api-key")
+            || lower.contains("apikey")
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(s: String) -> Self {
+        Self::Plain(s)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(s: &str) -> Self {
+        Self::Plain(s.to_string())
+    }
+}
+
+/// Resolved form of `McpServerConfig` — all `SecretString` values have been
+/// looked up and are concrete strings ready to pass to provider arg builders.
+pub struct ResolvedMcpServerConfig {
+    pub headers: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
+}
+
 /// Transport-discriminated MCP server config. Matches the shape every
 /// provider CLI accepts, modulo translation at registration time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,14 +105,14 @@ pub enum McpServerConfig {
     Http {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        headers: BTreeMap<String, String>,
+        headers: BTreeMap<String, SecretString>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude_tools: Vec<String>,
     },
     Sse {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        headers: BTreeMap<String, String>,
+        headers: BTreeMap<String, SecretString>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude_tools: Vec<String>,
     },
@@ -60,7 +121,7 @@ pub enum McpServerConfig {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        env: BTreeMap<String, String>,
+        env: BTreeMap<String, SecretString>,
     },
 }
 
@@ -81,6 +142,57 @@ impl McpServerConfig {
     pub fn blackbox_matches(&self, current_url: &str) -> bool {
         matches!(self, Self::Http { url, .. } if url == current_url)
     }
+
+    /// Resolve all `SecretString` values in this config to concrete strings.
+    /// Returns an error if any `$secret` reference cannot be resolved (env var
+    /// not set). Provider arg builders and dispatch paths must consume the
+    /// resolved form, not the raw config.
+    pub fn resolve_secrets(&self) -> anyhow::Result<ResolvedMcpServerConfig> {
+        let mut headers = BTreeMap::new();
+        let mut env = BTreeMap::new();
+        match self {
+            Self::Http { headers: h, .. } | Self::Sse { headers: h, .. } => {
+                for (k, v) in h {
+                    headers.insert(k.clone(), v.resolve()?);
+                }
+            }
+            Self::Stdio { env: e, .. } => {
+                for (k, v) in e {
+                    env.insert(k.clone(), v.resolve()?);
+                }
+            }
+        }
+        Ok(ResolvedMcpServerConfig { headers, env })
+    }
+}
+
+/// Validate that a project-scoped MCP store does not contain inline plain-text
+/// values for sensitive header/env keys.  Agents commit project mcp.json files;
+/// secrets must travel as `{"$secret": "ENV_VAR"}` references, not bare strings.
+pub fn validate_project_store(store: &McpStore) -> anyhow::Result<()> {
+    for (server_name, cfg) in &store.servers {
+        let pairs: Vec<(&str, &SecretString)> = match cfg {
+            McpServerConfig::Http { headers, .. } | McpServerConfig::Sse { headers, .. } => {
+                headers.iter().map(|(k, v)| (k.as_str(), v)).collect()
+            }
+            McpServerConfig::Stdio { env, .. } => {
+                env.iter().map(|(k, v)| (k.as_str(), v)).collect()
+            }
+        };
+        for (key, value) in pairs {
+            if SecretString::is_sensitive_key(key) {
+                if let SecretString::Plain(_) = value {
+                    anyhow::bail!(
+                        "project mcp.json: server '{}' key '{}' contains an inline sensitive \
+                         value; use {{\"$secret\": \"ENV_VAR_NAME\"}} instead",
+                        server_name,
+                        key
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Filter rules — mirrors what each provider's `--disallowedTools` /
@@ -219,17 +331,7 @@ impl McpStore {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let raw = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(raw.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, path)?;
-        Ok(())
+        crate::json_store::atomic_write_json_locked(path, self)
     }
 }
 
@@ -240,7 +342,55 @@ pub fn global_store_path() -> Option<PathBuf> {
 }
 
 pub fn project_store_path(project_dir: &Path) -> PathBuf {
-    project_dir.join(".bro").join("mcp.json")
+    project_dir.join(".bbox").join("mcp.json")
+}
+
+#[cfg(unix)]
+fn make_project_symlink(target: &Path, link: &Path) -> Result<()> {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    make_file_symlink(target, link)
+        .with_context(|| format!("symlinking {} -> {}", link.display(), target.display()))
+}
+
+#[cfg(not(unix))]
+fn make_project_symlink(_target: &Path, _link: &Path) -> Result<()> {
+    anyhow::bail!("mcp.json legacy migration is currently unsupported on this platform");
+}
+
+pub(crate) fn migrate_project_mcp_path(project_dir: &Path) -> Result<()> {
+    let legacy_path = project_dir.join(".bro").join("mcp.json");
+    let canonical_path = project_store_path(project_dir);
+
+    let new_exists = canonical_path.exists();
+    let old_exists = legacy_path.exists();
+    if !old_exists {
+        return Ok(());
+    }
+    if !new_exists {
+        if let Some(parent) = canonical_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::rename(&legacy_path, &canonical_path)
+            .with_context(|| format!("moving {} to {}", legacy_path.display(), canonical_path.display()))?;
+        make_project_symlink(&canonical_path, &legacy_path)?;
+        return Ok(());
+    }
+
+    let old_content = fs::read_to_string(&legacy_path)
+        .with_context(|| format!("reading {}", legacy_path.display()))?;
+    let new_content = fs::read_to_string(&canonical_path)
+        .with_context(|| format!("reading {}", canonical_path.display()))?;
+    if old_content == new_content {
+        fs::remove_file(&legacy_path)
+            .with_context(|| format!("replacing {}", legacy_path.display()))?;
+        make_project_symlink(&canonical_path, &legacy_path)?;
+    } else {
+        tracing::warn!("\\.bbox/mcp.json wins; legacy .bro/mcp.json retained for review");
+    }
+    Ok(())
 }
 
 // ── Overlay resolution ─────────────────────────────────────────────
@@ -829,11 +979,14 @@ fn action_list(p: &McpToolParams) -> Result<String> {
     let global_path = global_store_path().context("home dir")?;
     let global = McpStore::load(&global_path)?;
 
-    let project = p
-        .project
-        .as_deref()
-        .map(|pd| McpStore::load(&project_store_path(Path::new(pd))))
-        .transpose()?;
+    let project = p.project.as_deref().map(|pd| {
+        let cfg = crate::config::load_project(Path::new(pd))?;
+        if cfg.mcp.enabled == Some(false) {
+            return Ok(None);
+        }
+        McpStore::load(&project_store_path(Path::new(pd))).map(Some)
+    });
+    let project = project.transpose()?.flatten();
 
     let eff = resolve_effective(&global, project.as_ref(), false);
 
@@ -888,7 +1041,13 @@ fn action_add(p: &McpToolParams) -> Result<String> {
     let url = p.url.as_deref().context("'url' is required")?;
     let transport = p.transport.as_deref().unwrap_or("http");
     let scope = p.scope.as_deref().unwrap_or("global");
-    let headers = p.headers.clone().unwrap_or_default();
+    let headers: BTreeMap<String, SecretString> = p
+        .headers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k, SecretString::Plain(v)))
+        .collect();
     let exclude = p.exclude_tools.clone().unwrap_or_default();
 
     // Append ?surface= to URL when surface is specified.
@@ -956,9 +1115,11 @@ fn action_add(p: &McpToolParams) -> Result<String> {
 
     // Persist intent regardless of fan-out outcome — `sync` can replay
     // failed providers later, but only if we recorded the config.
-    let mut store = McpStore::load(&path)?;
-    store.servers.insert(name.to_string(), config);
-    store.save(&path)?;
+    crate::json_store::with_store_lock(&path.clone(), || {
+        let mut store = McpStore::load(&path)?;
+        store.servers.insert(name.to_string(), config);
+        store.save(&path)
+    })?;
 
     let mut lines = vec![format!("Saved {name} to {}", path.display())];
     lines.extend(fanout_lines);
@@ -970,9 +1131,12 @@ fn action_remove(p: &McpToolParams) -> Result<String> {
     let scope = p.scope.as_deref().unwrap_or("global");
 
     let path = resolve_scope_path(p)?;
-    let mut store = McpStore::load(&path)?;
-    let had = store.servers.remove(name).is_some();
-    store.save(&path)?;
+    let had = crate::json_store::with_store_lock(&path.clone(), || {
+        let mut store = McpStore::load(&path)?;
+        let had = store.servers.remove(name).is_some();
+        store.save(&path)?;
+        Ok(had)
+    })?;
 
     let mut lines = vec![if had {
         format!("Removed {name} from {}", path.display())
@@ -1001,21 +1165,24 @@ fn action_filter(p: &McpToolParams, disallow: bool) -> Result<String> {
     let pattern = p.pattern.as_deref().context("'pattern' is required")?;
     let normalized = normalize_filter_pattern(pattern);
     let path = resolve_scope_path(p)?;
-    let mut store = McpStore::load(&path)?;
+    crate::json_store::with_store_lock(&path.clone(), || {
+        let mut store = McpStore::load(&path)?;
 
-    let list = if disallow {
-        &mut store.filters.disallow
-    } else {
-        &mut store.filters.allow
-    };
-    if list.iter().any(|p| p == &normalized) {
-        return Ok(format!(
-            "{} pattern {normalized} already present",
-            if disallow { "disallow" } else { "allow" }
-        ));
-    }
-    list.push(normalized.clone());
-    store.save(&path)?;
+        let list = if disallow {
+            &mut store.filters.disallow
+        } else {
+            &mut store.filters.allow
+        };
+        if list.iter().any(|p| p == &normalized) {
+            return Ok(format!(
+                "{} pattern {normalized} already present",
+                if disallow { "disallow" } else { "allow" }
+            ));
+        }
+        list.push(normalized.clone());
+        store.save(&path)?;
+        Ok(String::new())
+    })?;
 
     Ok(format!(
         "Added {} pattern {normalized} to {}",
@@ -1026,10 +1193,13 @@ fn action_filter(p: &McpToolParams, disallow: bool) -> Result<String> {
 
 fn action_clear_filters(p: &McpToolParams) -> Result<String> {
     let path = resolve_scope_path(p)?;
-    let mut store = McpStore::load(&path)?;
-    let had = !store.filters.is_empty();
-    store.filters = McpFilters::default();
-    store.save(&path)?;
+    let (had, path) = crate::json_store::with_store_lock(&path.clone(), || {
+        let mut store = McpStore::load(&path)?;
+        let had = !store.filters.is_empty();
+        store.filters = McpFilters::default();
+        store.save(&path)?;
+        Ok((had, path))
+    })?;
     Ok(if had {
         format!("Cleared filters in {}", path.display())
     } else {
@@ -1039,21 +1209,29 @@ fn action_clear_filters(p: &McpToolParams) -> Result<String> {
 
 fn action_sync(p: &McpToolParams) -> Result<String> {
     let path = resolve_scope_path(p)?;
-    let store = McpStore::load(&path)?;
+    let store = crate::json_store::with_store_lock(&path.clone(), || {
+        McpStore::load(&path)
+    })?;
 
     let mut lines = vec![format!("Syncing {} server(s)…", store.servers.len())];
     for (name, cfg) in &store.servers {
-        let (url, headers) = match cfg {
-            McpServerConfig::Http { url, headers, .. }
-            | McpServerConfig::Sse { url, headers, .. } => (url.clone(), headers.clone()),
+        let url = match cfg {
+            McpServerConfig::Http { url, .. } | McpServerConfig::Sse { url, .. } => url.clone(),
             McpServerConfig::Stdio { .. } => {
                 lines.push(format!("  {name}: stdio not yet supported via sync"));
                 continue;
             }
         };
+        let resolved_headers = match cfg.resolve_secrets() {
+            Ok(r) => r.headers,
+            Err(e) => {
+                lines.push(format!("  {name}: secret resolution failed: {e}"));
+                continue;
+            }
+        };
         let exclude = cfg.exclude_tools();
         lines.extend(fanout_parallel(|provider| {
-            let add_args = provider.build_mcp_add_http_args_full(name, &url, exclude, &headers, "user")?;
+            let add_args = provider.build_mcp_add_http_args_full(name, &url, exclude, &resolved_headers, "user")?;
             if let Some(rm) = provider.build_mcp_remove_args(name) {
                 if let Err(e) = run_cli(&provider, &rm) {
                     tracing::debug!(target: "blackbox::mcp",
@@ -1135,10 +1313,123 @@ mod tests {
             McpServerConfig::Http { headers, .. } => {
                 assert_eq!(
                     headers.get("Authorization"),
-                    Some(&"Bearer token".to_string())
+                    Some(&SecretString::Plain("Bearer token".to_string()))
                 );
             }
             _ => panic!("expected Http variant"),
+        }
+    }
+
+    #[test]
+    fn project_mcp_path_uses_bbox() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().to_string_lossy().to_string();
+        let expected = Path::new(&project).join(".bbox").join("mcp.json");
+        assert_eq!(project_store_path(Path::new(&project)), expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn project_mcp_migrates_bro_path_when_new_missing() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().to_string_lossy().to_string();
+        let legacy_path = Path::new(&project).join(".bro").join("mcp.json");
+        let new_path = project_store_path(Path::new(&project));
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        McpStore::new().save(&legacy_path).unwrap();
+
+        migrate_project_mcp_path(Path::new(&project)).unwrap();
+
+        assert!(new_path.exists());
+        assert!(legacy_path.exists());
+        assert!(legacy_path.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn project_mcp_new_path_wins_on_conflict() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().to_string_lossy().to_string();
+        let legacy_path = Path::new(&project).join(".bro").join("mcp.json");
+        let new_path = project_store_path(Path::new(&project));
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+
+        std::fs::write(&legacy_path, "legacy").unwrap();
+        std::fs::write(&new_path, "current").unwrap();
+
+        migrate_project_mcp_path(Path::new(&project)).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&legacy_path).unwrap(), "legacy");
+        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "current");
+    }
+
+    #[test]
+    fn project_mcp_disabled_ignores_overlay() {
+        let dir = tempdir().unwrap();
+        let _guard = crate::util::test_env_lock();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir.path());
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(project.join(".bbox")).unwrap();
+        std::fs::write(
+            project.join(".bbox").join("config.toml"),
+            "[mcp]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let mut store = McpStore::new();
+        store.servers.insert(
+            "project".into(),
+            McpServerConfig::Http {
+                url: "http://project".into(),
+                headers: BTreeMap::new(),
+                exclude_tools: Vec::new(),
+            },
+        );
+        let store_path = project_store_path(&project);
+        store.save(&store_path).unwrap();
+
+        let global = McpStore {
+            version: 1,
+            servers: {
+                let mut servers = BTreeMap::new();
+                servers.insert(
+                    "global".into(),
+                    McpServerConfig::Http {
+                        url: "http://global".into(),
+                        headers: BTreeMap::new(),
+                        exclude_tools: Vec::new(),
+                    },
+                );
+                servers
+            },
+            filters: McpFilters::default(),
+        };
+        global
+            .save(&global_store_path().unwrap())
+            .unwrap();
+
+        let result = action_list(&McpToolParams {
+            action: McpAction::List,
+            name: None,
+            url: None,
+            transport: None,
+            scope: Some("project".into()),
+            project: Some(project.to_string_lossy().into()),
+            pattern: None,
+            exclude_tools: None,
+            headers: None,
+            surface: None,
+        })
+        .unwrap();
+
+        assert!(result.contains("1 server(s):"));
+        assert!(result.contains("global"));
+
+        match prior {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
         }
     }
 
@@ -1190,7 +1481,10 @@ mod tests {
         match cfg {
             McpServerConfig::Http { url, headers, .. } => {
                 assert_eq!(url, "http://example.com/mcp");
-                assert_eq!(headers.get("X-Auth"), Some(&"token123".to_string()));
+                assert_eq!(
+                    headers.get("X-Auth"),
+                    Some(&SecretString::Plain("token123".to_string()))
+                );
             }
             _ => panic!("expected Http variant"),
         }
@@ -1455,5 +1749,111 @@ mod tests {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn mcp_plain_string_round_trips_unchanged() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let mut store = McpStore::new();
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Custom".to_string(), SecretString::Plain("hello".to_string()));
+        store.servers.insert(
+            "srv".into(),
+            McpServerConfig::Http {
+                url: "http://host/mcp".into(),
+                headers,
+                exclude_tools: Vec::new(),
+            },
+        );
+        store.save(&path).unwrap();
+        // Verify the file contains the bare string (not a JSON object).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"hello\""), "Plain variant must serialize as bare string");
+        assert!(!raw.contains("$secret"), "Plain variant must not emit $secret key");
+        // Reload and verify the type round-trips.
+        let loaded = McpStore::load(&path).unwrap();
+        match loaded.servers.get("srv").unwrap() {
+            McpServerConfig::Http { headers, .. } => {
+                assert_eq!(
+                    headers.get("X-Custom"),
+                    Some(&SecretString::Plain("hello".to_string()))
+                );
+            }
+            _ => panic!("expected Http"),
+        }
+    }
+
+    #[test]
+    fn mcp_secret_reference_resolves_header() {
+        let cfg = McpServerConfig::Http {
+            url: "http://host/mcp".into(),
+            headers: {
+                let mut h = BTreeMap::new();
+                h.insert(
+                    "Authorization".into(),
+                    SecretString::Secret { name: "MY_TEST_TOKEN_12345".into() },
+                );
+                h
+            },
+            exclude_tools: Vec::new(),
+        };
+        // Without the env var set, resolution must fail.
+        std::env::remove_var("MY_TEST_TOKEN_12345");
+        assert!(cfg.resolve_secrets().is_err(), "missing secret must be an error");
+
+        // With it set, resolution must succeed.
+        std::env::set_var("MY_TEST_TOKEN_12345", "Bearer xyz123");
+        let resolved = cfg.resolve_secrets().unwrap();
+        assert_eq!(resolved.headers.get("Authorization").map(|s| s.as_str()), Some("Bearer xyz123"));
+        std::env::remove_var("MY_TEST_TOKEN_12345");
+    }
+
+    #[test]
+    fn mcp_inline_sensitive_header_rejected_in_project_file() {
+        let mut store = McpStore::new();
+        store.servers.insert(
+            "remote".into(),
+            McpServerConfig::Http {
+                url: "http://remote/mcp".into(),
+                headers: {
+                    let mut h = BTreeMap::new();
+                    // Inline plain-text token in a project file should be rejected.
+                    h.insert("Authorization".into(), SecretString::Plain("Bearer secret".into()));
+                    h
+                },
+                exclude_tools: Vec::new(),
+            },
+        );
+        let result = validate_project_store(&store);
+        assert!(result.is_err(), "inline sensitive header must be rejected for project stores");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Authorization"), "error must name the offending key");
+    }
+
+    #[test]
+    fn mcp_inline_sensitive_header_allowed_in_global_file() {
+        // Global stores may use inline values — developers own their own secrets.
+        // Validation is only for project-scoped stores.
+        let mut store = McpStore::new();
+        store.servers.insert(
+            "remote".into(),
+            McpServerConfig::Http {
+                url: "http://remote/mcp".into(),
+                headers: {
+                    let mut h = BTreeMap::new();
+                    h.insert("Authorization".into(), SecretString::Plain("Bearer secret".into()));
+                    h
+                },
+                exclude_tools: Vec::new(),
+            },
+        );
+        // validate_project_store is only called for project files; global files
+        // don't go through this validation.  Assert the store round-trips cleanly.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("global-mcp.json");
+        store.save(&path).unwrap();
+        let loaded = McpStore::load(&path).unwrap();
+        assert_eq!(loaded.servers.len(), 1);
     }
 }

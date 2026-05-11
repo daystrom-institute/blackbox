@@ -115,6 +115,10 @@ impl Provider {
     }
 
     pub fn bin(&self) -> String {
+        self.bin_with_env()
+    }
+
+    fn bin_with_env(&self) -> String {
         match self {
             Provider::Claude => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
             Provider::Glm => std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into()),
@@ -128,6 +132,20 @@ impl Provider {
             Provider::Copilot => std::env::var("COPILOT_BIN").unwrap_or_else(|_| "gh".into()),
             Provider::Vibe => std::env::var("VIBE_BIN").unwrap_or_else(|_| "vibe".into()),
             Provider::Gemini => std::env::var("GEMINI_BIN").unwrap_or_else(|_| "gemini".into()),
+            Provider::Workflow => "workflow".into(),
+        }
+    }
+
+    pub fn bin_with_config(&self, cfg: &blackbox::config::ProviderConfig) -> String {
+        match self {
+            Provider::Claude => cfg.claude_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Glm => cfg.opencode_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Deepseek => cfg.opencode_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Inception => cfg.opencode_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Codex => cfg.codex_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Copilot => cfg.copilot_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Vibe => cfg.vibe_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Gemini => cfg.gemini_bin.clone().unwrap_or_else(|| self.bin_with_env()),
             Provider::Workflow => "workflow".into(),
         }
     }
@@ -371,6 +389,7 @@ impl Provider {
                     "-p".into(),
                     prompt.into(),
                     "--yolo".into(),
+                    "--skip-trust".into(),
                     "-o".into(),
                     "json".into(),
                 ];
@@ -505,6 +524,7 @@ impl Provider {
                     "-p".into(),
                     prompt.into(),
                     "--yolo".into(),
+                    "--skip-trust".into(),
                     "-o".into(),
                     "json".into(),
                 ];
@@ -2266,6 +2286,7 @@ mod tests {
         assert!(args.contains(&"--resume".to_string()));
         assert!(args.contains(&"gsid-1".to_string()));
         assert!(args.contains(&"--yolo".to_string()));
+        assert!(args.contains(&"--skip-trust".to_string()));
     }
 
     #[test]

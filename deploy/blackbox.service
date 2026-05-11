@@ -8,15 +8,12 @@ Type=simple
 ExecStart=%h/.local/bin/blackboxd
 Restart=on-failure
 RestartSec=3
-Environment=BBOX_PORT=7264
 Environment=RUST_LOG=blackbox=info
-# HTTP listener bind. Default 127.0.0.1 (loopback only — the daemon
-# exposes broad MCP authority and webhook ingestion; never put it on
-# a public interface). Set to 0.0.0.0 only if you need a Docker
-# container on the same host to deliver webhooks
-# (Forgejo/Gitea/Stripe → http://172.17.0.1:7264/webhook/...).
-# Closed-network assumption applies in 0.0.0.0 mode.
-Environment=BBOX_BIND=127.0.0.1
+# Main config defaults to %h/.config/blackbox/config.toml.
+# Use BLACKBOX_CONFIG only when this unit must point at a non-default file.
+# Environment=BLACKBOX_CONFIG=%h/.config/blackbox/config.toml
+# Optional systemd secret injection:
+# LoadCredential=voyage-api-key:%h/.local/share/blackbox/secrets/voyage-api-key
 # blackbox-owned state defaults to XDG paths under ~/.local/{state,share}.
 WorkingDirectory=%h
 # Keep stderr/stdout in journald.
