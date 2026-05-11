@@ -20,6 +20,85 @@ hand-rolled boilerplate (POJO DOJO).
 
 Tree-sitter language: `java`.
 
+## What `extract_java_class` Already Does For You
+
+Read this section before reporting "gaps" — these are the contracts the
+composite extract plan currently enforces, automatically, with no opt-in
+flags. If you see behavior that contradicts the list below, the bug is
+real; if your concern is on the list, the planner already handles it.
+
+- **Target package is filesystem-derived.** When the target path lives
+  under a `src/{main,test}/java/` ancestor, the planner emits the
+  matching package declaration on the target. No need to hand-write
+  `target_prelude` for cross-directory targets. Explicit `target_prelude`
+  > existing target file's `package` > path-derived > source-package
+  fallback (only when target shares directory with source) > hard error.
+- **Cross-package extracts widen visibility to `public`.** Moved methods,
+  generated getters/setters, and moved constants all get `public` on
+  cross-package targets. Same-package extracts use the `package` floor.
+- **Source gains an `import <target-package>.<TargetClass>;`** when the
+  resolved target package differs from the source's.
+- **Static-final captures move WITH their cross-cluster references
+  rewritten.** When a `private static final` capture is referenced from
+  source-side code outside the extracted methods, the planner:
+  - Widens its visibility on the target to the package / public floor.
+  - Rewrites every surviving source-side reference to qualified
+    `<TargetClass>.<CONST>` form (bare reads AND `df.format(...)`
+    method-call receivers).
+  - Under `deep_analysis: true`, populates a
+    `remaining_source_constant_refs` preview report listing every
+    surviving site with line/column/context — analogous to
+    `remaining_source_accessors`.
+- **Mutable-capture-with-write is refused upfront.** If an extracted
+  method body writes to a non-final source field that isn't in
+  `move_fields`, the planner returns
+  `error.bad_input(code=mutable_capture_with_write)` listing the
+  offending fields. Promoting them to a `final` ctor parameter would
+  produce moved code that fails javac `cannot assign to final variable`;
+  the operator must add the field to `move_fields` (which routes it
+  through the generated-setter delegate path).
+- **Nested-class names in `item_names` get a directed error.**
+  `extract_java_class` only takes method names. Passing an inner-class
+  name yields `error.bad_input(code=nested_class_in_item_names)` with
+  a pointer to extract the inner class manually first.
+- **`remaining_source_accessors` excludes accesses inside the methods
+  being extracted in the same plan.** Reads/writes inside `item_names`
+  bodies move with the methods; only accesses that genuinely survive on
+  source are reported. The report is a clean pre-apply preview.
+- **`rewrite_remaining_accessors` is on by default whenever
+  `move_fields` is non-empty.** Pre-apply source-side reads/writes are
+  rewritten through the delegate's generated getter/setter regardless
+  of `deep_analysis`. Pass `rewrite_remaining_accessors: false` to opt
+  out.
+- **Delegate-wiring statement is placed after the latest source-ctor
+  assignment to any captured field.** Avoids `might not have been
+  initialized` on `final` ctor-param captures and avoids null capture
+  on non-final ones. `this(...)` / `super(...)` chains are not followed
+  — the wiring lands at top-of-body in that case and may need manual
+  adjustment.
+- **External-call FIXME resolutions now include "drop the call".** For
+  void-returning external calls whose side effect doesn't apply to the
+  target, the operator-facing FIXME lists "drop the call" alongside
+  the three structural fixes (add to extracted set / callback interface
+  / inject source instance).
+- **`bbox_refactor_plan` always returns `dry_run: true`.** The response
+  field indicates "this call did not write any files" — read it as the
+  inverse of `wrote_files`. The plan is staged on disk under
+  `$BLACKBOX_STATE_DIR/refactor/plans/<name>.json` (when `output_path`
+  was passed) and is applied via a follow-up `bbox_refactor_apply`.
+- **`plan_path` round-trips.** The absolute path returned in the plan
+  response (e.g. `/home/.../refactor/plans/extract.json`) is accepted
+  verbatim by `bbox_refactor_apply(plan_path=...)`. Relative filenames
+  also work. Slot-escaping paths (`/tmp/...`, `../../etc/passwd`) are
+  still rejected.
+- **Import inference for static-call receivers.** The organize-imports
+  heuristic walking the generated target's AST recognizes type names
+  used as the receiver of `method_invocation` / `field_access`
+  (uppercase-initial identifier) in addition to `type_identifier`. JDK
+  / Vaadin / project-local types accessed as `Collectors.toList()`,
+  `BigDecimal.ZERO`, `DateUtils.parse(...)` get their imports retained
+  from the source or added from the project type index.
+
 ## Tool Sequence
 
 1. Find Java methods/types and line ranges across the project:
