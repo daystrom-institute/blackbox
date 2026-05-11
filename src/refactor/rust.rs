@@ -136,7 +136,7 @@ pub(crate) fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> 
             path_string(&target_path)
         ),
         kind: "extract_rust_items".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![
@@ -294,7 +294,7 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
             path_string(&target_path)
         ),
         kind: "extract_rust_impl_methods".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![
@@ -456,7 +456,7 @@ pub(crate) fn build_delete_rust_plan(
             path_string(&parsed.path)
         ),
         kind: "delete_rust_items".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -518,7 +518,7 @@ pub(crate) fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<Stri
             path_string(&source_path)
         ),
         kind: "add_rust_router_to_sum".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -585,7 +585,7 @@ pub(crate) fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
             path_string(&source_path)
         ),
         kind: "add_rust_mod_decl".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -654,7 +654,7 @@ pub(crate) fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
             path_string(&source_path)
         ),
         kind: "add_rust_use_decl".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -739,7 +739,7 @@ pub(crate) fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String>
             path_string(&target_path)
         ),
         kind: "copy_rust_mod_decls".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -809,7 +809,7 @@ pub(crate) fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result
             path_string(&source_path)
         ),
         kind: "rewrite_rust_mod_visibility".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -920,7 +920,7 @@ pub(crate) fn plan_rewrite_rust_item_visibility(p: &RefactorPlanParams) -> Resul
             path_string(&source_path)
         ),
         kind: "rewrite_rust_item_visibility".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -1012,7 +1012,7 @@ pub(crate) fn plan_rewrite_rust_field_visibility(p: &RefactorPlanParams) -> Resu
             path_string(&source_path)
         ),
         kind: "rewrite_rust_field_visibility".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {

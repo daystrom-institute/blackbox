@@ -1,0 +1,10 @@
+fixture_borrow_shared_ref.rs: count: copy: u32
+fixture_borrow_unique_ref.rs: cache: unique_ref: HashMap<String, String>
+fixture_borrow_move.rs: string: move: String
+fixture_borrow_interior_mutation.rs: cache: interior_mutation_call: RefCell<HashMap<String, String>>
+fixture_copy_whitelist_primitive.rs: n: copy: u32
+fixture_copy_whitelist_ref.rs: s: copy: &'a str
+fixture_copy_whitelist_array.rs: buf: copy: [u8; 32]
+fixture_copy_whitelist_option_prelude.rs: maybe: copy: Option<u32>
+fixture_copy_whitelist_option_qualified.rs: maybe: copy: core::option::Option<u32>
+fixture_copy_whitelist_user_type.rs: thing: unknown_copy: MyCopyThing

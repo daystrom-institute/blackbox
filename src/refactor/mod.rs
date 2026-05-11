@@ -15,6 +15,9 @@ mod rust;
 use rust::*;
 mod java;
 use java::*;
+pub(crate) mod plan_slot;
+pub(crate) mod rust_partition;
+pub(crate) mod rust_public_api;
 
 #[cfg(test)]
 mod tests;
@@ -279,15 +282,14 @@ pub struct RefactorPlanParams {
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
-    /// Optional path to write the full RefactorPlan JSON to. When set,
-    /// the planner writes the plan to disk and returns a compact
+    /// Optional filename for writing the full RefactorPlan JSON to disk.
+    /// When set, the planner writes the plan and returns a compact
     /// `RefactorPlanSummary` instead of the full plan body. Use this for
-    /// large refactors whose plan JSON exceeds the MCP transport limit
-    /// (the daemon stringifies large parameter values past some
-    /// threshold, breaking inline `bbox_refactor_apply(plan=...)` calls
-    /// — pass `plan_path` to apply with the same path instead). Relative
-    /// paths resolve against `project_dir` or cwd. Parent directories
-    /// are created automatically.
+    /// large refactors whose plan JSON exceeds the MCP transport limit.
+    /// Must be a relative filename (no path separators that escape the
+    /// slot); it resolves under `$BLACKBOX_STATE_DIR/refactor/plans/`.
+    /// Absolute paths and slot-escaping paths are rejected. Apply the
+    /// saved plan via `bbox_refactor_apply(plan_path=<same value>)`.
     #[serde(default)]
     pub output_path: Option<String>,
     /// `lombokify_java_class`: how to handle a primitive `boolean` field
@@ -471,9 +473,10 @@ pub struct FileMove {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticStatus {
-    StructuralOnly,
+    SyntaxOnly,
+    #[serde(alias = "unverified")]
+    IndexedHints,
     LspVerified,
-    Unverified,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, schemars::JsonSchema)]
@@ -754,7 +757,7 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
 pub fn plan_with_ctx(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
     let plan_json = plan_dispatch(p, ctx)?;
     if let Some(output_path) = p.output_path.as_deref() {
-        let resolved = resolve_path(p.project_dir.as_deref(), output_path)?;
+        let resolved = plan_slot::resolve_plan_write_path(output_path)?;
         if let Some(parent) = resolved.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).with_context(|| {
@@ -815,7 +818,7 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
     }
     let plan: RefactorPlan = match (&p.plan, p.plan_path.as_deref()) {
         (_, Some(path)) => {
-            let resolved = PathBuf::from(path);
+            let resolved = plan_slot::resolve_plan_read_path(path)?;
             let body = fs::read_to_string(&resolved)
                 .with_context(|| format!("reading plan_path {}", resolved.display()))?;
             serde_json::from_str(&body).with_context(|| {
@@ -1486,7 +1489,7 @@ fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
             path_string(&target_path)
         ),
         kind: "move_file".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: vec![FileMove {
             source_path: path_string(&source_path),
@@ -1557,7 +1560,7 @@ fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
             edits.len()
         ),
         kind: "replace_text".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -1588,7 +1591,7 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
     let plan = RefactorPlan {
         title: format!("write complete file {}", path_string(&source_path)),
         kind: "write_file".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -1637,7 +1640,7 @@ fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
             path_string(&source_path)
         ),
         kind: "ensure_toml_table".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {

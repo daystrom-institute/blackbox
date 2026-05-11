@@ -2990,7 +2990,7 @@ mod tests {
         let plan = RefactorPlan {
             title: "bad".into(),
             kind: "extract_rust_items".into(),
-            semantic_status: SemanticStatus::StructuralOnly,
+            semantic_status: SemanticStatus::SyntaxOnly,
             dry_run: true,
             file_moves: Vec::new(),
             edits: vec![FileEdit {
@@ -3028,7 +3028,7 @@ mod tests {
         let plan = RefactorPlan {
             title: "practice".into(),
             kind: "extract_rust_items".into(),
-            semantic_status: SemanticStatus::StructuralOnly,
+            semantic_status: SemanticStatus::SyntaxOnly,
             dry_run: true,
             file_moves: Vec::new(),
             edits: vec![FileEdit {
@@ -3064,5 +3064,109 @@ mod tests {
         let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(applied.status, "ok");
         assert_eq!(fs::read_to_string(source).unwrap(), "fn g() {}\n");
+    }
+}
+
+#[cfg(test)]
+mod rx_f1a_taxonomy_tests {
+    use super::*;
+
+    #[test]
+    fn syntax_only_roundtrips() {
+        let s = serde_json::to_string(&SemanticStatus::SyntaxOnly).unwrap();
+        assert_eq!(s, r#""syntax_only""#);
+        let back: SemanticStatus = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, SemanticStatus::SyntaxOnly);
+    }
+
+    #[test]
+    fn indexed_hints_roundtrips() {
+        let s = serde_json::to_string(&SemanticStatus::IndexedHints).unwrap();
+        assert_eq!(s, r#""indexed_hints""#);
+        let back: SemanticStatus = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, SemanticStatus::IndexedHints);
+    }
+
+    #[test]
+    fn lsp_verified_roundtrips() {
+        let s = serde_json::to_string(&SemanticStatus::LspVerified).unwrap();
+        assert_eq!(s, r#""lsp_verified""#);
+        let back: SemanticStatus = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, SemanticStatus::LspVerified);
+    }
+
+    #[test]
+    fn unverified_alias_deserializes_to_indexed_hints() {
+        let back: SemanticStatus = serde_json::from_str(r#""unverified""#).unwrap();
+        assert_eq!(back, SemanticStatus::IndexedHints);
+    }
+}
+
+#[cfg(test)]
+mod rx_f1b_plan_slot_tests {
+    use crate::refactor::plan_slot;
+    use std::env;
+
+    fn with_state_dir<F: FnOnce()>(dir: &std::path::Path, f: F) {
+        let _lock = crate::util::test_env_lock();
+        let old = env::var("BLACKBOX_STATE_DIR").ok();
+        unsafe { env::set_var("BLACKBOX_STATE_DIR", dir) };
+        f();
+        match old {
+            Some(v) => unsafe { env::set_var("BLACKBOX_STATE_DIR", v) },
+            None => unsafe { env::remove_var("BLACKBOX_STATE_DIR") },
+        }
+    }
+
+    #[test]
+    fn output_path_resolves_under_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let resolved = plan_slot::resolve_plan_write_path("my-plan.json").unwrap();
+            let slot = plan_slot::ensure_plan_slot().unwrap();
+            assert!(
+                resolved.starts_with(&slot),
+                "expected {} to be under slot {}",
+                resolved.display(),
+                slot.display()
+            );
+            assert!(resolved.ends_with("my-plan.json"));
+        });
+    }
+
+    #[test]
+    fn output_path_absolute_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let err = plan_slot::resolve_plan_write_path("/tmp/x.json").unwrap_err();
+            assert!(
+                err.to_string().contains("plan_path_outside_slot"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn output_path_escape_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let err = plan_slot::resolve_plan_write_path("../../etc/passwd").unwrap_err();
+            assert!(
+                err.to_string().contains("plan_path_outside_slot"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn plan_path_read_escape_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let err = plan_slot::resolve_plan_read_path("../../foo.json").unwrap_err();
+            assert!(
+                err.to_string().contains("plan_path_outside_slot"),
+                "unexpected error: {err}"
+            );
+        });
     }
 }

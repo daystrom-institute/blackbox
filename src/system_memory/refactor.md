@@ -198,6 +198,15 @@ small files only; status defaults to at most 200 returned items and reports
    Do not pre-create placeholder files or pass `allow_dirty_worktree=true` just
    to let an extraction produce a new type.
 
+   **Plan-file slot policy (RX-F1b).** `output_path` (planner write) and
+   `plan_path` (applier read) both resolve under
+   `$BLACKBOX_STATE_DIR/refactor/plans/`. Pass a plain relative filename such as
+   `"my-plan.json"` — not an absolute path. Absolute paths and filenames that
+   escape the slot via `../` traversal are rejected with
+   `error.bad_input(code=plan_path_outside_slot)`. The `plan_path` value in the
+   returned `RefactorPlanSummary` is the absolute on-disk path; pass only the
+   filename portion (e.g. `Path::file_name`) when calling apply.
+
 6. Run the language toolchain after apply. Tree-sitter proves syntax shape, not
    semantic binding. For compound phases, add command validation steps directly
    to `bbox_refactor_run`:

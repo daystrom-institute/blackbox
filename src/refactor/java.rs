@@ -2137,7 +2137,7 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
             target_path.display()
         ),
         kind: "extract_java_methods".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![
@@ -2713,7 +2713,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             source_path.display()
         ),
         kind: "extract_java_class".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![
@@ -2833,7 +2833,7 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
             target_path.display()
         ),
         kind: "extract_java_nested_classes".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![
@@ -2904,7 +2904,7 @@ pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
             source_path.display()
         ),
         kind: "add_java_fields".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -2958,7 +2958,7 @@ pub(crate) fn plan_add_java_constructor(p: &RefactorPlanParams) -> Result<String
     let plan = RefactorPlan {
         title: format!("Add Java constructor to {}", source_path.display()),
         kind: "add_java_constructor".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -3045,7 +3045,7 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
             target_path.display()
         ),
         kind: "move_java_field".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![
@@ -3199,7 +3199,7 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
             target_path.display()
         ),
         kind: "move_java_constant".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits,
@@ -4234,7 +4234,7 @@ pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String>
             source_path.display()
         ),
         kind: "update_java_callers".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -4453,7 +4453,7 @@ pub(crate) fn plan_add_java_delegate_field(p: &RefactorPlanParams) -> Result<Str
             source_path.display()
         ),
         kind: "add_java_delegate_field".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -4564,7 +4564,7 @@ pub(crate) fn plan_rewrite_java_visibility(p: &RefactorPlanParams) -> Result<Str
             source_path.display()
         ),
         kind: "rewrite_java_visibility".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -4742,7 +4742,7 @@ pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String>
     let plan = RefactorPlan {
         title: format!("Add implements {} to class {}", interface_name, class_name),
         kind: "add_java_implements".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -5018,7 +5018,7 @@ let ident = chunk.split_whitespace().last().unwrap_or("").trim();
             interface_sigs.len()
         ),
         kind: "extract_java_interface".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits,
@@ -5098,7 +5098,7 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
             source_path.display()
         ),
         kind: "migrate_java_type_usages".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -5213,7 +5213,7 @@ pub(crate) fn plan_java_lsp_organize_imports(
             }
             (
                 heuristic_java_organize_imports(&project_dir, &source_path)?,
-                SemanticStatus::StructuralOnly,
+                SemanticStatus::SyntaxOnly,
             )
         }
     };
@@ -6460,7 +6460,7 @@ fn plan_lombokify_java_tree(p: &RefactorPlanParams, dir: &Path) -> Result<String
             dir.display()
         ),
         kind: "lombokify_java_class".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: all_edits,
@@ -6995,7 +6995,7 @@ fn plan_lombokify_java_class_single(
             source_path.display()
         ),
         kind: "lombokify_java_class".to_string(),
-        semantic_status: SemanticStatus::StructuralOnly,
+        semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
@@ -11252,10 +11252,14 @@ mod tests {
              }\n",
         )
         .unwrap();
-        let plan_path = dir.path().join("plan.json");
+        // Point BLACKBOX_STATE_DIR at a temp dir so the slot resolves there.
+        let state_dir = tempfile::tempdir().unwrap();
+        let _lock = crate::util::test_env_lock();
+        unsafe { std::env::set_var("BLACKBOX_STATE_DIR", state_dir.path()) };
         let mut params = java_plan_params("lombokify_java_class", &path);
-        params.output_path = Some(path_string(&plan_path));
+        params.output_path = Some("pair-plan.json".to_string());
         let response_text = plan(&params).unwrap();
+        unsafe { std::env::remove_var("BLACKBOX_STATE_DIR") };
         // Response is a summary, not a full RefactorPlan.
         let summary: RefactorPlanSummary = serde_json::from_str(&response_text).unwrap();
         assert_eq!(summary.status, "ok");
@@ -11264,9 +11268,15 @@ mod tests {
         assert!(summary.total_edits > 0);
         assert_eq!(summary.files.len(), 1);
         assert!(summary.files[0].path.ends_with("Pair.java"));
-        // Plan file written to disk.
+        // Plan file written to the slot.
+        let plan_path = std::path::Path::new(&summary.plan_path);
         assert!(plan_path.is_file(), "plan file should be written to disk");
-        let written = fs::read_to_string(&plan_path).unwrap();
+        assert!(
+            plan_path.starts_with(state_dir.path()),
+            "plan should be inside the slot: {}",
+            plan_path.display()
+        );
+        let written = fs::read_to_string(plan_path).unwrap();
         let on_disk: RefactorPlan = serde_json::from_str(&written).unwrap();
         assert_eq!(on_disk.kind, "lombokify_java_class");
         assert_eq!(on_disk.edits.len(), 1);
@@ -11288,16 +11298,25 @@ mod tests {
              }\n",
         )
         .unwrap();
-        let plan_path = dir.path().join("plans/bean-plan.json");
+        // Point BLACKBOX_STATE_DIR at a temp dir so both plan + apply use the slot.
+        let state_dir = tempfile::tempdir().unwrap();
+        let _lock = crate::util::test_env_lock();
+        unsafe { std::env::set_var("BLACKBOX_STATE_DIR", state_dir.path()) };
         let mut params = java_plan_params("lombokify_java_class", &src);
-        params.output_path = Some(path_string(&plan_path));
+        params.output_path = Some("bean-plan.json".to_string());
         let summary_text = plan(&params).unwrap();
         let summary: RefactorPlanSummary = serde_json::from_str(&summary_text).unwrap();
-        // Apply by reading the plan from disk.
+        // Derive relative plan_path from summary for apply (or use the slot filename).
+        let plan_filename = std::path::Path::new(&summary.plan_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        // Apply by reading the plan from the slot.
         let response = apply(
             &RefactorApplyParams {
                 plan: serde_json::Value::Null,
-                plan_path: Some(summary.plan_path.clone()),
+                plan_path: Some(plan_filename),
                 confirm: Some(true),
                 allow_dirty_worktree: Some(true),
                 allow_unregistered_paths: Some(true),
@@ -11305,6 +11324,7 @@ mod tests {
             &[project_record(dir.path())],
         )
         .unwrap();
+        unsafe { std::env::remove_var("BLACKBOX_STATE_DIR") };
         let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(applied.status, "ok");
         assert!(
