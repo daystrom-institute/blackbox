@@ -829,6 +829,7 @@ gradle test
 
 - Do not apply Rust plan kinds to Java files.
 - Tree-sitter does not enforce package/path consistency, generic type binding, annotation processing, Lombok/generated code, or classpath semantics.
+- **Annotation-processor-generated members are invisible to dependency analysis.** The `inherited_dependencies` walk traverses `extends` / `implements` chains in the project type index — it does not run annotation processors. Class-level annotations that generate members (Lombok `@Slf4j` → `log`, `@Data` / `@Getter` / `@Setter` → accessors, MapStruct-generated mappers, etc.) are not surfaced as inherited dependencies. If the extracted method body references such a generated member (`log.info(...)` from `@Slf4j` on the source class), the extracted target must either re-declare the same class-level annotation or accept the member as a constructor-injected dependency. The composite plan does not propagate class-level annotations between source and target.
 - `java_lsp_organize_imports` is strongest with `jdtls` installed and available
   in the system path. JDTLS is now run as a warm per-project session reused
   across calls, so cold-start cost is paid once per `(project_dir, java)`
