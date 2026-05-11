@@ -91,13 +91,15 @@ real; if your concern is on the list, the planner already handles it.
   verbatim by `bbox_refactor_apply(plan_path=...)`. Relative filenames
   also work. Slot-escaping paths (`/tmp/...`, `../../etc/passwd`) are
   still rejected.
-- **Import inference for static-call receivers.** The organize-imports
-  heuristic walking the generated target's AST recognizes type names
-  used as the receiver of `method_invocation` / `field_access`
+- **Import inference for static-call and method-reference receivers.**
+  The organize-imports heuristic walking the generated target's AST
+  recognizes type names used as the receiver of `method_invocation` /
+  `field_access` *and* as the qualifier of `method_reference` nodes
   (uppercase-initial identifier) in addition to `type_identifier`. JDK
   / Vaadin / project-local types accessed as `Collectors.toList()`,
-  `BigDecimal.ZERO`, `DateUtils.parse(...)` get their imports retained
-  from the source or added from the project type index.
+  `BigDecimal.ZERO`, `DateUtils.parse(...)`, or
+  `FormCategoryEnumConverter::toLabel` get their imports retained from
+  the source or added from the project type index.
 
 ## Tool Sequence
 
@@ -460,7 +462,7 @@ referenced by simple name get a fresh import added when the type index
 can resolve them uniquely. `import static …` and wildcard imports are
 kept verbatim.
 
-The reference walker recognizes type names in three syntactic positions:
+The reference walker recognizes type names in four syntactic positions:
 
 - `type_identifier` nodes — variable declarations, return types, field
   types, generic bounds, etc.
@@ -471,6 +473,10 @@ The reference walker recognizes type names in three syntactic positions:
   `field_access` — captures static member references like
   `BigDecimal.ZERO`, `Optional.empty`-as-receiver patterns, enum value
   reads.
+- Uppercase-initial `identifier` used as the qualifier of a
+  `method_reference` (`Foo::bar` syntax) — captures method references
+  like `FormCategoryEnumConverter::toLabel` that drop the implicit
+  type qualifier onto the enclosing call.
 
 The uppercase-initial check is convention-based; lower-case identifiers
 in receiver position are treated as values, not types. False positives

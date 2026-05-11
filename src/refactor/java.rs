@@ -385,6 +385,27 @@ fn collect_java_type_references(node: Node<'_>, source: &str, out: &mut HashSet<
             }
         }
     }
+    // `method_reference` nodes (`Foo::bar`) parse with the qualifier as
+    // the first named child — an `identifier` for `Foo::bar`, or
+    // `scoped_identifier` / `this` / `super` / `type_identifier` for the
+    // other shapes. The uppercase-initial identifier case is the same
+    // convention-based type signal handled above for static-call
+    // receivers; without it, `setItemLabelGenerator(EnumConverter::toLabel)`
+    // moves to the extracted target with its `EnumConverter` import pruned.
+    if node.kind() == "method_reference" {
+        let mut cursor = node.walk();
+        if let Some(qualifier) = node.named_children(&mut cursor).next() {
+            if qualifier.kind() == "identifier" {
+                if let Ok(text) = qualifier.utf8_text(source.as_bytes()) {
+                    if text.chars().next().is_some_and(|c| c.is_uppercase())
+                        && !java_builtin_type(text)
+                    {
+                        out.insert(text.to_string());
+                    }
+                }
+            }
+        }
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_java_type_references(child, source, out);
@@ -11272,6 +11293,54 @@ mod tests {
         assert!(
             replacement.contains("import b.DateUtils;"),
             "Gap 4: singular static-call import must be retained: {replacement}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_retains_import_for_method_reference_qualifier() {
+        // Method references (`Converter::toLabel`) parse with the type
+        // qualifier as the first named child of a `method_reference` node
+        // — same uppercase-initial type-shape signal as a static-call
+        // receiver. Without picking these up, an extracted body like
+        // `setItemLabelGenerator(EnumConverter::toLabel)` loses the
+        // source's `import b.EnumConverter;` on the generated target.
+        let dir = tempfile::tempdir().unwrap();
+        let a_pkg = dir.path().join("src/main/java/a");
+        let b_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&a_pkg).unwrap();
+        fs::create_dir_all(&b_pkg).unwrap();
+        fs::write(
+            b_pkg.join("EnumConverter.java"),
+            "package b;\npublic class EnumConverter { public static String toLabel(Object v) { return \"\"; } }\n",
+        )
+        .unwrap();
+        let source = a_pkg.join("Source.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import b.EnumConverter;\n\
+             import java.util.function.Function;\n\
+             public class Source {\n\
+            \x20   Function<Object,String> labels() { return EnumConverter::toLabel; }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = a_pkg.join("Extracted.java");
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Extracted".to_string());
+        params.delegate_field = Some("extracted".to_string());
+        params.item_names = Some(vec!["labels".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_edit = &plan.edits[1];
+        let replacement = &target_edit.edits[0].replacement;
+        assert!(
+            replacement.contains("import b.EnumConverter;"),
+            "method-reference qualifier import must be retained: {replacement}"
         );
     }
 
