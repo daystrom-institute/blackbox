@@ -2433,13 +2433,26 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         java_constructor_decl(&target_class_name, "public", &dependency_params, true, None)?
     };
 
-    // Gap 18: when the operator opted in (deep_analysis on, plus the
-    // `rewrite_remaining_accessors` toggle which defaults to true under
-    // deep_analysis), generate getter/setter methods on the target for
-    // each moved field so the source-side rewrites have something to call.
+    // Gap 18 + Gap 6: generate getter/setter methods on the target for each
+    // moved field, plus rewrite remaining source-side reads/writes through
+    // the delegate.
+    //
+    // Gap 6 decouples this from `deep_analysis`. Previously the accessor
+    // rewrite required `deep_analysis=true` AND `rewrite_remaining_accessors`
+    // unset/true; with `deep_analysis=false` a `move_fields` extract would
+    // silently miscompile (the field declarations move but every read/write
+    // in the source class stays as a bare reference). The accessor rewriter
+    // doesn't need the full call-graph walk — it only needs to know "this
+    // field was moved." So we now default `rewrite_remaining=true` whenever
+    // `move_fields` is non-empty, regardless of `deep_analysis`.
+    //
+    // Operator opt-out: `rewrite_remaining_accessors=false` (preserves the
+    // legacy report-only behavior under `deep_analysis=true`, and disables
+    // the new always-on rewrite under `deep_analysis=false`).
+    //
     // Generated accessors honour the same visibility floor used for the
     // moved methods (`package` same-package, `public` cross-package).
-    let rewrite_remaining = p.deep_analysis.unwrap_or(false)
+    let rewrite_remaining = !selected_fields.is_empty()
         && p.rewrite_remaining_accessors.unwrap_or(true);
     let accessor_specs: Vec<DelegateAccessorSpec> = if rewrite_remaining {
         selected_fields
@@ -2766,17 +2779,21 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             constructor.trim_end()
         );
     }
-    source_edits.extend(java_caller_rewrite_edits(
+    // Compute caller rewrites separately so they can be threaded into the
+    // accessor-rewrite pass below (Gap 1: caller-rewrite zero-width inserts
+    // inside an LHS-write RHS must be absorbed into the LHS-write rendering,
+    // not added to the global edit list).
+    let caller_edits = java_caller_rewrite_edits(
         &parsed,
         method_names,
         delegate_field,
         &removed_ranges,
-    )?);
+    )?;
 
-    // Gap 18: rewrite each remaining source-side read/write of a moved
-    // field through the delegate's generated getter/setter. Skipped when
-    // either deep_analysis is off (no analysis to drive it) OR the operator
-    // opted out via rewrite_remaining_accessors=false.
+    // Gap 18 + Gap 6: rewrite each remaining source-side read/write of a
+    // moved field through the delegate's generated getter/setter. Now fires
+    // whenever `move_fields` is non-empty (regardless of `deep_analysis`)
+    // unless the operator explicitly passes `rewrite_remaining_accessors=false`.
     if rewrite_remaining && !accessor_specs.is_empty() {
         // Skip ranges include both the moved field declarations AND the
         // moved method bodies — accesses inside moved methods are about to
@@ -2791,13 +2808,18 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 .iter()
                 .map(|method| (method.item.byte_start, method.item.byte_end)),
         );
-        let rewrite_edits = compute_remaining_accessor_rewrite_edits(
-            &parsed,
-            &accessor_specs,
-            &skip_ranges,
-            delegate_field,
-        );
-        source_edits.extend(rewrite_edits);
+        let (accessor_rewrite_edits, residual_caller_edits) =
+            compute_remaining_accessor_rewrite_edits(
+                &parsed,
+                &accessor_specs,
+                &skip_ranges,
+                delegate_field,
+                caller_edits,
+            )?;
+        source_edits.extend(residual_caller_edits);
+        source_edits.extend(accessor_rewrite_edits);
+    } else {
+        source_edits.extend(caller_edits);
     }
 
     source_edits.sort_by_key(|edit| edit.byte_start);
@@ -3738,7 +3760,8 @@ fn compute_remaining_accessor_rewrite_edits(
     specs: &[DelegateAccessorSpec],
     moved_decl_ranges: &[(usize, usize)],
     delegate_field: &str,
-) -> Vec<TextEdit> {
+    caller_edits: Vec<TextEdit>,
+) -> Result<(Vec<TextEdit>, Vec<TextEdit>)> {
     let spec_by_name: HashMap<&str, &DelegateAccessorSpec> = specs
         .iter()
         .map(|spec| (spec.field_name.as_str(), spec))
@@ -3868,6 +3891,31 @@ fn compute_remaining_accessor_rewrite_edits(
     let mut rhs_sub_edits: Vec<Vec<TextEdit>> = (0..lhs_write_sites.len())
         .map(|_| Vec::new())
         .collect();
+
+    // Gap 1: caller-rewrite absorption. `java_caller_rewrite_edits` emits
+    // zero-width inserts at the start of `method_invocation` nodes (e.g.
+    // `extractedGrid.` before `buildGrid()`). When an LHS-write of a moved
+    // field has an RHS that contains such a call (`grid = buildGrid();`),
+    // the LHS-write rewrite renders the WHOLE assignment as a single edit
+    // spanning the assignment range — and the caller-rewrite zero-width
+    // insert lands inside that span, tripping the planner's overlap
+    // validator. Absorb every caller edit whose range is fully inside an
+    // LHS-write RHS into that site's sub-edits, leaving the rest in the
+    // residual list to return to the caller.
+    let mut residual_caller_edits: Vec<TextEdit> = Vec::new();
+    for edit in caller_edits {
+        let absorbed = lhs_write_sites
+            .iter()
+            .position(|site| {
+                edit.byte_start >= site.rhs.start_byte() && edit.byte_end <= site.rhs.end_byte()
+            });
+        match absorbed {
+            Some(site_idx) => {
+                rhs_sub_edits[site_idx].push(edit);
+            }
+            None => residual_caller_edits.push(edit),
+        }
+    }
 
     let mut stack = vec![parsed.tree.root_node()];
     while let Some(node) = stack.pop() {
@@ -4057,8 +4105,55 @@ fn compute_remaining_accessor_rewrite_edits(
         });
     }
 
+    // Gap 1: filter + validate against LHS-write containment leaks.
+    //
+    // The two-pass walk above catches RHS sub-edits (bucket a) and the LHS
+    // access itself (bucket b), so in theory no leftover edit should land
+    // strictly inside an LHS-write site's full assign span. In practice
+    // zero-width inserts at the LHS position have slipped through (see
+    // JAVA_TOOL_GAPS Gap 1: `33824..33880 overlaps 33854..33854`). Belt-
+    // and-suspenders: drop any non-rendering edit whose range is fully
+    // contained within an LHS-write span, then assert the invariant.
+    let lhs_full_ranges: Vec<(usize, usize)> = lhs_write_sites
+        .iter()
+        .map(|site| (site.assign.start_byte(), site.assign.end_byte()))
+        .collect();
+    edits.retain(|edit| {
+        // Keep the LHS-write rendering edits themselves (they ARE the
+        // span). Drop any other edit whose range is fully contained.
+        let is_rendering = lhs_full_ranges
+            .iter()
+            .any(|(s, e)| *s == edit.byte_start && *e == edit.byte_end);
+        if is_rendering {
+            return true;
+        }
+        !lhs_full_ranges
+            .iter()
+            .any(|(s, e)| edit.byte_start >= *s && edit.byte_end <= *e)
+    });
+    for edit in &edits {
+        let is_rendering = lhs_full_ranges
+            .iter()
+            .any(|(s, e)| *s == edit.byte_start && *e == edit.byte_end);
+        if is_rendering {
+            continue;
+        }
+        if let Some((s, e)) = lhs_full_ranges
+            .iter()
+            .find(|(s, e)| edit.byte_start >= *s && edit.byte_end <= *e)
+        {
+            bail!(
+                "internal: accessor rewrite emitted edit {}..{} contained within LHS-write span {}..{} \
+                 (Gap 1 containment invariant violated; filter logic broken)",
+                edit.byte_start,
+                edit.byte_end,
+                s,
+                e
+            );
+        }
+    }
     edits.sort_by_key(|e| e.byte_start);
-    edits
+    Ok((edits, residual_caller_edits))
 }
 
 fn ranges_overlap(a: (usize, usize), b: (usize, usize)) -> bool {
@@ -9739,6 +9834,52 @@ mod tests {
         );
     }
 
+    // Gap 1 regression: LHS-write whose RHS contains a method invocation
+    // that update_java_callers rewrites. Pre-Gap-1 the planner emitted a
+    // zero-width caller-rewrite insert at the start of `buildGrid()` AND
+    // a span-edit covering the whole assignment for the LHS-write — the
+    // zero-width edit landed inside the span and the planner aborted with
+    // `overlapping edits: A..B overlaps X..X`. After the fix the caller
+    // rewrite is absorbed into the LHS-write's rendered RHS text.
+    #[test]
+    fn extract_java_class_lhs_write_with_moved_method_call_in_rhs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("ExtractedGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class Dashboard {\n\
+            \x20   private final Admin admin;\n\
+            \x20   private Grid grid;\n\
+            \x20   Dashboard() { grid = buildGrid(); refreshGrid(); }\n\
+            \x20   Grid buildGrid() { return admin.load(); }\n\
+            \x20   void refreshGrid() { grid.refresh(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("ExtractedGrid".to_string());
+        params.delegate_field = Some("extractedGrid".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string(), "refreshGrid".to_string()]);
+        params.move_fields = Some(vec!["grid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        // The plan call itself must not fail with `overlapping edits`.
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        // The whole `grid = buildGrid();` assignment should become a single
+        // setter call whose argument is the caller-rewritten method call.
+        assert!(
+            rewritten.contains("extractedGrid.setGrid(extractedGrid.buildGrid())"),
+            "expected absorbed caller rewrite inside setter: {rewritten}"
+        );
+    }
+
     // Gap 27: assignment where RHS does NOT reference the moved field — the
     // single-edit write rewrite must still cover the whole assignment.
     #[test]
@@ -10055,9 +10196,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_java_class_no_deep_analysis_no_rewrites_no_report() {
-        // Without deep_analysis the report is empty AND no rewrites are
-        // emitted (matches pre-Gap-18 behavior).
+    fn extract_java_class_no_deep_analysis_still_rewrites_when_fields_move() {
+        // Gap 6: `rewrite_remaining_accessors` is decoupled from
+        // `deep_analysis`. Whenever `move_fields` is non-empty the source-
+        // side reads/writes get rewritten through the delegate's accessors
+        // (and the target gains matching getter/setter declarations), even
+        // without `deep_analysis=true`. The `remaining_source_accessors`
+        // REPORT remains gated on `deep_analysis` — that's a separate
+        // diagnostic-only output.
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("View.java");
         let target = dir.path().join("MeterGrid.java");
@@ -10083,16 +10229,59 @@ mod tests {
 
         let plan: RefactorPlan =
             serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        // Report still gated on deep_analysis.
         assert!(plan.remaining_source_accessors.is_empty());
+        // But the rewrites fire (Gap 6 fix — would have silently miscompiled).
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("delegate.getMeterGrid"),
+            "Gap 6: source-side reads should be rewritten through the delegate: {rewritten}"
+        );
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("getMeterGrid"),
+            "Gap 6: target should expose accessors for moved fields: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_no_deep_analysis_opt_out_disables_rewrites() {
+        // Gap 6 opt-out: passing `rewrite_remaining_accessors=false`
+        // explicitly turns off the new always-on rewrite behavior.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("MeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private Grid meterGrid;\n\
+            \x20   void buildGrid() { meterGrid = new Grid(); }\n\
+            \x20   void layout() { add(meterGrid); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterGrid".to_string());
+        params.delegate_field = Some("delegate".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        params.move_fields = Some(vec!["meterGrid".to_string()]);
+        params.rewrite_remaining_accessors = Some(false);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
         let rewritten = apply_source_edits(&plan, &source);
         assert!(
             !rewritten.contains("delegate.getMeterGrid"),
-            "no rewrite without deep_analysis: {rewritten}"
+            "opt-out: no rewrites when rewrite_remaining_accessors=false: {rewritten}"
         );
         let target_text = target_replacement(&plan);
         assert!(
             !target_text.contains("getMeterGrid"),
-            "no accessors on target without deep_analysis: {target_text}"
+            "opt-out: no accessors on target: {target_text}"
         );
     }
 
