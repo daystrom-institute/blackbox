@@ -201,6 +201,116 @@ fn extract_java_imports(source: &str) -> Vec<String> {
         .collect()
 }
 
+/// Walk `target_path`'s ancestors looking for a `src/<sub>/java` triple where
+/// `<sub>` is `main` or `test`. Returns the package derived from the path
+/// segments BELOW the longest (nearest) matching root, so nested Maven/Gradle
+/// modules under another module's `src/main/java/` resolve against the deeper
+/// root. Returns `None` when no matching root is found, or `Some("")` if the
+/// file sits directly under the root with no package directory.
+fn derive_java_package_from_path(target_path: &Path) -> Option<String> {
+    let parent = target_path.parent()?;
+    let segments: Vec<String> = parent
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let n = segments.len();
+    if n < 3 {
+        return None;
+    }
+    for i in (0..=n - 3).rev() {
+        if segments[i] == "src"
+            && (segments[i + 1] == "main" || segments[i + 1] == "test")
+            && segments[i + 2] == "java"
+        {
+            let pkg_parts = &segments[i + 3..];
+            return Some(pkg_parts.join("."));
+        }
+    }
+    None
+}
+
+/// Resolve the target file's package with hybrid precedence:
+///   1. Explicit `target_prelude` containing `package <foo>;`.
+///   2. Existing target file's `package` declaration.
+///   3. Source-root-derived package from `target_path`'s filesystem location.
+///   4. Source's package — only when target shares a directory with source.
+///   5. Hard error — operator must pass `target_prelude` explicitly.
+///
+/// Returns `Ok(None)` only for the default (root) package on a `src/.../java`
+/// root match with no package directory below it.
+fn resolve_java_target_package(
+    p: &RefactorPlanParams,
+    source: &str,
+    source_path: &Path,
+    target_path: &Path,
+) -> Result<Option<String>> {
+    if let Some(prelude) = p.target_prelude.as_deref() {
+        if let Some(pkg) = extract_java_package(prelude) {
+            return Ok(Some(pkg));
+        }
+    }
+    if target_path.exists() {
+        if let Ok(existing) = fs::read_to_string(target_path) {
+            if let Some(pkg) = extract_java_package(&existing) {
+                return Ok(Some(pkg));
+            }
+        }
+    }
+    if let Some(pkg) = derive_java_package_from_path(target_path) {
+        return Ok(if pkg.is_empty() { None } else { Some(pkg) });
+    }
+    let same_dir = match (source_path.parent(), target_path.parent()) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    if same_dir {
+        return Ok(extract_java_package(source));
+    }
+    bail!(
+        "cannot derive target package for {}: no `src/{{main,test}}/java` ancestor found and target directory differs from source. \
+         Pass an explicit `target_prelude` with a `package <foo>;` declaration.",
+        target_path.display()
+    )
+}
+
+/// Build a `TextEdit` that inserts `import <fqcn>;` into a source file's
+/// import block. Returns `None` if an identical import already exists.
+fn java_source_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
+    let import_line = format!("import {fqcn};");
+    if source.lines().any(|line| line.trim() == import_line) {
+        return None;
+    }
+    let mut last_import_end: Option<usize> = None;
+    let mut package_end: Option<usize> = None;
+    let mut offset = 0usize;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let line_end = offset + line.len();
+        if trimmed.starts_with("package ") {
+            package_end = Some(line_end);
+        }
+        if trimmed.starts_with("import ") {
+            last_import_end = Some(line_end);
+        }
+        offset = line_end;
+    }
+    let (insert_at, replacement) = if let Some(end) = last_import_end {
+        (end, format!("{import_line}\n"))
+    } else if let Some(end) = package_end {
+        (end, format!("\n{import_line}\n"))
+    } else {
+        (0, format!("{import_line}\n\n"))
+    };
+    Some(TextEdit {
+        byte_start: insert_at,
+        byte_end: insert_at,
+        replacement,
+    })
+}
+
 fn java_import_simple_name(import_line: &str) -> Option<String> {
     let body = import_line
         .trim()
@@ -578,7 +688,11 @@ fn java_target_type_name(p: &RefactorPlanParams, target_path: &Path) -> Result<S
     Ok(name)
 }
 
-fn java_default_target_prelude(p: &RefactorPlanParams, source: &str) -> String {
+fn java_default_target_prelude(
+    p: &RefactorPlanParams,
+    source: &str,
+    resolved_package: Option<&str>,
+) -> String {
     if let Some(prelude) = p.target_prelude.as_deref() {
         let trimmed = prelude.trim();
         if trimmed.is_empty() {
@@ -586,23 +700,16 @@ fn java_default_target_prelude(p: &RefactorPlanParams, source: &str) -> String {
         }
         return format!("{trimmed}\n\n");
     }
-    extract_java_package(source)
-        .map(|pkg| {
-            let imports = extract_java_imports(source);
-            if imports.is_empty() {
-                format!("package {pkg};\n\n")
-            } else {
-                format!("package {pkg};\n\n{}\n\n", imports.join("\n"))
-            }
-        })
-        .unwrap_or_else(|| {
-            let imports = extract_java_imports(source);
-            if imports.is_empty() {
-                String::new()
-            } else {
-                format!("{}\n\n", imports.join("\n"))
-            }
-        })
+    let pkg = resolved_package
+        .map(str::to_string)
+        .or_else(|| extract_java_package(source));
+    let imports = extract_java_imports(source);
+    match (pkg, imports.is_empty()) {
+        (Some(pkg), true) => format!("package {pkg};\n\n"),
+        (Some(pkg), false) => format!("package {pkg};\n\n{}\n\n", imports.join("\n")),
+        (None, true) => String::new(),
+        (None, false) => format!("{}\n\n", imports.join("\n")),
+    }
 }
 
 fn java_class_wrapper(class_name: &str, prelude: &str, body: &str) -> String {
@@ -2117,7 +2224,9 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         text
     } else {
         let class_name = java_target_type_name(p, &target_path)?;
-        let prelude = java_default_target_prelude(p, &parsed.source);
+        let resolved_pkg =
+            resolve_java_target_package(p, &parsed.source, &source_path, &target_path)?;
+        let prelude = java_default_target_prelude(p, &parsed.source, resolved_pkg.as_deref());
         java_class_wrapper(&class_name, &prelude, &extracted_content.join("\n\n"))
     };
 
@@ -2258,26 +2367,16 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // if the target ends up in a different package than the source, the
     // floor escalates to `public`.
     let source_package = extract_java_package(&parsed.source);
-    let target_existing_package = if target_path.exists() {
-        fs::read_to_string(&target_path)
-            .ok()
-            .and_then(|content| extract_java_package(&content))
-    } else {
-        None
-    };
-    let target_package_from_prelude = p
-        .target_prelude
-        .as_deref()
-        .and_then(extract_java_package);
-    // Target package resolution mirrors java_default_target_prelude:
-    // 1. explicit target_prelude wins, 2. existing target file's package,
-    // 3. fallback to the source's package (the prelude inheritance path).
-    let target_package = target_package_from_prelude
-        .or(target_existing_package)
-        .or_else(|| source_package.clone());
+    // Gap 2: derive the target package via the unified resolver. Precedence is
+    // target_prelude > existing target file's package > source-root-derived from
+    // target_path > source's package (same-directory targets only) > hard error.
+    // This avoids silent path↔package contradictions on cross-package extracts.
+    let target_package =
+        resolve_java_target_package(p, &parsed.source, &source_path, &target_path)?;
     let cross_package = match (source_package.as_deref(), target_package.as_deref()) {
         (Some(src), Some(tgt)) => src != tgt,
-        _ => false,
+        (None, Some(_)) | (Some(_), None) => true,
+        (None, None) => false,
     };
     let mut visibility_floor = if cross_package { "public" } else { "package" };
     if let Some(requested) = p.visibility.as_deref() {
@@ -2373,7 +2472,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     .filter(|part| !part.trim().is_empty())
     .collect::<Vec<_>>()
     .join("\n\n");
-    let prelude = java_default_target_prelude(p, &parsed.source);
+    let prelude = java_default_target_prelude(p, &parsed.source, target_package.as_deref());
     let original_target_bytes = if target_path.exists() {
         fs::read(&target_path)?
     } else {
@@ -2628,6 +2727,21 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         byte_end: field_insert_at,
         replacement: format!("\n    private final {target_class_name} {delegate_field};"),
     });
+    // Gap 5: when the target type lands in a different package than the source,
+    // the source needs `import <target_pkg>.<TargetClass>;` so the new delegate
+    // field declaration resolves. Same-package targets resolve implicitly.
+    if cross_package {
+        if let Some(target_pkg) = target_package.as_deref() {
+            let fqcn = if target_pkg.is_empty() {
+                target_class_name.clone()
+            } else {
+                format!("{target_pkg}.{target_class_name}")
+            };
+            if let Some(import_edit) = java_source_import_edit(&parsed.source, &fqcn) {
+                source_edits.push(import_edit);
+            }
+        }
+    }
     let assignment = format!(
         "this.{delegate_field} = new {target_class_name}({});",
         dependency_params
@@ -3186,7 +3300,10 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
         text
     } else {
         let class_name = java_target_type_name(p, &target_path)?;
-        let prelude = java_default_target_prelude(p, &source_parsed.source);
+        let resolved_pkg =
+            resolve_java_target_package(p, &source_parsed.source, &source_path, &target_path)?;
+        let prelude =
+            java_default_target_prelude(p, &source_parsed.source, resolved_pkg.as_deref());
         // Indent constant declarations to match class-body conventions.
         let body = moved_text
             .lines()
