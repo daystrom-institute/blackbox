@@ -1948,20 +1948,31 @@ fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Resul
     }
     let mut selected = Vec::new();
     for expected in names {
-        let matches = candidates
+        // Parse a signature suffix for overload disambiguation:
+        // `methodName(Type1,Type2)` — match by (name, parameter-type list).
+        // Bare `methodName` still works when the name is unique.
+        let (target_name, sig_params): (&str, Option<Vec<String>>) = match expected.find('(') {
+            Some(open) if expected.ends_with(')') => {
+                let name = expected[..open].trim();
+                let inside = &expected[open + 1..expected.len() - 1];
+                let params: Vec<String> = if inside.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    inside.split(',').map(|p| normalize_param_type_text(p)).collect()
+                };
+                (name, Some(params))
+            }
+            _ => (expected.as_str(), None),
+        };
+        let name_matches: Vec<&JavaMethod> = candidates
             .iter()
-            .filter(|m| m.item.name.as_deref() == Some(expected.as_str()))
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
+            .filter(|m| m.item.name.as_deref() == Some(target_name))
+            .collect();
+        match name_matches.as_slice() {
             [] => {
-                // Distinguish "you passed a nested-class name" from "we just
-                // don't know what you meant." `extract_java_class` only
-                // accepts method names in `item_names`; nested classes are
-                // a separate plan kind that this composite plan does not
-                // currently dispatch.
                 let nested_match = java_nested_classes(parsed)
                     .into_iter()
-                    .any(|c| c.item.name.as_deref() == Some(expected.as_str()));
+                    .any(|c| c.item.name.as_deref() == Some(target_name));
                 if nested_match {
                     bail!(
                         "error.bad_input(code=nested_class_in_item_names): \
@@ -1975,12 +1986,160 @@ fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Resul
                 bail!("requested method `{expected}` was not found");
             }
             [method] => selected.push((**method).clone()),
-            _ => bail!(
-                "requested method `{expected}` matched multiple methods; method overloading requires more specific targeting (not yet implemented)"
-            ),
+            multi => {
+                // Overloaded — require a signature suffix.
+                let Some(wanted) = sig_params.as_ref() else {
+                    let overloads: Vec<String> = multi
+                        .iter()
+                        .map(|m| {
+                            let params = java_method_param_types(parsed, m)
+                                .unwrap_or_else(|| "?".to_string());
+                            format!("{target_name}({params})")
+                        })
+                        .collect();
+                    bail!(
+                        "error.bad_input(code=method_overload_ambiguous): \
+                         `{expected}` matched {n} overloads. Disambiguate by passing the \
+                         signature suffix in `item_names`, e.g. {choices:?}.",
+                        n = multi.len(),
+                        choices = overloads
+                    );
+                };
+                let chosen: Vec<&JavaMethod> = multi
+                    .iter()
+                    .copied()
+                    .filter(|m| {
+                        java_method_matches_param_types(parsed, m, wanted)
+                    })
+                    .collect();
+                match chosen.as_slice() {
+                    [m] => selected.push((**m).clone()),
+                    [] => bail!(
+                        "error.bad_input(code=method_overload_no_match): \
+                         no overload of `{target_name}` matches param types {wanted:?}. \
+                         Available overloads: {overloads:?}",
+                        overloads = multi
+                            .iter()
+                            .map(|m| {
+                                let params = java_method_param_types(parsed, m)
+                                    .unwrap_or_else(|| "?".to_string());
+                                format!("{target_name}({params})")
+                            })
+                            .collect::<Vec<_>>()
+                    ),
+                    _ => bail!(
+                        "error.bad_input(code=method_overload_signature_collision): \
+                         multiple overloads of `{target_name}` match {wanted:?} (likely the \
+                         same param-type spelling appears twice)"
+                    ),
+                }
+            }
         }
     }
     Ok(selected)
+}
+
+/// Return a comma-separated string of a method's parameter type texts —
+/// e.g. `String, int` for `void foo(String a, int b)`. Used to render
+/// the operator-facing overload list when item_names is ambiguous.
+fn java_method_param_types(parsed: &ParsedSource, method: &JavaMethod) -> Option<String> {
+    let method_node = find_node(parsed.tree.root_node(), |node| {
+        matches!(
+            node.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) && node.start_byte() == method.item.byte_start
+            && node.end_byte() == method.item.byte_end
+    })?;
+    let params = method_node.child_by_field_name("parameters")?;
+    let mut cursor = params.walk();
+    let parts: Vec<String> = params
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() == "formal_parameter")
+        .filter_map(|p| {
+            p.child_by_field_name("type")
+                .and_then(|t| t.utf8_text(parsed.source.as_bytes()).ok())
+                .map(|s| s.trim().to_string())
+        })
+        .collect();
+    Some(parts.join(", "))
+}
+
+/// True when `method`'s parameter list matches `wanted_types` (one entry per
+/// parameter, in order, comparing normalized type text). Generic parameter
+/// types and `final` modifiers are normalized away before comparison.
+fn java_method_matches_param_types(
+    parsed: &ParsedSource,
+    method: &JavaMethod,
+    wanted_types: &[String],
+) -> bool {
+    let Some(method_node) = find_node(parsed.tree.root_node(), |node| {
+        matches!(
+            node.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) && node.start_byte() == method.item.byte_start
+            && node.end_byte() == method.item.byte_end
+    }) else {
+        return false;
+    };
+    let Some(params) = method_node.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut cursor = params.walk();
+    let actual: Vec<String> = params
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() == "formal_parameter")
+        .filter_map(|p| {
+            p.child_by_field_name("type")
+                .and_then(|t| t.utf8_text(parsed.source.as_bytes()).ok())
+                .map(normalize_param_type_text)
+        })
+        .collect();
+    if actual.len() != wanted_types.len() {
+        return false;
+    }
+    actual
+        .iter()
+        .zip(wanted_types.iter())
+        .all(|(a, w)| a == w)
+}
+
+/// Normalize a Java type string for overload matching: strip `final`,
+/// collapse all whitespace, drop common annotation prefixes. The result
+/// is whatever the operator can reasonably type without copying tabs and
+/// `@Nullable` markers off the declaration.
+fn normalize_param_type_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_ws = false;
+    for ch in s.trim().chars() {
+        if ch.is_whitespace() {
+            if !prev_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_ws = true;
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+    let out = out.trim().to_string();
+    // Strip a leading `final ` modifier — common in method-param decls but
+    // not meaningful for overload resolution.
+    let stripped = out
+        .strip_prefix("final ")
+        .map(|s| s.to_string())
+        .unwrap_or(out);
+    // Strip any leading `@…` annotation tokens.
+    let mut rest = stripped.as_str();
+    while let Some(stripped) = rest.strip_prefix('@') {
+        // Skip until next whitespace.
+        if let Some(idx) = stripped.find(char::is_whitespace) {
+            rest = stripped[idx..].trim_start();
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    rest.to_string()
 }
 
 fn select_java_fields_by_name(parsed: &ParsedSource, names: &[String]) -> Result<Vec<JavaField>> {
@@ -11034,6 +11193,109 @@ mod tests {
         assert!(
             rewritten.contains("import b.Widgets;"),
             "cross-package: source must import the target class: {rewritten}"
+        );
+    }
+
+    // Overloaded methods can be selected by passing a signature suffix
+    // in `item_names`: `methodName(Type1,Type2)`. Bare names still work
+    // for non-overloaded methods.
+    #[test]
+    fn extract_java_class_disambiguates_overload_by_signature_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Helpers.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private void redistribute(float diff) {}\n\
+            \x20   private void redistribute(float diff, boolean flag) {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["redistribute(float, boolean)".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("redistribute(float diff, boolean flag)"),
+            "the 2-arg overload should be moved: {target_text}"
+        );
+        assert!(
+            !target_text.contains("redistribute(float diff)"),
+            "the 1-arg overload should stay on source: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_overload_ambiguous_lists_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Helpers.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private void redistribute(float diff) {}\n\
+            \x20   private void redistribute(float diff, boolean flag) {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        // Bare name → ambiguous → directed error with the available choices.
+        params.item_names = Some(vec!["redistribute".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let err = plan_extract_java_class(&params).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("method_overload_ambiguous"),
+            "expected ambiguity refusal: {msg}"
+        );
+        assert!(
+            msg.contains("redistribute(float)") && msg.contains("redistribute(float, boolean)"),
+            "error must enumerate the available overloads: {msg}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_overload_no_match_lists_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Helpers.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private void redistribute(float diff) {}\n\
+            \x20   private void redistribute(float diff, boolean flag) {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["redistribute(String)".to_string()]); // wrong types
+        params.project_dir = Some(path_string(dir.path()));
+
+        let err = plan_extract_java_class(&params).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("method_overload_no_match"),
+            "expected no-match refusal: {msg}"
         );
     }
 

@@ -81,6 +81,21 @@ real; if your concern is on the list, the planner already handles it.
   target, the operator-facing FIXME lists "drop the call" alongside
   the three structural fixes (add to extracted set / callback interface
   / inject source instance).
+- **Overloaded methods disambiguated by signature suffix.** `item_names`
+  accepts entries like `"methodName(Type1, Type2)"` to pick one specific
+  overload by parameter types. Bare `"methodName"` still works when the
+  name is unique; ambiguous bare names refuse with
+  `error.bad_input(code=method_overload_ambiguous)` and enumerate the
+  available overloads. Mismatched signature suffix refuses with
+  `error.bad_input(code=method_overload_no_match)`. Type-text comparison
+  is whitespace-normalized and ignores `final` / annotation prefixes.
+- **Default-method interfaces are recognized as satisfied.** The
+  `implements`-completeness check (the one that may emit
+  `// FIXME: target now implements I but does not satisfy method(s) <X>`)
+  filters out interface methods marked `default`, `static`, or `private`
+  — those have bodies on the interface itself and don't need explicit
+  declarations on the implementer. Default-only interfaces produce no
+  false-positive FIXME.
 - **`callback_externals` threads external calls as functional-interface
   callbacks.** Pass `callback_externals=[methodName, ...]` to route a
   source-class method through the target as a `Runnable` (no-arg void),
