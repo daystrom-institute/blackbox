@@ -2424,6 +2424,36 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .map(|field| field.name.as_str())
         .collect::<HashSet<_>>();
     let captured_variables = captured_fields_for_methods(&parsed, &selected_methods);
+
+    // Mutable-capture-with-write refusal. A capture that is (a) non-final on
+    // the source, (b) not listed in `move_fields`, and (c) WRITTEN inside any
+    // extracted method body cannot be promoted to a `final` constructor
+    // parameter — the moved code would fail `cannot assign to final variable`.
+    // Refuse the plan with an operator-actionable error pointing at the
+    // exact fields to add to `move_fields` (which then routes them through
+    // the rewrite_remaining_accessors / generated-setter path).
+    let written_mutable_captures: Vec<String> = captured_variables
+        .iter()
+        .filter(|c| c.source_mutable && !c.source_static_final)
+        .filter(|c| !moved_field_set.contains(c.name.as_str()))
+        .filter_map(|c| {
+            if extracted_methods_write_to(&parsed, &selected_methods, &c.name) {
+                Some(c.name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !written_mutable_captures.is_empty() {
+        bail!(
+            "error.bad_input(code=mutable_capture_with_write): extracted method bodies write to \
+             mutable source field(s) {fields:?}. Promoting them to a final constructor parameter \
+             on the target would fail with `cannot assign to final variable`. Add them to \
+             `move_fields` to route them through the delegate-with-generated-setter path instead.",
+            fields = written_mutable_captures
+        );
+    }
+
     let class_dependency_report = if p.deep_analysis.unwrap_or(false) {
         analyze_extracted_dependencies(
             &parsed,
@@ -4943,6 +4973,73 @@ fn java_caller_rewrite_edits(
 /// Same-package extracts use a `package` floor (no modifier — strip `private`);
 /// cross-package extracts use `public`. Constants that already meet or exceed
 /// the floor are emitted unchanged.
+/// Return true when any of the extracted methods' bodies contains a write
+/// (`assignment_expression` with LHS resolving to the field) or update
+/// (`x++` / `x--`) of `field_name`. Used by the mutable-capture-with-write
+/// refusal — captures that the moved code writes to cannot become `final`
+/// constructor parameters.
+fn extracted_methods_write_to(
+    parsed: &ParsedSource,
+    methods: &[JavaMethod],
+    field_name: &str,
+) -> bool {
+    for method in methods {
+        let Some(method_node) = find_node(parsed.tree.root_node(), |node| {
+            (node.kind() == "method_declaration" || node.kind() == "constructor_declaration")
+                && node.start_byte() == method.item.byte_start
+                && node.end_byte() == method.item.byte_end
+        }) else {
+            continue;
+        };
+        let mut stack = vec![method_node];
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+            if node.kind() != "identifier" {
+                continue;
+            }
+            let Ok(text) = node.utf8_text(parsed.source.as_bytes()) else {
+                continue;
+            };
+            if text != field_name {
+                continue;
+            }
+            let Some(access_node) = resolve_field_access(node) else {
+                continue;
+            };
+            if is_shadowed(node, text, &parsed.source) {
+                continue;
+            }
+            // Walk past parenthesized/cast wrappers, then check whether the
+            // access is on the LHS of an assignment or inside an update.
+            let mut target = access_node;
+            while let Some(parent) = target.parent() {
+                if matches!(parent.kind(), "parenthesized_expression" | "cast_expression") {
+                    target = parent;
+                    continue;
+                }
+                break;
+            }
+            if let Some(parent) = target.parent() {
+                match parent.kind() {
+                    "assignment_expression" => {
+                        if parent.child_by_field_name("left").map(|c| c.id())
+                            == Some(target.id())
+                        {
+                            return true;
+                        }
+                    }
+                    "update_expression" => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
 fn extract_field_text_with_visibility_floor(
     parsed: &ParsedSource,
     field: &JavaField,
@@ -9612,6 +9709,125 @@ mod tests {
         assert!(
             rewritten.contains("import b.Widgets;"),
             "cross-package: source must import the target class: {rewritten}"
+        );
+    }
+
+    // Mutable-capture-with-write refusal: when an extracted method writes
+    // to a mutable source field that isn't in `move_fields`, the planner
+    // would promote it to a `final` constructor parameter on the target —
+    // and the moved write would then fail `cannot assign to final variable`.
+    // Refuse the plan with operator-actionable instructions to add the
+    // field(s) to `move_fields`.
+    #[test]
+    fn extract_java_class_refuses_mutable_capture_with_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("Widgets.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class Dashboard {\n\
+            \x20   private Grid theGrid;\n\
+            \x20   void buildGrid() {\n\
+            \x20       if (theGrid == null) { theGrid = new Grid(); }\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Widgets".to_string());
+        params.delegate_field = Some("widgets".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        // `theGrid` intentionally NOT in move_fields → refusal expected.
+        params.project_dir = Some(path_string(dir.path()));
+
+        let err = plan_extract_java_class(&params).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mutable_capture_with_write"),
+            "expected refusal error code: {msg}"
+        );
+        assert!(
+            msg.contains("theGrid"),
+            "error must name the offending field: {msg}"
+        );
+        assert!(
+            msg.contains("move_fields"),
+            "error must point at the fix: {msg}"
+        );
+    }
+
+    // The same scenario, but with `theGrid` listed in `move_fields`, should
+    // proceed cleanly — the rewrite_remaining_accessors path routes the
+    // source-side write through the generated setter.
+    #[test]
+    fn extract_java_class_allows_mutable_capture_with_write_when_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("Widgets.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class Dashboard {\n\
+            \x20   private Grid theGrid;\n\
+            \x20   void buildGrid() {\n\
+            \x20       if (theGrid == null) { theGrid = new Grid(); }\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Widgets".to_string());
+        params.delegate_field = Some("widgets".to_string());
+        params.item_names = Some(vec!["buildGrid".to_string()]);
+        params.move_fields = Some(vec!["theGrid".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        // Plan succeeds with the field moved.
+        let _plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+    }
+
+    // Re-reported Gap 1 variant: the moved constant is used as a method-call
+    // receiver (`df.format(value)`), not as a bare value. `df` parses as the
+    // `object` of a method_invocation, not as a type_identifier. The
+    // qualifier rewrite must still apply.
+    #[test]
+    fn extract_java_class_qualifies_constant_used_as_method_receiver() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("Widgets.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.text.DecimalFormat;\n\
+             class Dashboard {\n\
+            \x20   private static final DecimalFormat df = new DecimalFormat(\"0.00\");\n\
+            \x20   String formatGas(double v) { return df.format(v); }\n\
+            \x20   String formatLiquid(double v) { return df.format(v * 1.0); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Widgets".to_string());
+        params.delegate_field = Some("widgets".to_string());
+        // Extract only formatGas; formatLiquid stays on source and still
+        // references df, which is moving with the extract.
+        params.item_names = Some(vec!["formatGas".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("return Widgets.df.format(v * 1.0)"),
+            "method-receiver constant ref must qualify: {rewritten}"
         );
     }
 
