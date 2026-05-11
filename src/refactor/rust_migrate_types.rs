@@ -304,7 +304,24 @@ fn collect_type_sites<'a>(
 
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.is_named() && node.kind() == "type_identifier" {
+        // Catch both type-position `type_identifier` and value-position
+        // `identifier` when it sits in the `path` slot of a `scoped_identifier`
+        // / `scoped_type_identifier`. The latter is how `OldService::new()`,
+        // `OldService::method()`, `OldService::CONST`, and turbofish forms
+        // appear in tree-sitter-rust 0.24.
+        let is_type_id = node.is_named() && node.kind() == "type_identifier";
+        let is_value_path_head = node.is_named()
+            && node.kind() == "identifier"
+            && node
+                .parent()
+                .map(|p| {
+                    matches!(p.kind(), "scoped_identifier" | "scoped_type_identifier")
+                        && p.child_by_field_name("path")
+                            .map(|path| path.start_byte() == node.start_byte())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+        if is_type_id || is_value_path_head {
             let text = node.utf8_text(source.as_bytes()).unwrap_or("");
             if text == module_name {
                 let (line, column) = line_col(source, node.start_byte());
@@ -492,17 +509,34 @@ fn is_associated_item_path(node: Node<'_>, _source: &str) -> bool {
 }
 
 fn is_turbofish(node: Node<'_>) -> bool {
+    // Two shapes for fn-call turbofish in tree-sitter-rust 0.24:
+    //   1. legacy `generic_type` under `call_expression`'s `function` field
+    //   2. `generic_function { function, type_arguments }` under `call_expression`
+    // Plus the directly-under-`type_arguments` case for both function-call and
+    // explicit `<T as Trait>::method::<T>` turbofish forms.
     let mut current = Some(node);
     while let Some(current_node) = current {
+        // Case (3): direct `type_arguments` ancestor whose parent is a callable shape.
+        if current_node.kind() == "type_arguments" {
+            if let Some(parent) = current_node.parent() {
+                match parent.kind() {
+                    "generic_function" | "scoped_identifier" | "call_expression" => return true,
+                    _ => {}
+                }
+            }
+        }
+        // Case (2): generic_function node directly.
+        if current_node.kind() == "generic_function" {
+            return true;
+        }
+        // Case (1): legacy generic_type as call's function.
         if current_node.kind() == "generic_type"
             && let Some(parent_call) = current_node.parent()
             && parent_call.kind() == "call_expression"
+            && let Some(function) = parent_call.child_by_field_name("function")
+            && range_contains(function, current_node)
         {
-            if let Some(function) = parent_call.child_by_field_name("function") {
-                if range_contains(function, current_node) {
-                    return true;
-                }
-            }
+            return true;
         }
         current = current_node.parent();
     }
@@ -525,11 +559,19 @@ fn is_typeid_reflection(node: Node<'_>, source: &str) -> bool {
 }
 
 fn is_typeid_of_function(function: Node<'_>, source: &str) -> bool {
-    let normalized = function
+    // For `TypeId::of::<X>()` the function field is a `generic_function`
+    // wrapping a `scoped_identifier`. Strip the turbofish (`type_arguments`)
+    // suffix by anchoring on the inner scoped path.
+    let inner = if function.kind() == "generic_function" {
+        function.child_by_field_name("function").unwrap_or(function)
+    } else {
+        function
+    };
+    let normalized = inner
         .utf8_text(source.as_bytes())
         .unwrap_or("")
         .replace(' ', "");
-    normalized == "TypeId::of"
+    normalized == "TypeId::of" || normalized.ends_with("::TypeId::of")
 }
 
 fn find_generic_anchor(node: Node<'_>) -> Option<Node<'_>> {
@@ -696,13 +738,17 @@ fn build_where_clause_edit(item: &Node<'_>, source: &str, bound_text: &str) -> O
 }
 
 fn end_of_item_header(item: &Node<'_>, source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
     let mut i = item.start_byte();
     while i < item.end_byte() {
-        if source.as_bytes()[i] == b'{'
-            || source.as_bytes()[i] == b'='
-            || source.as_bytes()[i] == b';'
-        {
-            return Some(i);
+        if bytes[i] == b'{' || bytes[i] == b'=' || bytes[i] == b';' {
+            // Walk back over trailing whitespace so the inserted ` where ...`
+            // doesn't double-space against the header.
+            let mut insert_at = i;
+            while insert_at > item.start_byte() && bytes[insert_at - 1].is_ascii_whitespace() {
+                insert_at -= 1;
+            }
+            return Some(insert_at);
         }
         i += 1;
     }
@@ -814,10 +860,7 @@ mod tests {
         parse_response(&response)
     }
 
-    // TODO(RX-M1 coverage): classifier currently detects 3 of 7 type-use positions;
-    // missing local-binding ascription, generic-arg-inside-wrapper, and Vec generic args.
     #[test]
-    #[ignore]
     fn rust_migrate_type_usages_bare_concrete_covers_supported_type_positions() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -832,14 +875,14 @@ fn consume(value: OldService, list: Vec<OldService>) -> OldService {
     let tmp: OldService = value;
     let ptr: Vec<OldService> = Vec::new();
     type Alias = OldService;
-    consume_inner::<OldService>(value)
+    tmp
 }
 "#,
         )
         .unwrap();
 
         let (edits, skipped) = plan_for("BareConcrete", &source, "Service");
-        assert!(skipped.is_empty());
+        assert!(skipped.is_empty(), "unexpected skips: {skipped:?}");
         assert_eq!(edits.len(), 7);
         assert!(edits.iter().all(|edit| edit.replacement == "Service"));
     }
@@ -857,7 +900,7 @@ struct Holder {
 
 fn consume(value: OldService, list: Vec<OldService>) -> OldService {
     type Alias = OldService;
-    consume_inner::<OldService>(value)
+    value
 }
 "#,
         )
@@ -1018,10 +1061,7 @@ fn consume<T>(value: OldService, list: Vec<OldService>) {
         );
     }
 
-    // TODO(RX-M1 coverage): classifier emits only 1 of 3 expected skip categories;
-    // constructor-path / associated-item / TypeId reflection paths need fuller detection.
     #[test]
-    #[ignore]
     fn rust_migrate_type_usages_skips_forbidden_categories() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -1102,10 +1142,7 @@ struct Holder {
         );
     }
 
-    // TODO(RX-M1 coverage): generic-param-T-bounded-Trait rewrite for functions WITHOUT
-    // an existing where clause doesn't currently insert the new where clause correctly.
     #[test]
-    #[ignore]
     fn rust_migrate_type_usages_generic_param_t_bounded_trait_handles_functions_without_where() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -1123,6 +1160,9 @@ fn consume(v: OldService) -> OldService {
         assert!(skipped.is_empty());
         let source_text = std::fs::read_to_string(&source).unwrap();
         let rewritten = super::apply_text_edits(&source_text, &edits).unwrap();
-        assert!(rewritten.contains("fn consume<T>(v: T) -> T where T: Service"));
+        assert!(
+            rewritten.contains("fn consume<T>(v: T) -> T where T: Service"),
+            "rewritten output: {rewritten}\nedits: {edits:?}"
+        );
     }
 }
