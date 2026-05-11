@@ -376,7 +376,7 @@ pub enum InjectPolicy {
 /// Per-node control-flow successor. Tagged enum: serialized JSON looks
 /// like `{"type": "goto", "to": "Foo"}`, `{"type": "branch", ...}`,
 /// `{"type": "fork", ...}`, or `{"type": "terminal"}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeTransition {
     /// Linear advance to a single named node. Use this for both
@@ -402,18 +402,10 @@ pub enum NodeTransition {
         continue_to: String,
     },
     /// Terminal sink — the arc ends successfully when control reaches
-    /// a node whose transition is `Terminal`.
+    /// a node whose transition is `Terminal`. Default for stub specs;
+    /// real specs always set `next` explicitly.
+    #[default]
     Terminal,
-}
-
-impl Default for NodeTransition {
-    fn default() -> Self {
-        // Default to Terminal so `NodeSpec::default()` produces a
-        // structurally-valid stub. Real specs always set `next`
-        // explicitly; the default only exists for `..NodeSpec::default()`
-        // patterns inside tests and builders.
-        NodeTransition::Terminal
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

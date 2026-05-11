@@ -83,10 +83,10 @@ fn build_thread_doc(thread: &Thread, threads_path: &Path, f: FieldHandles) -> Ta
     doc.add_text(f.account, "blackbox");
     doc.add_text(f.project, &thread.project);
     doc.add_text(f.role, "thread");
-    doc.add_text(f.file_path, &threads_path.to_string_lossy());
+    doc.add_text(f.file_path, threads_path.to_string_lossy());
     doc.add_text(
         f.path_tokens,
-        &format!(
+        format!(
             "thread {} {} {} {}",
             thread.id,
             thread.name.as_deref().unwrap_or(""),

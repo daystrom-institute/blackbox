@@ -109,15 +109,14 @@ fn check_file_permissions(path: &Path) -> Result<()> {
                 mode
             );
         }
-    } else if path.is_dir() {
-        if mode != 0o700 {
+    } else if path.is_dir()
+        && mode != 0o700 {
             bail!(
                 "Secret directory {} has insecure permissions: {:o} (expected 0700)",
                 path.display(),
                 mode
             );
         }
-    }
     
     Ok(())
 }
@@ -179,11 +178,10 @@ pub fn resolve_with_sources(name: &str, sources: SecretSources) -> Result<Secret
     
     // 3. Try environment variable
     let env_name = format!("{}{}", sources.env_prefix, secret_name_to_env_name(name));
-    if let Ok(value) = std::env::var(&env_name) {
-        if !value.is_empty() {
+    if let Ok(value) = std::env::var(&env_name)
+        && !value.is_empty() {
             return Ok(SecretValue::new(value));
         }
-    }
     
     // Not found in any source
     bail!("Secret '{}' not found in any source", name);
@@ -203,8 +201,8 @@ mod tests {
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
         let orig_env = env::var("BLACKBOX_SECRET_TEST_SECRET").ok();
-        env::remove_var("CREDENTIALS_DIRECTORY");
-        env::remove_var("BLACKBOX_SECRET_TEST_SECRET");
+        unsafe { env::remove_var("CREDENTIALS_DIRECTORY"); }
+        unsafe { env::remove_var("BLACKBOX_SECRET_TEST_SECRET"); }
         
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -222,7 +220,7 @@ mod tests {
         {
             fs::create_dir_all(&creds_dir).unwrap();
         }
-        env::set_var("CREDENTIALS_DIRECTORY", &creds_dir.to_string_lossy().into_owned());
+        unsafe { env::set_var("CREDENTIALS_DIRECTORY", &creds_dir.to_string_lossy().into_owned()); }
         
         // Create file secret that would conflict
         let secrets_dir = home.join("secrets");
@@ -247,7 +245,7 @@ mod tests {
         }
         
         // Set env var that would conflict
-        env::set_var("BLACKBOX_SECRET_TEST_SECRET", "from-env");
+        unsafe { env::set_var("BLACKBOX_SECRET_TEST_SECRET", "from-env"); }
         
         // Create LoadCredential file
         let loadcred_file = creds_dir.join("test-secret");
@@ -269,8 +267,8 @@ mod tests {
         assert_eq!(secret.expose(), "from-loadcredential");
         
         // Restore original env vars
-        if let Some(v) = orig_creds { env::set_var("CREDENTIALS_DIRECTORY", v); } else { env::remove_var("CREDENTIALS_DIRECTORY"); }
-        if let Some(v) = orig_env { env::set_var("BLACKBOX_SECRET_TEST_SECRET", v); } else { env::remove_var("BLACKBOX_SECRET_TEST_SECRET"); }
+        if let Some(v) = orig_creds { unsafe { env::set_var("CREDENTIALS_DIRECTORY", v) }; } else { unsafe { env::remove_var("CREDENTIALS_DIRECTORY") }; }
+        if let Some(v) = orig_env { unsafe { env::set_var("BLACKBOX_SECRET_TEST_SECRET", v) }; } else { unsafe { env::remove_var("BLACKBOX_SECRET_TEST_SECRET") }; }
     }
     
     #[test]
@@ -280,8 +278,8 @@ mod tests {
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
         let orig_env = env::var("BLACKBOX_SECRET_TEST_SECRET").ok();
-        env::remove_var("CREDENTIALS_DIRECTORY");
-        env::remove_var("BLACKBOX_SECRET_TEST_SECRET");
+        unsafe { env::remove_var("CREDENTIALS_DIRECTORY"); }
+        unsafe { env::remove_var("BLACKBOX_SECRET_TEST_SECRET"); }
         
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -309,7 +307,7 @@ mod tests {
         }
         
         // Set env var that would conflict
-        env::set_var("BLACKBOX_SECRET_TEST_SECRET", "from-env");
+        unsafe { env::set_var("BLACKBOX_SECRET_TEST_SECRET", "from-env"); }
         
         let sources = SecretSources {
             credentials_dir: None,
@@ -321,8 +319,8 @@ mod tests {
         assert_eq!(secret.expose(), "from-file");
         
         // Restore original env vars
-        if let Some(v) = orig_creds { env::set_var("CREDENTIALS_DIRECTORY", v); } else { env::remove_var("CREDENTIALS_DIRECTORY"); }
-        if let Some(v) = orig_env { env::set_var("BLACKBOX_SECRET_TEST_SECRET", v); } else { env::remove_var("BLACKBOX_SECRET_TEST_SECRET"); }
+        if let Some(v) = orig_creds { unsafe { env::set_var("CREDENTIALS_DIRECTORY", v) }; } else { unsafe { env::remove_var("CREDENTIALS_DIRECTORY") }; }
+        if let Some(v) = orig_env { unsafe { env::set_var("BLACKBOX_SECRET_TEST_SECRET", v) }; } else { unsafe { env::remove_var("BLACKBOX_SECRET_TEST_SECRET") }; }
     }
     
     #[test]
@@ -332,8 +330,8 @@ mod tests {
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
         let orig_env = env::var("BLACKBOX_SECRET_TEST_SECRET").ok();
-        env::remove_var("CREDENTIALS_DIRECTORY");
-        env::remove_var("BLACKBOX_SECRET_TEST_SECRET");
+        unsafe { env::remove_var("CREDENTIALS_DIRECTORY"); }
+        unsafe { env::remove_var("BLACKBOX_SECRET_TEST_SECRET"); }
         
         let dir = tempdir().unwrap();
         let home = dir.path();
@@ -343,7 +341,7 @@ mod tests {
         fs::create_dir_all(&secrets_dir).unwrap();
         
         // Set env var
-        env::set_var("BLACKBOX_SECRET_TEST_SECRET", "from-env");
+        unsafe { env::set_var("BLACKBOX_SECRET_TEST_SECRET", "from-env"); }
         
         let sources = SecretSources {
             credentials_dir: None,
@@ -355,8 +353,8 @@ mod tests {
         assert_eq!(secret.expose(), "from-env");
         
         // Restore original env vars
-        if let Some(v) = orig_creds { env::set_var("CREDENTIALS_DIRECTORY", v); } else { env::remove_var("CREDENTIALS_DIRECTORY"); }
-        if let Some(v) = orig_env { env::set_var("BLACKBOX_SECRET_TEST_SECRET", v); } else { env::remove_var("BLACKBOX_SECRET_TEST_SECRET"); }
+        if let Some(v) = orig_creds { unsafe { env::set_var("CREDENTIALS_DIRECTORY", v) }; } else { unsafe { env::remove_var("CREDENTIALS_DIRECTORY") }; }
+        if let Some(v) = orig_env { unsafe { env::set_var("BLACKBOX_SECRET_TEST_SECRET", v) }; } else { unsafe { env::remove_var("BLACKBOX_SECRET_TEST_SECRET") }; }
     }
     
     #[test]
@@ -365,14 +363,14 @@ mod tests {
         
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
-        env::remove_var("CREDENTIALS_DIRECTORY");
+        unsafe { env::remove_var("CREDENTIALS_DIRECTORY"); }
         
         let result = resolve("test/secret");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("path separators"));
         
         // Restore original env vars
-        if let Some(v) = orig_creds { env::set_var("CREDENTIALS_DIRECTORY", v); } else { env::remove_var("CREDENTIALS_DIRECTORY"); }
+        if let Some(v) = orig_creds { unsafe { env::set_var("CREDENTIALS_DIRECTORY", v) }; } else { unsafe { env::remove_var("CREDENTIALS_DIRECTORY") }; }
     }
     
     #[test]
@@ -381,7 +379,7 @@ mod tests {
         
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
-        env::remove_var("CREDENTIALS_DIRECTORY");
+        unsafe { env::remove_var("CREDENTIALS_DIRECTORY"); }
         
         #[cfg(unix)] {
             let dir = tempdir().unwrap();
@@ -409,7 +407,7 @@ mod tests {
         }
         
         // Restore original env vars
-        if let Some(v) = orig_creds { env::set_var("CREDENTIALS_DIRECTORY", v); } else { env::remove_var("CREDENTIALS_DIRECTORY"); }
+        if let Some(v) = orig_creds { unsafe { env::set_var("CREDENTIALS_DIRECTORY", v) }; } else { unsafe { env::remove_var("CREDENTIALS_DIRECTORY") }; }
     }
     
     #[test]
@@ -418,7 +416,7 @@ mod tests {
         
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
-        env::remove_var("CREDENTIALS_DIRECTORY");
+        unsafe { env::remove_var("CREDENTIALS_DIRECTORY"); }
         
         #[cfg(unix)] {
             let dir = tempdir().unwrap();
@@ -446,7 +444,7 @@ mod tests {
         }
         
         // Restore original env vars
-        if let Some(v) = orig_creds { env::set_var("CREDENTIALS_DIRECTORY", v); } else { env::remove_var("CREDENTIALS_DIRECTORY"); }
+        if let Some(v) = orig_creds { unsafe { env::set_var("CREDENTIALS_DIRECTORY", v) }; } else { unsafe { env::remove_var("CREDENTIALS_DIRECTORY") }; }
     }
     
     #[test]
@@ -456,8 +454,8 @@ mod tests {
         // Save original env vars
         let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
         let orig_env = env::var("BLACKBOX_SECRET_NONEXISTENT").ok();
-        env::remove_var("CREDENTIALS_DIRECTORY");
-        env::remove_var("BLACKBOX_SECRET_NONEXISTENT");
+        unsafe { env::remove_var("CREDENTIALS_DIRECTORY"); }
+        unsafe { env::remove_var("BLACKBOX_SECRET_NONEXISTENT"); }
         
         let dir = tempdir().unwrap();
         let secrets_dir = dir.path().join("secrets");
@@ -486,7 +484,7 @@ mod tests {
         assert!(!err.to_string().contains("from-env") && !err.to_string().contains("from-file"));
         
         // Restore original env vars
-        if let Some(v) = orig_creds { env::set_var("CREDENTIALS_DIRECTORY", v); } else { env::remove_var("CREDENTIALS_DIRECTORY"); }
-        if let Some(v) = orig_env { env::set_var("BLACKBOX_SECRET_NONEXISTENT", v); } else { env::remove_var("BLACKBOX_SECRET_NONEXISTENT"); }
+        if let Some(v) = orig_creds { unsafe { env::set_var("CREDENTIALS_DIRECTORY", v) }; } else { unsafe { env::remove_var("CREDENTIALS_DIRECTORY") }; }
+        if let Some(v) = orig_env { unsafe { env::set_var("BLACKBOX_SECRET_NONEXISTENT", v) }; } else { unsafe { env::remove_var("BLACKBOX_SECRET_NONEXISTENT") }; }
     }
 }

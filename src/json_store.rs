@@ -18,6 +18,7 @@ pub fn with_store_lock<T>(
     }
     let lock_file = fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;

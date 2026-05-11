@@ -367,7 +367,7 @@ impl LspSessionManager {
         }
 
         let client = LspClient {
-            session: &mut *guard,
+            session: &mut guard,
             config: &self.inner.config,
         };
         match f(client) {
@@ -730,15 +730,15 @@ mod tests {
         let _guard = blackbox::util::test_env_lock();
         let orig_prefixed = std::env::var("BLACKBOX_RUST_ANALYZER_BIN").ok();
 
-        std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN");
-        std::env::set_var("RUST_ANALYZER_BIN", "alias-path");
+        unsafe { std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN"); }
+        unsafe { std::env::set_var("RUST_ANALYZER_BIN", "alias-path"); }
 
         let config = Config::default();
         assert_eq!(config.rust_analyzer_bin, None,
             "RUST_ANALYZER_BIN should not be accepted after Phase 5");
 
-        std::env::remove_var("RUST_ANALYZER_BIN");
-        if let Some(v) = orig_prefixed { std::env::set_var("BLACKBOX_RUST_ANALYZER_BIN", v); } else { std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN"); }
+        unsafe { std::env::remove_var("RUST_ANALYZER_BIN"); }
+        if let Some(v) = orig_prefixed { unsafe { std::env::set_var("BLACKBOX_RUST_ANALYZER_BIN", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN") }; }
     }
 }
 

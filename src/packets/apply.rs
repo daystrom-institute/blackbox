@@ -12,6 +12,7 @@ use rmcp::schemars;
     Copy,
     PartialEq,
     Eq,
+    Default,
     Serialize,
     Deserialize,
     schemars::JsonSchema,
@@ -21,14 +22,9 @@ use rmcp::schemars;
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum ApplyMode {
+    #[default]
     First,
     All,
-}
-
-impl Default for ApplyMode {
-    fn default() -> Self {
-        ApplyMode::First
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

@@ -2896,11 +2896,7 @@ pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
     }
 
     let insert_at = java_after_fields_insert_position(class_node, &parsed.source);
-    let replacement = if insert_at == java_class_body_insert_position(class_node, &parsed.source) {
-        format!("\n{}", declarations.trim_end())
-    } else {
-        format!("\n{}", declarations.trim_end())
-    };
+    let replacement = format!("\n{}", declarations.trim_end());
     let plan = RefactorPlan {
         title: format!(
             "Add {} Java field(s) to {}",
@@ -3962,18 +3958,15 @@ fn update_operator_text(upd: Node<'_>, source: &str) -> Option<String> {
 /// the object is `this`. Returns None when the identifier is not actually a
 /// field-resolved access (method names, type names, declarators, accesses
 /// on other objects, etc.).
+#[allow(clippy::collapsible_match)]
 fn resolve_field_access<'a>(node: Node<'a>) -> Option<Node<'a>> {
     let parent = node.parent()?;
     let parent_kind = parent.kind();
 
     // Reject identifiers that are *names* of declarations or invocations.
     match parent_kind {
-        "variable_declarator" => {
-            if parent.child_by_field_name("name").map(|c| c.id()) == Some(node.id()) {
-                return None;
-            }
-        }
-        "formal_parameter"
+        "variable_declarator"
+        | "formal_parameter"
         | "spread_parameter"
         | "catch_formal_parameter"
         | "method_declaration"
@@ -3987,13 +3980,8 @@ fn resolve_field_access<'a>(node: Node<'a>) -> Option<Node<'a>> {
         | "type_parameter"
         | "marker_annotation"
         | "annotation"
-        | "enum_constant" => {
-            if parent.child_by_field_name("name").map(|c| c.id()) == Some(node.id()) {
-                return None;
-            }
-        }
-        "method_invocation" => {
-            // Reject when the identifier *is* the method name.
+        | "enum_constant"
+        | "method_invocation" => {
             if parent.child_by_field_name("name").map(|c| c.id()) == Some(node.id()) {
                 return None;
             }
@@ -4655,11 +4643,11 @@ fn build_visibility_rewrite_edit(
             }
         }
         [vis] => {
-            if new_visibility.is_some() {
+            if let Some(new_vis) = new_visibility {
                 TextEdit {
                     byte_start: vis.1,
                     byte_end: vis.2,
-                    replacement: new_visibility.unwrap().to_string(),
+                    replacement: new_vis.to_string(),
                 }
             } else {
                 let vis_end = vis.2;
@@ -4850,7 +4838,7 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
                     && node.unwrap().kind() == "method_declaration"
                     && method_is_public(node.unwrap())
                     && !method_is_static(node.unwrap())
-                    && m.item.name.as_deref() != Some(&format!("<init>"))
+                    && m.item.name.as_deref() != Some("<init>")
             })
             .filter_map(|m| m.item.name.as_deref())
             .collect()
@@ -4869,7 +4857,7 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
             .trim_end_matches('>')
             .split(',')
         {
-            let ident = chunk.trim().split_whitespace().last().unwrap_or("").trim();
+            let ident = chunk.split_whitespace().last().unwrap_or("").trim();
             if !ident.is_empty() {
                 class_type_params.insert(ident.to_string());
             }
@@ -4926,7 +4914,7 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
         if let Some(tp_text) = class_type_parameters_text(class_node, &parsed.source) {
             let inner = tp_text.trim_start_matches('<').trim_end_matches('>');
             for chunk in inner.split(',') {
-                let ident = chunk.trim().split_whitespace().last().unwrap_or("").trim();
+let ident = chunk.split_whitespace().last().unwrap_or("").trim();
                 if used_type_params.contains(ident) {
                     ordered.push(chunk.trim().to_string());
                 }
@@ -5900,9 +5888,7 @@ fn detect_apache_equals(
         if name != "append" || args.len() != 2 {
             return None;
         }
-        let Some(field) = normalize_field_ref(args[0], source) else {
-            return None;
-        };
+        let field = normalize_field_ref(args[0], source)?;
         field_names.push(field);
     }
     if field_names.is_empty() {
@@ -5955,9 +5941,7 @@ fn detect_apache_hashcode(method: Node<'_>, source: &str) -> Option<Vec<String>>
         if name != "append" || args.len() != 1 {
             return None;
         }
-        let Some(field) = normalize_field_ref(args[0], source) else {
-            return None;
-        };
+        let field = normalize_field_ref(args[0], source)?;
         field_names.push(field);
     }
     if field_names.is_empty() {
@@ -6014,9 +5998,7 @@ fn detect_apache_tostring(method: Node<'_>, source: &str) -> Option<Vec<String>>
         }
         match args.len() {
             1 => {
-                let Some(field) = normalize_field_ref(args[0], source) else {
-                    return None;
-                };
+let field = normalize_field_ref(args[0], source)?;
                 field_names.push(field);
             }
             2 => {
@@ -6640,22 +6622,16 @@ fn plan_lombokify_java_class_single(
             continue;
         }
         match classify_constructor(m.node, &instance_fields, &parsed.source) {
-            Some(ConstructorKind::NoArgs) => {
-                if noargs_ctor.replace(m.node).is_some() {
-                    ctor_collision = true;
-                }
+            Some(ConstructorKind::NoArgs) if noargs_ctor.replace(m.node).is_some() => {
+                ctor_collision = true;
             }
-            Some(ConstructorKind::AllArgs) => {
-                if allargs_ctor.replace(m.node).is_some() {
-                    ctor_collision = true;
-                }
+            Some(ConstructorKind::AllArgs) if allargs_ctor.replace(m.node).is_some() => {
+                ctor_collision = true;
             }
-            Some(ConstructorKind::RequiredArgs) => {
-                if requiredargs_ctor.replace(m.node).is_some() {
-                    ctor_collision = true;
-                }
+            Some(ConstructorKind::RequiredArgs) if requiredargs_ctor.replace(m.node).is_some() => {
+                ctor_collision = true;
             }
-            None => {}
+            _ => {}
         }
     }
     if ctor_collision {
@@ -7023,11 +6999,11 @@ fn plan_lombokify_java_class_single(
         dry_run: false,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
-            path: path_string(&source_path),
+            path: path_string(source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
             edits: text_edits,
         }],
-        validations: parse_validation_step_for_path(&source_path),
+        validations: parse_validation_step_for_path(source_path),
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
@@ -7049,8 +7025,8 @@ mod tests {
             repo_id: None,
             canonical_path: fs::canonicalize(path)
                 .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+                .display()
+                .to_string(),
             registered_at: "2026-05-09T00:00:00Z".to_string(),
             is_git_repo: false,
             languages: Default::default(),

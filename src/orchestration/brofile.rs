@@ -401,11 +401,11 @@ mod tests {
     fn with_fake_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        std::env::set_var("HOME", home);
+        unsafe { std::env::set_var("HOME", home); }
         let result = f();
         match prior {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
         result
     }

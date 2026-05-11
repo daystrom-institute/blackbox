@@ -1,3 +1,14 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::doc_overindented_list_items,
+    clippy::doc_lazy_continuation,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::large_enum_variant,
+    clippy::enum_variant_names,
+    clippy::let_and_return,
+)]
+
 #[cfg(test)]
 #[path = "../eval/agents/check.rs"]
 mod agent_eval_check;
@@ -64,6 +75,7 @@ mod util {
 }
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -1021,7 +1033,7 @@ impl ServerHandler for BlackboxServer {
         let entity = server::surface::build_surface_entity(surface_str, None);
         let decision = {
             let packets = self.state.packets.read();
-            server::surface::evaluate_tool_surface(&*packets, entity, None::<&str>)
+            server::surface::evaluate_tool_surface(&packets, entity, None::<&str>)
         };
         if matches!(decision.verdict, server::surface::ToolSurfaceVerdict::Deny { .. }) {
             let reason = match &decision.verdict {
@@ -1048,7 +1060,7 @@ impl ServerHandler for BlackboxServer {
         let entity = server::surface::build_surface_entity(surface, None);
         let packets = self.state.packets.read();
         let decision =
-            server::surface::evaluate_tool_surface(&*packets, entity, None::<&str>);
+            server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
         drop(packets);
         let universe: Vec<String> = self
             .tool_router
@@ -1072,7 +1084,7 @@ impl ServerHandler for BlackboxServer {
         let entity = server::surface::build_surface_entity(surface, None);
         let packets = self.state.packets.read();
         let decision =
-            server::surface::evaluate_tool_surface(&*packets, entity, None::<&str>);
+            server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
         drop(packets);
         let universe: Vec<String> = self
             .tool_router
@@ -1098,8 +1110,8 @@ impl ServerHandler for BlackboxServer {
             let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
             let entity = server::surface::build_surface_entity(surface, None);
             let packets = self.state.packets.read();
-            let decision =
-                server::surface::evaluate_tool_surface(&*packets, entity, None::<&str>);
+let decision =
+            server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
             let universe: Vec<String> = self
                 .tool_router
                 .list_all()
@@ -1333,8 +1345,8 @@ async fn main() -> anyhow::Result<()> {
     // Export for provider arg-builders so they can inject `--mcp-config`
     // etc. at dispatch time — ensures dispatched subprocesses see
     // blackbox regardless of which config file their CLI inherits.
-    std::env::set_var("BLACKBOX_MCP_URL", &bbox_url);
-    std::env::set_var("BLACKBOX_MCP_NAME", &bbox_mcp_name);
+    unsafe { std::env::set_var("BLACKBOX_MCP_URL", &bbox_url); }
+    unsafe { std::env::set_var("BLACKBOX_MCP_NAME", &bbox_mcp_name); }
     let report = orchestration::mcp::self_register_blackbox(&bbox_mcp_name, &bbox_url);
     tracing::info!(
         "blackbox MCP self-registration (name={}): {}",
@@ -1633,7 +1645,7 @@ async fn main() -> anyhow::Result<()> {
         if let Ok(entries) = std::fs::read_dir(&workflow_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.extension().is_some_and(|e| e == "json") {
+                if path.extension() != Some(OsStr::new("json")) {
                     continue;
                 }
                 if let Ok(bytes) = std::fs::read(&path) {

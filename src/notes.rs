@@ -124,20 +124,23 @@ pub enum NoteKind {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Default,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::AsRefStr,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum NoteResolution {
+    #[default]
     Unresolved,
     Acknowledged,
     Addressed,
-}
-
-impl Default for NoteResolution {
-    fn default() -> Self {
-        Self::Unresolved
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

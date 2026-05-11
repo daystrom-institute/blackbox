@@ -110,7 +110,7 @@ impl BlackboxServer {
                 (inner.started_at, entry)
             })
             .collect();
-        with_ts.sort_by(|a, b| b.0.cmp(&a.0));
+        with_ts.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
         let entries: Vec<Value> = with_ts.into_iter().take(limit).map(|(_, e)| e).collect();
         let agents: BTreeMap<String, Value> = agent_metrics
             .into_iter()
@@ -118,7 +118,7 @@ impl BlackboxServer {
                 let avg_elapsed_ms = if metrics.elapsed_count == 0 {
                     None
                 } else {
-                    Some(metrics.elapsed_ms_total / metrics.elapsed_count)
+                    Some((metrics.elapsed_ms_total as f64) / (metrics.elapsed_count as f64))
                 };
                 (
                     label,

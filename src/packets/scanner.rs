@@ -214,11 +214,11 @@ pub fn find_repair_candidates(
             "audit" => {
                 // Latest audit wins (events are newest-first, so first
                 // audit we see for this packet is the freshest).
-                if slot.latest_audit_ts.is_none() {
-                    if let Some(f) = ev.details.get("fidelity").and_then(|v| v.as_f64()) {
-                        slot.latest_fidelity = Some(f as f32);
-                        slot.latest_audit_ts = Some(ev.timestamp.clone());
-                    }
+                if slot.latest_audit_ts.is_none()
+                    && let Some(f) = ev.details.get("fidelity").and_then(|v| v.as_f64())
+                {
+                    slot.latest_fidelity = Some(f as f32);
+                    slot.latest_audit_ts = Some(ev.timestamp.clone());
                 }
             }
             _ => {}

@@ -455,23 +455,27 @@ pub(super) fn infer_classification_detailed<'a>(
 /// no `Independent` rule fired, which is the correct semantics for a
 /// catchall that should disappear when real findings exist.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::AsRefStr,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Emit {
     /// Default: rule fires whenever its antecedent matches.
+    #[default]
     Independent,
     /// Catchall / default-case rule. In `apply_all`, fires ONLY when no
     /// `Independent` rule fired. In `apply_first`, behaves like any
     /// other rule (first-match-wins ordering still applies).
     Fallback,
-}
-
-impl Default for Emit {
-    fn default() -> Self {
-        Emit::Independent
-    }
 }
 
 // ── Rule ──────────────────────────────────────────────────────────

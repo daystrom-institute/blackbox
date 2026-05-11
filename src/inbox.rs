@@ -344,7 +344,7 @@ fn stale_threads<'a>(
         .filter(|(_, age)| *age >= stale_days)
         .collect();
 
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.1));
     rows.truncate(limit);
     rows
 }
@@ -392,7 +392,7 @@ fn failed_tasks(task_store: &TaskStore, limit: usize) -> Vec<(String, String, u6
         })
         .collect();
 
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.2));
     rows.truncate(limit);
     rows
 }

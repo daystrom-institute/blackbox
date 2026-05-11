@@ -1,3 +1,14 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::doc_overindented_list_items,
+    clippy::doc_lazy_continuation,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::large_enum_variant,
+    clippy::enum_variant_names,
+    clippy::let_and_return,
+)]
+
 //! bro-slack — Slack sidecar bridge for blackbox.
 //!
 //! Owns Socket Mode WebSocket connection to Slack, token authentication,
@@ -458,8 +469,8 @@ pub fn normalize_envelope(
                 .map(String::from);
 
             // Block Kit actions
-            if let Some(actions) = payload.get("actions").and_then(|a| a.as_array()) {
-                if let Some(first_action) = actions.first() {
+            if let Some(actions) = payload.get("actions").and_then(|a| a.as_array())
+                && let Some(first_action) = actions.first() {
                     event.action_id = first_action
                         .get("action_id")
                         .and_then(Value::as_str)
@@ -469,7 +480,6 @@ pub fn normalize_envelope(
                         .and_then(Value::as_str)
                         .map(String::from);
                 }
-            }
 
             // View submission
             if let Some(view) = payload.get("view") {
@@ -1984,21 +1994,21 @@ mod tests {
     #[test]
     fn test_hmac_no_secret_returns_none() {
         // Ensure the env var is unset
-        std::env::remove_var("BRO_TEST_NO_SECRET");
+        unsafe { std::env::remove_var("BRO_TEST_NO_SECRET"); }
         let result = maybe_build_hmac_header(b"hello", "BRO_TEST_NO_SECRET");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_hmac_secret_empty_returns_none() {
-        std::env::set_var("BRO_TEST_EMPTY_SECRET", "");
+        unsafe { std::env::set_var("BRO_TEST_EMPTY_SECRET", ""); }
         let result = maybe_build_hmac_header(b"hello", "BRO_TEST_EMPTY_SECRET");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_hmac_produces_valid_hex() {
-        std::env::set_var("BRO_TEST_HMAC_SECRET", "hunter2");
+        unsafe { std::env::set_var("BRO_TEST_HMAC_SECRET", "hunter2"); }
         let body = br#"{"event":"test"}"#;
         let sig = maybe_build_hmac_header(body, "BRO_TEST_HMAC_SECRET").unwrap();
         // Should be 64 hex chars (32 bytes)
@@ -2017,7 +2027,7 @@ mod tests {
 
     #[test]
     fn test_hmac_different_bodies_produce_different_sigs() {
-        std::env::set_var("BRO_TEST_HMAC_DIFF", "secret");
+        unsafe { std::env::set_var("BRO_TEST_HMAC_DIFF", "secret"); }
         let sig1 = maybe_build_hmac_header(b"body1", "BRO_TEST_HMAC_DIFF").unwrap();
         let sig2 = maybe_build_hmac_header(b"body2", "BRO_TEST_HMAC_DIFF").unwrap();
         assert_ne!(sig1, sig2);
@@ -2317,7 +2327,7 @@ mod tests {
 
     #[test]
     fn test_hmac_same_input_same_output() {
-        std::env::set_var("BRO_TEST_DET", "secret");
+        unsafe { std::env::set_var("BRO_TEST_DET", "secret"); }
         let s1 = maybe_build_hmac_header(b"hello", "BRO_TEST_DET").unwrap();
         let s2 = maybe_build_hmac_header(b"hello", "BRO_TEST_DET").unwrap();
         assert_eq!(s1, s2);

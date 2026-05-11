@@ -1,3 +1,14 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::doc_overindented_list_items,
+    clippy::doc_lazy_continuation,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::large_enum_variant,
+    clippy::enum_variant_names,
+    clippy::let_and_return,
+)]
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -218,7 +229,7 @@ async fn main() -> Result<()> {
     ));
 
     if args.announce {
-        sender.send_privmsg(&args.channel, &help_text())?;
+        sender.send_privmsg(&args.channel, help_text())?;
     }
 
     loop {
@@ -243,8 +254,8 @@ async fn main() -> Result<()> {
                                 body: format!("error: {e:#}"),
                             }).ok();
                         }
-                    } else if nick != args.nick {
-                        if let Some(council_id) = ensure_council_for_target(&bridge_state, &tx, daemon.clone(), target) {
+                    } else if nick != args.nick
+                        && let Some(council_id) = ensure_council_for_target(&bridge_state, &tx, daemon.clone(), target) {
                             let client = reqwest::Client::new();
                             let body = normalize_instance_mentions(&bridge_state, target, body);
                             if let Err(e) = post_council_turn(&client, &daemon, &council_id, nick, &body).await {
@@ -254,7 +265,6 @@ async fn main() -> Result<()> {
                                 }).ok();
                             }
                         }
-                    }
                 }
             }
             Some(outbound) = rx.recv() => {
@@ -504,8 +514,8 @@ async fn tail_once(
             if payload.is_empty() {
                 continue;
             }
-            if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-                if let Some(line) =
+            if let Ok(value) = serde_json::from_str::<Value>(&payload)
+                && let Some(line) =
                     summarize_tail_event(client, daemon, &value, labels, last_outputs).await
                 {
                     tx.send(Outbound::Privmsg {
@@ -514,7 +524,6 @@ async fn tail_once(
                     })
                     .ok();
                 }
-            }
         }
     }
     Err(anyhow!("tail stream ended"))
@@ -1358,12 +1367,11 @@ async fn summarize_tail_event(
             Some(format!("{who} cancelled {task}"))
         }
         "task_progress" => {
-            let activity = v.get("activity").and_then(Value::as_str)?.trim();
-            if activity.is_empty() {
-                None
-            } else {
-                None
-            }
+            // Progress events are intentionally suppressed in the IRC bridge —
+            // too chatty for a chat channel. Keep the activity extraction so
+            // future filtering can reuse the parsed value.
+            let _activity = v.get("activity").and_then(Value::as_str)?.trim();
+            None
         }
         _ => None,
     }

@@ -15,6 +15,7 @@
 //! to a non-loopback address.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -124,7 +125,7 @@ pub fn load_all(dir: &std::path::Path) -> Vec<WebhookSpec> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "json") {
+        if path.extension() != Some(OsStr::new("json")) {
             continue;
         }
         if let Ok(bytes) = std::fs::read(&path) {
@@ -270,7 +271,7 @@ mod tests {
 
     #[test]
     fn hmac_sha256_signature_verifies_no_prefix() {
-        std::env::set_var("WEBHOOK_TEST_SECRET", "hunter2");
+        unsafe { std::env::set_var("WEBHOOK_TEST_SECRET", "hunter2"); }
         let scheme = SignatureScheme::HmacSha256 {
             secret_env: "WEBHOOK_TEST_SECRET".into(),
             header: "X-Gitea-Signature".into(),
@@ -293,7 +294,7 @@ mod tests {
 
     #[test]
     fn hmac_sha256_signature_verifies_with_prefix() {
-        std::env::set_var("WEBHOOK_TEST_SECRET2", "hunter3");
+        unsafe { std::env::set_var("WEBHOOK_TEST_SECRET2", "hunter3"); }
         let scheme = SignatureScheme::HmacSha256 {
             secret_env: "WEBHOOK_TEST_SECRET2".into(),
             header: "X-Hub-Signature-256".into(),

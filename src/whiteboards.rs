@@ -32,6 +32,7 @@
 //! lockfile dance phaser does for Node IPC isn't needed here).
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -581,7 +582,7 @@ impl WhiteboardRegistry {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.extension().is_some_and(|e| e == "json") {
+                if path.extension() != Some(OsStr::new("json")) {
                     continue;
                 }
                 if let Ok(bytes) = std::fs::read(&path) {

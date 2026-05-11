@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::server::*;
 use crate::*;
 
@@ -161,11 +163,15 @@ impl BlackboxServer {
             exec_opts.as_ref(),
         );
         let filters = brofile_filters.unwrap_or_default();
-        let dispatch_filters =
-            match resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, Some(&filters), None, &self.state.packets.read()) {
-                Ok(df) => df,
-                Err(e) => return Err(e),
-            };
+        let dispatch_filters = resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            false,
+            &task_id,
+            Some(&filters),
+            None,
+            &self.state.packets.read(),
+        )?;
         let effective_filters = dispatch_filters.filters.clone();
         args.extend(dispatch_filters.args);
 
@@ -1257,7 +1263,7 @@ impl BlackboxServer {
             cwd.as_deref(),
             exec_opts.as_ref(),
         );
-        let dispatch_filters = match resolve_dispatch_filters(
+        let dispatch_filters = resolve_dispatch_filters(
             provider,
             cwd.as_deref(),
             false,
@@ -1265,10 +1271,7 @@ impl BlackboxServer {
             brofile_filters.as_ref(),
             None,
             &self.state.packets.read(),
-        ) {
-            Ok(df) => df,
-            Err(e) => return Err(e),
-        };
+        )?;
         args.extend(dispatch_filters.args);
         let task = orch::spawn_with_pre_minted_id(
             task_id.to_string(),

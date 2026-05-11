@@ -2556,16 +2556,16 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             "no longer present in any rendered file",
         ));
 
-        std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap());
+        unsafe { std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap()); }
         // Make sure no other provider files are scanned (set to nonexistent paths).
-        std::env::set_var(
+        unsafe { std::env::set_var(
             "BLACKBOX_GLOBAL_CODEX_MD",
             tmpdir.path().join("nope-codex").to_str().unwrap(),
-        );
-        std::env::set_var(
+        ) };
+        unsafe { std::env::set_var(
             "BLACKBOX_GLOBAL_GEMINI_MD",
             tmpdir.path().join("nope-gemini").to_str().unwrap(),
-        );
+        ) };
 
         let report = kb
             .absorb(&AbsorbParams {
@@ -2574,9 +2574,9 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             })
             .unwrap();
 
-        std::env::remove_var("BLACKBOX_GLOBAL_CLAUDE_MD");
-        std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD");
-        std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD");
+        unsafe { std::env::remove_var("BLACKBOX_GLOBAL_CLAUDE_MD"); }
+        unsafe { std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD"); }
+        unsafe { std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD"); }
 
         assert!(
             report.contains("Global absorb is no-op"),
@@ -2624,15 +2624,15 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let claude_md = tmpdir.path().join("CLAUDE.md");
         // No markers — entire file is hand-authored. Should not absorb anything.
         std::fs::write(&claude_md, "@RTK.md\n\n## Hand-authored only\n\nbody\n").unwrap();
-        std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap());
-        std::env::set_var(
+        unsafe { std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap()); }
+        unsafe { std::env::set_var(
             "BLACKBOX_GLOBAL_CODEX_MD",
             tmpdir.path().join("nope-codex").to_str().unwrap(),
-        );
-        std::env::set_var(
+        ) };
+        unsafe { std::env::set_var(
             "BLACKBOX_GLOBAL_GEMINI_MD",
             tmpdir.path().join("nope-gemini").to_str().unwrap(),
-        );
+        ) };
 
         let report = kb
             .absorb(&AbsorbParams {
@@ -2641,9 +2641,9 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             })
             .unwrap();
 
-        std::env::remove_var("BLACKBOX_GLOBAL_CLAUDE_MD");
-        std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD");
-        std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD");
+        unsafe { std::env::remove_var("BLACKBOX_GLOBAL_CLAUDE_MD"); }
+        unsafe { std::env::remove_var("BLACKBOX_GLOBAL_CODEX_MD"); }
+        unsafe { std::env::remove_var("BLACKBOX_GLOBAL_GEMINI_MD"); }
 
         assert!(
             report.contains("Global absorb is no-op"),

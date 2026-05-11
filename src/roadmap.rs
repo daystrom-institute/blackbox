@@ -665,7 +665,7 @@ impl Roadmap {
 
                 // Staleness bonus: older accepted items score higher
                 if let Ok(age_days) = days_between(&i.created_at, &now) {
-                    score += (age_days as f64).min(90.0) * 0.5; // up to 45 points
+                    score += age_days * 0.5; // up to 45 points
                 }
 
                 // Blocker penalty

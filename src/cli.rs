@@ -1,3 +1,14 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::doc_overindented_list_items,
+    clippy::doc_lazy_continuation,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::large_enum_variant,
+    clippy::enum_variant_names,
+    clippy::let_and_return,
+)]
+
 //! `bro tail` — multi-lane transcript tail for agent orchestration.
 //!
 //! Selects one or more bros (by name, team, or provider), resolves their
@@ -404,13 +415,11 @@ async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
                 if payload.is_empty() {
                     continue;
                 }
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
-                    if let Some(signal) = parse_lane_signal(&value) {
-                        if tx.send(signal).is_err() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload)
+                    && let Some(signal) = parse_lane_signal(&value)
+                        && tx.send(signal).is_err() {
                             return;
                         }
-                    }
-                }
             }
         }
         // Stream ended — pause and reconnect.
@@ -605,21 +614,18 @@ impl Lane {
         bro_selector: Option<&str>,
         session_id: Option<&str>,
     ) -> bool {
-        if let Some(selector) = bro_selector {
-            if selector == self.bro_selector {
+        if let Some(selector) = bro_selector
+            && selector == self.bro_selector {
                 return true;
             }
-        }
-        if let Some(b) = bro {
-            if b == self.bro && self.team == "adhoc" {
+        if let Some(b) = bro
+            && b == self.bro && self.team == "adhoc" {
                 return true;
             }
-        }
-        if let (Some(s), Some(lane_sid)) = (session_id, self.session_id.as_deref()) {
-            if s == lane_sid {
+        if let (Some(s), Some(lane_sid)) = (session_id, self.session_id.as_deref())
+            && s == lane_sid {
                 return true;
             }
-        }
         false
     }
 
@@ -686,16 +692,14 @@ impl Lane {
             } => (session_id.as_deref(), jsonl_path.as_deref()),
         };
 
-        if self.session_id.is_none() {
-            if let Some(sid) = session_id {
+        if self.session_id.is_none()
+            && let Some(sid) = session_id {
                 self.session_id = Some(sid.to_string());
             }
-        }
-        if self.jsonl_path.is_none() {
-            if let Some(path) = jsonl_path {
+        if self.jsonl_path.is_none()
+            && let Some(path) = jsonl_path {
                 self.jsonl_path = Some(PathBuf::from(path));
             }
-        }
         if self.status != LaneStatus::Tailing
             && self.session_id.is_some()
             && self.jsonl_path.is_some()
@@ -1161,8 +1165,8 @@ async fn orchestrate_list(args: OrchestrateListArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<18} {:<22} {:<10} {:<22} {}",
-        "thread_id", "name", "status", "last_activity", "anchor"
+        "{:<18} {:<22} {:<10} {:<22} anchor",
+        "thread_id", "name", "status", "last_activity"
     );
     for e in arr.iter().take(args.limit) {
         let tid = e["thread_id"].as_str().unwrap_or("?");
@@ -1654,21 +1658,19 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
             if !in_body {
                 return;
             }
-            if let Some(idx) = lane_at(&app.lane_columns, col) {
-                if let Some(l) = app.lanes.get_mut(idx) {
+            if let Some(idx) = lane_at(&app.lane_columns, col)
+                && let Some(l) = app.lanes.get_mut(idx) {
                     l.scroll_from_bottom = l.scroll_from_bottom.saturating_add(3);
                 }
-            }
         }
         MouseEventKind::ScrollDown => {
             if !in_body {
                 return;
             }
-            if let Some(idx) = lane_at(&app.lane_columns, col) {
-                if let Some(l) = app.lanes.get_mut(idx) {
+            if let Some(idx) = lane_at(&app.lane_columns, col)
+                && let Some(l) = app.lanes.get_mut(idx) {
                     l.scroll_from_bottom = l.scroll_from_bottom.saturating_sub(3);
                 }
-            }
         }
         _ => {}
     }
@@ -2039,8 +2041,8 @@ fn phase_now(period_ms: u64) -> u64 {
 ///   (empty)      — no active task.
 fn activity_badge(lane: &Lane) -> Span<'static> {
     let now = Instant::now();
-    if let Some((t, _)) = &lane.last_failure {
-        if now.duration_since(*t) < Duration::from_secs(5) {
+    if let Some((t, _)) = &lane.last_failure
+        && now.duration_since(*t) < Duration::from_secs(5) {
             let bright = phase_now(400) < 200;
             let color = if bright { Color::Red } else { Color::DarkGray };
             return Span::styled(
@@ -2048,7 +2050,6 @@ fn activity_badge(lane: &Lane) -> Span<'static> {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             );
         }
-    }
     if lane.active_tasks.is_empty() {
         return Span::raw("");
     }
@@ -2082,14 +2083,13 @@ fn activity_badge(lane: &Lane) -> Span<'static> {
 /// watch the model stream even before the on-disk JSONL catches up.
 fn snippet_line(lane: &Lane) -> Line<'static> {
     if lane.active_tasks.is_empty() {
-        if let Some((t, err)) = &lane.last_failure {
-            if Instant::now().duration_since(*t) < Duration::from_secs(5) {
+        if let Some((t, err)) = &lane.last_failure
+            && Instant::now().duration_since(*t) < Duration::from_secs(5) {
                 return Line::from(Span::styled(
                     format!(" ✗ {err}"),
                     Style::default().fg(Color::Red),
                 ));
             }
-        }
         return Line::from("");
     }
     let snippet = lane.last_progress_snippet.as_deref().unwrap_or("…");
@@ -2296,14 +2296,13 @@ pub(crate) fn stitch_ordered_list_markers(lines: Vec<Line<'static>>) -> Vec<Line
     let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     let mut iter = lines.into_iter().peekable();
     while let Some(line) = iter.next() {
-        if is_ordered_list_marker_only(&line) {
-            if let Some(next) = iter.next() {
+        if is_ordered_list_marker_only(&line)
+            && let Some(next) = iter.next() {
                 let mut spans = line.spans;
                 spans.extend(next.spans);
                 out.push(Line::from(spans));
                 continue;
             }
-        }
         out.push(line);
     }
     out

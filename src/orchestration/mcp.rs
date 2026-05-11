@@ -1492,7 +1492,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        std::env::set_var("HOME", dir.path());
+        unsafe { std::env::set_var("HOME", dir.path()); }
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(project.join(".bbox")).unwrap();
@@ -1552,8 +1552,8 @@ mod tests {
         assert!(result.contains("global"));
 
         match prior {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
     }
 
@@ -1825,7 +1825,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        unsafe { std::env::set_var("HOME", tmp.path()); }
         let filters = McpFilters {
             disallow: vec!["mcp__blackbox__bro_*".into()],
             allow: vec![],
@@ -1838,8 +1838,8 @@ mod tests {
         assert!(content.contains("[[rule]]"));
         assert!(content.contains("bro_exec"));
         match prior {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
     }
 
@@ -1848,12 +1848,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        unsafe { std::env::set_var("HOME", tmp.path()); }
         let filters = McpFilters::default();
         assert!(write_gemini_policy_file("t", &filters).unwrap().is_none());
         match prior {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
     }
 
@@ -1862,7 +1862,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        unsafe { std::env::set_var("HOME", tmp.path()); }
         let filters = McpFilters {
             disallow: vec!["Edit".into()],
             allow: vec![],
@@ -1870,8 +1870,8 @@ mod tests {
         // Non-blackbox patterns → no rule block → no file written.
         assert!(write_gemini_policy_file("t", &filters).unwrap().is_none());
         match prior {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
     }
 
@@ -1923,14 +1923,14 @@ mod tests {
             exclude_tools: Vec::new(),
         };
         // Without the env var set, resolution must fail.
-        std::env::remove_var("MY_TEST_TOKEN_12345");
+        unsafe { std::env::remove_var("MY_TEST_TOKEN_12345"); }
         assert!(cfg.resolve_secrets().is_err(), "missing secret must be an error");
 
         // With it set, resolution must succeed.
-        std::env::set_var("MY_TEST_TOKEN_12345", "Bearer xyz123");
+        unsafe { std::env::set_var("MY_TEST_TOKEN_12345", "Bearer xyz123"); }
         let resolved = cfg.resolve_secrets().unwrap();
         assert_eq!(resolved.headers.get("Authorization").map(|s| s.as_str()), Some("Bearer xyz123"));
-        std::env::remove_var("MY_TEST_TOKEN_12345");
+        unsafe { std::env::remove_var("MY_TEST_TOKEN_12345"); }
     }
 
     #[test]

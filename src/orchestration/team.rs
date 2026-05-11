@@ -53,15 +53,11 @@ pub struct Teamplate {
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
+#[derive(Default)]
 pub enum AdvisorMode {
+    #[default]
     Blocking,
     Background,
-}
-
-impl Default for AdvisorMode {
-    fn default() -> Self {
-        Self::Blocking
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

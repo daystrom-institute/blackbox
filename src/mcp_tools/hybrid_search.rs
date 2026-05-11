@@ -358,7 +358,7 @@ fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Optio
         let canonical = std::fs::canonicalize(raw).ok()?;
         if let Some(record) = projects
             .iter()
-            .find(|r| std::path::PathBuf::from(&r.canonical_path) == canonical)
+            .find(|r| r.canonical_path == canonical)
         {
             return Some(record.project_id.clone());
         }

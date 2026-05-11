@@ -167,7 +167,7 @@ pub fn load_all(dir: &std::path::Path) -> Vec<CronSpec> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "json") {
+        if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
         if let Ok(bytes) = std::fs::read(&path) {
@@ -309,13 +309,7 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &CronSpec) -> R
     // sits in main.rs's dispatch_verdict where we have access to the
     // tokio::spawn boundary. Here we only refund the slot if the
     // dispatch itself failed at the routing layer.
-    if result.is_err() {
-        crons_for_done.mark_done(&cron_name);
-    } else {
-        // Inspect the verdict — only start_arc spawns a long-lived arc
-        // that needs deferred decrement. Other verdicts (signal/ignore/
-        // dead_letter) complete synchronously and free the slot now.
-        let r = result.as_ref().unwrap();
+    if let Ok(r) = &result {
         let was_start_arc = r.get("status").and_then(|v| v.as_str()) == Some("arc_started");
         if !was_start_arc {
             crons_for_done.mark_done(&cron_name);

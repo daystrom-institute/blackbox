@@ -184,7 +184,7 @@ impl ArcContext {
         schema
             .iter()
             .filter(|(_, e)| e.required)
-            .filter(|(k, _)| !self.vars.get(*k).is_some_and(|v| !matches!(v, Value::Null)))
+            .filter(|(k, _)| self.vars.get(*k).is_none_or(|v| matches!(v, Value::Null)))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn render_template_resolves_env_head() {
         let c = ctx();
-        std::env::set_var("CTX_TEST_HEAD", "hello");
+        unsafe { std::env::set_var("CTX_TEST_HEAD", "hello"); }
         let rendered = c.render_template("${env.CTX_TEST_HEAD} world");
         assert_eq!(rendered, "hello world");
     }
@@ -576,7 +576,7 @@ mod tests {
         // expression — that produced the broken
         // `'env.X}/path/${vars.y' did not resolve` error.
         let c = ctx();
-        std::env::set_var("CTX_TEST_BASE", "http://host:3000");
+        unsafe { std::env::set_var("CTX_TEST_BASE", "http://host:3000"); }
         let raw = json!("${env.CTX_TEST_BASE}/repos/${vars.repo}/issues/${vars.issue}");
         let resolved = resolve_arg_value(&c, &raw).unwrap();
         assert_eq!(resolved, json!("http://host:3000/repos/foo/bar/issues/42"));

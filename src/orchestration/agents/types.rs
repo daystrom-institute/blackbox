@@ -62,21 +62,12 @@ pub struct AgentManifest {
 // AgentFilterOverlay
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AgentFilterOverlay {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disallow: Vec<String>,
-}
-
-impl Default for AgentFilterOverlay {
-    fn default() -> Self {
-        Self {
-            allow: Vec::new(),
-            disallow: Vec::new(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -294,21 +285,12 @@ pub struct BadgeyAgentArgs {
 // MergedFilters
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MergedFilters {
     #[serde(default)]
     pub allow: Vec<String>,
     #[serde(default)]
     pub disallow: Vec<String>,
-}
-
-impl Default for MergedFilters {
-    fn default() -> Self {
-        Self {
-            allow: Vec::new(),
-            disallow: Vec::new(),
-        }
-    }
 }
 
 impl Default for AgentManifest {

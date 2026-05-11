@@ -245,12 +245,11 @@ impl App {
     }
 
     fn maybe_clear_status(&mut self) {
-        if let Some(until) = self.status_until {
-            if Instant::now() >= until {
+        if let Some(until) = self.status_until
+            && Instant::now() >= until {
                 self.status = None;
                 self.status_until = None;
             }
-        }
     }
 }
 
@@ -345,11 +344,10 @@ async fn run_sse_subscriber(url: String, tx: mpsc::Sender<Signal>) {
                 if payload.is_empty() {
                     continue;
                 }
-                if let Ok(ev) = serde_json::from_str::<CouncilEvent>(&payload) {
-                    if tx.send(Signal::Event(ev)).is_err() {
+                if let Ok(ev) = serde_json::from_str::<CouncilEvent>(&payload)
+                    && tx.send(Signal::Event(ev)).is_err() {
                         return;
                     }
-                }
             }
         }
         let _ = tx.send(Signal::Disconnected);

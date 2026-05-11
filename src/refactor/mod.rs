@@ -1399,9 +1399,7 @@ fn run_validation_command(
     if command.chars().any(char::is_whitespace) {
         return Ok(CommandStepResult {
             success: false,
-            error: Some(format!(
-                "command must be an executable path without whitespace; put arguments in args, e.g. command=\"cargo\", args=[\"fmt\"], not command=\"cargo fmt\""
-            )),
+            error: Some("command must be an executable path without whitespace; put arguments in args, e.g. command=\"cargo\", args=[\"fmt\"], not command=\"cargo fmt\"".to_string()),
         });
     }
     let mut cmd = Command::new(command);

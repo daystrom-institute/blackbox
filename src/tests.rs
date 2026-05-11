@@ -306,7 +306,7 @@ async fn proposal_approved_hook_bumps_link_version() {
     // Ensure no token leaks in from the surrounding env so the
     // hook short-circuits before HTTP. (Safety belt — the test
     // depends on the bump happening before the token check.)
-    std::env::remove_var("SLACK_BOT_TOKEN");
+    unsafe { std::env::remove_var("SLACK_BOT_TOKEN"); }
     try_slack_proposal_signal_hook("proposal-approved", &server.state, &correlate, &entity).await;
     let bumped = server
         .state
@@ -344,7 +344,7 @@ async fn proposal_clarify_hook_does_not_bump_version() {
         "user": "Ualice",
         "text": "actually never mind, this one is fine as-is",
     });
-    std::env::remove_var("SLACK_BOT_TOKEN");
+    unsafe { std::env::remove_var("SLACK_BOT_TOKEN"); }
     try_slack_proposal_signal_hook("proposal-clarify", &server.state, &correlate, &entity).await;
     let unchanged = server
         .state
@@ -368,7 +368,7 @@ async fn proposal_signal_hook_no_op_for_unknown_thread_ts() {
         "channel": "C01",
         "user": "Ualice",
     });
-    std::env::remove_var("SLACK_BOT_TOKEN");
+    unsafe { std::env::remove_var("SLACK_BOT_TOKEN"); }
     try_slack_proposal_signal_hook("proposal-approved", &server.state, &correlate, &entity).await;
     // Nothing to assert beyond "did not panic" — but make a
     // sanity probe on the link store size to confirm we didn't
@@ -2470,7 +2470,7 @@ async fn badgey_lifecycle_tools_write_thread_events() {
     let _env_guard = codex_bin_test_guard().await;
     let prior_bin = std::env::var("CODEX_BIN").ok();
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test"));
+    unsafe { std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test")); }
     save_badgey_test_brofile(&tmp);
     let server = test_server(&tmp);
 
@@ -2518,8 +2518,8 @@ async fn badgey_lifecycle_tools_write_thread_events() {
         .any(|body| body.contains(r#""event":"dismiss""#)));
 
     match prior_bin {
-        Some(value) => std::env::set_var("CODEX_BIN", value),
-        None => std::env::remove_var("CODEX_BIN"),
+        Some(value) => unsafe { std::env::set_var("CODEX_BIN", value) },
+        None => unsafe { std::env::remove_var("CODEX_BIN") },
     }
 }
 
@@ -2528,7 +2528,7 @@ async fn badgey_agent_dispatch_routes_through_wrapper_adapter() {
     let _env_guard = codex_bin_test_guard().await;
     let prior_bin = std::env::var("CODEX_BIN").ok();
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test"));
+    unsafe { std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test")); }
     save_badgey_test_brofile(&tmp);
     let server = test_server(&tmp);
     server
@@ -2584,8 +2584,8 @@ async fn badgey_agent_dispatch_routes_through_wrapper_adapter() {
     assert_eq!(server.state.badgey_registry.list().len(), 1);
 
     match prior_bin {
-        Some(value) => std::env::set_var("CODEX_BIN", value),
-        None => std::env::remove_var("CODEX_BIN"),
+        Some(value) => unsafe { std::env::set_var("CODEX_BIN", value) },
+        None => unsafe { std::env::remove_var("CODEX_BIN") },
     }
 }
 

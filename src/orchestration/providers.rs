@@ -1173,17 +1173,13 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
     if evt["type"].as_str() == Some("stream_event") {
         let inner_ty = evt["event"]["type"].as_str().unwrap_or("");
         match inner_ty {
-            "content_block_start" => {
-                if evt["event"]["content_block"]["type"].as_str() == Some("text") {
-                    append_block_separator(&mut sink.last_assistant_message);
-                }
+            "content_block_start" if evt["event"]["content_block"]["type"].as_str() == Some("text") => {
+                append_block_separator(&mut sink.last_assistant_message);
             }
-            "content_block_delta" => {
-                if evt["event"]["delta"]["type"].as_str() == Some("text_delta") {
-                    if let Some(chunk) = evt["event"]["delta"]["text"].as_str() {
-                        let buf = sink.last_assistant_message.get_or_insert_with(String::new);
-                        buf.push_str(chunk);
-                    }
+            "content_block_delta" if evt["event"]["delta"]["type"].as_str() == Some("text_delta") => {
+                if let Some(chunk) = evt["event"]["delta"]["text"].as_str() {
+                    let buf = sink.last_assistant_message.get_or_insert_with(String::new);
+                    buf.push_str(chunk);
                 }
             }
             _ => {}
@@ -1496,7 +1492,7 @@ pub fn discover_vibe_session(start_ms: u64, project_dir: &str) -> Option<String>
         })
         .collect();
 
-    scored.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
+    scored.sort_by_key(|b| std::cmp::Reverse(b.1)); // most recent first
 
     scored
         .iter()
@@ -1589,7 +1585,7 @@ pub fn discover_gemini_session_in(
         }
     }
 
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|b| std::cmp::Reverse(b.1));
     let task_match = scored
         .iter()
         .find(|(_, _, dir, recent, task)| *dir && *recent && *task)

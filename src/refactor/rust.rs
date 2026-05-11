@@ -1545,7 +1545,7 @@ pub(crate) fn rust_mod_keyword_byte(source: &str, item: &SyntaxItem) -> Result<u
         if trimmed
             .strip_prefix(name)
             .and_then(|suffix| suffix.as_bytes().first().copied())
-            .is_some_and(|byte| rust_ident_byte(byte))
+            .is_some_and(rust_ident_byte)
         {
             continue;
         }
@@ -1602,7 +1602,7 @@ pub(crate) fn rust_existing_mod_decl_names(path: &Path, source: &str) -> Result<
         .filter_map(|item| {
             ensure_rust_mod_declaration(source, &item)
                 .ok()
-                .and_then(|_| item.name)
+                .and(item.name)
         })
         .collect::<HashSet<_>>();
     Ok(names)

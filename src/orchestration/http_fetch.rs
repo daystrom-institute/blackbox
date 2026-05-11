@@ -154,7 +154,7 @@ impl HttpFetchSpec {
             .map_err(|e| anyhow!("http fetch {method} {url}: send: {e}"))?;
         let status = resp.status().as_u16();
         let allow = match &self.expect_status {
-            Some(arr) => arr.iter().any(|n| *n == status),
+            Some(arr) => arr.contains(&status),
             None => (200..300).contains(&status),
         };
         let text = resp

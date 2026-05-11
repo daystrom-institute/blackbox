@@ -312,19 +312,19 @@ mod tests {
 
     #[test]
     fn env_expansion_handles_braced_form() {
-        std::env::set_var("MCP_TEST_VAR", "abc123");
+        unsafe { std::env::set_var("MCP_TEST_VAR", "abc123"); }
         assert_eq!(_expand_for_test("token ${MCP_TEST_VAR}"), "token abc123");
     }
 
     #[test]
     fn env_expansion_handles_unbraced_form() {
-        std::env::set_var("MCP_TEST_VAR2", "xyz");
+        unsafe { std::env::set_var("MCP_TEST_VAR2", "xyz"); }
         assert_eq!(_expand_for_test("$MCP_TEST_VAR2/path"), "xyz/path");
     }
 
     #[test]
     fn env_expansion_leaves_missing_verbatim() {
-        std::env::remove_var("MCP_TEST_NOT_SET_42");
+        unsafe { std::env::remove_var("MCP_TEST_NOT_SET_42"); }
         assert_eq!(
             _expand_for_test("${MCP_TEST_NOT_SET_42}"),
             "${MCP_TEST_NOT_SET_42}"

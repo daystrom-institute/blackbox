@@ -232,11 +232,10 @@ pub fn extract_tool_target(tool_name: &str, input: &Value) -> String {
     }
     if let Some(obj) = input.as_object() {
         for (_k, v) in obj {
-            if let Some(s) = v.as_str() {
-                if !s.is_empty() {
+            if let Some(s) = v.as_str()
+                && !s.is_empty() {
                     return oneline_snippet(s, 160);
                 }
-            }
         }
     }
     String::new()
@@ -393,8 +392,8 @@ fn parse_user_message_rich(message: &Value, base: &RichBase) -> Vec<TranscriptEv
             for block in blocks {
                 match block["type"].as_str() {
                     Some("text") => {
-                        if let Some(text) = block["text"].as_str() {
-                            if !text.is_empty() {
+                        if let Some(text) = block["text"].as_str()
+                            && !text.is_empty() {
                                 if let Some(kind) = detect_user_signal(text) {
                                     out.push(make_rich(
                                         MessageRole::User,
@@ -412,7 +411,6 @@ fn parse_user_message_rich(message: &Value, base: &RichBase) -> Vec<TranscriptEv
                                     ));
                                 }
                             }
-                        }
                     }
                     Some("tool_result") => {
                         let tool_use_id = block["tool_use_id"].as_str().unwrap_or("?").to_string();
@@ -455,26 +453,24 @@ fn parse_assistant_message_rich(message: &Value, base: &RichBase) -> Vec<Transcr
         };
         match block_type {
             "text" => {
-                if let Some(text) = block["text"].as_str() {
-                    if !text.is_empty() {
+                if let Some(text) = block["text"].as_str()
+                    && !text.is_empty() {
                         out.push(make_rich(
                             MessageRole::Assistant,
                             EventDetail::Text { text: text.into() },
                             base,
                         ));
                     }
-                }
             }
             "thinking" => {
-                if let Some(t) = block["thinking"].as_str() {
-                    if !t.is_empty() {
+                if let Some(t) = block["thinking"].as_str()
+                    && !t.is_empty() {
                         out.push(make_rich(
                             MessageRole::Thinking,
                             EventDetail::Thinking { text: t.into() },
                             base,
                         ));
                     }
-                }
             }
             "tool_use" => {
                 let name = block["name"].as_str().unwrap_or("unknown").to_string();
@@ -662,11 +658,10 @@ fn parse_codex_content_rich(
     let content = match payload["content"].as_array() {
         Some(c) => c,
         None => {
-            if let Some(s) = payload["content"].as_str() {
-                if !s.is_empty() {
+            if let Some(s) = payload["content"].as_str()
+                && !s.is_empty() {
                     return vec![make_rich(role, EventDetail::Text { text: s.into() }, base)];
                 }
-            }
             return vec![];
         }
     };
@@ -675,8 +670,8 @@ fn parse_codex_content_rich(
         let block_type = block["type"].as_str().unwrap_or("");
         match block_type {
             "input_text" | "output_text" => {
-                if let Some(text) = block["text"].as_str() {
-                    if !text.is_empty() {
+                if let Some(text) = block["text"].as_str()
+                    && !text.is_empty() {
                         if let Some(kind) = detect_user_signal(text) {
                             out.push(make_rich(
                                 role,
@@ -694,7 +689,6 @@ fn parse_codex_content_rich(
                             ));
                         }
                     }
-                }
             }
             "function_call" => {
                 let name = block["name"].as_str().unwrap_or("unknown").to_string();
@@ -732,15 +726,14 @@ fn parse_codex_content_rich(
                 ));
             }
             "reasoning" => {
-                if let Some(text) = block["text"].as_str() {
-                    if !text.is_empty() {
+                if let Some(text) = block["text"].as_str()
+                    && !text.is_empty() {
                         out.push(make_rich(
                             MessageRole::Thinking,
                             EventDetail::Thinking { text: text.into() },
                             base,
                         ));
                     }
-                }
             }
             _ => {}
         }
@@ -824,15 +817,14 @@ pub fn parse_copilot_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEv
         }
         "assistant.message" => {
             let mut out = Vec::new();
-            if let Some(r) = data["reasoningText"].as_str() {
-                if !r.is_empty() {
+            if let Some(r) = data["reasoningText"].as_str()
+                && !r.is_empty() {
                     out.push(make_rich(
                         MessageRole::Thinking,
                         EventDetail::Thinking { text: r.into() },
                         &base,
                     ));
                 }
-            }
             let content = data["content"].as_str().unwrap_or("");
             if !content.is_empty() {
                 out.push(make_rich(
@@ -1064,15 +1056,14 @@ pub fn parse_gemini_file_rich(raw: &str) -> Vec<TranscriptEvent> {
                     }
                 } else if let Some(arr) = msg["content"].as_array() {
                     for block in arr {
-                        if let Some(text) = block["text"].as_str() {
-                            if !text.is_empty() {
+                        if let Some(text) = block["text"].as_str()
+                            && !text.is_empty() {
                                 out.push(make_rich(
                                     MessageRole::User,
                                     EventDetail::Text { text: text.into() },
                                     &base,
                                 ));
                             }
-                        }
                     }
                 }
             }
@@ -1096,8 +1087,8 @@ pub fn parse_gemini_file_rich(raw: &str) -> Vec<TranscriptEvent> {
                         }
                     }
                 }
-                if let Some(s) = msg["content"].as_str() {
-                    if !s.is_empty() {
+                if let Some(s) = msg["content"].as_str()
+                    && !s.is_empty() {
                         // Gemini sometimes inlines reasoning into `content`
                         // delimited by `[Thought: true]` markers: each
                         // segment before a marker is a thought, and anything
@@ -1128,7 +1119,6 @@ pub fn parse_gemini_file_rich(raw: &str) -> Vec<TranscriptEvent> {
                             }
                         }
                     }
-                }
                 // Gemini packs call + result together: each toolCalls entry has
                 // id/name/args plus a result[].functionResponse.response blob
                 // and a status (success|error|cancelled). Emit a ToolUse/
@@ -1279,20 +1269,18 @@ fn parse_user_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent> {
             for block in blocks {
                 match block["type"].as_str() {
                     Some("text") => {
-                        if let Some(text) = block["text"].as_str() {
-                            if !text.is_empty() {
+                        if let Some(text) = block["text"].as_str()
+                            && !text.is_empty() {
                                 events.push(make_event(MessageRole::User, &truncate(text), base));
                             }
-                        }
                     }
                     Some("tool_result") => {
-                        if let Some(text) = extract_tool_result_text(block) {
-                            if !text.is_empty() {
+                        if let Some(text) = extract_tool_result_text(block)
+                            && !text.is_empty() {
                                 let tool_id = block["tool_use_id"].as_str().unwrap_or("?");
                                 let content = format!("result:{} {}", tool_id, truncate(&text));
                                 events.push(make_event(MessageRole::ToolResult, &content, base));
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -1318,18 +1306,16 @@ fn parse_assistant_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent
 
         match block_type {
             "text" => {
-                if let Some(text) = block["text"].as_str() {
-                    if !text.is_empty() {
+                if let Some(text) = block["text"].as_str()
+                    && !text.is_empty() {
                         events.push(make_event(MessageRole::Assistant, &truncate(text), base));
                     }
-                }
             }
             "thinking" => {
-                if let Some(thinking) = block["thinking"].as_str() {
-                    if !thinking.is_empty() {
+                if let Some(thinking) = block["thinking"].as_str()
+                    && !thinking.is_empty() {
                         events.push(make_event(MessageRole::Thinking, &truncate(thinking), base));
                     }
-                }
             }
             "tool_use" => {
                 let tool_name = block["name"].as_str().unwrap_or("unknown");
@@ -1511,11 +1497,10 @@ fn parse_codex_content_blocks(
         Some(c) => c,
         None => {
             // Sometimes content is a string directly
-            if let Some(s) = payload["content"].as_str() {
-                if !s.is_empty() {
+            if let Some(s) = payload["content"].as_str()
+                && !s.is_empty() {
                     return vec![make_event(role, &truncate(s), base)];
                 }
-            }
             return vec![];
         }
     };
@@ -1525,11 +1510,10 @@ fn parse_codex_content_blocks(
         let block_type = block["type"].as_str().unwrap_or("");
         match block_type {
             "input_text" | "output_text" => {
-                if let Some(text) = block["text"].as_str() {
-                    if !text.is_empty() {
+                if let Some(text) = block["text"].as_str()
+                    && !text.is_empty() {
                         events.push(make_event(role, &truncate(text), base));
                     }
-                }
             }
             "function_call" => {
                 let name = block["name"].as_str().unwrap_or("unknown");
@@ -1546,11 +1530,10 @@ fn parse_codex_content_blocks(
             }
             "reasoning" => {
                 // Codex reasoning/thinking — map to "thinking"
-                if let Some(text) = block["text"].as_str() {
-                    if !text.is_empty() {
+                if let Some(text) = block["text"].as_str()
+                    && !text.is_empty() {
                         events.push(make_event(MessageRole::Thinking, &truncate(text), base));
                     }
-                }
             }
             _ => {}
         }

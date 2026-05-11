@@ -468,7 +468,7 @@ pub fn spawn_reindex_thread(
             let mut tick = 0_u64;
             loop {
                 tick = tick.wrapping_add(1);
-                let full = full_reindex_every_ticks != 0 && tick % full_reindex_every_ticks == 0;
+                let full = full_reindex_every_ticks != 0 && tick.is_multiple_of(full_reindex_every_ticks);
                 if let Err(e) = try_background_reindex(&index, &config, fields, full) {
                     tracing::error!("background reindex failed: {:#}", e);
                 }

@@ -1724,7 +1724,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_with_pre_minted_id_tracks_known_id() {
         let prior_bin = std::env::var("CODEX_BIN").ok();
-        std::env::set_var("CODEX_BIN", "/bin/true");
+        unsafe { std::env::set_var("CODEX_BIN", "/bin/true"); }
         let tmp = tempfile::tempdir().unwrap();
         let task_store = Arc::new(RwLock::new(TaskStore::new()));
         let (tail_tx, _) = tokio::sync::broadcast::channel(8);
@@ -1759,8 +1759,8 @@ mod tests {
         );
 
         match prior_bin {
-            Some(value) => std::env::set_var("CODEX_BIN", value),
-            None => std::env::remove_var("CODEX_BIN"),
+            Some(value) => unsafe { std::env::set_var("CODEX_BIN", value) },
+            None => unsafe { std::env::remove_var("CODEX_BIN") },
         }
     }
 

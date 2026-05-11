@@ -185,55 +185,40 @@ pub fn migrate_legacy_defaults(home: &Path) -> anyhow::Result<Vec<String>> {
     if env_path("BLACKBOX_KNOWLEDGE_PATH").is_none() {
         let old = home.join(".claude-shared").join("blackbox-knowledge.json");
         let new = blackbox_knowledge_path(home);
-        match migrate_legacy_file(&old, &new)? {
-            LegacyMove::Moved { old, new } => {
-                moved.push(format!("knowledge: {} -> {}", old.display(), new.display()));
-            }
-            _ => {}
+        if let LegacyMove::Moved { old, new } = migrate_legacy_file(&old, &new)? {
+            moved.push(format!("knowledge: {} -> {}", old.display(), new.display()));
         }
     }
 
     if env_path("BLACKBOX_THREADS_PATH").is_none() {
         let old = home.join(".claude-shared").join("blackbox-threads.json");
         let new = blackbox_threads_path(home);
-        match migrate_legacy_file(&old, &new)? {
-            LegacyMove::Moved { old, new } => {
-                moved.push(format!("threads: {} -> {}", old.display(), new.display()));
-            }
-            _ => {}
+        if let LegacyMove::Moved { old, new } = migrate_legacy_file(&old, &new)? {
+            moved.push(format!("threads: {} -> {}", old.display(), new.display()));
         }
     }
 
     if env_path("BLACKBOX_NOTES_PATH").is_none() {
         let old = home.join(".claude-shared").join("blackbox-notes.json");
         let new = blackbox_notes_path(home);
-        match migrate_legacy_file(&old, &new)? {
-            LegacyMove::Moved { old, new } => {
-                moved.push(format!("notes: {} -> {}", old.display(), new.display()));
-            }
-            _ => {}
+        if let LegacyMove::Moved { old, new } = migrate_legacy_file(&old, &new)? {
+            moved.push(format!("notes: {} -> {}", old.display(), new.display()));
         }
     }
 
     if env_path("TRANSCRIPT_SEARCH_INDEX_PATH").is_none() {
         let old = home.join(".claude-shared").join("transcript-index");
         let new = blackbox_index_path(home);
-        match migrate_legacy_file(&old, &new)? {
-            LegacyMove::Moved { old, new } => {
-                moved.push(format!("index: {} -> {}", old.display(), new.display()));
-            }
-            _ => {}
+        if let LegacyMove::Moved { old, new } = migrate_legacy_file(&old, &new)? {
+            moved.push(format!("index: {} -> {}", old.display(), new.display()));
         }
     }
 
     if env_path("BLACKBOX_GLOBAL_COMMON_MD").is_none() {
         let old = home.join(".claude-shared").join("BLACKBOX.md");
         let new = blackbox_global_common_md_path(home);
-        match migrate_legacy_file(&old, &new)? {
-            LegacyMove::Moved { old, new } => {
-                moved.push(format!("blackbox-md: {} -> {}", old.display(), new.display()));
-            }
-            _ => {}
+        if let LegacyMove::Moved { old, new } = migrate_legacy_file(&old, &new)? {
+            moved.push(format!("blackbox-md: {} -> {}", old.display(), new.display()));
         }
     }
 
@@ -289,13 +274,13 @@ mod tests {
         let orig_pins = std::env::var("BLACKBOX_PINS_PATH").ok();
         let orig_index = std::env::var("TRANSCRIPT_SEARCH_INDEX_PATH").ok();
         let orig_bro_home = std::env::var("BRO_HOME").ok();
-        std::env::remove_var("BLACKBOX_STATE_DIR");
-        std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH");
-        std::env::remove_var("BLACKBOX_THREADS_PATH");
-        std::env::remove_var("BLACKBOX_NOTES_PATH");
-        std::env::remove_var("BLACKBOX_PINS_PATH");
-        std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH");
-        std::env::remove_var("BRO_HOME");
+        unsafe { std::env::remove_var("BLACKBOX_STATE_DIR"); }
+        unsafe { std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH"); }
+        unsafe { std::env::remove_var("BLACKBOX_THREADS_PATH"); }
+        unsafe { std::env::remove_var("BLACKBOX_NOTES_PATH"); }
+        unsafe { std::env::remove_var("BLACKBOX_PINS_PATH"); }
+        unsafe { std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH"); }
+        unsafe { std::env::remove_var("BRO_HOME"); }
 
         let state = blackbox_state_dir(home);
         assert!(state.ends_with(".local/state/blackbox") || state.ends_with("blackbox"));
@@ -307,13 +292,13 @@ mod tests {
         assert!(bro_home_dir(home).ends_with("blackbox/bro"));
         
         // Restore
-        if let Some(v) = orig_state_dir { std::env::set_var("BLACKBOX_STATE_DIR", v); } else { std::env::remove_var("BLACKBOX_STATE_DIR"); }
-        if let Some(v) = orig_knowledge { std::env::set_var("BLACKBOX_KNOWLEDGE_PATH", v); } else { std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH"); }
-        if let Some(v) = orig_threads { std::env::set_var("BLACKBOX_THREADS_PATH", v); } else { std::env::remove_var("BLACKBOX_THREADS_PATH"); }
-        if let Some(v) = orig_notes { std::env::set_var("BLACKBOX_NOTES_PATH", v); } else { std::env::remove_var("BLACKBOX_NOTES_PATH"); }
-        if let Some(v) = orig_pins { std::env::set_var("BLACKBOX_PINS_PATH", v); } else { std::env::remove_var("BLACKBOX_PINS_PATH"); }
-        if let Some(v) = orig_index { std::env::set_var("TRANSCRIPT_SEARCH_INDEX_PATH", v); } else { std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH"); }
-        if let Some(v) = orig_bro_home { std::env::set_var("BRO_HOME", v); } else { std::env::remove_var("BRO_HOME"); }
+        if let Some(v) = orig_state_dir { unsafe { std::env::set_var("BLACKBOX_STATE_DIR", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_STATE_DIR") }; }
+        if let Some(v) = orig_knowledge { unsafe { std::env::set_var("BLACKBOX_KNOWLEDGE_PATH", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH") }; }
+        if let Some(v) = orig_threads { unsafe { std::env::set_var("BLACKBOX_THREADS_PATH", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_THREADS_PATH") }; }
+        if let Some(v) = orig_notes { unsafe { std::env::set_var("BLACKBOX_NOTES_PATH", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_NOTES_PATH") }; }
+        if let Some(v) = orig_pins { unsafe { std::env::set_var("BLACKBOX_PINS_PATH", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_PINS_PATH") }; }
+        if let Some(v) = orig_index { unsafe { std::env::set_var("TRANSCRIPT_SEARCH_INDEX_PATH", v) }; } else { unsafe { std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH") }; }
+        if let Some(v) = orig_bro_home { unsafe { std::env::set_var("BRO_HOME", v) }; } else { unsafe { std::env::remove_var("BRO_HOME") }; }
     }
 
     #[test]
@@ -340,15 +325,15 @@ mod tests {
         let orig_pins = std::env::var("BLACKBOX_PINS_PATH").ok();
         let orig_index = std::env::var("TRANSCRIPT_SEARCH_INDEX_PATH").ok();
         let orig_bro_home = std::env::var("BRO_HOME").ok();
-        std::env::remove_var("BLACKBOX_STATE_DIR");
-        std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH");
-        std::env::remove_var("BLACKBOX_THREADS_PATH");
-        std::env::remove_var("BLACKBOX_NOTES_PATH");
-        std::env::remove_var("BLACKBOX_PINS_PATH");
-        std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH");
-        std::env::remove_var("BRO_HOME");
-        std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
-        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        unsafe { std::env::remove_var("BLACKBOX_STATE_DIR"); }
+        unsafe { std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH"); }
+        unsafe { std::env::remove_var("BLACKBOX_THREADS_PATH"); }
+        unsafe { std::env::remove_var("BLACKBOX_NOTES_PATH"); }
+        unsafe { std::env::remove_var("BLACKBOX_PINS_PATH"); }
+        unsafe { std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH"); }
+        unsafe { std::env::remove_var("BRO_HOME"); }
+        unsafe { std::env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
+        unsafe { std::env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
 
         let moved = migrate_legacy_defaults(home).unwrap();
         // Moved: knowledge, threads, notes, index, bro (tasks.json)
@@ -363,15 +348,15 @@ mod tests {
         assert!(!old_bro.exists());
         
         // Restore
-        if let Some(v) = orig_state_dir { std::env::set_var("BLACKBOX_STATE_DIR", v); } else { std::env::remove_var("BLACKBOX_STATE_DIR"); }
-        if let Some(v) = orig_knowledge { std::env::set_var("BLACKBOX_KNOWLEDGE_PATH", v); } else { std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH"); }
-        if let Some(v) = orig_threads { std::env::set_var("BLACKBOX_THREADS_PATH", v); } else { std::env::remove_var("BLACKBOX_THREADS_PATH"); }
-        if let Some(v) = orig_notes { std::env::set_var("BLACKBOX_NOTES_PATH", v); } else { std::env::remove_var("BLACKBOX_NOTES_PATH"); }
-        if let Some(v) = orig_pins { std::env::set_var("BLACKBOX_PINS_PATH", v); } else { std::env::remove_var("BLACKBOX_PINS_PATH"); }
-        if let Some(v) = orig_index { std::env::set_var("TRANSCRIPT_SEARCH_INDEX_PATH", v); } else { std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH"); }
-        if let Some(v) = orig_bro_home { std::env::set_var("BRO_HOME", v); } else { std::env::remove_var("BRO_HOME"); }
-        std::env::remove_var("XDG_STATE_HOME");
-        std::env::remove_var("XDG_DATA_HOME");
+        if let Some(v) = orig_state_dir { unsafe { std::env::set_var("BLACKBOX_STATE_DIR", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_STATE_DIR") }; }
+        if let Some(v) = orig_knowledge { unsafe { std::env::set_var("BLACKBOX_KNOWLEDGE_PATH", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_KNOWLEDGE_PATH") }; }
+        if let Some(v) = orig_threads { unsafe { std::env::set_var("BLACKBOX_THREADS_PATH", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_THREADS_PATH") }; }
+        if let Some(v) = orig_notes { unsafe { std::env::set_var("BLACKBOX_NOTES_PATH", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_NOTES_PATH") }; }
+        if let Some(v) = orig_pins { unsafe { std::env::set_var("BLACKBOX_PINS_PATH", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_PINS_PATH") }; }
+        if let Some(v) = orig_index { unsafe { std::env::set_var("TRANSCRIPT_SEARCH_INDEX_PATH", v) }; } else { unsafe { std::env::remove_var("TRANSCRIPT_SEARCH_INDEX_PATH") }; }
+        if let Some(v) = orig_bro_home { unsafe { std::env::set_var("BRO_HOME", v) }; } else { unsafe { std::env::remove_var("BRO_HOME") }; }
+        unsafe { std::env::remove_var("XDG_STATE_HOME"); }
+        unsafe { std::env::remove_var("XDG_DATA_HOME"); }
     }
 
     #[test]
@@ -398,12 +383,12 @@ mod tests {
         
         // Save and clear env vars
         let orig_packets_dir = std::env::var("BLACKBOX_PACKETS_DIR").ok();
-        std::env::remove_var("BLACKBOX_PACKETS_DIR");
+        unsafe { std::env::remove_var("BLACKBOX_PACKETS_DIR"); }
         
         let packets_dir = blackbox_packets_dir(home);
         assert!(packets_dir == blackbox_state_dir(home).join("packets"));
         
         // Restore
-        if let Some(v) = orig_packets_dir { std::env::set_var("BLACKBOX_PACKETS_DIR", v); } else { std::env::remove_var("BLACKBOX_PACKETS_DIR"); }
+        if let Some(v) = orig_packets_dir { unsafe { std::env::set_var("BLACKBOX_PACKETS_DIR", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_PACKETS_DIR") }; }
     }
 }

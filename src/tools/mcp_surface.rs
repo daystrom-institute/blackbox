@@ -47,7 +47,7 @@ impl BlackboxServer {
         let entity = surface::build_surface_entity(surface, p.project.as_deref());
 
         let packets = self.state.packets.read();
-        let decision = surface::evaluate_tool_surface(&*packets, entity.clone(), p.project.as_deref());
+        let decision = surface::evaluate_tool_surface(&packets, entity.clone(), p.project.as_deref());
         drop(packets);
 
         let tool_universe: Vec<String> = self
@@ -174,7 +174,7 @@ impl BlackboxServer {
         let entity = surface::build_surface_entity(selected, p.project.as_deref());
         let packets_guard = self.state.packets.read();
         let decision =
-            surface::evaluate_tool_surface(&*packets_guard, entity, p.project.as_deref());
+            surface::evaluate_tool_surface(&packets_guard, entity, p.project.as_deref());
         drop(packets_guard);
 
         let verdict_summary = match &decision.verdict {

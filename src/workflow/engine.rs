@@ -1674,7 +1674,7 @@ impl<'a> WorkflowRunner<'a> {
         let project_dir = self.project_dir.clone();
         let parent_arc_id = self.ctx.meta.arc_id.clone();
         let group_cancel = self.cancel_token.child_token();
-        let effective_parallelism = runtime.parallelism.max(1).min(MAX_FOREACH_PARALLELISM);
+        let effective_parallelism = runtime.parallelism.clamp(1, MAX_FOREACH_PARALLELISM);
         let mut joinset = tokio::task::JoinSet::new();
         let mut next_to_start = 0usize;
         let mut stop_new_dispatch = false;

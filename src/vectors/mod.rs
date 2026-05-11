@@ -223,7 +223,7 @@ pub fn search(route: &str, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
 pub(crate) fn iter_active(
     route: &str,
     since: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<impl Iterator<Item = VectorEntry>> {
+) -> Result<std::vec::IntoIter<VectorEntry>> {
     global().iter_active(route, since)
 }
 
@@ -357,7 +357,7 @@ impl VectorStore {
         &self,
         route: &str,
         since: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<impl Iterator<Item = VectorEntry>> {
+    ) -> Result<std::vec::IntoIter<VectorEntry>> {
         let Some(partition) = self.partitions.read().get(route).cloned() else {
             return Ok(Vec::new().into_iter());
         };
@@ -901,12 +901,12 @@ fn cluster_entries(entries: Vec<VectorEntry>, similarity_threshold: f32) -> Vec<
         }
     }
     let mut groups: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-    for idx in 0..entries.len() {
+    for (idx, entry) in entries.iter().enumerate() {
         let root = find(&mut parent, idx);
         groups
             .entry(root)
             .or_default()
-            .push(entries[idx].entity_id.clone());
+            .push(entry.entity_id.clone());
     }
     let mut clusters = Vec::new();
     for (idx, mut members) in groups

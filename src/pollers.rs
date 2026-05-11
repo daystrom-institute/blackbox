@@ -154,7 +154,7 @@ pub fn load_all(dir: &std::path::Path) -> Vec<PollerSpec> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "json") {
+        if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
         if let Ok(bytes) = std::fs::read(&path) {
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn render_env_string_substitutes_present_var() {
-        std::env::set_var("POLLER_TEST_TOKEN", "abc123");
+        unsafe { std::env::set_var("POLLER_TEST_TOKEN", "abc123"); }
         assert_eq!(
             render_env_string("token ${env.POLLER_TEST_TOKEN}"),
             "token abc123"
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn render_env_string_leaves_missing_verbatim() {
-        std::env::remove_var("POLLER_TEST_NOT_SET");
+        unsafe { std::env::remove_var("POLLER_TEST_NOT_SET"); }
         assert_eq!(
             render_env_string("${env.POLLER_TEST_NOT_SET}"),
             "${env.POLLER_TEST_NOT_SET}"
@@ -387,8 +387,8 @@ mod tests {
 
     #[test]
     fn render_env_string_supports_multiple_substitutions() {
-        std::env::set_var("PT_BASE", "http://x:8080");
-        std::env::set_var("PT_PATH", "/api");
+        unsafe { std::env::set_var("PT_BASE", "http://x:8080"); }
+        unsafe { std::env::set_var("PT_PATH", "/api"); }
         assert_eq!(
             render_env_string("${env.PT_BASE}${env.PT_PATH}/items"),
             "http://x:8080/api/items"

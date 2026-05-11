@@ -318,7 +318,7 @@ impl BlackboxServer {
                         })
                     })
                     .collect();
-                let (status_label, _) = rm.computed_status(&item, &resolved);
+                let (status_label, _) = rm.computed_status(item, &resolved);
                 serde_json::json!({
                     "id": item.id,
                     "title": item.title,
@@ -708,8 +708,7 @@ impl BlackboxServer {
             // Has stored file_path — find by path match then verify entity
             let best_match = project_docs
                 .iter()
-                .filter(|d| d.file_path.contains(file_path_hint))
-                .next();
+                .find(|d| d.file_path.contains(file_path_hint));
 
             if let Some(matched) = best_match {
                 if !p.dry_run {
