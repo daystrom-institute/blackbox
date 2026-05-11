@@ -1192,6 +1192,85 @@ fn constructor_body_insert_position(constructor: Node<'_>, source: &str) -> usiz
         .unwrap_or_else(|| find_open_brace_position(constructor, source) + 1)
 }
 
+/// Collect identifier names declared as parameters of the constructor.
+fn constructor_parameter_names(constructor: Node<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(params) = constructor.child_by_field_name("parameters") else {
+        return names;
+    };
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        if child.kind() == "formal_parameter" {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                if let Ok(text) = name_node.utf8_text(source.as_bytes()) {
+                    names.insert(text.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Gap 7: find the latest top-level statement in `constructor`'s body that
+/// assigns to any field whose name appears in `field_names`. Returns the
+/// byte position immediately after that statement (its terminating `;`),
+/// suitable as a zero-width insertion point.
+///
+/// Returns `None` when no qualifying statement exists.
+fn last_field_assign_end_in_constructor(
+    constructor: Node<'_>,
+    source: &str,
+    field_names: &HashSet<&str>,
+) -> Option<usize> {
+    let body = constructor.child_by_field_name("body")?;
+    let mut last_end: Option<usize> = None;
+    let mut cursor = body.walk();
+    for stmt in body.named_children(&mut cursor) {
+        // Statements that wrap assignments. Java parses `field = expr;` as an
+        // `expression_statement` containing an `assignment_expression`.
+        if stmt.kind() != "expression_statement" {
+            continue;
+        }
+        let mut stmt_cursor = stmt.walk();
+        let assign = stmt
+            .named_children(&mut stmt_cursor)
+            .find(|c| c.kind() == "assignment_expression");
+        let Some(assign) = assign else { continue };
+        let Some(left) = assign.child_by_field_name("left") else {
+            continue;
+        };
+        let lhs_name = match left.kind() {
+            "identifier" => left.utf8_text(source.as_bytes()).ok().map(str::to_string),
+            "field_access" => {
+                // `this.foo = ...` — verify receiver is `this`, take field name.
+                let receiver_is_this = left
+                    .child_by_field_name("object")
+                    .map(|o| o.kind() == "this")
+                    .unwrap_or(false);
+                if !receiver_is_this {
+                    None
+                } else {
+                    left.child_by_field_name("field")
+                        .and_then(|f| f.utf8_text(source.as_bytes()).ok())
+                        .map(str::to_string)
+                }
+            }
+            _ => None,
+        };
+        let Some(lhs_name) = lhs_name else { continue };
+        if !field_names.contains(lhs_name.as_str()) {
+            continue;
+        }
+        // The expression_statement's end_byte includes the trailing `;`.
+        let end = stmt.end_byte();
+        last_end = Some(match last_end {
+            Some(prev) if prev > end => prev,
+            _ => end,
+        });
+    }
+    last_end
+}
+
 fn java_modifier_text(node: Node<'_>, source: &str) -> String {
     let mods = collect_java_modifiers(node);
     if mods.is_empty() {
@@ -2764,11 +2843,47 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             .join(", ")
     );
     if let Some(constructor) = first_constructor_node(class_node, &parsed.source) {
-        let insert_at = constructor_body_insert_position(constructor, &parsed.source);
+        // Gap 7: when any captured-param name refers to a field rather than
+        // a constructor parameter, that name is `null` until its own
+        // `this.field = ...` assignment runs. Inserting the wiring as the
+        // FIRST body statement evaluates the field reads too early — for
+        // `final` fields the compiler rejects it (`might not have been
+        // initialized`); for non-final fields it silently captures null.
+        //
+        // Defer the wiring statement until after the last source-ctor
+        // assignment to any of those field-only captures. When every
+        // captured name is also a ctor parameter (in scope from the
+        // parameter list), insertion at the body start is safe and matches
+        // the legacy placement.
+        let ctor_params = constructor_parameter_names(constructor, &parsed.source);
+        let field_only_captures: HashSet<&str> = dependency_params
+            .iter()
+            .map(|p| p.name.as_str())
+            .filter(|name| !ctor_params.contains(*name))
+            .collect();
+        let insert_at = if field_only_captures.is_empty() {
+            constructor_body_insert_position(constructor, &parsed.source)
+        } else {
+            match last_field_assign_end_in_constructor(
+                constructor,
+                &parsed.source,
+                &field_only_captures,
+            ) {
+                Some(end) => end,
+                None => constructor_body_insert_position(constructor, &parsed.source),
+            }
+        };
+        let replacement = if field_only_captures.is_empty() {
+            format!("\n        {assignment}")
+        } else {
+            // We're inserting after a `;` end — start with a newline to make
+            // the new statement appear on its own line below the previous.
+            format!("\n        {assignment}")
+        };
         source_edits.push(TextEdit {
             byte_start: insert_at,
             byte_end: insert_at,
-            replacement: format!("\n        {assignment}"),
+            replacement,
         });
     } else {
         let class_name = java_class_name(class_node, &parsed.source);
@@ -9831,6 +9946,64 @@ mod tests {
         assert!(
             !rewritten.contains("meterItems ="),
             "bare LHS field name must not survive: {rewritten}"
+        );
+    }
+
+    // Gap 7 regression: captured-param names that are FIELDS (not ctor
+    // parameters) require deferring the delegate-wiring statement until
+    // after their `this.field = param;` assignment in the constructor body,
+    // otherwise the wiring reads the field while it is still `null` (and
+    // `final` fields fail definite-assignment).
+    #[test]
+    fn extract_java_class_defers_wiring_after_field_only_captured_assigns() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("ExtractedGrid.java");
+        // `plantPicker` is a captured FIELD (referenced by `setup()`), set
+        // from the ctor `PlantPicker plantPickerParam` param via
+        // `this.plantPicker = plantPickerParam;` — the assignment, not the
+        // declaration, is what makes plantPicker non-null inside the ctor.
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class Dashboard {\n\
+            \x20   private final PlantPicker plantPicker;\n\
+            \x20   private Grid pipelineGrid;\n\
+            \x20   Dashboard(PlantPicker plantPickerParam) {\n\
+            \x20       this.plantPicker = plantPickerParam;\n\
+            \x20       setup();\n\
+            \x20   }\n\
+            \x20   void setup() { pipelineGrid = plantPicker.buildGrid(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("ExtractedGrid".to_string());
+        params.delegate_field = Some("extractedGrid".to_string());
+        params.item_names = Some(vec!["setup".to_string()]);
+        params.move_fields = Some(vec!["pipelineGrid".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        // The wiring assignment must appear AFTER `this.plantPicker =
+        // plantPickerParam;` — i.e., the substring index of the wiring is
+        // greater than the substring index of the field assignment.
+        let assign_idx = rewritten
+            .find("this.plantPicker = plantPickerParam;")
+            .expect("field assignment present");
+        let wiring_idx = rewritten
+            .find("this.extractedGrid = new ExtractedGrid(plantPicker)")
+            .expect("wiring statement present");
+        assert!(
+            wiring_idx > assign_idx,
+            "Gap 7: wiring must follow the captured-field assignment.\n\
+             field-assign idx: {assign_idx}\n\
+             wiring idx:       {wiring_idx}\n\
+             source:\n{rewritten}",
         );
     }
 
