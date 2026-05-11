@@ -1057,6 +1057,53 @@ fn collect_interface_declared_methods(
     Some(collect_java_type_method_names(&parsed, type_node))
 }
 
+/// Collect only the ABSTRACT methods declared on an interface — methods
+/// the implementer MUST provide. Excludes `default`, `static`, and
+/// `private` methods (all of which have bodies on the interface itself
+/// and are already satisfied). Used by the `implements`-completeness
+/// check; without this filter, a target that "implements" an interface
+/// whose only method is `default` incorrectly gets a
+/// `// FIXME: target now implements ... but does not satisfy method(s)`
+/// marker.
+fn collect_interface_abstract_method_names(
+    project_dir: &Path,
+    interface_name: &str,
+) -> Option<HashSet<String>> {
+    let type_paths = project_java_type_paths(project_dir);
+    let path = type_paths.get(interface_name)?.as_ref()?;
+    let parsed = parse_source_file(path).ok()?;
+    let type_node = find_java_type_declaration_by_name(&parsed, interface_name)?;
+    let body = type_node
+        .child_by_field_name("body")
+        .unwrap_or(type_node);
+    let mut names = HashSet::new();
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if child.kind() != "method_declaration" {
+            continue;
+        }
+        let mods = collect_java_modifiers(child);
+        let has_concrete_modifier = mods.iter().any(|(name, _, _)| {
+            matches!(name.as_str(), "default" | "static" | "private")
+        });
+        if has_concrete_modifier {
+            continue;
+        }
+        // A method without a body is abstract on an interface; tree-sitter
+        // exposes the body as a child_by_field_name("body") that's absent
+        // for abstract methods. Belt-and-suspenders check.
+        if child.child_by_field_name("body").is_some() {
+            continue;
+        }
+        if let Some(name) = child.child_by_field_name("name") {
+            if let Ok(text) = name.utf8_text(parsed.source.as_bytes()) {
+                names.insert(text.to_string());
+            }
+        }
+    }
+    Some(names)
+}
+
 fn java_class_name(class_node: Node<'_>, source: &str) -> String {
     class_node
         .child_by_field_name("name")
@@ -2831,15 +2878,19 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             let Some(project_dir) = project_dir_path else {
                 continue;
             };
-            // Gather the interface's declared methods. If the interface is
-            // not uniquely resolvable in the project, skip it — we can't
-            // safely add `implements` for a type we can't import.
+            // Gather the interface's ABSTRACT methods only — methods the
+            // implementer must explicitly provide. `default`, `static`,
+            // and `private` interface methods already have bodies on the
+            // interface itself and don't need to be in the extracted set.
+            // If the interface is not uniquely resolvable in the project,
+            // skip it — we can't safely add `implements` for a type we
+            // can't import.
             let Some(declared_methods) =
-                collect_interface_declared_methods(project_dir, interface_name)
+                collect_interface_abstract_method_names(project_dir, interface_name)
             else {
                 continue;
             };
-            // Satisfaction: every declared method on the interface must be
+            // Satisfaction: every abstract method on the interface must be
             // in the extracted method set. Else the target is abstract.
             let unsatisfied: Vec<String> = declared_methods
                 .iter()
@@ -9942,6 +9993,56 @@ mod tests {
         assert!(
             target_text.contains("public class CompositionMeterGrid implements HasLogger"),
             "expected implements clause + FIXME above it:\n{target_text}"
+        );
+    }
+
+    // An interface whose only methods are `default` (or `static` / `private`)
+    // is fully satisfied by `implements I` alone — no explicit method
+    // declarations needed. The completeness check must filter those out
+    // before deciding whether to emit a `// FIXME: target now implements I
+    // but does not satisfy method(s)` marker.
+    #[test]
+    fn extract_java_class_no_unsatisfied_fixme_when_interface_is_default_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("HasLogger.java"),
+            "package com.example;\n\
+             public interface HasLogger {\n\
+            \x20   default void getLogger() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let source = dir.path().join("CompositionView.java");
+        let target = dir.path().join("CompositionMeterGrid.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class CompositionView implements HasLogger {\n\
+            \x20   void createMeterGrid() { getLogger(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("CompositionMeterGrid".to_string());
+        params.delegate_field = Some("compositionMeterGrid".to_string());
+        params.item_names = Some(vec!["createMeterGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = extract_java_class_target_text(&plan);
+        // The implements clause IS injected.
+        assert!(
+            target_text.contains("implements HasLogger"),
+            "implements clause expected: {target_text}"
+        );
+        // But NO unsatisfied-method FIXME: the only method is default.
+        assert!(
+            !target_text.contains("FIXME: target now implements"),
+            "default-only interface must not trigger unsatisfied FIXME: {target_text}"
         );
     }
 
