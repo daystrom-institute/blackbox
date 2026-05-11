@@ -81,6 +81,16 @@ real; if your concern is on the list, the planner already handles it.
   target, the operator-facing FIXME lists "drop the call" alongside
   the three structural fixes (add to extracted set / callback interface
   / inject source instance).
+- **Source-class inner type references are qualified + widened.** When
+  extracted bodies reference an inner type (enum, class, record, or
+  interface) declared inside the source class — bare `InnerType`,
+  `InnerType.VALUE`, or `InnerType.staticCall()` — the planner rewrites
+  each reference to `<SourceClass>.<InnerType>` on the target, adds an
+  `import <source-package>.<SourceClass>;` to cross-package targets, and
+  widens the inner type's source-side visibility to the same floor used
+  for moved methods (`package` same-pkg, `public` cross-pkg). Inner types
+  already at/above the floor stay unchanged. References the operator
+  already qualified as `Outer.Inner` are left alone.
 - **Overloaded methods disambiguated by signature suffix.** `item_names`
   accepts entries like `"methodName(Type1, Type2)"` to pick one specific
   overload by parameter types. Bare `"methodName"` still works when the

@@ -3171,6 +3171,129 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         }
     }
 
+    // Source-class inner type references (Gap 5). Methods being moved may
+    // reference an inner type (enum / class / record / interface) declared
+    // on the source class — bare names that resolve from the source's
+    // package but won't resolve from the target's. Rewrite each such
+    // reference in the target body to `<SourceClass>.<InnerType>`, add
+    // a source-class import on the target (cross-package only), and widen
+    // the inner type's visibility on the source to at least the same
+    // floor the planner applies to moved methods.
+    let inner_type_decls: BTreeMap<String, Node<'_>> = {
+        let mut map = BTreeMap::new();
+        if let Some(class_body) = class_node.child_by_field_name("body") {
+            let mut cursor = class_body.walk();
+            for child in class_body.named_children(&mut cursor) {
+                let kind = child.kind();
+                if matches!(
+                    kind,
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                        | "record_declaration"
+                ) {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
+                            map.insert(name.to_string(), child);
+                        }
+                    }
+                }
+            }
+        }
+        map
+    };
+    let source_class_name = java_class_name(class_node, &parsed.source);
+    let mut referenced_inner_types: BTreeSet<String> = BTreeSet::new();
+    if !inner_type_decls.is_empty() {
+        // Walk the assembled target text for type_identifier references
+        // matching an inner-type name. Skip references already qualified
+        // (scoped_type_identifier — the operator wrote `Outer.Inner`
+        // themselves) and the inner-type declarations the target may have
+        // itself (defensive — they shouldn't appear, but if a moved cluster
+        // somehow brought one along, don't qualify the declaration site).
+        if let Ok(target_tree) = parse_source("java", &target_content) {
+            let mut edits: Vec<(usize, usize, String)> = Vec::new();
+            let mut stack = vec![target_tree.root_node()];
+            while let Some(node) = stack.pop() {
+                let mut c = node.walk();
+                for ch in node.named_children(&mut c) {
+                    stack.push(ch);
+                }
+                if node.kind() != "type_identifier" {
+                    continue;
+                }
+                let Ok(text) = node.utf8_text(target_content.as_bytes()) else {
+                    continue;
+                };
+                if !inner_type_decls.contains_key(text) {
+                    continue;
+                }
+                // Skip references that are already part of a
+                // `Outer.Inner` qualified type. tree-sitter-java exposes
+                // that as `scoped_type_identifier` containing two
+                // `type_identifier` children; if our match is one of
+                // them, the parent's kind tells us.
+                if node
+                    .parent()
+                    .map(|p| p.kind() == "scoped_type_identifier")
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                edits.push((
+                    node.start_byte(),
+                    node.end_byte(),
+                    format!("{source_class_name}.{text}"),
+                ));
+                referenced_inner_types.insert(text.to_string());
+            }
+            // Also pick up uppercase-initial identifier receivers of
+            // method_invocation / field_access that match an inner enum
+            // name (`InnerEnum.VALUE`).
+            let mut stack2 = vec![target_tree.root_node()];
+            while let Some(node) = stack2.pop() {
+                let mut c = node.walk();
+                for ch in node.named_children(&mut c) {
+                    stack2.push(ch);
+                }
+                if !matches!(node.kind(), "method_invocation" | "field_access") {
+                    continue;
+                }
+                let Some(receiver) = node.child_by_field_name("object") else {
+                    continue;
+                };
+                if receiver.kind() != "identifier" {
+                    continue;
+                }
+                let Ok(text) = receiver.utf8_text(target_content.as_bytes()) else {
+                    continue;
+                };
+                if !inner_type_decls.contains_key(text) {
+                    continue;
+                }
+                edits.push((
+                    receiver.start_byte(),
+                    receiver.end_byte(),
+                    format!("{source_class_name}.{text}"),
+                ));
+                referenced_inner_types.insert(text.to_string());
+            }
+            edits.sort_by_key(|e| e.0);
+            // Dedupe overlapping edits (e.g., a type_identifier inside a
+            // method_invocation receiver matched twice).
+            edits.dedup_by_key(|e| e.0);
+            target_content = apply_text_edits(&target_content, &edits);
+        }
+        // Cross-package: target needs to import the source class so the
+        // qualified `<SourceClass>.<InnerType>` references resolve.
+        if !referenced_inner_types.is_empty() && cross_package {
+            if let Some(src_pkg) = source_package.as_deref() {
+                let source_fqcn = format!("{src_pkg}.{source_class_name}");
+                target_content = java_inject_import(&target_content, &source_fqcn);
+            }
+        }
+    }
+
     let mut source_edits = Vec::new();
     let removed_ranges = selected_methods
         .iter()
@@ -3193,6 +3316,30 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             replacement: String::new(),
         });
     }
+
+    // Source-side visibility widening for referenced inner types (Gap 5).
+    // Widen each below-floor inner-type declaration to the floor so the
+    // qualified `<SourceClass>.<InnerType>` references on the new target
+    // can reach them. Inner types already at/above the floor stay
+    // unchanged.
+    for name in &referenced_inner_types {
+        if let Some(inner_node) = inner_type_decls.get(name) {
+            let mods = collect_java_modifiers(*inner_node);
+            let current = java_visibility_from_mods(&mods);
+            if java_visibility_rank(current) >= java_visibility_rank(visibility_floor) {
+                continue;
+            }
+            let new_visibility = if visibility_floor == "package" {
+                None
+            } else {
+                Some(visibility_floor)
+            };
+            let vis_edit =
+                build_visibility_rewrite_edit(*inner_node, &mods, new_visibility, &parsed.source);
+            source_edits.push(vis_edit);
+        }
+    }
+
     let field_insert_at = java_class_body_insert_position(class_node, &parsed.source);
     let delegate_edit_idx = source_edits.len();
     source_edits.push(TextEdit {
@@ -11296,6 +11443,101 @@ mod tests {
         assert!(
             msg.contains("method_overload_no_match"),
             "expected no-match refusal: {msg}"
+        );
+    }
+
+    // Source-class inner types (enum / class / record / interface declared
+    // INSIDE the source class) referenced from moved method bodies are
+    // qualified to `<SourceClass>.<InnerType>` on the target and widened
+    // to the visibility floor on the source. Cross-package targets also
+    // gain an import for the source class so the qualified name resolves.
+    #[test]
+    fn extract_java_class_qualifies_and_widens_source_inner_enum() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_pkg = dir.path().join("src/main/java/a");
+        let b_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&a_pkg).unwrap();
+        fs::create_dir_all(&b_pkg).unwrap();
+        let source = a_pkg.join("Runtime.java");
+        let target = b_pkg.join("Helpers.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             class Runtime {\n\
+            \x20   enum Mode { Site, Plant }\n\
+            \x20   private Mode current;\n\
+            \x20   boolean isSite() { return Mode.Site.equals(current); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["isSite".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        // Target body references Runtime.Mode now, not bare Mode.
+        assert!(
+            target_text.contains("Runtime.Mode.Site"),
+            "inner-enum value must be qualified: {target_text}"
+        );
+        // Target has an import for Runtime (cross-package).
+        assert!(
+            target_text.contains("import a.Runtime;"),
+            "target must import the source class: {target_text}"
+        );
+
+        // Source: Mode declaration widened to `public` (cross-package floor).
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("public enum Mode"),
+            "inner enum must be widened to public on cross-package: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_same_package_qualifies_inner_type_widens_to_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Runtime.java");
+        let target = pkg.join("Helpers.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             class Runtime {\n\
+            \x20   private enum Mode { Site, Plant }\n\
+            \x20   private Mode current;\n\
+            \x20   boolean isSite() { return Mode.Site.equals(current); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["isSite".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("Runtime.Mode.Site"),
+            "same-package: inner enum still qualified: {target_text}"
+        );
+        // Same-package doesn't need an extra source-class import (auto-resolved).
+        // Source: `private` widened to package-floor (no explicit modifier).
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("enum Mode") && !rewritten.contains("private enum Mode"),
+            "inner enum private widened to package floor: {rewritten}"
         );
     }
 
