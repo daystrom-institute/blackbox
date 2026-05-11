@@ -223,6 +223,23 @@ and constructor assignment, and source-local calls to moved methods are
 rewritten through that delegate. The response includes `captured_variables` so
 you can review the dependency boundary before applying.
 
+**Delegate wiring placement.** The
+`this.<delegate_field> = new <target_class>(...)` statement is inserted
+into the source's first constructor. When every captured argument is
+also a constructor parameter (in scope from the parameter list),
+insertion happens at the top of the body. When any captured argument
+refers to a field rather than a parameter (the constructor assigns
+`this.field = param;` somewhere in its body and the wiring needs the
+post-assignment value), insertion is deferred until immediately after
+the latest such `this.field = …` / `field = …` statement. This avoids
+reading the captured fields while they are still `null` —
+`final`-field captures would otherwise hit `might not have been
+initialized`; non-`final` captures would silently capture null. The
+placement logic walks only top-level statements of the chosen
+constructor; `this(...)` / `super(...)` chains are not followed, so a
+delegating constructor whose target ctor assigns the captured fields
+ends up with the wiring at top-of-body and may need manual adjustment.
+
 `captured_variables` entries carry `source_static_final` and `source_mutable`
 booleans alongside `name`, `kind`, `source_type`, and `source_visibility`.
 - `source_static_final: true` means the field is `private static final` (or
@@ -245,12 +262,36 @@ source-side delegate calls produced by `update_java_callers` compile. The
 floor is `package` for same-package extractions and `public` when the
 target ends up in a different package than the source. Methods already at
 or above the floor (e.g. `public`, or `protected` in same-package mode)
-are emitted unchanged. The package decision uses the explicit
-`target_prelude` first, then the existing target file's `package`, then
-the source's package as a fallback (mirroring `java_default_target_prelude`).
-An explicit `visibility` parameter on the plan acts as an additional floor
-— the planner widens further if you ask for `public`, but never narrows
-below the cross-package requirement. (Gap 24)
+are emitted unchanged.
+
+**Target package resolution.** The package decision uses a hybrid
+precedence so cross-directory targets land in the correct package:
+
+1. Explicit `target_prelude` containing `package <foo>;`.
+2. Existing target file's `package` declaration (only when the target
+   file already exists).
+3. Source-root-derived from `target_path`'s filesystem location — walks
+   ancestors of `target_path` for a `src/{main,test}/java/` triple and
+   uses the longest (nearest) match. Multi-module Gradle/Maven layouts
+   resolve against the deepest matching root.
+4. Source's package — only when `target_path` shares a directory with
+   `source_path` (the legacy same-package extract path).
+5. Hard error — pass `target_prelude` with an explicit
+   `package <foo>;` when no rule above resolves.
+
+The cross-package detector compares the resolved target package against
+the source's. When they differ, the planner:
+
+- Sets the visibility floor for extracted methods to `public` (instead of
+  `package`) so source-side delegate calls compile from a different
+  package.
+- Emits an additional `import <target-package>.<TargetClass>;` edit on
+  the source so the new delegate field type resolves.
+
+Same-package targets get the `package` floor and resolve the delegate
+type implicitly. An explicit `visibility` parameter on the plan acts as
+an additional floor — the planner widens further if you ask for `public`,
+but never narrows below the cross-package requirement.
 
 Pass `deep_analysis: true` to also receive:
 
@@ -265,17 +306,26 @@ Pass `deep_analysis: true` to also receive:
   apply. The shape is documented under `move_java_field` in step 7 below;
   the contract is the same.
 
-When `deep_analysis: true` AND `move_fields` non-empty, the planner also
-**rewrites every remaining source-side access through the delegate** and
-**generates matching getter/setter declarations on the target** (gap 18).
-Defaults to on; pass `rewrite_remaining_accessors: false` to opt out and
-keep only the report. Default summary:
+Whenever `move_fields` is non-empty, the planner **rewrites every
+remaining source-side read/write through the delegate** and **generates
+matching getter/setter declarations on the target**. The rewrite needs
+only "this field was moved" — not the full call-graph walk that
+`deep_analysis` triggers — so it runs by default regardless of
+`deep_analysis`. Pass `rewrite_remaining_accessors: false` to opt out
+(useful when the operator plans to hand-rewrite the remaining accesses
+or has a custom delegation shape in mind). Behavior matrix:
 
 | `deep_analysis` | `rewrite_remaining_accessors` | Behavior                                  |
 |-----------------|-------------------------------|-------------------------------------------|
-| `true`          | unset / `true`                | Rewrite reads/writes + emit accessors     |
+| `true`          | unset / `true`                | Rewrite reads/writes + emit accessors + populate `remaining_source_accessors` report |
 | `true`          | `false`                       | Skip rewrites; report still populates     |
-| `false`         | (ignored)                     | Pre-Gap-18 behavior — silent miscompiles  |
+| `false`         | unset / `true`                | Rewrite reads/writes + emit accessors (no report)  |
+| `false`         | `false`                       | Skip rewrites; no report — operator owns the leftover accesses |
+
+The `remaining_source_accessors` report (read/write scan results) is
+gated on `deep_analysis: true` because it walks every identifier in the
+source body. The rewrite is not — it only inspects accesses to the
+specific moved fields.
 
 Rewrite shape:
 
@@ -289,16 +339,26 @@ Rewrite shape:
 | Compound write (`+=`, `<<=`…)  | `counter += 5`          | `delegate.setCounter(delegate.getCounter() + 5)` |
 | Increment / decrement          | `counter++`             | `delegate.setCounter(delegate.getCounter() + 1)` |
 
-**LHS-write rewrite (Gap 27).** When a moved field appears on both sides of
-an assignment (`field = field.transform()`), the planner emits a SINGLE
-edit that spans the whole `assignment_expression` and replaces it with
-`delegate.setField(<read-rewritten rhs>)`. The RHS reads are still rewritten
-through the getter — they live INSIDE the setter argument. Implementation
-detail: a two-pass walk over the AST first identifies LHS-write sites, then
-collects RHS sub-edits per site and folds them into the combined write
-rewrite at the end. This is non-overlapping with respect to the global edit
-list: bucket-(a) reads inside an LHS-write's RHS are never emitted as
-standalone edits — they only exist inside the rendered setter call.
+**LHS-write rewrite.** When a moved field appears on both sides of an
+assignment (`field = field.transform()`), the planner emits a SINGLE
+edit spanning the whole `assignment_expression` and replaces it with
+`delegate.setField(<read-rewritten rhs>)`. RHS reads still route through
+the getter — they live INSIDE the setter argument. Implementation: a
+two-pass walk identifies LHS-write sites, then collects RHS sub-edits
+per site and folds them into the combined write rewrite.
+
+Caller-rewrites that fall inside an LHS-write RHS are absorbed too.
+`update_java_callers` emits zero-width inserts at the start of moved
+`method_invocation` nodes (e.g. `delegate.` before `buildGrid()`). When
+the LHS-write RHS contains a call to a moved method
+(`grid = buildGrid();`), the caller-rewrite is threaded through the
+accessor-rewrite pass and folded into the setter argument
+(`delegate.setGrid(delegate.buildGrid())`). The global edit list never
+sees the absorbed caller edits, avoiding the overlap that would
+otherwise trip the planner's non-overlap validator. A post-pass
+containment check bails with `RefactorError` if a non-rendering edit
+survives inside an LHS-write span — defense for future caller-rewrite
+shapes that might slip through.
 
 Generated accessors honour the same package/public visibility floor used
 for moved methods (`package` same-package, `public` cross-package).
@@ -315,14 +375,36 @@ in setter form and lets the Java compiler complain.
 
 The composite plan also runs the tree-sitter `organize_imports` heuristic
 on the generated target file in-process before returning (gap 25). The
-target's import block ends up containing only imports whose simple name is
-referenced as a `type_identifier` in the extracted method bodies; project-
-local types referenced by simple name get a fresh import added when the
-type index can resolve them uniquely. `import static …` and wildcard
-imports are kept verbatim. This means the operator no longer needs a
-follow-up `java_lsp_organize_imports` call solely to prune Vaadin-`@Route`
-or CSV-writer-style noise — though running JDTLS-backed `organize_imports`
-afterward is still a good idea for full semantic verification.
+target's import block ends up containing only imports whose simple name
+is referenced in the extracted method bodies; project-local types
+referenced by simple name get a fresh import added when the type index
+can resolve them uniquely. `import static …` and wildcard imports are
+kept verbatim.
+
+The reference walker recognizes type names in three syntactic positions:
+
+- `type_identifier` nodes — variable declarations, return types, field
+  types, generic bounds, etc.
+- Uppercase-initial `identifier` used as the receiver (`object` field)
+  of a `method_invocation` — captures static method calls like
+  `DateUtils.parse(...)`, `Collectors.toList()`, `Math.abs(...)`.
+- Uppercase-initial `identifier` used as the receiver of a
+  `field_access` — captures static member references like
+  `BigDecimal.ZERO`, `Optional.empty`-as-receiver patterns, enum value
+  reads.
+
+The uppercase-initial check is convention-based; lower-case identifiers
+in receiver position are treated as values, not types. False positives
+(an uppercase-initial local variable that violates convention) resolve
+as "no matching type" in the project index and get silently dropped.
+
+This means the operator no longer needs a follow-up
+`java_lsp_organize_imports` call solely to prune Vaadin-`@Route` or
+CSV-writer-style noise, or to retain imports for types only referenced
+as static-call receivers — though running JDTLS-backed
+`organize_imports` afterward is still a good idea for full semantic
+verification (third-party FQCN inference for types that aren't in the
+project type index is out of scope for the heuristic).
 
 **Wildcard coverage (Gap 28).** The same heuristic also drops explicit
 single-type imports already covered by a wildcard from the same package.
