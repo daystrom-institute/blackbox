@@ -978,6 +978,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "extract_java_methods" => plan_extract_java_methods(p),
         "extract_java_class" => plan_extract_java_class(p),
         "extract_java_nested_classes" => plan_extract_java_nested_classes(p),
+        "promote_java_inner_class" => plan_promote_java_inner_class(p),
         "add_java_fields" => plan_add_java_fields(p),
         "add_java_constructor" => plan_add_java_constructor(p),
         "move_java_field" => plan_move_java_field(p),

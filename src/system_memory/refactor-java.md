@@ -93,6 +93,56 @@ real; if your concern is on the list, the planner already handles it.
   as needed. Two-plus-arg methods refuse with
   `error.bad_input(code=callback_arity_unsupported)` — wrap them or
   extract a real callback interface.
+
+## `promote_java_inner_class` — for clusters with capture-aware inner classes
+
+When a cluster you want to extract includes a non-static inner class that
+captures outer-class state, use `promote_java_inner_class` BEFORE running
+`extract_java_class` on the outer methods. (The static-inner case is
+covered by `extract_java_nested_classes` — that's a syntactic move with
+no capture analysis.)
+
+```text
+bbox_refactor_plan(
+  kind="promote_java_inner_class",
+  source="src/main/java/com/example/Outer.java",
+  target="src/main/java/com/example/.../Promoted.java",
+  module_name="Promoted",
+  item_names=["Promoted"],   # same value as module_name; both accepted
+  project_dir="/repo/x"
+)
+```
+
+What it does:
+
+- Walks the inner class body for outer-field reads. Bare `field` (after
+  shadow checks against inner fields, locals, params) and
+  `OuterClass.this.field` both count as captures.
+  `this.field` is NEVER a capture (it binds to the inner instance only;
+  lambdas inherit enclosing `this`, but anonymous-class bodies rebind
+  `this` and are detected accordingly).
+- Synthesizes or augments a single constructor on the promoted class
+  with `final` captures as parameters. Captures are assigned AFTER any
+  leading `super(...)` chain.
+- Rewrites every `new <Inner>(args)` site in source to
+  `new <Promoted>(args, capture1, capture2, ...)`.
+- Drops the inner declaration from source.
+- Adds `import <target-package>.<Promoted>;` on cross-package targets.
+
+Refusal codes (the planner returns these instead of emitting broken Java):
+
+| Code | When |
+|------|------|
+| `static_inner_class_in_promote` | Inner is declared `static`. Use `extract_java_nested_classes` for a syntactic move; static inners have no outer captures. |
+| `inner_class_writes_outer_field` | Inner writes (assigns / increments) an outer field. `final` ctor params can't be reassigned. Refactor the write before promoting. |
+| `inner_class_calls_outer_method` | Inner calls a source-class method. v1 does not thread outer-method calls; refactor (inline or accept a `Runnable` callback) before promoting. |
+| `inner_class_multiple_ctors` | Inner has more than one constructor. Consolidate first. |
+| `inner_class_this_chain_ctor` | Inner's ctor delegates via `this(...)`. Inline the delegation first. |
+| `inner_class_referenced_as_type` | Inner is referenced outside `new <Inner>(...)` (variable decl, cast, method reference, `Outer.Inner` path). v1 only rewrites instantiations; handle other sites manually. |
+
+Workflow after promotion: run `extract_java_class` on the outer cluster
+as a separate call. The moved methods will reference the promoted class
+via the source's new import.
 - **`bbox_refactor_plan` always returns `dry_run: true`.** The response
   field indicates "this call did not write any files" — read it as the
   inverse of `wrote_files`. The plan is staged on disk under
