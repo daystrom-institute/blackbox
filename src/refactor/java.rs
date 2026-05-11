@@ -3294,6 +3294,168 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         }
     }
 
+    // Cross-package bare-field-to-getter rewrites (Gap 6). When the moved
+    // code accesses a `private` field of a source-class inner type via a
+    // method parameter (e.g. `truckTicket.direction`), the bare access
+    // fails to compile from a different package. The inner type often
+    // already declares a public getter (`getDirection()`); rewrite the
+    // bare access to the getter call so cross-package extracts compile
+    // without manual fixup. Same-package extracts retain bare access.
+    if cross_package && !inner_type_decls.is_empty() {
+        let mut field_to_getter_by_type: BTreeMap<String, BTreeMap<String, String>> =
+            BTreeMap::new();
+        for (type_name, type_node) in &inner_type_decls {
+            let Some(type_body) = type_node.child_by_field_name("body") else { continue };
+            let mut fields: Vec<(String, String)> = Vec::new();
+            let mut getters: BTreeSet<String> = BTreeSet::new();
+            let mut tcur = type_body.walk();
+            for child in type_body.named_children(&mut tcur) {
+                match child.kind() {
+                    "field_declaration" => {
+                        if let (Some(n), Some(ty)) = (
+                            java_field_declaration_name(child, &parsed.source),
+                            java_field_type_text(child, &parsed.source),
+                        ) {
+                            fields.push((n, ty));
+                        }
+                    }
+                    "method_declaration" => {
+                        let mods = collect_java_modifiers(child);
+                        let is_public = mods.iter().any(|(m, _, _)| m == "public");
+                        if !is_public {
+                            continue;
+                        }
+                        let no_params = child
+                            .child_by_field_name("parameters")
+                            .map(|p| {
+                                let mut pcur = p.walk();
+                                !p.named_children(&mut pcur)
+                                    .any(|n| n.kind() == "formal_parameter")
+                            })
+                            .unwrap_or(false);
+                        if !no_params {
+                            continue;
+                        }
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
+                                getters.insert(name.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut getter_map: BTreeMap<String, String> = BTreeMap::new();
+            for (field_name, field_type) in fields {
+                let cap = {
+                    let mut chars = field_name.chars();
+                    match chars.next() {
+                        Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+                        None => String::new(),
+                    }
+                };
+                let mut candidates = vec![format!("get{cap}")];
+                if field_type.trim() == "boolean" {
+                    candidates.insert(0, format!("is{cap}"));
+                }
+                for candidate in candidates {
+                    if getters.contains(&candidate) {
+                        getter_map.insert(field_name.clone(), candidate);
+                        break;
+                    }
+                }
+            }
+            if !getter_map.is_empty() {
+                field_to_getter_by_type.insert(type_name.clone(), getter_map);
+            }
+        }
+
+        if !field_to_getter_by_type.is_empty() {
+            // Re-parse target_content (post Gap-5 inner-type qualification)
+            // and walk for `field_access` whose receiver is a parameter
+            // typed as one of these inner types.
+            if let Ok(target_tree) = parse_source("java", &target_content) {
+                let mut edits: Vec<(usize, usize, String)> = Vec::new();
+                let mut tstack = vec![target_tree.root_node()];
+                while let Some(tnode) = tstack.pop() {
+                    let mut c = tnode.walk();
+                    for ch in tnode.named_children(&mut c) {
+                        tstack.push(ch);
+                    }
+                    if tnode.kind() != "method_declaration"
+                        && tnode.kind() != "constructor_declaration"
+                    {
+                        continue;
+                    }
+                    // Map parameter name → inner-type simple name.
+                    let mut typed_receivers: BTreeMap<String, String> = BTreeMap::new();
+                    if let Some(params) = tnode.child_by_field_name("parameters") {
+                        let mut pc = params.walk();
+                        for p in params.named_children(&mut pc) {
+                            if p.kind() != "formal_parameter" {
+                                continue;
+                            }
+                            let ty = p
+                                .child_by_field_name("type")
+                                .and_then(|t| t.utf8_text(target_content.as_bytes()).ok())
+                                .map(|s| s.trim().to_string());
+                            let name = p
+                                .child_by_field_name("name")
+                                .and_then(|n| n.utf8_text(target_content.as_bytes()).ok())
+                                .map(|s| s.to_string());
+                            if let (Some(ty), Some(name)) = (ty, name) {
+                                // Param type may be `Outer.Inner` after the
+                                // Gap-5 qualification pass; strip the
+                                // qualifier to look up by simple name.
+                                let simple = ty
+                                    .rsplit_once('.')
+                                    .map(|(_, s)| s.trim().to_string())
+                                    .unwrap_or_else(|| ty.trim().to_string());
+                                if field_to_getter_by_type.contains_key(&simple) {
+                                    typed_receivers.insert(name, simple);
+                                }
+                            }
+                        }
+                    }
+                    if typed_receivers.is_empty() {
+                        continue;
+                    }
+                    // Walk this method's body for field_access on those
+                    // receivers.
+                    let Some(body) = tnode.child_by_field_name("body") else { continue };
+                    let mut bstack = vec![body];
+                    while let Some(node) = bstack.pop() {
+                        let mut bc = node.walk();
+                        for ch in node.named_children(&mut bc) {
+                            bstack.push(ch);
+                        }
+                        if node.kind() != "field_access" {
+                            continue;
+                        }
+                        let Some(obj) = node.child_by_field_name("object") else { continue };
+                        if obj.kind() != "identifier" {
+                            continue;
+                        }
+                        let Ok(obj_name) = obj.utf8_text(target_content.as_bytes()) else { continue };
+                        let Some(ty) = typed_receivers.get(obj_name) else { continue };
+                        let Some(field_node) = node.child_by_field_name("field") else { continue };
+                        let Ok(field_name) = field_node.utf8_text(target_content.as_bytes()) else { continue };
+                        let Some(getter_map) = field_to_getter_by_type.get(ty) else { continue };
+                        let Some(getter) = getter_map.get(field_name) else { continue };
+                        edits.push((
+                            node.start_byte(),
+                            node.end_byte(),
+                            format!("{obj_name}.{getter}()"),
+                        ));
+                    }
+                }
+                edits.sort_by_key(|e| e.0);
+                edits.dedup_by_key(|e| e.0);
+                target_content = apply_text_edits(&target_content, &edits);
+            }
+        }
+    }
+
     let mut source_edits = Vec::new();
     let removed_ranges = selected_methods
         .iter()
@@ -11538,6 +11700,91 @@ mod tests {
         assert!(
             rewritten.contains("enum Mode") && !rewritten.contains("private enum Mode"),
             "inner enum private widened to package floor: {rewritten}"
+        );
+    }
+
+    // Cross-package extracts rewrite bare-field access on source-class
+    // inner-type DTOs to the matching public getter. Same-package extracts
+    // leave bare access alone (still resolves).
+    #[test]
+    fn extract_java_class_cross_pkg_rewrites_inner_dto_field_to_getter() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_pkg = dir.path().join("src/main/java/a");
+        let b_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&a_pkg).unwrap();
+        fs::create_dir_all(&b_pkg).unwrap();
+        let source = a_pkg.join("TicketsView.java");
+        let target = b_pkg.join("TicketHelpers.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             class TicketsView {\n\
+            \x20   public static class Ticket {\n\
+            \x20       private final String direction;\n\
+            \x20       Ticket(String direction) { this.direction = direction; }\n\
+            \x20       public String getDirection() { return direction; }\n\
+            \x20   }\n\
+            \x20   String describe(Ticket ticket) { return ticket.direction; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("TicketHelpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["describe".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("ticket.getDirection()"),
+            "cross-package: bare field access must route through getter: {target_text}"
+        );
+        assert!(
+            !target_text.contains("ticket.direction"),
+            "cross-package: bare access must NOT remain: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_same_pkg_leaves_inner_dto_field_access_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("TicketsView.java");
+        let target = pkg.join("TicketHelpers.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             class TicketsView {\n\
+            \x20   public static class Ticket {\n\
+            \x20       private final String direction;\n\
+            \x20       Ticket(String direction) { this.direction = direction; }\n\
+            \x20       public String getDirection() { return direction; }\n\
+            \x20   }\n\
+            \x20   String describe(Ticket ticket) { return ticket.direction; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("TicketHelpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["describe".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        // Same-package: bare access works; Gap 5 still qualifies the inner
+        // type but the field access is untouched.
+        assert!(
+            target_text.contains("ticket.direction"),
+            "same-package: bare access must remain: {target_text}"
         );
     }
 

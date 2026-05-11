@@ -81,6 +81,16 @@ real; if your concern is on the list, the planner already handles it.
   target, the operator-facing FIXME lists "drop the call" alongside
   the three structural fixes (add to extracted set / callback interface
   / inject source instance).
+- **Cross-package bare-field access on inner-type DTOs routes through
+  getters.** When the moved methods take a parameter typed as a
+  source-class inner type (`public static class Ticket` with
+  `private final` fields + public `getX()` / `isX()` accessors), and
+  the extract is cross-package, `param.field` accesses in the extracted
+  body get rewritten to `param.getField()` / `param.isField()`. Lookup
+  is conservative: only handles direct parameter receivers (not locals
+  or chained accesses), only triggers on inner types declared inside
+  the source class, and only fires when the inner type has a matching
+  public getter. Same-package extracts leave bare access alone.
 - **Source-class inner type references are qualified + widened.** When
   extracted bodies reference an inner type (enum, class, record, or
   interface) declared inside the source class — bare `InnerType`,
