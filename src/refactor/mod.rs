@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -402,6 +402,42 @@ pub struct RefactorRunParams {
     pub allow_unregistered_paths: Option<bool>,
 }
 
+/// Which stdout format to parse for a Command step (RX-F2a).
+/// Additional variants (clippy JSON, miri) may be added in later phases.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSpec {
+    /// Parse stdout as `cargo --message-format=json` output and extract
+    /// `compiler-message` entries.  Malformed lines are silently dropped.
+    RustcJson,
+}
+
+/// Failure-handling mode for a Command step (RX-F2b).
+/// Supersedes the legacy `required: bool` field when set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailure {
+    /// Exit-code != 0 rolls back all prior writes and terminates the run. Default.
+    Required,
+    /// Exit-code != 0 is logged as `failed_optional` and the run continues.
+    Optional,
+    /// Exit-code != 0 opens a repair obligation and continues. A later repair
+    /// step must mark the obligation Consumed or LeftOver for terminal success.
+    /// Any obligation that remains Open at run end triggers rollback from the
+    /// first soft-fail cursor (RX-F2b).
+    ContinueForRepair,
+}
+
+/// Summary of captured compiler diagnostics for a command step.
+/// Full diagnostic bodies are NOT included in the MCP response (size budget);
+/// only aggregate counts are surfaced here (RX-F2a).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CapturedDiagnosticsSummary {
+    pub count: usize,
+    /// Keyed by severity level, e.g. `{"error": 2, "warning": 3}`.
+    pub severity_counts: HashMap<String, usize>,
+}
+
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RefactorRunStep {
@@ -430,6 +466,16 @@ pub enum RefactorRunStep {
         /// Defaults true. Required command failure rolls back prior plan writes.
         #[serde(default)]
         required: Option<bool>,
+        /// When set, the command's stdout is parsed in the specified format and
+        /// stashed in the run-context capture store under ref `"last"` (RX-F2a).
+        /// This field is independent of `required` / failure handling.
+        #[serde(default)]
+        capture: Option<CaptureSpec>,
+        /// How to handle a non-zero exit code (RX-F2b). When set, supersedes
+        /// the legacy `required` field. When unset, `required: false` → Optional,
+        /// `required: true` (default) → Required.
+        #[serde(default)]
+        on_failure: Option<OnFailure>,
     },
 }
 
@@ -593,6 +639,10 @@ pub struct RefactorRunResponse {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rollback_errors: Vec<String>,
+    /// Repair obligations opened during the run (RX-F2b). Non-empty when
+    /// any `ContinueForRepair` command step fired.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligations: Vec<ObligationReport>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -610,6 +660,10 @@ pub struct RefactorRunStepReport {
     pub validations: Vec<ParseValidationResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set when the step was run with `capture=rustc_json` (RX-F2a).
+    /// Full diagnostic bodies are omitted; only aggregate counts are returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_diagnostics_summary: Option<CapturedDiagnosticsSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1031,6 +1085,7 @@ pub fn run_with_ctx(
     let mut snapshot_paths: HashSet<PathBuf> = HashSet::new();
     let mut reports = Vec::new();
     let mut files_written = Vec::new();
+    let mut capture_ctx = RunCaptureContext::default();
 
     for (idx, step) in p.steps.iter().enumerate() {
         match step {
@@ -1039,6 +1094,49 @@ pub fn run_with_ctx(
                 if step_params.project_dir.is_none() {
                     step_params.project_dir = Some(path_string(&project_dir));
                 }
+
+                // Test-only stub plan kinds for obligation consumption (RX-F2b).
+                // These are handled before calling plan_with_ctx so they never
+                // reach production plan dispatch. Compiled in only under #[cfg(test)].
+                #[cfg(test)]
+                {
+                    let ref_name = if step_params.source.is_empty() {
+                        "last".to_string()
+                    } else {
+                        step_params.source.clone()
+                    };
+                    if step_params.kind == "test_consume_obligation" {
+                        capture_ctx.mark_obligation_consumed(&ref_name, 0);
+                        reports.push(RefactorRunStepReport {
+                            index: idx,
+                            op: "plan".to_string(),
+                            status: "ok".to_string(),
+                            kind: Some(step_params.kind.clone()),
+                            title: Some("stub: consume obligation".to_string()),
+                            files: Vec::new(),
+                            validations: Vec::new(),
+                            error: None,
+                            captured_diagnostics_summary: None,
+                        });
+                        continue;
+                    }
+                    if step_params.kind == "test_leftover_obligation" {
+                        capture_ctx.mark_obligation_consumed(&ref_name, 1);
+                        reports.push(RefactorRunStepReport {
+                            index: idx,
+                            op: "plan".to_string(),
+                            status: "ok".to_string(),
+                            kind: Some(step_params.kind.clone()),
+                            title: Some("stub: leftover obligation".to_string()),
+                            files: Vec::new(),
+                            validations: Vec::new(),
+                            error: None,
+                            captured_diagnostics_summary: None,
+                        });
+                        continue;
+                    }
+                }
+
                 let plan_text = match plan_with_ctx(&step_params, ctx) {
                     Ok(plan_text) => plan_text,
                     Err(err) if *optional => {
@@ -1055,11 +1153,13 @@ pub fn run_with_ctx(
                             files: Vec::new(),
                             validations: Vec::new(),
                             error: Some(err.to_string()),
+                            captured_diagnostics_summary: None,
                         });
                         continue;
                     }
                     Err(err) => {
-                        let rollback_errors = restore_snapshots(&snapshots);
+                        let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
                         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                             status: "step_failed".to_string(),
                             title: p.title.clone(),
@@ -1075,12 +1175,14 @@ pub fn run_with_ctx(
                                     files: Vec::new(),
                                     validations: Vec::new(),
                                     error: Some(err.to_string()),
+                                    captured_diagnostics_summary: None,
                                 },
                             ),
                             files_written,
                             rolled_back: rollback_errors.is_empty(),
                             error: Some(err.to_string()),
                             rollback_errors,
+                            obligations: capture_ctx.obligation_reports(),
                         })?);
                     }
                 };
@@ -1101,7 +1203,9 @@ pub fn run_with_ctx(
                         let path = PathBuf::from(file);
                         if p.allow_unregistered_paths != Some(true) {
                             if let Err(err) = ensure_path_in_registered_project(&path, projects) {
-                                let rollback_errors = restore_snapshots(&snapshots);
+                                let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                                let rollback_errors =
+                                    restore_snapshots_from(&snapshots, cursor);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -1111,13 +1215,16 @@ pub fn run_with_ctx(
                                     rolled_back: rollback_errors.is_empty(),
                                     error: Some(err.to_string()),
                                     rollback_errors,
+                                    obligations: capture_ctx.obligation_reports(),
                                 })?);
                             }
                         }
                         if !snapshot_paths.contains(&path) {
                             if p.allow_dirty_worktree != Some(true) {
                                 if let Err(err) = ensure_git_clean_for_path(&path) {
-                                    let rollback_errors = restore_snapshots(&snapshots);
+                                    let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                                    let rollback_errors =
+                                        restore_snapshots_from(&snapshots, cursor);
                                     return Ok(serde_json::to_string_pretty(
                                         &RefactorRunResponse {
                                             status: "step_failed".to_string(),
@@ -1128,6 +1235,7 @@ pub fn run_with_ctx(
                                             rolled_back: rollback_errors.is_empty(),
                                             error: Some(err.to_string()),
                                             rollback_errors,
+                                            obligations: capture_ctx.obligation_reports(),
                                         },
                                     )?);
                                 }
@@ -1136,7 +1244,9 @@ pub fn run_with_ctx(
                                 Ok(bytes) => Some(bytes),
                                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                                 Err(err) => {
-                                    let rollback_errors = restore_snapshots(&snapshots);
+                                    let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                                    let rollback_errors =
+                                        restore_snapshots_from(&snapshots, cursor);
                                     return Ok(serde_json::to_string_pretty(
                                         &RefactorRunResponse {
                                             status: "step_failed".to_string(),
@@ -1150,6 +1260,7 @@ pub fn run_with_ctx(
                                                 path.display()
                                             )),
                                             rollback_errors,
+                                            obligations: capture_ctx.obligation_reports(),
                                         },
                                     )?);
                                 }
@@ -1171,7 +1282,8 @@ pub fn run_with_ctx(
                     ) {
                         Ok(apply_text) => apply_text,
                         Err(err) => {
-                            let rollback_errors = restore_snapshots(&snapshots);
+                            let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
                             return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                 status: "step_failed".to_string(),
                                 title: p.title.clone(),
@@ -1181,6 +1293,7 @@ pub fn run_with_ctx(
                                 rolled_back: rollback_errors.is_empty(),
                                 error: Some(err.to_string()),
                                 rollback_errors,
+                                obligations: capture_ctx.obligation_reports(),
                             })?);
                         }
                     };
@@ -1188,7 +1301,9 @@ pub fn run_with_ctx(
                         match serde_json::from_str(&apply_text) {
                             Ok(response) => response,
                             Err(err) => {
-                                let rollback_errors = restore_snapshots(&snapshots);
+                                let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                                let rollback_errors =
+                                    restore_snapshots_from(&snapshots, cursor);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -1198,6 +1313,7 @@ pub fn run_with_ctx(
                                     rolled_back: rollback_errors.is_empty(),
                                     error: Some(err.to_string()),
                                     rollback_errors,
+                                    obligations: capture_ctx.obligation_reports(),
                                 })?);
                             }
                         };
@@ -1214,9 +1330,11 @@ pub fn run_with_ctx(
                         files: step_written,
                         validations,
                         error: apply_response.error.clone(),
+                        captured_diagnostics_summary: None,
                     });
                     if status != "ok" {
-                        let rollback_errors = restore_snapshots(&snapshots);
+                        let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
                         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                             status: "step_failed".to_string(),
                             title: p.title.clone(),
@@ -1226,6 +1344,7 @@ pub fn run_with_ctx(
                             rolled_back: rollback_errors.is_empty(),
                             error: apply_response.error,
                             rollback_errors,
+                            obligations: capture_ctx.obligation_reports(),
                         })?);
                     }
                 } else {
@@ -1238,6 +1357,7 @@ pub fn run_with_ctx(
                         files: step_files,
                         validations: Vec::new(),
                         error: None,
+                        captured_diagnostics_summary: None,
                     });
                 }
             }
@@ -1247,6 +1367,8 @@ pub fn run_with_ctx(
                 cwd,
                 touches,
                 required,
+                capture,
+                on_failure,
             } => {
                 if !confirmed {
                     reports.push(RefactorRunStepReport {
@@ -1258,10 +1380,14 @@ pub fn run_with_ctx(
                         files: touches.clone(),
                         validations: Vec::new(),
                         error: None,
+                        captured_diagnostics_summary: None,
                     });
                     continue;
                 }
 
+                // Capture snapshot count before touches so the soft-fail cursor
+                // points to the START of this step (includes the step's own touches).
+                let step_snapshot_start = snapshots.len();
                 let touched_paths = touches
                     .iter()
                     .map(|path| resolve_path(Some(&path_string(&project_dir)), path))
@@ -1278,7 +1404,9 @@ pub fn run_with_ctx(
                             Ok(bytes) => Some(bytes),
                             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                             Err(err) => {
-                                let rollback_errors = restore_snapshots(&snapshots);
+                                let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                                let rollback_errors =
+                                    restore_snapshots_from(&snapshots, cursor);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -1291,6 +1419,7 @@ pub fn run_with_ctx(
                                         path.display()
                                     )),
                                     rollback_errors,
+                                    obligations: capture_ctx.obligation_reports(),
                                 })?);
                             }
                         };
@@ -1312,8 +1441,10 @@ pub fn run_with_ctx(
                             files: touched_paths.iter().map(|path| path_string(path)).collect(),
                             validations: Vec::new(),
                             error: Some(format!("{err:#}")),
+                            captured_diagnostics_summary: None,
                         });
-                        let rollback_errors = restore_snapshots(&snapshots);
+                        let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
                         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                             status: "step_failed".to_string(),
                             title: p.title.clone(),
@@ -1323,45 +1454,116 @@ pub fn run_with_ctx(
                             rolled_back: rollback_errors.is_empty(),
                             error: Some(format!("command failed: {title}")),
                             rollback_errors,
+                            obligations: capture_ctx.obligation_reports(),
                         })?);
                     }
                 };
-                let command_required = required.unwrap_or(true);
+                // Resolve effective failure mode: on_failure supersedes required (RX-F2b).
+                let effective_on_failure = match on_failure.as_ref() {
+                    Some(of) => of.clone(),
+                    None => {
+                        if required.unwrap_or(true) {
+                            OnFailure::Required
+                        } else {
+                            OnFailure::Optional
+                        }
+                    }
+                };
+                let captured_diag_summary = if let Some(CaptureSpec::RustcJson) = capture {
+                    let parsed = parse_rustc_json_output(&command_result.stdout);
+                    let summary = CapturedDiagnosticsSummary {
+                        count: parsed.len(),
+                        severity_counts: parsed
+                            .iter()
+                            .fold(HashMap::new(), |mut acc, d| {
+                                *acc.entry(d.level.clone()).or_insert(0) += 1;
+                                acc
+                            }),
+                    };
+                    capture_ctx.stash("last".to_string(), parsed);
+                    Some(summary)
+                } else {
+                    None
+                };
                 files_written.extend(touched_paths.iter().map(|path| path_string(path)));
+                let step_status = if command_result.success {
+                    "ok".to_string()
+                } else {
+                    match effective_on_failure {
+                        OnFailure::Required => "failed".to_string(),
+                        OnFailure::Optional => "failed_optional".to_string(),
+                        OnFailure::ContinueForRepair => "soft_failed".to_string(),
+                    }
+                };
                 reports.push(RefactorRunStepReport {
                     index: idx,
                     op: "command".to_string(),
-                    status: if command_result.success {
-                        "ok".to_string()
-                    } else if command_required {
-                        "failed".to_string()
-                    } else {
-                        "failed_optional".to_string()
-                    },
+                    status: step_status.clone(),
                     kind: None,
                     title: Some(command_display(command, args)),
                     files: touched_paths.iter().map(|path| path_string(path)).collect(),
                     validations: Vec::new(),
                     error: command_result.error,
+                    captured_diagnostics_summary: captured_diag_summary,
                 });
-                if !command_result.success && command_required {
-                    let rollback_errors = restore_snapshots(&snapshots);
-                    return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
-                        status: "step_failed".to_string(),
-                        title: p.title.clone(),
-                        dry_run: false,
-                        steps: reports,
-                        files_written,
-                        rolled_back: rollback_errors.is_empty(),
-                        error: Some(format!(
-                            "command failed: {}",
-                            command_display(command, args)
-                        )),
-                        rollback_errors,
-                    })?);
+                if !command_result.success {
+                    match effective_on_failure {
+                        OnFailure::Required => {
+                            let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                            let rollback_errors =
+                                restore_snapshots_from(&snapshots, cursor);
+                            return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                                status: "step_failed".to_string(),
+                                title: p.title.clone(),
+                                dry_run: false,
+                                steps: reports,
+                                files_written,
+                                rolled_back: rollback_errors.is_empty(),
+                                error: Some(format!(
+                                    "command failed: {}",
+                                    command_display(command, args)
+                                )),
+                                rollback_errors,
+                                obligations: capture_ctx.obligation_reports(),
+                            })?);
+                        }
+                        OnFailure::Optional => {
+                            // Continue; step already logged as failed_optional.
+                        }
+                        OnFailure::ContinueForRepair => {
+                            // Open a repair obligation and continue (RX-F2b).
+                            // The cursor points to the START of this step so that
+                            // the step's own touches are included in rollback.
+                            capture_ctx.open_obligation(
+                                "last".to_string(),
+                                idx,
+                                step_snapshot_start,
+                            );
+                        }
+                    }
                 }
             }
         }
+    }
+
+    // Terminal-success policy (RX-F2b): commit only if every obligation is
+    // Consumed or LeftOver. Any Open obligation triggers rollback from the
+    // first soft-fail cursor. Consumed/LeftOver obligations are STILL live
+    // rollback anchors until this terminal-success gate is passed.
+    if confirmed && capture_ctx.has_any_obligation() && !capture_ctx.all_obligations_resolved() {
+        let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+        return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+            status: "obligations_unresolved".to_string(),
+            title: p.title.clone(),
+            dry_run: false,
+            steps: reports,
+            files_written,
+            rolled_back: rollback_errors.is_empty(),
+            error: Some("run ended with unresolved repair obligations".to_string()),
+            rollback_errors,
+            obligations: capture_ctx.obligation_reports(),
+        })?);
     }
 
     Ok(serde_json::to_string_pretty(&RefactorRunResponse {
@@ -1373,6 +1575,7 @@ pub fn run_with_ctx(
         rolled_back: false,
         error: None,
         rollback_errors: Vec::new(),
+        obligations: capture_ctx.obligation_reports(),
     })?)
 }
 
@@ -1387,6 +1590,196 @@ fn append_report(
 struct CommandStepResult {
     success: bool,
     error: Option<String>,
+    /// Raw stdout bytes from the command, always collected (RX-F2a).
+    stdout: Vec<u8>,
+}
+
+/// Lifecycle state of a repair obligation (RX-F2b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObligationStatus {
+    /// Opened by a soft-fail step; not yet resolved.
+    Open,
+    /// All diagnostics were consumed by a repair step (acceptable for commit).
+    Consumed,
+    /// Some diagnostics remain but were explicitly acknowledged as leftovers
+    /// (still acceptable for commit).
+    LeftOver,
+}
+
+/// A repair obligation opened by a `ContinueForRepair` command step (RX-F2b).
+/// The obligation stays live until the run reaches terminal success.
+#[derive(Debug, Clone)]
+pub struct Obligation {
+    pub ref_name: String,
+    pub opened_at_step_idx: usize,
+    /// Number of diagnostics captured when the obligation was opened.
+    pub captured_count: usize,
+    pub status: ObligationStatus,
+    /// Non-zero only when status is `LeftOver`.
+    pub leftover_count: usize,
+}
+
+/// Serializable summary of one obligation for the run response.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ObligationReport {
+    pub ref_name: String,
+    pub opened_at_step_idx: usize,
+    pub captured_count: usize,
+    pub leftover_count: usize,
+    /// `"open"`, `"consumed"`, or `"left_over"`.
+    pub status: String,
+}
+
+/// Per-run scratch for captured diagnostic output (RX-F2a/F2b).
+/// Keyed by a named ref string; the default ref is `"last"`.
+#[derive(Default)]
+pub struct RunCaptureContext {
+    captures: HashMap<String, Vec<RustcDiagnostic>>,
+    /// Repair obligations opened by ContinueForRepair steps (RX-F2b).
+    obligations: Vec<Obligation>,
+    /// Index into the run's snapshots vec at the time the first soft fail opened.
+    /// Rollback on non-terminal-success goes to this position.
+    first_soft_fail_snapshot_idx: Option<usize>,
+}
+
+impl RunCaptureContext {
+    fn stash(&mut self, ref_name: String, diagnostics: Vec<RustcDiagnostic>) {
+        self.captures.insert(ref_name, diagnostics);
+    }
+
+    /// Retrieve the diagnostics stashed under a named ref (for F2b use).
+    #[allow(dead_code)]
+    pub fn get(&self, ref_name: &str) -> Option<&[RustcDiagnostic]> {
+        self.captures.get(ref_name).map(|v| v.as_slice())
+    }
+
+    /// Open a repair obligation for a soft-failed step (RX-F2b).
+    fn open_obligation(&mut self, ref_name: String, step_idx: usize, snapshot_idx: usize) {
+        let captured_count = self.captures.get(&ref_name).map_or(0, |v| v.len());
+        self.obligations.push(Obligation {
+            ref_name,
+            opened_at_step_idx: step_idx,
+            captured_count,
+            status: ObligationStatus::Open,
+            leftover_count: 0,
+        });
+        if self.first_soft_fail_snapshot_idx.is_none() {
+            self.first_soft_fail_snapshot_idx = Some(snapshot_idx);
+        }
+    }
+
+    /// Mark the first Open obligation for `ref_name` as Consumed or LeftOver.
+    /// Called by repair plan kinds (RX-C1) or test stubs (RX-F2b).
+    #[allow(dead_code)]
+    pub fn mark_obligation_consumed(&mut self, ref_name: &str, leftover_count: usize) {
+        if let Some(ob) = self
+            .obligations
+            .iter_mut()
+            .find(|ob| ob.ref_name == ref_name && ob.status == ObligationStatus::Open)
+        {
+            ob.leftover_count = leftover_count;
+            ob.status = if leftover_count > 0 {
+                ObligationStatus::LeftOver
+            } else {
+                ObligationStatus::Consumed
+            };
+        }
+    }
+
+    fn has_any_obligation(&self) -> bool {
+        !self.obligations.is_empty()
+    }
+
+    /// True when every obligation is Consumed or LeftOver (none Open).
+    fn all_obligations_resolved(&self) -> bool {
+        self.obligations
+            .iter()
+            .all(|ob| ob.status != ObligationStatus::Open)
+    }
+
+    /// Snapshot-list index where rollback should begin (first soft-fail cursor).
+    fn first_soft_fail_snapshot_idx(&self) -> Option<usize> {
+        self.first_soft_fail_snapshot_idx
+    }
+
+    fn obligation_reports(&self) -> Vec<ObligationReport> {
+        self.obligations
+            .iter()
+            .map(|ob| ObligationReport {
+                ref_name: ob.ref_name.clone(),
+                opened_at_step_idx: ob.opened_at_step_idx,
+                captured_count: ob.captured_count,
+                leftover_count: ob.leftover_count,
+                status: match ob.status {
+                    ObligationStatus::Open => "open".to_string(),
+                    ObligationStatus::Consumed => "consumed".to_string(),
+                    ObligationStatus::LeftOver => "left_over".to_string(),
+                },
+            })
+            .collect()
+    }
+}
+
+/// A single `compiler-message` entry from `cargo --message-format=json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RustcDiagnostic {
+    pub level: String,
+    /// The short diagnostic code (e.g. `"E0308"`), if any.
+    pub code: Option<String>,
+    pub message: String,
+    /// Span objects from the cargo message; stored as raw JSON for forward-compat.
+    pub spans: Vec<serde_json::Value>,
+    /// Child diagnostics / suggestions; stored as raw JSON.
+    pub children: Vec<serde_json::Value>,
+}
+
+/// Parse `cargo --message-format=json` stdout into `RustcDiagnostic` entries.
+/// Malformed or non-`compiler-message` lines are silently dropped.
+pub fn parse_rustc_json_output(stdout: &[u8]) -> Vec<RustcDiagnostic> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if val.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        let Some(msg) = val.get("message") else {
+            continue;
+        };
+        let level = msg
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let code = msg
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let message = msg
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let spans = msg
+            .get("spans")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let children = msg
+            .get("children")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        out.push(RustcDiagnostic { level, code, message, spans, children });
+    }
+    out
 }
 
 fn run_validation_command(
@@ -1403,6 +1796,7 @@ fn run_validation_command(
         return Ok(CommandStepResult {
             success: false,
             error: Some("command must be an executable path without whitespace; put arguments in args, e.g. command=\"cargo\", args=[\"fmt\"], not command=\"cargo fmt\"".to_string()),
+            stdout: Vec::new(),
         });
     }
     let mut cmd = Command::new(command);
@@ -1417,22 +1811,25 @@ fn run_validation_command(
             working_dir.display()
         )
     })?;
+    let raw_stdout = output.stdout;
     if output.status.success() {
         return Ok(CommandStepResult {
             success: true,
             error: None,
+            stdout: raw_stdout,
         });
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_text = String::from_utf8_lossy(&raw_stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     Ok(CommandStepResult {
         success: false,
         error: Some(format!(
             "exit status: {}\nstdout:\n{}\nstderr:\n{}",
             output.status,
-            truncate_for_report(&stdout, 4000),
+            truncate_for_report(&stdout_text, 4000),
             truncate_for_report(&stderr, 4000)
         )),
+        stdout: raw_stdout,
     })
 }
 
@@ -2255,6 +2652,17 @@ fn restore_snapshots(snapshots: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
         }
     }
     errors
+}
+
+/// Roll back snapshots starting at `cursor` (the first-soft-fail snapshot index).
+/// When `cursor` is None, rolls back all snapshots (same as `restore_snapshots`).
+/// This implements the first_live_soft_fail_cursor rollback policy (RX-F2b).
+fn restore_snapshots_from(
+    snapshots: &[(PathBuf, Option<Vec<u8>>)],
+    cursor: Option<usize>,
+) -> Vec<String> {
+    let start = cursor.unwrap_or(0);
+    restore_snapshots(&snapshots[start..])
 }
 
 fn ensure_non_overlapping(edits: &[TextEdit]) -> Result<()> {

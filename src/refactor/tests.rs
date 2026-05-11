@@ -1471,6 +1471,8 @@ mod tests {
                         cwd: None,
                         touches: Vec::new(),
                         required: Some(true),
+                        capture: None,
+                        on_failure: None,
                     },
                 ],
                 confirm: Some(true),
@@ -1528,6 +1530,8 @@ mod tests {
                         cwd: None,
                         touches: Vec::new(),
                         required: Some(true),
+                        capture: None,
+                        on_failure: None,
                     },
                 ],
                 confirm: Some(true),
@@ -1563,6 +1567,8 @@ mod tests {
                     cwd: None,
                     touches: vec!["generated.txt".into()],
                     required: Some(true),
+                    capture: None,
+                    on_failure: None,
                 }],
                 confirm: Some(true),
                 allow_dirty_worktree: None,
@@ -3168,5 +3174,644 @@ mod rx_f1b_plan_slot_tests {
                 "unexpected error: {err}"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod rx_f2b_obligation_tests {
+    use super::*;
+    use std::fs;
+
+    fn project_record(path: &std::path::Path) -> ProjectRecord {
+        ProjectRecord {
+            project_id: "test-project".to_string(),
+            repo_id: None,
+            canonical_path: fs::canonicalize(path).unwrap().display().to_string(),
+            registered_at: "2026-05-09T00:00:00Z".to_string(),
+            is_git_repo: false,
+            languages: Default::default(),
+        }
+    }
+
+    /// Write a shell script that exits 1 and prints N compiler-message JSON lines.
+    fn make_failing_capture_script(
+        dir: &std::path::Path,
+        name: &str,
+        errors: usize,
+        warnings: usize,
+    ) -> std::path::PathBuf {
+        let data_file = dir.join(format!("{name}_data.txt"));
+        let script = dir.join(format!("{name}.sh"));
+        let mut lines = Vec::new();
+        for i in 0..errors {
+            lines.push(
+                serde_json::json!({
+                    "reason": "compiler-message",
+                    "message": {
+                        "level": "error",
+                        "code": null,
+                        "message": format!("error {i}"),
+                        "spans": [],
+                        "children": []
+                    }
+                })
+                .to_string(),
+            );
+        }
+        for i in 0..warnings {
+            lines.push(
+                serde_json::json!({
+                    "reason": "compiler-message",
+                    "message": {
+                        "level": "warning",
+                        "code": null,
+                        "message": format!("warning {i}"),
+                        "spans": [],
+                        "children": []
+                    }
+                })
+                .to_string(),
+            );
+        }
+        fs::write(&data_file, lines.join("\n")).unwrap();
+        let script_body = format!("#!/bin/sh\ncat {}\nexit 1", data_file.display());
+        fs::write(&script, script_body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    fn with_state_dir_and_lock(dir: &std::path::Path) -> impl Drop {
+        let _lock = crate::util::test_env_lock();
+        unsafe { std::env::set_var("BLACKBOX_STATE_DIR", dir) };
+        // Return an RAII guard that clears the env var on drop.
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("BLACKBOX_STATE_DIR") };
+            }
+        }
+        Guard
+    }
+
+    // ── Gate A: legacy required: bool behaves identically when on_failure unset ──
+
+    #[test]
+    fn legacy_required_true_on_failure_unset_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _guard = with_state_dir_and_lock(state_dir.path());
+
+        let response = run(
+            &RefactorRunParams {
+                title: "legacy required=true".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Command {
+                    command: "false".into(),
+                    args: Vec::new(),
+                    cwd: None,
+                    touches: Vec::new(),
+                    required: Some(true),
+                    capture: None,
+                    on_failure: None,
+                }],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "step_failed");
+        assert_eq!(resp.steps[0].status, "failed");
+        assert!(resp.obligations.is_empty());
+    }
+
+    #[test]
+    fn legacy_required_false_on_failure_unset_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _guard = with_state_dir_and_lock(state_dir.path());
+
+        let response = run(
+            &RefactorRunParams {
+                title: "legacy required=false".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Command {
+                    command: "false".into(),
+                    args: Vec::new(),
+                    cwd: None,
+                    touches: Vec::new(),
+                    required: Some(false),
+                    capture: None,
+                    on_failure: None,
+                }],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "ok", "optional failure should not abort: {response}");
+        assert_eq!(resp.steps[0].status, "failed_optional");
+        assert!(resp.obligations.is_empty());
+    }
+
+    // ── Gate B: ContinueForRepair obligation lifecycle ──
+
+    #[test]
+    fn continue_for_repair_consumed_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _guard = with_state_dir_and_lock(state_dir.path());
+        let script = make_failing_capture_script(dir.path(), "cargo_check", 2, 1);
+
+        let response = run(
+            &RefactorRunParams {
+                title: "continue_for_repair consumed".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    // Step 0: soft-fail command that opens an obligation
+                    RefactorRunStep::Command {
+                        command: path_string(&script),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(false),
+                        capture: Some(CaptureSpec::RustcJson),
+                        on_failure: Some(OnFailure::ContinueForRepair),
+                    },
+                    // Step 1: stub plan kind that marks the obligation Consumed
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "test_consume_obligation".into(),
+                            source: "last".into(),
+                            ..Default::default()
+                        },
+                        optional: false,
+                    },
+                    // Step 2: final required check passes
+                    RefactorRunStep::Command {
+                        command: "true".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                        capture: None,
+                        on_failure: None,
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "ok", "consumed obligation should commit: {response}");
+        assert!(!resp.rolled_back);
+        assert_eq!(resp.steps[0].status, "soft_failed");
+        assert_eq!(resp.steps[1].status, "ok");
+        assert_eq!(resp.steps[2].status, "ok");
+        assert_eq!(resp.obligations.len(), 1);
+        assert_eq!(resp.obligations[0].status, "consumed");
+        assert_eq!(resp.obligations[0].leftover_count, 0);
+    }
+
+    #[test]
+    fn continue_for_repair_leftover_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _guard = with_state_dir_and_lock(state_dir.path());
+        let script = make_failing_capture_script(dir.path(), "cargo_check", 2, 0);
+
+        let response = run(
+            &RefactorRunParams {
+                title: "continue_for_repair leftover".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Command {
+                        command: path_string(&script),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(false),
+                        capture: Some(CaptureSpec::RustcJson),
+                        on_failure: Some(OnFailure::ContinueForRepair),
+                    },
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "test_leftover_obligation".into(),
+                            source: "last".into(),
+                            ..Default::default()
+                        },
+                        optional: false,
+                    },
+                    RefactorRunStep::Command {
+                        command: "true".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                        capture: None,
+                        on_failure: None,
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "ok", "leftover obligation should commit: {response}");
+        assert!(!resp.rolled_back);
+        assert_eq!(resp.obligations.len(), 1);
+        assert_eq!(resp.obligations[0].status, "left_over");
+        assert_eq!(resp.obligations[0].leftover_count, 1);
+    }
+
+    #[test]
+    fn continue_for_repair_open_obligation_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _guard = with_state_dir_and_lock(state_dir.path());
+        let script = make_failing_capture_script(dir.path(), "cargo_check", 1, 0);
+
+        // No stub consumption step — obligation stays Open.
+        let response = run(
+            &RefactorRunParams {
+                title: "open obligation should fail".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Command {
+                        command: path_string(&script),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(false),
+                        capture: Some(CaptureSpec::RustcJson),
+                        on_failure: Some(OnFailure::ContinueForRepair),
+                    },
+                    // No consume step here — obligation remains Open.
+                    RefactorRunStep::Command {
+                        command: "true".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                        capture: None,
+                        on_failure: None,
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "obligations_unresolved", "{response}");
+        assert!(resp.rolled_back, "should have rolled back");
+        assert_eq!(resp.obligations.len(), 1);
+        assert_eq!(resp.obligations[0].status, "open");
+    }
+
+    #[test]
+    fn continue_for_repair_final_check_fails_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _guard = with_state_dir_and_lock(state_dir.path());
+        let script = make_failing_capture_script(dir.path(), "cargo_check", 1, 0);
+        // Create a touch file that the soft-fail step will snapshot.
+        let touch_file = dir.path().join("side_effect.txt");
+        fs::write(&touch_file, b"before").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "final check fails rolls back".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Command {
+                        command: path_string(&script),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: vec!["side_effect.txt".into()],
+                        required: Some(false),
+                        capture: Some(CaptureSpec::RustcJson),
+                        on_failure: Some(OnFailure::ContinueForRepair),
+                    },
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "test_consume_obligation".into(),
+                            source: "last".into(),
+                            ..Default::default()
+                        },
+                        optional: false,
+                    },
+                    // Final check fails — triggers rollback from soft-fail cursor.
+                    RefactorRunStep::Command {
+                        command: "false".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                        capture: None,
+                        on_failure: None,
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "step_failed", "{response}");
+        assert!(resp.rolled_back, "should have rolled back from soft-fail cursor");
+        // The touch file should be restored to "before" (soft-fail cursor rollback).
+        let content = fs::read_to_string(&touch_file).unwrap();
+        assert_eq!(content, "before", "touch file should be restored on rollback");
+    }
+
+    // ── Gate C: multi-soft-fail cursor stays at FIRST soft-fail ──
+
+    #[test]
+    fn multi_soft_fail_cursor_at_first_step() {
+        // Two soft-fail commands. First is consumed; second stays Open.
+        // Terminal commit fails. Rollback must go to the FIRST cursor,
+        // not the second, because consumed obligations do not release their cursor.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _guard = with_state_dir_and_lock(state_dir.path());
+
+        let script1 = make_failing_capture_script(dir.path(), "check1", 1, 0);
+        let script2 = make_failing_capture_script(dir.path(), "check2", 1, 0);
+
+        // Side-effect files: one touched by step1 (before soft-fail cursor),
+        // one used as a touch on the first soft-fail step (inside cursor),
+        // one touched by the second soft-fail step.
+        let touch1 = dir.path().join("touch1.txt");
+        let touch2 = dir.path().join("touch2.txt");
+        fs::write(&touch1, b"t1_before").unwrap();
+        fs::write(&touch2, b"t2_before").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "multi soft-fail cursor test".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    // Step 0: first soft-fail (touches touch1 → cursor = 0)
+                    RefactorRunStep::Command {
+                        command: path_string(&script1),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: vec!["touch1.txt".into()],
+                        required: Some(false),
+                        capture: Some(CaptureSpec::RustcJson),
+                        on_failure: Some(OnFailure::ContinueForRepair),
+                    },
+                    // Step 1: consume the first obligation
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "test_consume_obligation".into(),
+                            source: "last".into(),
+                            ..Default::default()
+                        },
+                        optional: false,
+                    },
+                    // Step 2: second soft-fail (touches touch2 → second cursor NOT set,
+                    // first cursor stays live)
+                    RefactorRunStep::Command {
+                        command: path_string(&script2),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: vec!["touch2.txt".into()],
+                        required: Some(false),
+                        capture: Some(CaptureSpec::RustcJson),
+                        on_failure: Some(OnFailure::ContinueForRepair),
+                    },
+                    // Step 3: final check passes — but second obligation is Open → fails.
+                    RefactorRunStep::Command {
+                        command: "true".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                        capture: None,
+                        on_failure: None,
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "obligations_unresolved", "{response}");
+        assert!(resp.rolled_back);
+        assert_eq!(resp.obligations.len(), 2);
+        // First obligation: consumed.
+        assert_eq!(resp.obligations[0].status, "consumed");
+        // Second obligation: still open.
+        assert_eq!(resp.obligations[1].status, "open");
+        // Both touch files should be restored because rollback goes from cursor=0.
+        let t1 = fs::read_to_string(&touch1).unwrap();
+        let t2 = fs::read_to_string(&touch2).unwrap();
+        assert_eq!(t1, "t1_before", "touch1 should be restored (inside first cursor)");
+        assert_eq!(t2, "t2_before", "touch2 should be restored (rollback from first cursor)");
+    }
+}
+
+#[cfg(test)]
+mod rx_f2a_capture_tests {
+    use super::*;
+    use std::fs;
+
+    fn project_record(path: &Path) -> ProjectRecord {
+        ProjectRecord {
+            project_id: "test-project".to_string(),
+            repo_id: None,
+            canonical_path: fs::canonicalize(path).unwrap().display().to_string(),
+            registered_at: "2026-05-09T00:00:00Z".to_string(),
+            is_git_repo: false,
+            languages: Default::default(),
+        }
+    }
+
+    /// Build a minimal `cargo --message-format=json` line for one diagnostic.
+    fn make_compiler_message(level: &str, msg: &str) -> String {
+        serde_json::json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": level,
+                "code": null,
+                "message": msg,
+                "spans": [],
+                "children": []
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parse_rustc_json_correct_counts() {
+        // 2 errors + 3 warnings
+        let lines: Vec<String> = [
+            make_compiler_message("error", "undefined variable"),
+            make_compiler_message("error", "type mismatch"),
+            make_compiler_message("warning", "unused import"),
+            make_compiler_message("warning", "dead code"),
+            make_compiler_message("warning", "unused variable"),
+        ]
+        .into_iter()
+        .collect();
+        let stdout = lines.join("\n").into_bytes();
+        let diags = parse_rustc_json_output(&stdout);
+        assert_eq!(diags.len(), 5);
+        let errors = diags.iter().filter(|d| d.level == "error").count();
+        let warnings = diags.iter().filter(|d| d.level == "warning").count();
+        assert_eq!(errors, 2);
+        assert_eq!(warnings, 3);
+    }
+
+    #[test]
+    fn parse_rustc_json_tolerates_malformed_lines() {
+        let mut lines = vec![
+            "not json at all".to_string(),
+            "{broken json".to_string(),
+            make_compiler_message("error", "real error"),
+            "".to_string(),
+            make_compiler_message("warning", "real warning"),
+        ];
+        // Also include a valid JSON line that is NOT a compiler-message.
+        lines.push(
+            serde_json::json!({"reason": "build-finished", "success": true}).to_string(),
+        );
+        let stdout = lines.join("\n").into_bytes();
+        let diags = parse_rustc_json_output(&stdout);
+        // Only the two compiler-message lines should survive.
+        assert_eq!(diags.len(), 2, "expected 2 diagnostics, got: {diags:?}");
+        assert_eq!(diags.iter().filter(|d| d.level == "error").count(), 1);
+        assert_eq!(diags.iter().filter(|d| d.level == "warning").count(), 1);
+    }
+
+    #[test]
+    fn run_step_with_capture_populates_summary() {
+        // Write a data file with 2 errors + 3 warnings, and a script that cats it.
+        // Using a separate data file avoids shell quoting issues with JSON content.
+        let dir = tempfile::tempdir().unwrap();
+        let data_file = dir.path().join("cargo_output.txt");
+        let script = dir.path().join("fake_cargo.sh");
+        let output_lines: Vec<String> = [
+            make_compiler_message("error", "e1"),
+            make_compiler_message("error", "e2"),
+            make_compiler_message("warning", "w1"),
+            make_compiler_message("warning", "w2"),
+            make_compiler_message("warning", "w3"),
+        ]
+        .into_iter()
+        .collect();
+        fs::write(&data_file, output_lines.join("\n")).unwrap();
+        let script_body = format!("#!/bin/sh\ncat {}", data_file.display());
+        fs::write(&script, script_body).unwrap();
+        // chmod +x
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let _lock = crate::util::test_env_lock();
+        unsafe { std::env::set_var("BLACKBOX_STATE_DIR", state_dir.path()) };
+
+        let response = run(
+            &RefactorRunParams {
+                title: "capture test".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Command {
+                    command: path_string(&script),
+                    args: Vec::new(),
+                    cwd: None,
+                    touches: Vec::new(),
+                    required: Some(false),
+                    capture: Some(CaptureSpec::RustcJson),
+                    on_failure: None,
+                }],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("BLACKBOX_STATE_DIR") };
+
+        let run_resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_resp.status, "ok", "run failed: {response}");
+        assert_eq!(run_resp.steps.len(), 1);
+        let step = &run_resp.steps[0];
+        let summary = step
+            .captured_diagnostics_summary
+            .as_ref()
+            .expect("expected captured_diagnostics_summary on the command step");
+        assert_eq!(summary.count, 5);
+        assert_eq!(summary.severity_counts.get("error").copied().unwrap_or(0), 2);
+        assert_eq!(summary.severity_counts.get("warning").copied().unwrap_or(0), 3);
+    }
+
+    #[test]
+    fn run_step_without_capture_has_none_summary() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let _lock = crate::util::test_env_lock();
+        unsafe { std::env::set_var("BLACKBOX_STATE_DIR", state_dir.path()) };
+
+        let response = run(
+            &RefactorRunParams {
+                title: "no capture test".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Command {
+                    command: "true".into(),
+                    args: Vec::new(),
+                    cwd: None,
+                    touches: Vec::new(),
+                    required: Some(true),
+                    capture: None,
+                    on_failure: None,
+                }],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("BLACKBOX_STATE_DIR") };
+
+        let run_resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_resp.status, "ok");
+        assert_eq!(run_resp.steps.len(), 1);
+        assert!(
+            run_resp.steps[0].captured_diagnostics_summary.is_none(),
+            "expected None when capture=None"
+        );
     }
 }
