@@ -349,6 +349,22 @@ pub struct RefactorPlanParams {
     /// saved plan via `bbox_refactor_apply(plan_path=<same value>)`.
     #[serde(default)]
     pub output_path: Option<String>,
+    /// `extract_java_class`: source-class method names that the extracted
+    /// methods call but the operator wants threaded back to source as
+    /// functional-interface callbacks rather than appearing as
+    /// `// FIXME: external call` markers. For each name listed, the planner
+    /// picks a functional interface from the method's signature
+    /// (no-arg void → `Runnable`, single-arg void → `Consumer<T>`,
+    /// no-arg non-void → `Supplier<R>`, single-arg non-void →
+    /// `Function<T,R>`), adds the matching `private final` field +
+    /// constructor parameter to the target, rewrites each call site in the
+    /// extracted bodies to the interface's invocation method
+    /// (`.run()` / `.accept(arg)` / `.get()` / `.apply(arg)`), and appends
+    /// a `this::<method>` argument to the source-side `new <Target>(...)`
+    /// wiring expression. Two-plus-arg methods are not supported yet; the
+    /// planner refuses with `error.bad_input(code=callback_arity_unsupported)`.
+    #[serde(default)]
+    pub callback_externals: Option<Vec<String>>,
     /// `lombokify_java_class`: how to handle a primitive `boolean` field
     /// whose hand-rolled getter uses `get-` prefix (e.g., `getShowFlag()`
     /// for `boolean showFlag`). Lombok's @Getter generates `isShowFlag()`,

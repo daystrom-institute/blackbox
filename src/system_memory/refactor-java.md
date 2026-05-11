@@ -81,6 +81,18 @@ real; if your concern is on the list, the planner already handles it.
   target, the operator-facing FIXME lists "drop the call" alongside
   the three structural fixes (add to extracted set / callback interface
   / inject source instance).
+- **`callback_externals` threads external calls as functional-interface
+  callbacks.** Pass `callback_externals=[methodName, ...]` to route a
+  source-class method through the target as a `Runnable` (no-arg void),
+  `Supplier<R>` (no-arg non-void), `Consumer<T>` (single-arg void), or
+  `Function<T,R>` (single-arg non-void) field instead of leaving a FIXME
+  marker. The planner adds the field + ctor param on the target,
+  rewrites each call site in the extracted bodies to `field.run()` /
+  `.get()` / `.accept(arg)` / `.apply(arg)`, appends `this::method` to
+  the source-side wiring expression, and imports `java.util.function.*`
+  as needed. Two-plus-arg methods refuse with
+  `error.bad_input(code=callback_arity_unsupported)` — wrap them or
+  extract a real callback interface.
 - **`bbox_refactor_plan` always returns `dry_run: true`.** The response
   field indicates "this call did not write any files" — read it as the
   inverse of `wrote_files`. The plan is staged on disk under

@@ -2525,6 +2525,49 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         })
         .collect::<Vec<_>>();
 
+    // `callback_externals`: source-class methods the operator wants threaded
+    // through the target as a functional-interface callback instead of
+    // surfacing as a `// FIXME: external call` marker. Classify each into
+    // (Runnable / Supplier<R> / Consumer<T> / Function<T,R>) by inspecting
+    // the source method's signature. 2+ arg methods are refused with a
+    // dedicated bad_input code.
+    let callback_specs: Vec<CallbackSpec> = {
+        let names = p.callback_externals.as_deref().unwrap_or_default();
+        if names.is_empty() {
+            Vec::new()
+        } else {
+            let mut specs = Vec::new();
+            for name in names {
+                // The method must exist on the source class.
+                let method_node = find_node(parsed.tree.root_node(), |node| {
+                    node.kind() == "method_declaration"
+                        && node
+                            .child_by_field_name("name")
+                            .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
+                            == Some(name.as_str())
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "error.bad_input(code=callback_method_not_found): \
+                         `callback_externals` entry `{name}` is not a method declaration on the \
+                         source class"
+                    )
+                })?;
+                specs.push(classify_callback_method(&parsed, method_node)?);
+            }
+            specs
+        }
+    };
+    // Append callback ctor params after instance captures so the wiring's
+    // positional arg list is (captured1, captured2, ..., callback1, ...).
+    let mut all_target_ctor_params = dependency_params.clone();
+    for spec in &callback_specs {
+        all_target_ctor_params.push(JavaParameterSpec {
+            type_name: spec.interface_type.clone(),
+            name: spec.field_name.clone(),
+        });
+    }
+
     // Locate the source-side `field_declaration` node for each static-final
     // capture so we can (a) render the original declaration verbatim onto
     // the target and (b) emit a removal edit on the source.
@@ -2598,15 +2641,15 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let dependency_field_text = dependency_params
+    let dependency_field_text = all_target_ctor_params
         .iter()
         .map(|param| format!("    private final {} {};", param.type_name, param.name))
         .collect::<Vec<_>>()
         .join("\n");
-    let constructor_text = if dependency_params.is_empty() {
+    let constructor_text = if all_target_ctor_params.is_empty() {
         String::new()
     } else {
-        java_constructor_decl(&target_class_name, "public", &dependency_params, true, None)?
+        java_constructor_decl(&target_class_name, "public", &all_target_ctor_params, true, None)?
     };
 
     // Gap 18 + Gap 6: generate getter/setter methods on the target for each
@@ -2670,7 +2713,19 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     if !original_target_bytes.is_empty() {
         bail!("extract_java_class currently requires a missing or empty target file");
     }
-    let raw_target_content = java_class_wrapper(&target_class_name, &prelude, &target_body);
+    let mut raw_target_content = java_class_wrapper(&target_class_name, &prelude, &target_body);
+
+    // `callback_externals`: rewrite each callback invocation inside the
+    // extracted method bodies BEFORE organize_imports + FIXME insertion run.
+    // After rewrite, calls like `refreshGrid()` become `refreshGrid.run()`,
+    // so the import-walker sees them as `Runnable`-typed field accesses and
+    // the external-call FIXME finder no longer matches them by method name.
+    if !callback_specs.is_empty() {
+        let callback_edits =
+            compute_callback_call_rewrites(&raw_target_content, &callback_specs)?;
+        raw_target_content = apply_text_edits(&raw_target_content, &callback_edits);
+    }
+
     // Gap 25: prune unused imports on the generated target. The prelude
     // copies every import from the source; the heuristic walks the in-memory
     // target AST and drops imports whose simple name is never referenced as
@@ -2694,6 +2749,15 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 raw_target_content
             }
         };
+    // Inject any functional-interface imports needed by the callbacks
+    // (Runnable lives in java.lang; Consumer/Supplier/Function live under
+    // java.util.function and need an explicit import even though their
+    // simple name is referenced by the ctor parameter type).
+    for spec in &callback_specs {
+        if let Some(fqcn) = spec.extra_import.as_deref() {
+            target_content = java_inject_import(&target_content, fqcn);
+        }
+    }
 
     // Gap 22 / Gap 23: scaffold unresolved deps in the generated target text.
     // Only meaningful when deep_analysis was on (the report is empty otherwise).
@@ -2842,8 +2906,18 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         }
 
         // Gap 22: insert FIXME comment lines above each external_call site
-        // in the generated target body.
+        // in the generated target body. `callback_externals` methods are
+        // already threaded through the target as functional-interface
+        // callbacks (call sites rewritten to `field.run()` / `.accept(...)`
+        // etc.); they are NOT external calls that need a FIXME.
+        let callback_names: HashSet<&str> = callback_specs
+            .iter()
+            .map(|c| c.method_name.as_str())
+            .collect();
         for call in &class_dependency_report.external_calls {
+            if callback_names.contains(call.method.as_str()) {
+                continue;
+            }
             let fixme = fixme_external_call(&call.method);
             let (next, _count) =
                 java_insert_fixme_above_calls(&target_content, &call.method, &fixme);
@@ -2931,14 +3005,22 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             }
         }
     }
-    let assignment = format!(
-        "this.{delegate_field} = new {target_class_name}({});",
-        dependency_params
+    // Source-side wiring args: capture names verbatim, then `this::<method>`
+    // for each callback (the target's ctor takes the captures first, then the
+    // functional-interface callbacks, in declaration order).
+    let assignment = {
+        let mut args: Vec<String> = dependency_params
             .iter()
-            .map(|param| param.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+            .map(|param| param.name.clone())
+            .collect();
+        for spec in &callback_specs {
+            args.push(format!("this::{}", spec.method_name));
+        }
+        format!(
+            "this.{delegate_field} = new {target_class_name}({});",
+            args.join(", ")
+        )
+    };
     if let Some(constructor) = first_constructor_node(class_node, &parsed.source) {
         // Gap 7: when any captured-param name refers to a field rather than
         // a constructor parameter, that name is `null` until its own
@@ -5019,6 +5101,165 @@ fn java_caller_rewrite_edits(
 /// (`x++` / `x--`) of `field_name`. Used by the mutable-capture-with-write
 /// refusal — captures that the moved code writes to cannot become `final`
 /// constructor parameters.
+/// Specification for a `callback_externals` entry. Built from a source-class
+/// method declaration: tells the planner what functional-interface field to
+/// put on the target, how to rewrite call sites inside the extracted bodies,
+/// and what extra `import` to add to the target file.
+#[derive(Debug, Clone)]
+struct CallbackSpec {
+    method_name: String,
+    field_name: String,
+    interface_type: String,
+    invoke_method: String,
+    extra_import: Option<String>,
+}
+
+/// Classify a source-class method declaration into a functional-interface
+/// callback for use by `callback_externals`. Returns
+/// `error.bad_input(code=callback_arity_unsupported)` when the method has
+/// more than one parameter (BiConsumer / BiFunction support is future work).
+fn classify_callback_method(
+    parsed: &ParsedSource,
+    method_node: Node<'_>,
+) -> Result<CallbackSpec> {
+    let method_name = method_node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
+        .ok_or_else(|| anyhow!("could not read callback method name"))?
+        .to_string();
+    let return_type_text = method_node
+        .child_by_field_name("type")
+        .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
+        .map(str::trim)
+        .unwrap_or("void");
+    let is_void = return_type_text == "void";
+    let params_node = method_node
+        .child_by_field_name("parameters")
+        .ok_or_else(|| anyhow!("callback method `{method_name}` has no parameter list"))?;
+    let mut cursor = params_node.walk();
+    let formal_params: Vec<Node<'_>> = params_node
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() == "formal_parameter")
+        .collect();
+    let param_types: Vec<String> = formal_params
+        .iter()
+        .map(|p| {
+            p.child_by_field_name("type")
+                .and_then(|t| t.utf8_text(parsed.source.as_bytes()).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "?".to_string())
+        })
+        .collect();
+    let (interface_type, invoke_method, extra_import) = match (param_types.len(), is_void) {
+        (0, true) => (
+            "Runnable".to_string(),
+            "run".to_string(),
+            None,
+        ),
+        (0, false) => (
+            format!("Supplier<{}>", boxed_for_supplier(return_type_text)),
+            "get".to_string(),
+            Some("java.util.function.Supplier".to_string()),
+        ),
+        (1, true) => (
+            format!("Consumer<{}>", boxed_for_supplier(&param_types[0])),
+            "accept".to_string(),
+            Some("java.util.function.Consumer".to_string()),
+        ),
+        (1, false) => (
+            format!(
+                "Function<{}, {}>",
+                boxed_for_supplier(&param_types[0]),
+                boxed_for_supplier(return_type_text)
+            ),
+            "apply".to_string(),
+            Some("java.util.function.Function".to_string()),
+        ),
+        (n, _) => bail!(
+            "error.bad_input(code=callback_arity_unsupported): callback method `{method_name}` \
+             takes {n} parameters; only 0-arg and 1-arg signatures are supported (Runnable / \
+             Supplier / Consumer / Function). Add a wrapper method or expand the planner's \
+             callback support."
+        ),
+    };
+    Ok(CallbackSpec {
+        method_name: method_name.clone(),
+        field_name: method_name,
+        interface_type,
+        invoke_method,
+        extra_import,
+    })
+}
+
+/// Build `(byte_start, byte_end, replacement)` edits over `target_text` that
+/// rewrite every unqualified or `this.`-qualified invocation of a callback's
+/// `method_name` to `<field_name>.<invoke_method>(args)`. Skips invocations
+/// with non-`this` receivers (those bind to a different instance).
+fn compute_callback_call_rewrites(
+    target_text: &str,
+    callbacks: &[CallbackSpec],
+) -> Result<Vec<(usize, usize, String)>> {
+    if callbacks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tree = parse_source("java", target_text)?;
+    let by_name: HashMap<&str, &CallbackSpec> = callbacks
+        .iter()
+        .map(|c| (c.method_name.as_str(), c))
+        .collect();
+    let mut edits = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "method_invocation" {
+            continue;
+        }
+        let Some(name_node) = node.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(name) = name_node.utf8_text(target_text.as_bytes()) else {
+            continue;
+        };
+        let Some(spec) = by_name.get(name) else {
+            continue;
+        };
+        // Reject calls with a non-`this` receiver — they bind to a different
+        // instance and should not be redirected through our callback.
+        if let Some(object) = node.child_by_field_name("object") {
+            if object.kind() != "this" && object.kind() != "this_expression" {
+                continue;
+            }
+        }
+        let args_node = node.child_by_field_name("arguments");
+        let args_text = args_node
+            .and_then(|n| n.utf8_text(target_text.as_bytes()).ok())
+            .unwrap_or("()");
+        // Strip the surrounding `(` `)` so we can rebuild a clean call.
+        let args_inner = args_text.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        let replacement = if args_inner.is_empty() {
+            format!("{}.{}()", spec.field_name, spec.invoke_method)
+        } else {
+            format!("{}.{}({})", spec.field_name, spec.invoke_method, args_inner)
+        };
+        edits.push((node.start_byte(), node.end_byte(), replacement));
+    }
+    edits.sort_by_key(|(s, _, _)| *s);
+    Ok(edits)
+}
+
+/// Apply `(start, end, replacement)` edits to `text` from rightmost to
+/// leftmost so byte indices stay valid.
+fn apply_text_edits(text: &str, edits: &[(usize, usize, String)]) -> String {
+    let mut out = text.to_string();
+    for (s, e, repl) in edits.iter().rev() {
+        out.replace_range(*s..*e, repl);
+    }
+    out
+}
+
 fn extracted_methods_write_to(
     parsed: &ParsedSource,
     methods: &[JavaMethod],
@@ -7889,6 +8130,7 @@ mod tests {
             rewrite_remaining_accessors: None,
             project_dir: None,
             boolean_getter_strategy: None,
+            callback_externals: None,
             output_path: None,
         }
     }
@@ -9803,6 +10045,143 @@ mod tests {
     // and the moved write would then fail `cannot assign to final variable`.
     // Refuse the plan with operator-actionable instructions to add the
     // field(s) to `move_fields`.
+
+    // `callback_externals`: a source-class method that the extracted body
+    // calls but the operator wants threaded as a functional-interface
+    // callback rather than appearing as a FIXME. Target gains a Runnable /
+    // Consumer / Supplier / Function field + ctor param matching the
+    // method's signature; call sites in the extracted body are rewritten
+    // to `field.run()` / `.accept(arg)` / `.get()` / `.apply(arg)`;
+    // source-side wiring appends `this::method`.
+    #[test]
+    fn extract_java_class_threads_callback_externals_through_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("Widgets.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class Dashboard {\n\
+            \x20   private final Admin admin;\n\
+            \x20   Dashboard(Admin admin) { this.admin = admin; }\n\
+            \x20   void refreshGrid() {}\n\
+            \x20   void buildWidget() { admin.load(); refreshGrid(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Widgets".to_string());
+        params.delegate_field = Some("widgets".to_string());
+        params.item_names = Some(vec!["buildWidget".to_string()]);
+        params.callback_externals = Some(vec!["refreshGrid".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("private final Runnable refreshGrid;"),
+            "target must hold callback as Runnable field: {target_text}"
+        );
+        assert!(
+            target_text.contains("Runnable refreshGrid")
+                && target_text.contains("this.refreshGrid = refreshGrid;"),
+            "target ctor must wire the callback: {target_text}"
+        );
+        assert!(
+            target_text.contains("refreshGrid.run()"),
+            "extracted body must call the callback via .run(): {target_text}"
+        );
+        assert!(
+            !target_text.contains("FIXME: external call `refreshGrid`"),
+            "no FIXME for callback-handled external: {target_text}"
+        );
+
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("new Widgets(admin, this::refreshGrid)"),
+            "source wiring must append this::refreshGrid: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_callback_externals_with_consumer_arity() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("Widgets.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class Dashboard {\n\
+            \x20   private final Admin admin;\n\
+            \x20   Dashboard(Admin admin) { this.admin = admin; }\n\
+            \x20   void log(String msg) {}\n\
+            \x20   void buildWidget() { admin.load(); log(\"built\"); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Widgets".to_string());
+        params.delegate_field = Some("widgets".to_string());
+        params.item_names = Some(vec!["buildWidget".to_string()]);
+        params.callback_externals = Some(vec!["log".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("private final Consumer<String> log;"),
+            "Consumer field expected: {target_text}"
+        );
+        assert!(
+            target_text.contains("import java.util.function.Consumer;"),
+            "Consumer import expected: {target_text}"
+        );
+        assert!(
+            target_text.contains("log.accept(\"built\")"),
+            "call site must use .accept: {target_text}"
+        );
+    }
+
+    #[test]
+    fn extract_java_class_callback_externals_rejects_two_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("Widgets.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class Dashboard {\n\
+            \x20   void compute(String a, int b) {}\n\
+            \x20   void buildWidget() { compute(\"x\", 1); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Widgets".to_string());
+        params.delegate_field = Some("widgets".to_string());
+        params.item_names = Some(vec!["buildWidget".to_string()]);
+        params.callback_externals = Some(vec!["compute".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let err = plan_extract_java_class(&params).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("callback_arity_unsupported"),
+            "expected arity refusal: {msg}"
+        );
+        assert!(msg.contains("compute"), "error must name the method: {msg}");
+    }
+
     #[test]
     fn extract_java_class_refuses_mutable_capture_with_write() {
         let dir = tempfile::tempdir().unwrap();

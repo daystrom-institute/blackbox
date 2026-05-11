@@ -855,6 +855,7 @@ mod tests {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             boolean_getter_strategy: None,
+            callback_externals: None,
             output_path: None,
         })
         .unwrap();
@@ -973,6 +974,7 @@ fn consume(input: OldService, output: Vec<OldService>) -> OldService {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             boolean_getter_strategy: None,
+            callback_externals: None,
             output_path: None,
         });
         let msg = err.expect_err("impl trait should fail").to_string();
@@ -1053,6 +1055,7 @@ fn consume<T>(value: OldService, list: Vec<OldService>) {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             boolean_getter_strategy: None,
+            callback_externals: None,
             output_path: None,
         });
         let msg = err.expect_err("expected conflict").to_string();
@@ -1134,6 +1137,7 @@ struct Holder {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             boolean_getter_strategy: None,
+            callback_externals: None,
             output_path: None,
         });
         let msg = err.expect_err("impl trait should refuse struct field").to_string();
