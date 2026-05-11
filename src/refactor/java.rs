@@ -2380,6 +2380,7 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         leftovers: Vec::new(),
         captured_variables,
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: dependency_report.external_calls,
         inherited_dependencies: dependency_report.inherited_dependencies,
         deep_analysis: None,
@@ -2522,9 +2523,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     let moved_constants_text = moved_constant_fields
         .iter()
         .map(|field| {
-            parsed.source[field.item.leading_trivia_start..field.item.byte_end]
-                .trim_matches('\n')
-                .to_string()
+            extract_field_text_with_visibility_floor(&parsed, field, visibility_floor)
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -2964,6 +2963,40 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         source_edits.extend(caller_edits);
     }
 
+    // Constants whose declaration is moving lose their bare-name binding in
+    // the source. Rewrite every remaining source-side reference (outside the
+    // extracted methods and outside the moved declarations) to a qualified
+    // `<TargetClass>.<CONST>` form. Constants are also rendered on the target
+    // with a widened visibility (handled above by
+    // `extract_field_text_with_visibility_floor`), so the qualified
+    // references resolve from a different package when cross_package.
+    let constant_names: Vec<String> = moved_constant_fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect();
+    if !constant_names.is_empty() {
+        let mut const_skip_ranges: Vec<(usize, usize)> = selected_methods
+            .iter()
+            .map(|method| (method.item.byte_start, method.item.byte_end))
+            .collect();
+        const_skip_ranges.extend(
+            selected_fields
+                .iter()
+                .map(|field| (field.item.byte_start, field.item.byte_end)),
+        );
+        const_skip_ranges.extend(
+            moved_constant_fields
+                .iter()
+                .map(|field| (field.item.byte_start, field.item.byte_end)),
+        );
+        source_edits.extend(compute_remaining_constant_qualify_edits(
+            &parsed,
+            &constant_names,
+            &const_skip_ranges,
+            &target_class_name,
+        ));
+    }
+
     source_edits.sort_by_key(|edit| edit.byte_start);
     ensure_non_overlapping(&source_edits)?;
 
@@ -2986,6 +3019,31 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 &moved_field_names_owned,
                 &moved_field_decl_ranges,
             )
+        } else {
+            Vec::new()
+        };
+
+    // Preview report for moved constants — populated under deep_analysis
+    // analogous to `remaining_source_accessors`. The qualifier rewrites
+    // themselves run unconditionally (see above) so cross-cluster refs
+    // never silently miscompile.
+    let remaining_source_constant_refs =
+        if !constant_names.is_empty() && p.deep_analysis.unwrap_or(false) {
+            let mut skip = selected_methods
+                .iter()
+                .map(|m| (m.item.byte_start, m.item.byte_end))
+                .collect::<Vec<_>>();
+            skip.extend(
+                selected_fields
+                    .iter()
+                    .map(|f| (f.item.byte_start, f.item.byte_end)),
+            );
+            skip.extend(
+                moved_constant_fields
+                    .iter()
+                    .map(|f| (f.item.byte_start, f.item.byte_end)),
+            );
+            compute_remaining_source_constant_refs(&parsed, &constant_names, &skip)
         } else {
             Vec::new()
         };
@@ -3030,6 +3088,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         leftovers: Vec::new(),
         captured_variables,
         remaining_source_accessors,
+        remaining_source_constant_refs,
         external_calls: class_dependency_report.external_calls,
         inherited_dependencies: class_dependency_report.inherited_dependencies,
         deep_analysis: None,
@@ -3140,6 +3199,7 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -3216,6 +3276,7 @@ pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -3274,6 +3335,7 @@ pub(crate) fn plan_add_java_constructor(p: &RefactorPlanParams) -> Result<String
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -3376,6 +3438,7 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors,
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -3523,6 +3586,7 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -3696,6 +3760,137 @@ fn widen_static_final_visibility_edit(
 /// in the source class. Skips occurrences inside the moved declarations
 /// themselves and identifiers shadowed by an enclosing local variable or
 /// formal parameter of the same name.
+/// Find every source-side reference to a moved static-final constant that
+/// survives outside the extracted-method / moved-declaration ranges. Returns
+/// one entry per constant. Each entry's `accesses` list is the call sites
+/// that would fail to compile against a bare `CONST` reference after the
+/// declaration moves to the target — these are the references the planner
+/// rewrites to `<TargetClass>.<CONST>`.
+///
+/// `skip_ranges` should include both the extracted method bodies AND the
+/// moved-constant declaration ranges (those are about to be deleted).
+fn compute_remaining_source_constant_refs(
+    parsed: &ParsedSource,
+    constant_names: &[String],
+    skip_ranges: &[(usize, usize)],
+) -> Vec<RemainingFieldAccessor> {
+    let name_set: HashSet<&str> = constant_names.iter().map(String::as_str).collect();
+    let mut by_const: BTreeMap<String, Vec<FieldAccessSite>> = BTreeMap::new();
+    for name in constant_names {
+        by_const.insert(name.clone(), Vec::new());
+    }
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "identifier" {
+            continue;
+        }
+        let Ok(text) = node.utf8_text(parsed.source.as_bytes()) else {
+            continue;
+        };
+        if !name_set.contains(text) {
+            continue;
+        }
+        if skip_ranges
+            .iter()
+            .any(|(s, e)| node.start_byte() >= *s && node.end_byte() <= *e)
+        {
+            continue;
+        }
+        // Exclude qualified accesses on something other than `this` — e.g.
+        // `Other.CONST` already resolves elsewhere. Constants are accessed
+        // bare or as `this.CONST`; both are handled by `resolve_field_access`.
+        if resolve_field_access(node).is_none() {
+            continue;
+        }
+        if is_shadowed(node, text, &parsed.source) {
+            continue;
+        }
+        let (line, column) = line_col(&parsed.source, node.start_byte());
+        let context = surrounding_context(&parsed.source, node.start_byte());
+        if let Some(list) = by_const.get_mut(text) {
+            list.push(FieldAccessSite {
+                line,
+                column,
+                kind: "read".to_string(),
+                context,
+            });
+        }
+    }
+    let mut report: Vec<RemainingFieldAccessor> = constant_names
+        .iter()
+        .map(|name| {
+            let mut accesses = by_const.remove(name).unwrap_or_default();
+            accesses.sort_by(|a, b| a.line.cmp(&b.line).then(a.column.cmp(&b.column)));
+            RemainingFieldAccessor {
+                field: name.clone(),
+                accesses,
+            }
+        })
+        .collect();
+    report.sort_by_key(|r| {
+        constant_names
+            .iter()
+            .position(|name| name == &r.field)
+            .unwrap_or(usize::MAX)
+    });
+    report
+}
+
+/// Emit `CONST` → `<TargetClass>.<CONST>` rewrite edits for every surviving
+/// source-side reference to a moved static-final constant. Skips refs inside
+/// extracted methods and inside the moved declarations themselves (those are
+/// about to be deleted) and shadowed refs.
+fn compute_remaining_constant_qualify_edits(
+    parsed: &ParsedSource,
+    constant_names: &[String],
+    skip_ranges: &[(usize, usize)],
+    target_class_name: &str,
+) -> Vec<TextEdit> {
+    let name_set: HashSet<&str> = constant_names.iter().map(String::as_str).collect();
+    let mut edits = Vec::new();
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "identifier" {
+            continue;
+        }
+        let Ok(text) = node.utf8_text(parsed.source.as_bytes()) else {
+            continue;
+        };
+        if !name_set.contains(text) {
+            continue;
+        }
+        if skip_ranges
+            .iter()
+            .any(|(s, e)| node.start_byte() >= *s && node.end_byte() <= *e)
+        {
+            continue;
+        }
+        let Some(access_node) = resolve_field_access(node) else {
+            continue;
+        };
+        if is_shadowed(node, text, &parsed.source) {
+            continue;
+        }
+        // For bare reads: replace the identifier itself.
+        // For `this.CONST`: replace the entire field_access expression
+        // (drops the `this.` prefix and inserts the class qualifier).
+        edits.push(TextEdit {
+            byte_start: access_node.start_byte(),
+            byte_end: access_node.end_byte(),
+            replacement: format!("{target_class_name}.{text}"),
+        });
+    }
+    edits
+}
+
 fn compute_remaining_source_accessors(
     parsed: &ParsedSource,
     field_names: &[String],
@@ -4636,6 +4831,7 @@ pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String>
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -4729,6 +4925,56 @@ fn java_caller_rewrite_edits(
 /// A method already at or above the floor is emitted unchanged. The floor
 /// itself is `package` for same-package extractions and `public` when the
 /// target ends up in a different package than the source.
+/// Like `extract_method_text_with_visibility_floor` but for `field_declaration`
+/// nodes — used to render moved static-final constants on the target with a
+/// widened modifier when the constant's source-side visibility is below the
+/// floor.
+///
+/// Same-package extracts use a `package` floor (no modifier — strip `private`);
+/// cross-package extracts use `public`. Constants that already meet or exceed
+/// the floor are emitted unchanged.
+fn extract_field_text_with_visibility_floor(
+    parsed: &ParsedSource,
+    field: &JavaField,
+    visibility_floor: &str,
+) -> String {
+    let original = parsed.source[field.item.leading_trivia_start..field.item.byte_end]
+        .trim_matches('\n')
+        .to_string();
+    let field_node = find_node(parsed.tree.root_node(), |node| {
+        node.kind() == "field_declaration"
+            && node.start_byte() == field.item.byte_start
+            && node.end_byte() == field.item.byte_end
+    });
+    let Some(field_node) = field_node else {
+        return original;
+    };
+    let mods = collect_java_modifiers(field_node);
+    let current = java_visibility_from_mods(&mods);
+    if java_visibility_rank(current) >= java_visibility_rank(visibility_floor) {
+        return original;
+    }
+    let new_visibility = if visibility_floor == "package" {
+        None
+    } else {
+        Some(visibility_floor)
+    };
+    let edit = build_visibility_rewrite_edit(field_node, &mods, new_visibility, &parsed.source);
+    let window_start = field.item.leading_trivia_start;
+    let window_end = field.item.byte_end;
+    if edit.byte_start < window_start || edit.byte_end > window_end {
+        return original;
+    }
+    let local_start = edit.byte_start - window_start;
+    let local_end = edit.byte_end - window_start;
+    let raw = &parsed.source[window_start..window_end];
+    let mut rewritten = String::with_capacity(raw.len() + edit.replacement.len());
+    rewritten.push_str(&raw[..local_start]);
+    rewritten.push_str(&edit.replacement);
+    rewritten.push_str(&raw[local_end..]);
+    rewritten.trim_matches('\n').to_string()
+}
+
 fn extract_method_text_with_visibility_floor(
     parsed: &ParsedSource,
     method: &JavaMethod,
@@ -4859,6 +5105,7 @@ pub(crate) fn plan_add_java_delegate_field(p: &RefactorPlanParams) -> Result<Str
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -4974,6 +5221,7 @@ pub(crate) fn plan_rewrite_java_visibility(p: &RefactorPlanParams) -> Result<Str
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -5156,6 +5404,7 @@ pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String>
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -5433,6 +5682,7 @@ let ident = chunk.split_whitespace().last().unwrap_or("").trim();
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -5521,6 +5771,7 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -5653,6 +5904,7 @@ pub(crate) fn plan_java_lsp_organize_imports(
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -6885,6 +7137,7 @@ fn plan_lombokify_java_tree(p: &RefactorPlanParams, dir: &Path) -> Result<String
         leftovers: skipped,
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -7428,6 +7681,7 @@ fn plan_lombokify_java_class_single(
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -9173,12 +9427,19 @@ mod tests {
         assert!(captured.source_static_final);
 
         // Target body contains the constant declaration with `static final`
-        // and the original initializer literal.
+        // and the original initializer literal. Visibility widens to the
+        // same-package floor (no explicit modifier — package-private) so
+        // any cross-cluster source-side reference can still see it.
         let target_replacement = &plan.edits[1].edits[0].replacement;
         assert!(
             target_replacement
-                .contains("private static final String SAMPLE_STATUS_OK = \"UP TO DATE\";"),
+                .contains("static final String SAMPLE_STATUS_OK = \"UP TO DATE\";"),
             "target should keep static final + initializer: {target_replacement}"
+        );
+        assert!(
+            !target_replacement
+                .contains("private static final String SAMPLE_STATUS_OK"),
+            "target must widen private to the same-package floor: {target_replacement}"
         );
 
         // No constructor parameter for the constant. The body should not
@@ -9214,6 +9475,136 @@ mod tests {
         );
     }
 
+    // Cross-cluster refs to moved constants: declarations leave the source,
+    // so every surviving bare reference outside the extracted methods must be
+    // rewritten to `<TargetClass>.<CONST>`. The constant declaration itself
+    // is widened on the target (package-floor or public-floor, by package).
+    // `deep_analysis: true` also populates a preview report.
+    #[test]
+    fn extract_java_class_qualifies_cross_cluster_constant_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("Widgets.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class Dashboard {\n\
+            \x20   private static final String LAST_14_DAYS = \"Last 14 Days\";\n\
+            \x20   private final ComboBox<String> picker;\n\
+            \x20   Dashboard(ComboBox<String> picker) { this.picker = picker; }\n\
+            \x20   String buildWidget() { return LAST_14_DAYS; }\n\
+            \x20   void setComboItems() { picker.setItems(LAST_14_DAYS); }\n\
+            \x20   boolean isCustom(String v) { return v.equals(LAST_14_DAYS); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Widgets".to_string());
+        params.delegate_field = Some("widgets".to_string());
+        params.item_names = Some(vec!["buildWidget".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+
+        // Source side: cross-cluster references rewritten to qualified form.
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("picker.setItems(Widgets.LAST_14_DAYS)"),
+            "setComboItems must use qualified reference: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("v.equals(Widgets.LAST_14_DAYS)"),
+            "isCustom must use qualified reference: {rewritten}"
+        );
+        // Bare reference inside the extracted method moves with it.
+        assert!(
+            !rewritten.contains("return LAST_14_DAYS"),
+            "extracted method must be removed from source: {rewritten}"
+        );
+
+        // Target side: constant retained with widened visibility (same
+        // package → package floor → no explicit modifier).
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("static final String LAST_14_DAYS"),
+            "target must keep the constant: {target_text}"
+        );
+        assert!(
+            !target_text.contains("private static final String LAST_14_DAYS"),
+            "target must drop `private` so cross-cluster source refs resolve: {target_text}"
+        );
+
+        // Report: every surviving ref is enumerated with line/column.
+        let report = plan
+            .remaining_source_constant_refs
+            .iter()
+            .find(|r| r.field == "LAST_14_DAYS")
+            .expect("report entry for LAST_14_DAYS");
+        assert_eq!(
+            report.accesses.len(),
+            2,
+            "expected 2 surviving refs (setComboItems + isCustom): {:?}",
+            report.accesses
+        );
+    }
+
+    #[test]
+    fn extract_java_class_qualifies_cross_cluster_constant_refs_cross_package() {
+        // Cross-package extract widens to `public` and the qualified refs
+        // resolve via the source-side delegate-class import.
+        let dir = tempfile::tempdir().unwrap();
+        let a_pkg = dir.path().join("src/main/java/a");
+        let b_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&a_pkg).unwrap();
+        fs::create_dir_all(&b_pkg).unwrap();
+        let source = a_pkg.join("Dashboard.java");
+        let target = b_pkg.join("Widgets.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             class Dashboard {\n\
+            \x20   private static final String LAST_14_DAYS = \"Last 14 Days\";\n\
+            \x20   private final java.util.List<String> picker;\n\
+            \x20   Dashboard(java.util.List<String> picker) { this.picker = picker; }\n\
+            \x20   String buildWidget() { return LAST_14_DAYS; }\n\
+            \x20   void setComboItems() { picker.add(LAST_14_DAYS); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Widgets".to_string());
+        params.delegate_field = Some("widgets".to_string());
+        params.item_names = Some(vec!["buildWidget".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("public static final String LAST_14_DAYS"),
+            "cross-package: constant must be widened to public: {target_text}"
+        );
+
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("picker.add(Widgets.LAST_14_DAYS)"),
+            "cross-package: source ref must qualify with target class: {rewritten}"
+        );
+        // Delegate-class import (Gap 5 from prior tranche) carries the
+        // qualifier's resolution.
+        assert!(
+            rewritten.contains("import b.Widgets;"),
+            "cross-package: source must import the target class: {rewritten}"
+        );
+    }
+
     #[test]
     fn extract_java_class_separates_static_final_from_instance_captures() {
         let dir = tempfile::tempdir().unwrap();
@@ -9235,11 +9626,16 @@ mod tests {
         let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
         let target_replacement = &plan.edits[1].edits[0].replacement;
 
-        // Constant: emitted as static final with initializer.
+        // Constant: emitted as static final with initializer; private is
+        // widened to the same-package floor.
         assert!(
             target_replacement
-                .contains("private static final String LABEL = \"ok\";"),
+                .contains("static final String LABEL = \"ok\";"),
             "target should keep LABEL as static final constant: {target_replacement}"
+        );
+        assert!(
+            !target_replacement.contains("private static final String LABEL"),
+            "target must widen private to the same-package floor: {target_replacement}"
         );
         assert!(
             !target_replacement.contains("private final String LABEL;"),

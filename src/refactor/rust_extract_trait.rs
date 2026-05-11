@@ -296,6 +296,7 @@ pub fn plan_extract_trait(p: &crate::refactor::RefactorPlanParams) -> Result<Str
             leftovers,
             captured_variables: Vec::new(),
             remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
             external_calls: Vec::new(),
             inherited_dependencies: Vec::new(),
             deep_analysis: None,

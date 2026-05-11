@@ -187,6 +187,7 @@ pub fn plan_lift_to_free(p: &RefactorPlanParams) -> Result<String> {
             .collect(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
