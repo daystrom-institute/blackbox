@@ -358,6 +358,33 @@ fn collect_java_type_references(node: Node<'_>, source: &str, out: &mut HashSet<
         }
         return;
     }
+    // Gap 4: type names appearing as receivers of static method calls or
+    // static member references parse as plain `identifier` nodes, not
+    // `type_identifier`. Without this, the organize-imports heuristic
+    // misses references like `DateUtils.getX(...)`, `Collectors.toList()`,
+    // `BigDecimal.ZERO`, etc. — and either drops the source's singular
+    // import for them or never adds the JDK/Vaadin import the moved body
+    // needs.
+    //
+    // Heuristic: an identifier child of a `method_invocation` (as its
+    // `object` field) or of a `field_access` (as its `object` field) is a
+    // type reference when the name starts with an uppercase letter. This
+    // matches Java's name-shape convention. False positives are limited
+    // to local variables that violate convention; those will simply fail
+    // to import (no project type matches) and be pruned later.
+    if matches!(node.kind(), "method_invocation" | "field_access") {
+        if let Some(receiver) = node.child_by_field_name("object") {
+            if receiver.kind() == "identifier" {
+                if let Ok(text) = receiver.utf8_text(source.as_bytes()) {
+                    if text.chars().next().is_some_and(|c| c.is_uppercase())
+                        && !java_builtin_type(text)
+                    {
+                        out.insert(text.to_string());
+                    }
+                }
+            }
+        }
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_java_type_references(child, source, out);
@@ -10459,6 +10486,53 @@ mod tests {
     }
 
     // ---------- Gap 25: extract_java_class organizes target imports ----------
+
+    #[test]
+    fn extract_java_class_retains_singular_import_for_static_method_call() {
+        // Gap 4 variant: `DateUtils.parse(...)` references `DateUtils` as a
+        // plain identifier (receiver of a method_invocation), not as a
+        // type_identifier. Pre-fix the organize-imports heuristic missed
+        // this reference and pruned the source's singular
+        // `import b.DateUtils;` from the generated target, even though the
+        // moved body still uses it.
+        let dir = tempfile::tempdir().unwrap();
+        let a_pkg = dir.path().join("src/main/java/a");
+        let b_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&a_pkg).unwrap();
+        fs::create_dir_all(&b_pkg).unwrap();
+        fs::write(
+            b_pkg.join("DateUtils.java"),
+            "package b;\npublic class DateUtils { public static String now() { return \"\"; } }\n",
+        )
+        .unwrap();
+        let source = a_pkg.join("Source.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import b.DateUtils;\n\
+             public class Source {\n\
+            \x20   String today() { return DateUtils.now(); }\n\
+             }\n",
+        )
+        .unwrap();
+        let target = a_pkg.join("Extracted.java");
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Extracted".to_string());
+        params.delegate_field = Some("extracted".to_string());
+        params.item_names = Some(vec!["today".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_edit = &plan.edits[1];
+        let replacement = &target_edit.edits[0].replacement;
+        assert!(
+            replacement.contains("import b.DateUtils;"),
+            "Gap 4: singular static-call import must be retained: {replacement}"
+        );
+    }
 
     #[test]
     fn extract_java_class_prunes_unused_target_imports() {
