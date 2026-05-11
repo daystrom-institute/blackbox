@@ -152,46 +152,70 @@ refactor brofiles"; "Shared `prompt_template` shape"; "Operator-
 authority invariant".
 
 **Components.**
-- Lint pass invoked from the artifact-install path when
-  `manifest.brofile_ref` matches one of the refactor personas
-  (`rust-refactor-persona`, `java-refactor-persona`). The lint
-  checks:
-  - `brofile_ref` is one of the recognized refactor personas
-    (not an arbitrary brofile).
-  - `filter_overlay.allow` is empty OR a documented subset
-    (overlay can only widen allows beyond the brofile; a refactor
-    atom should not widen — narrow only). A non-empty allow
-    triggers a warning, not refusal (Codex round-1 design review:
-    deny-wins, allow widens; empty allow is the safe default).
-  - `outputs.schema` includes the RA-T1 base fields (status,
-    plan_path, files_touched, fixme_count, deep_analysis_summary,
-    cargo_result, block_reason, done_note_id).
-  - `inputs.prompt_template` includes recognizable markers from
-    the five-step protocol: at minimum, the strings
-    `bbox_refactor_plan`, `bbox_refactor_run`, and
-    `bbox_note(kind=` appear in the template.
-  - When the schema includes an `acknowledge_*` opt-out field,
-    the field is required to have no default in the JSONSchema
-    (operator-authority invariant — atom cannot default).
-- Lint failures surface in `install_warnings`
-  (`src/orchestration/agents/registry.rs`) rather than rejecting
-  the install. Operators can ship intentional deviations with a
-  visible audit trail.
+- **Lint trigger** (Codex round-2 fix): the lint runs when the
+  manifest declares itself a refactor atom via a top-level
+  marker, NOT when `brofile_ref` matches a refactor persona
+  (the latter would skip the lint precisely when a manifest
+  claims-to-be-refactor uses a permissive brofile — the case
+  the lint must catch). The marker is one of:
+  - Top-level `"_contract": "refactor-atom/v1"` in the manifest
+    JSON. Authoring convention; refactor atom templates
+    include this.
+  - OR the manifest source path matches
+    `examples/agents/refactor/**` (path-based trigger for the
+    shipped catalog).
+- **Severity split** (Codex round-2 fix):
+  - **Hard reject** (install fails):
+    - `brofile_ref` is not one of the recognized refactor
+      personas (`rust-refactor-persona` or
+      `java-refactor-persona`). Codex round-3: no escape-hatch
+      flag in v1. The trigger conditions (`_contract:
+      "refactor-atom/v1"` marker OR path under
+      `examples/agents/refactor/**`) are themselves the
+      opt-in. An operator who wants different semantics
+      either doesn't declare the contract marker or hosts
+      the manifest outside the refactor path. This avoids
+      adding a top-level field that `schema/agent.schema.json`
+      (which has `additionalProperties: false`) would reject.
+    - `inputs.schema` declares an `acknowledge_*` opt-out
+      field with a `default` value (any default; the field
+      must be operator-explicit per the operator-authority
+      invariant in RX-V1).
+  - **Warning** (install succeeds with `install_warnings`):
+    - `filter_overlay.allow` non-empty (overlay can only
+      widen; refactor atoms should narrow via additional
+      denies only).
+    - `outputs.schema` missing one or more RA-T1 base fields
+      (status, plan_path, files_touched, fixme_count,
+      deep_analysis_summary, cargo_result, block_reason,
+      done_note_id).
+    - `inputs.prompt_template` missing one or more recognizable
+      protocol markers: `bbox_refactor_plan`,
+      `bbox_refactor_run`, `bbox_note(kind=`.
+- Warnings surface in `install_warnings`
+  (`src/orchestration/agents/registry.rs`). Hard rejects return
+  `error.bad_input(code=refactor_atom_lint_failed)` with a
+  specific reason.
 
 **Gates.**
-- Install a known-good refactor atom: lint emits zero warnings.
-- Install a refactor atom with `brofile_ref:
-  "code-reviewer-persona"`: lint emits a warning identifying the
-  non-refactor brofile.
-- Install with `filter_overlay.allow` non-empty: warning.
-- Install with missing base outputs fields: warning.
+- Install a known-good refactor atom: lint emits zero warnings,
+  install succeeds.
+- Install a manifest with `"_contract": "refactor-atom/v1"` and
+  `brofile_ref: "code-reviewer-persona"`: install REJECTED with
+  `refactor_atom_lint_failed` (brofile_ref reason). No escape
+  hatch in v1; the operator drops the contract marker if they
+  want a non-refactor brofile.
+- Install with `acknowledge_repr` having `default: false`: install
+  REJECTED.
+- Install with `filter_overlay.allow: ["mcp__blackbox__Bash"]`:
+  install succeeds, `install_warnings` non-empty.
+- Install with missing base outputs fields: install succeeds,
+  warning.
 - Install with prompt template missing protocol markers: warning.
-- Install with `acknowledge_repr` having `default: true`: warning.
 
 **Follow-ups.**
-- Lint warning escalation policy: future "strict" mode that
-  rejects installs on lint warnings, gated by a per-host config
-  flag. Out of scope v1.
+- Future strict-mode flag that escalates warnings to rejections,
+  gated by per-host config. Out of scope v1.
 
 ---
 
@@ -510,11 +534,11 @@ delegate; rewrite source-side accesses conservatively.
 
 ### Phase RA-A6 — `rust-error-migrate`
 
-**Scope.** Rewrite a module's error type. The atom internally
-calls the `rust_public_api_guard` PLAN KIND (RX-G2) as a
-precondition step in its `bbox_refactor_run`, NOT the
-`rust-public-api-guard` agent. v1 composition is intra-run plan
-composition, not atom-to-atom dispatch.
+**Scope.** Rewrite a module's error type. The atom runs the
+`rust_public_api_guard` PLAN KIND (RX-G2) as a PREFLIGHT plan
+BEFORE its mutating `bbox_refactor_run`, NOT as a step inside
+that run, and NOT as a separate atom dispatch. v1 composition is
+intra-prompt preflight-then-run, not atom-to-atom dispatch.
 
 **Realizes.** `design/refactor-agents.md` catalog entry
 "`rust-error-migrate`".
@@ -528,26 +552,37 @@ composition, not atom-to-atom dispatch.
   workflow, but RA-A6 does not require RA-A2 to be installed.
 - Inputs: standard set including `error_mapping`,
   `acknowledge_public_api_change`.
-- Prompt template — single-run composition:
+- **Prompt template — preflight then mutating run** (Codex
+  round-2 sharpening: keep the guard OUTSIDE the mutating run
+  so no `bbox_refactor_run(confirm=true)` ever starts on a
+  blocked path):
   1. Ground via `bbox_code_symbols` / `bbox_refactor_status`.
-  2. Plan `bbox_refactor_plan(kind="rust_public_api_guard",
-     source=…, proposed_changes=[<rewrite_rust_error_type plan
-     ref>])`. Inspect the response.
-  3. If `advisory_severity: breaking` AND
-     `inputs.acknowledge_public_api_change != true`: block via
-     `bbox_note(kind="blocked")` with the guard's findings; return
-     `status: "blocked"`. The atom must NOT default the
+  2. Preview the proposed `rewrite_rust_error_type` plan
+     (e.g., via `bbox_refactor_plan` without confirm) to obtain
+     a plan-ref or proposed-change summary.
+  3. Run `bbox_refactor_plan(kind="rust_public_api_guard",
+     source=…, proposed_changes=[<preview plan-ref>])` as a
+     PREFLIGHT plan, OUTSIDE any `bbox_refactor_run`. Inspect
+     `advisory_severity`.
+  4. If `advisory_severity: breaking` AND
+     `inputs.acknowledge_public_api_change != true`: emit
+     `bbox_note(kind="blocked")` with the guard's findings;
+     return `status: "blocked"`. **No `bbox_refactor_run` is
+     created on this path.** The atom must NOT default the
      acknowledge flag.
-  4. Otherwise compose a `bbox_refactor_run` with the guard plan
-     (informational), the `rewrite_rust_error_type` plan, the
+  5. Only if the preflight allows: create a `bbox_refactor_run`
+     containing the `rewrite_rust_error_type` plan, the
      `continue_for_repair` cargo-check command capturing rustc
-     JSON, the `rust_compile_fix_round` repair plan, and a final
-     `cargo check` validation step.
-- This v1 composition pattern is intentionally intra-run. The v2
-  composition primitive (atom-to-atom dispatch per
-  `design/agent-system-impl.md:608`) is NOT used here; Codex
-  round-2 feedback: do not introduce atom-to-atom dispatch in v1
-  prompt discipline.
+     JSON, the `rust_compile_fix_round` repair plan, and a
+     final `cargo check` validation step.
+- The guard plan deliberately runs as a preflight, not as a
+  step inside the mutating run. This keeps the transaction
+  story clean: the only `confirm=true` run executes when the
+  guard already cleared, so the repair-transaction invariant
+  (RX-F2b) governs only the mutating sequence.
+- v2 atom-to-atom dispatch (per
+  `design/agent-system-impl.md:608`) is NOT used here; v1
+  composition is intra-prompt sequencing of preflight + run.
 
 **Gates.**
 - Install + search + dispatch.
@@ -607,15 +642,22 @@ RX-C1.
   2. For each partition: plan
      `bbox_refactor_plan(kind="extract_rust_impl_methods",
      deep_analysis=true)`.
-  3. Optionally chain `rust_ra_classify_callbacks` for
-     resolved_callbacks.
-  4. Inspect `unresolved_callbacks` / `external_calls`-equivalent:
-     if any unresolved call crosses partition boundary AND
-     `allow_cross_partition_delegation: false`, block.
+  3. **Chain `rust_ra_classify_callbacks`** (mandatory, not
+     optional — Codex round-2 fix for the RX-R2 requirement).
+     If rust-analyzer is unavailable, the underlying plan kind
+     returns `error.lsp_unavailable` per RX-V3; the atom emits
+     `bbox_note(kind="blocked")` with the fail-closed reason
+     and returns `status: "blocked"`.
+  4. Inspect `resolved_callbacks` (now populated): any call
+     resolving to a method in a DIFFERENT partition's set is a
+     cross-partition call. If any cross-partition call exists
+     AND `allow_cross_partition_delegation: false`, block.
   5. Otherwise compose a `bbox_refactor_run` with per-partition
      extract + `add_rust_router_to_sum` + `add_rust_mod_decl` +
-     `rewrite_rust_item_visibility` + `rust_organize_imports` +
-     cargo check + compile-fix + cargo test.
+     `rewrite_rust_item_visibility` (widening to `pub(crate)`
+     for cross-partition callees when delegation allowed) +
+     `rust_organize_imports` + cargo check + compile-fix +
+     cargo test.
 
 **Gates.**
 - Install + search + dispatch.
@@ -791,11 +833,25 @@ remain trustworthy as plan kinds evolve.
   - **Done note**: clean dispatch → atom emits
     `bbox_note(kind="done")` with the agent's expected
     summary shape.
-  Implementation: introspect via `bbox_messages` for the
-  dispatched session and assert tool-call order; via `bbox_notes`
-  for the emitted notes. Codex round-1 of this doc review: do
-  not defer all behavior to RX — atom-wrapper orchestration
-  contract is the agent layer's responsibility.
+- **Implementation — deterministic template/sequence simulation
+  via recording adapter** (Codex round-2/3 fix): the
+  behavior-smoke harness registers a recording/fake
+  `AgentDispatchAdapter` (per
+  `src/orchestration/agents/adapter.rs:71`) for the atoms under
+  test. The adapter receives the manifest + args and SIMULATES
+  the prompt template's intended tool-call sequence (parsing
+  the template's `bbox_refactor_*` markers in order), without
+  actually invoking a live LLM. This makes the test
+  deterministic and CI-stable. Codex round-3 caveat: the
+  adapter does NOT observe real LLM tool calls — it interprets
+  the template's intended sequence. So this gate confirms the
+  TEMPLATE-INTENDED orchestration, not the LIVE-LLM
+  orchestration. Live `bbox_messages` introspection on a real
+  dispatched session is the secondary integration check,
+  marked slow/live; the recording adapter is the v1 default.
+- Codex round-1 of this doc review: do not defer all behavior
+  to RX — atom-wrapper orchestration contract is the agent
+  layer's responsibility.
 - Eval-runner integration via `eval/check.rs`.
 - **Embedding-readiness gate** (Codex round-1): discovery eval
   runs in one of two modes, never both:
@@ -850,9 +906,23 @@ se, but required so atom version bumps don't corrupt callers.
   existing agent-system pipeline handles the mechanics. The
   refactor-atom phase calls it out so operators know the cost
   per version bump.
-- Operators pinning a specific version via `agent="<atom>@v<N>"`
-  in dispatch continue to work until the version is removed
-  (separate explicit policy outside this phase).
+- **Pinned-dispatch behavior** (Codex round-2 grounding:
+  `bro_agent_dispatch` rejects inactive records at
+  `src/tools/agents.rs:522` with `agent '...' is not active
+  (superseded or deactivated)`):
+  - `bro_agent_get(name="<atom>@v<N>")` and
+    `bro_agent_describe(...)` resolve superseded versions
+    (read paths permit `include_superseded=true`).
+  - `bro_agent_dispatch(agent="<atom>@v<N>")` of a superseded
+    version is **rejected** by the existing dispatch path.
+    Operators who need to dispatch an older version must
+    explicitly un-supersede it (the existing
+    `bbox_artifact_supersede` mechanics support this), or pin
+    to a version that's still active.
+  - This phase does NOT add an `allow_superseded` flag to
+    dispatch; doing so would weaken the "active version is
+    canonical" invariant. If pinned-superseded dispatch
+    becomes a real operator need, it's a separate v2 design.
 - `sm-refactor` documents the supersession rules per refactor
   atom.
 
@@ -860,7 +930,13 @@ se, but required so atom version bumps don't corrupt callers.
 - Install atom v2 superseding v1: v1 disappears from
   default-search and default-list.
 - `include_superseded=true` surfaces v1.
-- Pinned dispatch `agent="<atom>@v1"` still resolves.
+- Pinned `bro_agent_get(name="<atom>@v1")` and
+  `bro_agent_describe(...)` resolve v1 (read paths permit
+  superseded targets).
+- Pinned `bro_agent_dispatch(agent="<atom>@v1")` REJECTS with
+  the existing `agent '...' is not active (superseded or
+  deactivated)` error from `src/tools/agents.rs:522`. No
+  `allow_superseded` flag in v1.
 - Embedding refresh fires on install; `embedding_pending` toggles
   through the expected lifecycle.
 - `sm-refactor` entry exists.
@@ -902,13 +978,17 @@ follow-up flagged in Codex round-1 of this doc review.
   index entry.
 - Catalog enumerates every atom currently in
   `examples/agents/refactor/`.
-- A new atom landing without a catalog update is caught by a
-  CI hygiene check (or at least a manual review checklist
-  entry).
+- **CI-enforced completeness check** (Codex round-2 fix:
+  manual checklist is too weak): a CI step compares the set of
+  manifests under `examples/agents/refactor/*.json` against the
+  catalog entry's atom list; mismatch fails the build. A
+  follow-up `tools/refactor-atom-catalog-gen` script can
+  auto-regenerate the catalog from manifests, removing the
+  drift risk entirely.
 
 **Follow-ups.**
-- Auto-generation from the manifest set, so atom landings
-  update the catalog mechanically. Out of scope v1.
+- Auto-generation from the manifest set via the script above,
+  so atom landings update the catalog mechanically.
 
 ---
 
@@ -916,13 +996,15 @@ follow-up flagged in Codex round-1 of this doc review.
 
 ```
 Substrate:
-  RA-B1 (rust persona) ──┐
-  RA-B2 (java persona) ──┤
-                         ├──► RA-S1 (manifest lint) ──┐
-                         │                            │
-  RA-T1 (template + base outputs schema) ─────────────┤
-                                                      ▼
-                              every atom phase (RA-A1..A7, RA-X1)
+  RA-B1 (rust persona) ────► RA-S1 (manifest lint) ──┐
+                                                     │
+  RA-T1 (template + base outputs schema) ────────────┤
+                                                     ▼
+                              every Rust atom phase (RA-A1..A7)
+
+  RA-B2 (java persona) ──► RA-X1 (java appendix atom)
+  (RA-B2 only required when Java atoms ship; RA-S1's
+   recognized-personas list grows when RA-B2 lands)
 
 Build-time deps from RX-:
   RX-F1a, RX-F1b, RX-F2a, RX-F2b, RX-A1a/b/c/d, RX-A2, RX-C1,
