@@ -20,6 +20,19 @@ hand-rolled boilerplate (POJO DOJO).
 
 Tree-sitter language: `java`.
 
+## MCP Namespace Split
+
+`bbox_refactor_plan`, `bbox_refactor_status`, `bbox_refactor_run`, and
+`bbox_refactor_project_refs` are exposed under `mcp__blackbox__`.
+`bbox_refactor_apply` is exposed under `mcp__blackbox-ops__` — the
+write surface is intentionally split into a separate MCP server so it
+can be permissioned independently (read/plan tools stay broadly
+allowed; the apply tool requires explicit operator opt-in).
+
+If `bbox_refactor_apply` looks "missing" from tab-complete in
+`mcp__blackbox__`, that's the split: look for
+`mcp__blackbox-ops__bbox_refactor_apply` instead.
+
 ## Tool Sequence
 
 1. Find Java methods/types and line ranges across the project:

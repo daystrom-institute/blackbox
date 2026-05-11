@@ -2355,7 +2355,7 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         ),
         kind: "extract_java_methods".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![
             FileEdit {
@@ -2998,7 +2998,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         ),
         kind: "extract_java_class".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![
             FileEdit {
@@ -3124,7 +3124,7 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
         ),
         kind: "extract_java_nested_classes".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![
             FileEdit {
@@ -3199,7 +3199,7 @@ pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
         ),
         kind: "add_java_fields".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
@@ -3257,7 +3257,7 @@ pub(crate) fn plan_add_java_constructor(p: &RefactorPlanParams) -> Result<String
         title: format!("Add Java constructor to {}", source_path.display()),
         kind: "add_java_constructor".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
@@ -3348,7 +3348,7 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
         ),
         kind: "move_java_field".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![
             FileEdit {
@@ -3512,7 +3512,7 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
         ),
         kind: "move_java_constant".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits,
         validations: parse_validation_step_for_path(&source_path)
@@ -4623,7 +4623,7 @@ pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String>
         ),
         kind: "update_java_callers".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
@@ -4846,7 +4846,7 @@ pub(crate) fn plan_add_java_delegate_field(p: &RefactorPlanParams) -> Result<Str
         ),
         kind: "add_java_delegate_field".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
@@ -4961,7 +4961,7 @@ pub(crate) fn plan_rewrite_java_visibility(p: &RefactorPlanParams) -> Result<Str
         ),
         kind: "rewrite_java_visibility".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
@@ -5143,7 +5143,7 @@ pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String>
         title: format!("Add implements {} to class {}", interface_name, class_name),
         kind: "add_java_implements".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
@@ -5425,7 +5425,7 @@ let ident = chunk.split_whitespace().last().unwrap_or("").trim();
         ),
         kind: "extract_java_interface".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits,
         validations,
@@ -5508,7 +5508,7 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
         ),
         kind: "migrate_java_type_usages".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
@@ -5645,7 +5645,7 @@ pub(crate) fn plan_java_lsp_organize_imports(
         title: format!("Organize Java imports in {}", p.source),
         kind: "java_lsp_organize_imports".to_string(),
         semantic_status,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: file_edits,
         validations,
@@ -6877,7 +6877,7 @@ fn plan_lombokify_java_tree(p: &RefactorPlanParams, dir: &Path) -> Result<String
         ),
         kind: "lombokify_java_class".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: all_edits,
         validations,
@@ -7415,7 +7415,7 @@ fn plan_lombokify_java_class_single(
         ),
         kind: "lombokify_java_class".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
-        dry_run: false,
+        dry_run: true,
         file_moves: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(source_path),
