@@ -72,40 +72,29 @@ fn reject_if_outside(normalized: &Path, slot: &Path, label: &str) -> Result<()> 
     Ok(())
 }
 
-/// Resolve a relative `output_path` string to an absolute path inside the
-/// plan slot.  Absolute paths and paths that escape the slot are rejected.
+/// Resolve an `output_path` string to an absolute path inside the plan
+/// slot. Accepts either:
+///   * a relative filename (resolves under the slot), or
+///   * an absolute path that already lives inside the slot (round-trips
+///     the `plan_path` value returned in the plan response).
+/// Anything that canonicalizes outside the slot is rejected.
 pub fn resolve_plan_write_path(output_path: &str) -> Result<PathBuf> {
-    let p = Path::new(output_path);
-    if p.is_absolute() {
-        anyhow::bail!(
-            "error.bad_input(code=plan_path_outside_slot): output_path must be a relative \
-             filename, not an absolute path ({})",
-            output_path
-        );
-    }
-    // ensure_plan_slot() creates the directory and returns a canonical path.
     let slot = ensure_plan_slot()?;
+    let p = Path::new(output_path);
+    // Path::join replaces its base when the argument is absolute, so this
+    // works uniformly for relative filenames and absolute paths.
     let normalized = normalize_path(&slot.join(p));
     reject_if_outside(&normalized, &slot, output_path)?;
     Ok(normalized)
 }
 
 /// Resolve a `plan_path` string (from `bbox_refactor_apply`) to an absolute
-/// path inside the plan slot.  Absolute paths and slot-escaping paths are
-/// rejected.
+/// path inside the plan slot. Accepts either a relative filename or the
+/// absolute path returned in the plan response (round-trip). Paths that
+/// canonicalize outside the slot are rejected.
 pub fn resolve_plan_read_path(plan_path: &str) -> Result<PathBuf> {
-    let p = Path::new(plan_path);
-    if p.is_absolute() {
-        anyhow::bail!(
-            "error.bad_input(code=plan_path_outside_slot): plan_path must be a relative \
-             filename, not an absolute path ({})",
-            plan_path
-        );
-    }
-    // Use ensure_plan_slot() to get a canonical slot path (same as write side).
-    // This creates the directory on first call; that is acceptable for the read
-    // path because the slot must already exist if a plan file is being read.
     let slot = ensure_plan_slot()?;
+    let p = Path::new(plan_path);
     let normalized = normalize_path(&slot.join(p));
     reject_if_outside(&normalized, &slot, plan_path)?;
     Ok(normalized)
@@ -150,11 +139,37 @@ mod tests {
     }
 
     #[test]
-    fn write_path_rejects_absolute() {
+    fn write_path_rejects_absolute_outside_slot() {
         let tmp = tempfile::tempdir().unwrap();
         with_state_dir(tmp.path(), || {
             let err = resolve_plan_write_path("/tmp/evil.json").unwrap_err();
             assert!(err.to_string().contains("plan_path_outside_slot"));
+        });
+    }
+
+    #[test]
+    fn write_path_accepts_absolute_inside_slot() {
+        // Round-trip: the plan response returns an absolute path under the
+        // slot; passing that same value to a follow-up call must succeed.
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let slot = ensure_plan_slot().unwrap();
+            let abs = slot.join("roundtrip.json");
+            let resolved =
+                resolve_plan_write_path(abs.to_str().unwrap()).expect("absolute-in-slot accepted");
+            assert_eq!(resolved, abs);
+        });
+    }
+
+    #[test]
+    fn read_path_accepts_absolute_inside_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_state_dir(tmp.path(), || {
+            let slot = ensure_plan_slot().unwrap();
+            let abs = slot.join("roundtrip.json");
+            let resolved =
+                resolve_plan_read_path(abs.to_str().unwrap()).expect("absolute-in-slot accepted");
+            assert_eq!(resolved, abs);
         });
     }
 
