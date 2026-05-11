@@ -3006,10 +3006,20 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // get one shape across both plan kinds.
     let remaining_source_accessors =
         if !selected_fields.is_empty() && p.deep_analysis.unwrap_or(false) {
-            let moved_field_decl_ranges = selected_fields
+            // Skip ranges include both the moved field declarations (about
+            // to be deleted from source) AND the bodies of every method in
+            // `item_names` (those methods move to the target, so accesses
+            // inside them are about to leave the source class entirely —
+            // listing them as "remaining" is a false positive).
+            let mut skip_ranges = selected_fields
                 .iter()
                 .map(|field| (field.item.byte_start, field.item.byte_end))
                 .collect::<Vec<_>>();
+            skip_ranges.extend(
+                selected_methods
+                    .iter()
+                    .map(|method| (method.item.byte_start, method.item.byte_end)),
+            );
             let moved_field_names_owned = selected_fields
                 .iter()
                 .map(|field| field.name.clone())
@@ -3017,7 +3027,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             compute_remaining_source_accessors(
                 &parsed,
                 &moved_field_names_owned,
-                &moved_field_decl_ranges,
+                &skip_ranges,
             )
         } else {
             Vec::new()
@@ -9602,6 +9612,61 @@ mod tests {
         assert!(
             rewritten.contains("import b.Widgets;"),
             "cross-package: source must import the target class: {rewritten}"
+        );
+    }
+
+    // remaining_source_accessors should NOT include accesses inside methods
+    // that are themselves being extracted in the same plan — those accesses
+    // move with the methods. Pre-fix the report listed every read/write
+    // regardless of whether the surrounding method was being extracted,
+    // producing false positives that looked like compile errors waiting to
+    // happen.
+    #[test]
+    fn remaining_source_accessors_excludes_extracted_method_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("View.java");
+        let target = dir.path().join("Extracted.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class View {\n\
+            \x20   private Tab selectedTab;\n\
+            \x20   void other() { selectedTab = null; }\n\
+            \x20   Tab getSelected() { return selectedTab; }\n\
+            \x20   void addStyle() { selectedTab.addClassName(\"sel\"); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Extracted".to_string());
+        params.delegate_field = Some("extracted".to_string());
+        params.item_names = Some(vec!["getSelected".to_string(), "addStyle".to_string()]);
+        params.move_fields = Some(vec!["selectedTab".to_string()]);
+        params.deep_analysis = Some(true);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let entry = plan
+            .remaining_source_accessors
+            .iter()
+            .find(|r| r.field == "selectedTab")
+            .expect("report entry for selectedTab");
+        // Only the access inside `other()` (NOT being extracted) should
+        // remain. The reads/writes inside getSelected() and addStyle() are
+        // moving with their methods and must not appear.
+        assert_eq!(
+            entry.accesses.len(),
+            1,
+            "expected exactly the access in other(), got: {:?}",
+            entry.accesses
+        );
+        let only = &entry.accesses[0];
+        assert!(
+            only.context.contains("selectedTab = null"),
+            "the surviving access should be the write in other(): {only:?}"
         );
     }
 
