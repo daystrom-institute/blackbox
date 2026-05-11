@@ -357,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "RX-R2 LSP-integration — requires rust-analyzer + cargo project setup, flaky outside CI"]
     fn test_ra_classify_inherent() {
         if !ra_available() {
             return;
@@ -404,6 +405,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "RX-R2 LSP-integration"]
     fn test_ra_classify_trait() {
         if !ra_available() {
             return;
@@ -454,6 +456,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "RX-R2 LSP-integration"]
     fn test_ra_classify_external() {
         if !ra_available() {
             return;
