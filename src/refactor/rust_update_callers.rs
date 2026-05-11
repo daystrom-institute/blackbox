@@ -7,6 +7,7 @@
 
 use super::*;
 use super::rust_deep;
+use super::rust_warning_markers;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -151,6 +152,64 @@ pub fn plan_update_callers(p: &RefactorPlanParams) -> anyhow::Result<String> {
     edits.sort_by_key(|e| e.byte_start);
     ensure_non_overlapping(&edits).context("overlapping rewrites in update_rust_callers")?;
 
+    // ── RX-W1b: warning marker emission for borrow_promotions ─────────────────
+    let emit_applied_markers = p
+        .toml_entries
+        .as_ref()
+        .and_then(|m| m.get("emit_applied_markers"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let new_text_override: Option<String> = if emit_applied_markers
+        && !borrow_promotions.is_empty()
+        && !edits.is_empty()
+    {
+        let post_edit = apply_text_edits(&parsed.source, &edits)?;
+        let site_lines: Vec<(usize, String)> = borrow_promotions
+            .iter()
+            .map(|site| {
+                let field_name = site
+                    .context
+                    .strip_prefix("self.")
+                    .and_then(|s| {
+                        s.split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .next()
+                    })
+                    .unwrap_or("<unknown>");
+                let marker = rust_warning_markers::emit_warning_marker(
+                    "borrow promotion",
+                    &format!(
+                        "this delegate access now goes through &mut self.{delegate_field} \
+                         even though the original read was through &self.{field_name}"
+                    ),
+                    "cross-check no concurrent borrow",
+                );
+                (site.line, marker)
+            })
+            .collect();
+        Some(rust_warning_markers::apply_warning_markers_to_text(
+            &post_edit,
+            &site_lines,
+        ))
+    } else {
+        None
+    };
+
+    let warning_count = if emit_applied_markers {
+        borrow_promotions.len()
+    } else {
+        0
+    };
+
+    let fixme_count_override: Option<FixmeCount> = if warning_count > 0 {
+        Some(FixmeCount {
+            plan_only: 0,
+            warning: warning_count,
+        })
+    } else {
+        None
+    };
+
     // ── assemble unrewriteable_accessors ──────────────────────────────────────
     let mut unrewriteable_accessors: Vec<RemainingFieldAccessor> = unrewriteable
         .into_iter()
@@ -167,7 +226,7 @@ pub fn plan_update_callers(p: &RefactorPlanParams) -> anyhow::Result<String> {
             path: path_string(&source_path),
             original_sha256: sha,
             edits,
-            new_text: None,
+            new_text: new_text_override,
         }]
     };
 
@@ -196,7 +255,7 @@ pub fn plan_update_callers(p: &RefactorPlanParams) -> anyhow::Result<String> {
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
-        fixme_count: None,
+        fixme_count: fixme_count_override,
     };
 
     // validate_plan_shape rejects empty edits; skip it when nothing was rewritten.

@@ -27,6 +27,10 @@ pub(crate) mod rust_error_migrate;
 pub(crate) mod rust_move_fields;
 pub(crate) mod rust_delegate_field;
 pub(crate) mod rust_update_callers;
+pub(crate) mod rust_ra_move_item;
+pub(crate) mod rust_ra_classify_callbacks;
+pub(crate) mod rust_compile_fix;
+pub(crate) mod rust_warning_markers;
 
 #[cfg(test)]
 mod tests;
@@ -965,14 +969,117 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "migrate_java_type_usages" => plan_migrate_java_type_usages(p),
         "lombokify_java_class" => plan_lombokify_java_class(p),
         "rewrite_rust_error_type" => rust_error_migrate::plan_rewrite_error_type(p),
+        "migrate_rust_type_usages" => rust_migrate_types::plan_migrate_type_usages(p),
+        "extract_rust_trait" => rust_extract_trait::plan_extract_trait(p),
+        "rust_match_arm_to_strategy" => rust_match_strategy::plan_match_to_strategy(p),
+        "move_rust_struct_fields" => rust_move_fields::plan_move_struct_fields(p),
+        "add_rust_delegate_field" => rust_delegate_field::plan_add_delegate(p),
+        "update_rust_callers" => rust_update_callers::plan_update_callers(p),
+        "rust_ra_move_item_to_module" => rust_ra_move_item::plan_ra_move(p),
+        "rust_ra_classify_callbacks" => rust_ra_classify_callbacks::plan_ra_classify(p, ctx),
+        "rust_impl_partition_analysis" => plan_rust_impl_partition_analysis(p),
+        "rust_public_api_guard" => plan_rust_public_api_guard(p),
         "move_file" => plan_move_file(p),
         "replace_text" => plan_replace_text(p),
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, lombokify_java_class, rewrite_rust_error_type, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, lombokify_java_class, rewrite_rust_error_type, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_public_api_guard, rust_compile_fix_round, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
+}
+
+/// RX-G1 wrapper: surface `rust_impl_partition_analysis` through the plan dispatcher.
+///
+/// Analysis-only — no FileEdits. The impl-graph struct is flattened into the
+/// response under `partition_graph`.
+fn plan_rust_impl_partition_analysis(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let impl_name = p
+        .impl_name
+        .as_deref()
+        .or(p.module_name.as_deref())
+        .ok_or_else(|| anyhow!("impl_name or module_name required for rust_impl_partition_analysis"))?;
+    let graph = rust_partition::analyze_impl(&source_path, impl_name)?;
+    let plan = RefactorPlan {
+        title: format!("rust_impl_partition_analysis on `{impl_name}`"),
+        kind: "rust_impl_partition_analysis".to_string(),
+        semantic_status: SemanticStatus::IndexedHints,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: Vec::new(),
+        validations: Vec::new(),
+        items: Vec::new(),
+        leftovers: Vec::new(),
+        captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
+    };
+    let body = serde_json::json!({
+        "title": plan.title,
+        "kind": plan.kind,
+        "semantic_status": plan.semantic_status,
+        "dry_run": plan.dry_run,
+        "file_moves": plan.file_moves,
+        "edits": plan.edits,
+        "validations": plan.validations,
+        "items": plan.items,
+        "leftovers": plan.leftovers,
+        "plan_status": plan.plan_status,
+        "partition_graph": graph,
+    });
+    Ok(serde_json::to_string_pretty(&body)?)
+}
+
+/// RX-G2 wrapper: surface `rust_public_api_guard` through the plan dispatcher.
+///
+/// Advisory only — no FileEdits. Severity + touched-item delta are flattened
+/// into the response under `public_api_report`.
+fn plan_rust_public_api_guard(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let proposed_changes: Vec<rust_public_api::ProposedChangeRef> = p
+        .toml_entries
+        .as_ref()
+        .and_then(|e| e.get("proposed_changes"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let report = rust_public_api::analyze_public_api(&source_path, &proposed_changes)?;
+    let plan = RefactorPlan {
+        title: "rust_public_api_guard advisory".to_string(),
+        kind: "rust_public_api_guard".to_string(),
+        semantic_status: SemanticStatus::IndexedHints,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: Vec::new(),
+        validations: Vec::new(),
+        items: Vec::new(),
+        leftovers: Vec::new(),
+        captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
+    };
+    let body = serde_json::json!({
+        "title": plan.title,
+        "kind": plan.kind,
+        "semantic_status": plan.semantic_status,
+        "dry_run": plan.dry_run,
+        "file_moves": plan.file_moves,
+        "edits": plan.edits,
+        "validations": plan.validations,
+        "items": plan.items,
+        "leftovers": plan.leftovers,
+        "plan_status": plan.plan_status,
+        "public_api_report": report,
+    });
+    Ok(serde_json::to_string_pretty(&body)?)
 }
 
 pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<String> {
@@ -1213,6 +1320,90 @@ pub fn run_with_ctx(
                 let mut step_params = params.clone();
                 if step_params.project_dir.is_none() {
                     step_params.project_dir = Some(path_string(&project_dir));
+                }
+
+                // RX-C1: rust_compile_fix_round — read diagnostics from capture context,
+                // classify them, mark the obligation consumed/leftover.
+                if step_params.kind == "rust_compile_fix_round" {
+                    let ref_name = step_params
+                        .toml_entries
+                        .as_ref()
+                        .and_then(|e| e.get("diagnostics_ref"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| {
+                            if step_params.source.is_empty() {
+                                "last"
+                            } else {
+                                step_params.source.as_str()
+                            }
+                        })
+                        .to_string();
+                    let diagnostics: Vec<RustcDiagnostic> = capture_ctx
+                        .get(&ref_name)
+                        .unwrap_or(&[])
+                        .to_vec();
+                    let plan_json = match rust_compile_fix::plan_compile_fix(&step_params, &diagnostics) {
+                        Ok(j) => j,
+                        Err(err) if *optional => {
+                            reports.push(RefactorRunStepReport {
+                                index: idx,
+                                op: "plan".to_string(),
+                                status: "skipped".to_string(),
+                                kind: Some(step_params.kind.clone()),
+                                title: None,
+                                files: Vec::new(),
+                                validations: Vec::new(),
+                                error: Some(err.to_string()),
+                                captured_diagnostics_summary: None,
+                            });
+                            continue;
+                        }
+                        Err(err) => {
+                            let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                            return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                                status: "step_failed".to_string(),
+                                title: p.title.clone(),
+                                dry_run: !confirmed,
+                                steps: append_report(
+                                    reports,
+                                    RefactorRunStepReport {
+                                        index: idx,
+                                        op: "plan".to_string(),
+                                        status: "plan_failed".to_string(),
+                                        kind: Some(step_params.kind.clone()),
+                                        title: None,
+                                        files: Vec::new(),
+                                        validations: Vec::new(),
+                                        error: Some(err.to_string()),
+                                        captured_diagnostics_summary: None,
+                                    },
+                                ),
+                                files_written,
+                                rolled_back: rollback_errors.is_empty(),
+                                error: Some(err.to_string()),
+                                rollback_errors,
+                                obligations: capture_ctx.obligation_reports(),
+                            })?);
+                        }
+                    };
+                    // Mark the obligation consumed or leftover based on plan's leftover count.
+                    let leftover_count = serde_json::from_str::<RefactorPlan>(&plan_json)
+                        .map(|plan| plan.leftovers.len())
+                        .unwrap_or(0);
+                    capture_ctx.mark_obligation_consumed(&ref_name, leftover_count);
+                    reports.push(RefactorRunStepReport {
+                        index: idx,
+                        op: "plan".to_string(),
+                        status: "ok".to_string(),
+                        kind: Some(step_params.kind.clone()),
+                        title: Some("rust_compile_fix_round: diagnostics classified".to_string()),
+                        files: Vec::new(),
+                        validations: Vec::new(),
+                        error: None,
+                        captured_diagnostics_summary: None,
+                    });
+                    continue;
                 }
 
                 // Test-only stub plan kinds for obligation consumption (RX-F2b).
