@@ -24,6 +24,9 @@ pub(crate) mod rust_migrate_types;
 pub(crate) mod rust_lift_free;
 pub(crate) mod rust_match_strategy;
 pub(crate) mod rust_error_migrate;
+pub(crate) mod rust_move_fields;
+pub(crate) mod rust_delegate_field;
+pub(crate) mod rust_update_callers;
 
 #[cfg(test)]
 mod tests;

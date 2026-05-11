@@ -364,7 +364,7 @@ fn borrow_context_severity(ctx: &str) -> u8 {
     }
 }
 
-fn is_copy_whitelist(ty: &str) -> bool {
+pub(crate) fn is_copy_whitelist(ty: &str) -> bool {
     let t = ty.trim();
     if matches!(
         t,
