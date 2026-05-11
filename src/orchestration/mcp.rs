@@ -590,6 +590,12 @@ pub fn self_register_blackbox(name: &str, url: &str) -> SelfRegisterReport {
 }
 
 fn register_one(provider: Provider, name: &str, url: &str) -> SelfRegisterOutcome {
+    // Vibe manages MCP via ~/.vibe/config.toml, not CLI subcommands.
+    // Special-case it with file-based registration.
+    if provider == Provider::Vibe {
+        return register_vibe_file_based(name, url);
+    }
+
     let Some(list_args) = provider.build_mcp_list_args() else {
         return SelfRegisterOutcome::Unsupported;
     };
@@ -657,6 +663,115 @@ fn register_one(provider: Provider, name: &str, url: &str) -> SelfRegisterOutcom
             },
         },
     }
+}
+
+/// Register blackbox in Vibe's config.toml. Vibe has no `mcp add/list`
+/// CLI; its MCP servers live as an inline-table array in
+/// `~/.vibe/config.toml`:
+///   `mcp_servers = [ { name = "blackbox", transport = "http", url = "..." }, ... ]`
+/// Honors `VIBE_HOME` env. If the config file doesn't exist, returns
+/// NotInstalled (don't create it from scratch just for our entry —
+/// that's vibe's job).
+fn register_vibe_file_based(name: &str, url: &str) -> SelfRegisterOutcome {
+    let vibe_home = std::env::var("VIBE_HOME").ok().map(std::path::PathBuf::from);
+    let config_path = match vibe_home {
+        Some(p) => p.join("config.toml"),
+        None => match dirs::home_dir() {
+            Some(h) => h.join(".vibe").join("config.toml"),
+            None => {
+                return SelfRegisterOutcome::Error {
+                    detail: "no home dir".into(),
+                };
+            }
+        },
+    };
+
+    if !config_path.exists() {
+        return SelfRegisterOutcome::NotInstalled {
+            detail: format!("{} does not exist", config_path.display()),
+        };
+    }
+
+    let raw = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return SelfRegisterOutcome::Error {
+                detail: format!("read {}: {e}", config_path.display()),
+            };
+        }
+    };
+
+    let mut doc: toml_edit::DocumentMut = match raw.parse() {
+        Ok(d) => d,
+        Err(e) => {
+            return SelfRegisterOutcome::Error {
+                detail: format!("parse {}: {e}", config_path.display()),
+            };
+        }
+    };
+
+    // mcp_servers is an array of inline tables.
+    let servers = match doc.get_mut("mcp_servers") {
+        Some(toml_edit::Item::Value(toml_edit::Value::Array(arr))) => arr.clone(),
+        Some(_) => {
+            return SelfRegisterOutcome::Error {
+                detail: "mcp_servers is not an array".into(),
+            };
+        }
+        None => toml_edit::Array::new(),
+    };
+
+    // Scan for an existing entry with our name.
+    let mut found_index: Option<usize> = None;
+    for (i, item) in servers.iter().enumerate() {
+        if let toml_edit::Value::InlineTable(t) = item {
+            if t.get("name").and_then(|v| v.as_str()) == Some(name) {
+                found_index = Some(i);
+                break;
+            }
+        }
+    }
+
+    let mut new_servers = servers.clone();
+    let outcome = match found_index {
+        Some(i) => {
+            let existing_url = new_servers.get(i).and_then(|v| {
+                if let toml_edit::Value::InlineTable(t) = v {
+                    t.get("url").and_then(|x| x.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            });
+            if existing_url.as_deref() == Some(url) {
+                return SelfRegisterOutcome::Unchanged;
+            }
+            // Drift — rewrite the entry in place.
+            let mut entry = toml_edit::InlineTable::new();
+            entry.insert("name", toml_edit::Value::from(name));
+            entry.insert("transport", toml_edit::Value::from("http"));
+            entry.insert("url", toml_edit::Value::from(url));
+            let _ = new_servers.replace(i, toml_edit::Value::InlineTable(entry));
+            SelfRegisterOutcome::Updated
+        }
+        None => {
+            let mut entry = toml_edit::InlineTable::new();
+            entry.insert("name", toml_edit::Value::from(name));
+            entry.insert("transport", toml_edit::Value::from("http"));
+            entry.insert("url", toml_edit::Value::from(url));
+            new_servers.push(toml_edit::Value::InlineTable(entry));
+            SelfRegisterOutcome::Added
+        }
+    };
+
+    doc["mcp_servers"] = toml_edit::Item::Value(toml_edit::Value::Array(new_servers));
+
+    if let Err(e) = std::fs::write(&config_path, doc.to_string()) {
+        return SelfRegisterOutcome::Error {
+            detail: format!("write {}: {e}", config_path.display()),
+        };
+    }
+
+    outcome
 }
 
 /// Default timeout for provider CLI invocations. MCP CRUD calls

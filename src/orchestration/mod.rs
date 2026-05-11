@@ -1223,17 +1223,19 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         let _ = stdout_done_rx.await;
         let code = status.ok().and_then(|s| s.code());
 
-        // Post-hoc vibe session discovery
+        // Post-hoc vibe session discovery. Run unconditionally when
+        // session_id is still "pending"; discover_vibe_session falls
+        // back to the most-recent session within the start_ms window
+        // when project_dir is empty, so bro_exec without project_dir
+        // still gets a real session id.
         if provider == Provider::Vibe {
             let inner = task_ref_wait.inner.lock();
             if inner.session_id == "pending" {
-                if let Some(ref c) = inner.cwd {
-                    let start = inner.started_at;
-                    let cwd_clone = c.clone();
-                    drop(inner); // release lock before blocking call
-                    if let Some(sid) = providers::discover_vibe_session(start, &cwd_clone) {
-                        task_ref_wait.inner.lock().session_id = sid;
-                    }
+                let start = inner.started_at;
+                let cwd_clone = inner.cwd.clone().unwrap_or_default();
+                drop(inner); // release lock before blocking call
+                if let Some(sid) = providers::discover_vibe_session(start, &cwd_clone) {
+                    task_ref_wait.inner.lock().session_id = sid;
                 }
             }
         }
