@@ -652,6 +652,12 @@ pub struct RefactorPlan {
     pub captured_variables: Vec<CapturedVariable>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remaining_source_accessors: Vec<RemainingFieldAccessor>,
+    /// Surviving source-side references to static-final constants moved by
+    /// `extract_java_class` (under `deep_analysis: true`). Populated alongside
+    /// the qualifier rewrites the planner emits — operator-facing preview of
+    /// each constant's leftover ref sites. `kind` is always `"read"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remaining_source_constant_refs: Vec<RemainingFieldAccessor>,
     /// External method calls inside the extracted set that resolve to methods
     /// on the source class but are not in the extracted set. Reported by
     /// `extract_java_methods` and `extract_java_class`.
@@ -1013,6 +1019,7 @@ fn plan_rust_impl_partition_analysis(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -1060,6 +1067,7 @@ fn plan_rust_public_api_guard(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -2210,6 +2218,7 @@ fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -2285,6 +2294,7 @@ fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -2324,6 +2334,7 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
@@ -2377,6 +2388,7 @@ fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,

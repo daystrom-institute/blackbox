@@ -130,6 +130,7 @@ pub fn plan_add_delegate(p: &RefactorPlanParams) -> anyhow::Result<String> {
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,

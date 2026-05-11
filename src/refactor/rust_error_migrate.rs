@@ -186,6 +186,7 @@ pub fn plan_rewrite_error_type(p: &crate::refactor::RefactorPlanParams) -> Resul
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
         external_calls: Vec::new(),
         inherited_dependencies: Vec::new(),
         deep_analysis: None,
