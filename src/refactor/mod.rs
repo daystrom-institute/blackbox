@@ -19,6 +19,11 @@ pub(crate) mod plan_slot;
 pub(crate) mod rust_partition;
 pub(crate) mod rust_public_api;
 pub(crate) mod rust_deep;
+pub(crate) mod rust_extract_trait;
+pub(crate) mod rust_migrate_types;
+pub(crate) mod rust_lift_free;
+pub(crate) mod rust_match_strategy;
+pub(crate) mod rust_error_migrate;
 
 #[cfg(test)]
 mod tests;
@@ -930,6 +935,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
     match p.kind.as_str() {
         "extract_rust_items" => plan_extract_rust_items(p),
         "extract_rust_impl_methods" => plan_extract_rust_impl_methods(p),
+        "lift_rust_inherent_to_free" => rust_lift_free::plan_lift_to_free(p),
         "delete_rust_items" => plan_delete_rust_items(p),
         "add_rust_router_to_sum" => plan_add_rust_router_to_sum(p),
         "add_rust_mod_decl" => plan_add_rust_mod_decl(p),
@@ -955,12 +961,13 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "extract_java_interface" => plan_extract_java_interface(p),
         "migrate_java_type_usages" => plan_migrate_java_type_usages(p),
         "lombokify_java_class" => plan_lombokify_java_class(p),
+        "rewrite_rust_error_type" => rust_error_migrate::plan_rewrite_error_type(p),
         "move_file" => plan_move_file(p),
         "replace_text" => plan_replace_text(p),
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, lombokify_java_class, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, lombokify_java_class, rewrite_rust_error_type, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
