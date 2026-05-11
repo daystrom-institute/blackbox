@@ -935,7 +935,7 @@ fn java_insert_fixme_above_calls(
 fn fixme_external_call(method: &str) -> Vec<String> {
     vec![
         format!("// FIXME: external call `{method}` — unresolved on target. Source-class method."),
-        "//   resolutions: add to extracted set, extract callback interface, or inject source instance.".to_string(),
+        "//   resolutions: add to extracted set, extract callback interface, inject source instance, or drop the call if it returns void and the source-side side effect does not apply to the target.".to_string(),
     ]
 }
 
@@ -1885,7 +1885,27 @@ fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Resul
             .filter(|m| m.item.name.as_deref() == Some(expected.as_str()))
             .collect::<Vec<_>>();
         match matches.as_slice() {
-            [] => bail!("requested method `{expected}` was not found"),
+            [] => {
+                // Distinguish "you passed a nested-class name" from "we just
+                // don't know what you meant." `extract_java_class` only
+                // accepts method names in `item_names`; nested classes are
+                // a separate plan kind that this composite plan does not
+                // currently dispatch.
+                let nested_match = java_nested_classes(parsed)
+                    .into_iter()
+                    .any(|c| c.item.name.as_deref() == Some(expected.as_str()));
+                if nested_match {
+                    bail!(
+                        "error.bad_input(code=nested_class_in_item_names): \
+                         `{expected}` is a nested class, not a method. \
+                         `extract_java_class` accepts only method names in `item_names`; \
+                         inner-class extraction is not currently supported by this plan kind. \
+                         Extract the inner class to a top-level file manually, then re-run \
+                         extract_java_class for the outer methods."
+                    );
+                }
+                bail!("requested method `{expected}` was not found");
+            }
             [method] => selected.push((**method).clone()),
             _ => bail!(
                 "requested method `{expected}` matched multiple methods; method overloading requires more specific targeting (not yet implemented)"
@@ -9709,6 +9729,50 @@ mod tests {
         assert!(
             rewritten.contains("import b.Widgets;"),
             "cross-package: source must import the target class: {rewritten}"
+        );
+    }
+
+    // Passing a nested-class name in `item_names` for extract_java_class
+    // produces a directed error message rather than the generic
+    // "requested method `X` was not found." Inner-class extraction is a
+    // separate plan kind that this composite does not dispatch.
+    #[test]
+    fn extract_java_class_rejects_nested_class_in_item_names_with_directed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Outer.java");
+        let target = dir.path().join("Extracted.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             class Outer {\n\
+            \x20   static class InnerService {\n\
+            \x20       void run() {}\n\
+            \x20   }\n\
+            \x20   void delegate() { new InnerService().run(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Extracted".to_string());
+        params.delegate_field = Some("ext".to_string());
+        params.item_names = Some(vec!["delegate".to_string(), "InnerService".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let err = plan_extract_java_class(&params).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nested_class_in_item_names"),
+            "expected directed error code: {msg}"
+        );
+        assert!(
+            msg.contains("InnerService"),
+            "error must name the nested class: {msg}"
+        );
+        assert!(
+            msg.contains("inner-class extraction is not currently supported"),
+            "error must explain the limitation: {msg}"
         );
     }
 
