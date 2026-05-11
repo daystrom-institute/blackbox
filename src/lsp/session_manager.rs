@@ -34,8 +34,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -167,14 +165,6 @@ impl std::fmt::Display for LspError {
 }
 
 impl std::error::Error for LspError {}
-
-impl LspError {
-    pub fn into_inner(self) -> anyhow::Error {
-        match self {
-            LspError::Broken(inner) | LspError::Other(inner) => inner,
-        }
-    }
-}
 
 /// Per-call wrapper handed to the `with_session` closure. Allocates
 /// request ids from the shared session counter and correlates

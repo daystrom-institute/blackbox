@@ -20,9 +20,9 @@ pub mod http;
 pub mod post;
 pub mod session;
 
-pub use envelope::{frame_hash, EnvelopeStatus, InboxEnvelope, ReplyMeta};
-pub use post::{parse_mentions, CouncilPost, ReplyScope, SenderKind};
-pub use session::{CouncilConfig, CouncilSession, CouncilStatus};
+pub use envelope::{EnvelopeStatus, InboxEnvelope};
+pub use post::{CouncilPost, ReplyScope};
+pub use session::{CouncilSession, CouncilStatus};
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -269,13 +269,6 @@ pub struct CouncilSummary {
     pub created_at: String,
     pub updated_at: String,
     pub post_count: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CouncilView {
-    pub session: CouncilSession,
-    pub posts: Vec<CouncilPost>,
-    pub envelopes: Vec<InboxEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,5 +1,4 @@
 use crate::*;
-use ::schemars;
 
 pub(crate) struct BadgeyAgentAdapter {
     pub(crate) state: Arc<SharedState>,

@@ -21,8 +21,6 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::workflow::wait::canonicalize_correlation;
-
 /// Dispatch verdict produced by a routing packet. Routing packet
 /// rule consequents are JSON-encoded objects of this shape (or the
 /// shorthand string forms `"ignore"` / `"dead_letter"`).
@@ -168,13 +166,6 @@ pub fn resolve_entity_template(entity: &Value, raw: &Value) -> Value {
         }
         other => other.clone(),
     }
-}
-
-/// Canonicalize a correlation tuple — same canonicalization the wait
-/// store uses, so equivalent tuples compare equal regardless of key
-/// order. Re-exported here for inlets that need to dedup on tuples.
-pub fn canonicalize(corr: &serde_json::Map<String, Value>) -> String {
-    canonicalize_correlation(corr)
 }
 
 fn resolve_one(entity: &Value, expr: &str) -> Option<Value> {

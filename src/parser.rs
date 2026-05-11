@@ -1,3 +1,9 @@
+// Multi-bin crate: blackboxd uses the basic parser API (ParsedEvent,
+// parse_transcript_line, parse_codex_line, ...) via src/index/*;
+// bro uses the rich parser API (TranscriptEvent, *_rich functions)
+// via src/cli.rs. Each binary sees the other half as dead.
+#![allow(dead_code)]
+
 use serde_json::Value;
 
 /// The role associated with a single transcript event. All provider

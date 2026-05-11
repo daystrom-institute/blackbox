@@ -101,6 +101,7 @@ pub trait PacketResolver {
 
 /// Resolver that never finds a packet. Handy as a default when the
 /// caller hasn't wired composition.
+#[allow(dead_code)] // used by test-only `apply`/`apply_all` wrappers below
 pub struct NoopResolver;
 
 impl PacketResolver for NoopResolver {
@@ -386,6 +387,7 @@ pub(crate) fn eval_predicate(
 /// `Apply` predicates in the tree silently return false because there
 /// is no resolver — use [`apply_with`] for composition-aware
 /// evaluation.
+#[allow(dead_code)] // test-only wrapper around `apply_with`
 pub fn apply(packet: &Packet, entity: &serde_json::Value) -> Option<Prediction> {
     apply_with(packet, entity, &NoopResolver)
 }
@@ -427,6 +429,7 @@ pub fn apply_with(
 /// pass_all_clean-fires-alongside-FAILs bug without special-casing the
 /// severity enum. A catchall PASS rule authored as `emit: "fallback"`
 /// now vanishes automatically when any real finding exists.
+#[allow(dead_code)] // test-only wrapper around `apply_all_with`
 pub fn apply_all(packet: &Packet, entity: &serde_json::Value) -> ApplyAllResult {
     apply_all_with(packet, entity, &NoopResolver)
 }

@@ -60,6 +60,7 @@ fn default_allow_empty() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct HttpFetchResult {
+    #[allow(dead_code)] // Debug-formatted in log output
     pub status: u16,
     pub value: Value,
 }

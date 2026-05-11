@@ -123,6 +123,7 @@ pub(crate) struct EmbeddingSourceDoc {
     pub doc_type: String,
     pub account: String,
     pub session_id: String,
+    #[allow(dead_code)] // Debug-formatted in trace logs
     pub project: String,
     pub file_path: String,
     pub byte_offset: u64,

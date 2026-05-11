@@ -279,11 +279,6 @@ fn java_import_block_range(source: &str) -> (usize, usize, usize) {
     )
 }
 
-fn project_java_type_index(project_dir: &Path) -> Result<BTreeMap<String, Option<String>>> {
-    let JavaTypeIndex { top_level, .. } = build_java_type_index(project_dir)?;
-    Ok(top_level)
-}
-
 #[derive(Default, Debug)]
 struct JavaTypeIndex {
     /// Simple-name → uniquely-resolvable FQCN for *top-level* types,

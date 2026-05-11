@@ -156,6 +156,7 @@ impl TaskStore {
         Ok(())
     }
 
+    #[allow(dead_code)] // test-only entry point; production paths use reserve_id + insert_reserved
     pub fn insert(&mut self, id: String, task: Arc<Task>) -> Result<(), BroSpawnError> {
         if self.tasks.contains_key(&id) {
             return Err(BroSpawnError::DuplicateTaskId { id });
@@ -515,6 +516,7 @@ pub struct AmbientContext {
     /// tool filtering (Claude/Copilot), the text recursion guard is
     /// omitted in favor of the mechanical filter applied at the CLI arg
     /// layer. Unset or unsupported provider → text guard as fallback.
+    #[allow(dead_code)] // reserved hook for defense-in-depth text guards; see comment above apply_ambient
     pub provider: Option<providers::Provider>,
 }
 
@@ -634,6 +636,7 @@ pub fn apply_brofile_lens(prompt: &str, lens: Option<&str>) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BroSpawnError {
     DuplicateTaskId { id: String },
+    #[allow(dead_code)] // only constructed by the test-only `insert` method
     ReservedTaskId { id: String },
 }
 

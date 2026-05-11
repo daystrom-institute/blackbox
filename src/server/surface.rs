@@ -101,6 +101,9 @@ impl ToolSurfaceVerdict {
 #[derive(Debug, Clone)]
 pub struct ToolSurfaceDecision {
     pub verdict: ToolSurfaceVerdict,
+    // Filters derived from the verdict, exposed as part of the decision's
+    // public surface for callers that want a pre-built filter set.
+    #[allow(dead_code)]
     pub filters: McpFilters,
 }
 
@@ -250,7 +253,7 @@ pub fn extract_surface_from_uri(query: Option<&str>) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packets::{self, CompileParams, Packets, Value as AstValue};
+    use crate::packets::{CompileParams, Packets, Value as AstValue};
 
     fn tmp_packets() -> (tempfile::TempDir, Packets) {
         let dir = tempfile::TempDir::new().unwrap();

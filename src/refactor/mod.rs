@@ -746,6 +746,7 @@ pub fn project_refs(p: &RefactorProjectRefsParams) -> Result<String> {
     Ok(serde_json::to_string_pretty(&response)?)
 }
 
+#[allow(dead_code)] // test-only wrapper; production paths use plan_with_ctx
 pub fn plan(p: &RefactorPlanParams) -> Result<String> {
     plan_with_ctx(p, &PlanContext::default())
 }
@@ -1005,6 +1006,7 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
     })?)
 }
 
+#[allow(dead_code)] // test-only wrapper; production paths use run_with_ctx
 pub fn run(p: &RefactorRunParams, projects: &[ProjectRecord]) -> Result<String> {
     run_with_ctx(p, projects, &PlanContext::default())
 }

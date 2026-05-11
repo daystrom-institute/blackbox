@@ -414,6 +414,7 @@ pub(super) fn review_prefix_inference() -> BTreeMap<String, String> {
 /// so this function explicitly picks the longest matching prefix.
 /// Codex flagged this as the hidden-policy-most-likely-to-surprise in
 /// phase-3 review (thread-cc7ff97d).
+#[allow(dead_code)] // test-only wrapper; tests in packets/mod.rs use this directly
 pub(super) fn infer_classification(
     id: &str,
     prefix_map: &BTreeMap<String, String>,

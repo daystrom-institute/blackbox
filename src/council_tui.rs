@@ -41,6 +41,7 @@ const INPUT_HEIGHT: u16 = 3;
 
 // ── Wire shapes (mirror src/council/{post,envelope,session}.rs) ───────
 
+#[allow(dead_code)] // fields populated by serde from daemon JSON
 #[derive(Debug, Clone, Deserialize)]
 struct CouncilSummary {
     id: String,
@@ -64,6 +65,7 @@ struct CouncilOpenResponse {
     charter: String,
 }
 
+#[allow(dead_code)] // fields populated by serde from daemon JSON
 #[derive(Debug, Clone, Deserialize)]
 struct CouncilPost {
     council_id: String,
@@ -79,6 +81,7 @@ struct CouncilPost {
     created_at: String,
 }
 
+#[allow(dead_code)] // fields populated by serde from daemon JSON
 #[derive(Debug, Clone, Deserialize)]
 struct InboxEnvelope {
     bro_id: String,
@@ -91,6 +94,7 @@ struct InboxEnvelope {
 
 // ── SSE event shapes ──────────────────────────────────────────────────
 
+#[allow(dead_code)] // variant fields populated by serde from SSE wire payload
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum CouncilEvent {
@@ -121,7 +125,6 @@ enum Signal {
 
 struct App {
     council_id: String,
-    base_url: String,
     topic: String,
     team_id: String,
     project: Option<String>,
@@ -160,7 +163,7 @@ struct MemberView {
 }
 
 impl App {
-    fn new(council_id: String, base_url: String, summary: CouncilSummary, charter: &str) -> Self {
+    fn new(council_id: String, summary: CouncilSummary, charter: &str) -> Self {
         let _ = charter; // reserved for future charter inspection toggle
         let mut members: Vec<MemberView> = summary
             .members
@@ -174,7 +177,6 @@ impl App {
         members.sort_by(|a, b| a.bro_id.cmp(&b.bro_id));
         Self {
             council_id,
-            base_url,
             topic: summary.topic,
             team_id: summary.team_id,
             project: summary.project,
@@ -266,7 +268,6 @@ pub async fn run(council_id: String, url: Option<String>) -> anyhow::Result<()> 
     let initial = fetch_initial(&base_url, &council_id).await?;
     let mut app = App::new(
         council_id.clone(),
-        base_url.clone(),
         initial.summary,
         &initial.charter,
     );

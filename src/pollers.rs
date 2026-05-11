@@ -114,10 +114,6 @@ impl PollerRegistry {
         self.by_name.read().values().cloned().collect()
     }
 
-    pub fn get(&self, name: &str) -> Option<PollerSpec> {
-        self.by_name.read().get(name).cloned()
-    }
-
     pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Vec<PollerSpec> {
         let mut updated = Vec::new();
         let mut by_name = self.by_name.write();
@@ -147,12 +143,6 @@ impl PollerRegistry {
         }
     }
 
-    /// Drop + abort the named poller's task. Used by uninstall.
-    pub fn abort(&self, name: &str) {
-        if let Some(h) = self.handles.write().remove(name) {
-            h.abort();
-        }
-    }
 }
 
 /// Load all persisted poller specs from a directory. Bad files are

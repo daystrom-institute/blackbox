@@ -15,7 +15,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Map, Value};
@@ -151,32 +150,6 @@ pub async fn run_workflow_with_initial_vars(
         HashMap::new(),
         initial_vars,
         None,
-    )
-    .await
-}
-
-/// Same as [`run_workflow_with_initial_vars`] but with a caller-minted
-/// arc id. Used by async MCP orchestration so the returned task can
-/// expose a stable arc id immediately.
-pub async fn run_workflow_with_initial_vars_and_arc_id(
-    server: &BlackboxServer,
-    compiled: &CompiledWorkflow,
-    project_dir: Option<String>,
-    max_steps: Option<usize>,
-    initial_vars: Map<String, Value>,
-    arc_id: String,
-) -> WorkflowRunResult {
-    run_workflow_at_depth_with_cancel(
-        server,
-        compiled,
-        project_dir,
-        max_steps,
-        0,
-        HashMap::new(),
-        initial_vars,
-        None,
-        None,
-        Some(arc_id),
     )
     .await
 }
@@ -2852,13 +2825,6 @@ impl<'a> WorkflowRunner<'a> {
         Ok(())
     }
 
-    fn duration_label(d: Option<Duration>) -> String {
-        match d {
-            Some(d) => format!("{}s", d.as_secs()),
-            None => "indefinite".into(),
-        }
-    }
-
     fn log_event(&mut self, kind: &str, data: Value) {
         let ev = json!({
             "kind": kind,
@@ -3159,7 +3125,7 @@ mod tests {
         assert_eq!(runner.next_node("Decide").unwrap(), "Fallback");
     }
 
-    fn runner_for(compiled: &CompiledWorkflow) -> DummyRunner {
+    fn runner_for(compiled: &CompiledWorkflow) -> DummyRunner<'_> {
         DummyRunner {
             compiled,
             last_verdict: None,

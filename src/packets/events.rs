@@ -5,10 +5,6 @@ use std::path::{Path, PathBuf};
 
 // ── Storage ───────────────────────────────────────────────────────
 
-pub(super) fn packets_dir(packets_dir: &Path) -> PathBuf {
-    packets_dir.to_path_buf()
-}
-
 pub(super) fn scope_dir(packets_dir: &Path, scope: &str) -> PathBuf {
     packets_dir.join(scope)
 }

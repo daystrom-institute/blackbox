@@ -250,6 +250,7 @@ impl<'a> AgentRegistry<'a> {
         load_manifest_degraded_value(value)
     }
 
+    #[allow(dead_code)] // used by tests in same file
     pub fn search(
         &self,
         query: &str,

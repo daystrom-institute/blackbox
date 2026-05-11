@@ -95,20 +95,6 @@ impl CouncilPost {
         }
     }
 
-    pub fn new_system(council_id: String, sequence: u64, body: String) -> Self {
-        Self {
-            council_id,
-            sequence,
-            sender_kind: SenderKind::System,
-            sender_id: "system".to_string(),
-            body,
-            addressed_to: Vec::new(),
-            reply_scope: ReplyScope::Origin,
-            source_envelope_id: None,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        }
-    }
-
     /// Format a single post for inclusion in a replay or catchup frame.
     pub fn render_for_frame(&self) -> String {
         let prefix = match self.sender_kind {

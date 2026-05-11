@@ -426,6 +426,7 @@ pub enum BranchSelector {
 
 /// Parse a workflow from a JSON string. (YAML loader is a trivial
 /// one-line extension once `serde_yaml` is added to Cargo.toml.)
+#[allow(dead_code)] // test-only entry point; tests use this through the workflow::load_workflow reexport
 pub fn load_workflow(src: &str) -> Result<Workflow> {
     serde_json::from_str(src).context("workflow JSON parse failed")
 }

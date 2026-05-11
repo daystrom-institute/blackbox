@@ -154,11 +154,6 @@ impl CronRegistry {
         }
     }
 
-    pub fn abort(&self, name: &str) {
-        if let Some(h) = self.handles.write().remove(name) {
-            h.abort();
-        }
-    }
 }
 
 pub type SharedRegistry = Arc<CronRegistry>;

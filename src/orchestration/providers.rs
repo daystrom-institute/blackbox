@@ -571,6 +571,7 @@ impl Provider {
     /// into the cwd's project-scoped config file). Returns None when the
     /// provider's CLI doesn't support that scope (Codex has no project
     /// scope; Vibe has no MCP CRUD at all).
+    #[allow(dead_code)] // used by tests in same file
     pub fn build_mcp_add_http_args_scoped(
         &self,
         name: &str,
@@ -878,6 +879,7 @@ impl Provider {
     /// time or not at all). Claude, Copilot, Codex, Gemini, and Vibe all
     /// support per-invocation mechanical filtering via different
     /// mechanisms (Vibe via --enabled-tools allow-list in programmatic mode).
+    #[allow(dead_code)] // used by tests in same file
     pub fn supports_dispatch_filter(&self) -> bool {
         matches!(
             self,

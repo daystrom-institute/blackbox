@@ -134,6 +134,7 @@ impl SlackProposalLinks {
     /// reverse-lookup path (apply hook, refine hook). Returns None
     /// when the channel has no record of this proposal_id — even if
     /// another channel happens to have a proposal with the same id.
+    #[allow(dead_code)] // used by tests in same file
     pub fn lookup_by_proposal(
         &self,
         team_id: &str,
@@ -202,6 +203,7 @@ impl SlackProposalLinks {
 
     /// Drop a link. Removes both the forward and reverse index
     /// entries. Returns the removed record, if any.
+    #[allow(dead_code)] // used by tests in same file
     pub fn forget(
         &self,
         team_id: &str,

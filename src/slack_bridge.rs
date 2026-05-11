@@ -6,7 +6,7 @@
 //! endpoint. The daemon never links a Slack crate.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -1493,6 +1493,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
 
     // ── Identity loading ────────────────────────────────────────
 

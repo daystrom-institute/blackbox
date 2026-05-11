@@ -32,7 +32,7 @@
 //! lockfile dance phaser does for Node IPC isn't needed here).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
@@ -322,6 +322,7 @@ pub struct VoteCounts {
 }
 
 impl VoteCounts {
+    #[allow(dead_code)]
     pub fn total(&self) -> u32 {
         self.accept + self.reject + self.defer
     }
@@ -1051,6 +1052,7 @@ fn post_type_str(t: PostType) -> &'static str {
 /// Flatten a board into a `Value` map for ArcContext template
 /// rendering and gate-packet entity evaluation. Exposes phase,
 /// counts, vote tally, and an array of posts/annotations.
+#[allow(dead_code)]
 pub fn board_template_scope(board: &Board) -> Value {
     let mut out = Map::new();
     out.insert("id".into(), Value::String(board.id.clone()));

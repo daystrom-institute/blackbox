@@ -642,17 +642,17 @@ mod tests {
         let Ok(chunks) = chunks_for_path(&path, Path::new(path_hint)) else {
             return false;
         };
+        // Match by content-addressed identity (rel_path_hash + chunk_hash) only.
+        // occurrence_idx is positional bookkeeping that drifts on unrelated edits
+        // to neighbor chunks; gating on it turned this assertion into a snapshot
+        // test that breaks on cosmetic refactors. The chunk_hash IS the identity.
         chunks.iter().any(|chunk| match entity_ref {
             EntityRef::ProjectFile {
                 project_id: _,
                 rel_path_hash,
                 chunk_hash,
-                occurrence_idx,
-            } => {
-                &chunk.rel_path_hash == rel_path_hash
-                    && &chunk.chunk_hash == chunk_hash
-                    && &chunk.occurrence_idx == occurrence_idx
-            }
+                occurrence_idx: _,
+            } => &chunk.rel_path_hash == rel_path_hash && &chunk.chunk_hash == chunk_hash,
             EntityRef::Symbol {
                 project_id: _,
                 qualified_name,

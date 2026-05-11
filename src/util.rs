@@ -3,7 +3,6 @@
 //! belong with their owner.
 
 use std::fs;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BLACKBOX_MCP_NAME: &str = "blackbox";

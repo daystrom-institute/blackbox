@@ -272,27 +272,6 @@ fn find_marker_positions(text: &str) -> Result<(Option<usize>, Option<usize>)> {
     ))
 }
 
-/// Extract the body between `<!-- bb:managed-start -->` and
-/// `<!-- bb:managed-end -->` markers in a memory file. Returns None if
-/// the file has no balanced managed region. The returned slice excludes
-/// the markers themselves and any trailing newline immediately after the
-/// start marker / before the end marker.
-///
-/// Used by `bbox_absorb --scope=global` to read back the managed region
-/// of provider global-memory files (which mix bbox-managed content with
-/// user-authored content outside the markers — only the managed region
-/// is bbox's territory).
-pub fn extract_managed_region(content: &str) -> Option<&str> {
-    let (start, end) = find_marker_positions(content).ok()?;
-    let s = start?;
-    let e = end?;
-    if e <= s + MANAGED_START.len() {
-        return None;
-    }
-    let inner = &content[s + MANAGED_START.len()..e];
-    Some(inner.trim_matches('\n'))
-}
-
 /// Snapshot a file to `~/.local/state/blackbox/backups/<ISO-ts>/<filename>`.
 /// Returns the destination path. Creates parent dirs as needed.
 pub fn snapshot_file(src: &Path) -> Result<PathBuf> {

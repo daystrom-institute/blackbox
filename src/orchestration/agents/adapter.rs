@@ -14,9 +14,12 @@ use super::types::{AgentFilterOverlay, AgentManifest, AgentSession, MergedFilter
 #[derive(Debug, Clone)]
 pub struct DispatchContext {
     pub project_dir: Option<String>,
+    #[allow(dead_code)] // populated by callers, consumed by adapter impls in tests
     pub ambient: Option<String>,
     pub bro_label_prefix: Option<String>,
+    #[allow(dead_code)] // populated by callers, consumed by adapter impls in tests
     pub caller_provider: Option<String>,
+    #[allow(dead_code)] // populated by callers, consumed by adapter impls in tests
     pub caller_session_id: Option<String>,
 }
 
@@ -48,6 +51,7 @@ pub struct AgentDispatchResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentDispatchError {
     BadInput { message: String },
+    #[allow(dead_code)] // exercised by tests; production paths surface AdapterFailed instead
     NotFound { name: String },
     AdapterFailed { message: String },
 }

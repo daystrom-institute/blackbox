@@ -57,7 +57,7 @@ mod webhooks;
 mod whiteboards;
 mod workflow;
 
-use blackbox::{config, secrets};
+use blackbox::config;
 
 mod util {
     pub use blackbox::util::*;
@@ -81,7 +81,6 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ErrorCode, InitializeRequestParams, InitializeResult,
     IntoContents, ListToolsResult, ServerCapabilities, ServerInfo,
 };
-use rmcp::schemars;
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -159,154 +158,6 @@ impl BlackboxServer {
         self.state.idx.write().delete_knowledge_entry(entry_id)?;
         embed_queue::tombstone_knowledge(&crate::index::knowledge_entity_id(entry_id));
         Ok(())
-    }
-
-    fn inspect_extra_properties(
-        &self,
-        r: &crate::entity_ref::EntityRef,
-    ) -> anyhow::Result<Option<BTreeMap<String, String>>> {
-        use crate::entity_ref::EntityRef;
-        match r {
-            EntityRef::Knowledge { id } => Ok(self.state.kb.read().entry(id).map(|entry| {
-                let mut properties = BTreeMap::new();
-                properties.insert("id".into(), entry.id.clone());
-                properties.insert("title".into(), entry.title.clone());
-                properties.insert("content".into(), entry.content.clone());
-                properties.insert("category".into(), format!("{:?}", entry.category));
-                properties.insert("scope".into(), format!("{:?}", entry.scope));
-                properties.insert("status".into(), format!("{:?}", entry.status));
-                properties.insert("approval".into(), format!("{:?}", entry.approval));
-                if let Some(project) = &entry.project {
-                    properties.insert("project".into(), project.clone());
-                }
-                if let Some(supersedes) = &entry.supersedes {
-                    properties.insert("supersedes".into(), supersedes.clone());
-                }
-                properties
-            })),
-            EntityRef::Thread { thread_id } => Ok(self
-                .state
-                .threads
-                .read()
-                .all()
-                .iter()
-                .find(|thread| thread.id == *thread_id)
-                .map(|thread| {
-                    let mut properties = BTreeMap::new();
-                    properties.insert("thread_id".into(), thread.id.clone());
-                    properties.insert("topic".into(), thread.topic.clone());
-                    properties.insert("project".into(), thread.project.clone());
-                    properties.insert("status".into(), format!("{:?}", thread.status));
-                    if let Some(name) = &thread.name {
-                        properties.insert("name".into(), name.clone());
-                    }
-                    properties
-                })),
-            EntityRef::Note { note_id } => Ok(self
-                .state
-                .notes
-                .read()
-                .all()
-                .iter()
-                .find(|note| note.id == *note_id)
-                .map(|note| {
-                    let mut properties = BTreeMap::new();
-                    properties.insert("note_id".into(), note.id.clone());
-                    properties.insert("kind".into(), format!("{:?}", note.kind));
-                    properties.insert("body".into(), note.body.clone());
-                    properties.insert("created_at".into(), note.created_at.clone());
-                    if let Some(task_id) = &note.task_id {
-                        properties.insert("task_id".into(), task_id.clone());
-                    }
-                    if let Some(thread_id) = &note.thread_id {
-                        properties.insert("thread_id".into(), thread_id.clone());
-                    }
-                    properties
-                })),
-            EntityRef::Whiteboard { board_id } => {
-                Ok(self.state.whiteboards.get(board_id).map(|board| {
-                    let board = board.read();
-                    let mut properties = BTreeMap::new();
-                    properties.insert("board_id".into(), board.id.clone());
-                    properties.insert("topic".into(), board.topic.clone());
-                    properties.insert("project".into(), board.project.clone());
-                    properties.insert("phase".into(), format!("{:?}", board.phase));
-                    properties
-                }))
-            }
-            EntityRef::Brofile { name } => {
-                Ok(
-                    orch::brofile::list_brofiles("global", &self.state.store_dir, None)
-                        .into_iter()
-                        .find(|brofile| brofile.name == *name)
-                        .map(|brofile| {
-                            let mut properties = BTreeMap::new();
-                            properties.insert("name".into(), brofile.name);
-                            properties.insert("provider".into(), brofile.provider.as_str().into());
-                            if let Some(model) = brofile.model {
-                                properties.insert("model".into(), model);
-                            }
-                            if let Some(effort) = brofile.effort {
-                                properties.insert("effort".into(), effort);
-                            }
-                            properties
-                        }),
-                )
-            }
-            EntityRef::Agent { name, version } => {
-                let catalog = self.state.artifacts.read();
-                let meta = catalog
-                    .metadata_for(artifacts::ArtifactKind::Agent, name)
-                    .ok()
-                    .flatten();
-                let meta = match meta {
-                    Some(m) if m.active => m,
-                    _ => return Ok(None),
-                };
-                if meta.version != format!("{version}") {
-                    return Ok(None);
-                }
-                let artifact_value = catalog
-                    .load_artifact_value(artifacts::ArtifactKind::Agent, name)
-                    .ok()
-                    .flatten();
-                let mut properties = BTreeMap::new();
-                properties.insert("name".into(), name.clone());
-                properties.insert("version".into(), version.to_string());
-                if let Some(v) = &artifact_value {
-                    let manifest = v.get("manifest").unwrap_or(v);
-                    if let Some(desc) = manifest.get("description").and_then(|d| d.as_str()) {
-                        properties.insert("description".into(), desc.to_string());
-                    }
-                    if let Some(bro) = manifest.get("brofile_ref").and_then(|b| b.as_str()) {
-                        properties.insert("brofile_ref".into(), bro.to_string());
-                    }
-                    if let Some(wtu) = manifest.get("when_to_use").and_then(|w| w.as_array()) {
-                        properties.insert(
-                            "when_to_use".into(),
-                            wtu.iter()
-                                .filter_map(|s| s.as_str())
-                                .collect::<Vec<_>>()
-                                .join("; "),
-                        );
-                    }
-                }
-                Ok(Some(properties))
-            }
-            _ => self.state.idx.read().entity_properties(&r.to_string()),
-        }
-    }
-
-    fn inspect_entity_exists(
-        &self,
-        r: &crate::entity_ref::EntityRef,
-        extra_properties: Option<&BTreeMap<String, String>>,
-    ) -> bool {
-        if extra_properties.is_some() {
-            return true;
-        }
-        let edge_index = self.state.edge_index.read();
-        !edge_index.forward_edges(r).is_empty() || !edge_index.reverse_edges(r).is_empty()
     }
 
     fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
@@ -667,11 +518,6 @@ impl BlackboxServer {
     /// Drop the arc's cancel token. Called by the runner at terminus.
     pub fn unregister_arc_cancel_token(&self, arc_id: &str) {
         self.state.unregister_arc_cancel_token(arc_id);
-    }
-
-    /// Trigger cancellation for a running arc.
-    pub fn cancel_arc(&self, arc_id: &str) -> bool {
-        self.state.cancel_arc(arc_id)
     }
 
     fn rebuild_edge_index_from_stores(&self) {

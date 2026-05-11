@@ -72,6 +72,7 @@ pub struct AllModeMismatch {
 /// `{entity, expected_verdict?, expected_rule_ids?}`. Compares aggregate
 /// verdict + fired-rule-id set independently; mismatches tag which
 /// check failed so fixes are targeted.
+#[allow(dead_code)] // test-only wrapper around `verify_all_with`
 pub fn verify_all(packet: &Packet, dataset: &serde_json::Value) -> Result<AllModeFidelityReport> {
     verify_all_with(packet, dataset, &NoopResolver)
 }
@@ -174,6 +175,7 @@ pub fn verify_all_with(
 
 /// Apply packet to every entry in `dataset`. Dataset is a JSON array of
 /// `{entity, expected}` pairs. Returns a fidelity report.
+#[allow(dead_code)] // test-only wrapper around `verify_with`
 pub fn verify(packet: &Packet, dataset: &serde_json::Value) -> Result<FidelityReport> {
     verify_with(packet, dataset, &NoopResolver)
 }

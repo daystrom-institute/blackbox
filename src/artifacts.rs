@@ -194,6 +194,7 @@ impl ArtifactCatalog {
         })
     }
 
+    #[allow(dead_code)] // used by tests in this file and src/watcher.rs
     pub fn load_artifact_value_scoped(
         &self,
         project_id: Option<&str>,
@@ -222,26 +223,6 @@ impl ArtifactCatalog {
         }
         // Fall back to global.
         self.load_artifact_value(kind, name)
-    }
-
-    fn install_value_locked(
-        &self,
-        kind: ArtifactKind,
-        source: String,
-        value: &Value,
-        name_override: Option<String>,
-        version_override: Option<String>,
-        supersedes_override: Option<String>,
-    ) -> Result<ArtifactMetadata> {
-        self.install_value_locked_scoped(
-            ArtifactScope::Global,
-            kind,
-            source,
-            value,
-            name_override,
-            version_override,
-            supersedes_override,
-        )
     }
 
     fn install_value_locked_scoped(
@@ -549,12 +530,6 @@ impl ArtifactCatalog {
             fs::create_dir_all(parent)?;
         }
         atomic_write_json(&path, meta)
-    }
-
-    fn save_version_snapshot(&self, meta: &ArtifactMetadata, value: &Value) -> Result<()> {
-        let artifact_path = self.version_artifact_path(meta.kind, &meta.name, &meta.version)?;
-        atomic_write_json(&artifact_path, value)?;
-        self.save_version_metadata(meta)
     }
 
     fn save_version_metadata(&self, meta: &ArtifactMetadata) -> Result<()> {

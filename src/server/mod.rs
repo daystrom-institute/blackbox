@@ -4,8 +4,7 @@ pub mod state;
 pub mod surface;
 pub mod tail;
 
-pub use progress::*;
-pub use routes::*;
-pub use state::*;
-pub use surface::*;
-pub use tail::*;
+pub(crate) use progress::*;
+pub(crate) use routes::*;
+pub(crate) use state::*;
+pub(crate) use tail::*;

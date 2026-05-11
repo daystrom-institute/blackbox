@@ -4972,7 +4972,7 @@ fn bro_agent_dispatch_schema_202012_prefix_items_rejected() {
 fn bbox_describe_schema_includes_installed_agents() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
-    let cat = &server.state.artifacts.read();
+    let cat = server.state.artifacts.read();
     cat.install_value(
         artifacts::ArtifactKind::Agent,
         "schema-agent.json".into(),

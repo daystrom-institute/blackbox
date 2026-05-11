@@ -7,7 +7,7 @@ pub mod wal;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};

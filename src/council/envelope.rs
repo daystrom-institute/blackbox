@@ -137,6 +137,7 @@ impl InboxEnvelope {
         }
     }
 
+    #[allow(dead_code)] // used by tests in same file
     pub fn dedupe_key(&self) -> Option<(u64, &str)> {
         self.source_post_seq.map(|s| (s, self.bro_id.as_str()))
     }

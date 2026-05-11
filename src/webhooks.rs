@@ -20,7 +20,6 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
 use crate::workflow::extractor::Extractor;
 
@@ -232,7 +231,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 // `RoutingVerdict` lives in `crate::routing` — both webhook ingress
 // and (future) pollers feed extracted entities into the same dispatch
 // pipeline, so the verdict types are inlet-agnostic.
-pub use crate::routing::{canonicalize, RoutingVerdict};
 
 #[cfg(test)]
 mod tests {

@@ -67,6 +67,7 @@ impl SecretString {
 
     /// True if `key` (case-insensitive) matches common sensitive header names
     /// that must not be stored as inline plain text in project-local files.
+    #[allow(dead_code)] // called by test-only validate_project_store
     pub fn is_sensitive_key(key: &str) -> bool {
         let lower = key.to_lowercase();
         lower.contains("authorization")
@@ -139,6 +140,7 @@ impl McpServerConfig {
 impl McpServerConfig {
     /// True if this is the blackbox self-entry (used by self-registration
     /// to detect URL drift and decide add vs remove+add).
+    #[allow(dead_code)] // used by tests in same file
     pub fn blackbox_matches(&self, current_url: &str) -> bool {
         matches!(self, Self::Http { url, .. } if url == current_url)
     }
@@ -169,6 +171,7 @@ impl McpServerConfig {
 /// Validate that a project-scoped MCP store does not contain inline plain-text
 /// values for sensitive header/env keys.  Agents commit project mcp.json files;
 /// secrets must travel as `{"$secret": "ENV_VAR"}` references, not bare strings.
+#[allow(dead_code)] // used by tests in same file
 pub fn validate_project_store(store: &McpStore) -> anyhow::Result<()> {
     for (server_name, cfg) in &store.servers {
         let pairs: Vec<(&str, &SecretString)> = match cfg {
@@ -533,12 +536,18 @@ pub enum SelfRegisterOutcome {
     Updated,
     /// Provider binary isn't on PATH (spawn failed). Distinguished from
     /// ListFailed: the CLI is genuinely absent, not just misbehaving.
-    NotInstalled { detail: String },
+    NotInstalled {
+        #[allow(dead_code)] // Debug-formatted for logs
+        detail: String,
+    },
     /// Provider binary spawned but `mcp list` exited non-zero. CLI is
     /// installed but something is wrong (auth, schema mismatch, etc.).
     /// Worth surfacing differently — the user can fix this; NotInstalled
     /// requires actually installing the CLI.
-    ListFailed { detail: String },
+    ListFailed {
+        #[allow(dead_code)] // Debug-formatted for logs
+        detail: String,
+    },
     /// Provider has no MCP CRUD (Vibe).
     Unsupported,
     /// The subsequent add/remove CLI call errored out.

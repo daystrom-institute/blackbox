@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 // AgentArtifact — top-level wrapper for installed agent files
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // used by tests in same file and badgey/mod.rs test module
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentArtifact {
     pub kind: String,
@@ -120,6 +121,7 @@ pub struct AgentComposition {
     pub fan_out_aggregator: Option<String>,
 }
 
+#[allow(dead_code)] // used by tests in same file
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompositionShape {
@@ -281,6 +283,7 @@ pub struct AgentSession {
 // BadgeyAgentArgs
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // used by tests in same file
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BadgeyAgentArgs {
     pub prompt: String,

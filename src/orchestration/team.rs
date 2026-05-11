@@ -301,6 +301,7 @@ pub fn find_bro_matches<'a>(name: &str, teams: &'a [Team]) -> Vec<BroMatch<'a>> 
     matches
 }
 
+#[allow(dead_code)] // used by tests in same file
 pub fn find_bro<'a>(name: &str, teams: &'a [Team]) -> Option<BroMatch<'a>> {
     find_bro_matches(name, teams).into_iter().next()
 }

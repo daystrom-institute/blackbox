@@ -17,17 +17,15 @@ pub mod schema;
 pub mod wait;
 
 pub use engine::{
-    run_workflow, run_workflow_streaming, run_workflow_streaming_with_vars,
-    run_workflow_streaming_with_vars_and_arc_id, run_workflow_with_initial_vars,
-    run_workflow_with_initial_vars_and_arc_id, WorkflowRunResult,
+    run_workflow, run_workflow_streaming, run_workflow_streaming_with_vars_and_arc_id,
+    run_workflow_with_initial_vars,
 };
 pub use schema::{
-    load_workflow, ActorFailureMode, ActorKind, ActorSpec, BranchSelector, ForeachCollect,
-    ForeachSpec, GateMode, ItemFailurePolicy, MatrixAxis, MatrixSpec, NodeMode, NodeTransition,
-    Workflow,
+    ActorFailureMode, ActorKind, ActorSpec, ForeachSpec, GateMode, ItemFailurePolicy, MatrixSpec,
+    NodeMode, NodeTransition, Workflow,
 };
 #[cfg(test)]
-pub use schema::{InjectPolicy, LateInject, NodeSpec, RetryPolicy};
+pub use schema::load_workflow;
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};

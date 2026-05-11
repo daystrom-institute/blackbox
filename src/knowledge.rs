@@ -1042,6 +1042,9 @@ impl Knowledge {
         })
     }
 
+    // Test-only convenience wrapper around learn_result; production callers
+    // use the structured variant.
+    #[allow(dead_code)]
     pub fn learn(&mut self, p: &LearnParams, from_agent: bool) -> Result<String> {
         self.learn_result(p, from_agent)
             .map(|result| result.message)
