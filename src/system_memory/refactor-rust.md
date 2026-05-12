@@ -86,16 +86,19 @@ Writable plan kinds:
   multiple files.
 - `rust_organize_imports`: request rust-analyzer `source.organizeImports` for
   `source` and emit the resulting workspace edit as normal hash-checked edits.
-- `rust_ra_move_item_to_module`: rust-analyzer `refactor.move` code action.
-  Moves a named top-level item AND rewrites callers across the workspace.
+- `rust_ra_move_item_to_module`: requests rust-analyzer's `refactor.move`
+  code action at the named item's byte range. **The tool name oversells its
+  behavior.** The `target` parameter is title-only — it is NOT sent to RA;
+  RA decides the destination itself. In observed practice (rust-analyzer
+  1.95) the action does not fire for top-level items moved between sibling
+  modules, nor for inline `mod foo { ... }` blocks moved to a file. Expect
+  `error.lsp_unavailable: no move-to-module code action found for <name>`
+  for most realistic use cases. Until either the tool or the RA assist
+  catches up, use `extract_rust_items` (top-level items) or a manual
+  body-extract + `mod foo;` declaration rewrite (inline-mod-to-file).
   Accepts `function_item`, `struct_item`, `enum_item`, `trait_item`,
-  `type_item`, `const_item`, `static_item`, `mod_item`. Refuses `impl_method`
-  (use `extract_rust_impl_methods` instead). Requires `target` to be a path
-  RA recognizes as a sibling/child module; if RA returns no code action you
-  see `error.lsp_unavailable: no move-to-module code action found for <name>`.
-  In practice RA wants the destination declared inside the source's module
-  (or a sibling under a shared parent), so scaffold `mod target;` and the
-  empty target file before requesting the move.
+  `type_item`, `const_item`, `static_item`, `mod_item`. Refuses
+  `impl_method` (use `extract_rust_impl_methods`).
 - `rust_ra_classify_callbacks`: walks call sites of named methods in `source`
   and asks rust-analyzer `textDocument/definition` to resolve where each
   callee is declared. Returns `resolved_callbacks` (one entry per method with
@@ -375,42 +378,50 @@ cargo test --bin blackboxd
 
 Use a narrower test command when the changed package has a clearer local test.
 
-## Splitting a monster file with RA-move
+## Splitting a monster file
 
-The killer combination for breaking up a sprawling module is
-`add_rust_mod_decl` + scaffold target file + `rust_ra_move_item_to_module`.
-The semantic move rewrites callers across the workspace, which the syntactic
-`extract_rust_items` does not.
+Don't reach for `rust_ra_move_item_to_module` first — RA's code action
+declines for most realistic moves. The working sequence uses the
+syntactic tools end-to-end:
 
-Sequence:
+1. Scaffold the destination file (`Write` or `write_file`) — empty file
+   with a doc comment + `use super::*;`. For a child module of `parent.rs`,
+   the file goes at `parent/<child>.rs`.
+2. `add_rust_mod_decl(source="parent.rs", module_name="child")` — adds
+   `mod child;` so rustc sees the new file.
+3. `rewrite_rust_item_visibility(visibility="pub(super)", item_names=...)`
+   — bump every item that will move so the parent module can call it
+   after the move. Use `pub(crate)` instead when callers are further away.
+4. `extract_rust_items(source, target, item_names, item_kinds)` — move
+   the named items literally. Tree-sitter validates both files.
+5. `add_rust_use_decl(source="parent.rs", use_path="child::{Name1, fn2}")`
+   — bring the moved names back into scope so existing call sites compile
+   without qualifier changes.
+6. If the moved items are structs with private fields constructed outside
+   the new module, `rewrite_rust_field_visibility(visibility="pub(super)",
+   item_names=[StructName])` so the parent can still build them. Forgetting
+   this surfaces as `E0451: fields ... of struct ... are private`.
+7. `cargo check` + relevant test suite. Iterate if visibility errors fire.
 
-1. Scaffold the destination — create the empty file (or stub) with a doc
-   comment + `use super::*;`. Use the `write_file` plan kind for the scaffold
-   inside a compound run, or just write it with conventional file ops.
-2. Declare the module so RA can see it. For a child module of `parent.rs`,
-   the file goes at `parent/<child>.rs` AND `parent.rs` gets
-   `mod <child>;` via `add_rust_mod_decl`.
-3. Run `cargo check` once so RA picks up the new module. RA needs an indexed
-   workspace; new files added between RA sessions may be invisible until the
-   project is reloaded.
-4. Plan the move: `rust_ra_move_item_to_module(source, target, item_names,
-   item_kinds)`. Apply it.
-5. Run `cargo check` again. RA's workspace edit usually handles cross-file
-   caller rewrites, but visibility may need a follow-up
-   `rewrite_rust_item_visibility(visibility="pub(crate)")` if the moved item
-   was private.
+### Inline `mod foo { ... }` → `foo.rs` submodule file
 
-If RA returns `error.lsp_unavailable: no move-to-module code action found
-for <name>`, the most common causes (in observed order):
+No bbox plan kind handles this transform in one shot today. `extract_rust_items`
+moves the WHOLE `mod foo { ... }` block verbatim to the target, which leaves
+the target with a redundant nested module. `rust_ra_move_item_to_module`
+declines (see above). Until the tool catches up, do it manually:
 
-- Target is a sibling of source's module, not a submodule. RA only offers
-  the move when the destination is reachable as a child of the current
-  module. Fix: nest the target inside source's module.
-- Target file isn't declared with `mod` anywhere in the workspace yet.
-- Source workspace hasn't been re-indexed since the target file was added
-  (especially in CI / disposable worktrees). Re-run `cargo check` and retry.
-- Item is unmoveable for semantic reasons (e.g., depends on a non-pub item
-  that can't follow it). Inspect with `rust_impl_partition_analysis` first.
+1. Read the body content of the inline mod (lines between the opening `{`
+   and closing `}`).
+2. Write that body as `foo.rs` (drop one indentation level if you want,
+   though rustc doesn't care).
+3. Replace the inline `mod foo { ... }` block in the parent with
+   `mod foo;` (preserve any `#[cfg(test)]` attribute).
+4. `cargo check` + tests.
+
+For `#[cfg(test)] mod tests { ... }` specifically this is mechanical and
+safe — the tests retain access to the parent's private items via
+`use super::*;` because `mod tests;` keeps the tests module nested under
+the same parent.
 
 ## Safety Rules
 
