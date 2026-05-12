@@ -14,11 +14,10 @@
 //! transient-injection providers (Claude, Copilot, Codex) receive the
 //! effective set per-invocation as well for determinism.
 //!
-//! The recursion guard is now mechanical: the default filter set includes
-//! disallow patterns matching the current blackbox MCP prefix's recursive
-//! tool surfaces (`bro_*` orchestration plus `bbox_refactor_*` structural
-//! rewrites) so dispatched agents literally cannot see (let alone call)
-//! those tools unless `allow_recursion=true`.
+//! The recursion guard is mechanical: the default filter set disallows
+//! the current blackbox MCP prefix's `bro_*` orchestration tools so
+//! dispatched agents cannot spawn further sub-bros unless
+//! `allow_recursion=true`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -291,16 +290,12 @@ impl McpFilters {
     }
 
     /// Default filter set: the mechanical recursion guard. Blocks every
-    /// `bro_*` orchestration tool and every `bbox_refactor_*` structural
-    /// rewrite tool so dispatched agents can't spawn sub-bros or rewrite
-    /// broad code surfaces unless recursion is explicitly allowed. Callers
-    /// that pass allow_recursion=true skip this layer.
+    /// `bro_*` orchestration tool so dispatched agents can't spawn
+    /// sub-bros unless recursion is explicitly allowed. Callers that
+    /// pass allow_recursion=true skip this layer.
     pub fn default_recursion_guard() -> Self {
         Self {
-            disallow: vec![
-                format!("{}bro_*", crate::tool_docs::blackbox_mcp_prefix()),
-                format!("{}bbox_refactor_*", crate::tool_docs::blackbox_mcp_prefix()),
-            ],
+            disallow: vec![format!("{}bro_*", crate::tool_docs::blackbox_mcp_prefix())],
             allow: Vec::new(),
         }
     }
@@ -1690,15 +1685,12 @@ mod tests {
     }
 
     #[test]
-    fn default_guard_blocks_bro_and_refactor_tools() {
+    fn default_guard_blocks_bro_only() {
         let global = McpStore::new();
         let eff = resolve_effective(&global, None, true);
         assert_eq!(
             eff.filters.disallow,
-            vec![
-                "mcp__blackbox__bro_*".to_string(),
-                "mcp__blackbox__bbox_refactor_*".to_string()
-            ]
+            vec!["mcp__blackbox__bro_*".to_string()]
         );
     }
 

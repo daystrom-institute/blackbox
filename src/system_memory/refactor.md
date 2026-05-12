@@ -234,10 +234,6 @@ small files only; status defaults to at most 200 returned items and reports
    touches are snapshotted before the command and are rolled back with prior
    plan writes on required command failure.
 
-7. Dispatched agents normally cannot see `bbox_refactor_*` because those tools
-   are in the default recursion guard. The orchestrator must deliberately use
-   `allow_recursion=true` when delegating a refactor task that needs these tools.
-
 ## Refactor-atom personas (RA-B1 / RA-B2)
 
 The atomic refactor agent layer (`design/refactor-agents.md`) ships JSON

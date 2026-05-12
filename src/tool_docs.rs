@@ -1206,10 +1206,10 @@ fn system_memory_hint(doc: &ToolDoc) -> Option<String> {
 
 // ── Filter translation helpers ───────────────────────────────────────
 
-/// Bare names of every dispatch-guarded tool. Used by provider
-/// filter translators that can't accept glob patterns (Codex,
-/// Gemini's policy engine) to expand the current blackbox MCP prefix's
-/// `bro_*` / `bbox_refactor_*` patterns into a concrete list.
+/// Bare names of every orchestration + refactor tool. Used by
+/// provider filter translators that can't accept glob patterns (Codex,
+/// Gemini's policy engine) to expand `bro_*` / `bbox_refactor_*`
+/// patterns into a concrete list.
 pub fn orchestration_tool_names() -> Vec<&'static str> {
     TOOL_DOCS
         .iter()
