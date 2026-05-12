@@ -115,14 +115,18 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
             names.len(),
             path_string(project_dir)
         ),
-        "semantic_status": "syntax_only",
+        "semantic_status": SemanticStatus::SyntaxOnly,
         "dry_run": true,
         "file_moves": [],
         "edits": [],
         "validations": [],
         "items": [],
         "leftovers": [],
-        "plan_status": "Planned",
+        // Gap 18: route plan_status through the PlanStatus enum so
+        // serde's `rename_all = "snake_case"` attribute produces
+        // lowercase `"planned"` (what the apply-side deserializer
+        // expects). Hardcoding the string here was the bug.
+        "plan_status": PlanStatus::Planned,
         "usage_count": count,
         "usages": usages,
     });
@@ -606,7 +610,7 @@ mod tests {
         let v = parse_response(&response);
         assert_eq!(v["kind"].as_str().unwrap(), "find_java_usages");
         assert_eq!(v["dry_run"].as_bool().unwrap(), true);
-        assert_eq!(v["plan_status"].as_str().unwrap(), "Planned");
+        assert_eq!(v["plan_status"].as_str().unwrap(), "planned");
         assert!(v["edits"].as_array().unwrap().is_empty());
         assert_eq!(v["usage_count"].as_u64().unwrap(), 0);
     }

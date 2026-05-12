@@ -166,14 +166,17 @@ pub(crate) fn plan_rename_java_symbol(p: &RefactorPlanParams) -> Result<String> 
             "rename Java symbol `{old_name}` → `{new_name}` across {} file(s)",
             touched
         ),
-        "semantic_status": "syntax_only",
+        "semantic_status": SemanticStatus::SyntaxOnly,
         "dry_run": true,
         "file_moves": [],
         "edits": file_edits,
         "validations": validations,
         "items": [],
         "leftovers": [],
-        "plan_status": "Planned",
+        // Gap 18: serialize the PlanStatus enum so serde's
+        // rename_all="snake_case" attr produces lowercase "planned",
+        // matching the apply-side deserializer's expectation.
+        "plan_status": PlanStatus::Planned,
         "files_touched": touched,
         "file_rename_advisory": file_rename_advisory,
     });
@@ -645,6 +648,58 @@ mod tests {
             err.contains("new_text is required"),
             "expected new_text refusal, got: {err}"
         );
+    }
+
+    // Gap 18 regression: the plan JSON produced by rename_java_symbol
+    // must parse cleanly back into RefactorApplyParams.plan — the
+    // apply path's deserializer is the contract. Pre-fix it broke on
+    // `plan_status: "Planned"` (capital P); the fix routes through
+    // the PlanStatus enum so serde's snake_case attr emits lowercase
+    // "planned" which matches the deserializer.
+    #[test]
+    fn plan_json_round_trips_through_apply_deserializer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("Outer.java"),
+            "package com.example;\npublic class Outer {\n    void doIt() {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("Caller.java"),
+            "package com.example;\nclass Caller { Outer o; }\n",
+        )
+        .unwrap();
+        let plan_json = plan_rename_java_symbol(&make_params(dir.path(), "Outer", "Inner"))
+            .expect("plan should succeed");
+        // The serialized plan_status MUST be lowercase — the apply
+        // path's PlanStatus enum is `rename_all = "snake_case"`.
+        assert!(
+            plan_json.contains("\"plan_status\": \"planned\""),
+            "plan_status must serialize as lowercase `planned`, not `Planned`. \
+             Got:\n{plan_json}"
+        );
+        assert!(
+            !plan_json.contains("\"plan_status\": \"Planned\""),
+            "capital-P serialization is the Gap 18 regression"
+        );
+        // Round-trip: parse the body into a generic serde_json::Value
+        // (mirrors the apply path's plan parameter) and verify the
+        // PlanStatus value deserializes via the same enum.
+        let v: serde_json::Value =
+            serde_json::from_str(&plan_json).expect("plan JSON parses");
+        let status_str = v["plan_status"].as_str().expect("plan_status is a string");
+        let status: PlanStatus = serde_json::from_value(serde_json::Value::String(
+            status_str.to_string(),
+        ))
+        .unwrap_or_else(|e| {
+            panic!(
+                "PlanStatus deserializer rejected `{status_str}`: {e}. \
+                 This is the Gap 18 mismatch."
+            )
+        });
+        assert_eq!(status, PlanStatus::Planned);
     }
 
     // Gate: refuse when item_names has more than one entry.
