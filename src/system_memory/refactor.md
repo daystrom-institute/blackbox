@@ -6,30 +6,97 @@ picked a language-specific runbook.
 ## Support Matrix
 
 Project-scoped symbol lookup uses `bbox_code_symbols`. Single-file syntax
-exploration uses `bbox_code_node_describe` and `bbox_code_query`. Refactor
-inventory uses `bbox_refactor_status` and is available for any source file
-whose extension maps to a supported tree-sitter parser in `CodeChunker`.
-The operational runbooks below cover the common application languages;
-additional mapped languages are inspect-only unless a newer language memory
-says otherwise.
+exploration uses `bbox_code_node_describe` and `bbox_code_query`. Per-file
+reference extraction (calls / imports / fields / identifiers) uses
+`bbox_code_refs`. Refactor inventory uses `bbox_refactor_status` and is
+available for any source file whose extension maps to a supported tree-sitter
+parser in `CodeChunker`. The operational runbooks below cover the common
+application languages; additional mapped languages are inspect-only unless a
+newer language memory says otherwise.
 
-`bbox_code_symbols`, `bbox_code_node_describe`, and `bbox_code_query` are syntax
-locators, not refactor planners. Use `bbox_code_symbols` instead of shell
-`rg -n` when you need method/function/type line numbers, candidate files for a
-symbol, or exact refactorable item names. Use `bbox_code_node_describe` when you
-have a line/column and need local grammar shape. Use `bbox_code_query` when the
-file is known and you need a custom tree-sitter pattern. Their responses include
-a `handoff` block with suggested `bbox_refactor_status` and
-`bbox_refactor_project_refs` calls. Treat those suggestions as the bridge into
-the guarded refactor surfaces; do not turn raw query captures directly into
-edits unless the edit is a generic literal plan such as `replace_text`.
+`bbox_code_symbols`, `bbox_code_node_describe`, `bbox_code_query`, and
+`bbox_code_refs` are syntax locators, not refactor planners. Use
+`bbox_code_symbols` instead of shell `rg -n` when you need
+method/function/type line numbers, candidate files for a symbol, or exact
+refactorable item names. Use `bbox_code_node_describe` when you have a
+line/column and need local grammar shape. Use `bbox_code_query` when the file
+is known and you need a custom tree-sitter pattern. Use `bbox_code_refs` when
+you want every call site / import / field access / identifier occurrence in
+one file without re-parsing yourself. Every response carries
+`semantic_status: "syntax_only"` and per-record `edge_confidence:
+"heuristic"` (on `bbox_code_refs`) — these are syntactic captures, NOT
+binding resolution. For binding authority, use LSP via `bbox_refactor_plan`
+or graph traversal via `bbox_inspect_entity`. Responses include a `handoff`
+block with suggested `bbox_refactor_status` and `bbox_refactor_project_refs`
+calls; treat those as the bridge into the guarded refactor surfaces. Do not
+turn raw query captures directly into edits unless the edit is a generic
+literal plan such as `replace_text`.
+
+### `bbox_code_symbols` modes — indexed (default) vs live
+
+The tool ships two lanes, selected via the `mode` param:
+
+- `mode="indexed"` (default when the daemon has a populated index): reads
+  stored `project_file` docs from tantivy. No parse cost; works at any
+  project size; carries `symbol_kind` (raw tree-sitter), `parent_kind`
+  (nearest enclosing symbol kind), and `line_range` directly from stored
+  fields. Truncation reports `truncation_reason: "scan_cap_reached"`
+  when the tantivy match count exceeds the 5000-record scan cap on a
+  post-filtered query — `matching_items` is a lower bound, not exact.
+- `mode="live"`: walks the project tree and calls `bbox_refactor_status`
+  per file. Slower but always reflects the on-disk state, even if the
+  reindexer is behind. Honours `file_limit` and the
+  `MAX_CODE_NAV_SCANNED_FILES` cap; oversized files are skipped with a
+  typed per-file `file_too_large_for_code_nav` entry in `errors[]`.
+
+### Dual `kind` vocabulary on `item_kinds`
+
+`bbox_code_symbols(item_kinds=...)` accepts both vocabularies on the same
+filter:
+
+- Raw tree-sitter node kinds — `function_item`, `impl_item`,
+  `struct_item`, `method_declaration`, `class_declaration`, etc. The
+  same kinds emitted by `bbox_code_query` captures and stored in
+  `symbol_kind`.
+- Refactor synthetic kinds — `impl_method` (Rust `function_item` inside
+  `impl_item`). The same kinds emitted by `bbox_refactor_status` and
+  consumed by `bbox_refactor_plan`. Synthesised at read time via
+  `refactor_kind_for(language, symbol_kind, parent_kind)`.
+
+For Rust impl methods specifically, `item_kinds=["impl_method"]` and
+`item_kinds=["function_item"]` both match — the synthetic form returns
+ONLY impl methods, the raw form returns impl methods plus top-level
+functions. Each record carries both `kind` (refactor synthetic) and
+`symbol_kind` (raw) so the caller can dispatch on either.
 
 `bbox_refactor_project_refs` is a grounding-only companion for metadata and
 provenance repairs. It returns current
 `project_file:<project>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>` refs for
-one file using the same chunking/hash rules as the agentic corpus. Use it before
-literal edits to eval fixtures, citations, or expected refs; whole-file
-`sha256sum` is not a valid substitute for a chunk hash.
+one file using the same chunking/hash rules as the agentic corpus, and (post
+CN-D4) carries the same `symbol_kind` / `parent_kind` / `line_start` /
+`line_end` metadata as `bbox_code_symbols`. Use it before literal edits to
+eval fixtures, citations, or expected refs; whole-file `sha256sum` is not a
+valid substitute for a chunk hash.
+
+### Error response shape
+
+Code-nav tools return a typed `CodeNavErrorResponse` for recoverable failure
+modes rather than bailing. The agent reads `code` for typed dispatch and
+`suggestion` for the recovery call. Stable codes:
+
+- `file_too_large_for_code_nav` — file exceeds 2 MiB cap. Includes
+  `file_bytes` and `max_bytes`.
+- `project_not_registered` — `project_dir` is not a registered root nor
+  a descendant of one. Includes `registered_projects: [{canonical_path,
+  project_id}, ...]`.
+- `invalid_code_symbols_mode` — `mode` was something other than
+  `"indexed"` / `"live"`.
+- `unsupported_language_for_code_refs` — language has no curated
+  reference query and the requested `kind` is not `"identifiers"`. Use
+  `bbox_code_query` instead, or switch to `kind="identifiers"`.
+
+Every error response carries `semantic_status: "syntax_only"` so the
+labelling invariant holds across both ok and error paths.
 
 - Rust: `rust`
 - TypeScript / TSX: `typescript`

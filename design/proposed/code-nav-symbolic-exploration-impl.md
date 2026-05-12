@@ -861,3 +861,125 @@ design doc's Non-Tool sections:
   here.
 - Macro expansion, type inference, or any answer that requires a
   compiler. The graph + LSP surfaces own that authority.
+
+---
+
+## CN-X2 audit — Acceptance Criteria status (2026-05-12)
+
+The design-doc Acceptance Criteria from
+`design/proposed/code-nav-symbolic-exploration.md`:
+
+1. **Tool docs explain syntax-only vs graph vs LSP semantics.**
+   ✓ `src/tool_docs.rs` stanzas for `bbox_code_symbols`,
+   `bbox_code_query`, `bbox_code_node_describe`, and
+   `bbox_code_refs` each name the syntax-only label, the dual
+   vocabulary, and the handoff to LSP / refactor plan / graph
+   surfaces. `src/system_memory/refactor.md` carries the longer
+   discussion + error-shape reference. Re-rendered into provider
+   files on daemon startup via the `bb-tool-reference` mechanism.
+
+2. **Query and node-describe tools return bounded responses with
+   parse diagnostics.**
+   ✓ Both honour CN-S1's `MAX_CODE_NAV_FILE_BYTES` cap (typed
+   `file_too_large_for_code_nav` error response with `file_bytes`
+   + `max_bytes`). Both carry `parse_report` on every successful
+   response.
+
+3. **Kind-filtered indexed symbol search is not exposed until
+   `symbol_kind` exists.**
+   ✓ `bbox_code_symbols(mode="indexed")` reads stored
+   `symbol_kind` from tantivy — the field landed in CN-D3 along
+   with the schema-version bump
+   (`agentic-corpus-g6-symbol-kind-and-ranges`). Records that
+   predate the bump are skipped by the indexed lane; the live
+   lane is the documented fallback.
+
+4. **Existing graph navigation remains the preferred route for
+   indexed callers, callees, and evidence bundles.**
+   ✓ Handoff blocks on every code-nav response point at
+   `bbox_refactor_status` / `bbox_refactor_project_refs`; the
+   sm-refactor memory explicitly directs binding-authority
+   questions to `bbox_inspect_entity` / `bbox_find_paths` /
+   `bbox_bundle_evidence`. `bbox_code_refs` records carry
+   `edge_confidence: "heuristic"` so callers cannot mistake
+   syntax matches for graph-resolved references.
+
+5. **Generic structural declaration rewrites are not named like
+   semantic rename.**
+   ✓ No new tool emits a generic `rename_symbol` plan kind.
+   `bbox_refactor_plan(kind="rust_lsp_rename")` remains the
+   binding-aware path; a future structural declaration-only
+   rewrite would land under the refactor-plan family with an
+   explicit `structural_only` semantic_status.
+
+6. **Tests cover at least Rust, JavaScript/TypeScript, Python,
+   and Java query or node-describe behaviour, plus one
+   unsupported-language error path.**
+   ✓ `src/code_nav/tests.rs` covers:
+   - Rust: `test_code_query_rust`,
+     `test_code_query_handoff_maps_rust_impl_method_to_refactor_status_kind`,
+     `code_symbols_live_lane_populates_symbol_kind_and_parent_kind`,
+     `code_refs_rust_calls_resolve_containing_symbol`.
+   - JavaScript: `test_code_query_javascript`.
+   - TypeScript: `test_code_query_typescript`,
+     `test_code_node_describe_typescript` (CN-T3 landed these
+     explicitly because the existing JS tests didn't exercise
+     the TS grammar).
+   - Python: `test_code_node_describe_python`,
+     `code_refs_python_identifiers_with_query_filter`.
+   - Java: `test_code_query_java`,
+     `test_code_query_handoff_suggests_refactor_status_for_java_method`,
+     `test_code_symbols_finds_java_method_line_ranges_without_rg`,
+     `code_refs_java_imports`.
+   - Unsupported-language paths: `test_unsupported_language_error`
+     (existing) plus
+     `code_refs_unsupported_language_typed_error_for_non_identifier_kind`
+     (typed error from `bbox_code_refs`).
+
+### Phases landed
+
+CN-0 (audit), CN-S1 (gates), CN-S2 (semantic_status invariant),
+CN-D1 → CN-D4 (data model + schema bump; CN-D5 deferred as
+explicit optional), CN-T1 (`bbox_code_refs`), CN-T2 (mode +
+indexed lane), CN-T3 (TS coverage), CN-X1 (this doc set), CN-X2
+(this audit).
+
+### Phases deferred (known limitations, future work)
+
+- **CN-D5 — embed-text builder + content-hash invalidation.**
+  Optional per the impl doc; the indexed code_symbols lane does
+  not depend on it. Vector search will not benefit from
+  kind-aware embed text until this lands.
+- **Indexed graph hints on `bbox_code_refs`.** The impl doc lists
+  this as an optional V1 enrichment ("when extracted identifier
+  matches a known `symbol_exact`, attach `indexed_symbol_ref`").
+  Deferred — the V1 surface stays strictly syntax-only.
+- **Single-file tool registered-project gate.** CN-T3 noted the
+  trade-off: adding the gate would force every existing test
+  through `registered_for(&dir)` for marginal value over the
+  CN-S1 file-size gate. Future work if a concrete misuse
+  emerges.
+- **`chunker::code::is_symbol_node` audit for `const_item` /
+  `static_item` / `macro_definition`.** Codex round-3 review
+  flagged that code_nav surfaces these as refactor item kinds
+  but the symbol walker may not emit them. Audit + extend the
+  symbol-node set as part of the next chunker iteration; not a
+  blocker for the current Acceptance Criteria but a coverage
+  gap for some Rust workloads.
+
+### Codex review history
+
+Three rounds against the durable code-nav review bro (session
+`019e1d18-9fc9-7823-9bc1-d36219f12b61`):
+
+- Round 1 (CN-S2..CN-T2): REVISE → 4 must-fix items (live-lane
+  size gate hole, indexed kind filter copy-paste bug, dishonest
+  truncation, anyhow-bail on invalid mode) — addressed in
+  commit `b7d32d3`.
+- Round 2 (post-fixes): REVISE → 3 must-fix items
+  (scan_cap_reached semantics conflating fast-path and real
+  cap, missing doc-comment entry, missing language guard on
+  synthesis decomposition) — addressed in commit `d9a3376`.
+- Round 3 (post-fixes): APPROVE_WITH_NITS. One deferred
+  coverage nit (`const_item`/`static_item`/`macro_definition`)
+  tracked above.
