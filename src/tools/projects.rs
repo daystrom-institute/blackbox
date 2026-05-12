@@ -256,6 +256,85 @@ impl BlackboxServer {
     }
 
     #[tool(
+        name = "bbox_project_unregister",
+        description = "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, councils, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry."
+    )]
+    pub(crate) fn bbox_project_unregister(
+        &self,
+        Parameters(p): Parameters<ProjectUnregisterParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_project_unregister", || {
+            let force = p.force.unwrap_or(false);
+            let dry_run = p.dry_run.unwrap_or(false);
+
+            let record = self
+                .state
+                .projects
+                .read()
+                .resolve(&p.project)?
+                .with_context(|| format!("project not registered: {}", p.project))?;
+
+            let counts = project_ref_counts(&self.state, &record.canonical_path)?;
+            let total_refs: u64 = counts
+                .as_object()
+                .map(|m| {
+                    m.values()
+                        .filter_map(|v| v.as_u64())
+                        .sum()
+                })
+                .unwrap_or(0);
+
+            if dry_run {
+                return Ok(serde_json::to_string_pretty(&json!({
+                    "status": "dry_run",
+                    "record": record,
+                    "ref_counts": counts,
+                    "total_refs": total_refs,
+                    "would_remove": true,
+                    "force_required": total_refs > 0,
+                }))?);
+            }
+
+            if total_refs > 0 && !force {
+                anyhow::bail!(
+                    "project {} still has {} project-scoped refs across {}; re-run with force=true to orphan them, or use bbox_project_rename to migrate first. counts: {}",
+                    record.project_id,
+                    total_refs,
+                    counts
+                        .as_object()
+                        .map(|m| {
+                            m.iter()
+                                .filter(|(_, v)| v.as_u64().unwrap_or(0) > 0)
+                                .map(|(k, _)| k.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default(),
+                    counts,
+                );
+            }
+
+            let removed = self
+                .state
+                .projects
+                .write()
+                .unregister_project(&p.project)?;
+
+            // Rebuild EdgeIndex so edges that were keyed on the removed
+            // project no longer surface in subsequent inspections.
+            self.rebuild_edge_index_from_stores();
+
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "record": removed,
+                "ref_counts": counts,
+                "orphaned_refs": total_refs,
+                "forced": total_refs > 0 && force,
+            }))?)
+        })
+    }
+
+    #[tool(
         name = "bbox_project_list",
         description = "List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered."
     )]

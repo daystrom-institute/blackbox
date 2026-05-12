@@ -113,6 +113,7 @@ use packets::{Packets, ScannerConfig};
 use pins::{AmbientPinQuery, PinParams, Pins};
 use projects::{
     ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry, ProjectRenameParams,
+    ProjectUnregisterParams,
 };
 use providers::ProviderContext;
 use roadmap::Roadmap;
