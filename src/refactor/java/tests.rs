@@ -7509,3 +7509,49 @@ class Example {\n\
             "wrapper must preserve throws clause: {rewritten}"
         );
     }
+
+    // G7-FU: javax.inject.Inject is deduped when the source already has
+    // com.google.inject.Inject — same simple name means collision, so the
+    // javax variant must NOT be added.
+    #[test]
+    fn g7_fu_inject_import_dedup_by_simple_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import com.google.inject.Inject;\n\
+             public class Admin {\n\
+             \x20   @Inject private Object dep;\n\
+             \x20   public Long save() { return 1L; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["save".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.wiring_mode = Some("guice_field_inject".to_string());
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("import com.google.inject.Inject;"),
+            "existing Guice Inject import must be preserved: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("import javax.inject.Inject;"),
+            "javax.inject.Inject must NOT appear when com.google.inject.Inject already present: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("@Inject private Service service;"),
+            "delegate field must use @Inject: {rewritten}"
+        );
+    }
