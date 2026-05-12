@@ -615,6 +615,8 @@ mod tests {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             boolean_getter_strategy: None,
+            declaring_class: None,
+            summary_only: None,
             callback_externals: None,
             output_path: None,
         }

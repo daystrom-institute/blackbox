@@ -382,6 +382,15 @@ pub struct RefactorPlanParams {
     /// `is-` prefix (Lombok generates `getXxx()` for boxed types).
     #[serde(default)]
     pub boolean_getter_strategy: Option<String>,
+    /// `find_java_usages`: optional declaring class simple name. When set,
+    /// filter results to call sites whose receiver expression plausibly
+    /// resolves to a field of that type within the enclosing class (G9).
+    #[serde(default)]
+    pub declaring_class: Option<String>,
+    /// `find_java_usages`: when true, return per-name counts + top-5
+    /// example call sites instead of the full usage enumeration (G10).
+    #[serde(default)]
+    pub summary_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

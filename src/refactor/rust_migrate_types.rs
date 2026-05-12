@@ -855,6 +855,8 @@ mod tests {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             boolean_getter_strategy: None,
+            declaring_class: None,
+            summary_only: None,
             callback_externals: None,
             output_path: None,
         })
@@ -974,6 +976,8 @@ fn consume(input: OldService, output: Vec<OldService>) -> OldService {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             boolean_getter_strategy: None,
+            declaring_class: None,
+            summary_only: None,
             callback_externals: None,
             output_path: None,
         });
@@ -1055,6 +1059,8 @@ fn consume<T>(value: OldService, list: Vec<OldService>) {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             boolean_getter_strategy: None,
+            declaring_class: None,
+            summary_only: None,
             callback_externals: None,
             output_path: None,
         });
@@ -1137,6 +1143,8 @@ struct Holder {
             deep_analysis: None,
             rewrite_remaining_accessors: None,
             boolean_getter_strategy: None,
+            declaring_class: None,
+            summary_only: None,
             callback_externals: None,
             output_path: None,
         });

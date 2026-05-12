@@ -107,6 +107,8 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
     usages.sort_by(|a, b| a.path.cmp(&b.path).then(a.byte_start.cmp(&b.byte_start)));
 
     let count = usages.len();
+    let production_sites = usages.iter().filter(|u| !u.is_test_site).count();
+    let test_sites = usages.iter().filter(|u| u.is_test_site).count();
     let body = serde_json::json!({
         "status": "ok",
         "kind": "find_java_usages",
@@ -122,12 +124,10 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
         "validations": [],
         "items": [],
         "leftovers": [],
-        // Gap 18: route plan_status through the PlanStatus enum so
-        // serde's `rename_all = "snake_case"` attribute produces
-        // lowercase `"planned"` (what the apply-side deserializer
-        // expects). Hardcoding the string here was the bug.
         "plan_status": PlanStatus::Planned,
         "usage_count": count,
+        "production_sites": production_sites,
+        "test_sites": test_sites,
         "usages": usages,
     });
     Ok(serde_json::to_string_pretty(&body)?)
@@ -143,6 +143,24 @@ struct JavaUsage {
     context: String,
     usage_kind: String,
     matched_name: String,
+    is_test_site: bool,
+}
+
+fn is_test_site_path(path: &Path) -> bool {
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    for i in 0..components.len() {
+        if components[i] == "src"
+            && i + 2 < components.len()
+            && components[i + 1] == "test"
+            && components[i + 2] == "java"
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn collect_usages_in_file(
@@ -154,6 +172,7 @@ fn collect_usages_in_file(
 ) {
     let src = parsed.source.as_bytes();
     let path_str = path_string(path);
+    let is_test_site = is_test_site_path(path);
     let mut stack = vec![parsed.tree.root_node()];
     while let Some(node) = stack.pop() {
         let mut c = node.walk();
@@ -174,7 +193,7 @@ fn collect_usages_in_file(
                 if is_declaration_name(node) {
                     continue;
                 }
-                push_usage(out, &path_str, parsed, node, "type_reference", text, kind_filter);
+                push_usage(out, &path_str, parsed, node, "type_reference", text, kind_filter, is_test_site);
             }
             // method_invocation: the .name child is the method being
             // called. Receiver-side identifier (the object before `.`)
@@ -192,6 +211,7 @@ fn collect_usages_in_file(
                                 "method_invocation",
                                 text,
                                 kind_filter,
+                                is_test_site,
                             );
                         }
                     }
@@ -210,6 +230,7 @@ fn collect_usages_in_file(
                                 "field_access",
                                 text,
                                 kind_filter,
+                                is_test_site,
                             );
                         }
                     }
@@ -237,6 +258,7 @@ fn collect_usages_in_file(
                                     "method_reference",
                                     qt,
                                     kind_filter,
+                                    is_test_site,
                                 );
                             }
                         }
@@ -252,6 +274,7 @@ fn collect_usages_in_file(
                                     "method_reference",
                                     nt,
                                     kind_filter,
+                                    is_test_site,
                                 );
                             }
                         }
@@ -277,6 +300,7 @@ fn collect_usages_in_file(
                         "import",
                         trailing,
                         kind_filter,
+                        is_test_site,
                     );
                 }
             }
@@ -315,6 +339,7 @@ fn push_usage(
     kind: &str,
     matched: &str,
     kind_filter: Option<&HashSet<&str>>,
+    is_test_site: bool,
 ) {
     if let Some(filter) = kind_filter {
         if !filter.contains(kind) {
@@ -332,6 +357,7 @@ fn push_usage(
         context,
         usage_kind: kind.to_string(),
         matched_name: matched.to_string(),
+        is_test_site,
     });
 }
 
@@ -382,6 +408,8 @@ mod tests {
             boolean_getter_strategy: None,
             callback_externals: None,
             output_path: None,
+            declaring_class: None,
+            summary_only: None,
         }
     }
 
@@ -613,6 +641,44 @@ mod tests {
         assert_eq!(v["plan_status"].as_str().unwrap(), "planned");
         assert!(v["edits"].as_array().unwrap().is_empty());
         assert_eq!(v["usage_count"].as_u64().unwrap(), 0);
+        assert_eq!(v["production_sites"].as_u64().unwrap(), 0);
+        assert_eq!(v["test_sites"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn g6_is_test_site_from_src_test_java_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_pkg = dir.path().join("src/main/java/com/example");
+        let test_pkg = dir.path().join("src/test/java/com/example");
+        fs::create_dir_all(&main_pkg).unwrap();
+        fs::create_dir_all(&test_pkg).unwrap();
+        for p in [&main_pkg, &test_pkg] {
+            fs::write(
+                p.join("Caller.java"),
+                "package com.example;\n\
+                 class Symbol {}\n\
+                 class Usage { Symbol s; }\n",
+            )
+            .unwrap();
+        }
+        let response = plan_find_java_usages(&make_params(dir.path(), &["Symbol"])).unwrap();
+        let v = parse_response(&response);
+        let usages = v["usages"].as_array().unwrap();
+        let by_path: Vec<(bool, &str)> = usages
+            .iter()
+            .map(|u| {
+                (
+                    u["is_test_site"].as_bool().unwrap(),
+                    u["path"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let test_count = by_path.iter().filter(|(is_test, _)| *is_test).count();
+        let prod_count = by_path.iter().filter(|(is_test, _)| !*is_test).count();
+        assert_eq!(test_count, 1, "expected exactly one test-site usage: {by_path:?}");
+        assert_eq!(prod_count, 1, "expected exactly one production usage: {by_path:?}");
+        assert_eq!(v["production_sites"].as_u64().unwrap(), 1);
+        assert_eq!(v["test_sites"].as_u64().unwrap(), 1);
     }
 
     // Gate: refuses when project_dir is missing.
