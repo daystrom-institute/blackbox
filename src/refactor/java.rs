@@ -288,9 +288,18 @@ fn java_source_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
     // (e.g. `com.google.inject.Inject` vs `javax.inject.Inject`) can't
     // both be imported — Java rejects duplicate simple-name imports.
     // Skip the new import when the source already has any single-type
-    // import with the same simple name. Wildcard imports (`*`) are not
-    // a collision because they don't introduce a binding for the simple
-    // name until resolution.
+    // import with the same simple name.
+    //
+    // G7-FU-v2: also skip when any wildcard import (`import x.y.*;`) is
+    // present in the source. Without classpath resolution we can't tell
+    // whether the wildcard's package actually contains the desired
+    // simple name, but the conservative call is to skip — adding the
+    // new explicit import changes which type binds when the wildcard
+    // DOES contain a same-name type (e.g. `import com.google.inject.*;`
+    // already provides `Inject`, and adding `javax.inject.Inject` flips
+    // the binding silently). The cost of a false positive ("operator has
+    // to add the import manually") is far below the cost of a silent
+    // semantic flip.
     let desired_simple = fqcn.rsplit('.').next().unwrap_or("");
     if !desired_simple.is_empty() {
         for line in source.lines() {
@@ -298,6 +307,9 @@ fn java_source_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
                 if existing == desired_simple {
                     return None;
                 }
+            }
+            if java_import_has_wildcard(line) {
+                return None;
             }
         }
     }
@@ -327,6 +339,24 @@ fn java_source_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
         byte_end: insert_at,
         replacement,
     })
+}
+
+/// G7-FU-v2: true when the import line is a wildcard like
+/// `import x.y.*;` (skipping `import static x.y.*;` static wildcards —
+/// those don't introduce type names into the simple-name namespace).
+fn java_import_has_wildcard(import_line: &str) -> bool {
+    let Some(body) = import_line
+        .trim()
+        .strip_prefix("import ")
+        .and_then(|s| s.strip_suffix(';'))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    if body.starts_with("static ") {
+        return false;
+    }
+    body.ends_with(".*")
 }
 
 fn java_import_simple_name(import_line: &str) -> Option<String> {
@@ -885,6 +915,23 @@ fn java_inject_import(target_text: &str, fqcn: &str) -> String {
         .any(|line| line.trim() == import_line)
     {
         return target_text.to_string();
+    }
+    // G7-FU-v2: same dedupe shape as java_source_import_edit — skip when
+    // a different FQCN with the same simple name is already imported, or
+    // when any wildcard import is present (could supply the simple name
+    // from a different package, silently flipping the binding).
+    let desired_simple = fqcn.rsplit('.').next().unwrap_or("");
+    if !desired_simple.is_empty() {
+        for line in target_text.lines() {
+            if let Some(existing) = java_import_simple_name(line) {
+                if existing == desired_simple {
+                    return target_text.to_string();
+                }
+            }
+            if java_import_has_wildcard(line) {
+                return target_text.to_string();
+            }
+        }
     }
     // Place after the last existing import; otherwise after the package line;
     // otherwise at the top.

@@ -1315,8 +1315,8 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
             if let Some(plan_anchor) = plan_anchor {
                 let cwd_top = crate::git::git_root_for_path(&cwd_path);
                 let plan_top = crate::git::git_root_for_path(&plan_anchor);
-                if let (Some(c), Some(pp)) = (cwd_top.as_ref(), plan_top.as_ref()) {
-                    if c != pp {
+                match (cwd_top.as_ref(), plan_top.as_ref()) {
+                    (Some(c), Some(pp)) if c != pp => {
                         bail!(
                             "cross_worktree_apply: plan was generated against `{}` but apply is running from `{}`. \
                              Re-plan from the current worktree, or pass `force_path=true` to write to the plan's recorded paths.",
@@ -1324,6 +1324,25 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
                             c.display()
                         );
                     }
+                    // G15-FU-v2: daemon-mode safety. When the plan is in
+                    // a git tree but the apply cwd is NOT (e.g. systemd
+                    // starts blackboxd with WorkingDirectory=$HOME and an
+                    // MCP caller omits cwd), the fallback env::current_dir()
+                    // resolved to $HOME — not the caller's repo. Failing
+                    // open was the round-1 hole: the apply silently wrote
+                    // to the plan's recorded paths even though the
+                    // caller's intent was unclear. Refuse with the same
+                    // error class and direct the operator to pass
+                    // project_dir/cwd explicitly or set force_path.
+                    (None, Some(pp)) if p.cwd.is_none() => {
+                        bail!(
+                            "cross_worktree_apply: plan was generated against `{}` but apply is running with no caller cwd \
+                             (env::current_dir resolved to a non-git directory). Pass `cwd` (or `project_dir` from the dispatching tool) \
+                             to identify the caller's worktree, or pass `force_path=true` to write to the plan's recorded paths.",
+                            pp.display()
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
