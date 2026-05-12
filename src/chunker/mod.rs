@@ -27,7 +27,7 @@ pub struct Chunk {
     /// by code chunks built from a `SymbolSpec`; `None` for chunks
     /// without a tree-sitter kind (non-code, structure-pack fallback
     /// before tree-sitter parse, etc.). See CN-D1 in
-    /// `design/proposed/code-nav-symbolic-exploration-impl.md`.
+    /// `design/archive/code-nav-symbolic-exploration-impl.md`.
     pub symbol_kind: Option<String>,
     /// Kind of the nearest enclosing symbol-producing ancestor, or
     /// `None` at file top level. Required for deterministic indexed

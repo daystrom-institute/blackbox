@@ -19,7 +19,7 @@ pub struct CodeChunker;
 /// `kind` is the raw tree-sitter node kind from the AST walk
 /// (e.g. `"function_item"`, `"impl_item"`, `"class_declaration"`,
 /// `"call"` for Elixir defmodule/def/defp/defmacro). Per the design
-/// in `design/proposed/code-nav-symbolic-exploration.md`, this must
+/// in `design/archive/code-nav-symbolic-exploration.md`, this must
 /// stay raw — any synthesised vocabulary (`impl_method`, etc.) is
 /// derived at read time by `refactor_kind_for(language, kind,
 /// parent_kind)`. The structure-pack fallback path cannot read
@@ -317,7 +317,7 @@ fn collect_structure_item(
 /// `node.kind()` to surface; the language-pack's abstract categories
 /// are the most precise label we can attach. Documented as a
 /// best-effort fallback in
-/// `design/proposed/code-nav-symbolic-exploration-impl.md` (CN-D1).
+/// `design/archive/code-nav-symbolic-exploration-impl.md` (CN-D1).
 fn structure_kind_label(kind: &StructureKind) -> String {
     match kind {
         StructureKind::Function => "function".to_string(),

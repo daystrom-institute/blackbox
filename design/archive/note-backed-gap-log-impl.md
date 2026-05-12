@@ -1,8 +1,8 @@
 # Note-backed gap log implementation plan
 
-Status: implementation proposal
+Status: implemented and archived after `32d15e7`
 Date: 2026-05-12
-Related: `design/proposed/note-backed-gap-log.md`
+Related: `design/archive/note-backed-gap-log.md`
 
 ## Scope
 
@@ -26,7 +26,7 @@ any code changes land.
 
 Work:
 
-- Keep `design/proposed/note-backed-gap-log.md` as the canonical design.
+- Keep `design/archive/note-backed-gap-log.md` as the canonical design.
 - Add a short system-memory runbook, or extend the side-channel notes runbook,
   with the `blackbox.gap_note.v1` JSON body and routing rule.
 - Keep the runbook imperative:

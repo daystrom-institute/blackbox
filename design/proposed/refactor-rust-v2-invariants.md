@@ -1,12 +1,13 @@
 # Rust Refactor — v2 invariants and deferred plan kinds
 
-Status: proposed (deferred items from `refactor-rust-expansion-impl` non-goals).
+Status: proposed v2 follow-ups (deferred items from
+`refactor-rust-expansion-impl` non-goals; refactor-agents v1 has landed).
 Related: `design/archive/refactor-rust-expansion.md`,
 `design/archive/refactor-rust-expansion-impl.md` ("Non-goals (this skeleton)"
 and "Cross-surface invariants" sections),
-`design/proposed/refactor-agents-impl.md` (consumer that exercises these
-invariants via atom dispatch — the agents skeleton is the natural pull
-for v2 enforcement).
+`design/archive/refactor-agents-impl.md` (v1 consumer that exercises these
+invariants mostly through prompt discipline, manifest lint, and atom dispatch;
+v2 enforcement still belongs here).
 
 ## Thesis
 
@@ -18,15 +19,15 @@ explicit about what it *didn't* ship:
 - A handful of plan kinds and runner features were tagged "future" or
   "open question" without a home.
 
-This doc collects those items so they can be picked up when the
-refactor-agents pull (the consumer that actually exercises atom
-dispatch + command allowlist) lands.
+This doc collects those items now that refactor-agents v1 has landed. The
+current agent manifests and prompts exercise these invariants, but some checks
+remain prompt/manifest discipline rather than runner-side enforcement.
 
 ## Items
 
 ### V2 runtime enforcement of operator-authority opt-outs (RX-V1)
 
-Source: `archive/refactor-rust-expansion-impl.md` RX-V1.
+Source: `design/archive/refactor-rust-expansion-impl.md` RX-V1.
 
 v1 ships `operator_opt_outs_used` as an audit field on durable
 `RefactorPlan`. v2: dispatch-side check that an agent's invocation
@@ -37,7 +38,7 @@ surface in `refactor-agents-impl` is the home).
 
 ### V2 runtime enforcement of atom command-allowlist (RX-V2)
 
-Source: `archive/refactor-rust-expansion-impl.md` RX-V2.
+Source: `design/archive/refactor-rust-expansion-impl.md` RX-V2.
 
 v1 ships the cargo-only command allowlist as docs + atom-prompt-template
 encoding. v2 adds runner-side enforcement: runner accepts
@@ -49,7 +50,7 @@ agents-impl skeleton is the natural producer of.
 
 ### RX-C1 multi-round compile-fix loop semantics
 
-Source: `archive/refactor-rust-expansion-impl.md` non-goals.
+Source: `design/archive/refactor-rust-expansion-impl.md` non-goals.
 
 Open question deferred from the RX-C1 ship: under what termination
 condition does a compile-fix round loop? Current v1 ships single-round
@@ -60,7 +61,7 @@ deliberately.
 
 ### Cargo-semver-checks integration (RX-G2)
 
-Source: `archive/refactor-rust-expansion-impl.md` non-goals.
+Source: `design/archive/refactor-rust-expansion-impl.md` non-goals.
 
 RX-G2 ships `rust_public_api_guard` as a structural advisory.
 Integrate `cargo-semver-checks` as the authoritative source for
@@ -69,7 +70,7 @@ check. Future.
 
 ### `dejunk_rust_struct` plan kind
 
-Source: `archive/refactor-rust-expansion-impl.md` non-goals
+Source: `design/archive/refactor-rust-expansion-impl.md` non-goals
 ("`dejunk_rust_struct` modernization plan kind — separate doc").
 
 Modernization sweep over a Rust struct: drop unused fields, collapse
@@ -91,9 +92,9 @@ them inside RX:
 
 ## Picking the next one
 
-V1+V2 are the high-value pair — they unlock safe agent dispatch of
-refactor atoms, which is the entire point of `refactor-agents`. If
-the agents skeleton lands, V1+V2 should land with it.
+V1+V2 are the high-value pair. Refactor-agents v1 has landed with prompt,
+manifest, and workflow-level discipline; these two items are the remaining
+runtime hardening path for safe agent dispatch of refactor atoms.
 
 The remaining items (C1 loop semantics, semver-checks, dejunk) are
 opportunistic.

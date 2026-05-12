@@ -1,11 +1,12 @@
 # AST-Grounded Restructure Execution Plan
 
 Date: 2026-05-07
-Status: executable checkpoint plan
+Status: partially executed checkpoint plan; moved from `design/proposed/` on 2026-05-12
+Related: `design/partial/restructure.md`
 
 ## Purpose
 
-This restates `design/restructure.md` as a sequence of grounding calls and
+This restates `design/partial/restructure.md` as a sequence of grounding calls and
 `bbox_refactor_*` plans. It is the worker-facing plan for a disposable practice
 worktree. The goal is to prove the refactor MCP surface can mechanize the
 restructure without benchmark-only shortcuts.

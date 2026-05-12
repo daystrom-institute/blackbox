@@ -1,7 +1,8 @@
 # Code Navigation and Symbolic Exploration
 
 Date: 2026-05-09
-Status: proposal, revised after code-grounding review
+Status: implemented and archived after CN-X2 audit on 2026-05-12
+Related: `design/archive/code-nav-symbolic-exploration-impl.md`
 
 ## Problem
 

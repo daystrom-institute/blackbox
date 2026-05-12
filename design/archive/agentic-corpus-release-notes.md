@@ -185,7 +185,7 @@ part of the inbox when task surfacing is enabled.
 
 `bbox_embed_status` includes each route's provider, model, and dimension so
 operators can audit data-export routes without opening the embedding config.
-See `design/agentic-corpus-data-export-policy.md` for the default Voyage
+See `design/archive/agentic-corpus-data-export-policy.md` for the default Voyage
 routing policy and local-only Ollama override examples.
 
 For v1, the scheduled candidate scan is observable-only and capped at 50; seed

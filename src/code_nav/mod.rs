@@ -21,7 +21,7 @@ mod tests;
 ///
 /// Code-nav tools (`bbox_code_query`, `bbox_code_node_describe`,
 /// `bbox_code_symbols`) are syntax locators, not binding-aware lookups.
-/// Per the design boundary in `design/proposed/code-nav-symbolic-exploration.md`,
+/// Per the design boundary in `design/archive/code-nav-symbolic-exploration.md`,
 /// any tool that returns syntactic references must label them as
 /// syntax-derived so agents do not mistake them for semantic facts.
 pub const SEMANTIC_STATUS_SYNTAX_ONLY: &str = "syntax_only";

@@ -1,5 +1,7 @@
 # Agentic Corpus Data Export Policy
 
+Status: archived policy note for the shipped embedding route configuration.
+
 Blackbox routes embedding text by bucket. The default configuration sends every
 bucket to Voyage:
 

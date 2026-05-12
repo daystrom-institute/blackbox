@@ -407,7 +407,7 @@ fn test_unsupported_language_error() {
 
 /// Every code-nav tool must emit `semantic_status = "syntax_only"` at the
 /// top level. The design boundary in
-/// `design/proposed/code-nav-symbolic-exploration.md` forbids surfaces that
+/// `design/archive/code-nav-symbolic-exploration.md` forbids surfaces that
 /// promise binding-aware answers without going through LSP / compiler /
 /// graph confidence — this test locks that invariant mechanically so it
 /// cannot drift from the doc.

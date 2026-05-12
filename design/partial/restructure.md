@@ -1,7 +1,14 @@
 # Restructure Proposal: Crate Topology
 
 Date: 2026-05-05
-Status: proposal, baseline refreshed 2026-05-07
+Status: partially implemented; moved from `design/proposed/` on 2026-05-12
+Related: `design/partial/restructure-ast.md`
+
+Note: this plan is no longer a pure proposal. The repo now has a `[lib]`
+target, `src/packets/`, `src/server/`, and `src/tools/`, but `src/main.rs`
+still owns many binary-local module declarations and `src/lib.rs` is still a
+small shell. Keep this in `design/partial/` until the crate topology work is
+closed or superseded.
 
 ## Problem
 

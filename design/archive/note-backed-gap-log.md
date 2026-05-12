@@ -1,9 +1,9 @@
 # Note-backed gap log
 
-Status: proposal
+Status: implemented and archived after `32d15e7`
 Date: 2026-05-12
 Related: `src/notes.rs`, `src/inbox.rs`, `src/tools/packets.rs`,
-`src/system_memory/side-channel-notes.md`
+`src/system_memory/gap-notes.md`, `design/archive/note-backed-gap-log-impl.md`
 
 ## Thesis
 

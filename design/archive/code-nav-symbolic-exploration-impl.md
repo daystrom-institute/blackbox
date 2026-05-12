@@ -1,9 +1,9 @@
 # Code Navigation and Symbolic Exploration — implementation skeleton
 
 Date: 2026-05-11
-Status: proposal
+Status: implemented and archived after CN-X2 audit on 2026-05-12
 
-Companion to `design/proposed/code-nav-symbolic-exploration.md`. Phases are
+Companion to `design/archive/code-nav-symbolic-exploration.md`. Phases are
 prefixed `CN-` to disambiguate from `RA-` (refactor-agents), `RX-` (Rust
 expansion), and other plan prefixes.
 
@@ -867,7 +867,7 @@ design doc's Non-Tool sections:
 ## CN-X2 audit — Acceptance Criteria status (2026-05-12)
 
 The design-doc Acceptance Criteria from
-`design/proposed/code-nav-symbolic-exploration.md`:
+`design/archive/code-nav-symbolic-exploration.md`:
 
 1. **Tool docs explain syntax-only vs graph vs LSP semantics.**
    ✓ `src/tool_docs.rs` stanzas for `bbox_code_symbols`,
