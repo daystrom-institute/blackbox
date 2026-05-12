@@ -39,26 +39,48 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
         }
     }
 
+    // Gap 10: derive package + imports for the target, matching what
+    // extract_java_class already does. Without this the emitted file
+    // has no package decl and no imports, so every type reference
+    // fails javac with `cannot find symbol`.
+    let target_package = resolve_java_target_package(p, &parsed.source, &source_path, &target_path)?;
+    let source_package = extract_java_package(&parsed.source);
+    let cross_package = match (source_package.as_deref(), target_package.as_deref()) {
+        (Some(src), Some(tgt)) => src != tgt,
+        (None, Some(_)) | (Some(_), None) => true,
+        (None, None) => false,
+    };
+    let prelude = java_default_target_prelude(p, &parsed.source, target_package.as_deref());
+
+    // Source edits: delete each class from highest byte to lowest so
+    // earlier byte offsets stay valid.
     selected.sort_by_key(|c| std::cmp::Reverse(c.item.byte_start));
-
     let mut source_edits = Vec::new();
-    let mut extracted_content = Vec::new();
-
     for class_item in &selected {
         source_edits.push(TextEdit {
             byte_start: class_item.item.leading_trivia_start,
             byte_end: class_item.item.byte_end,
             replacement: String::new(),
         });
-        let content =
-            &parsed.source[class_item.item.leading_trivia_start..class_item.item.byte_end];
-        extracted_content.push(content.to_string());
     }
 
+    // Gap 10: strip `private` and `static` modifiers on each moved class
+    // becoming top-level. Promote to `public` on cross-package extracts so
+    // the source's remaining qualified references still resolve. Same-package
+    // extracts keep the default-package visibility — operator can widen
+    // afterwards if needed.
+    let mut extracted_content = Vec::new();
+    for class_item in &selected {
+        let raw = parsed
+            .source
+            .get(class_item.item.leading_trivia_start..class_item.item.byte_end)
+            .ok_or_else(|| anyhow!("invalid nested class range for `{}`", class_item.item.name.as_deref().unwrap_or("(unnamed)")))?;
+        let rewritten = rewrite_top_level_class_modifiers(raw, cross_package)?;
+        extracted_content.push(rewritten);
+    }
     extracted_content.reverse();
 
-    let prelude = p.target_prelude.clone().unwrap_or_default();
-    let target_content = format!("{}\n\n{}\n", prelude, extracted_content.join("\n\n"));
+    let target_content = format!("{}{}\n", prelude, extracted_content.join("\n\n"));
 
     let original_target_bytes = if target_path.exists() {
         fs::read(&target_path)?
@@ -96,7 +118,13 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
             },
             target_edit,
         ],
-        validations: vec![],
+        // Gap 10: the previous validations: vec![] meant tree-sitter
+        // didn't even fire on the target. Wire up parse-validation on
+        // both files so future regressions surface at plan time.
+        validations: parse_validation_step_for_path(&source_path)
+            .into_iter()
+            .chain(parse_validation_step_for_path(&target_path))
+            .collect(),
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),
@@ -110,6 +138,100 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+/// Gap 10: rewrite the modifier prefix of a top-level Java class
+/// declaration that was just extracted from a nested position.
+///
+/// - Strip `private` and `static` tokens. A top-level Java class can
+///   neither be private nor static; javac rejects both.
+/// - When `cross_package` is true and the declaration has no explicit
+///   `public` modifier, inject `public ` before the existing modifiers
+///   (or before the `class`/`interface`/`record`/`enum` keyword if no
+///   modifiers exist). Same-package extracts keep package-default
+///   visibility — operator widens afterwards if needed.
+/// - `final`, `abstract`, `sealed`, `non-sealed`, annotations, and
+///   anything else passes through untouched.
+fn rewrite_top_level_class_modifiers(raw: &str, cross_package: bool) -> Result<String> {
+    let tree = parse_source("java", raw)?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let decl = root.named_children(&mut cursor).find(|n| {
+        matches!(
+            n.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "record_declaration"
+                | "enum_declaration"
+                | "annotation_type_declaration"
+        )
+    });
+    let Some(decl) = decl else {
+        // No top-level declaration parsed — return raw text unchanged
+        // so the validator catches the syntax error rather than us
+        // silently dropping the move.
+        return Ok(raw.to_string());
+    };
+
+    let mut modifiers_node = None;
+    let mut keyword_node = None;
+    {
+        let mut c = decl.walk();
+        for child in decl.children(&mut c) {
+            match child.kind() {
+                "modifiers" => modifiers_node = Some(child),
+                "class" | "interface" | "record" | "enum" => {
+                    keyword_node = Some(child);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let bytes = raw.as_bytes();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut has_public = false;
+
+    if let Some(mods) = modifiers_node {
+        let mut c = mods.walk();
+        for tok in mods.children(&mut c) {
+            match tok.kind() {
+                "private" | "static" => {
+                    let start = tok.start_byte();
+                    let mut end = tok.end_byte();
+                    // Absorb a single trailing space so the next
+                    // modifier or keyword butts up cleanly. Don't
+                    // absorb newlines — annotations on their own line
+                    // shouldn't lose their separator.
+                    if end < bytes.len() && bytes[end] == b' ' {
+                        end += 1;
+                    }
+                    edits.push((start, end, String::new()));
+                }
+                "public" => has_public = true,
+                _ => {}
+            }
+        }
+    }
+
+    if cross_package && !has_public {
+        let insert_at = modifiers_node
+            .map(|n| n.start_byte())
+            .or_else(|| keyword_node.map(|n| n.start_byte()))
+            .unwrap_or_else(|| decl.start_byte());
+        edits.push((insert_at, insert_at, "public ".to_string()));
+    }
+
+    if edits.is_empty() {
+        return Ok(raw.to_string());
+    }
+    edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut out = raw.to_string();
+    for (start, end, repl) in edits {
+        out.replace_range(start..end, &repl);
+    }
+    Ok(out)
 }
 
 pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {

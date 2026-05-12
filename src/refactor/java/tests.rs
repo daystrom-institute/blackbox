@@ -6102,3 +6102,151 @@
         assert!(!final_text.contains("getFirst()"));
         assert!(!final_text.contains("getSecond()"));
     }
+
+    // ── Gap 10: extract_java_nested_classes emits a compilable target ──
+
+    // Gap 10: same-package extract gets package decl + imports +
+    // private/static modifiers stripped on the moved class. Package
+    // visibility (no public modifier) is fine because callers in the
+    // same package resolve default-package items.
+    #[test]
+    fn extract_java_nested_classes_same_package_strips_modifiers_and_adds_prelude() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        let source = pkg_dir.join("Outer.java");
+        let target = pkg_dir.join("Readings.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.List;\n\
+             import java.math.BigDecimal;\n\
+             public class Outer {\n\
+            \x20   private static final class Readings {\n\
+            \x20       private final List<BigDecimal> values;\n\
+            \x20       Readings(List<BigDecimal> v) { this.values = v; }\n\
+            \x20   }\n\
+            \x20   void use() { new Readings(java.util.List.of()); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+
+        assert!(
+            target_text.starts_with("package com.example;"),
+            "target must start with package decl: {target_text}"
+        );
+        assert!(
+            target_text.contains("import java.util.List;")
+                && target_text.contains("import java.math.BigDecimal;"),
+            "imports copied from source: {target_text}"
+        );
+        assert!(
+            !target_text.contains("private static final class Readings")
+                && !target_text.contains("private static class Readings")
+                && !target_text.contains("static final class Readings"),
+            "private + static stripped on the top-level class: {target_text}"
+        );
+        assert!(
+            target_text.contains("final class Readings")
+                || target_text.contains("class Readings"),
+            "class declaration survives (with final preserved if present): {target_text}"
+        );
+
+        // Validations now wired up; both files included.
+        assert_eq!(plan.validations.len(), 2);
+    }
+
+    // Gap 10: cross-package extract gets public modifier injected on
+    // top of stripping private/static, so the source's qualified
+    // reference still resolves from the new package.
+    #[test]
+    fn extract_java_nested_classes_cross_package_promotes_to_public() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/com/example");
+        let tgt_pkg = dir.path().join("src/main/java/com/example/queries");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&tgt_pkg).unwrap();
+        let source = src_pkg.join("Outer.java");
+        let target = tgt_pkg.join("Readings.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.List;\n\
+             public class Outer {\n\
+            \x20   private static class Readings {\n\
+            \x20       Readings() {}\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+
+        assert!(
+            target_text.starts_with("package com.example.queries;"),
+            "target package derived from path: {target_text}"
+        );
+        assert!(
+            target_text.contains("public class Readings"),
+            "public modifier injected on cross-package extract: {target_text}"
+        );
+        assert!(
+            !target_text.contains("private")
+                && !target_text.contains("static class Readings"),
+            "private + static stripped: {target_text}"
+        );
+    }
+
+    // Gap 10: emitted file must actually parse via tree-sitter — the
+    // previous validations: vec![] bug let nonsense through. This test
+    // pins the validation wiring.
+    #[test]
+    fn extract_java_nested_classes_emits_parseable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        let source = pkg_dir.join("Outer.java");
+        let target = pkg_dir.join("Inner.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private static class Inner {\n\
+            \x20       int x;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Inner".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+        // tree-sitter parse of the target text must have zero errors —
+        // the apply-validation step runs the same check.
+        let tree = parse_source("java", target_text).unwrap();
+        let report = parse_report(tree.root_node());
+        assert!(
+            !report.has_error && report.error_nodes == 0 && report.missing_nodes == 0,
+            "target text must parse cleanly: {target_text:?} (report={report:?})"
+        );
+    }
