@@ -361,6 +361,53 @@ mod tests {
     }
 
     #[test]
+    fn extract_impl_methods_rebases_super_paths_for_child_module_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("engine.rs");
+        let target = dir.path().join("engine/fanout.rs");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &source,
+            "struct WorkflowRunner;\n\nimpl WorkflowRunner {\n    fn run_activity_node(&self) {\n        self.run_dynamic_fanout_node();\n    }\n\n    fn run_dynamic_fanout_node(&self) -> super::schema::NodeSpec {\n        super::compile(\"x\");\n        super::schema::NodeSpec::default()\n    }\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["run_dynamic_fanout_node".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl WorkflowRunner".into()),
+            target_prelude: Some("use super::*;".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.contains("pub(super) fn run_dynamic_fanout_node"));
+        assert!(target_text.contains("-> super::super::schema::NodeSpec"));
+        assert!(target_text.contains("super::super::compile(\"x\")"));
+        assert!(!target_text.contains("super::super::super::schema"));
+    }
+
+    #[test]
     fn extract_impl_methods_can_generate_router_export_helper() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -4664,5 +4711,90 @@ impl Cache {
                 "matching toplevels must not trigger G15 refusal, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn rust_top_level_dependency_analysis_reports_edges_and_external_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let lib = src.join("lib.rs");
+        fs::write(
+            &lib,
+            "pub struct Config;\n\nconst LIMIT: usize = 3;\n\nfn helper() -> Config {\n    Config\n}\n\npub fn parse() -> usize {\n    let _cfg: Config = helper();\n    LIMIT\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("sibling.rs"),
+            "use crate::{parse, Config};\n\nfn call() {\n    let _ = parse();\n    let _cfg: Option<Config> = None;\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rust_top_level_dependency_analysis".into(),
+            source: path_string(&lib),
+            project_dir: Some(path_string(dir.path())),
+            item_names: Some(vec![
+                "Config".into(),
+                "LIMIT".into(),
+                "helper".into(),
+                "parse".into(),
+            ]),
+            item_kinds: None,
+            ..Default::default()
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        assert_eq!(value["kind"], "rust_top_level_dependency_analysis");
+        assert_eq!(value["dry_run"], true);
+        assert!(value["edits"].as_array().unwrap().is_empty());
+
+        let graph = &value["top_level_dependency_graph"];
+        let edges = graph["edges"].as_array().unwrap();
+        assert!(edges.iter().any(|edge| {
+            edge["from"] == "parse" && edge["to"] == "helper" && edge["kind"] == "calls"
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge["from"] == "parse" && edge["to"] == "Config" && edge["kind"] == "type_ref"
+        }));
+        assert!(edges.iter().any(|edge| {
+            edge["from"] == "parse" && edge["to"] == "LIMIT" && edge["kind"] == "global_ref"
+        }));
+
+        let external_refs = graph["external_references"].as_array().unwrap();
+        assert!(external_refs.iter().any(|reference| {
+            reference["item"] == "parse"
+                && reference["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("sibling.rs"))
+        }));
+        assert!(external_refs.iter().any(|reference| {
+            reference["item"] == "Config"
+                && reference["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("sibling.rs"))
+        }));
+    }
+
+    #[test]
+    fn rust_top_level_dependency_analysis_warns_on_macro_invocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        fs::write(&lib, "fn macro_user() {\n    println!(\"opaque {}\", 1);\n}\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rust_top_level_dependency_analysis".into(),
+            source: path_string(&lib),
+            item_names: Some(vec!["macro_user".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let warnings = value["top_level_dependency_graph"]["warnings"]
+            .as_array()
+            .unwrap();
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap_or_default().contains("macro_user")));
     }
 }

@@ -65,8 +65,9 @@ Plan kinds, grouped by intent:
   or `extract_rust_items_to_submodule` / `move_rust_items_with_callers`
   (cross-file case) instead.
 - Analysis only (no FileEdits): `rust_impl_partition_analysis` (impl-method
-  graph for split planning), `rust_public_api_guard` (advisory for visibility
-  changes touching public API).
+  graph for split planning), `rust_top_level_dependency_analysis` (top-level
+  item graph + external reference hints + suggested clusters),
+  `rust_public_api_guard` (advisory for visibility changes touching public API).
 - Run-loop integration: `rust_compile_fix_round` (classify a `capture=rustc_json`
   step's diagnostics into use-decl / visibility / replace proposals).
 - Generic primitives (language-agnostic, useful in compound runs):
@@ -83,7 +84,10 @@ Writable plan kinds:
 - `extract_rust_impl_methods`: move named methods out of one `impl` block into
   another file, preserving method attributes/modifiers such as `async` and
   optionally generating a `#[tool_router(router = name)]` wrapper around the
-  moved methods.
+  moved methods. When moving from `foo.rs` to `foo/bar.rs`, the planner rebases
+  `super::...` references one module deeper (`super::super::...`). If the
+  parent file still references a moved method after deletion and `visibility`
+  was not supplied, the moved method is widened to `pub(super)`.
 - `delete_rust_items`: delete named top-level Rust items or named impl methods
   in place. `item_names` is required; use `item_kinds` only to narrow matches.
   Use `item_kinds=["impl_method"]` plus `impl_name` when method names are
@@ -173,6 +177,9 @@ Writable plan kinds:
     somewhere in the source after the deletions land. Names whose only
     references were inside the moved items themselves are dropped from
     the use_decl entirely (no spurious unused-import warning).
+    When `use_decl_visibility="pub(super)"` and `use_decl_items` is omitted,
+    the planner emits `pub(super) use <module_name>::*;` as an explicit broad
+    compatibility mode for sibling modules that rely on `use super::*`.
   - `merge_into_existing_target` (default `false`): append moved item
     blocks to an existing non-empty target instead of refusing. Useful
     for incremental batching multiple plan calls into the same
@@ -237,6 +244,12 @@ Writable plan kinds:
   of methods inside one `impl` block. Pass `source` + `impl_name` (or
   `module_name`). Returns `partition_graph`; no FileEdits. Use before a split
   to see which methods cluster together.
+- `rust_top_level_dependency_analysis` (analysis-only): build a dependency
+  graph for named or all top-level Rust items in one file. Returns
+  `top_level_dependency_graph` with item->call/type/module/global edges,
+  crate-wide textual external reference hints, suggested connected clusters,
+  and macro-heavy warnings. Use before choosing `item_names` for
+  `extract_rust_items_to_submodule`.
 - `rust_public_api_guard` (analysis-only): score a proposed set of changes
   against the file's public API surface and report severity / touched-item
   delta. `toml_entries={"proposed_changes": [...]}` carries the change set.

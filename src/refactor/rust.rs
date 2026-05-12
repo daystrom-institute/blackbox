@@ -269,6 +269,27 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
         })
         .collect::<Vec<_>>();
 
+    let source_edits = selected
+        .iter()
+        .map(|method| TextEdit {
+            byte_start: method.item.leading_trivia_start,
+            byte_end: method.item.trailing_trivia_end,
+            replacement: String::new(),
+        })
+        .collect::<Vec<_>>();
+    ensure_non_overlapping(&source_edits)?;
+
+    let parent_after_move = apply_text_edits(&parsed.source, &source_edits)?;
+    let parent_still_calls_moved_method = selected
+        .iter()
+        .filter_map(|method| method.item.name.as_deref())
+        .any(|name| rust_text_contains_identifier(&parent_after_move, name));
+    let effective_visibility = p
+        .visibility
+        .as_deref()
+        .or_else(|| parent_still_calls_moved_method.then_some("pub(super)"));
+    let rebase_super_paths = rust_target_is_child_module_of_source(&source_path, &target_path);
+
     let target_source = fs::read_to_string(&target_path).unwrap_or_default();
     let target_edits = rust_impl_methods_target_edits(
         &target_path,
@@ -279,18 +300,9 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
         &selected[0].impl_name,
         &parsed.source,
         &selected,
-        p.visibility.as_deref(),
+        effective_visibility,
+        rebase_super_paths,
     )?;
-
-    let source_edits = selected
-        .iter()
-        .map(|method| TextEdit {
-            byte_start: method.item.leading_trivia_start,
-            byte_end: method.item.trailing_trivia_end,
-            replacement: String::new(),
-        })
-        .collect::<Vec<_>>();
-    ensure_non_overlapping(&source_edits)?;
 
     // RX-A1: run deep analysis before consuming `selected`.
     let (semantic_status, deep_analysis) = if p.deep_analysis == Some(true) {
@@ -1259,6 +1271,7 @@ pub(crate) fn rust_impl_methods_target_edits(
     source: &str,
     selected: &[RustImplMethod],
     visibility: Option<&str>,
+    rebase_super_paths: bool,
 ) -> Result<Vec<TextEdit>> {
     if let Some(insertion) =
         existing_target_impl_insert_byte(target_path, target_source, impl_name, router_name)?
@@ -1267,7 +1280,12 @@ pub(crate) fn rust_impl_methods_target_edits(
         if !insertion.body_is_empty {
             replacement.push('\n');
         }
-        replacement.push_str(&rust_impl_methods_block(source, selected, visibility)?);
+        replacement.push_str(&rust_impl_methods_block(
+            source,
+            selected,
+            visibility,
+            rebase_super_paths,
+        )?);
         return Ok(vec![TextEdit {
             byte_start: insertion.byte,
             byte_end: insertion.byte,
@@ -1283,6 +1301,7 @@ pub(crate) fn rust_impl_methods_target_edits(
         source,
         selected,
         visibility,
+        rebase_super_paths,
     )?;
     let Some(prelude) = target_prelude
         .map(str::trim)
@@ -1422,6 +1441,7 @@ pub(crate) fn rust_impl_methods_target_wrapper(
     source: &str,
     selected: &[RustImplMethod],
     visibility: Option<&str>,
+    rebase_super_paths: bool,
 ) -> Result<String> {
     let mut wrapper = String::new();
     if let Some(export_name) = router_export_name {
@@ -1444,7 +1464,12 @@ pub(crate) fn rust_impl_methods_target_wrapper(
     }
     wrapper.push_str(impl_name);
     wrapper.push_str(" {\n");
-    wrapper.push_str(&rust_impl_methods_block(source, selected, visibility)?);
+    wrapper.push_str(&rust_impl_methods_block(
+        source,
+        selected,
+        visibility,
+        rebase_super_paths,
+    )?);
     wrapper.push_str("}\n");
 
     if target_source.trim().is_empty() {
@@ -1466,6 +1491,7 @@ pub(crate) fn rust_impl_methods_block(
     source: &str,
     selected: &[RustImplMethod],
     visibility: Option<&str>,
+    rebase_super_paths: bool,
 ) -> Result<String> {
     let mut block = String::new();
     let vis_prefix = if let Some(v) = visibility {
@@ -1484,7 +1510,7 @@ pub(crate) fn rust_impl_methods_block(
                 )
             })?;
 
-        let text = if let Some(ref new_vis) = vis_prefix {
+        let mut text = if let Some(ref new_vis) = vis_prefix {
             let keyword = rust_visibility_keyword_byte(source, &method.item)?;
             let vis_start = rust_item_visibility_start_byte(source, &method.item, keyword);
 
@@ -1503,6 +1529,9 @@ pub(crate) fn rust_impl_methods_block(
         } else {
             original_text.to_string()
         };
+        if rebase_super_paths {
+            text = rust_rebase_super_paths_one_level_deeper(&text);
+        }
 
         if idx > 0 {
             block.push('\n');
@@ -1511,6 +1540,52 @@ pub(crate) fn rust_impl_methods_block(
         block.push('\n');
     }
     Ok(block)
+}
+
+fn rust_target_is_child_module_of_source(source_path: &Path, target_path: &Path) -> bool {
+    let Some(source_parent) = source_path.parent() else {
+        return false;
+    };
+    let Some(source_stem) = source_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    target_path.parent() == Some(&source_parent.join(source_stem))
+}
+
+fn rust_text_contains_identifier(text: &str, needle: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    bytes.windows(needle.len()).enumerate().any(|(idx, window)| {
+        window == needle
+            && rust_identifier_boundary(bytes.get(idx.wrapping_sub(1)).copied())
+            && rust_identifier_boundary(bytes.get(idx + needle.len()).copied())
+    })
+}
+
+fn rust_identifier_boundary(ch: Option<u8>) -> bool {
+    !matches!(ch, Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'))
+}
+
+fn rust_rebase_super_paths_one_level_deeper(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0;
+    while idx < text.len() {
+        let rest = &text[idx..];
+        if rest.starts_with("super::")
+            && rust_identifier_boundary(text.as_bytes().get(idx.wrapping_sub(1)).copied())
+        {
+            out.push_str("super::super::");
+            idx += "super::".len();
+        } else {
+            let ch = rest.chars().next().expect("idx is on char boundary");
+            out.push(ch);
+            idx += ch.len_utf8();
+        }
+    }
+    out
 }
 
 pub(crate) fn validate_rust_identifier(value: &str, field: &str) -> Result<()> {

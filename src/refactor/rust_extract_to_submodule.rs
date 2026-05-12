@@ -122,42 +122,56 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
     // Source-side: mod_decl + use_decl insertions (skip if already present).
     let mod_decl_edit = compute_mod_decl_edit_idempotent(&parsed.source, &items, &module_name)?;
 
-    // Auto-prune the re-export list: when the operator didn't pass
-    // `use_decl_items` explicitly, scan the source for surviving
-    // identifier references to each moved name. Names whose every
-    // occurrence is inside a deletion range need no re-export.
-    let deletion_ranges: Vec<(usize, usize)> = selected
-        .iter()
-        .map(|item| (item.leading_trivia_start, item.trailing_trivia_end))
-        .collect();
-    let re_export_names: Vec<String> = match explicit_use_decl_items {
-        Some(names) => {
-            // Validate every requested name is in the move set.
-            let move_set: HashSet<&str> =
-                selected.iter().filter_map(|i| i.name.as_deref()).collect();
-            for n in &names {
-                if !move_set.contains(n.as_str()) {
-                    bail!(
-                        "use_decl_items entry `{n}` is not in item_names; \
-                         can only re-export moved items"
-                    );
-                }
-            }
-            names
-        }
-        None => survivors_referenced_in_source(&parsed.source, &deletion_ranges, &selected),
-    };
-
-    let use_decl_edit = if re_export_names.is_empty() {
-        None
-    } else {
-        let use_path_str = build_use_path_for_names(&module_name, &re_export_names);
+    let glob_reexport =
+        use_decl_visibility_prefix == "pub(super) " && explicit_use_decl_items.is_none();
+    let use_decl_edit = if glob_reexport {
+        let use_path_str = format!("{module_name}::*");
         compute_use_decl_edit_idempotent(
             &parsed.source,
             &items,
             &use_path_str,
             use_decl_visibility_prefix,
         )?
+    } else {
+        // Auto-prune the re-export list: when the operator didn't pass
+        // `use_decl_items` explicitly, scan the source for surviving
+        // identifier references to each moved name. Names whose every
+        // occurrence is inside a deletion range need no re-export.
+        let deletion_ranges: Vec<(usize, usize)> = selected
+            .iter()
+            .map(|item| (item.leading_trivia_start, item.trailing_trivia_end))
+            .collect();
+        let re_export_names: Vec<String> = match explicit_use_decl_items {
+            Some(names) => {
+                // Validate every requested name is in the move set.
+                let move_set: HashSet<&str> = selected
+                    .iter()
+                    .filter_map(|i| i.name.as_deref())
+                    .collect();
+                for n in &names {
+                    if !move_set.contains(n.as_str()) {
+                        bail!(
+                            "use_decl_items entry `{n}` is not in item_names; \
+                             can only re-export moved items"
+                        );
+                    }
+                }
+                names
+            }
+            None => survivors_referenced_in_source(&parsed.source, &deletion_ranges, &selected),
+        };
+
+        if re_export_names.is_empty() {
+            None
+        } else {
+            let use_path_str = build_use_path_for_names(&module_name, &re_export_names);
+            compute_use_decl_edit_idempotent(
+                &parsed.source,
+                &items,
+                &use_path_str,
+                use_decl_visibility_prefix,
+            )?
+        }
     };
 
     // Source-side deletions for each moved item.
@@ -1001,6 +1015,35 @@ mod tests {
         assert!(
             source_after.contains("pub(crate) use child::x;"),
             "use_decl should have pub(crate) prefix: {source_after}"
+        );
+    }
+
+    #[test]
+    fn pub_super_visibility_without_explicit_items_emits_glob_reexport() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        fs::write(&src, "fn caller() { x(); }\nfn x() {}\nfn y() {}\n").unwrap();
+        let mut params = make_params(&src, &tgt, &["x", "y"], Some(vec!["function_item"]));
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "use_decl_visibility".to_string(),
+            serde_json::Value::String("pub(super)".to_string()),
+        );
+        params.toml_entries = Some(entries);
+        let plan_json = plan_extract_rust_items_to_submodule(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        let source_after = apply_file_edit(&src, &plan.edits[0]);
+        assert!(
+            source_after.contains("pub(super) use child::*;"),
+            "pub(super) compatibility mode should use a glob re-export: {source_after}"
+        );
+        assert!(
+            !source_after.contains("use child::{x, y};")
+                && !source_after.contains("use child::x;")
+                && !source_after.contains("use child::y;"),
+            "pub(super) compatibility mode should not emit explicit imports: {source_after}"
         );
     }
 
