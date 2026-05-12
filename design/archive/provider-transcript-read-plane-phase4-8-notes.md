@@ -2,7 +2,8 @@
 
 Date: 2026-05-12
 Author: readplane-impl::glm (task 30de744d)
-Companion to: `provider-transcript-read-plane-impl.md`
+Status: implemented follow-up notes archived after `c3022b5`
+Companion to: `design/archive/provider-transcript-read-plane-impl.md`
 
 Concrete codebase audit of every provider surface that Phases 4-8 depend on.
 Findings are keyed by phase with file:line references to the actual code.
@@ -590,7 +591,7 @@ After Phase 3 lands:
 
 | File | Change |
 |------|--------|
-| `design/proposed/provider-transcript-read-plane-phase4-8-notes.md` | New file (this document) |
+| `design/archive/provider-transcript-read-plane-phase4-8-notes.md` | New file (this document) |
 
 No source files were modified. No tests were added or changed.
 

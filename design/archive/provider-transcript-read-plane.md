@@ -1,8 +1,16 @@
 # Provider transcript read plane
 
-Status: design proposal v2
+Status: implemented and archived after `c3022b5`
 Date: 2026-05-12
-Related: `design/proposed/provider-transcript-read-plane-impl.md`, `design/proposed/tmux-portal-workflows.md`, `WORKFLOWS.md`
+Related: `design/archive/provider-transcript-read-plane-impl.md`, `design/proposed/tmux-portal-workflows.md`, `WORKFLOWS.md`
+
+Implementation note: this archived design records the pre-implementation
+intent. The landed code in `src/transcripts/types.rs` uses a flat
+`TranscriptLocation { provider, storage, path, ... }` struct rather than the
+tagged enum sketched below, and `TranscriptCursor` uses
+`ProviderEventId`/`MessageIdSet` variants rather than the exact preliminary
+shape in this document. New implementation work should treat
+`src/transcripts/types.rs` as canonical.
 
 ## 1. Thesis
 
@@ -366,8 +374,9 @@ This is the layer that tmux mode should depend on for automated status.
 Adapter failures are workflow-visible. A workflow gate that depends on the
 read plane should treat adapter errors as transient until proven otherwise:
 
-1. Retry with backoff up to the provider's threshold. Default: three retries
-   over sixty seconds.
+1. Retry with backoff up to the provider's threshold. The landed v1 behavior
+   is three consecutive read failures with bounded polling delay; consult
+   `src/workflow/engine.rs::provider_event_retry_delay` for the exact timing.
 2. If retries fail, mark the node `blocked` with the adapter error, provider,
    session id, cursor, and raw location in the note.
 3. If a TUI processor exists, include its advisory snapshot as evidence, but

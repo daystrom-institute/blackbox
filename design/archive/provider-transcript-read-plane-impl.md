@@ -1,7 +1,8 @@
 # Provider Transcript Read Plane: Implementation Plan
 
 Date: 2026-05-12
-Companion to: `design/proposed/provider-transcript-read-plane.md` (design);
+Status: implemented and archived after `c3022b5`
+Companion to: `design/archive/provider-transcript-read-plane.md` (design);
 supports `design/proposed/tmux-portal-workflows.md`.
 
 The implementation should land the read-plane abstraction without breaking
@@ -583,7 +584,7 @@ persists the cursor through `CursorStore`.
 
 8.3 **Degradation rule.** On adapter error:
 
-- retry with backoff, default three retries over sixty seconds
+- retry with backoff up to the implemented provider-event threshold
 - if still failing, mark node blocked
 - include provider, session id, cursor, location, and adapter error in a
   `bbox_note(kind="blocked")`

@@ -2,7 +2,7 @@
 
 Status: design proposal v3
 Date: 2026-05-12
-Related: `WORKFLOWS.md`, `examples/keystone/`, `design/proposed/supervision.md`, `design/proposed/provider-transcript-read-plane.md`
+Related: `WORKFLOWS.md`, `examples/keystone/`, `design/proposed/supervision.md`, `design/archive/provider-transcript-read-plane.md`, `design/proposed/tmux-portal-workflows-impl.md`
 
 ## 1. Thesis
 
@@ -105,7 +105,7 @@ struct PortalHandle {
 The handle is task metadata, not output. It should appear in
 `bro_arc_status`, `bro tail`, and notes only by reference.
 `TranscriptLocation` and `TranscriptCursor` come from
-`provider-transcript-read-plane.md`; tmux mode must not define a parallel
+`design/archive/provider-transcript-read-plane.md`; tmux mode must not define a parallel
 read-source model.
 
 ## 4. Portal hook ops
@@ -322,24 +322,31 @@ There are two processor classes.
 
 Read processors normalize provider transcript/session stores into a common
 event stream. These are the source of truth for workflow automation and are
-specified in `provider-transcript-read-plane.md`.
+specified in `design/archive/provider-transcript-read-plane.md`.
 
 Normalized events should be provider-neutral enough for workflow gates. The
-canonical shape lives in `provider-transcript-read-plane.md`; tmux mode uses
-it but does not own it. A typical event has this form:
+canonical implementation shape lives in `src/transcripts/types.rs`; the
+archived design is `design/archive/provider-transcript-read-plane.md`. Tmux
+mode uses it but does not own it. A typical event has this form:
 
 ```json
 {
-  "provider": "codex|claude|opencode",
+  "provider": "codex|claude|glm",
   "session_id": "...",
-  "sequence": "...",
   "role": "user|assistant|tool|system",
-  "kind": "message|tool_call|tool_result|error|status",
-  "text": "...",
-  "raw_ref": {
-    "store": "jsonl|sqlite|api",
+  "kind": "message|tool_use|tool_result|thinking|developer",
+  "content": "...",
+  "tool_call": {
+    "kind": "shell|edit|read|mcp|other",
+    "name": "Bash",
+    "tool_use_id": "..."
+  },
+  "raw": {
+    "storage": "jsonl_file|history_jsonl|json_file|sqlite|provider_command",
     "path": "...",
-    "record_id": "..."
+    "byte_offset": 123,
+    "event_idx": 0,
+    "provider_event_id": "..."
   }
 }
 ```
@@ -396,9 +403,10 @@ This keeps tmux as the live control surface while letting blackbox reason
 over transcript-quality data.
 
 If the read-plane adapter fails while a workflow gate is waiting, the
-workflow follows the degradation rule in `provider-transcript-read-plane.md`:
-retry briefly, then block with the adapter error and include any TUI snapshot
-only as diagnostic evidence.
+workflow follows the degradation rule in
+`design/archive/provider-transcript-read-plane.md`: retry briefly, then block
+with the adapter error and include any TUI snapshot only as diagnostic
+evidence.
 
 ## 10. Implementation sketch
 
