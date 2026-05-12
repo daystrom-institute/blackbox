@@ -7601,3 +7601,23 @@ class Example {\n\
             "@Inject must appear immediately above the target ctor: {target_text}"
         );
     }
+
+    // G16-FU: @FunctionalInterface and @SafeVarargs are JDK built-in
+    // annotation types — java_builtin_type must classify them as such so
+    // the organize-imports heuristic doesn't try to resolve them as
+    // project-local types.
+    #[test]
+    fn g16_fu_java_builtin_type_includes_functional_interface_and_safe_varargs() {
+        assert!(
+            java_builtin_type("FunctionalInterface"),
+            "FunctionalInterface must be a JDK builtin"
+        );
+        assert!(
+            java_builtin_type("SafeVarargs"),
+            "SafeVarargs must be a JDK builtin"
+        );
+        assert!(
+            !java_builtin_type("Inject"),
+            "Inject must NOT be a JDK builtin"
+        );
+    }
