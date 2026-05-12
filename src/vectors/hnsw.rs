@@ -366,11 +366,7 @@ impl HnswIndex {
     }
 
     fn max_neighbors(&self, layer: usize) -> usize {
-        if layer == 0 {
-            self.m0
-        } else {
-            self.options.m
-        }
+        if layer == 0 { self.m0 } else { self.options.m }
     }
 
     fn deterministic_level(&self, id: &str) -> usize {

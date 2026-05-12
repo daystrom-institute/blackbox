@@ -87,13 +87,18 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
 
     let parsed = parse_rust_file(&source_path)?;
     let items = rust_items(&parsed);
-    let selected = select_top_level_items_local(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
+    let selected =
+        select_top_level_items_local(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
 
     // Render each moved item with item-level visibility + (struct) field
     // visibility bumped. Bake into target text so no sequencing edits run.
     let mut moved_blocks: Vec<String> = Vec::new();
     for item in &selected {
-        moved_blocks.push(render_item_with_visibility_bumped(&parsed, item, visibility_prefix)?);
+        moved_blocks.push(render_item_with_visibility_bumped(
+            &parsed,
+            item,
+            visibility_prefix,
+        )?);
     }
 
     // v2 knobs out of toml_entries.
@@ -111,15 +116,11 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
     };
     let explicit_use_decl_items: Option<Vec<String>> =
         read_toml_str_array(&p.toml_entries, "use_decl_items");
-    let merge_into_existing_target = read_toml_bool(
-        &p.toml_entries,
-        "merge_into_existing_target",
-    )
-    .unwrap_or(false);
+    let merge_into_existing_target =
+        read_toml_bool(&p.toml_entries, "merge_into_existing_target").unwrap_or(false);
 
     // Source-side: mod_decl + use_decl insertions (skip if already present).
-    let mod_decl_edit =
-        compute_mod_decl_edit_idempotent(&parsed.source, &items, &module_name)?;
+    let mod_decl_edit = compute_mod_decl_edit_idempotent(&parsed.source, &items, &module_name)?;
 
     // Auto-prune the re-export list: when the operator didn't pass
     // `use_decl_items` explicitly, scan the source for surviving
@@ -132,10 +133,8 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
     let re_export_names: Vec<String> = match explicit_use_decl_items {
         Some(names) => {
             // Validate every requested name is in the move set.
-            let move_set: HashSet<&str> = selected
-                .iter()
-                .filter_map(|i| i.name.as_deref())
-                .collect();
+            let move_set: HashSet<&str> =
+                selected.iter().filter_map(|i| i.name.as_deref()).collect();
             for n in &names {
                 if !move_set.contains(n.as_str()) {
                     bail!(
@@ -285,8 +284,7 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
         fixme_count: None,
     };
 
-    validate_plan_shape(&plan)
-        .context("validate extract_rust_items_to_submodule plan")?;
+    validate_plan_shape(&plan).context("validate extract_rust_items_to_submodule plan")?;
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
@@ -310,8 +308,7 @@ fn select_top_level_items_local<'a>(
             );
         }
     }
-    let kind_set = kinds
-        .map(|xs| xs.iter().map(String::as_str).collect::<HashSet<_>>());
+    let kind_set = kinds.map(|xs| xs.iter().map(String::as_str).collect::<HashSet<_>>());
     let mut selected: Vec<&SyntaxItem> = Vec::new();
     for expected in names {
         let mut matches = items
@@ -515,8 +512,7 @@ fn survivors_referenced_in_source(
             }
             // Word boundary checks.
             let prev_ok = i == 0 || !is_rust_ident_byte(bytes[i - 1]);
-            let next_ok =
-                i + nlen == bytes.len() || !is_rust_ident_byte(bytes[i + nlen]);
+            let next_ok = i + nlen == bytes.len() || !is_rust_ident_byte(bytes[i + nlen]);
             if !prev_ok || !next_ok {
                 i += 1;
                 continue;
@@ -721,11 +717,7 @@ mod tests {
         let src = dir.path().join("parent.rs");
         let tgt = dir.path().join("parent/child.rs");
         fs::create_dir_all(tgt.parent().unwrap()).unwrap();
-        fs::write(
-            &src,
-            "struct Data { value: u32 }\nfn doit() {}\n",
-        )
-        .unwrap();
+        fs::write(&src, "struct Data { value: u32 }\nfn doit() {}\n").unwrap();
 
         let mut params = make_params(&src, &tgt, &["Data", "doit"], None);
         params.visibility = Some("pub(crate)".to_string());
@@ -897,11 +889,7 @@ mod tests {
         let src = dir.path().join("parent.rs");
         let tgt = dir.path().join("parent/child.rs");
         fs::create_dir_all(tgt.parent().unwrap()).unwrap();
-        fs::write(
-            &src,
-            "mod child;\nuse child::x;\n\nfn x() {}\n",
-        )
-        .unwrap();
+        fs::write(&src, "mod child;\nuse child::x;\n\nfn x() {}\n").unwrap();
         let plan_json = plan_extract_rust_items_to_submodule(&make_params(
             &src,
             &tgt,
@@ -1050,11 +1038,7 @@ mod tests {
         fs::create_dir_all(tgt.parent().unwrap()).unwrap();
         // outer() references both. Auto-prune would keep both. Override
         // shrinks the use_decl to just `x`.
-        fs::write(
-            &src,
-            "fn outer() { x(); y(); }\nfn x() {}\nfn y() {}\n",
-        )
-        .unwrap();
+        fs::write(&src, "fn outer() { x(); y(); }\nfn x() {}\nfn y() {}\n").unwrap();
         let mut params = make_params(&src, &tgt, &["x", "y"], Some(vec!["function_item"]));
         let mut entries = std::collections::BTreeMap::new();
         entries.insert(
@@ -1111,11 +1095,7 @@ mod tests {
         fs::create_dir_all(tgt.parent().unwrap()).unwrap();
         fs::write(&src, "fn caller() { added(); }\nfn added() {}\n").unwrap();
         // Existing target has a prelude + one item.
-        fs::write(
-            &tgt,
-            "use super::*;\n\npub(super) fn already_here() {}\n",
-        )
-        .unwrap();
+        fs::write(&tgt, "use super::*;\n\npub(super) fn already_here() {}\n").unwrap();
         let mut params = make_params(&src, &tgt, &["added"], Some(vec!["function_item"]));
         let mut entries = std::collections::BTreeMap::new();
         entries.insert(
@@ -1123,8 +1103,8 @@ mod tests {
             serde_json::Value::Bool(true),
         );
         params.toml_entries = Some(entries);
-        let plan_json = plan_extract_rust_items_to_submodule(&params)
-            .expect("merge should succeed");
+        let plan_json =
+            plan_extract_rust_items_to_submodule(&params).expect("merge should succeed");
         let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
         let target_after = apply_file_edit(&tgt, &plan.edits[1]);
         // Original content preserved.

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use tree_sitter::Query;
 
 use super::*;
@@ -34,7 +34,7 @@ pub fn plan_lift_to_free(p: &RefactorPlanParams) -> Result<String> {
         .as_deref()
         .ok_or_else(|| anyhow!("target is required for lift_rust_inherent_to_free"))
         .and_then(|target| resolve_path(p.project_dir.as_deref(), target))?;
-    
+
     if source_path == target_path {
         bail!("source and target must be different files");
     }
@@ -48,17 +48,19 @@ pub fn plan_lift_to_free(p: &RefactorPlanParams) -> Result<String> {
 
     // Parse the source file
     let parsed = parse_rust_file(&source_path)?;
-    
+
     // Extract impl methods
     let all_methods = rust_impl_methods(&parsed);
     let impl_name = &all_methods[0].impl_name; // All methods are from same impl block
-    
+
     // Filter and select methods
     let mut selected: Vec<RustImplMethod> = Vec::new();
     for expected in names {
         let matches = all_methods
             .iter()
-            .filter(|method| method.impl_name == *impl_name && method.item.name.as_deref() == Some(expected))
+            .filter(|method| {
+                method.impl_name == *impl_name && method.item.name.as_deref() == Some(expected)
+            })
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [] => bail!("requested impl method `{expected}` was not found"),
@@ -75,18 +77,32 @@ pub fn plan_lift_to_free(p: &RefactorPlanParams) -> Result<String> {
     let mut kept: Vec<RustImplMethod> = Vec::new();
 
     for method in &selected {
-        let method_text = parsed.source
+        let method_text = parsed
+            .source
             .get(method.item.leading_trivia_start..method.item.byte_end)
-            .ok_or_else(|| anyhow!("invalid method range for {}", method.item.name.as_deref().unwrap_or("(unnamed)")))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid method range for {}",
+                    method.item.name.as_deref().unwrap_or("(unnamed)")
+                )
+            })?;
 
-        match analyze_method_lift(method_text, method.item.name.as_deref().unwrap_or("(unnamed)")) {
+        match analyze_method_lift(
+            method_text,
+            method.item.name.as_deref().unwrap_or("(unnamed)"),
+        ) {
             Ok(result) => {
                 results.push(result);
                 kept.push(method.clone());
             }
             Err(reason) => {
                 refusal_reasons.push(LiftRefusalReason {
-                    method: method.item.name.as_deref().unwrap_or("(unnamed)").to_string(),
+                    method: method
+                        .item
+                        .name
+                        .as_deref()
+                        .unwrap_or("(unnamed)")
+                        .to_string(),
                     reason: reason.to_string(),
                 });
             }
@@ -106,7 +122,7 @@ pub fn plan_lift_to_free(p: &RefactorPlanParams) -> Result<String> {
     // Create target file edits
     let target_source = fs::read_to_string(&target_path).unwrap_or_default();
     let mut target_edits = Vec::new();
-    
+
     // Module name derived from target file basename
     let module_name = target_path
         .file_stem()
@@ -120,7 +136,7 @@ pub fn plan_lift_to_free(p: &RefactorPlanParams) -> Result<String> {
         .map(|r| r.free_function.clone())
         .collect::<Vec<_>>();
     let free_functions_text = free_functions.join("\n\n");
-    
+
     if !free_functions_text.is_empty() {
         target_edits.push(TextEdit {
             byte_start: target_source.len(),
@@ -196,12 +212,12 @@ pub fn plan_lift_to_free(p: &RefactorPlanParams) -> Result<String> {
     };
 
     validate_plan_shape(&plan)?;
-    
+
     let response = PlanWithRefusalReasons {
         plan,
         refusal_reasons,
     };
-    
+
     Ok(serde_json::to_string_pretty(&response)?)
 }
 
@@ -210,22 +226,22 @@ fn analyze_method_lift(method_text: &str, method_name: &str) -> Result<MethodLif
     let has_self_field = method_text.contains("self.");
     let has_self_type_ref = method_text.contains("Self::");
     let has_self_expr = method_text.contains("self()");
-    
+
     if has_self_field {
         bail!("method contains `self.field` access");
     }
-    
+
     if has_self_type_ref {
         bail!("method contains `Self::` references");
     }
-    
+
     if has_self_expr {
         bail!("method contains `self` expression");
     }
 
     // Generate free function by removing `self` from parameters and returns
     let free_function = generate_free_function(method_text, method_name)?;
-    
+
     // Generate call site rewrites (simple case for this implementation)
     let call_site_edits = generate_call_site_edits(method_name);
 
@@ -296,7 +312,7 @@ mod tests {
         value.to_uppercase()
     }
 "#;
-        
+
         let result = analyze_method_lift(method_text, "helper").unwrap();
         assert!(!result.free_function.contains("&self"));
         assert!(result.free_function.contains("fn helper("));
@@ -311,7 +327,7 @@ mod tests {
         self.data.clone()
     }
 "#;
-        
+
         let result = analyze_method_lift(method_text, "process");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("self.field"));
@@ -324,7 +340,7 @@ mod tests {
         Self::CONST * 2
     }
 "#;
-        
+
         let result = analyze_method_lift(method_text, "calculate");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Self::"));
@@ -334,9 +350,11 @@ mod tests {
     fn test_mixed_items_one_accepted_one_refused() {
         let source_path = Path::new("test_source.rs");
         let target_path = Path::new("test_target.rs");
-        
+
         // Create test files
-        fs::write(source_path, r#"
+        fs::write(
+            source_path,
+            r#"
 impl MyStruct {
     pub fn pure_method(&self) -> String {
         "pure".to_string()
@@ -346,10 +364,12 @@ impl MyStruct {
         self.field.clone()
     }
 }
-"#).unwrap();
-        
+"#,
+        )
+        .unwrap();
+
         fs::write(target_path, "").unwrap();
-        
+
         let params = RefactorPlanParams {
             kind: "lift_rust_inherent_to_free".to_string(),
             source: source_path.to_string_lossy().into_owned(),
@@ -388,17 +408,17 @@ impl MyStruct {
             callback_externals: None,
             output_path: None,
         };
-        
+
         let result = plan_lift_to_free(&params);
-        
+
         // Clean up test files
         fs::remove_file(source_path).unwrap();
         fs::remove_file(target_path).unwrap();
-        
+
         assert!(result.is_ok());
         let plan_json = result.unwrap();
         let plan: PlanWithRefusalReasons = serde_json::from_str(&plan_json).unwrap();
-        
+
         // Should have one accepted, one refused
         assert_eq!(plan.plan.items.len(), 1);
         assert_eq!(plan.refusal_reasons.len(), 1);

@@ -2,8 +2,8 @@ use anyhow::Result;
 
 use super::adapter::AgentAdapterRegistry;
 use super::types::{
-    validate_description_length, validate_when_to_use_nonempty, AgentFilterOverlay, AgentManifest,
-    AgentProvenance,
+    AgentFilterOverlay, AgentManifest, AgentProvenance, validate_description_length,
+    validate_when_to_use_nonempty,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2062,9 +2062,8 @@ mod tests {
         }
         atom_names.sort();
 
-        let catalog =
-            std::fs::read_to_string(crate_root.join("src/system_memory/refactor.md"))
-                .expect("read sm-refactor");
+        let catalog = std::fs::read_to_string(crate_root.join("src/system_memory/refactor.md"))
+            .expect("read sm-refactor");
 
         let mut missing: Vec<&str> = Vec::new();
         for name in &atom_names {
@@ -2138,8 +2137,8 @@ mod tests {
             }
             found += 1;
             let src = std::fs::read_to_string(&path).expect("read manifest");
-            let v: serde_json::Value = serde_json::from_str(&src)
-                .unwrap_or_else(|e| panic!("{name} did not parse: {e}"));
+            let v: serde_json::Value =
+                serde_json::from_str(&src).unwrap_or_else(|e| panic!("{name} did not parse: {e}"));
             assert!(
                 is_refactor_atom_artifact(&v, None),
                 "{name} missing _contract marker"

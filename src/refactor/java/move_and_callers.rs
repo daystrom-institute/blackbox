@@ -70,9 +70,7 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
             bail!("move_java_constant only supports java files");
         }
         let target_class = find_first_class_declaration(target_parsed.tree.root_node())
-            .ok_or_else(|| {
-                anyhow!("no class declaration found in {}", target_path.display())
-            })?;
+            .ok_or_else(|| anyhow!("no class declaration found in {}", target_path.display()))?;
         let insert_at = java_after_fields_insert_position(target_class, &target_parsed.source);
         let mut text = target_parsed.source.clone();
         text.insert_str(insert_at, &format!("\n{}", moved_text));

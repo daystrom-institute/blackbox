@@ -17,7 +17,7 @@
 //! can reach `BlackboxServer` + `workflow_registry` without dragging
 //! the whole orchestration surface into this module.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

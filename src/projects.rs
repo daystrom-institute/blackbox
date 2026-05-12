@@ -440,7 +440,10 @@ pub fn detect_languages(root: &Path) -> BTreeSet<Language> {
                     "Cargo.toml" => {
                         found.insert(Language::Rust);
                     }
-                    "pom.xml" | "build.gradle" | "build.gradle.kts" | "settings.gradle"
+                    "pom.xml"
+                    | "build.gradle"
+                    | "build.gradle.kts"
+                    | "settings.gradle"
                     | "settings.gradle.kts" => {
                         found.insert(Language::Java);
                     }
@@ -728,39 +731,45 @@ mod tests {
     }
 
     fn init_git_repo(path: &Path) {
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .arg("init")
-            .output()
-            .unwrap()
-            .status
-            .success());
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .arg("init")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         fs::write(path.join("README.md"), "repo").unwrap();
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .arg("add")
-            .arg("README.md")
-            .output()
-            .unwrap()
-            .status
-            .success());
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args([
-                "-c",
-                "user.name=Blackbox Test",
-                "-c",
-                "user.email=blackbox@example.invalid",
-                "commit",
-                "-m",
-                "initial",
-            ])
-            .output()
-            .unwrap()
-            .status
-            .success());
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .arg("add")
+                .arg("README.md")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args([
+                    "-c",
+                    "user.name=Blackbox Test",
+                    "-c",
+                    "user.email=blackbox@example.invalid",
+                    "commit",
+                    "-m",
+                    "initial",
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
     }
 }

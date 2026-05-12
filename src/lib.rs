@@ -11,7 +11,7 @@
     clippy::type_complexity,
     clippy::large_enum_variant,
     clippy::enum_variant_names,
-    clippy::let_and_return,
+    clippy::let_and_return
 )]
 
 pub mod config;

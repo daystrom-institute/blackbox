@@ -123,7 +123,11 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
     let usage_count = usages.len();
     let production_sites = usages.iter().filter(|u| !u.is_test_site).count();
     let test_sites = usages.iter().filter(|u| u.is_test_site).count();
-    let unique_call_files = usages.iter().map(|u| u.path.as_str()).collect::<HashSet<_>>().len();
+    let unique_call_files = usages
+        .iter()
+        .map(|u| u.path.as_str())
+        .collect::<HashSet<_>>()
+        .len();
     let mut usage_summary_by_name: BTreeMap<String, usize> = BTreeMap::new();
     for usage in &usages {
         *usage_summary_by_name
@@ -165,7 +169,10 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
         if let Some(parent) = plan_path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).with_context(|| {
-                    format!("creating parent directory for plan output: {}", parent.display())
+                    format!(
+                        "creating parent directory for plan output: {}",
+                        parent.display()
+                    )
                 })?;
             }
         }
@@ -294,14 +301,25 @@ fn collect_usages_in_file(
             // `name` field IS this node — that's the symbol being
             // defined, not a usage).
             "type_identifier" => {
-                let Ok(text) = node.utf8_text(src) else { continue };
+                let Ok(text) = node.utf8_text(src) else {
+                    continue;
+                };
                 if !symbol_set.contains(text) {
                     continue;
                 }
                 if is_declaration_name(node) {
                     continue;
                 }
-                push_usage(out, &path_str, parsed, node, "type_reference", text, kind_filter, is_test_site);
+                push_usage(
+                    out,
+                    &path_str,
+                    parsed,
+                    node,
+                    "type_reference",
+                    text,
+                    kind_filter,
+                    is_test_site,
+                );
             }
             // method_invocation: the .name child is the method being
             // called. Receiver-side identifier (the object before `.`)
@@ -358,9 +376,7 @@ fn collect_usages_in_file(
                 if children.len() == 2 {
                     let qualifier = children[0];
                     let name_node = children[1];
-                    if qualifier.kind() == "identifier"
-                        || qualifier.kind() == "type_identifier"
-                    {
+                    if qualifier.kind() == "identifier" || qualifier.kind() == "type_identifier" {
                         if let Ok(qt) = qualifier.utf8_text(src) {
                             if symbol_set.contains(qt) {
                                 push_usage(
@@ -492,7 +508,10 @@ fn method_invocation_receiver_name(object: Node<'_>, source: &str) -> Option<Str
             let field_node = object.child_by_field_name("field")?;
             let object_node = object.child_by_field_name("object")?;
             if object_node.kind() == "this" {
-                field_node.utf8_text(source.as_bytes()).ok().map(str::to_string)
+                field_node
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(str::to_string)
             } else {
                 None
             }
@@ -505,7 +524,10 @@ fn enclosing_java_class(mut node: Node<'_>) -> Option<Node<'_>> {
     while let Some(parent) = node.parent() {
         if matches!(
             parent.kind(),
-            "class_declaration" | "record_declaration" | "interface_declaration" | "enum_declaration"
+            "class_declaration"
+                | "record_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
         ) {
             return Some(parent);
         }
@@ -572,7 +594,10 @@ fn line_context(source: &str, byte_offset: usize) -> String {
     let clamped = byte_offset.min(source.len());
     let line_start = source[..clamped].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let after = &source[line_start..];
-    let line_end = after.find('\n').map(|i| line_start + i).unwrap_or(source.len());
+    let line_end = after
+        .find('\n')
+        .map(|i| line_start + i)
+        .unwrap_or(source.len());
     source[line_start..line_end].trim_end().to_string()
 }
 
@@ -668,10 +693,7 @@ mod tests {
             .iter()
             .map(|u| u["usage_kind"].as_str().unwrap())
             .collect();
-        assert!(
-            kinds.contains(&"import"),
-            "import usage missing: {kinds:?}"
-        );
+        assert!(kinds.contains(&"import"), "import usage missing: {kinds:?}");
         assert!(
             kinds.contains(&"type_reference"),
             "type_reference usage missing: {kinds:?}"
@@ -800,10 +822,7 @@ mod tests {
             );
         }
         // At least the one import we wrote must be present.
-        assert!(
-            !usages.is_empty(),
-            "expected at least one import usage"
-        );
+        assert!(!usages.is_empty(), "expected at least one import usage");
     }
 
     // Gate: build/target dirs are skipped during the walk.
@@ -883,8 +902,14 @@ mod tests {
             .collect();
         let test_count = by_path.iter().filter(|(is_test, _)| *is_test).count();
         let prod_count = by_path.iter().filter(|(is_test, _)| !*is_test).count();
-        assert_eq!(test_count, 1, "expected exactly one test-site usage: {by_path:?}");
-        assert_eq!(prod_count, 1, "expected exactly one production usage: {by_path:?}");
+        assert_eq!(
+            test_count, 1,
+            "expected exactly one test-site usage: {by_path:?}"
+        );
+        assert_eq!(
+            prod_count, 1,
+            "expected exactly one production usage: {by_path:?}"
+        );
         assert_eq!(v["production_sites"].as_u64().unwrap(), 1);
         assert_eq!(v["test_sites"].as_u64().unwrap(), 1);
     }
@@ -923,7 +948,11 @@ mod tests {
             .iter()
             .map(|u| u["context"].as_str().unwrap())
             .collect();
-        assert_eq!(usages.len(), 1, "receiver filter should include only repoDao call: {invocations:?}");
+        assert_eq!(
+            usages.len(),
+            1,
+            "receiver filter should include only repoDao call: {invocations:?}"
+        );
         assert!(
             invocations[0].contains("repoDao.save()"),
             "filtered usage must be repoDao call: {invocations:?}"
@@ -951,13 +980,19 @@ mod tests {
         unsafe { std::env::remove_var("BLACKBOX_STATE_DIR") };
 
         let v = parse_response(&response);
-        assert!(v.get("usages").is_none(), "output-path response should be digest only");
+        assert!(
+            v.get("usages").is_none(),
+            "output-path response should be digest only"
+        );
         assert_eq!(v["total_usages"].as_u64().unwrap(), 1);
         assert_eq!(v["usage_summary_by_name"]["Symbol"].as_u64().unwrap(), 1);
         let plan_path = std::path::Path::new(v["plan_path"].as_str().unwrap());
         assert!(plan_path.starts_with(state_dir.path()));
         let on_disk = parse_response(&fs::read_to_string(plan_path).unwrap());
-        assert!(on_disk.get("usages").is_some(), "full report should be written to slot");
+        assert!(
+            on_disk.get("usages").is_some(),
+            "full report should be written to slot"
+        );
         assert_eq!(on_disk["usage_count"].as_u64().unwrap(), 1);
         assert_eq!(on_disk["total_usages"].as_u64().unwrap(), 1);
     }
@@ -985,7 +1020,10 @@ mod tests {
         params.summary_only = Some(true);
         let response = plan_find_java_usages(&params).unwrap();
         let v = parse_response(&response);
-        assert!(v.get("usages").is_none(), "summary_only should suppress full enumeration");
+        assert!(
+            v.get("usages").is_none(),
+            "summary_only should suppress full enumeration"
+        );
         assert_eq!(v["total_usages"].as_u64().unwrap(), 6);
         assert_eq!(v["unique_call_files"].as_u64().unwrap(), 1);
         let examples = v["usage_examples_by_name"]["Symbol"].as_array().unwrap();

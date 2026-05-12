@@ -28,6 +28,7 @@ use super::extractor::Selector;
 pub struct WaitSpec {
     /// One or more signals; first to arrive wins (race semantics).
     /// Single-signal wait is just `any_of: [...]` of length 1.
+    #[serde(default)]
     pub any_of: Vec<WaitSignal>,
     /// Optional timeout. On expiry, the arc resumes with a synthetic
     /// `__timeout__` signal. If absent, the arc waits indefinitely
@@ -38,6 +39,12 @@ pub struct WaitSpec {
         with = "duration_secs_opt"
     )]
     pub timeout: Option<Duration>,
+    /// Poll an actor's provider transcript until an event matching the
+    /// requested shape appears. This is intentionally separate from
+    /// signal waits: provider output is read from transcript adapters,
+    /// not from webhook/direct signal routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_event: Option<ProviderEventWait>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +56,17 @@ pub struct WaitSignal {
     /// match key when a signal arrives.
     #[serde(default)]
     pub correlate: HashMap<String, Selector>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEventWait {
+    pub actor: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub contains: Option<String>,
 }
 
 /// Canonical form of a correlation tuple. Used as the second

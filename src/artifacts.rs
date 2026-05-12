@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -128,9 +128,7 @@ impl<'a> ArtifactScope<'a> {
     fn id_path_local(&self) -> (Option<String>, Option<String>, bool) {
         match self {
             Self::Global => (None, None, false),
-            Self::Project { project_id, local } => {
-                (Some((*project_id).to_string()), None, *local)
-            }
+            Self::Project { project_id, local } => (Some((*project_id).to_string()), None, *local),
         }
     }
 
@@ -170,7 +168,15 @@ impl ArtifactCatalog {
         version_override: Option<String>,
         supersedes_override: Option<String>,
     ) -> Result<ArtifactMetadata> {
-        self.install_value_scoped(ArtifactScope::Global, kind, source, value, name_override, version_override, supersedes_override)
+        self.install_value_scoped(
+            ArtifactScope::Global,
+            kind,
+            source,
+            value,
+            name_override,
+            version_override,
+            supersedes_override,
+        )
     }
 
     pub fn install_value_scoped(
@@ -186,11 +192,21 @@ impl ArtifactCatalog {
         let name = name_override
             .clone()
             .or_else(|| artifact_name(kind, value))
-            .ok_or_else(|| anyhow!("artifact name required (via value.name/domain or name_override)"))?;
+            .ok_or_else(|| {
+                anyhow!("artifact name required (via value.name/domain or name_override)")
+            })?;
         let meta_path = self.metadata_path_scoped(&scope, kind, &name)?;
 
         crate::json_store::with_store_lock(&meta_path, || {
-            self.install_value_locked_scoped(scope, kind, source, value, name_override, version_override, supersedes_override)
+            self.install_value_locked_scoped(
+                scope,
+                kind,
+                source,
+                value,
+                name_override,
+                version_override,
+                supersedes_override,
+            )
         })
     }
 
@@ -203,22 +219,32 @@ impl ArtifactCatalog {
     ) -> Result<Option<Value>> {
         // Lookup order: project local → project committed → global
         if let Some(pid) = project_id {
-            let local_scope = ArtifactScope::Project { project_id: pid, local: true };
+            let local_scope = ArtifactScope::Project {
+                project_id: pid,
+                local: true,
+            };
             let path = self.artifact_path_scoped(&local_scope, kind, name)?;
             if path.exists() {
                 let raw = fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
-                return Ok(Some(serde_json::from_str(&raw)
-                    .with_context(|| format!("parsing {}", path.display()))?));
+                return Ok(Some(
+                    serde_json::from_str(&raw)
+                        .with_context(|| format!("parsing {}", path.display()))?,
+                ));
             }
 
-            let committed_scope = ArtifactScope::Project { project_id: pid, local: false };
+            let committed_scope = ArtifactScope::Project {
+                project_id: pid,
+                local: false,
+            };
             let path = self.artifact_path_scoped(&committed_scope, kind, name)?;
             if path.exists() {
                 let raw = fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
-                return Ok(Some(serde_json::from_str(&raw)
-                    .with_context(|| format!("parsing {}", path.display()))?));
+                return Ok(Some(
+                    serde_json::from_str(&raw)
+                        .with_context(|| format!("parsing {}", path.display()))?,
+                ));
             }
         }
         // Fall back to global.
@@ -588,33 +614,85 @@ impl ArtifactCatalog {
         }
     }
 
-    fn artifact_path_scoped(&self, scope: &ArtifactScope<'_>, kind: ArtifactKind, name: &str) -> Result<PathBuf> {
-        Ok(self.scoped_root(scope).join(kind.as_str()).join(name_path(name, "json")?))
+    fn artifact_path_scoped(
+        &self,
+        scope: &ArtifactScope<'_>,
+        kind: ArtifactKind,
+        name: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .scoped_root(scope)
+            .join(kind.as_str())
+            .join(name_path(name, "json")?))
     }
 
-    fn metadata_path_scoped(&self, scope: &ArtifactScope<'_>, kind: ArtifactKind, name: &str) -> Result<PathBuf> {
-        Ok(self.scoped_root(scope).join(kind.as_str()).join(name_dir_path(name)?).join("metadata.json"))
+    fn metadata_path_scoped(
+        &self,
+        scope: &ArtifactScope<'_>,
+        kind: ArtifactKind,
+        name: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .scoped_root(scope)
+            .join(kind.as_str())
+            .join(name_dir_path(name)?)
+            .join("metadata.json"))
     }
 
-    fn version_dir_path_scoped(&self, scope: &ArtifactScope<'_>, kind: ArtifactKind, name: &str) -> Result<PathBuf> {
-        Ok(self.scoped_root(scope).join(kind.as_str()).join(name_dir_path(name)?).join(".versions"))
+    fn version_dir_path_scoped(
+        &self,
+        scope: &ArtifactScope<'_>,
+        kind: ArtifactKind,
+        name: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .scoped_root(scope)
+            .join(kind.as_str())
+            .join(name_dir_path(name)?)
+            .join(".versions"))
     }
 
-    fn version_artifact_path_scoped(&self, scope: &ArtifactScope<'_>, kind: ArtifactKind, name: &str, version: &str) -> Result<PathBuf> {
-        Ok(self.version_dir_path_scoped(scope, kind, name)?.join(format!("v{version}.json")))
+    fn version_artifact_path_scoped(
+        &self,
+        scope: &ArtifactScope<'_>,
+        kind: ArtifactKind,
+        name: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .version_dir_path_scoped(scope, kind, name)?
+            .join(format!("v{version}.json")))
     }
 
-    fn version_metadata_path_scoped(&self, scope: &ArtifactScope<'_>, kind: ArtifactKind, name: &str, version: &str) -> Result<PathBuf> {
-        Ok(self.version_dir_path_scoped(scope, kind, name)?.join(format!("v{version}.metadata.json")))
+    fn version_metadata_path_scoped(
+        &self,
+        scope: &ArtifactScope<'_>,
+        kind: ArtifactKind,
+        name: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .version_dir_path_scoped(scope, kind, name)?
+            .join(format!("v{version}.metadata.json")))
     }
 
-    fn load_metadata_scoped(&self, scope: &ArtifactScope<'_>, kind: ArtifactKind, name: &str) -> Result<ArtifactMetadata> {
+    fn load_metadata_scoped(
+        &self,
+        scope: &ArtifactScope<'_>,
+        kind: ArtifactKind,
+        name: &str,
+    ) -> Result<ArtifactMetadata> {
         let path = self.metadata_path_scoped(scope, kind, name)?;
-        let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
     }
 
-    fn save_metadata_scoped(&self, scope: &ArtifactScope<'_>, meta: &ArtifactMetadata) -> Result<()> {
+    fn save_metadata_scoped(
+        &self,
+        scope: &ArtifactScope<'_>,
+        meta: &ArtifactMetadata,
+    ) -> Result<()> {
         let path = self.metadata_path_scoped(scope, meta.kind, &meta.name)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -622,13 +700,20 @@ impl ArtifactCatalog {
         atomic_write_json(&path, meta)
     }
 
-    fn save_version_snapshot_scoped(&self, scope: &ArtifactScope<'_>, meta: &ArtifactMetadata, value: &Value) -> Result<()> {
-        let artifact_path = self.version_artifact_path_scoped(scope, meta.kind, &meta.name, &meta.version)?;
+    fn save_version_snapshot_scoped(
+        &self,
+        scope: &ArtifactScope<'_>,
+        meta: &ArtifactMetadata,
+        value: &Value,
+    ) -> Result<()> {
+        let artifact_path =
+            self.version_artifact_path_scoped(scope, meta.kind, &meta.name, &meta.version)?;
         if let Some(parent) = artifact_path.parent() {
             fs::create_dir_all(parent)?;
         }
         atomic_write_json(&artifact_path, value)?;
-        let version_meta_path = self.version_metadata_path_scoped(scope, meta.kind, &meta.name, &meta.version)?;
+        let version_meta_path =
+            self.version_metadata_path_scoped(scope, meta.kind, &meta.name, &meta.version)?;
         if let Some(parent) = version_meta_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -671,7 +756,8 @@ impl ArtifactCatalog {
             meta.superseded_by = Some("file_removed".to_string());
             self.save_metadata_scoped(&scope, &meta)?;
             // Also update version snapshot metadata.
-            let version_meta_path = self.version_metadata_path_scoped(&scope, kind, &meta.name, &meta.version)?;
+            let version_meta_path =
+                self.version_metadata_path_scoped(&scope, kind, &meta.name, &meta.version)?;
             if version_meta_path.exists() {
                 atomic_write_json(&version_meta_path, &meta)?;
             }
@@ -697,7 +783,11 @@ impl ArtifactCatalog {
     /// writes back the patched metadata.  Missing artifact JSON is logged and
     /// counted but does not abort startup.
     pub fn backfill_content_hashes(&self) -> anyhow::Result<BackfillReport> {
-        let mut report = BackfillReport { active_updated: 0, version_updated: 0, missing_artifacts: 0 };
+        let mut report = BackfillReport {
+            active_updated: 0,
+            version_updated: 0,
+            missing_artifacts: 0,
+        };
         self.backfill_in_dir(&self.root, &mut report)?;
         Ok(report)
     }
@@ -718,11 +808,17 @@ impl ArtifactCatalog {
 
             let raw = match fs::read_to_string(path) {
                 Ok(r) => r,
-                Err(e) => { tracing::warn!("backfill: reading {}: {e}", path.display()); continue; }
+                Err(e) => {
+                    tracing::warn!("backfill: reading {}: {e}", path.display());
+                    continue;
+                }
             };
             let mut meta: ArtifactMetadata = match serde_json::from_str(&raw) {
                 Ok(m) => m,
-                Err(e) => { tracing::warn!("backfill: parsing {}: {e}", path.display()); continue; }
+                Err(e) => {
+                    tracing::warn!("backfill: parsing {}: {e}", path.display());
+                    continue;
+                }
             };
 
             if meta.content_sha256.is_some() {
@@ -752,16 +848,33 @@ impl ArtifactCatalog {
 
             let artifact_raw = match fs::read_to_string(&artifact_path) {
                 Ok(r) => r,
-                Err(e) => { tracing::warn!("backfill: reading artifact {}: {e}", artifact_path.display()); report.missing_artifacts += 1; continue; }
+                Err(e) => {
+                    tracing::warn!(
+                        "backfill: reading artifact {}: {e}",
+                        artifact_path.display()
+                    );
+                    report.missing_artifacts += 1;
+                    continue;
+                }
             };
             let artifact_value: Value = match serde_json::from_str(&artifact_raw) {
                 Ok(v) => v,
-                Err(e) => { tracing::warn!("backfill: parsing artifact {}: {e}", artifact_path.display()); report.missing_artifacts += 1; continue; }
+                Err(e) => {
+                    tracing::warn!(
+                        "backfill: parsing artifact {}: {e}",
+                        artifact_path.display()
+                    );
+                    report.missing_artifacts += 1;
+                    continue;
+                }
             };
 
             let hash = match artifact_content_sha256(&artifact_value) {
                 Ok(h) => h,
-                Err(e) => { tracing::warn!("backfill: hashing {}: {e}", artifact_path.display()); continue; }
+                Err(e) => {
+                    tracing::warn!("backfill: hashing {}: {e}", artifact_path.display());
+                    continue;
+                }
             };
 
             meta.content_sha256 = Some(hash);
@@ -770,7 +883,11 @@ impl ArtifactCatalog {
                 continue;
             }
 
-            if is_active { report.active_updated += 1; } else { report.version_updated += 1; }
+            if is_active {
+                report.active_updated += 1;
+            } else {
+                report.version_updated += 1;
+            }
         }
         Ok(())
     }
@@ -823,8 +940,19 @@ pub fn discover_and_install_project_artifacts(
                 continue;
             }
         };
-        let scope = ArtifactScope::Project { project_id, local: artifact.local };
-        match catalog.install_value_scoped(scope, artifact.kind, artifact.path.clone(), &value, None, None, None) {
+        let scope = ArtifactScope::Project {
+            project_id,
+            local: artifact.local,
+        };
+        match catalog.install_value_scoped(
+            scope,
+            artifact.kind,
+            artifact.path.clone(),
+            &value,
+            None,
+            None,
+            None,
+        ) {
             Ok(meta) => results.push(meta),
             Err(e) => tracing::warn!("discover_and_install: installing {}: {e}", artifact.path),
         }
@@ -832,8 +960,17 @@ pub fn discover_and_install_project_artifacts(
     Ok(results)
 }
 
-fn scan_artifact_dir(scan_root: &Path, _bbox_root: &Path, local: bool, out: &mut Vec<DiscoveredArtifact>) {
-    for entry in WalkDir::new(scan_root).max_depth(2).into_iter().filter_map(|e| e.ok()) {
+fn scan_artifact_dir(
+    scan_root: &Path,
+    _bbox_root: &Path,
+    local: bool,
+    out: &mut Vec<DiscoveredArtifact>,
+) {
+    for entry in WalkDir::new(scan_root)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -881,9 +1018,10 @@ pub fn artifact_kind_from_dir_pub(component: &str) -> Option<ArtifactKind> {
 
 fn artifact_name(kind: ArtifactKind, value: &Value) -> Option<String> {
     match kind {
-        ArtifactKind::Workflow | ArtifactKind::Brofile | ArtifactKind::Agent | ArtifactKind::Team => {
-            value.get("name")?.as_str().map(str::to_string)
-        }
+        ArtifactKind::Workflow
+        | ArtifactKind::Brofile
+        | ArtifactKind::Agent
+        | ArtifactKind::Team => value.get("name")?.as_str().map(str::to_string),
         ArtifactKind::Packet => value.get("domain")?.as_str().map(str::to_string),
     }
 }
@@ -981,8 +1119,10 @@ pub fn artifact_content_sha256(value: &Value) -> anyhow::Result<String> {
 fn canonicalize_value(v: &Value) -> Value {
     match v {
         Value::Object(map) => {
-            let sorted: BTreeMap<String, Value> =
-                map.iter().map(|(k, v)| (k.clone(), canonicalize_value(v))).collect();
+            let sorted: BTreeMap<String, Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), canonicalize_value(v)))
+                .collect();
             Value::Object(sorted.into_iter().collect())
         }
         Value::Array(arr) => Value::Array(arr.iter().map(canonicalize_value).collect()),
@@ -1340,14 +1480,18 @@ mod tests {
         assert_eq!(meta.version, "2");
         assert!(meta.active);
 
-        assert!(catalog
-            .load_artifact_value(ArtifactKind::Agent, "nonexistent")
-            .unwrap()
-            .is_none());
-        assert!(catalog
-            .metadata_for(ArtifactKind::Agent, "nonexistent")
-            .unwrap()
-            .is_none());
+        assert!(
+            catalog
+                .load_artifact_value(ArtifactKind::Agent, "nonexistent")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            catalog
+                .metadata_for(ArtifactKind::Agent, "nonexistent")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1374,11 +1518,18 @@ mod tests {
         let committed_count = discovered.iter().filter(|d| !d.local).count();
         let local_count = discovered.iter().filter(|d| d.local).count();
 
-        assert_eq!(committed_count, 5, "should find one committed artifact per kind dir (brofiles/workflows/packets/agents/teams)");
+        assert_eq!(
+            committed_count, 5,
+            "should find one committed artifact per kind dir (brofiles/workflows/packets/agents/teams)"
+        );
         assert_eq!(local_count, 2, "should find 2 local artifacts");
 
         // Make sure Team kind is included
-        assert!(discovered.iter().any(|d| d.kind == ArtifactKind::Team && !d.local));
+        assert!(
+            discovered
+                .iter()
+                .any(|d| d.kind == ArtifactKind::Team && !d.local)
+        );
     }
 
     #[test]
@@ -1388,10 +1539,39 @@ mod tests {
         let committed = serde_json::json!({"name": "shadow-arc", "version": "1", "tier": "committed", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
         let local = serde_json::json!({"name": "shadow-arc", "version": "2", "tier": "local", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
 
-        catalog.install_value_scoped(ArtifactScope::Project { project_id: "p1", local: false }, ArtifactKind::Workflow, "committed.json".into(), &committed, None, None, None).unwrap();
-        catalog.install_value_scoped(ArtifactScope::Project { project_id: "p1", local: true }, ArtifactKind::Workflow, "local.json".into(), &local, None, None, None).unwrap();
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: false,
+                },
+                ArtifactKind::Workflow,
+                "committed.json".into(),
+                &committed,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p1",
+                    local: true,
+                },
+                ArtifactKind::Workflow,
+                "local.json".into(),
+                &local,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
-        let v = catalog.load_artifact_value_scoped(Some("p1"), ArtifactKind::Workflow, "shadow-arc").unwrap().unwrap();
+        let v = catalog
+            .load_artifact_value_scoped(Some("p1"), ArtifactKind::Workflow, "shadow-arc")
+            .unwrap()
+            .unwrap();
         assert_eq!(v["tier"], "local", "local must shadow committed");
     }
 
@@ -1402,10 +1582,35 @@ mod tests {
         let global = serde_json::json!({"name": "shadow-global", "version": "1", "tier": "global", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
         let committed = serde_json::json!({"name": "shadow-global", "version": "2", "tier": "committed", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
 
-        catalog.install_value(ArtifactKind::Workflow, "global.json".into(), &global, None, None, None).unwrap();
-        catalog.install_value_scoped(ArtifactScope::Project { project_id: "p2", local: false }, ArtifactKind::Workflow, "committed.json".into(), &committed, None, None, None).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "global.json".into(),
+                &global,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "p2",
+                    local: false,
+                },
+                ArtifactKind::Workflow,
+                "committed.json".into(),
+                &committed,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
-        let v = catalog.load_artifact_value_scoped(Some("p2"), ArtifactKind::Workflow, "shadow-global").unwrap().unwrap();
+        let v = catalog
+            .load_artifact_value_scoped(Some("p2"), ArtifactKind::Workflow, "shadow-global")
+            .unwrap()
+            .unwrap();
         assert_eq!(v["tier"], "committed", "committed must shadow global");
     }
 
@@ -1414,11 +1619,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
         let global = serde_json::json!({"name": "global-only", "version": "1", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
-        catalog.install_value(ArtifactKind::Workflow, "global.json".into(), &global, None, None, None).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "global.json".into(),
+                &global,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         // No project_id → falls through to global
-        let v = catalog.load_artifact_value_scoped(None, ArtifactKind::Workflow, "global-only").unwrap().unwrap();
-        assert_eq!(v["name"].as_str(), Some("global-only"), "global artifact must be returned");
+        let v = catalog
+            .load_artifact_value_scoped(None, ArtifactKind::Workflow, "global-only")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            v["name"].as_str(),
+            Some("global-only"),
+            "global artifact must be returned"
+        );
     }
 
     #[test]
@@ -1427,25 +1648,62 @@ mod tests {
         let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
         let artifact = serde_json::json!({"name": "proj-arc", "version": "1", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
 
-        let scope = ArtifactScope::Project { project_id: "test-project", local: false };
-        let meta = catalog.install_value_scoped(scope, ArtifactKind::Workflow, "src.json".into(), &artifact, None, None, None).unwrap();
+        let scope = ArtifactScope::Project {
+            project_id: "test-project",
+            local: false,
+        };
+        let meta = catalog
+            .install_value_scoped(
+                scope,
+                ArtifactKind::Workflow,
+                "src.json".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         assert_eq!(meta.project_id.as_deref(), Some("test-project"));
         assert!(!meta.local);
 
         // Global artifact must not exist.
-        let global_artifact = dir.path().join("artifacts").join("workflow").join("proj-arc.json");
-        assert!(!global_artifact.exists(), "project install must not write global artifact");
+        let global_artifact = dir
+            .path()
+            .join("artifacts")
+            .join("workflow")
+            .join("proj-arc.json");
+        assert!(
+            !global_artifact.exists(),
+            "project install must not write global artifact"
+        );
 
         // Scoped artifact exists.
-        let scoped_artifact = dir.path().join("artifacts").join("projects").join("test-project").join("committed").join("workflow").join("proj-arc.json");
-        assert!(scoped_artifact.exists(), "project artifact must be written to scoped path");
+        let scoped_artifact = dir
+            .path()
+            .join("artifacts")
+            .join("projects")
+            .join("test-project")
+            .join("committed")
+            .join("workflow")
+            .join("proj-arc.json");
+        assert!(
+            scoped_artifact.exists(),
+            "project artifact must be written to scoped path"
+        );
 
         // Global lookup returns None.
-        assert!(catalog.load_artifact_value(ArtifactKind::Workflow, "proj-arc").unwrap().is_none());
+        assert!(
+            catalog
+                .load_artifact_value(ArtifactKind::Workflow, "proj-arc")
+                .unwrap()
+                .is_none()
+        );
 
         // Scoped lookup returns the value.
-        let v = catalog.load_artifact_value_scoped(Some("test-project"), ArtifactKind::Workflow, "proj-arc").unwrap();
+        let v = catalog
+            .load_artifact_value_scoped(Some("test-project"), ArtifactKind::Workflow, "proj-arc")
+            .unwrap();
         assert!(v.is_some());
     }
 
@@ -1456,9 +1714,24 @@ mod tests {
         let artifact = serde_json::json!({"name": "bf-arc", "version": "1", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
 
         // Install, then manually strip the hash from active metadata.
-        catalog.install_value(ArtifactKind::Workflow, "src.json".into(), &artifact, None, None, None).unwrap();
-        let meta_path = dir.path().join("artifacts").join("workflow").join("bf-arc").join("metadata.json");
-        let mut meta: ArtifactMetadata = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "src.json".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let meta_path = dir
+            .path()
+            .join("artifacts")
+            .join("workflow")
+            .join("bf-arc")
+            .join("metadata.json");
+        let mut meta: ArtifactMetadata =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
         meta.content_sha256 = None;
         fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
 
@@ -1466,7 +1739,8 @@ mod tests {
         assert_eq!(report.active_updated, 1);
         assert_eq!(report.missing_artifacts, 0);
 
-        let after: ArtifactMetadata = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        let after: ArtifactMetadata =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
         assert!(after.content_sha256.is_some());
     }
 
@@ -1476,16 +1750,37 @@ mod tests {
         let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
         let artifact = serde_json::json!({"name": "bf-ver", "version": "1", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
 
-        catalog.install_value(ArtifactKind::Workflow, "src.json".into(), &artifact, None, None, None).unwrap();
-        let version_meta_path = dir.path().join("artifacts").join("workflow").join("bf-ver").join(".versions").join("v1.metadata.json");
-        let mut meta: ArtifactMetadata = serde_json::from_str(&fs::read_to_string(&version_meta_path).unwrap()).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "src.json".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let version_meta_path = dir
+            .path()
+            .join("artifacts")
+            .join("workflow")
+            .join("bf-ver")
+            .join(".versions")
+            .join("v1.metadata.json");
+        let mut meta: ArtifactMetadata =
+            serde_json::from_str(&fs::read_to_string(&version_meta_path).unwrap()).unwrap();
         meta.content_sha256 = None;
-        fs::write(&version_meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+        fs::write(
+            &version_meta_path,
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
 
         let report = catalog.backfill_content_hashes().unwrap();
         assert_eq!(report.version_updated, 1);
 
-        let after: ArtifactMetadata = serde_json::from_str(&fs::read_to_string(&version_meta_path).unwrap()).unwrap();
+        let after: ArtifactMetadata =
+            serde_json::from_str(&fs::read_to_string(&version_meta_path).unwrap()).unwrap();
         assert!(after.content_sha256.is_some());
     }
 
@@ -1495,12 +1790,27 @@ mod tests {
         let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
         let artifact = serde_json::json!({"name": "bf-miss", "version": "1", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
 
-        catalog.install_value(ArtifactKind::Workflow, "src.json".into(), &artifact, None, None, None).unwrap();
-        let versions_dir = dir.path().join("artifacts").join("workflow").join("bf-miss").join(".versions");
+        catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "src.json".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let versions_dir = dir
+            .path()
+            .join("artifacts")
+            .join("workflow")
+            .join("bf-miss")
+            .join(".versions");
 
         // Strip hash from version metadata, then delete the version artifact JSON.
         let version_meta = versions_dir.join("v1.metadata.json");
-        let mut meta: ArtifactMetadata = serde_json::from_str(&fs::read_to_string(&version_meta).unwrap()).unwrap();
+        let mut meta: ArtifactMetadata =
+            serde_json::from_str(&fs::read_to_string(&version_meta).unwrap()).unwrap();
         meta.content_sha256 = None;
         fs::write(&version_meta, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
         fs::remove_file(versions_dir.join("v1.json")).unwrap();
@@ -1508,7 +1818,8 @@ mod tests {
         let report = catalog.backfill_content_hashes().unwrap();
         assert_eq!(report.missing_artifacts, 1);
         // Metadata should still have no hash (not backfilled since payload missing).
-        let after: ArtifactMetadata = serde_json::from_str(&fs::read_to_string(&version_meta).unwrap()).unwrap();
+        let after: ArtifactMetadata =
+            serde_json::from_str(&fs::read_to_string(&version_meta).unwrap()).unwrap();
         assert!(after.content_sha256.is_none());
     }
 
@@ -1591,23 +1902,58 @@ mod tests {
             "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
         });
 
-        let first = catalog.install_value(ArtifactKind::Workflow, "src.json".into(), &artifact, None, None, None).unwrap();
+        let first = catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "src.json".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         assert!(first.content_sha256.is_some());
 
         // Second install with same content must be a no-op: installed_at unchanged.
-        let second = catalog.install_value(ArtifactKind::Workflow, "src.json".into(), &artifact, None, None, None).unwrap();
-        assert_eq!(first.installed_at, second.installed_at, "no-op install must not change installed_at");
+        let second = catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "src.json".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            first.installed_at, second.installed_at,
+            "no-op install must not change installed_at"
+        );
         assert_eq!(first.content_sha256, second.content_sha256);
 
         // Only one version artifact file should exist (not counting .metadata.json).
-        let version_dir = dir.path().join("artifacts").join("workflow").join("idempotent-arc").join(".versions");
-        let files: Vec<_> = std::fs::read_dir(&version_dir).unwrap().filter_map(|e| e.ok()).collect();
-        let artifact_count = files.iter().filter(|e| {
-            let name = e.file_name();
-            let s = name.to_string_lossy();
-            s.ends_with(".json") && !s.ends_with(".metadata.json")
-        }).count();
-        assert_eq!(artifact_count, 1, "only one version artifact file after idempotent install");
+        let version_dir = dir
+            .path()
+            .join("artifacts")
+            .join("workflow")
+            .join("idempotent-arc")
+            .join(".versions");
+        let files: Vec<_> = std::fs::read_dir(&version_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        let artifact_count = files
+            .iter()
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.ends_with(".json") && !s.ends_with(".metadata.json")
+            })
+            .count();
+        assert_eq!(
+            artifact_count, 1,
+            "only one version artifact file after idempotent install"
+        );
     }
 
     #[test]
@@ -1617,11 +1963,32 @@ mod tests {
         let v1 = serde_json::json!({"name": "chain-arc", "version": "1", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
         let v2 = serde_json::json!({"name": "chain-arc", "version": "2", "extra": "data", "actors": {}, "start": "Done", "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}});
 
-        let m1 = catalog.install_value(ArtifactKind::Workflow, "src.json".into(), &v1, None, None, None).unwrap();
-        let m2 = catalog.install_value(ArtifactKind::Workflow, "src.json".into(), &v2, None, None, None).unwrap();
+        let m1 = catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "src.json".into(),
+                &v1,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let m2 = catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "src.json".into(),
+                &v2,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Different content → different hash
-        assert_ne!(m1.content_sha256, m2.content_sha256, "hash must differ after content change");
+        assert_ne!(
+            m1.content_sha256, m2.content_sha256,
+            "hash must differ after content change"
+        );
         // New install has content_sha256 set
         assert!(m2.content_sha256.is_some());
         // Version reflects the new value
@@ -1639,7 +2006,10 @@ mod tests {
         std::fs::write(&source_path, serde_json::to_string(&value).unwrap()).unwrap();
 
         let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
-        let scope = ArtifactScope::Project { project_id: "proj-rem", local: false };
+        let scope = ArtifactScope::Project {
+            project_id: "proj-rem",
+            local: false,
+        };
         let meta = catalog
             .install_value_scoped(
                 scope.clone(),

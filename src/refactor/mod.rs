@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -16,24 +16,24 @@ use rust::*;
 mod java;
 use java::*;
 pub(crate) mod plan_slot;
-pub(crate) mod rust_partition;
-pub(crate) mod rust_public_api;
+pub(crate) mod rust_compile_fix;
 pub(crate) mod rust_deep;
+pub(crate) mod rust_delegate_field;
+pub(crate) mod rust_error_migrate;
+pub(crate) mod rust_extract_to_submodule;
 pub(crate) mod rust_extract_trait;
-pub(crate) mod rust_migrate_types;
+pub(crate) mod rust_inline_mod;
 pub(crate) mod rust_lift_free;
 pub(crate) mod rust_match_strategy;
-pub(crate) mod rust_error_migrate;
+pub(crate) mod rust_migrate_types;
 pub(crate) mod rust_move_fields;
-pub(crate) mod rust_delegate_field;
-pub(crate) mod rust_update_callers;
-pub(crate) mod rust_ra_move_item;
-pub(crate) mod rust_ra_classify_callbacks;
-pub(crate) mod rust_compile_fix;
-pub(crate) mod rust_warning_markers;
-pub(crate) mod rust_inline_mod;
-pub(crate) mod rust_extract_to_submodule;
 pub(crate) mod rust_move_with_callers;
+pub(crate) mod rust_partition;
+pub(crate) mod rust_public_api;
+pub(crate) mod rust_ra_classify_callbacks;
+pub(crate) mod rust_ra_move_item;
+pub(crate) mod rust_update_callers;
+pub(crate) mod rust_warning_markers;
 
 #[cfg(test)]
 mod tests;
@@ -1088,7 +1088,10 @@ pub fn plan_with_ctx(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String
         if let Some(parent) = resolved.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).with_context(|| {
-                    format!("creating parent directory for plan output: {}", parent.display())
+                    format!(
+                        "creating parent directory for plan output: {}",
+                        parent.display()
+                    )
                 })?;
             }
         }
@@ -1115,9 +1118,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "rewrite_rust_field_visibility" => plan_rewrite_rust_field_visibility(p),
         "rust_lsp_rename" => plan_rust_lsp_rename(p, ctx),
         "rust_organize_imports" => plan_rust_organize_imports(p, ctx),
-        "inline_mod_to_file_submodule" => {
-            rust_inline_mod::plan_inline_mod_to_file_submodule(p)
-        }
+        "inline_mod_to_file_submodule" => rust_inline_mod::plan_inline_mod_to_file_submodule(p),
         "extract_rust_items_to_submodule" => {
             rust_extract_to_submodule::plan_extract_rust_items_to_submodule(p)
         }
@@ -1175,7 +1176,9 @@ fn plan_rust_impl_partition_analysis(p: &RefactorPlanParams) -> Result<String> {
         .impl_name
         .as_deref()
         .or(p.module_name.as_deref())
-        .ok_or_else(|| anyhow!("impl_name or module_name required for rust_impl_partition_analysis"))?;
+        .ok_or_else(|| {
+            anyhow!("impl_name or module_name required for rust_impl_partition_analysis")
+        })?;
     let graph = rust_partition::analyze_impl(&source_path, impl_name)?;
     let plan = RefactorPlan {
         title: format!("rust_impl_partition_analysis on `{impl_name}`"),
@@ -1580,55 +1583,54 @@ pub fn run_with_ctx(
                             }
                         })
                         .to_string();
-                    let diagnostics: Vec<RustcDiagnostic> = capture_ctx
-                        .get(&ref_name)
-                        .unwrap_or(&[])
-                        .to_vec();
-                    let plan_json = match rust_compile_fix::plan_compile_fix(&step_params, &diagnostics) {
-                        Ok(j) => j,
-                        Err(err) if *optional => {
-                            reports.push(RefactorRunStepReport {
-                                index: idx,
-                                op: "plan".to_string(),
-                                status: "skipped".to_string(),
-                                kind: Some(step_params.kind.clone()),
-                                title: None,
-                                files: Vec::new(),
-                                validations: Vec::new(),
-                                error: Some(err.to_string()),
-                                captured_diagnostics_summary: None,
-                            });
-                            continue;
-                        }
-                        Err(err) => {
-                            let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
-                            return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
-                                status: "step_failed".to_string(),
-                                title: p.title.clone(),
-                                dry_run: !confirmed,
-                                steps: append_report(
-                                    reports,
-                                    RefactorRunStepReport {
-                                        index: idx,
-                                        op: "plan".to_string(),
-                                        status: "plan_failed".to_string(),
-                                        kind: Some(step_params.kind.clone()),
-                                        title: None,
-                                        files: Vec::new(),
-                                        validations: Vec::new(),
-                                        error: Some(err.to_string()),
-                                        captured_diagnostics_summary: None,
-                                    },
-                                ),
-                                files_written,
-                                rolled_back: rollback_errors.is_empty(),
-                                error: Some(err.to_string()),
-                                rollback_errors,
-                                obligations: capture_ctx.obligation_reports(),
-                            })?);
-                        }
-                    };
+                    let diagnostics: Vec<RustcDiagnostic> =
+                        capture_ctx.get(&ref_name).unwrap_or(&[]).to_vec();
+                    let plan_json =
+                        match rust_compile_fix::plan_compile_fix(&step_params, &diagnostics) {
+                            Ok(j) => j,
+                            Err(err) if *optional => {
+                                reports.push(RefactorRunStepReport {
+                                    index: idx,
+                                    op: "plan".to_string(),
+                                    status: "skipped".to_string(),
+                                    kind: Some(step_params.kind.clone()),
+                                    title: None,
+                                    files: Vec::new(),
+                                    validations: Vec::new(),
+                                    error: Some(err.to_string()),
+                                    captured_diagnostics_summary: None,
+                                });
+                                continue;
+                            }
+                            Err(err) => {
+                                let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                                return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                                    status: "step_failed".to_string(),
+                                    title: p.title.clone(),
+                                    dry_run: !confirmed,
+                                    steps: append_report(
+                                        reports,
+                                        RefactorRunStepReport {
+                                            index: idx,
+                                            op: "plan".to_string(),
+                                            status: "plan_failed".to_string(),
+                                            kind: Some(step_params.kind.clone()),
+                                            title: None,
+                                            files: Vec::new(),
+                                            validations: Vec::new(),
+                                            error: Some(err.to_string()),
+                                            captured_diagnostics_summary: None,
+                                        },
+                                    ),
+                                    files_written,
+                                    rolled_back: rollback_errors.is_empty(),
+                                    error: Some(err.to_string()),
+                                    rollback_errors,
+                                    obligations: capture_ctx.obligation_reports(),
+                                })?);
+                            }
+                        };
                     // Mark the obligation consumed or leftover based on plan's leftover count.
                     let leftover_count = serde_json::from_str::<RefactorPlan>(&plan_json)
                         .map(|plan| plan.leftovers.len())
@@ -1757,8 +1759,7 @@ pub fn run_with_ctx(
                         if p.allow_unregistered_paths != Some(true) {
                             if let Err(err) = ensure_path_in_registered_project(&path, projects) {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors =
-                                    restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -1863,8 +1864,7 @@ pub fn run_with_ctx(
                             Ok(response) => response,
                             Err(err) => {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors =
-                                    restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -1966,8 +1966,7 @@ pub fn run_with_ctx(
                             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                             Err(err) => {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors =
-                                    restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -2034,12 +2033,10 @@ pub fn run_with_ctx(
                     let parsed = parse_rustc_json_output(&command_result.stdout);
                     let summary = CapturedDiagnosticsSummary {
                         count: parsed.len(),
-                        severity_counts: parsed
-                            .iter()
-                            .fold(HashMap::new(), |mut acc, d| {
-                                *acc.entry(d.level.clone()).or_insert(0) += 1;
-                                acc
-                            }),
+                        severity_counts: parsed.iter().fold(HashMap::new(), |mut acc, d| {
+                            *acc.entry(d.level.clone()).or_insert(0) += 1;
+                            acc
+                        }),
                     };
                     capture_ctx.stash("last".to_string(), parsed);
                     Some(summary)
@@ -2071,8 +2068,7 @@ pub fn run_with_ctx(
                     match effective_on_failure {
                         OnFailure::Required => {
                             let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                            let rollback_errors =
-                                restore_snapshots_from(&snapshots, cursor);
+                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
                             return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                 status: "step_failed".to_string(),
                                 title: p.title.clone(),
@@ -2338,7 +2334,13 @@ pub fn parse_rustc_json_output(stdout: &[u8]) -> Vec<RustcDiagnostic> {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        out.push(RustcDiagnostic { level, code, message, spans, children });
+        out.push(RustcDiagnostic {
+            level,
+            code,
+            message,
+            spans,
+            children,
+        });
     }
     out
 }
@@ -3379,11 +3381,12 @@ fn validate_rewritten_files(files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<ParseVal
                 .with_context(|| format!("{} is not valid utf-8", path.display()))?;
             let tree = parse_source(language, source)?;
             let (report, error_locations) = parse_report_with_locations(tree.root_node());
-            let error_excerpts = if report.has_error || report.error_nodes > 0 || report.missing_nodes > 0 {
-                build_parse_error_excerpts(source, &error_locations)
-            } else {
-                Vec::new()
-            };
+            let error_excerpts =
+                if report.has_error || report.error_nodes > 0 || report.missing_nodes > 0 {
+                    build_parse_error_excerpts(source, &error_locations)
+                } else {
+                    Vec::new()
+                };
             Ok(ParseValidationResult {
                 path: path_string(path),
                 has_error: report.has_error,
@@ -3409,9 +3412,7 @@ struct ParseErrorLocation {
     is_missing: bool,
 }
 
-fn parse_report_with_locations(
-    root: Node<'_>,
-) -> (ParseReport, Vec<ParseErrorLocation>) {
+fn parse_report_with_locations(root: Node<'_>) -> (ParseReport, Vec<ParseErrorLocation>) {
     let mut report = ParseReport {
         has_error: root.has_error(),
         error_nodes: 0,
@@ -3489,11 +3490,21 @@ fn render_snippet_window(source: &str, line: usize, context: usize) -> String {
     }
     let width = end.to_string().len();
     let mut out = String::new();
-    for (idx, ln) in lines.iter().enumerate().skip(start - 1).take(end - start + 1) {
+    for (idx, ln) in lines
+        .iter()
+        .enumerate()
+        .skip(start - 1)
+        .take(end - start + 1)
+    {
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!("{:>width$} | {}", idx + 1, ln.trim_end(), width = width));
+        out.push_str(&format!(
+            "{:>width$} | {}",
+            idx + 1,
+            ln.trim_end(),
+            width = width
+        ));
     }
     out
 }

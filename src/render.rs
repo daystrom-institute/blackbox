@@ -385,7 +385,9 @@ mod tests {
     fn test_apply_patch_preserves_surrounding_content_and_backs_up() {
         let dir = tempfile::tempdir().unwrap();
         let backup_dir = dir.path().join("backups");
-        unsafe { std::env::set_var("BLACKBOX_BACKUP_DIR", &backup_dir); }
+        unsafe {
+            std::env::set_var("BLACKBOX_BACKUP_DIR", &backup_dir);
+        }
 
         let p = dir.path().join("CLAUDE.md");
         std::fs::write(
@@ -404,7 +406,9 @@ mod tests {
         assert!(result.contains("fresh"), "new managed body present");
         assert!(!result.contains("\nold\n"), "old managed body replaced");
 
-        unsafe { std::env::remove_var("BLACKBOX_BACKUP_DIR"); }
+        unsafe {
+            std::env::remove_var("BLACKBOX_BACKUP_DIR");
+        }
     }
 
     #[test]

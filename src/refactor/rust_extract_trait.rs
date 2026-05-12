@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -138,12 +138,8 @@ pub fn plan_extract_trait(p: &crate::refactor::RefactorPlanParams) -> Result<Str
         .filter_map(|method| method.item.name.clone())
         .collect::<HashSet<_>>();
 
-    let source_impl_target = infer_impl_target_type(
-        &source_path,
-        &parsed,
-        &impl_methods,
-        impl_start,
-    )?;
+    let source_impl_target =
+        infer_impl_target_type(&source_path, &parsed, &impl_methods, impl_start)?;
 
     let object_safety = ObjectSafetyReport {
         dyn_compatible: true,
@@ -202,11 +198,7 @@ pub fn plan_extract_trait(p: &crate::refactor::RefactorPlanParams) -> Result<Str
                 }
                 bail!(
                     "error.bad_input(code=extract_trait_orphaned_call): lifted method `{}` calls `{}` which is not in the lifted set and is not public",
-                    selected_method
-                        .item
-                        .name
-                        .as_deref()
-                        .unwrap_or("(unnamed)"),
+                    selected_method.item.name.as_deref().unwrap_or("(unnamed)"),
                     call
                 );
             }
@@ -292,11 +284,14 @@ pub fn plan_extract_trait(p: &crate::refactor::RefactorPlanParams) -> Result<Str
                     byte_range: None,
                 },
             ],
-            items: selected_by_byte.iter().map(|method| method.item.clone()).collect(),
+            items: selected_by_byte
+                .iter()
+                .map(|method| method.item.clone())
+                .collect(),
             leftovers,
             captured_variables: Vec::new(),
             remaining_source_accessors: Vec::new(),
-        remaining_source_constant_refs: Vec::new(),
+            remaining_source_constant_refs: Vec::new(),
             external_calls: Vec::new(),
             inherited_dependencies: Vec::new(),
             deep_analysis: None,
@@ -384,7 +379,10 @@ fn collect_impl_methods(parsed: &ParsedSource) -> Result<Vec<LiftMethod>> {
     Ok(methods)
 }
 
-fn method_syntax_item(parsed: &ParsedSource, function_node: tree_sitter::Node<'_>) -> Option<SyntaxItem> {
+fn method_syntax_item(
+    parsed: &ParsedSource,
+    function_node: tree_sitter::Node<'_>,
+) -> Option<SyntaxItem> {
     Some(syntax_item_with_kind(parsed, function_node, "impl_method"))
 }
 
@@ -392,7 +390,9 @@ fn signature_is_generic(signature: &str, signature_start: usize) -> Result<bool>
     let after_fn = signature
         .get(signature_start..)
         .ok_or_else(|| anyhow!("invalid signature range"))?;
-    let open_paren = after_fn.find('(').ok_or_else(|| anyhow!("invalid function signature"))?;
+    let open_paren = after_fn
+        .find('(')
+        .ok_or_else(|| anyhow!("invalid function signature"))?;
     let head = &after_fn[..open_paren];
     Ok(head.contains('<') && head.contains('>'))
 }
@@ -404,9 +404,8 @@ fn signature_is_self_by_value(signature: &str, signature_start: usize) -> Result
     let open_paren = after_fn
         .find('(')
         .ok_or_else(|| anyhow!("invalid function signature"))?;
-    let close_paren = matching_paren(after_fn, open_paren).ok_or_else(|| {
-        anyhow!("invalid function signature: unmatched function parameter list")
-    })?;
+    let close_paren = matching_paren(after_fn, open_paren)
+        .ok_or_else(|| anyhow!("invalid function signature: unmatched function parameter list"))?;
     let params = after_fn[open_paren + 1..close_paren].trim();
     if params.is_empty() {
         return Ok(false);
@@ -512,11 +511,7 @@ fn matching_paren(text: &str, open_pos: usize) -> Option<usize> {
     None
 }
 
-fn find_self_calls(
-    source: &str,
-    body_start: usize,
-    body_end: usize,
-) -> Result<Vec<String>> {
+fn find_self_calls(source: &str, body_start: usize, body_end: usize) -> Result<Vec<String>> {
     let body = source
         .get(body_start..body_end)
         .ok_or_else(|| anyhow!("invalid method body range"))?;
@@ -548,8 +543,13 @@ fn infer_impl_target_type(
         .iter()
         .find(|method| method.impl_start == impl_start)
         .ok_or_else(|| anyhow!("failed to locate impl block for target methods"))?;
-    let impl_node = method_decl_node_by_start(parsed, target_impl.impl_start)
-        .ok_or_else(|| anyhow!("failed to locate impl node at byte {} in {}", impl_start, path.display()))?;
+    let impl_node = method_decl_node_by_start(parsed, target_impl.impl_start).ok_or_else(|| {
+        anyhow!(
+            "failed to locate impl node at byte {} in {}",
+            impl_start,
+            path.display()
+        )
+    })?;
     let body = impl_declaration_list(impl_node)
         .ok_or_else(|| anyhow!("impl block for {} missing declaration list", path.display()))?;
     let mut header = parsed
@@ -569,12 +569,18 @@ fn infer_impl_target_type(
         header = header[..where_pos].trim().to_string();
     }
     if header.is_empty() {
-        bail!("failed to infer struct type from impl header in {}", path.display());
+        bail!(
+            "failed to infer struct type from impl header in {}",
+            path.display()
+        );
     }
     Ok(header)
 }
 
-fn method_decl_node_by_start(parsed: &ParsedSource, byte_start: usize) -> Option<tree_sitter::Node<'_>> {
+fn method_decl_node_by_start(
+    parsed: &ParsedSource,
+    byte_start: usize,
+) -> Option<tree_sitter::Node<'_>> {
     let root = parsed.tree.root_node();
     let mut cursor = root.walk();
     for node in root.named_children(&mut cursor) {
@@ -899,8 +905,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
-            cwd: None,
-            force_path: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -956,7 +962,11 @@ mod tests {
 
         let parsed = read_plan_fields(&plan_text);
         assert!(!parsed.dyn_compatible);
-        assert!(parsed.object_safety_report["dyn_compatible"].as_bool().unwrap_or(true));
+        assert!(
+            parsed.object_safety_report["dyn_compatible"]
+                .as_bool()
+                .unwrap_or(true)
+        );
 
         let response = apply(
             &RefactorApplyParams {
@@ -965,8 +975,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
-            cwd: None,
-            force_path: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1049,10 +1059,11 @@ mod tests {
 
         let parsed = read_plan_fields(&plan_text);
         assert!(!parsed.dyn_compatible);
-        assert!(parsed
-            .object_safety_report["generic_methods"]
-            .as_array()
-            .is_some_and(|vals| vals.iter().any(|v| v == "generic")));
+        assert!(
+            parsed.object_safety_report["generic_methods"]
+                .as_array()
+                .is_some_and(|vals| vals.iter().any(|v| v == "generic"))
+        );
     }
 
     #[test]
@@ -1109,11 +1120,7 @@ mod tests {
             "struct Store;\n\nimpl Store {\n    pub fn do_work(&self) {}\n}\n",
         )
         .unwrap();
-        fs::write(
-            &caller,
-            "fn call() {\n    Store::do_work();\n}\n",
-        )
-        .unwrap();
+        fs::write(&caller, "fn call() {\n    Store::do_work();\n}\n").unwrap();
 
         let plan_text = plan_extract_trait(&RefactorPlanParams {
             kind: "extract_rust_trait".into(),
@@ -1140,9 +1147,11 @@ mod tests {
         .unwrap();
 
         let parsed = read_plan_fields(&plan_text);
-        assert!(parsed
-            .trait_in_scope_required
-            .iter()
-            .any(|path| path.ends_with("remote")));
+        assert!(
+            parsed
+                .trait_in_scope_required
+                .iter()
+                .any(|path| path.ends_with("remote"))
+        );
     }
 }

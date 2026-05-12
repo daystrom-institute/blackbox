@@ -36,7 +36,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -1280,9 +1280,11 @@ mod tests {
         .unwrap();
         let arc = r.get("b1").unwrap();
         let conflicts = detect_conflicts(&arc.read());
-        assert!(conflicts
-            .iter()
-            .any(|c| matches!(c, Conflict::SeverityDisagreement { .. })));
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| matches!(c, Conflict::SeverityDisagreement { .. }))
+        );
     }
 
     #[test]

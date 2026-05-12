@@ -18,7 +18,7 @@ pub mod whiteboard;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};

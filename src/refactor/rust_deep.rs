@@ -47,8 +47,7 @@ pub fn deep_analyze_extract(
     // Resolve struct name and field types.
     let struct_name =
         struct_name_from_impl(parsed.source.as_bytes(), impl_node).unwrap_or_default();
-    let field_types =
-        collect_struct_field_types(parsed.source.as_bytes(), root, &struct_name);
+    let field_types = collect_struct_field_types(parsed.source.as_bytes(), root, &struct_name);
 
     let captured_self_fields = analyze_captured_fields(&parsed, &matched, &field_types);
     let unresolved_callbacks = analyze_callbacks(&parsed, &matched, &method_name_set);
@@ -172,11 +171,7 @@ fn collect_struct_field_types(
     fields
 }
 
-fn collect_fields_from_node(
-    source: &[u8],
-    node: Node<'_>,
-    fields: &mut HashMap<String, String>,
-) {
+fn collect_fields_from_node(source: &[u8], node: Node<'_>, fields: &mut HashMap<String, String>) {
     if node.kind() == "field_declaration" {
         if let (Some(name_node), Some(type_node)) = (
             node.child_by_field_name("name"),
@@ -228,10 +223,8 @@ fn analyze_captured_fields(
         let mut method_call_fields: HashSet<String> = HashSet::new();
         walk_self_field_accesses(source, body, &mut raw_accesses, &mut method_call_fields);
 
-        let all_fields: HashSet<String> = raw_accesses
-            .union(&method_call_fields)
-            .cloned()
-            .collect();
+        let all_fields: HashSet<String> =
+            raw_accesses.union(&method_call_fields).cloned().collect();
 
         for field_name in &all_fields {
             let Some(field_type) = field_types.get(field_name.as_str()) else {
@@ -270,7 +263,11 @@ fn self_receiver_kind(source: &[u8], fn_node: Node<'_>) -> &'static str {
         "mutable_ref"
     } else if text.contains("&self") || text.contains("& self") {
         "shared_ref"
-    } else if text.trim_start_matches('(').trim_start().starts_with("self") {
+    } else if text
+        .trim_start_matches('(')
+        .trim_start()
+        .starts_with("self")
+    {
         "consuming"
     } else {
         "none"
@@ -595,7 +592,11 @@ fn analyze_inherited_params(
                 if !name.is_empty() {
                     type_params.push((
                         name,
-                        if bounds.is_empty() { vec![] } else { vec![bounds] },
+                        if bounds.is_empty() {
+                            vec![]
+                        } else {
+                            vec![bounds]
+                        },
                     ));
                 }
             }
@@ -640,8 +641,7 @@ fn analyze_inherited_params(
         })
         .collect();
 
-    let inherited_generics: Vec<String> =
-        used_type_params.iter().map(|(n, _)| n.clone()).collect();
+    let inherited_generics: Vec<String> = used_type_params.iter().map(|(n, _)| n.clone()).collect();
     let inherited_bounds: Vec<String> = used_type_params
         .into_iter()
         .flat_map(|(_, bounds)| bounds)

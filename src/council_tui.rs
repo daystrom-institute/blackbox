@@ -30,7 +30,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -246,10 +246,11 @@ impl App {
 
     fn maybe_clear_status(&mut self) {
         if let Some(until) = self.status_until
-            && Instant::now() >= until {
-                self.status = None;
-                self.status_until = None;
-            }
+            && Instant::now() >= until
+        {
+            self.status = None;
+            self.status_until = None;
+        }
     }
 }
 
@@ -265,11 +266,7 @@ pub async fn run(council_id: String, url: Option<String>) -> anyhow::Result<()> 
     let base_url = base_url.trim_end_matches('/').to_string();
 
     let initial = fetch_initial(&base_url, &council_id).await?;
-    let mut app = App::new(
-        council_id.clone(),
-        initial.summary,
-        &initial.charter,
-    );
+    let mut app = App::new(council_id.clone(), initial.summary, &initial.charter);
     app.posts = initial.posts;
     app.refresh_members_from_envelopes(&initial.envelopes);
 
@@ -345,9 +342,10 @@ async fn run_sse_subscriber(url: String, tx: mpsc::Sender<Signal>) {
                     continue;
                 }
                 if let Ok(ev) = serde_json::from_str::<CouncilEvent>(&payload)
-                    && tx.send(Signal::Event(ev)).is_err() {
-                        return;
-                    }
+                    && tx.send(Signal::Event(ev)).is_err()
+                {
+                    return;
+                }
             }
         }
         let _ = tx.send(Signal::Disconnected);

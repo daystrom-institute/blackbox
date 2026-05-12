@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ignore::{DirEntry, WalkBuilder};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use crate::chunker::code::{language_for_path, parser_for_language, ts_language_f
 use crate::index::{first_text, first_u64, optional_text};
 use crate::projects::ProjectRecord;
 use crate::refactor::{
-    parse_report, resolve_path, ParseReport, RefactorStatus, RefactorStatusParams, SyntaxItem,
+    ParseReport, RefactorStatus, RefactorStatusParams, SyntaxItem, parse_report, resolve_path,
 };
 
 #[cfg(test)]
@@ -53,11 +53,7 @@ pub const MAX_CODE_NAV_SCANNED_FILES: usize = 5000;
 /// As of CN-T2 there is exactly one documented case: Rust impl methods.
 /// See `src/refactor/rust.rs:rust_impl_methods_in` for the live-side
 /// synthesis that this function inverts.
-pub fn refactor_kind_for(
-    language: &str,
-    symbol_kind: &str,
-    parent_kind: Option<&str>,
-) -> String {
+pub fn refactor_kind_for(language: &str, symbol_kind: &str, parent_kind: Option<&str>) -> String {
     match (language, symbol_kind, parent_kind) {
         ("rust", "function_item", Some("impl_item")) => "impl_method".to_string(),
         _ => symbol_kind.to_string(),
@@ -70,14 +66,9 @@ pub fn refactor_kind_for(
 /// raw tree-sitter kinds on the response shape too. Returns
 /// `(refactor_kind.to_string(), None)` for kinds with no documented
 /// synthesis — honest about the parent-context loss in that direction.
-pub fn symbol_kind_from_refactor(
-    language: &str,
-    refactor_kind: &str,
-) -> (String, Option<String>) {
+pub fn symbol_kind_from_refactor(language: &str, refactor_kind: &str) -> (String, Option<String>) {
     match (language, refactor_kind) {
-        ("rust", "impl_method") => {
-            ("function_item".to_string(), Some("impl_item".to_string()))
-        }
+        ("rust", "impl_method") => ("function_item".to_string(), Some("impl_item".to_string())),
         _ => (refactor_kind.to_string(), None),
     }
 }
@@ -105,9 +96,9 @@ fn indexed_kind_filter_for(
     fields: crate::index::FieldHandles,
     kind: &str,
 ) -> Vec<Box<dyn tantivy::query::Query>> {
+    use tantivy::Term;
     use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
     use tantivy::schema::IndexRecordOption;
-    use tantivy::Term;
 
     let raw_probe: Box<dyn Query> = Box::new(TermQuery::new(
         Term::from_field_text(fields.symbol_kind, kind),
@@ -254,9 +245,7 @@ fn err_project_not_registered(project_dir: &str, registered: &[ProjectRecord]) -
     let response = CodeNavErrorResponse {
         status: "error".to_string(),
         code: "project_not_registered".to_string(),
-        message: format!(
-            "{project_dir} is not a registered project root or a descendant of one"
-        ),
+        message: format!("{project_dir} is not a registered project root or a descendant of one"),
         suggestion: format!(
             "Either pass a project_dir at or under one of `registered_projects[*].canonical_path`, \
              or call `bbox_project_register(path=\"{project_dir}\")` to register this directory first."
@@ -265,7 +254,10 @@ fn err_project_not_registered(project_dir: &str, registered: &[ProjectRecord]) -
         file_bytes: None,
         max_bytes: None,
         project_dir: Some(project_dir.to_string()),
-        registered_projects: registered.iter().map(CodeNavProjectHint::from_record).collect(),
+        registered_projects: registered
+            .iter()
+            .map(CodeNavProjectHint::from_record)
+            .collect(),
         semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
     };
     Ok(serde_json::to_string_pretty(&response)?)
@@ -1330,9 +1322,7 @@ pub fn code_symbols_indexed(
         // (e.g. .claude/worktrees/foo under transcript-search).
         .max_by_key(|rec| rec.canonical_path.len())
         .map(|rec| rec.project_id.clone())
-        .ok_or_else(|| {
-            anyhow!("internal: project_dir passed gate but no project_id resolved")
-        })?;
+        .ok_or_else(|| anyhow!("internal: project_dir passed gate but no project_id resolved"))?;
     let project_dir_arg = project_dir.to_string_lossy().into_owned();
 
     let limit = p.limit.unwrap_or(100).min(1000);
@@ -1418,14 +1408,8 @@ pub fn code_symbols_indexed(
     // count is a lower bound. Without an explicit `query`/path filter
     // the tantivy-level filter is exact, so `limit` itself is the
     // truthful upper bound.
-    let has_post_filter = p
-        .query
-        .as_deref()
-        .is_some_and(|q| !q.is_empty())
-        || p
-            .path_contains
-            .as_deref()
-            .is_some_and(|q| !q.is_empty());
+    let has_post_filter = p.query.as_deref().is_some_and(|q| !q.is_empty())
+        || p.path_contains.as_deref().is_some_and(|q| !q.is_empty());
     const INDEXED_SCAN_CAP: usize = 5000;
 
     // Three honest paths:
@@ -1467,17 +1451,14 @@ pub fn code_symbols_indexed(
     for (_score, addr) in hits {
         let doc: TantivyDocument = searcher.doc(addr)?;
         let stored_file_path = first_text(&doc, fields.file_path);
-        let rel_path = if let Ok(rel) =
-            std::path::Path::new(&stored_file_path).strip_prefix(&project_dir)
-        {
-            rel.to_string_lossy().into_owned()
-        } else {
-            stored_file_path.clone()
-        };
+        let rel_path =
+            if let Ok(rel) = std::path::Path::new(&stored_file_path).strip_prefix(&project_dir) {
+                rel.to_string_lossy().into_owned()
+            } else {
+                stored_file_path.clone()
+            };
 
-        if let Some(path_contains) =
-            p.path_contains.as_deref().filter(|s| !s.is_empty())
-        {
+        if let Some(path_contains) = p.path_contains.as_deref().filter(|s| !s.is_empty()) {
             if !rel_path.contains(path_contains) {
                 continue;
             }
@@ -1492,8 +1473,7 @@ pub fn code_symbols_indexed(
         let Some(symbol_kind) = symbol_kind_raw.clone() else {
             continue;
         };
-        let refactor_kind =
-            refactor_kind_for(&language, &symbol_kind, parent_kind_raw.as_deref());
+        let refactor_kind = refactor_kind_for(&language, &symbol_kind, parent_kind_raw.as_deref());
         let symbol_display = optional_text(&doc, fields.symbol);
         let symbol_exact = optional_text(&doc, fields.symbol_exact);
         let name = symbol_exact.or(symbol_display.clone());
@@ -1657,10 +1637,9 @@ fn err_invalid_code_refs_kind(raw: &str) -> Result<String> {
             "kind {raw:?} is not valid for bbox_code_refs; expected one of \
              \"calls\", \"imports\", \"fields\", \"identifiers\", \"all\""
         ),
-        suggestion:
-            "Pass kind=\"calls\" / \"imports\" / \"fields\" / \"identifiers\" / \"all\". \
+        suggestion: "Pass kind=\"calls\" / \"imports\" / \"fields\" / \"identifiers\" / \"all\". \
              Use kind=\"all\" if you want the union; narrow with `query` for substring filtering."
-                .to_string(),
+            .to_string(),
         file: None,
         file_bytes: None,
         max_bytes: None,
@@ -1675,7 +1654,11 @@ fn err_invalid_code_refs_kind(raw: &str) -> Result<String> {
 /// nearest symbol-producing ancestor (same notion of "containing
 /// symbol" as `SymbolSpec.parent_kind`). Best-effort — returns
 /// `None` at file top level or when no ancestor is symbol-producing.
-fn containing_symbol_for(node: tree_sitter::Node<'_>, source: &str, language: &str) -> Option<String> {
+fn containing_symbol_for(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    language: &str,
+) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
         // Skip wrapper nodes; only return when the AST node itself
@@ -1815,8 +1798,7 @@ pub fn code_refs(p: &CodeRefsParams) -> Result<String> {
             } else {
                 None
             };
-            let containing_symbol =
-                containing_symbol_for(node, &parsed.source, &language);
+            let containing_symbol = containing_symbol_for(node, &parsed.source, &language);
             let byte_range = (node.start_byte(), node.end_byte());
             let line_range = (start.row + 1, end.row + 1);
             let column_range = (start.column + 1, end.column + 1);
@@ -1951,7 +1933,10 @@ fn capture_to_ref_kind(capture: &str) -> &'static str {
 /// Generic identifier-only walker for languages without a curated
 /// code_refs query. Walks every named node and emits a record for
 /// each `identifier` node it finds.
-fn code_refs_generic_identifiers(parsed: &CodeNavParsedSource, p: &CodeRefsParams) -> Result<String> {
+fn code_refs_generic_identifiers(
+    parsed: &CodeNavParsedSource,
+    p: &CodeRefsParams,
+) -> Result<String> {
     let limit = p.limit.unwrap_or(200).min(1000);
     let include_text = p.include_text.unwrap_or(false);
     let name_filter = p.query.as_deref().filter(|s| !s.is_empty());
@@ -1964,9 +1949,7 @@ fn code_refs_generic_identifiers(parsed: &CodeNavParsedSource, p: &CodeRefsParam
     while let Some(node) = stack.pop() {
         if node.kind() == "identifier" {
             if let Ok(name) = node.utf8_text(parsed.source.as_bytes()) {
-                let matches_filter = name_filter
-                    .map(|f| name.contains(f))
-                    .unwrap_or(true);
+                let matches_filter = name_filter.map(|f| name.contains(f)).unwrap_or(true);
                 if matches_filter {
                     matching_refs += 1;
                     if records.len() < limit {
@@ -1975,11 +1958,8 @@ fn code_refs_generic_identifiers(parsed: &CodeNavParsedSource, p: &CodeRefsParam
                         let byte_range = (node.start_byte(), node.end_byte());
                         let line_range = (start.row + 1, end.row + 1);
                         let column_range = (start.column + 1, end.column + 1);
-                        let containing_symbol = containing_symbol_for(
-                            node,
-                            &parsed.source,
-                            &parsed.language,
-                        );
+                        let containing_symbol =
+                            containing_symbol_for(node, &parsed.source, &parsed.language);
                         let handoff = code_ref_handoff(
                             &p.file,
                             p.project_dir.as_deref(),

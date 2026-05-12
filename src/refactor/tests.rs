@@ -48,11 +48,13 @@ mod tests {
             parsed.project_id, parsed.rel_path_hash
         )));
         assert_eq!(chunk.chunk_hash.len(), 64);
-        assert!(chunk
-            .excerpt
-            .as_deref()
-            .unwrap_or_default()
-            .contains("alpha"));
+        assert!(
+            chunk
+                .excerpt
+                .as_deref()
+                .unwrap_or_default()
+                .contains("alpha")
+        );
     }
 
     /// CN-D4 contract: project_refs records carry symbol_kind,
@@ -95,7 +97,11 @@ mod tests {
         // Qualified name is `<impl header>::run`; bare name asserted via
         // the symbol field containing "run".
         assert!(
-            method_ref.symbol.as_deref().map(|s| s.contains("run")).unwrap_or(false),
+            method_ref
+                .symbol
+                .as_deref()
+                .map(|s| s.contains("run"))
+                .unwrap_or(false),
             "expected method symbol to contain 'run', got {:?}",
             method_ref.symbol
         );
@@ -134,10 +140,12 @@ mod tests {
         let parsed: RefactorStatus = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed.language, "rust");
         assert_eq!(parsed.parse.error_nodes, 0);
-        assert!(parsed
-            .items
-            .iter()
-            .any(|item| item.kind == "struct_item" && item.name.as_deref() == Some("Thing")));
+        assert!(
+            parsed
+                .items
+                .iter()
+                .any(|item| item.kind == "struct_item" && item.name.as_deref() == Some("Thing"))
+        );
         assert!(parsed.items.iter().any(|item| {
             item.attributes
                 .iter()
@@ -170,10 +178,12 @@ mod tests {
             .iter()
             .find(|item| item.kind == "impl_method" && item.name.as_deref() == Some("find"))
             .expect("impl method should be listed");
-        assert!(method
-            .attributes
-            .iter()
-            .any(|attr| attr == "#[tool(description = \"x\")]"));
+        assert!(
+            method
+                .attributes
+                .iter()
+                .any(|attr| attr == "#[tool(description = \"x\")]")
+        );
     }
 
     #[test]
@@ -697,9 +707,11 @@ mod tests {
         .unwrap();
         let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(applied.status, "ok");
-        assert!(fs::read_to_string(&target)
-            .unwrap()
-            .starts_with("/*!\nmodule docs\n*/\n\nuse super::*;"));
+        assert!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .starts_with("/*!\nmodule docs\n*/\n\nuse super::*;")
+        );
     }
 
     #[test]
@@ -823,9 +835,10 @@ mod tests {
             ..Default::default()
         })
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("only supports item_kinds impl_method"));
+        assert!(
+            err.to_string()
+                .contains("only supports item_kinds impl_method")
+        );
     }
 
     #[test]
@@ -975,12 +988,16 @@ mod tests {
         .unwrap();
         let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
         let leftovers = plan_value["leftovers"].as_array().unwrap();
-        assert!(leftovers
-            .iter()
-            .any(|leftover| leftover.as_str().unwrap().contains("keep_a")));
-        assert!(!leftovers
-            .iter()
-            .any(|leftover| leftover.as_str().unwrap().contains("keep_b")));
+        assert!(
+            leftovers
+                .iter()
+                .any(|leftover| leftover.as_str().unwrap().contains("keep_a"))
+        );
+        assert!(
+            !leftovers
+                .iter()
+                .any(|leftover| leftover.as_str().unwrap().contains("keep_b"))
+        );
     }
 
     #[test]
@@ -1425,10 +1442,12 @@ mod tests {
         let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(run_response.status, "step_failed");
         assert!(run_response.rolled_back);
-        assert!(run_response
-            .error
-            .unwrap()
-            .contains("outside registered projects"));
+        assert!(
+            run_response
+                .error
+                .unwrap()
+                .contains("outside registered projects")
+        );
         assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
         assert_eq!(fs::read_to_string(&outside).unwrap(), "mod outside_mod;\n");
     }
@@ -1625,11 +1644,13 @@ mod tests {
         let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(run_response.status, "step_failed");
         assert!(run_response.rolled_back);
-        assert!(run_response.steps[1]
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("put arguments in args"));
+        assert!(
+            run_response.steps[1]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("put arguments in args")
+        );
         assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
     }
 
@@ -1780,9 +1801,11 @@ mod tests {
         .unwrap();
         let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(applied.status, "ok");
-        assert!(fs::read_to_string(&source)
-            .unwrap()
-            .contains("impl Thing { pub(super) fn hidden(&self) {} }"));
+        assert!(
+            fs::read_to_string(&source)
+                .unwrap()
+                .contains("impl Thing { pub(super) fn hidden(&self) {} }")
+        );
     }
 
     #[test]
@@ -1834,9 +1857,11 @@ mod tests {
         .unwrap();
         let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(applied.status, "ok");
-        assert!(fs::read_to_string(&source)
-            .unwrap()
-            .contains("impl Thing { pub(super) async fn hidden(&self) {} }"));
+        assert!(
+            fs::read_to_string(&source)
+                .unwrap()
+                .contains("impl Thing { pub(super) async fn hidden(&self) {} }")
+        );
     }
 
     #[test]
@@ -2688,7 +2713,10 @@ mod tests {
             .expect("validation pass should succeed even when source has parse errors");
         assert_eq!(results.len(), 1, "one input file → one validation result");
         let result = &results[0];
-        assert!(result.has_error, "deliberately broken source must flag has_error");
+        assert!(
+            result.has_error,
+            "deliberately broken source must flag has_error"
+        );
         assert!(
             !result.error_excerpts.is_empty(),
             "broken source must surface at least one excerpt"
@@ -3026,10 +3054,12 @@ mod tests {
         let parsed: RefactorStatus = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed.language, "typescript");
         assert_eq!(parsed.parse.error_nodes, 0);
-        assert!(parsed
-            .items
-            .iter()
-            .any(|item| item.kind.contains("export") || item.name.as_deref() == Some("helper")));
+        assert!(
+            parsed
+                .items
+                .iter()
+                .any(|item| item.kind.contains("export") || item.name.as_deref() == Some("helper"))
+        );
     }
 
     #[test]
@@ -3210,7 +3240,7 @@ mod tests {
             leftovers: Vec::new(),
             captured_variables: Vec::new(),
             remaining_source_accessors: Vec::new(),
-        remaining_source_constant_refs: Vec::new(),
+            remaining_source_constant_refs: Vec::new(),
             external_calls: Vec::new(),
             inherited_dependencies: Vec::new(),
             deep_analysis: None,
@@ -3259,7 +3289,7 @@ mod tests {
             leftovers: Vec::new(),
             captured_variables: Vec::new(),
             remaining_source_accessors: Vec::new(),
-        remaining_source_constant_refs: Vec::new(),
+            remaining_source_constant_refs: Vec::new(),
             external_calls: Vec::new(),
             inherited_dependencies: Vec::new(),
             deep_analysis: None,
@@ -3531,7 +3561,10 @@ mod rx_f2b_obligation_tests {
         .unwrap();
 
         let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(resp.status, "ok", "optional failure should not abort: {response}");
+        assert_eq!(
+            resp.status, "ok",
+            "optional failure should not abort: {response}"
+        );
         assert_eq!(resp.steps[0].status, "failed_optional");
         assert!(resp.obligations.is_empty());
     }
@@ -3589,7 +3622,10 @@ mod rx_f2b_obligation_tests {
         .unwrap();
 
         let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(resp.status, "ok", "consumed obligation should commit: {response}");
+        assert_eq!(
+            resp.status, "ok",
+            "consumed obligation should commit: {response}"
+        );
         assert!(!resp.rolled_back);
         assert_eq!(resp.steps[0].status, "soft_failed");
         assert_eq!(resp.steps[1].status, "ok");
@@ -3647,7 +3683,10 @@ mod rx_f2b_obligation_tests {
         .unwrap();
 
         let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(resp.status, "ok", "leftover obligation should commit: {response}");
+        assert_eq!(
+            resp.status, "ok",
+            "leftover obligation should commit: {response}"
+        );
         assert!(!resp.rolled_back);
         assert_eq!(resp.obligations.len(), 1);
         assert_eq!(resp.obligations[0].status, "left_over");
@@ -3755,10 +3794,16 @@ mod rx_f2b_obligation_tests {
 
         let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(resp.status, "step_failed", "{response}");
-        assert!(resp.rolled_back, "should have rolled back from soft-fail cursor");
+        assert!(
+            resp.rolled_back,
+            "should have rolled back from soft-fail cursor"
+        );
         // The touch file should be restored to "before" (soft-fail cursor rollback).
         let content = fs::read_to_string(&touch_file).unwrap();
-        assert_eq!(content, "before", "touch file should be restored on rollback");
+        assert_eq!(
+            content, "before",
+            "touch file should be restored on rollback"
+        );
     }
 
     // ── Gate C: multi-soft-fail cursor stays at FIRST soft-fail ──
@@ -3848,8 +3893,14 @@ mod rx_f2b_obligation_tests {
         // Both touch files should be restored because rollback goes from cursor=0.
         let t1 = fs::read_to_string(&touch1).unwrap();
         let t2 = fs::read_to_string(&touch2).unwrap();
-        assert_eq!(t1, "t1_before", "touch1 should be restored (inside first cursor)");
-        assert_eq!(t2, "t2_before", "touch2 should be restored (rollback from first cursor)");
+        assert_eq!(
+            t1, "t1_before",
+            "touch1 should be restored (inside first cursor)"
+        );
+        assert_eq!(
+            t2, "t2_before",
+            "touch2 should be restored (rollback from first cursor)"
+        );
     }
 }
 
@@ -3915,9 +3966,7 @@ mod rx_f2a_capture_tests {
             make_compiler_message("warning", "real warning"),
         ];
         // Also include a valid JSON line that is NOT a compiler-message.
-        lines.push(
-            serde_json::json!({"reason": "build-finished", "success": true}).to_string(),
-        );
+        lines.push(serde_json::json!({"reason": "build-finished", "success": true}).to_string());
         let stdout = lines.join("\n").into_bytes();
         let diags = parse_rustc_json_output(&stdout);
         // Only the two compiler-message lines should survive.
@@ -3985,8 +4034,14 @@ mod rx_f2a_capture_tests {
             .as_ref()
             .expect("expected captured_diagnostics_summary on the command step");
         assert_eq!(summary.count, 5);
-        assert_eq!(summary.severity_counts.get("error").copied().unwrap_or(0), 2);
-        assert_eq!(summary.severity_counts.get("warning").copied().unwrap_or(0), 3);
+        assert_eq!(
+            summary.severity_counts.get("error").copied().unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            summary.severity_counts.get("warning").copied().unwrap_or(0),
+            3
+        );
     }
 
     #[test]
@@ -4036,8 +4091,7 @@ mod rx_a1_deep_tests {
     use std::{fs, path::Path};
 
     fn fixture_dir() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/refactor/test_fixtures/rx_a1b_copy")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/refactor/test_fixtures/rx_a1b_copy")
     }
 
     /// A1b: manifest-driven borrow_context classification for every fixture.
@@ -4070,22 +4124,20 @@ mod rx_a1_deep_tests {
             let impl_name = methods[0].impl_name.clone();
             let method_name = methods[0].item.name.clone().unwrap_or_default();
 
-            let deep =
-                rust_deep::deep_analyze_extract(&fixture_path, &impl_name, &[&method_name])
-                    .unwrap_or_else(|e| {
-                        panic!("deep_analyze_extract failed for {fixture_file}: {e}")
-                    });
+            let deep = rust_deep::deep_analyze_extract(&fixture_path, &impl_name, &[&method_name])
+                .unwrap_or_else(|e| panic!("deep_analyze_extract failed for {fixture_file}: {e}"));
 
             let field = deep
                 .captured_self_fields
                 .iter()
                 .find(|f| f.field_name == field_name)
                 .unwrap_or_else(|| {
-                    let names: Vec<_> =
-                        deep.captured_self_fields.iter().map(|f| &f.field_name).collect();
-                    panic!(
-                        "field `{field_name}` not found in {fixture_file}; got: {names:?}"
-                    )
+                    let names: Vec<_> = deep
+                        .captured_self_fields
+                        .iter()
+                        .map(|f| &f.field_name)
+                        .collect();
+                    panic!("field `{field_name}` not found in {fixture_file}; got: {names:?}")
                 });
 
             assert_eq!(
@@ -4219,8 +4271,7 @@ mod rx_a2_fixme_marker_tests {
     use std::{fs, path::Path};
 
     fn fixture_dir() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/refactor/test_fixtures/rx_a1b_copy")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/refactor/test_fixtures/rx_a1b_copy")
     }
 
     /// Source with a unique_ref field — guarantees at least one blocking finding.
@@ -4379,7 +4430,11 @@ impl Cache {
         .unwrap();
 
         let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
-        assert_eq!(p.plan_status, PlanStatus::Planned, "expected Planned (no deep_analysis)");
+        assert_eq!(
+            p.plan_status,
+            PlanStatus::Planned,
+            "expected Planned (no deep_analysis)"
+        );
 
         apply(
             &RefactorApplyParams {
@@ -4423,7 +4478,10 @@ impl Cache {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
             .collect();
-        assert!(!fixtures.is_empty(), "no fixture files found in rx_a1b_copy");
+        assert!(
+            !fixtures.is_empty(),
+            "no fixture files found in rx_a1b_copy"
+        );
 
         for entry in fixtures {
             let fixture_path = entry.path();
@@ -4437,12 +4495,9 @@ impl Cache {
             let impl_name = methods[0].impl_name.clone();
             let method_name = methods[0].item.name.clone().unwrap_or_default();
 
-            let da = rust_deep::deep_analyze_extract(
-                &fixture_path,
-                &impl_name,
-                &[method_name.as_str()],
-            )
-            .unwrap_or_else(|e| panic!("deep analysis failed for {fixture_name}: {e}"));
+            let da =
+                rust_deep::deep_analyze_extract(&fixture_path, &impl_name, &[method_name.as_str()])
+                    .unwrap_or_else(|e| panic!("deep analysis failed for {fixture_name}: {e}"));
 
             let expected_count = da.captured_self_fields.len()
                 + da.unresolved_callbacks.len()
@@ -4451,8 +4506,7 @@ impl Cache {
 
             let (_markers, count) = rust_deep::generate_fixme_markers(&da);
             assert_eq!(
-                count,
-                expected_count,
+                count, expected_count,
                 "fixture {fixture_name}: marker count {count} != findings count {expected_count}"
             );
         }
@@ -4462,7 +4516,10 @@ impl Cache {
         ProjectRecord {
             project_id: "g15-test-project".to_string(),
             repo_id: None,
-            canonical_path: fs::canonicalize(path).unwrap().to_string_lossy().into_owned(),
+            canonical_path: fs::canonicalize(path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             registered_at: "2026-05-12T00:00:00Z".to_string(),
             is_git_repo: true,
             languages: Default::default(),

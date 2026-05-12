@@ -28,16 +28,16 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
-use crate::orchestration::team::{load_all_teams, Team};
+use crate::orchestration::team::{Team, load_all_teams};
 
 const COUNCIL_EVENT_BUFFER: usize = 256;
 

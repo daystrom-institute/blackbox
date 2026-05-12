@@ -64,9 +64,7 @@ impl ToolCategory {
             Self::Transcripts => {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
             }
-            Self::Graph => {
-                "Inspect entities, graph vocabulary, paths, bundles, and retrieval."
-            }
+            Self::Graph => "Inspect entities, graph vocabulary, paths, bundles, and retrieval.",
             Self::Projects => "Register project roots for later file indexing.",
             Self::Refactor => {
                 "Mechanize structural refactors with tree-sitter-backed source inventory, dry-run plans, hash-checked apply, transaction composition, file moves, and parse validation. Inspection is multi-language for supported grammars; writable plan kinds may be generic or language-scoped. Pull `sm-refactor` first, then any relevant language runbook via `bbox_knowledge` for exact plan kinds, arguments, and validation expectations. These tools are syntax-aware, not semantic rename engines; use language servers or compiler feedback for reference resolution and import repair."
@@ -142,14 +140,18 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Graph,
         summary: "Hybrid BM25+vector search over typed entities. vector_weight=0.6 by default; set 0.0 for BM25-only behavior, 1.0 for vector-only.",
         when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits — top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes.",
-        example: Some(r#"bbox_hybrid_search(query="triad implementation", limit=10, project="/home/me/repos/erlang-test")"#),
+        example: Some(
+            r#"bbox_hybrid_search(query="triad implementation", limit=10, project="/home/me/repos/erlang-test")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_discover_seed_entities",
         category: ToolCategory::Graph,
         summary: "Find seed entities with notable_edges; inspect before answering.",
         when_to_use: "Alternate Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`) — same blender as `bbox_hybrid_search` but with `notable_edges` rendered for each seed. Reach for it when the next step will be `bbox_inspect_entity` and you want pre-vetted hops.",
-        example: Some(r#"bbox_discover_seed_entities(query="triad closure convergence test", limit=5)"#),
+        example: Some(
+            r#"bbox_discover_seed_entities(query="triad closure convergence test", limit=5)"#,
+        ),
     },
     ToolDoc {
         name: "bbox_cite",
@@ -304,7 +306,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Projects,
         summary: "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, councils, whiteboards, pollers, and crons, then reindexes project files.",
         when_to_use: "Use after renaming a repo directory, or with `move_on_disk=true` to let bbox move the directory first. Prefer `dry_run=true` before changing several project names so the affected state counts are visible.",
-        example: Some(r#"bbox_project_rename(project="d723917f", new_path="/home/me/repos/blackbox", dry_run=true)"#),
+        example: Some(
+            r#"bbox_project_rename(project="d723917f", new_path="/home/me/repos/blackbox", dry_run=true)"#,
+        ),
     },
     ToolDoc {
         name: "bbox_project_list",
@@ -318,7 +322,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Projects,
         summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, councils, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry.",
         when_to_use: "Use to drop a stale or accidentally-registered project root without hand-editing projects.json. Prefer `dry_run=true` first to see what is still attached, then `bbox_project_rename` to migrate or `force=true` to accept orphaning.",
-        example: Some(r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#),
+        example: Some(
+            r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#,
+        ),
     },
     // ── Refactor mechanization ───────────────────────────────────────
     ToolDoc {
@@ -326,14 +332,18 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Refactor,
         summary: "Find refactorable syntax symbols across a project and return exact line ranges plus refactor/project-ref handoff hints.",
         when_to_use: "Use instead of `rg -n` when you need method/function/type line numbers, refactorable item names, or candidate files for a symbol. Two lanes via `mode`: `indexed` (default; reads stored tantivy docs, no parse cost) and `live` (walks + reparses; honest fallback when the reindexer is behind). `item_kinds` accepts BOTH refactor synthetic kinds (e.g. `impl_method`) and raw tree-sitter kinds (e.g. `function_item`); see `sm-refactor` for the dual-vocabulary contract. Records carry `kind` (refactor synthetic) plus `symbol_kind` and `parent_kind` (raw), byte_range, line_range, and `handoff` suggestions for bbox_refactor_status / bbox_refactor_project_refs. Truncation signalled via `truncation_reason` (limit_reached / file_limit_reached / scan_cap_reached). Recoverable errors return typed JSON with `code` + `suggestion`. This is syntax inventory, not reference resolution.",
-        example: Some(r#"bbox_code_symbols(project_dir="/repo/x", query="readFromProperties", languages=["java"], item_kinds=["method_declaration"], limit=20)"#),
+        example: Some(
+            r#"bbox_code_symbols(project_dir="/repo/x", query="readFromProperties", languages=["java"], item_kinds=["method_declaration"], limit=20)"#,
+        ),
     },
     ToolDoc {
         name: "bbox_code_query",
         category: ToolCategory::Refactor,
         summary: "Run a tree-sitter query against one source file. Return syntactic matches plus handoff hints for refactor/status grounding.",
         when_to_use: "Use after the file is known to find AST patterns, block ranges, or specific syntactic constructs using tree-sitter S-expressions. For method/function/type line numbers across a project, use bbox_code_symbols first instead of shell `rg`. Returns matched nodes, byte/line ranges, optional text, parse diagnostics, and `handoff` suggestions for bbox_refactor_status / bbox_refactor_project_refs. The matches are syntax-only, not semantic bindings.",
-        example: Some(r#"bbox_code_query(file="src/foo.rs", query="(function_item name: (identifier) @name)")"#),
+        example: Some(
+            r#"bbox_code_query(file="src/foo.rs", query="(function_item name: (identifier) @name)")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_code_node_describe",
@@ -354,35 +364,45 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Refactor,
         summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",
         when_to_use: "Use before syntax-aware structural planning to inventory refactorable syntax items, confirm tree-sitter sees the file cleanly, and copy exact item names/kinds into a supported bbox_refactor_plan when the plan kind needs them. On large files, pass item_kinds/item_names and limit to keep the response agent-sized. Pull `sm-refactor` first, then any relevant language memory for language-specific item kinds, arguments, caveats, and validation commands.",
-        example: Some(r#"bbox_refactor_status(file="src/path/to/file.ext", project_dir="/repo/x", item_names=["Thing"], limit=50, include_attributes=false)"#),
+        example: Some(
+            r#"bbox_refactor_status(file="src/path/to/file.ext", project_dir="/repo/x", item_names=["Thing"], limit=50, include_attributes=false)"#,
+        ),
     },
     ToolDoc {
         name: "bbox_refactor_project_refs",
         category: ToolCategory::Refactor,
         summary: "Ground current project_file entity refs for a source file using the same chunk and hash rules as the agentic corpus.",
         when_to_use: "Use before editing eval fixtures, provenance metadata, design docs, or any other structured text that stores `project_file:<project>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>` refs. This is a grounding/read tool: it returns the current rel_path_hash, chunk hashes, occurrence indexes, symbols, byte ranges, and canonical entity_ref strings for a file so agents do not guess from whole-file sha256 or replace the wrong ref segment.",
-        example: Some(r#"bbox_refactor_project_refs(file="src/packets/mod.rs", project_dir="/repo/x", query="compile", limit=20)"#),
+        example: Some(
+            r#"bbox_refactor_project_refs(file="src/packets/mod.rs", project_dir="/repo/x", query="compile", limit=20)"#,
+        ),
     },
     ToolDoc {
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
         summary: "Create a dry-run structural refactor plan using a supported generic or language-scoped plan kind.",
         when_to_use: "Use after `sm-refactor` identifies an exact supported plan kind. For syntax-item operations, inspect with bbox_refactor_status first and use the relevant language memory (`sm-refactor-rust`, `sm-refactor-java`, etc.) for exact item kinds, extra arguments, language-specific contracts, and plan-refusal codes — those details do not live here. This call never writes files: the response always has `dry_run: true` and any edits are staged in-memory (returned inline) or, when `output_path=<file>` is passed, written to disk under `$BLACKBOX_STATE_DIR/refactor/plans/`. The response's `plan_path` field is the absolute resolved location; pass either that absolute path or the bare relative filename back to `bbox_refactor_apply(plan_path=…)` — both round-trip cleanly. `output_path` is required when the plan JSON would exceed the MCP transport's parameter-string limit (the response is a compact summary in that case). Supported extraction plans may create a missing target as an empty-original FileEdit; do not pre-create placeholder files or use allow_dirty_worktree=true for normal target creation. `deep_analysis: true` on language plans that support it adds safety reports (captured_variables, external_calls, inherited_dependencies, remaining_source_accessors, remaining_source_constant_refs) — see the language runbook for the exact shape. The plan is reviewable JSON with hash checks, file moves or text edits, parse validations, selected items, and leftovers where applicable. Keep this generic surface free of language-specific assumptions; semantic rename belongs to LSP, compiler validation, or language-scoped surfaces.",
-        example: Some(r#"bbox_refactor_plan(kind="<supported_plan_kind>", source="src/path/to/file.ext", target="src/path/to/target.ext", item_names=["Thing"], old_text="exact before", new_text="exact after", project_dir="/repo/x")"#),
+        example: Some(
+            r#"bbox_refactor_plan(kind="<supported_plan_kind>", source="src/path/to/file.ext", target="src/path/to/target.ext", item_names=["Thing"], old_text="exact before", new_text="exact after", project_dir="/repo/x")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_refactor_apply",
         category: ToolCategory::Refactor,
         summary: "Apply a previously generated refactor plan with hash checks, supported-source parse validation, atomic writes, and rollback on write failure.",
         when_to_use: "Use only after reviewing a bbox_refactor_plan result. Requires confirm=true; refuses stale file hashes and validates rewritten supported source files before writing. Pass `plan` for inline JSON or `plan_path` for a filesystem path to a plan file written by `bbox_refactor_plan(output_path=...)` — exactly one of the two is required. `plan_path` is the right choice for large plans whose JSON exceeds the MCP transport's parameter-string limit. `plan_path` accepts either the absolute path echoed in the plan response's `plan_path` field (round-trip) or the bare relative filename you passed to `output_path`; both resolve to the same on-disk file under `$BLACKBOX_STATE_DIR/refactor/plans/`. Slot-escaping paths (`/tmp/...`, `../../etc/passwd`) are rejected. Paths must live under registered projects unless allow_unregistered_paths=true is explicitly set for a disposable practice worktree or isolated smoke test.",
-        example: Some(r#"bbox_refactor_apply(plan_path="/tmp/refactor.json", confirm=true) OR bbox_refactor_apply(plan=<plan-json>, confirm=true)"#),
+        example: Some(
+            r#"bbox_refactor_apply(plan_path="/tmp/refactor.json", confirm=true) OR bbox_refactor_apply(plan=<plan-json>, confirm=true)"#,
+        ),
     },
     ToolDoc {
         name: "bbox_refactor_run",
         category: ToolCategory::Refactor,
         summary: "Compose primitive refactor plans into one transactional run with rollback across touched files.",
         when_to_use: "Use when a restructuring move needs several bbox_refactor_plan primitives and validation commands to succeed or fail together. V1 executes primitive plan steps sequentially against the live projected state when confirm=true, snapshots touched files before first write, rejects initially dirty files unless allow_dirty_worktree=true, and rolls back primitive-plan writes if any later required plan or command step fails. Plan steps accept an `optional: true` flag that turns plan-time failures (e.g., a no-op lombokify against a non-POJO file in a curated batch) into per-step `skipped` entries rather than aborting + rolling back the batch — use this for bulk batches where a subset of steps may legitimately have nothing to do. Command steps are validation-only unless `touches` declares paths they may mutate; declared touches are snapshotted and included in rollback. Language memories should name the project-specific validation commands; the runner executes them generically.",
-        example: Some(r#"bbox_refactor_run(title="compound structural move", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"<supported_plan_kind>","source":"src/path/to/file.ext","item_names":["Thing"]},{"op":"command","command":"make","args":["test"],"touches":["generated.lock"]}])"#),
+        example: Some(
+            r#"bbox_refactor_run(title="compound structural move", project_dir="/repo/x", confirm=true, steps=[{"op":"plan","kind":"<supported_plan_kind>","source":"src/path/to/file.ext","item_names":["Thing"]},{"op":"command","command":"make","args":["test"],"touches":["generated.lock"]}])"#,
+        ),
     },
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {
@@ -638,28 +658,36 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Orchestration,
         summary: "Start a Badgey consultant instance for a project scope and return its badgey_id, provider session, task, and thread-of-record ids.",
         when_to_use: "Use when you want Badgey to consult over a project with continuity. The wrapper opens a work-item thread, dispatches the badgey brofile, and owns the session mapping. Use `badgey_resume` or `badgey_ask` for follow-up turns.",
-        example: Some(r#"badgey_exec(project_dir="/repo/x", brief="help me navigate the agent graph work")"#),
+        example: Some(
+            r#"badgey_exec(project_dir="/repo/x", brief="help me navigate the agent graph work")"#,
+        ),
     },
     ToolDoc {
         name: "badgey_resume",
         category: ToolCategory::Orchestration,
         summary: "Send a turn to an existing Badgey instance. Mechanical commands such as `dismiss` are handled by the wrapper before provider resume.",
         when_to_use: "Use for any follow-up where Badgey should keep its thread-of-record context. Calls are serialized per badgey_id so concurrent callers do not corrupt the provider session.",
-        example: Some(r#"badgey_resume(badgey_id="bg-0123abcd-4567ef89", prompt="teach me why this edge matters")"#),
+        example: Some(
+            r#"badgey_resume(badgey_id="bg-0123abcd-4567ef89", prompt="teach me why this edge matters")"#,
+        ),
     },
     ToolDoc {
         name: "badgey_ask",
         category: ToolCategory::Orchestration,
         summary: "Question-shaped alias for badgey_resume.",
         when_to_use: "Use when the caller is asking a direct question of an existing Badgey instance and you prefer `question` over `prompt` in the request shape.",
-        example: Some(r#"badgey_ask(badgey_id="bg-0123abcd-4567ef89", question="what should I inspect next?")"#),
+        example: Some(
+            r#"badgey_ask(badgey_id="bg-0123abcd-4567ef89", question="what should I inspect next?")"#,
+        ),
     },
     ToolDoc {
         name: "badgey_dismiss",
         category: ToolCategory::Orchestration,
         summary: "Dismiss a Badgey instance, drain queued turns, write a dismiss event, and resolve its thread of record.",
         when_to_use: "Use when a Badgey consultation is done or should stop accepting turns. After dismissal, new resumes for that badgey_id fail with instance_dismissed.",
-        example: Some(r#"badgey_dismiss(badgey_id="bg-0123abcd-4567ef89", reason="work complete")"#),
+        example: Some(
+            r#"badgey_dismiss(badgey_id="bg-0123abcd-4567ef89", reason="work complete")"#,
+        ),
     },
     ToolDoc {
         name: "badgey_status",
@@ -680,7 +708,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Orchestration,
         summary: "Ask Badgey to author scout sub-charters for a focused question; wrapper post-processing dispatches emitted scout actions.",
         when_to_use: "Use for bounded fan-out investigation when Badgey should decompose one question into focused scout turns without exposing bro_exec to the Badgey provider session.",
-        example: Some(r#"badgey_scout(badgey_id="bg-0123abcd-4567ef89", charter="compare these two graph paths")"#),
+        example: Some(
+            r#"badgey_scout(badgey_id="bg-0123abcd-4567ef89", charter="compare these two graph paths")"#,
+        ),
     },
     ToolDoc {
         name: "badgey_collect",
@@ -821,9 +851,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Orchestration,
         summary: "Get-or-create the system Badgey instance that authors triage briefs for a Slack-bound project. Reads the (team_id, channel_id) binding to resolve the project scope, looks up the binding's badgey_id; if absent or the instance has been dismissed, exec a fresh Badgey instance, persist its id back on the binding, and return it. Used by the per-channel triage workflow's EnsureInstance node.",
         when_to_use: "Called from the per-channel triage workflow's first node. Requires a binding via `bro_slack_bind action=bind`. Idempotent — re-calling against an active instance returns the existing id with `created=false`.",
-        example: Some(
-            r#"badgey_ensure_for_channel(team_id="T0123ABCD", channel_id="C0123XYZ")"#,
-        ),
+        example: Some(r#"badgey_ensure_for_channel(team_id="T0123ABCD", channel_id="C0123XYZ")"#),
     },
     ToolDoc {
         name: "bro_slack_link_lookup",
@@ -1029,7 +1057,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Orchestration,
         summary: "Search installed agents by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and matched anti-patterns.",
         when_to_use: "Discovery: find agents relevant to a task before dispatching. Call with the task description to get ranked candidates. Set exclude_anti_pattern_matches=false to see all matches including anti-pattern hits (useful for review). Filter by cost_class or provenance_kind to narrow results.",
-        example: Some(r#"bro_agent_search(query="review pull request for security issues", limit=3)"#),
+        example: Some(
+            r#"bro_agent_search(query="review pull request for security issues", limit=3)"#,
+        ),
     },
     ToolDoc {
         name: "bro_agent_dispatch",

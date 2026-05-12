@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use regex::Regex;
 
-use super::{placeholder_chunk, Chunk, Edge, SourceFormatChunker};
+use super::{Chunk, Edge, SourceFormatChunker, placeholder_chunk};
 
 pub struct MarkdownChunker;
 

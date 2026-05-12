@@ -18,6 +18,8 @@ use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::sync::Notify;
 
+use crate::transcripts::adapters::TranscriptAdapterRegistry;
+use crate::transcripts::types::{TranscriptCursor, TranscriptLocation};
 use providers::{EventSink, Provider, Usage};
 
 const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
@@ -130,6 +132,8 @@ pub struct TaskInner {
     /// rather than starting a fresh session — the conversation
     /// history is intact. Surfaced through `bro_status` / `bro_wait`.
     pub recoverable: bool,
+    pub transcript_location: Option<TranscriptLocation>,
+    pub transcript_cursor: Option<TranscriptCursor>,
 }
 
 pub struct Task {
@@ -277,6 +281,10 @@ struct PersistedTask {
     /// `bro_resume(session_id=...)`" from "task genuinely failed".
     #[serde(default)]
     recoverable: bool,
+    #[serde(default)]
+    transcript_location: Option<TranscriptLocation>,
+    #[serde(default)]
+    transcript_cursor: Option<TranscriptCursor>,
 }
 
 impl TaskStore {
@@ -312,6 +320,8 @@ impl TaskStore {
                     agent_label: inner.agent_label.clone(),
                     report: inner.report.clone(),
                     recoverable: inner.recoverable,
+                    transcript_location: inner.transcript_location.clone(),
+                    transcript_cursor: inner.transcript_cursor.clone(),
                 }
             })
             .collect();
@@ -373,6 +383,8 @@ impl TaskStore {
                     agent_label: rec.agent_label,
                     report: rec.report,
                     recoverable: rec.recoverable,
+                    transcript_location: rec.transcript_location,
+                    transcript_cursor: rec.transcript_cursor,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -551,7 +563,8 @@ pub struct AmbientContext {
     /// tool filtering (Claude/Copilot), the text recursion guard is
     /// omitted in favor of the mechanical filter applied at the CLI arg
     /// layer. Unset or unsupported provider → text guard as fallback.
-    #[allow(dead_code)] // reserved hook for defense-in-depth text guards; see comment above apply_ambient
+    #[allow(dead_code)]
+    // reserved hook for defense-in-depth text guards; see comment above apply_ambient
     pub provider: Option<providers::Provider>,
 }
 
@@ -670,9 +683,13 @@ pub fn apply_brofile_lens(prompt: &str, lens: Option<&str>) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BroSpawnError {
-    DuplicateTaskId { id: String },
+    DuplicateTaskId {
+        id: String,
+    },
     #[allow(dead_code)] // only constructed by the test-only `insert` method
-    ReservedTaskId { id: String },
+    ReservedTaskId {
+        id: String,
+    },
 }
 
 impl std::fmt::Display for BroSpawnError {
@@ -740,6 +757,8 @@ fn failed_duplicate_task(
             agent_label,
             report: None,
             recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -797,6 +816,8 @@ pub fn spawn_in_process_task(
             agent_label,
             report: None,
             recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -1016,6 +1037,8 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
                     agent_label: agent_label.clone(),
                     report: None,
                     recoverable: false,
+                    transcript_location: None,
+                    transcript_cursor: None,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -1048,6 +1071,8 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             agent_label,
             report: None,
             recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(pid),
@@ -1541,6 +1566,7 @@ pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
 }
 
 pub fn task_result_json(task: &Task) -> Value {
+    populate_transcript_handle(task);
     let inner = task.inner.lock();
     let mut obj = serde_json::json!({
         "taskId": inner.id,
@@ -1576,6 +1602,12 @@ pub fn task_result_json(task: &Task) -> Value {
     if let Some(ref report) = inner.report {
         obj["report"] = report.to_json();
     }
+    if let Some(ref location) = inner.transcript_location {
+        obj["transcriptLocation"] = serde_json::to_value(location).unwrap_or(Value::Null);
+    }
+    if let Some(ref cursor) = inner.transcript_cursor {
+        obj["transcriptCursor"] = serde_json::to_value(cursor).unwrap_or(Value::Null);
+    }
     if inner.status == TaskStatus::Failed {
         if let Some(code) = inner.exit_code {
             obj["exitCode"] = Value::from(code);
@@ -1602,6 +1634,28 @@ pub fn task_result_json(task: &Task) -> Value {
         }
     }
     obj
+}
+
+fn populate_transcript_handle(task: &Task) {
+    let (provider, session_id, already_located) = {
+        let inner = task.inner.lock();
+        (
+            inner.provider,
+            inner.session_id.clone(),
+            inner.transcript_location.is_some(),
+        )
+    };
+    if already_located || session_id.is_empty() || session_id == "pending" {
+        return;
+    }
+    let registry = TranscriptAdapterRegistry::from_runtime_config();
+    let Ok(Some(location)) = registry.locate(provider, &session_id) else {
+        return;
+    };
+    let mut inner = task.inner.lock();
+    if inner.transcript_location.is_none() && inner.session_id == session_id {
+        inner.transcript_location = Some(location);
+    }
 }
 
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
@@ -1688,6 +1742,8 @@ mod tests {
                 agent_label: None,
                 report: None,
                 recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1712,6 +1768,8 @@ mod tests {
                 agent_label: None,
                 report: None,
                 recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1752,6 +1810,8 @@ mod tests {
                 agent_label: None,
                 report: None,
                 recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1769,7 +1829,9 @@ mod tests {
     #[tokio::test]
     async fn spawn_with_pre_minted_id_tracks_known_id() {
         let prior_bin = std::env::var("CODEX_BIN").ok();
-        unsafe { std::env::set_var("CODEX_BIN", "/bin/true"); }
+        unsafe {
+            std::env::set_var("CODEX_BIN", "/bin/true");
+        }
         let tmp = tempfile::tempdir().unwrap();
         let task_store = Arc::new(RwLock::new(TaskStore::new()));
         let (tail_tx, _) = tokio::sync::broadcast::channel(8);
@@ -2040,6 +2102,8 @@ mod tests {
                 agent_label: None,
                 report: None,
                 recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -2074,6 +2138,8 @@ mod tests {
                 agent_label: None,
                 report: None,
                 recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -2081,10 +2147,12 @@ mod tests {
 
         let json = task_result_json(&task);
         assert_eq!(json["exitCode"], 1);
-        assert!(json["stderr"]
-            .as_str()
-            .unwrap()
-            .contains("something went wrong"));
+        assert!(
+            json["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("something went wrong")
+        );
     }
 
     #[test]
@@ -2111,6 +2179,8 @@ mod tests {
             agent_label: None,
             report: None,
             recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
         };
 
         reject_forked_session(&mut inner, "forked-session");
@@ -2156,6 +2226,8 @@ mod tests {
             agent_label: None,
             report: None,
             recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
         };
 
         let sink = EventSink {
@@ -2215,6 +2287,8 @@ mod async_tests {
                 agent_label: None,
                 report: None,
                 recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -2246,6 +2320,8 @@ mod async_tests {
                 agent_label: None,
                 report: None,
                 recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -2290,6 +2366,8 @@ mod async_tests {
                 agent_label: None,
                 report: None,
                 recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),

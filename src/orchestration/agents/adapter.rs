@@ -50,10 +50,16 @@ pub struct AgentDispatchResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentDispatchError {
-    BadInput { message: String },
+    BadInput {
+        message: String,
+    },
     #[allow(dead_code)] // exercised by tests; production paths surface AdapterFailed instead
-    NotFound { name: String },
-    AdapterFailed { message: String },
+    NotFound {
+        name: String,
+    },
+    AdapterFailed {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for AgentDispatchError {

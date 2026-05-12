@@ -64,33 +64,19 @@ pub(crate) fn plan_move_rust_items_with_callers(p: &RefactorPlanParams) -> Resul
     let project_dir = Path::new(&project_dir);
 
     // Derive module simple names.
-    let source_simple = resolve_module_simple_name(
-        p.module_name.as_deref(),
-        &source_path,
-        "source",
-    )?;
-    let target_simple = resolve_module_simple_name(
-        p.target_prelude.as_deref(),
-        &target_path,
-        "target",
-    )?;
+    let source_simple =
+        resolve_module_simple_name(p.module_name.as_deref(), &source_path, "source")?;
+    let target_simple =
+        resolve_module_simple_name(p.target_prelude.as_deref(), &target_path, "target")?;
     if source_simple == target_simple {
-        bail!(
-            "source and target module simple names must differ; got `{source_simple}`"
-        );
+        bail!("source and target module simple names must differ; got `{source_simple}`");
     }
 
     let parsed = parse_rust_file(&source_path)?;
     let items = rust_items(&parsed);
-    let selected = select_top_level_items_for_move(
-        &items,
-        p.item_names.as_deref(),
-        p.item_kinds.as_deref(),
-    )?;
-    let moved_names: HashSet<&str> = selected
-        .iter()
-        .filter_map(|i| i.name.as_deref())
-        .collect();
+    let selected =
+        select_top_level_items_for_move(&items, p.item_names.as_deref(), p.item_kinds.as_deref())?;
+    let moved_names: HashSet<&str> = selected.iter().filter_map(|i| i.name.as_deref()).collect();
 
     // Source-side deletion edits.
     let source_edits: Vec<TextEdit> = selected
@@ -167,9 +153,7 @@ pub(crate) fn plan_move_rust_items_with_callers(p: &RefactorPlanParams) -> Resul
             continue;
         }
         let canonical = fs::canonicalize(path).ok();
-        if canonical.is_some()
-            && (canonical == canonical_source || canonical == canonical_target)
-        {
+        if canonical.is_some() && (canonical == canonical_source || canonical == canonical_target) {
             continue;
         }
         let caller_source = match fs::read_to_string(path) {
@@ -223,19 +207,14 @@ pub(crate) fn plan_move_rust_items_with_callers(p: &RefactorPlanParams) -> Resul
         fixme_count: None,
     };
 
-    validate_plan_shape(&plan)
-        .context("validate move_rust_items_with_callers plan")?;
+    validate_plan_shape(&plan).context("validate move_rust_items_with_callers plan")?;
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
 /// Resolve a module's simple name. Explicit override wins. Otherwise
 /// fall back to the file stem, rejecting `lib`/`main`/`mod` because
 /// those names rarely match caller-side path segments.
-fn resolve_module_simple_name(
-    explicit: Option<&str>,
-    path: &Path,
-    label: &str,
-) -> Result<String> {
+fn resolve_module_simple_name(explicit: Option<&str>, path: &Path, label: &str) -> Result<String> {
     if let Some(name) = explicit {
         if !name.is_empty() {
             return Ok(name.to_string());
@@ -270,8 +249,7 @@ fn select_top_level_items_for_move<'a>(
             );
         }
     }
-    let kind_set = kinds
-        .map(|xs| xs.iter().map(String::as_str).collect::<HashSet<_>>());
+    let kind_set = kinds.map(|xs| xs.iter().map(String::as_str).collect::<HashSet<_>>());
     let mut selected: Vec<&SyntaxItem> = Vec::new();
     for expected in names {
         let mut matches = items
@@ -656,11 +634,7 @@ mod tests {
         fs::write(&source, "pub fn moved() {}\n").unwrap();
         fs::write(&target, "").unwrap();
         // Reference inside target/ should NOT be touched.
-        fs::write(
-            build_dir.join("artifact.rs"),
-            "use crate::mod_a::moved;\n",
-        )
-        .unwrap();
+        fs::write(build_dir.join("artifact.rs"), "use crate::mod_a::moved;\n").unwrap();
         let plan_json = plan_move_rust_items_with_callers(&make_params(
             &source,
             &target,

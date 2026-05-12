@@ -544,7 +544,8 @@ mod tests {
             .expect("plan should succeed");
         let v = parse_response(&response);
         let edits_arr = v["edits"].as_array().unwrap();
-        let file_edits: Vec<TextEdit> = serde_json::from_value(edits_arr[0]["edits"].clone()).unwrap();
+        let file_edits: Vec<TextEdit> =
+            serde_json::from_value(edits_arr[0]["edits"].clone()).unwrap();
         let path = Path::new(edits_arr[0]["path"].as_str().unwrap());
         let after = apply_edits(path, &file_edits);
         assert!(
@@ -559,10 +560,7 @@ mod tests {
             after.contains("decode(\"x\")"),
             "call site renamed: {after}"
         );
-        assert!(
-            !after.contains("parse"),
-            "no parse survives: {after}"
-        );
+        assert!(!after.contains("parse"), "no parse survives: {after}");
         // Method rename in a non-class-file does NOT emit a file-rename
         // advisory.
         let advisory = v["file_rename_advisory"].as_array().unwrap();
@@ -592,12 +590,8 @@ mod tests {
         ]);
         let response = plan_rename_java_symbol(&params).expect("plan should succeed");
         let v = parse_response(&response);
-        let edits: Vec<TextEdit> =
-            serde_json::from_value(v["edits"][0]["edits"].clone()).unwrap();
-        let after = apply_edits(
-            Path::new(v["edits"][0]["path"].as_str().unwrap()),
-            &edits,
-        );
+        let edits: Vec<TextEdit> = serde_json::from_value(v["edits"][0]["edits"].clone()).unwrap();
+        let after = apply_edits(Path::new(v["edits"][0]["path"].as_str().unwrap()), &edits);
         // Class declaration renamed.
         assert!(
             after.contains("public class Token"),
@@ -692,18 +686,16 @@ mod tests {
         // Round-trip: parse the body into a generic serde_json::Value
         // (mirrors the apply path's plan parameter) and verify the
         // PlanStatus value deserializes via the same enum.
-        let v: serde_json::Value =
-            serde_json::from_str(&plan_json).expect("plan JSON parses");
+        let v: serde_json::Value = serde_json::from_str(&plan_json).expect("plan JSON parses");
         let status_str = v["plan_status"].as_str().expect("plan_status is a string");
-        let status: PlanStatus = serde_json::from_value(serde_json::Value::String(
-            status_str.to_string(),
-        ))
-        .unwrap_or_else(|e| {
-            panic!(
-                "PlanStatus deserializer rejected `{status_str}`: {e}. \
+        let status: PlanStatus =
+            serde_json::from_value(serde_json::Value::String(status_str.to_string()))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "PlanStatus deserializer rejected `{status_str}`: {e}. \
                  This is the Gap 18 mismatch."
-            )
-        });
+                    )
+                });
         assert_eq!(status, PlanStatus::Planned);
     }
 

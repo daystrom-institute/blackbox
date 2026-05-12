@@ -9,7 +9,7 @@ use crate::edge_index::EdgeIndex;
 use crate::entity_loader;
 use crate::entity_ref::EntityRef;
 use crate::mcp_tools::find_paths::{render_node, render_path};
-use crate::path_cache::{CachedPath, PathCache, PROCESS_SESSION_KEY};
+use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache};
 use crate::providers::ProviderContext;
 
 const ENTITY_CAP: usize = 50;

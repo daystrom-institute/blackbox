@@ -141,8 +141,9 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
     // (project types, JDK, third-party) resolves out of the box. A
     // follow-up `java_lsp_organize_imports` can prune later if the
     // operator cares about minimal imports.
-    let target_pkg =
-        resolve_java_target_package(p, &parsed.source, &source_path, &target_path).ok().flatten();
+    let target_pkg = resolve_java_target_package(p, &parsed.source, &source_path, &target_path)
+        .ok()
+        .flatten();
     let prelude = java_default_target_prelude(p, &parsed.source, target_pkg.as_deref());
 
     let methods = java_methods(&parsed);
@@ -174,7 +175,9 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
     };
 
     if selected_names.is_empty() {
-        bail!("no public non-static methods found to extract; pass item_names to select specific methods");
+        bail!(
+            "no public non-static methods found to extract; pass item_names to select specific methods"
+        );
     }
 
     let mut interface_sigs = Vec::new();
@@ -243,7 +246,7 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
         if let Some(tp_text) = class_type_parameters_text(class_node, &parsed.source) {
             let inner = tp_text.trim_start_matches('<').trim_end_matches('>');
             for chunk in inner.split(',') {
-let ident = chunk.split_whitespace().last().unwrap_or("").trim();
+                let ident = chunk.split_whitespace().last().unwrap_or("").trim();
                 if used_type_params.contains(ident) {
                     ordered.push(chunk.trim().to_string());
                 }

@@ -22,14 +22,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content, RawContent};
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
-use rmcp::ServiceExt;
 use serde_json::Value;
 use tokio::time::timeout;
 
-use crate::orchestration::mcp::{global_store_path, project_store_path, McpServerConfig, McpStore};
+use crate::orchestration::mcp::{McpServerConfig, McpStore, global_store_path, project_store_path};
 
 /// Resolve the named MCP server from the merged global+project store.
 /// Returns the entry's transport config + a flag indicating which
@@ -312,19 +312,25 @@ mod tests {
 
     #[test]
     fn env_expansion_handles_braced_form() {
-        unsafe { std::env::set_var("MCP_TEST_VAR", "abc123"); }
+        unsafe {
+            std::env::set_var("MCP_TEST_VAR", "abc123");
+        }
         assert_eq!(_expand_for_test("token ${MCP_TEST_VAR}"), "token abc123");
     }
 
     #[test]
     fn env_expansion_handles_unbraced_form() {
-        unsafe { std::env::set_var("MCP_TEST_VAR2", "xyz"); }
+        unsafe {
+            std::env::set_var("MCP_TEST_VAR2", "xyz");
+        }
         assert_eq!(_expand_for_test("$MCP_TEST_VAR2/path"), "xyz/path");
     }
 
     #[test]
     fn env_expansion_leaves_missing_verbatim() {
-        unsafe { std::env::remove_var("MCP_TEST_NOT_SET_42"); }
+        unsafe {
+            std::env::remove_var("MCP_TEST_NOT_SET_42");
+        }
         assert_eq!(
             _expand_for_test("${MCP_TEST_NOT_SET_42}"),
             "${MCP_TEST_NOT_SET_42}"

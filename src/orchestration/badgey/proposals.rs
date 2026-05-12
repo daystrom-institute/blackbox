@@ -8,7 +8,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::types::{
-    now_rfc3339, BadgeyId, BadgeyProposal, ProposalEvent, ProposalKind, ProposalState,
+    BadgeyId, BadgeyProposal, ProposalEvent, ProposalKind, ProposalState, now_rfc3339,
 };
 
 #[derive(Debug)]

@@ -26,7 +26,6 @@ pub(super) struct MovedStaticItem {
     pub(super) kind: &'static str,
 }
 
-
 /// Gap 4: compute caller-rewrite FileEdits for every `.java` file in the
 /// project that references `<old_class>.<moved_item>` as a static call or
 /// field access. The source file and the target file are excluded — both
@@ -118,7 +117,6 @@ pub(super) fn compute_cross_file_static_caller_edits(
     }
     out
 }
-
 
 /// Scan one parsed Java file for `<old_class>.<name>` references where
 /// `<name>` is a moved method or field. Emits a TextEdit per match that

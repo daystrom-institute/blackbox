@@ -1,6 +1,6 @@
 #![allow(dead_code)] // E1 client is constructed by routing; E2/E3 drive calls.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -126,7 +126,7 @@ struct OllamaResponse {
 
 #[cfg(test)]
 mod tests {
-    use axum::{routing::post, Json, Router};
+    use axum::{Json, Router, routing::post};
     use serde_json::json;
     use tokio::net::TcpListener;
 

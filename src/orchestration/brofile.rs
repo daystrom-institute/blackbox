@@ -406,7 +406,9 @@ mod tests {
     fn with_fake_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", home); }
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
         let result = f();
         match prior {
             Some(value) => unsafe { std::env::set_var("HOME", value) },
@@ -454,7 +456,10 @@ mod tests {
             filters: None,
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
-        assert!(written.exists(), "save_brofile must report the on-disk path");
+        assert!(
+            written.exists(),
+            "save_brofile must report the on-disk path"
+        );
         assert!(
             resolve_brofile("post-install-verification", dir.path(), None).is_some(),
             "saved brofile must resolve immediately — G11 desync regression"
@@ -595,7 +600,12 @@ mod tests {
         let bf: Brofile = serde_json::from_str(src).expect("rust-refactor-persona parses");
         assert_eq!(bf.name, "rust-refactor-persona");
         assert_eq!(bf.provider, Provider::Claude);
-        assert!(bf.lens.as_deref().unwrap_or("").contains("bbox refactor primitives"));
+        assert!(
+            bf.lens
+                .as_deref()
+                .unwrap_or("")
+                .contains("bbox refactor primitives")
+        );
 
         let f = bf.filters.expect("filters present");
 
@@ -806,9 +816,11 @@ mod tests {
         let resolved =
             resolve_provider_env(Provider::Claude, Some("account2"), None, store.path()).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(resolved
-            .get("CLAUDE_CONFIG_DIR")
-            .is_some_and(|path| path.ends_with("/.claude-account2")));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-account2"))
+        );
     }
 
     #[test]
@@ -847,9 +859,11 @@ mod tests {
 
         let resolved = resolve_provider_env(Provider::Claude, None, None, store.path()).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(resolved
-            .get("CLAUDE_CONFIG_DIR")
-            .is_some_and(|path| path.ends_with("/.claude-account2")));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-account2"))
+        );
     }
 
     #[test]

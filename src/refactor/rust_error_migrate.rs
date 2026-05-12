@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use tree_sitter::Node;
 
 use super::*;
@@ -355,13 +355,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn parse_response(
-        plan_json: &str,
-    ) -> (
-        Vec<TextEdit>,
-        Vec<QuestionMarkSite>,
-        Vec<String>,
-    ) {
+    fn parse_response(plan_json: &str) -> (Vec<TextEdit>, Vec<QuestionMarkSite>, Vec<String>) {
         let value: serde_json::Value = serde_json::from_str(plan_json).unwrap();
         let edits: Vec<TextEdit> = value
             .get("edits")
@@ -387,10 +381,7 @@ mod tests {
                     .map(|v| QuestionMarkSite {
                         line: v["line"].as_u64().unwrap_or(0) as usize,
                         column: v["column"].as_u64().unwrap_or(0) as usize,
-                        classification: v["classification"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string(),
+                        classification: v["classification"].as_str().unwrap_or("").to_string(),
                     })
                     .collect()
             })
@@ -424,8 +415,7 @@ mod tests {
         } else {
             let mut map = serde_json::Map::new();
             if !mapping.is_empty() {
-                let mapping_json =
-                    serde_json::to_value(&mapping).expect("mapping serialization");
+                let mapping_json = serde_json::to_value(&mapping).expect("mapping serialization");
                 map.insert("error_mapping".to_string(), mapping_json);
             }
             if acknowledge_public_api_change {
@@ -434,7 +424,10 @@ mod tests {
                     serde_json::Value::Bool(true),
                 );
             }
-            Some(map.into_iter().collect::<std::collections::BTreeMap<_, _>>())
+            Some(
+                map.into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
         };
         plan_rewrite_error_type(&crate::refactor::RefactorPlanParams {
             kind: "rewrite_rust_error_type".to_string(),
@@ -494,7 +487,14 @@ fn other_fn() -> Result<i32, OldErr> {
         )
         .unwrap();
 
-        let result = plan_for(&source, "OldErr", "NewErr", &["do_something", "other_fn"], &[], false);
+        let result = plan_for(
+            &source,
+            "OldErr",
+            "NewErr",
+            &["do_something", "other_fn"],
+            &[],
+            false,
+        );
         let plan_json = result.unwrap();
         let (edits, qm_sites, opt_outs) = parse_response(&plan_json);
         assert!(qm_sites.is_empty());
@@ -566,14 +566,7 @@ fn with_question() -> Result<(), NewErr> {
         )
         .unwrap();
 
-        let result = plan_for(
-            &source,
-            "OldErr",
-            "NewErr",
-            &["inner"],
-            &[],
-            false,
-        );
+        let result = plan_for(&source, "OldErr", "NewErr", &["inner"], &[], false);
         let plan_json = result.unwrap();
         let (edits, qm_sites, _) = parse_response(&plan_json);
         assert_eq!(edits.len(), 1);
@@ -601,14 +594,7 @@ fn with_question() -> Result<(), NewErr> {
         )
         .unwrap();
 
-        let result = plan_for(
-            &source,
-            "OldErr",
-            "NewErr",
-            &["inner"],
-            &[],
-            false,
-        );
+        let result = plan_for(&source, "OldErr", "NewErr", &["inner"], &[], false);
         let plan_json = result.unwrap();
         let (edits, qm_sites, _) = parse_response(&plan_json);
         assert_eq!(edits.len(), 1);
@@ -668,15 +654,10 @@ fn do_something() -> Result<(), OldErr> {
         )
         .unwrap();
 
-        let err = plan_for(
-            &source,
-            "OldErr",
-            "NewErr",
-            &["do_something"],
-            &[],
-            false,
-        );
-        let msg = err.expect_err("pub type without ack should refuse").to_string();
+        let err = plan_for(&source, "OldErr", "NewErr", &["do_something"], &[], false);
+        let msg = err
+            .expect_err("pub type without ack should refuse")
+            .to_string();
         assert!(
             msg.contains("error.bad_input(code=public_api_change_unacknowledged)"),
             "message was: {msg}"
@@ -701,14 +682,7 @@ fn do_something() -> Result<(), OldErr> {
         )
         .unwrap();
 
-        let result = plan_for(
-            &source,
-            "OldErr",
-            "NewErr",
-            &["do_something"],
-            &[],
-            true,
-        );
+        let result = plan_for(&source, "OldErr", "NewErr", &["do_something"], &[], true);
         let plan_json = result.unwrap();
         let (edits, _, opt_outs) = parse_response(&plan_json);
         assert_eq!(edits.len(), 1);
@@ -736,14 +710,7 @@ fn do_something() -> Result<(), OldErr> {
         )
         .unwrap();
 
-        let result = plan_for(
-            &source,
-            "OldErr",
-            "NewErr",
-            &["do_something"],
-            &[],
-            false,
-        );
+        let result = plan_for(&source, "OldErr", "NewErr", &["do_something"], &[], false);
         let plan_json = result.unwrap();
         let (edits, _, opt_outs) = parse_response(&plan_json);
         assert_eq!(edits.len(), 1);

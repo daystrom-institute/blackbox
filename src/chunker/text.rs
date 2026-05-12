@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use super::{placeholder_chunk, Chunk, Edge, SourceFormatChunker};
+use super::{Chunk, Edge, SourceFormatChunker, placeholder_chunk};
 
 const TARGET_CHUNK_BYTES: usize = 1024;
 

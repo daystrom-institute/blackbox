@@ -1156,7 +1156,10 @@ mod tests {
         let sections = ctx["sections"].as_array().unwrap();
         assert!(!sections.is_empty());
         let sec = sections.iter().find(|s| s["status"] == "accepted");
-        assert!(sec.is_some(), "accepted item with no threads → accepted section");
+        assert!(
+            sec.is_some(),
+            "accepted item with no threads → accepted section"
+        );
         let items = sec.unwrap()["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
     }

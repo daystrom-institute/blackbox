@@ -308,9 +308,8 @@ impl SharedState {
             ),
             lsp_sessions: lsp::LspSessionManager::new(),
             config: Arc::new(RwLock::new(
-                crate::config::load().unwrap_or_else(|e| {
-                    panic!("loading config for test SharedState: {e}")
-                }),
+                crate::config::load()
+                    .unwrap_or_else(|e| panic!("loading config for test SharedState: {e}")),
             )),
         }
     }

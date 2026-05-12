@@ -47,7 +47,8 @@ impl BlackboxServer {
         let entity = surface::build_surface_entity(surface, p.project.as_deref());
 
         let packets = self.state.packets.read();
-        let decision = surface::evaluate_tool_surface(&packets, entity.clone(), p.project.as_deref());
+        let decision =
+            surface::evaluate_tool_surface(&packets, entity.clone(), p.project.as_deref());
         drop(packets);
 
         let tool_universe: Vec<String> = self
@@ -122,10 +123,8 @@ impl BlackboxServer {
 
     fn handle_mcp_surface_describe(&self, p: &McpSurfaceParams) -> anyhow::Result<String> {
         let packets = self.state.packets.read();
-        let loaded = packets.load_latest_by_domain(
-            surface::SURFACE_ROUTING_DOMAIN,
-            p.project.as_deref(),
-        );
+        let loaded =
+            packets.load_latest_by_domain(surface::SURFACE_ROUTING_DOMAIN, p.project.as_deref());
         let packet = loaded?.ok_or_else(|| {
             anyhow::anyhow!(
                 "no mcp-surface/routing packet found{}",
@@ -167,21 +166,15 @@ impl BlackboxServer {
         });
         drop(packets);
 
-        let selected = p
-            .surface
-            .as_deref()
-            .unwrap_or("default");
+        let selected = p.surface.as_deref().unwrap_or("default");
         let entity = surface::build_surface_entity(selected, p.project.as_deref());
         let packets_guard = self.state.packets.read();
-        let decision =
-            surface::evaluate_tool_surface(&packets_guard, entity, p.project.as_deref());
+        let decision = surface::evaluate_tool_surface(&packets_guard, entity, p.project.as_deref());
         drop(packets_guard);
 
         let verdict_summary = match &decision.verdict {
             surface::ToolSurfaceVerdict::ToolSurface {
-                allow,
-                disallow,
-                ..
+                allow, disallow, ..
             } => serde_json::json!({
                 "route": "tool_surface",
                 "allow": allow,
@@ -217,10 +210,7 @@ mod tests {
             .compile(&CompileParams {
                 domain: surface::SURFACE_ROUTING_DOMAIN.to_string(),
                 rules: serde_json::Value::Array(rules),
-                classification_lattice: Some(vec![
-                    "tool_surface".to_string(),
-                    "deny".to_string(),
-                ]),
+                classification_lattice: Some(vec!["tool_surface".to_string(), "deny".to_string()]),
                 prefix_inference: Some(Default::default()),
                 scope: Some(scope.to_string()),
                 project: project.map(|s| s.to_string()),
@@ -292,12 +282,13 @@ mod tests {
         );
         drop(packets);
 
-        let result = server.handle_mcp_surface_replay(&McpSurfaceParams {
-            action: "replay".to_string(),
-            surface: Some("readonly".to_string()),
-            project: None,
-        })
-        .unwrap();
+        let result = server
+            .handle_mcp_surface_replay(&McpSurfaceParams {
+                action: "replay".to_string(),
+                surface: Some("readonly".to_string()),
+                project: None,
+            })
+            .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["verdict_classification"], "tool_surface");
@@ -321,7 +312,13 @@ mod tests {
         compile_surface_packet(
             &packets,
             vec![
-                surface_rule("readonly", "readonly", &["bbox_search"], &[], "tool_surface"),
+                surface_rule(
+                    "readonly",
+                    "readonly",
+                    &["bbox_search"],
+                    &[],
+                    "tool_surface",
+                ),
                 catchall_deny(),
             ],
             "global",
@@ -329,12 +326,13 @@ mod tests {
         );
         drop(packets);
 
-        let result = server.handle_mcp_surface_replay(&McpSurfaceParams {
-            action: "replay".to_string(),
-            surface: Some("unknown".to_string()),
-            project: None,
-        })
-        .unwrap();
+        let result = server
+            .handle_mcp_surface_replay(&McpSurfaceParams {
+                action: "replay".to_string(),
+                surface: Some("unknown".to_string()),
+                project: None,
+            })
+            .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["verdict_classification"], "deny");
@@ -373,12 +371,13 @@ mod tests {
         );
         drop(packets);
 
-        let result = server.handle_mcp_surface_replay(&McpSurfaceParams {
-            action: "replay".to_string(),
-            surface: Some("default".to_string()),
-            project: Some(project_path.to_string()),
-        })
-        .unwrap();
+        let result = server
+            .handle_mcp_surface_replay(&McpSurfaceParams {
+                action: "replay".to_string(),
+                surface: Some("default".to_string()),
+                project: Some(project_path.to_string()),
+            })
+            .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["verdict_classification"], "tool_surface");
@@ -394,12 +393,13 @@ mod tests {
             visible
         );
 
-        let result_global = server.handle_mcp_surface_replay(&McpSurfaceParams {
-            action: "replay".to_string(),
-            surface: Some("default".to_string()),
-            project: None,
-        })
-        .unwrap();
+        let result_global = server
+            .handle_mcp_surface_replay(&McpSurfaceParams {
+                action: "replay".to_string(),
+                surface: Some("default".to_string()),
+                project: None,
+            })
+            .unwrap();
 
         let parsed_global: serde_json::Value = serde_json::from_str(&result_global).unwrap();
         let visible_global: Vec<&str> = parsed_global["visible_tools"]
@@ -423,7 +423,13 @@ mod tests {
         compile_surface_packet(
             &packets,
             vec![
-                surface_rule("readonly", "readonly", &["bbox_search"], &[], "tool_surface"),
+                surface_rule(
+                    "readonly",
+                    "readonly",
+                    &["bbox_search"],
+                    &[],
+                    "tool_surface",
+                ),
                 catchall_deny(),
             ],
             "global",
@@ -455,7 +461,13 @@ mod tests {
         compile_surface_packet(
             &packets,
             vec![
-                surface_rule("readonly", "readonly", &["bbox_search"], &[], "tool_surface"),
+                surface_rule(
+                    "readonly",
+                    "readonly",
+                    &["bbox_search"],
+                    &[],
+                    "tool_surface",
+                ),
                 catchall_deny(),
             ],
             "global",
@@ -463,12 +475,13 @@ mod tests {
         );
         drop(packets);
 
-        let result = server.handle_mcp_surface_describe(&McpSurfaceParams {
-            action: "describe".to_string(),
-            surface: Some("readonly".to_string()),
-            project: None,
-        })
-        .unwrap();
+        let result = server
+            .handle_mcp_surface_describe(&McpSurfaceParams {
+                action: "describe".to_string(),
+                surface: Some("readonly".to_string()),
+                project: None,
+            })
+            .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["packet"]["rule_count"], 2);

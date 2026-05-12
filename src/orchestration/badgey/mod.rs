@@ -23,7 +23,7 @@ mod artifact_tests {
         DispatchContext,
     };
     use crate::orchestration::agents::types::AgentArtifact;
-    use crate::orchestration::agents::validate::{validate_agent_install, InstallCtx};
+    use crate::orchestration::agents::validate::{InstallCtx, validate_agent_install};
     use crate::orchestration::brofile::Brofile;
     use serde_json::Value;
 
@@ -57,9 +57,11 @@ mod artifact_tests {
             include_str!("../../../examples/badgey/brofiles/badgey-scout-persona.json"),
         ] {
             let brofile: Brofile = serde_json::from_str(raw).unwrap();
-            assert!(brofile.filters.as_ref().is_some_and(|filters| filters
-                .disallow
-                .contains(&"mcp__blackbox__bro_*".to_string())));
+            assert!(brofile.filters.as_ref().is_some_and(|filters| {
+                filters
+                    .disallow
+                    .contains(&"mcp__blackbox__bro_*".to_string())
+            }));
             assert!(brofile.lens.as_deref().is_some_and(|lens| !lens.is_empty()));
         }
     }

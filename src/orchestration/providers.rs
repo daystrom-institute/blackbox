@@ -138,14 +138,32 @@ impl Provider {
 
     pub fn bin_with_config(&self, cfg: &blackbox::config::ProviderConfig) -> String {
         match self {
-            Provider::Claude => cfg.claude_bin.clone().unwrap_or_else(|| self.bin_with_env()),
-            Provider::Glm => cfg.opencode_bin.clone().unwrap_or_else(|| self.bin_with_env()),
-            Provider::Deepseek => cfg.opencode_bin.clone().unwrap_or_else(|| self.bin_with_env()),
-            Provider::Inception => cfg.opencode_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Claude => cfg
+                .claude_bin
+                .clone()
+                .unwrap_or_else(|| self.bin_with_env()),
+            Provider::Glm => cfg
+                .opencode_bin
+                .clone()
+                .unwrap_or_else(|| self.bin_with_env()),
+            Provider::Deepseek => cfg
+                .opencode_bin
+                .clone()
+                .unwrap_or_else(|| self.bin_with_env()),
+            Provider::Inception => cfg
+                .opencode_bin
+                .clone()
+                .unwrap_or_else(|| self.bin_with_env()),
             Provider::Codex => cfg.codex_bin.clone().unwrap_or_else(|| self.bin_with_env()),
-            Provider::Copilot => cfg.copilot_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Copilot => cfg
+                .copilot_bin
+                .clone()
+                .unwrap_or_else(|| self.bin_with_env()),
             Provider::Vibe => cfg.vibe_bin.clone().unwrap_or_else(|| self.bin_with_env()),
-            Provider::Gemini => cfg.gemini_bin.clone().unwrap_or_else(|| self.bin_with_env()),
+            Provider::Gemini => cfg
+                .gemini_bin
+                .clone()
+                .unwrap_or_else(|| self.bin_with_env()),
             Provider::Workflow => "workflow".into(),
         }
     }
@@ -255,11 +273,7 @@ pub fn resolve_bin(bin: &str) -> Option<String> {
         return None;
     }
     let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path)
-    }
+    if path.is_empty() { None } else { Some(path) }
 }
 
 // ---------------------------------------------------------------------------
@@ -883,7 +897,11 @@ impl Provider {
     pub fn supports_dispatch_filter(&self) -> bool {
         matches!(
             self,
-            Provider::Claude | Provider::Copilot | Provider::Codex | Provider::Gemini | Provider::Vibe
+            Provider::Claude
+                | Provider::Copilot
+                | Provider::Codex
+                | Provider::Gemini
+                | Provider::Vibe
         )
     }
 }
@@ -1171,10 +1189,14 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
     if evt["type"].as_str() == Some("stream_event") {
         let inner_ty = evt["event"]["type"].as_str().unwrap_or("");
         match inner_ty {
-            "content_block_start" if evt["event"]["content_block"]["type"].as_str() == Some("text") => {
+            "content_block_start"
+                if evt["event"]["content_block"]["type"].as_str() == Some("text") =>
+            {
                 append_block_separator(&mut sink.last_assistant_message);
             }
-            "content_block_delta" if evt["event"]["delta"]["type"].as_str() == Some("text_delta") => {
+            "content_block_delta"
+                if evt["event"]["delta"]["type"].as_str() == Some("text_delta") =>
+            {
                 if let Some(chunk) = evt["event"]["delta"]["text"].as_str() {
                     let buf = sink.last_assistant_message.get_or_insert_with(String::new);
                     buf.push_str(chunk);
@@ -2732,9 +2754,11 @@ mod tests {
         assert!(g.iter().any(|a| a == "-s"));
         assert!(g.contains(&u.to_string()));
 
-        assert!(Provider::Vibe
-            .build_mcp_add_http_args("x", "y", &[])
-            .is_none());
+        assert!(
+            Provider::Vibe
+                .build_mcp_add_http_args("x", "y", &[])
+                .is_none()
+        );
     }
 
     #[test]
@@ -2781,9 +2805,11 @@ mod tests {
         assert!(args[1].contains("Bash(rm -rf *)"));
         // The raw glob should NOT appear — it'd be treated as a literal
         // tool name by Claude and match nothing.
-        assert!(!args[1]
-            .split_whitespace()
-            .any(|t| t == "mcp__blackbox__bro_*"));
+        assert!(
+            !args[1]
+                .split_whitespace()
+                .any(|t| t == "mcp__blackbox__bro_*")
+        );
     }
 
     #[test]
@@ -3009,39 +3035,57 @@ mod tests {
     #[test]
     fn test_scoped_arg_builders_honor_scope_capability() {
         // Claude + Gemini support both user and project.
-        assert!(Provider::Claude
-            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-            .is_some());
-        assert!(Provider::Claude
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_some());
-        assert!(Provider::Gemini
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_some());
+        assert!(
+            Provider::Claude
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_some()
+        );
+        assert!(
+            Provider::Claude
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
+        assert!(
+            Provider::Gemini
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
 
         // Codex has no project scope (single config file).
-        assert!(Provider::Codex
-            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-            .is_some());
-        assert!(Provider::Codex
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_none());
-        assert!(Provider::Codex
-            .build_mcp_remove_args_scoped("x", "project")
-            .is_none());
+        assert!(
+            Provider::Codex
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_some()
+        );
+        assert!(
+            Provider::Codex
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_none()
+        );
+        assert!(
+            Provider::Codex
+                .build_mcp_remove_args_scoped("x", "project")
+                .is_none()
+        );
 
         // Copilot only user (no documented project flag).
-        assert!(Provider::Copilot
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_none());
+        assert!(
+            Provider::Copilot
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_none()
+        );
 
         // Vibe never.
-        assert!(Provider::Vibe
-            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-            .is_none());
-        assert!(Provider::Vibe
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_none());
+        assert!(
+            Provider::Vibe
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_none()
+        );
+        assert!(
+            Provider::Vibe
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_none()
+        );
 
         // Claude project scope emits -s project.
         let claude_proj = Provider::Claude

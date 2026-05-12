@@ -158,8 +158,9 @@ pub fn plan_move_struct_fields(p: &RefactorPlanParams) -> anyhow::Result<String>
     )
     .ok_or_else(|| anyhow!("target struct AST node not found"))?;
 
-    let insert_byte = field_list_close_brace_byte(tgt_struct_node)
-        .ok_or_else(|| anyhow!("could not locate field_declaration_list closing brace in target struct"))?;
+    let insert_byte = field_list_close_brace_byte(tgt_struct_node).ok_or_else(|| {
+        anyhow!("could not locate field_declaration_list closing brace in target struct")
+    })?;
 
     let mut inserted = String::new();
     for field in &fields_to_move {
@@ -526,15 +527,14 @@ fn walk_for_remaining_accesses(
                             if field_names.contains(fname) {
                                 let (line, column) = line_col(source_str, child.start_byte());
                                 let context = line_text(source_str, child.start_byte());
-                                accesses
-                                    .entry(fname.to_string())
-                                    .or_default()
-                                    .push(FieldAccessSite {
+                                accesses.entry(fname.to_string()).or_default().push(
+                                    FieldAccessSite {
                                         line,
                                         column,
                                         kind: "pattern_destructure".to_string(),
                                         context,
-                                    });
+                                    },
+                                );
                             }
                         }
                     }
@@ -626,7 +626,10 @@ fn classify_access_kind(field_expr: Node<'_>) -> String {
 /// Extract the trimmed text of the line containing `byte`.
 fn line_text(source: &str, byte: usize) -> String {
     let start = line_start_before(source, byte);
-    let end = source[start..].find('\n').map(|i| start + i).unwrap_or(source.len());
+    let end = source[start..]
+        .find('\n')
+        .map(|i| start + i)
+        .unwrap_or(source.len());
     source.get(start..end).unwrap_or("").trim().to_string()
 }
 
@@ -934,7 +937,10 @@ impl<T: Send> Server<T> {
         let plan_json = plan_move_struct_fields(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&plan_json).unwrap();
         let generics = v["inherited_generics"].as_array().unwrap();
-        assert!(!generics.is_empty(), "expected inherited_generics to be non-empty");
+        assert!(
+            !generics.is_empty(),
+            "expected inherited_generics to be non-empty"
+        );
         let names: Vec<&str> = generics.iter().map(|g| g.as_str().unwrap()).collect();
         assert!(names.contains(&"T"), "expected T in inherited_generics");
     }
@@ -972,6 +978,9 @@ impl<T: Send> Server<T> {
         let p = params_for(&src, &tgt, "Foo", &["count"]);
         let plan_json = plan_move_struct_fields(&p).unwrap();
         let tgt_text = target_text_from_plan(&plan_json);
-        assert!(tgt_text.contains("pub count: u32"), "expected pub visibility");
+        assert!(
+            tgt_text.contains("pub count: u32"),
+            "expected pub visibility"
+        );
     }
 }

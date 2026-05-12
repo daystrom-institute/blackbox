@@ -4,10 +4,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 use tree_sitter::{Node, Tree};
+use walkdir::WalkDir;
 
 use crate::chunker::code::{language_for_path, parser_for_language};
 
@@ -213,7 +213,10 @@ fn collect_rust_files(source: &Path) -> Result<Vec<PathBuf>> {
         return if source.extension().and_then(|ext| ext.to_str()) == Some("rs") {
             Ok(vec![source.to_path_buf()])
         } else {
-            Err(anyhow!("source must be .rs file or directory: {}", source.display()))
+            Err(anyhow!(
+                "source must be .rs file or directory: {}",
+                source.display()
+            ))
         };
     }
 
@@ -262,10 +265,13 @@ fn collect_items_from_file(path: &Path) -> Result<Vec<AnalyzedItem>> {
 }
 
 fn parse_rust_file(path: &Path) -> Result<ParsedFile> {
-    let source = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let source =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let language = language_for_path(path).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("unsupported language for {}", path.display()))
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported language for {}", path.display()),
+        )
     })?;
     let mut parser = parser_for_language(language)?;
     let tree = parser
@@ -317,10 +323,7 @@ fn item_name(node: Node<'_>, source: &str) -> String {
     }
     if node.kind() == "use_declaration" {
         let names = parse_use_declaration_names(&node_text(node, source));
-        return names
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        return names.into_iter().next().unwrap_or_default();
     }
 
     node_text(node, source)
@@ -465,11 +468,14 @@ fn collect_affected_root_re_exports(
                 continue;
             }
             let names = parse_use_declaration_names(&node_text(node, &parsed.source));
-            let touched_names: HashSet<&str> = touched.iter().map(|item| item.name.as_str()).collect();
+            let touched_names: HashSet<&str> =
+                touched.iter().map(|item| item.name.as_str()).collect();
             let touched_by_path = matches_proposed_path(&proposed_changes, &path);
 
             for name in names {
-                if touched_names.contains(name.as_str()) || touched_by_path.iter().any(|target| name.contains(target)) {
+                if touched_names.contains(name.as_str())
+                    || touched_by_path.iter().any(|target| name.contains(target))
+                {
                     out.push(ReExport {
                         path: path.clone(),
                         name,
@@ -555,7 +561,9 @@ fn dedupe_re_exports(items: Vec<ReExport>) -> Vec<ReExport> {
 }
 
 fn node_text(node: Node<'_>, source: &str) -> String {
-    node.utf8_text(source.as_bytes()).unwrap_or_default().to_string()
+    node.utf8_text(source.as_bytes())
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[cfg(test)]

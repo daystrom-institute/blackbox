@@ -356,10 +356,7 @@ fn resolve_project_filter(raw: Option<&str>, ctx: &ProviderContext<'_>) -> Optio
     if let Some(state) = ctx.state() {
         let projects = state.projects.read().list();
         let canonical = std::fs::canonicalize(raw).ok()?;
-        if let Some(record) = projects
-            .iter()
-            .find(|r| r.canonical_path == canonical)
-        {
+        if let Some(record) = projects.iter().find(|r| r.canonical_path == canonical) {
             return Some(record.project_id.clone());
         }
     }

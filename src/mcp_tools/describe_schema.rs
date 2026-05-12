@@ -261,15 +261,21 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let vertex_types = value["vertex_types"].as_array().unwrap();
         assert_eq!(vertex_types.len(), 14);
-        assert!(vertex_types
-            .iter()
-            .any(|value| value["entity_type"] == "knowledge"));
-        assert!(vertex_types
-            .iter()
-            .any(|value| value["entity_type"] == "bash_call"));
-        assert!(vertex_types
-            .iter()
-            .any(|value| value["entity_type"] == "agent"));
+        assert!(
+            vertex_types
+                .iter()
+                .any(|value| value["entity_type"] == "knowledge")
+        );
+        assert!(
+            vertex_types
+                .iter()
+                .any(|value| value["entity_type"] == "bash_call")
+        );
+        assert!(
+            vertex_types
+                .iter()
+                .any(|value| value["entity_type"] == "agent")
+        );
     }
 
     #[test]
@@ -359,11 +365,13 @@ mod tests {
             .iter()
             .find(|entry| entry["name"] == "badgey")
             .expect("badgey consultant entry");
-        assert!(badgey["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool == "badgey_exec"));
+        assert!(
+            badgey["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "badgey_exec")
+        );
         assert!(value["text"].as_str().unwrap().contains("### Consultants"));
     }
 }

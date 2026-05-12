@@ -25,7 +25,7 @@
 //! query via bbox_knowledge." Agent reads tool description, spots pointer,
 //! pulls the runbook with one query when they actually need it.
 
-use crate::query::{parse_query, QueryAtom, QueryNode};
+use crate::query::{QueryAtom, QueryNode, parse_query};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SystemMemory {

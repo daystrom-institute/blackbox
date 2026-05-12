@@ -351,7 +351,7 @@ impl BlackboxServer {
         prompt: &str,
         timeout_seconds: Option<f64>,
     ) -> Result<Value, String> {
-        use orchestration::badgey::commands::{parse_command, WrapperCommand};
+        use orchestration::badgey::commands::{WrapperCommand, parse_command};
 
         let id = self.badgey_parse_id(badgey_id)?;
         match parse_command(prompt) {

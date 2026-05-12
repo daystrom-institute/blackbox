@@ -123,35 +123,37 @@ fn spawn_periodic_flusher(store: Arc<VectorStore>) {
 fn spawn_periodic_compactor(store: Arc<VectorStore>) {
     std::thread::Builder::new()
         .name("blackbox-vectors-compact".into())
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(COMPACT_INTERVAL_SECS));
-            let partitions: Vec<_> = store.partitions.read().values().cloned().collect();
-            for partition in partitions {
-                let needs = partition.read().needs_compaction();
-                if !needs {
-                    continue;
-                }
-                let mut p = partition.write();
-                if !p.needs_compaction() {
-                    continue;
-                }
-                let started = std::time::Instant::now();
-                let route = p.route.clone();
-                match p.compact() {
-                    Ok(stats) => tracing::info!(
-                        route = %route,
-                        before_wal_records = stats.before_wal_records,
-                        after_wal_records = stats.after_wal_records,
-                        before_slab_entries = stats.before_slab_entries,
-                        after_slab_entries = stats.after_slab_entries,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "vector partition compacted"
-                    ),
-                    Err(err) => tracing::warn!(
-                        route = %route,
-                        error = %err,
-                        "vector partition compaction failed; will retry"
-                    ),
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(COMPACT_INTERVAL_SECS));
+                let partitions: Vec<_> = store.partitions.read().values().cloned().collect();
+                for partition in partitions {
+                    let needs = partition.read().needs_compaction();
+                    if !needs {
+                        continue;
+                    }
+                    let mut p = partition.write();
+                    if !p.needs_compaction() {
+                        continue;
+                    }
+                    let started = std::time::Instant::now();
+                    let route = p.route.clone();
+                    match p.compact() {
+                        Ok(stats) => tracing::info!(
+                            route = %route,
+                            before_wal_records = stats.before_wal_records,
+                            after_wal_records = stats.after_wal_records,
+                            before_slab_entries = stats.before_slab_entries,
+                            after_slab_entries = stats.after_slab_entries,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "vector partition compacted"
+                        ),
+                        Err(err) => tracing::warn!(
+                            route = %route,
+                            error = %err,
+                            "vector partition compaction failed; will retry"
+                        ),
+                    }
                 }
             }
         })

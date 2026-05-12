@@ -27,8 +27,7 @@ fn state_dir() -> Result<PathBuf> {
         }
     }
     let home = dirs::home_dir().context("cannot determine home directory")?;
-    let state =
-        dirs::state_dir().unwrap_or_else(|| home.join(".local").join("state"));
+    let state = dirs::state_dir().unwrap_or_else(|| home.join(".local").join("state"));
     Ok(state.join("blackbox"))
 }
 

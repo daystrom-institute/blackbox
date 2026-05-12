@@ -6,7 +6,7 @@
     clippy::type_complexity,
     clippy::large_enum_variant,
     clippy::enum_variant_names,
-    clippy::let_and_return,
+    clippy::let_and_return
 )]
 
 //! bro-slack — Slack sidecar bridge for blackbox.
@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use blackbox::secrets;
@@ -470,16 +470,17 @@ pub fn normalize_envelope(
 
             // Block Kit actions
             if let Some(actions) = payload.get("actions").and_then(|a| a.as_array())
-                && let Some(first_action) = actions.first() {
-                    event.action_id = first_action
-                        .get("action_id")
-                        .and_then(Value::as_str)
-                        .map(String::from);
-                    event.action_value = first_action
-                        .get("value")
-                        .and_then(Value::as_str)
-                        .map(String::from);
-                }
+                && let Some(first_action) = actions.first()
+            {
+                event.action_id = first_action
+                    .get("action_id")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                event.action_value = first_action
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+            }
 
             // View submission
             if let Some(view) = payload.get("view") {
@@ -873,8 +874,8 @@ where
 // loopback endpoint (§13.1). Shared across the processing pipeline
 // via Arc; the health HTTP server reads a clone.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Default)]
 pub struct HealthStats {
@@ -961,7 +962,7 @@ fn spawn_health_server(
     self_user_id: String,
     self_bot_id: String,
 ) -> tokio::task::JoinHandle<()> {
-    use axum::{routing::get, Json, Router};
+    use axum::{Json, Router, routing::get};
 
     async fn health_handler(
         axum::extract::State(state): axum::extract::State<(SharedHealthStats, String, String)>,
@@ -1331,9 +1332,16 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            secrets::resolve("slack-app-token").ok().map(|sv| sv.expose().to_string())
+            secrets::resolve("slack-app-token")
+                .ok()
+                .map(|sv| sv.expose().to_string())
         })
-        .with_context(|| format!("app token env var {} not set and secret 'slack-app-token' not found", args.app_token_env))?;
+        .with_context(|| {
+            format!(
+                "app token env var {} not set and secret 'slack-app-token' not found",
+                args.app_token_env
+            )
+        })?;
     if !app_token.starts_with("xapp-") {
         tracing::warn!("SLACK_APP_TOKEN does not start with 'xapp-'; Socket Mode may fail");
     }
@@ -1341,7 +1349,9 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            secrets::resolve("slack-signing-secret").ok().map(|sv| sv.expose().to_string())
+            secrets::resolve("slack-signing-secret")
+                .ok()
+                .map(|sv| sv.expose().to_string())
         });
     if _signing_secret.is_none() || _signing_secret.as_deref() == Some("") {
         tracing::info!(
@@ -1994,21 +2004,27 @@ mod tests {
     #[test]
     fn test_hmac_no_secret_returns_none() {
         // Ensure the env var is unset
-        unsafe { std::env::remove_var("BRO_TEST_NO_SECRET"); }
+        unsafe {
+            std::env::remove_var("BRO_TEST_NO_SECRET");
+        }
         let result = maybe_build_hmac_header(b"hello", "BRO_TEST_NO_SECRET");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_hmac_secret_empty_returns_none() {
-        unsafe { std::env::set_var("BRO_TEST_EMPTY_SECRET", ""); }
+        unsafe {
+            std::env::set_var("BRO_TEST_EMPTY_SECRET", "");
+        }
         let result = maybe_build_hmac_header(b"hello", "BRO_TEST_EMPTY_SECRET");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_hmac_produces_valid_hex() {
-        unsafe { std::env::set_var("BRO_TEST_HMAC_SECRET", "hunter2"); }
+        unsafe {
+            std::env::set_var("BRO_TEST_HMAC_SECRET", "hunter2");
+        }
         let body = br#"{"event":"test"}"#;
         let sig = maybe_build_hmac_header(body, "BRO_TEST_HMAC_SECRET").unwrap();
         // Should be 64 hex chars (32 bytes)
@@ -2027,7 +2043,9 @@ mod tests {
 
     #[test]
     fn test_hmac_different_bodies_produce_different_sigs() {
-        unsafe { std::env::set_var("BRO_TEST_HMAC_DIFF", "secret"); }
+        unsafe {
+            std::env::set_var("BRO_TEST_HMAC_DIFF", "secret");
+        }
         let sig1 = maybe_build_hmac_header(b"body1", "BRO_TEST_HMAC_DIFF").unwrap();
         let sig2 = maybe_build_hmac_header(b"body2", "BRO_TEST_HMAC_DIFF").unwrap();
         assert_ne!(sig1, sig2);
@@ -2083,10 +2101,12 @@ mod tests {
 
         // Fields not present in this event should be null
         assert!(serialized.get("command").and_then(Value::as_str).is_none());
-        assert!(serialized
-            .get("action_id")
-            .and_then(Value::as_str)
-            .is_none());
+        assert!(
+            serialized
+                .get("action_id")
+                .and_then(Value::as_str)
+                .is_none()
+        );
         // files is always emitted (empty array when no files)
         assert_eq!(serialized["files"].as_array().unwrap().len(), 0);
     }
@@ -2327,7 +2347,9 @@ mod tests {
 
     #[test]
     fn test_hmac_same_input_same_output() {
-        unsafe { std::env::set_var("BRO_TEST_DET", "secret"); }
+        unsafe {
+            std::env::set_var("BRO_TEST_DET", "secret");
+        }
         let s1 = maybe_build_hmac_header(b"hello", "BRO_TEST_DET").unwrap();
         let s2 = maybe_build_hmac_header(b"hello", "BRO_TEST_DET").unwrap();
         assert_eq!(s1, s2);

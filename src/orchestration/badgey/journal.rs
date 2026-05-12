@@ -8,7 +8,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::types::{
-    now_rfc3339, ActionId, ActionJournalEntry, ActionJournalEvent, ActionJournalState,
+    ActionId, ActionJournalEntry, ActionJournalEvent, ActionJournalState, now_rfc3339,
 };
 
 #[derive(Debug)]

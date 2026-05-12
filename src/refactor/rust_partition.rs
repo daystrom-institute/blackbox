@@ -3,11 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
-use super::{attached_attributes, leading_trivia_start, parse_rust_file, ParsedSource};
+use super::{ParsedSource, attached_attributes, leading_trivia_start, parse_rust_file};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MethodNode {
@@ -93,7 +93,11 @@ pub fn analyze_impl(source_path: &Path, impl_name: &str) -> Result<ImplPartition
     // Build edges ordered by (from, to)
     let edges = build_edges(&methods);
 
-    Ok(ImplPartitionGraph { methods, fields, edges })
+    Ok(ImplPartitionGraph {
+        methods,
+        fields,
+        edges,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -235,16 +239,40 @@ fn collect_accesses(
                 handle_write_lhs(left, source, writes);
             }
             if let Some(right) = node.child_by_field_name("right") {
-                collect_accesses(right, source, all_method_names, reads, writes, calls, unresolved);
+                collect_accesses(
+                    right,
+                    source,
+                    all_method_names,
+                    reads,
+                    writes,
+                    calls,
+                    unresolved,
+                );
             }
         }
         // `self.method(args)`, `Self::method(args)`, or chained `self.field.method(args)`
         "call_expression" => {
             if let Some(func) = node.child_by_field_name("function") {
-                handle_call_function(func, source, all_method_names, reads, writes, calls, unresolved);
+                handle_call_function(
+                    func,
+                    source,
+                    all_method_names,
+                    reads,
+                    writes,
+                    calls,
+                    unresolved,
+                );
             }
             if let Some(args) = node.child_by_field_name("arguments") {
-                collect_accesses(args, source, all_method_names, reads, writes, calls, unresolved);
+                collect_accesses(
+                    args,
+                    source,
+                    all_method_names,
+                    reads,
+                    writes,
+                    calls,
+                    unresolved,
+                );
             }
         }
         // Plain field read: `self.field` not in call or assignment position
@@ -257,9 +285,25 @@ fn collect_accesses(
                 }
                 return;
             }
-            recurse(node, source, all_method_names, reads, writes, calls, unresolved);
+            recurse(
+                node,
+                source,
+                all_method_names,
+                reads,
+                writes,
+                calls,
+                unresolved,
+            );
         }
-        _ => recurse(node, source, all_method_names, reads, writes, calls, unresolved),
+        _ => recurse(
+            node,
+            source,
+            all_method_names,
+            reads,
+            writes,
+            calls,
+            unresolved,
+        ),
     }
 }
 
@@ -317,10 +361,26 @@ fn handle_call_function(
                             }
                         }
                         // Deeper chain — recurse into the receiver
-                        collect_accesses(obj, source, all_method_names, reads, writes, calls, unresolved);
+                        collect_accesses(
+                            obj,
+                            source,
+                            all_method_names,
+                            reads,
+                            writes,
+                            calls,
+                            unresolved,
+                        );
                     }
                     _ => {
-                        collect_accesses(obj, source, all_method_names, reads, writes, calls, unresolved);
+                        collect_accesses(
+                            obj,
+                            source,
+                            all_method_names,
+                            reads,
+                            writes,
+                            calls,
+                            unresolved,
+                        );
                     }
                 }
             }
@@ -331,12 +391,23 @@ fn handle_call_function(
             let name_node = func.child_by_field_name("name");
             if let (Some(path), Some(name_node)) = (path, name_node) {
                 if path.utf8_text(source.as_bytes()).ok() == Some("Self") {
-                    let method_name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    let method_name = name_node
+                        .utf8_text(source.as_bytes())
+                        .unwrap_or("")
+                        .to_string();
                     classify_call(method_name, all_method_names, calls, unresolved);
                 }
             }
         }
-        _ => collect_accesses(func, source, all_method_names, reads, writes, calls, unresolved),
+        _ => collect_accesses(
+            func,
+            source,
+            all_method_names,
+            reads,
+            writes,
+            calls,
+            unresolved,
+        ),
     }
 }
 
@@ -376,7 +447,15 @@ fn recurse(
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_accesses(child, source, all_method_names, reads, writes, calls, unresolved);
+        collect_accesses(
+            child,
+            source,
+            all_method_names,
+            reads,
+            writes,
+            calls,
+            unresolved,
+        );
     }
 }
 
@@ -469,7 +548,11 @@ fn build_edges(methods: &[MethodNode]) -> Vec<Edge> {
             seen.insert((from.clone(), format!("field:{field}"), "writes".to_string()));
         }
         for callee in &method.calls {
-            seen.insert((from.clone(), format!("method:{callee}"), "calls".to_string()));
+            seen.insert((
+                from.clone(),
+                format!("method:{callee}"),
+                "calls".to_string(),
+            ));
         }
     }
     seen.into_iter()
@@ -487,8 +570,7 @@ mod tests {
 
     #[test]
     fn analyze_blackbox_server_impl() {
-        let source_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let source_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
         let graph =
             analyze_impl(&source_path, "BlackboxServer").expect("analyze_impl should succeed");
         assert!(

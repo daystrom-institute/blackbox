@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use tree_sitter::Node;
 
@@ -41,15 +41,12 @@ struct PlanWithRefusedVariants {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn plan_match_to_strategy(
-    p: &crate::refactor::RefactorPlanParams,
-) -> anyhow::Result<String> {
+pub fn plan_match_to_strategy(p: &crate::refactor::RefactorPlanParams) -> anyhow::Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
 
-    let enum_name = p
-        .module_name
-        .as_deref()
-        .ok_or_else(|| anyhow!("module_name (enum name) is required for rust_match_arm_to_strategy"))?;
+    let enum_name = p.module_name.as_deref().ok_or_else(|| {
+        anyhow!("module_name (enum name) is required for rust_match_arm_to_strategy")
+    })?;
     if enum_name.is_empty() {
         bail!("module_name must not be empty");
     }
@@ -100,12 +97,8 @@ pub fn plan_match_to_strategy(
     let root = parsed.tree.root_node();
     let source = &parsed.source;
 
-    let enum_node = find_enum_by_name(root, source, enum_name).ok_or_else(|| {
-        anyhow!(
-            "enum `{enum_name}` not found in {}",
-            source_path.display()
-        )
-    })?;
+    let enum_node = find_enum_by_name(root, source, enum_name)
+        .ok_or_else(|| anyhow!("enum `{enum_name}` not found in {}", source_path.display()))?;
 
     // Classify variants.
     let variants = collect_enum_variants(&enum_node, source);
@@ -148,10 +141,7 @@ pub fn plan_match_to_strategy(
     }
     for v in &accepted {
         if !variant_to_driver.contains_key(v) {
-            variant_to_driver.insert(
-                v.clone(),
-                format!("{}_driver", v.to_ascii_lowercase()),
-            );
+            variant_to_driver.insert(v.clone(), format!("{}_driver", v.to_ascii_lowercase()));
         }
     }
 
@@ -267,9 +257,11 @@ pub fn plan_match_to_strategy(
         fixme_count: None,
     };
 
-    validate_plan_shape(&plan)
-        .context("rust_match_arm_to_strategy plan validation")?;
-    let response = PlanWithRefusedVariants { plan, refused_variants };
+    validate_plan_shape(&plan).context("rust_match_arm_to_strategy plan validation")?;
+    let response = PlanWithRefusedVariants {
+        plan,
+        refused_variants,
+    };
     Ok(serde_json::to_string_pretty(&response)?)
 }
 
@@ -370,9 +362,8 @@ fn generate_spec_module(
     data_field_names: &[String],
     driver_mod: &str,
 ) -> String {
-    let mut out = format!(
-        "//! Spec for `{enum_name}::{variant}` — shared driver: `{driver_mod}`.\n\n"
-    );
+    let mut out =
+        format!("//! Spec for `{enum_name}::{variant}` — shared driver: `{driver_mod}`.\n\n");
     out.push_str(&format!("pub struct {variant}Spec;\n"));
     if !data_field_names.is_empty() {
         out.push('\n');
@@ -395,9 +386,8 @@ fn generate_shared_driver_module(
 ) -> String {
     let struct_name = to_pascal_case(driver_mod);
     let sharing_list = variants.join(", ");
-    let mut out = format!(
-        "//! Shared driver `{driver_mod}` for `{enum_name}` variants: {sharing_list}.\n\n"
-    );
+    let mut out =
+        format!("//! Shared driver `{driver_mod}` for `{enum_name}` variants: {sharing_list}.\n\n");
     out.push_str(&format!("pub struct {struct_name};\n"));
     if !behavior_names.is_empty() {
         out.push('\n');
@@ -433,7 +423,10 @@ fn generate_router_fn(
             let driver_mod = &variant_to_driver[variant];
             let is_shared = driver_to_variants[driver_mod].len() > 1;
             let dispatch = if is_shared {
-                format!("// {driver_mod}::{}::{method}()", to_pascal_case(driver_mod))
+                format!(
+                    "// {driver_mod}::{}::{method}()",
+                    to_pascal_case(driver_mod)
+                )
             } else {
                 format!(
                     "// {}::{variant}Driver::{method}()",
@@ -455,15 +448,9 @@ fn generate_router_fn(
             let driver_mod = &variant_to_driver[variant];
             let is_shared = driver_to_variants[driver_mod].len() > 1;
             let spec_path = if is_shared {
-                format!(
-                    "{}_spec::{variant}Spec::{uc}",
-                    variant.to_ascii_lowercase()
-                )
+                format!("{}_spec::{variant}Spec::{uc}", variant.to_ascii_lowercase())
             } else {
-                format!(
-                    "{}::{variant}Spec::{uc}",
-                    variant.to_ascii_lowercase()
-                )
+                format!("{}::{variant}Spec::{uc}", variant.to_ascii_lowercase())
             };
             out.push_str(&format!(
                 "            {enum_name}::{variant} => {spec_path},\n"
@@ -579,11 +566,7 @@ mod tests {
     fn three_variant_enum_generates_per_variant_modules() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("providers.rs");
-        std::fs::write(
-            &source,
-            "enum Provider { Claude, Codex, Copilot }\n",
-        )
-        .unwrap();
+        std::fs::write(&source, "enum Provider { Claude, Codex, Copilot }\n").unwrap();
 
         let mut entries = BTreeMap::new();
         entries.insert(
@@ -630,10 +613,22 @@ mod tests {
             .find(|e| e["path"].as_str() == Some(source_str.as_ref()))
             .unwrap();
         let replacement = src_edit["edits"][0]["replacement"].as_str().unwrap_or("");
-        assert!(replacement.contains("match self"), "router missing match: {replacement}");
-        assert!(replacement.contains("Provider::Claude"), "router missing Claude");
-        assert!(replacement.contains("Provider::Codex"), "router missing Codex");
-        assert!(replacement.contains("Provider::Copilot"), "router missing Copilot");
+        assert!(
+            replacement.contains("match self"),
+            "router missing match: {replacement}"
+        );
+        assert!(
+            replacement.contains("Provider::Claude"),
+            "router missing Claude"
+        );
+        assert!(
+            replacement.contains("Provider::Codex"),
+            "router missing Codex"
+        );
+        assert!(
+            replacement.contains("Provider::Copilot"),
+            "router missing Copilot"
+        );
 
         // Module file for Claude should contain ClaudeSpec and ClaudeDriver.
         let claude_edit = v["edits"]
@@ -711,11 +706,16 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["path"].as_str().is_some_and(|p| p.ends_with("a_b_driver.rs")))
+            .find(|e| {
+                e["path"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with("a_b_driver.rs"))
+            })
             .unwrap();
         let shared_content = shared_edit["new_text"].as_str().unwrap_or("");
         assert!(
-            shared_content.contains("A, B") || shared_content.contains("A") && shared_content.contains("B"),
+            shared_content.contains("A, B")
+                || shared_content.contains("A") && shared_content.contains("B"),
             "shared driver should mention both variants: {shared_content}"
         );
 

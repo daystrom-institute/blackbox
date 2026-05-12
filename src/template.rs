@@ -14,8 +14,8 @@ pub fn render(source: &str, ctx: &serde_json::Value) -> Result<String> {
     let mut tera = Tera::default();
     tera.add_raw_template("__tpl__", source)
         .map_err(|e| anyhow::anyhow!("template parse: {e}"))?;
-    let context = Context::from_serialize(ctx)
-        .map_err(|e| anyhow::anyhow!("template context: {e}"))?;
+    let context =
+        Context::from_serialize(ctx).map_err(|e| anyhow::anyhow!("template context: {e}"))?;
     tera.render("__tpl__", &context)
         .map_err(|e| anyhow::anyhow!("template render: {e}"))
 }
@@ -47,7 +47,8 @@ mod tests {
 
     #[test]
     fn render_in_operator() {
-        let tpl = "{% set active = [\"a\", \"b\"] %}{% if val in active %}yes{% else %}no{% endif %}";
+        let tpl =
+            "{% set active = [\"a\", \"b\"] %}{% if val in active %}yes{% else %}no{% endif %}";
         let yes = render(tpl, &json!({"val": "a"})).unwrap();
         let no = render(tpl, &json!({"val": "c"})).unwrap();
         assert_eq!(yes, "yes");

@@ -20,14 +20,14 @@ pub use engine::{
     run_workflow, run_workflow_streaming, run_workflow_streaming_with_vars_and_arc_id,
     run_workflow_with_initial_vars,
 };
+#[cfg(test)]
+pub use schema::load_workflow;
 pub use schema::{
     ActorFailureMode, ActorKind, ActorSpec, ForeachSpec, GateMode, ItemFailurePolicy, MatrixSpec,
     NodeMode, NodeTransition, Workflow,
 };
-#[cfg(test)]
-pub use schema::load_workflow;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 
 use self::context::VarKind;
@@ -279,7 +279,9 @@ fn validate_foreach_like<S: FanoutSpec>(
 
     match (spec.subworkflow(), spec.subworkflow_ref()) {
         (Some(_), Some(_)) => {
-            bail!("node '{node_id}' foreach/matrix has BOTH subworkflow and subworkflow_ref — pick one")
+            bail!(
+                "node '{node_id}' foreach/matrix has BOTH subworkflow and subworkflow_ref — pick one"
+            )
         }
         (None, None) => {
             bail!("node '{node_id}' foreach/matrix requires subworkflow or subworkflow_ref")

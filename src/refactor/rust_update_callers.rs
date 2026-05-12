@@ -5,9 +5,9 @@
 //! unambiguous method calls are rewritten. Everything else goes to
 //! `unrewriteable_accessors`. `semantic_status: IndexedHints`.
 
-use super::*;
 use super::rust_deep;
 use super::rust_warning_markers;
+use super::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -160,40 +160,35 @@ pub fn plan_update_callers(p: &RefactorPlanParams) -> anyhow::Result<String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let new_text_override: Option<String> = if emit_applied_markers
-        && !borrow_promotions.is_empty()
-        && !edits.is_empty()
-    {
-        let post_edit = apply_text_edits(&parsed.source, &edits)?;
-        let site_lines: Vec<(usize, String)> = borrow_promotions
-            .iter()
-            .map(|site| {
-                let field_name = site
-                    .context
-                    .strip_prefix("self.")
-                    .and_then(|s| {
-                        s.split(|c: char| !c.is_alphanumeric() && c != '_')
-                            .next()
-                    })
-                    .unwrap_or("<unknown>");
-                let marker = rust_warning_markers::emit_warning_marker(
-                    "borrow promotion",
-                    &format!(
-                        "this delegate access now goes through &mut self.{delegate_field} \
+    let new_text_override: Option<String> =
+        if emit_applied_markers && !borrow_promotions.is_empty() && !edits.is_empty() {
+            let post_edit = apply_text_edits(&parsed.source, &edits)?;
+            let site_lines: Vec<(usize, String)> = borrow_promotions
+                .iter()
+                .map(|site| {
+                    let field_name = site
+                        .context
+                        .strip_prefix("self.")
+                        .and_then(|s| s.split(|c: char| !c.is_alphanumeric() && c != '_').next())
+                        .unwrap_or("<unknown>");
+                    let marker = rust_warning_markers::emit_warning_marker(
+                        "borrow promotion",
+                        &format!(
+                            "this delegate access now goes through &mut self.{delegate_field} \
                          even though the original read was through &self.{field_name}"
-                    ),
-                    "cross-check no concurrent borrow",
-                );
-                (site.line, marker)
-            })
-            .collect();
-        Some(rust_warning_markers::apply_warning_markers_to_text(
-            &post_edit,
-            &site_lines,
-        ))
-    } else {
-        None
-    };
+                        ),
+                        "cross-check no concurrent borrow",
+                    );
+                    (site.line, marker)
+                })
+                .collect();
+            Some(rust_warning_markers::apply_warning_markers_to_text(
+                &post_edit,
+                &site_lines,
+            ))
+        } else {
+            None
+        };
 
     let warning_count = if emit_applied_markers {
         borrow_promotions.len()
@@ -345,17 +340,22 @@ fn walk_for_rewrites(
     match node.kind() {
         "call_expression" => {
             let fn_node = node.child_by_field_name("function");
-            let is_moved_method = fn_node
-                .filter(|f| f.kind() == "field_expression")
-                .and_then(|f| {
-                    let val = f.child_by_field_name("value")?;
-                    let fld = f.child_by_field_name("field")?;
-                    if val.utf8_text(source_bytes).ok()? != "self" {
-                        return None;
-                    }
-                    let fname = fld.utf8_text(source_bytes).ok()?.to_string();
-                    if item_names.contains(&fname) { Some(fname) } else { None }
-                });
+            let is_moved_method =
+                fn_node
+                    .filter(|f| f.kind() == "field_expression")
+                    .and_then(|f| {
+                        let val = f.child_by_field_name("value")?;
+                        let fld = f.child_by_field_name("field")?;
+                        if val.utf8_text(source_bytes).ok()? != "self" {
+                            return None;
+                        }
+                        let fname = fld.utf8_text(source_bytes).ok()?.to_string();
+                        if item_names.contains(&fname) {
+                            Some(fname)
+                        } else {
+                            None
+                        }
+                    });
 
             if let Some(method_name) = is_moved_method {
                 // The entire call_expression is the rewrite unit.
@@ -363,8 +363,7 @@ fn walk_for_rewrites(
                 let args_text = args_node
                     .and_then(|n| n.utf8_text(source_bytes).ok())
                     .unwrap_or("()");
-                let replacement =
-                    format!("self.{delegate_field}.{method_name}{args_text}");
+                let replacement = format!("self.{delegate_field}.{method_name}{args_text}");
                 let in_sr = is_in_self_receiver_fn(source_bytes, node);
                 let (line, col) = line_col(source, node.start_byte());
                 candidates.push(Candidate {
@@ -445,8 +444,7 @@ fn walk_for_rewrites(
                         // RHS / rvalue: check Copy whitelist.
                         let field_ty = field_types.get(&fname).map(String::as_str).unwrap_or("");
                         if !field_ty.is_empty() && rust_deep::is_copy_whitelist(field_ty) {
-                            let replacement =
-                                format!("self.{delegate_field}.{fname}()");
+                            let replacement = format!("self.{delegate_field}.{fname}()");
                             let in_sr = is_in_self_receiver_fn(source_bytes, node);
                             candidates.push(Candidate {
                                 byte_start: node.start_byte(),
@@ -492,13 +490,7 @@ fn walk_for_rewrites(
 
         "struct_pattern" | "struct_expression" => {
             // Pattern / struct-literal destructuring — report spread and field patterns.
-            report_struct_pattern_sites(
-                source,
-                source_bytes,
-                node,
-                item_names,
-                unrewriteable,
-            );
+            report_struct_pattern_sites(source, source_bytes, node, item_names, unrewriteable);
             // Don't recurse further; the pattern sites are fully handled.
         }
 
@@ -784,10 +776,7 @@ impl BigServer {
             .iter()
             .map(|a| a["kind"].as_str().unwrap())
             .collect();
-        assert!(
-            kinds.contains(&"write"),
-            "expected write kind: {kinds:?}"
-        );
+        assert!(kinds.contains(&"write"), "expected write kind: {kinds:?}");
     }
 
     // Gate: method call on moved method rewrites cleanly.

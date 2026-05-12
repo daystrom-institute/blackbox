@@ -3,16 +3,14 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use lsp_types::{
-    notification::DidOpenTextDocument,
-    request::CodeActionRequest,
     CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    DidOpenTextDocumentParams, Position, Range, TextDocumentIdentifier, TextDocumentItem,
-    Url,
+    DidOpenTextDocumentParams, Position, Range, TextDocumentIdentifier, TextDocumentItem, Url,
+    notification::DidOpenTextDocument, request::CodeActionRequest,
 };
 
-use crate::lsp::{LspSessionManager, LspError};
+use crate::lsp::{LspError, LspSessionManager};
 use crate::projects::Language;
 
 use super::*;
@@ -69,8 +67,14 @@ pub fn plan_ra_move(p: &RefactorPlanParams) -> Result<String> {
         });
 
     let manager = LspSessionManager::new();
-    let file_edits = request_move_actions(&manager, &project_dir, &source_path, &source_text, &selected)
-        .map_err(|err| anyhow!("error.lsp_unavailable: {err}"))?;
+    let file_edits = request_move_actions(
+        &manager,
+        &project_dir,
+        &source_path,
+        &source_text,
+        &selected,
+    )
+    .map_err(|err| anyhow!("error.lsp_unavailable: {err}"))?;
 
     if file_edits.is_empty() {
         bail!("rust-analyzer returned no move-to-module edits");
@@ -179,13 +183,18 @@ fn request_move_actions(
 
         let mut file_edits = Vec::new();
         for item in selected {
-            let item_name = item.name.clone().unwrap_or_else(|| "<anonymous>".to_string());
+            let item_name = item
+                .name
+                .clone()
+                .unwrap_or_else(|| "<anonymous>".to_string());
             let range = Range {
                 start: byte_to_lsp_position(source_text, item.byte_start),
                 end: byte_to_lsp_position(source_text, item.byte_end),
             };
             let params = CodeActionParams {
-                text_document: TextDocumentIdentifier { uri: source_uri.clone() },
+                text_document: TextDocumentIdentifier {
+                    uri: source_uri.clone(),
+                },
                 range,
                 context: CodeActionContext {
                     diagnostics: vec![],
@@ -200,7 +209,9 @@ fn request_move_actions(
             let actions: Option<Vec<lsp_types::CodeActionOrCommand>> =
                 client.read_response::<CodeActionRequest>(id)?;
             if actions.is_none() {
-                return Err(LspError::Other(anyhow!("no code actions returned for `{item_name}`")));
+                return Err(LspError::Other(anyhow!(
+                    "no code actions returned for `{item_name}`"
+                )));
             }
             let mut matched = false;
             for action in actions.unwrap() {
@@ -217,16 +228,20 @@ fn request_move_actions(
                         }
                     }
 
-                    let edit = code_action
-                        .edit
-                        .ok_or_else(|| LspError::Other(anyhow!("move-to-module action for `{item_name}` had no edit")))?;
+                    let edit = code_action.edit.ok_or_else(|| {
+                        LspError::Other(anyhow!(
+                            "move-to-module action for `{item_name}` had no edit"
+                        ))
+                    })?;
                     let edits = workspace_edit_to_file_edits(edit).map_err(LspError::Other)?;
                     file_edits.extend(edits);
                     matched = true;
                 }
             }
             if !matched {
-                return Err(LspError::Other(anyhow!("no move-to-module code action found for `{item_name}`")));
+                return Err(LspError::Other(anyhow!(
+                    "no move-to-module code action found for `{item_name}`"
+                )));
             }
         }
 
@@ -288,8 +303,13 @@ mod tests {
         let target = dir.path().join("target.rs");
         std::fs::write(&source, "fn moved() {}\n").unwrap();
 
-        let err = plan_ra_move(&params(&source, &target, &["moved"], Some(vec!["impl_method"])))
-            .unwrap_err();
+        let err = plan_ra_move(&params(
+            &source,
+            &target,
+            &["moved"],
+            Some(vec!["impl_method"]),
+        ))
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("impl_method_unsupported_in_ra_move"));
         assert!(msg.contains("extract_rust_impl_methods"));
@@ -304,9 +324,16 @@ mod tests {
         std::fs::write(&target, "").unwrap();
 
         // Force an unavailable rust-analyzer by setting a bad binary path.
-        unsafe { std::env::set_var("BLACKBOX_RUST_ANALYZER_BIN", "__definitely_missing_binary__"); }
+        unsafe {
+            std::env::set_var(
+                "BLACKBOX_RUST_ANALYZER_BIN",
+                "__definitely_missing_binary__",
+            );
+        }
         let err = plan_ra_move(&params(&source, &target, &["moved"], None)).unwrap_err();
-        unsafe { std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN"); }
+        unsafe {
+            std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN");
+        }
         let msg = err.to_string();
         assert!(msg.contains("error.lsp_unavailable"));
     }
@@ -317,7 +344,9 @@ mod tests {
     #[ignore]
     fn move_free_fn_updates_decl_and_call_sites() {
         if !rust_analyzer_available() {
-            eprintln!("skipping rust_ra_move_item_to_module free-fn test: rust-analyzer unavailable");
+            eprintln!(
+                "skipping rust_ra_move_item_to_module free-fn test: rust-analyzer unavailable"
+            );
             return;
         }
 

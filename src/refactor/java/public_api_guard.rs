@@ -101,8 +101,11 @@ pub(crate) fn plan_java_public_api_guard(p: &RefactorPlanParams) -> Result<Strin
     let mut delta = ApiDelta::default();
     let mut max_severity = Severity::Info;
     for change in &proposed_changes {
-        let change_path = resolve_path(p.project_dir.as_deref(), change.file.to_string_lossy().as_ref())
-            .unwrap_or_else(|_| change.file.clone());
+        let change_path = resolve_path(
+            p.project_dir.as_deref(),
+            change.file.to_string_lossy().as_ref(),
+        )
+        .unwrap_or_else(|_| change.file.clone());
         let item = analyzed.iter().find(|it| {
             // Match by path (canonicalized comparison if possible) and item name.
             it.path == change_path && it.name == change.item_name
@@ -433,11 +436,7 @@ mod tests {
     fn removing_public_class_is_breaking() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("Foo.java");
-        fs::write(
-            &source,
-            "package com.example;\npublic class Foo {}\n",
-        )
-        .unwrap();
+        fs::write(&source, "package com.example;\npublic class Foo {}\n").unwrap();
         let changes = serde_json::json!([
             { "file": source.to_string_lossy(),
               "item_name": "Foo",
@@ -553,11 +552,7 @@ mod tests {
     fn response_shape_matches_analysis_only_contract() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("F.java");
-        fs::write(
-            &source,
-            "package com.example;\npublic class F {}\n",
-        )
-        .unwrap();
+        fs::write(&source, "package com.example;\npublic class F {}\n").unwrap();
         let changes = serde_json::json!([]);
         let response = plan_java_public_api_guard(&make_params(&source, changes)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&response).unwrap();

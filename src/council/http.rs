@@ -15,16 +15,16 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State as AxumState};
 use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use axum::Json;
+use axum::response::sse::{Event, Sse};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    post_user_turn, CouncilEvent, CouncilPost, CouncilStatus, CouncilSummary, InboxEnvelope,
+    CouncilEvent, CouncilPost, CouncilStatus, CouncilSummary, InboxEnvelope, post_user_turn,
 };
 
 // ── Request / response shapes ─────────────────────────────────────────

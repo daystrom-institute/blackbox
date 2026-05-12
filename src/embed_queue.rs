@@ -5,9 +5,10 @@ use parking_lot::RwLock;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::SharedState;
 use crate::chunker::Chunk;
 use crate::embed::queue::{EmbedQueueHandle, EmbedRequest, EmbedStatusResponse};
-use crate::embed::{queue, Bucket};
+use crate::embed::{Bucket, queue};
 use crate::entity_ref::EntityRef;
 use crate::knowledge::KnowledgeEntry;
 use crate::notes::Note;
@@ -17,7 +18,6 @@ use crate::orchestration::agents::types::{
 };
 use crate::routing::RoutingVerdict;
 use crate::threads::Thread;
-use crate::SharedState;
 
 static GLOBAL_QUEUE: OnceLock<RwLock<Option<EmbedQueueHandle>>> = OnceLock::new();
 static CONTRADICTION_STATE: OnceLock<RwLock<Option<std::sync::Arc<SharedState>>>> = OnceLock::new();

@@ -749,13 +749,19 @@ impl BlackboxServer {
                 project.and_then(|project_root| {
                     config::load_project(std::path::Path::new(project_root))
                         .ok()
-                        .and_then(|c| c.roadmap.write_path.map(|p| p.to_string_lossy().into_owned()))
+                        .and_then(|c| {
+                            c.roadmap
+                                .write_path
+                                .map(|p| p.to_string_lossy().into_owned())
+                        })
                 })
             })
             .or_else(|| {
-                config::load()
-                    .ok()
-                    .and_then(|c| c.roadmap.write_path.map(|p| p.to_string_lossy().into_owned()))
+                config::load().ok().and_then(|c| {
+                    c.roadmap
+                        .write_path
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
             });
         let inline_template = p.get("template").and_then(|v| v.as_str());
         let template_path: Option<String> = p
@@ -773,9 +779,11 @@ impl BlackboxServer {
                 })
             })
             .or_else(|| {
-                config::load()
-                    .ok()
-                    .and_then(|c| c.roadmap.template_path.map(|p| p.to_string_lossy().into_owned()))
+                config::load().ok().and_then(|c| {
+                    c.roadmap
+                        .template_path
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
             });
         let project = project.unwrap_or("blackbox");
 

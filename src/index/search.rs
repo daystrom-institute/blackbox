@@ -1404,67 +1404,17 @@ impl TranscriptIndex {
         let tool_edges =
             crate::index::tool_edges::ToolEdgeContext::from_config(&self.config, !full)?;
 
-        for (account_name, root) in &self.config.roots.clone() {
-            let projects_dir = root.join("projects");
-            if projects_dir.exists() {
-                index_directory_standalone(
-                    &projects_dir,
-                    account_name,
-                    f,
-                    &mut writer,
-                    &mut meta,
-                    &mut indexed_files,
-                    &mut indexed_docs,
-                    &mut skipped,
-                    &tool_edges,
-                    !full,
-                )?;
-            }
-            let history = root.join("history.jsonl");
-            if history.exists() {
-                index_history_standalone(
-                    &history,
-                    account_name,
-                    f,
-                    &mut writer,
-                    &mut meta,
-                    &mut indexed_files,
-                    &mut indexed_docs,
-                    &mut skipped,
-                    &tool_edges,
-                )?;
-            }
-        }
-
-        if let Some(ref codex_root) = self.config.codex_root.clone() {
-            let sessions_dir = codex_root.join("sessions");
-            if sessions_dir.exists() {
-                index_codex_directory_standalone(
-                    &sessions_dir,
-                    f,
-                    &mut writer,
-                    &mut meta,
-                    &mut indexed_files,
-                    &mut indexed_docs,
-                    &mut skipped,
-                    &tool_edges,
-                    !full,
-                )?;
-            }
-            let history = codex_root.join("history.jsonl");
-            if history.exists() {
-                index_codex_history_standalone(
-                    &history,
-                    f,
-                    &mut writer,
-                    &mut meta,
-                    &mut indexed_files,
-                    &mut indexed_docs,
-                    &mut skipped,
-                    &tool_edges,
-                )?;
-            }
-        }
+        index_transcripts_via_adapters(
+            &self.config,
+            f,
+            &mut writer,
+            &mut meta,
+            &mut indexed_files,
+            &mut indexed_docs,
+            &mut skipped,
+            &tool_edges,
+            !full,
+        )?;
 
         let project_stats = project_files::index_registered_projects_standalone(
             &self.config,

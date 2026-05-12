@@ -21,15 +21,16 @@ impl BlackboxServer {
         let reg = AgentRegistry::new(&catalog);
         let cost_class = match p.cost_class.as_deref() {
             Some(s) => {
-                let parsed: AgentCostClass =
-                    match serde_json::from_value(serde_json::Value::String(s.to_string())) {
-                        Ok(c) => c,
-                        Err(_) => {
-                            return Self::err_text(&format!(
+                let parsed: AgentCostClass = match serde_json::from_value(
+                    serde_json::Value::String(s.to_string()),
+                ) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Self::err_text(&format!(
                             "unknown cost_class: {s} (expected one of: cheap, normal, expensive)"
                         ));
-                        }
-                    };
+                    }
+                };
                 Some(parsed)
             }
             None => None,
@@ -742,12 +743,18 @@ impl BlackboxServer {
             disallow: merged.disallow.clone(),
         };
         let extra = combine_dispatch_filters(Some(&brofile_filters), None);
-        let dispatch_filters =
-            match resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, extra.as_ref(), None, &self.state.packets.read())
-            {
-                Ok(df) => df,
-                Err(e) => return Self::err_text(&e),
-            };
+        let dispatch_filters = match resolve_dispatch_filters(
+            provider,
+            cwd.as_deref(),
+            false,
+            &task_id,
+            extra.as_ref(),
+            None,
+            &self.state.packets.read(),
+        ) {
+            Ok(df) => df,
+            Err(e) => return Self::err_text(&e),
+        };
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(

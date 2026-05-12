@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::orchestration::providers::Provider;
 
 use super::queue::{PendingTurn, QueueError, QueuePermit, QueueStatus, ResumeQueue};
-use super::types::{now_rfc3339, BadgeyId, BadgeyScope};
+use super::types::{BadgeyId, BadgeyScope, now_rfc3339};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BadgeyInstance {
@@ -235,10 +235,12 @@ mod tests {
             registry.get(&id),
             Err(RegistryError::Dismissed { .. })
         ));
-        assert!(registry
-            .get_including_dismissed(&id)
-            .unwrap()
-            .is_dismissed());
+        assert!(
+            registry
+                .get_including_dismissed(&id)
+                .unwrap()
+                .is_dismissed()
+        );
     }
 
     #[test]

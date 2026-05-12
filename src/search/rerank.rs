@@ -47,11 +47,7 @@ pub fn temporal_decay(features: &RerankFeatures, now: DateTime<Utc>) -> f32 {
     let recency_boost = parse_time(features.last_recalled.as_deref())
         .map(|last| {
             let days = (now - last).num_seconds().max(0) as f32 / 86_400.0;
-            if days <= 30.0 {
-                0.10
-            } else {
-                0.0
-            }
+            if days <= 30.0 { 0.10 } else { 0.0 }
         })
         .unwrap_or(0.0);
     (base + recall_boost + recency_boost).clamp(0.50, 1.25)

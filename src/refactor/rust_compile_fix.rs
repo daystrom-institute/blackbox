@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use super::*;
 
@@ -20,10 +20,7 @@ use super::*;
 /// `restrict_to_files`: optional list of file path substrings from `p.toml_entries["restrict_to_files"]`.
 ///
 /// Returns `error.bad_input: code=no_diagnostics_to_classify` when `diagnostics` is empty.
-pub fn plan_compile_fix(
-    p: &RefactorPlanParams,
-    diagnostics: &[RustcDiagnostic],
-) -> Result<String> {
+pub fn plan_compile_fix(p: &RefactorPlanParams, diagnostics: &[RustcDiagnostic]) -> Result<String> {
     if diagnostics.is_empty() {
         bail!("error.bad_input: code=no_diagnostics_to_classify");
     }
@@ -68,16 +65,11 @@ pub fn plan_compile_fix(
                             Ok(resolved) => {
                                 use_decl_proposals.push((path_string(&resolved), use_path));
                             }
-                            Err(_) => leftovers.push(format!(
-                                "{code}: {} (path resolution failed)",
-                                diag.message
-                            )),
+                            Err(_) => leftovers
+                                .push(format!("{code}: {} (path resolution failed)", diag.message)),
                         }
                     } else {
-                        leftovers.push(format!(
-                            "{code}: {} (no primary span file)",
-                            diag.message
-                        ));
+                        leftovers.push(format!("{code}: {} (no primary span file)", diag.message));
                     }
                 } else {
                     leftovers.push(format!(
@@ -90,11 +82,20 @@ pub fn plan_compile_fix(
             "E0603" | "E0624" | "E0616" => {
                 // Private item access: propose visibility rewrite to pub(crate).
                 // Always notes in leftovers as operator review is required.
-                let proposal =
-                    extract_visibility_proposal(&diag.spans, &diag.children, p.project_dir.as_deref());
+                let proposal = extract_visibility_proposal(
+                    &diag.spans,
+                    &diag.children,
+                    p.project_dir.as_deref(),
+                );
                 match proposal {
                     Ok(Some((file, start, end, replacement))) => {
-                        visibility_proposals.push((file, start, end, replacement, diag.message.clone()));
+                        visibility_proposals.push((
+                            file,
+                            start,
+                            end,
+                            replacement,
+                            diag.message.clone(),
+                        ));
                     }
                     Ok(None) => {}
                     Err(_) => {}
@@ -135,11 +136,9 @@ pub fn plan_compile_fix(
             "E0061" => {
                 // Wrong number of arguments: leftover UNLESS a machine-applicable suggestion
                 // with a span matching the diagnostic's file is present.
-                if let Some((file, edit)) = machine_applicable_edit(
-                    &diag.spans,
-                    &diag.children,
-                    p.project_dir.as_deref(),
-                ) {
+                if let Some((file, edit)) =
+                    machine_applicable_edit(&diag.spans, &diag.children, p.project_dir.as_deref())
+                {
                     replace_proposals.push((file, edit));
                 } else {
                     leftovers.push(format!("{code}: {}", diag.message));
@@ -228,14 +227,14 @@ pub fn plan_compile_fix(
     for (file_path, text_edit) in &replace_proposals {
         match read_original_sha256(file_path) {
             Ok(original_sha256) => {
-                let entry = file_edits.entry(file_path.clone()).or_insert_with(|| {
-                    FileEdit {
+                let entry = file_edits
+                    .entry(file_path.clone())
+                    .or_insert_with(|| FileEdit {
                         path: file_path.clone(),
                         original_sha256,
                         edits: Vec::new(),
                         new_text: None,
-                    }
-                });
+                    });
                 entry.edits.push(text_edit.clone());
             }
             Err(e) => {
@@ -313,7 +312,11 @@ fn extract_suggested_replacement(
 fn primary_span_file(spans: &[serde_json::Value]) -> Option<String> {
     spans
         .iter()
-        .find(|s| s.get("is_primary").and_then(|v| v.as_bool()).unwrap_or(false))
+        .find(|s| {
+            s.get("is_primary")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
         .or_else(|| spans.first())
         .and_then(|s| s.get("file_name"))
         .and_then(|v| v.as_str())
@@ -330,10 +333,7 @@ fn normalize_use_path(replacement: &str) -> String {
 
 /// Build the parameters for a use-declaration insertion.
 /// Returns `(insert_at, replacement_text, original_sha256)` or `None` if already present.
-fn build_use_decl_edit(
-    file_path: &str,
-    use_path: &str,
-) -> Result<Option<(usize, String, String)>> {
+fn build_use_decl_edit(file_path: &str, use_path: &str) -> Result<Option<(usize, String, String)>> {
     validate_rust_use_path(use_path)?;
     let declaration = format!("use {use_path};");
     let parsed = parse_rust_file(Path::new(file_path))?;
@@ -467,8 +467,8 @@ fn machine_applicable_edit(
 
 /// Read a file and compute its sha256 hex digest.
 fn read_original_sha256(file_path: &str) -> Result<String> {
-    let bytes = std::fs::read(file_path)
-        .map_err(|e| anyhow::anyhow!("failed to read {file_path}: {e}"))?;
+    let bytes =
+        std::fs::read(file_path).map_err(|e| anyhow::anyhow!("failed to read {file_path}: {e}"))?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -557,7 +557,12 @@ mod tests {
             Some("E0432"),
             "unresolved import `std::collections::HashMap`",
             vec![file_span(&file)],
-            vec![suggestion_child(&file, 0, 0, "use std::collections::HashMap;")],
+            vec![suggestion_child(
+                &file,
+                0,
+                0,
+                "use std::collections::HashMap;",
+            )],
         );
         let text = plan_compile_fix(&params(None), &[d]).unwrap();
         let plan: RefactorPlan = serde_json::from_str(&text).unwrap();
@@ -565,7 +570,9 @@ mod tests {
         assert!(!plan.edits.is_empty(), "expected at least one FileEdit");
         let edit = &plan.edits[0];
         assert!(
-            edit.edits[0].replacement.contains("use std::collections::HashMap;"),
+            edit.edits[0]
+                .replacement
+                .contains("use std::collections::HashMap;"),
             "replacement should contain the use decl: {:?}",
             edit.edits[0].replacement
         );
@@ -641,7 +648,10 @@ mod tests {
         let text = plan_compile_fix(&params(None), &[d]).unwrap();
         let plan: RefactorPlan = serde_json::from_str(&text).unwrap();
         // Edit should be in plan.edits.
-        assert!(!plan.edits.is_empty(), "expected visibility rewrite in edits");
+        assert!(
+            !plan.edits.is_empty(),
+            "expected visibility rewrite in edits"
+        );
         assert_eq!(
             plan.edits[0].edits[0].replacement, "pub(crate) ",
             "should rewrite to pub(crate)"
@@ -658,12 +668,7 @@ mod tests {
 
     #[test]
     fn e0624_no_span_info_goes_to_leftovers_only() {
-        let d = diag(
-            Some("E0624"),
-            "method `secret` is private",
-            vec![],
-            vec![],
-        );
+        let d = diag(Some("E0624"), "method `secret` is private", vec![], vec![]);
         let text = plan_compile_fix(&params(None), &[d]).unwrap();
         let plan: RefactorPlan = serde_json::from_str(&text).unwrap();
         // With no span info we can't produce an edit; leftover should still note operator review.
@@ -722,12 +727,7 @@ mod tests {
 
     #[test]
     fn e0382_borrow_checker_goes_to_leftovers() {
-        let d = diag(
-            Some("E0382"),
-            "use of moved value: `x`",
-            vec![],
-            vec![],
-        );
+        let d = diag(Some("E0382"), "use of moved value: `x`", vec![], vec![]);
         let text = plan_compile_fix(&params(None), &[d]).unwrap();
         let plan: RefactorPlan = serde_json::from_str(&text).unwrap();
         assert!(plan.edits.is_empty());
@@ -781,7 +781,11 @@ mod tests {
     #[test]
     fn e0061_with_machine_applicable_suggestion_produces_replace_text() {
         let dir = tempfile::tempdir().unwrap();
-        let file = write_rust_file(dir.path(), "lib.rs", "fn foo(a: u32, b: u32) {} fn bar() { foo(1); }\n");
+        let file = write_rust_file(
+            dir.path(),
+            "lib.rs",
+            "fn foo(a: u32, b: u32) {} fn bar() { foo(1); }\n",
+        );
 
         let d = diag(
             Some("E0061"),
@@ -809,12 +813,7 @@ mod tests {
 
     #[test]
     fn unrecognized_code_goes_to_leftovers() {
-        let d = diag(
-            Some("E9999"),
-            "some unknown error",
-            vec![],
-            vec![],
-        );
+        let d = diag(Some("E9999"), "some unknown error", vec![], vec![]);
         let text = plan_compile_fix(&params(None), &[d]).unwrap();
         let plan: RefactorPlan = serde_json::from_str(&text).unwrap();
         assert!(plan.edits.is_empty());
@@ -835,16 +834,17 @@ mod tests {
     fn span_data_used_for_use_decl_insertion_position() {
         let dir = tempfile::tempdir().unwrap();
         // File already has a use decl so insertion should go after it.
-        let file = write_rust_file(
-            dir.path(),
-            "lib.rs",
-            "use std::fmt;\n\nfn foo() {}\n",
-        );
+        let file = write_rust_file(dir.path(), "lib.rs", "use std::fmt;\n\nfn foo() {}\n");
         let d = diag(
             Some("E0432"),
             "unresolved import `std::collections::HashMap`",
             vec![file_span(&file)],
-            vec![suggestion_child(&file, 0, 0, "use std::collections::HashMap;")],
+            vec![suggestion_child(
+                &file,
+                0,
+                0,
+                "use std::collections::HashMap;",
+            )],
         );
         let text = plan_compile_fix(&params(None), &[d]).unwrap();
         let plan: RefactorPlan = serde_json::from_str(&text).unwrap();
@@ -973,7 +973,10 @@ mod tests {
         .unwrap();
 
         let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(resp.status, "ok", "all-leftovers run should commit: {response}");
+        assert_eq!(
+            resp.status, "ok",
+            "all-leftovers run should commit: {response}"
+        );
         assert!(!resp.rolled_back);
         assert_eq!(resp.obligations.len(), 1);
         assert_eq!(

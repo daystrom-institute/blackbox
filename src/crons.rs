@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use cron::Schedule;
 use parking_lot::RwLock;
@@ -153,7 +153,6 @@ impl CronRegistry {
             prev.abort();
         }
     }
-
 }
 
 pub type SharedRegistry = Arc<CronRegistry>;

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -271,7 +271,9 @@ mod tests {
 
     #[test]
     fn hmac_sha256_signature_verifies_no_prefix() {
-        unsafe { std::env::set_var("WEBHOOK_TEST_SECRET", "hunter2"); }
+        unsafe {
+            std::env::set_var("WEBHOOK_TEST_SECRET", "hunter2");
+        }
         let scheme = SignatureScheme::HmacSha256 {
             secret_env: "WEBHOOK_TEST_SECRET".into(),
             header: "X-Gitea-Signature".into(),
@@ -294,7 +296,9 @@ mod tests {
 
     #[test]
     fn hmac_sha256_signature_verifies_with_prefix() {
-        unsafe { std::env::set_var("WEBHOOK_TEST_SECRET2", "hunter3"); }
+        unsafe {
+            std::env::set_var("WEBHOOK_TEST_SECRET2", "hunter3");
+        }
         let scheme = SignatureScheme::HmacSha256 {
             secret_env: "WEBHOOK_TEST_SECRET2".into(),
             header: "X-Hub-Signature-256".into(),

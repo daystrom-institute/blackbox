@@ -3,9 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use notify::RecommendedWatcher;
-use notify_debouncer_full::{
-    new_debouncer, DebounceEventResult, Debouncer, RecommendedCache,
-};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 
 use crate::artifacts::{ArtifactCatalog, ArtifactScope};
 
@@ -85,11 +83,7 @@ impl BbxWatcher {
 }
 
 /// Route a single debounced notify event to the appropriate artifact action.
-pub(crate) fn handle_event(
-    event: &notify::Event,
-    roots: &[PathBuf],
-    catalog: &ArtifactCatalog,
-) {
+pub(crate) fn handle_event(event: &notify::Event, roots: &[PathBuf], catalog: &ArtifactCatalog) {
     let is_create_or_rename_to = matches!(
         event.kind,
         notify::EventKind::Create(_)
@@ -263,7 +257,10 @@ mod tests {
                 "watch-flow",
             )
             .unwrap();
-        assert!(scoped.is_some(), "artifact should be installed in scoped path");
+        assert!(
+            scoped.is_some(),
+            "artifact should be installed in scoped path"
+        );
 
         // Global lookup must return None (not polluted).
         let global = catalog

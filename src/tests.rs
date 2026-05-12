@@ -71,9 +71,10 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             slack_proposal_links::SlackProposalLinks::open(&tmp.path().join("bro")).unwrap(),
         ),
         lsp_sessions: lsp::LspSessionManager::new(),
-        config: Arc::new(RwLock::new(crate::config::load().unwrap_or_else(|e| {
-            panic!("loading config for test SharedState: {e}")
-        }))),
+        config: Arc::new(RwLock::new(
+            crate::config::load()
+                .unwrap_or_else(|e| panic!("loading config for test SharedState: {e}")),
+        )),
     });
     BlackboxServer::new(state)
 }
@@ -250,17 +251,21 @@ async fn artifact_install_wires_f3_workflow_and_packet() {
     .await
     .unwrap();
 
-    assert!(server
-        .state
-        .workflow_registry
-        .read()
-        .contains_key("schema-migration-arc"));
-    assert!(server
-        .state
-        .packets
-        .read()
-        .load("domain:workflow-policy/arc-budget")
-        .is_ok());
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("schema-migration-arc")
+    );
+    assert!(
+        server
+            .state
+            .packets
+            .read()
+            .load("domain:workflow-policy/arc-budget")
+            .is_ok()
+    );
     let rows = server
         .state
         .artifacts
@@ -306,7 +311,9 @@ async fn proposal_approved_hook_bumps_link_version() {
     // Ensure no token leaks in from the surrounding env so the
     // hook short-circuits before HTTP. (Safety belt — the test
     // depends on the bump happening before the token check.)
-    unsafe { std::env::remove_var("SLACK_BOT_TOKEN"); }
+    unsafe {
+        std::env::remove_var("SLACK_BOT_TOKEN");
+    }
     try_slack_proposal_signal_hook("proposal-approved", &server.state, &correlate, &entity).await;
     let bumped = server
         .state
@@ -344,7 +351,9 @@ async fn proposal_clarify_hook_does_not_bump_version() {
         "user": "Ualice",
         "text": "actually never mind, this one is fine as-is",
     });
-    unsafe { std::env::remove_var("SLACK_BOT_TOKEN"); }
+    unsafe {
+        std::env::remove_var("SLACK_BOT_TOKEN");
+    }
     try_slack_proposal_signal_hook("proposal-clarify", &server.state, &correlate, &entity).await;
     let unchanged = server
         .state
@@ -368,16 +377,20 @@ async fn proposal_signal_hook_no_op_for_unknown_thread_ts() {
         "channel": "C01",
         "user": "Ualice",
     });
-    unsafe { std::env::remove_var("SLACK_BOT_TOKEN"); }
+    unsafe {
+        std::env::remove_var("SLACK_BOT_TOKEN");
+    }
     try_slack_proposal_signal_hook("proposal-approved", &server.state, &correlate, &entity).await;
     // Nothing to assert beyond "did not panic" — but make a
     // sanity probe on the link store size to confirm we didn't
     // accidentally insert anything.
-    assert!(server
-        .state
-        .slack_proposal_links
-        .lookup_by_msg("T01", "C01", "ts-unknown")
-        .is_none());
+    assert!(
+        server
+            .state
+            .slack_proposal_links
+            .lookup_by_msg("T01", "C01", "ts-unknown")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -403,11 +416,13 @@ async fn artifact_install_wires_project_bootstrap_arc() {
     .await
     .unwrap();
 
-    assert!(server
-        .state
-        .workflow_registry
-        .read()
-        .contains_key("project-bootstrap-arc"));
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("project-bootstrap-arc")
+    );
     let rows = server
         .state
         .artifacts
@@ -455,10 +470,12 @@ async fn artifact_install_wires_project_bootstrap_arc() {
         .cloned()
         .unwrap();
     assert_eq!(snapshot.status, "completed");
-    assert!(snapshot
-        .completed_nodes
-        .iter()
-        .any(|node| node == "Publish"));
+    assert!(
+        snapshot
+            .completed_nodes
+            .iter()
+            .any(|node| node == "Publish")
+    );
 }
 
 #[tokio::test]
@@ -518,23 +535,29 @@ async fn artifact_install_wires_m2_compaction_arc_and_packets() {
     .await
     .unwrap();
 
-    assert!(server
-        .state
-        .workflow_registry
-        .read()
-        .contains_key("embed-compaction-arc"));
-    assert!(server
-        .state
-        .packets
-        .read()
-        .load("domain:embed/compaction-policy")
-        .is_ok());
-    assert!(server
-        .state
-        .packets
-        .read()
-        .load("domain:cron-routing/embed-compaction")
-        .is_ok());
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("embed-compaction-arc")
+    );
+    assert!(
+        server
+            .state
+            .packets
+            .read()
+            .load("domain:embed/compaction-policy")
+            .is_ok()
+    );
+    assert!(
+        server
+            .state
+            .packets
+            .read()
+            .load("domain:cron-routing/embed-compaction")
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -709,29 +732,33 @@ async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
     .await
     .unwrap();
 
-    assert!(server
-        .state
-        .workflow_registry
-        .read()
-        .contains_key("auto-digest-arc"));
-    assert!(server
-        .state
-        .packets
-        .read()
-        .load("domain:auto-digest/entry-quality")
-        .is_ok());
-    assert!(server
-        .state
-        .packets
-        .read()
-        .load("domain:auto-digest/task-completed-routing")
-        .is_ok());
-    assert!(orchestration::brofile::resolve_brofile(
-        "digest-extractor",
-        &server.state.store_dir,
-        None
-    )
-    .is_some());
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("auto-digest-arc")
+    );
+    assert!(
+        server
+            .state
+            .packets
+            .read()
+            .load("domain:auto-digest/entry-quality")
+            .is_ok()
+    );
+    assert!(
+        server
+            .state
+            .packets
+            .read()
+            .load("domain:auto-digest/task-completed-routing")
+            .is_ok()
+    );
+    assert!(
+        orchestration::brofile::resolve_brofile("digest-extractor", &server.state.store_dir, None)
+            .is_some()
+    );
 
     let cases: Value =
         serde_json::from_str(include_str!("../eval/audit/auto-digest/cases.json")).unwrap();
@@ -846,11 +873,13 @@ async fn artifact_install_wires_m4_contradiction_review_artifacts() {
     .await
     .unwrap();
 
-    assert!(server
-        .state
-        .workflow_registry
-        .read()
-        .contains_key("contradiction-review-arc"));
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("contradiction-review-arc")
+    );
     let packet_store = server.state.packets.read();
     let packet = packet_store
         .load("domain:contradiction/review-synthesis")
@@ -862,12 +891,14 @@ async fn artifact_install_wires_m4_contradiction_review_artifacts() {
     )
     .unwrap();
     assert_eq!(prediction.classification, "contradicts");
-    assert!(orchestration::brofile::resolve_brofile(
-        "contradiction-facilitator",
-        &server.state.store_dir,
-        None
-    )
-    .is_some());
+    assert!(
+        orchestration::brofile::resolve_brofile(
+            "contradiction-facilitator",
+            &server.state.store_dir,
+            None
+        )
+        .is_some()
+    );
 }
 
 #[tokio::test]
@@ -971,11 +1002,13 @@ async fn artifact_install_wires_m5_auto_edge_artifacts_and_audit() {
     )
     .await
     .unwrap();
-    assert!(server
-        .state
-        .workflow_registry
-        .read()
-        .contains_key("auto-edge-arc"));
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("auto-edge-arc")
+    );
 
     let packet_store = server.state.packets.read();
     let packet = packet_store
@@ -1045,10 +1078,12 @@ async fn write_semantic_edge_projects_describes_sidecar() {
     });
     let source_ref = entity_ref::EntityRef::parse(source).unwrap();
     let target_ref = entity_ref::EntityRef::parse(target).unwrap();
-    assert!(edge_index
-        .forward_edges(&source_ref)
-        .iter()
-        .any(|edge| edge.kind == "DESCRIBES" && edge.target == target_ref));
+    assert!(
+        edge_index
+            .forward_edges(&source_ref)
+            .iter()
+            .any(|edge| edge.kind == "DESCRIBES" && edge.target == target_ref)
+    );
 }
 
 #[tokio::test]
@@ -1233,11 +1268,13 @@ async fn artifact_supersession_deactivates_workflow_registry_entry() {
     )
     .await
     .unwrap();
-    assert!(server
-        .state
-        .workflow_registry
-        .read()
-        .contains_key("workflow-a"));
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a")
+    );
 
     install_artifact_value(
         &server.state,
@@ -1253,22 +1290,28 @@ async fn artifact_supersession_deactivates_workflow_registry_entry() {
     .await
     .unwrap();
 
-    assert!(!server
-        .state
-        .workflow_registry
-        .read()
-        .contains_key("workflow-a"));
-    assert!(server
-        .state
-        .workflow_registry
-        .read()
-        .contains_key("workflow-a2"));
-    assert!(!server
-        .state
-        .store_dir
-        .join("workflows")
-        .join("workflow-a.json")
-        .exists());
+    assert!(
+        !server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a")
+    );
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a2")
+    );
+    assert!(
+        !server
+            .state
+            .store_dir
+            .join("workflows")
+            .join("workflow-a.json")
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -2007,10 +2050,12 @@ async fn workflow_foreach_continue_collects_item_failures() {
         .expect("results array");
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row["status"] == "error"));
-    assert!(rows[0]["error"]
-        .as_str()
-        .unwrap()
-        .contains("did not export declared key"));
+    assert!(
+        rows[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("did not export declared key")
+    );
 }
 
 #[tokio::test]
@@ -2470,7 +2515,9 @@ async fn badgey_lifecycle_tools_write_thread_events() {
     let _env_guard = codex_bin_test_guard().await;
     let prior_bin = std::env::var("CODEX_BIN").ok();
     let tmp = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test")); }
+    unsafe {
+        std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test"));
+    }
     save_badgey_test_brofile(&tmp);
     let server = test_server(&tmp);
 
@@ -2513,9 +2560,11 @@ async fn badgey_lifecycle_tools_write_thread_events() {
     assert!(bodies.iter().any(|body| body.contains(r#""event":"exec""#)
         && body.contains(r#""provider_session_id":"codex-session-test""#)));
     assert!(bodies.iter().any(|body| body.contains(r#""event":"turn""#)));
-    assert!(bodies
-        .iter()
-        .any(|body| body.contains(r#""event":"dismiss""#)));
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains(r#""event":"dismiss""#))
+    );
 
     match prior_bin {
         Some(value) => unsafe { std::env::set_var("CODEX_BIN", value) },
@@ -2528,7 +2577,9 @@ async fn badgey_agent_dispatch_routes_through_wrapper_adapter() {
     let _env_guard = codex_bin_test_guard().await;
     let prior_bin = std::env::var("CODEX_BIN").ok();
     let tmp = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test")); }
+    unsafe {
+        std::env::set_var("CODEX_BIN", fake_codex_bin(&tmp, "codex-session-test"));
+    }
     save_badgey_test_brofile(&tmp);
     let server = test_server(&tmp);
     server
@@ -2950,11 +3001,12 @@ fn badgey_restart_replay_skips_unobserved_pending_session() {
 
     restore_badgey_registry_from_notes(&server.state);
     assert!(server.state.badgey_registry.get(&id).is_err());
-    assert!(server.state.notes.read().all().iter().any(|note| note.kind
-        == notes::NoteKind::Surprise
-        && note
-            .body
-            .contains("badgey_restore_skipped_unobserved_session")));
+    assert!(server.state.notes.read().all().iter().any(|note| {
+        note.kind == notes::NoteKind::Surprise
+            && note
+                .body
+                .contains("badgey_restore_skipped_unobserved_session")
+    }));
 }
 
 #[test]
@@ -3882,10 +3934,12 @@ fn bro_agent_describe_degraded_manifest() {
     assert_ne!(result.is_error, Some(true));
     let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
     assert_eq!(body["name"], "broken");
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("manifest parse failed"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("manifest parse failed")
+    );
 }
 
 #[test]
@@ -5336,10 +5390,7 @@ fn compile_surface_packet_for_test(
         .compile(&CompileParams {
             domain: server::surface::SURFACE_ROUTING_DOMAIN.to_string(),
             rules: serde_json::Value::Array(rules),
-            classification_lattice: Some(vec![
-                "tool_surface".to_string(),
-                "deny".to_string(),
-            ]),
+            classification_lattice: Some(vec!["tool_surface".to_string(), "deny".to_string()]),
             prefix_inference: Some(Default::default()),
             scope: Some(scope.to_string()),
             project: project.map(|s| s.to_string()),
@@ -5630,9 +5681,9 @@ fn bro_mcp_add_surface_appends_to_url() {
     let result = orchestration::mcp::handle(&params).unwrap();
     assert!(result.contains("added"), "add should succeed: {result}");
 
-    let store = orchestration::mcp::McpStore::load(
-        &orchestration::mcp::project_store_path(std::path::Path::new(&project)),
-    )
+    let store = orchestration::mcp::McpStore::load(&orchestration::mcp::project_store_path(
+        std::path::Path::new(&project),
+    ))
     .unwrap();
     let cfg = store.servers.get("test-surface").unwrap();
     match cfg {
@@ -5667,9 +5718,9 @@ fn bro_mcp_add_without_surface_preserves_url() {
     let result = orchestration::mcp::handle(&params).unwrap();
     assert!(result.contains("added"), "add should succeed: {result}");
 
-    let store = orchestration::mcp::McpStore::load(
-        &orchestration::mcp::project_store_path(std::path::Path::new(&project)),
-    )
+    let store = orchestration::mcp::McpStore::load(&orchestration::mcp::project_store_path(
+        std::path::Path::new(&project),
+    ))
     .unwrap();
     let cfg = store.servers.get("test-no-surface").unwrap();
     match cfg {
@@ -5682,8 +5733,8 @@ fn bro_mcp_add_without_surface_preserves_url() {
 
 #[test]
 fn example_surface_packet_parses_and_compiles() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/mcp-surfaces/routing.json");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/mcp-surfaces/routing.json");
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("example packet not found at {:?}: {e}", path));
     let value: serde_json::Value = serde_json::from_str(&raw).expect("example packet JSON parse");
@@ -5697,18 +5748,19 @@ fn example_surface_packet_parses_and_compiles() {
     );
     let tmp = tempfile::TempDir::new().unwrap();
     let packets = packets::Packets::open(tmp.path()).unwrap();
-    let _packet_id = packets.compile(&packets::CompileParams {
-        domain: domain.to_string(),
-        rules: value["rules"].clone(),
-        classification_lattice: Some(vec!["tool_surface".into(), "deny".into()]),
-        prefix_inference: Some(Default::default()),
-        scope: Some("global".into()),
-        project: None,
-        source_ids: None,
-        rank_lookup_key: None,
-        rank_table: None,
-        threshold_lookup_key: None,
-        threshold_table: None,
-    })
-    .expect("example packet compiles");
+    let _packet_id = packets
+        .compile(&packets::CompileParams {
+            domain: domain.to_string(),
+            rules: value["rules"].clone(),
+            classification_lattice: Some(vec!["tool_surface".into(), "deny".into()]),
+            prefix_inference: Some(Default::default()),
+            scope: Some("global".into()),
+            project: None,
+            source_ids: None,
+            rank_lookup_key: None,
+            rank_table: None,
+            threshold_lookup_key: None,
+            threshold_table: None,
+        })
+        .expect("example packet compiles");
 }

@@ -152,6 +152,7 @@ jsonschema = { version = "0.17", default-features = false, features = ["draft202
 tempfile = "3"
 lsp-types = "0.94.1"
 url = "2.5.8"
+rusqlite = "0.32"
 
 [dev-dependencies]
 

@@ -1,21 +1,24 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Result;
 use tantivy::schema::*;
-use tantivy::{Index, IndexWriter, TantivyDocument};
+use tantivy::{Index, IndexWriter};
 use walkdir::WalkDir;
 
-use super::helpers::*;
 use super::knowledge_docs;
 use super::project_files;
 use super::tool_edges::ToolEdgeContext;
 use super::{FieldHandles, FileMeta, ReindexConfig};
-use crate::entity_ref;
-use crate::parser;
+use crate::orchestration::providers::Provider;
+use crate::transcripts::adapters::{
+    TranscriptAdapterRegistry, TranscriptReadAdapter, TranscriptScanTarget,
+};
+use crate::transcripts::projection::normalized_to_doc;
+use crate::transcripts::types::TranscriptLocation;
 
 const DEFAULT_BACKGROUND_FULL_REINDEX_EVERY_TICKS: u64 = 0;
 
@@ -237,67 +240,17 @@ fn try_background_reindex(
     let tool_edges = ToolEdgeContext::from_config(config, !full)?;
 
     let transcript_phase = Instant::now();
-    for (account_name, root) in &config.roots {
-        let projects_dir = root.join("projects");
-        if projects_dir.exists() {
-            index_directory_standalone(
-                &projects_dir,
-                account_name,
-                fields,
-                &mut writer,
-                &mut meta,
-                &mut indexed_files,
-                &mut indexed_docs,
-                &mut skipped,
-                &tool_edges,
-                !full,
-            )?;
-        }
-        let history = root.join("history.jsonl");
-        if history.exists() {
-            index_history_standalone(
-                &history,
-                account_name,
-                fields,
-                &mut writer,
-                &mut meta,
-                &mut indexed_files,
-                &mut indexed_docs,
-                &mut skipped,
-                &tool_edges,
-            )?;
-        }
-    }
-
-    if let Some(ref codex_root) = config.codex_root {
-        let sessions_dir = codex_root.join("sessions");
-        if sessions_dir.exists() {
-            index_codex_directory_standalone(
-                &sessions_dir,
-                fields,
-                &mut writer,
-                &mut meta,
-                &mut indexed_files,
-                &mut indexed_docs,
-                &mut skipped,
-                &tool_edges,
-                !full,
-            )?;
-        }
-        let history = codex_root.join("history.jsonl");
-        if history.exists() {
-            index_codex_history_standalone(
-                &history,
-                fields,
-                &mut writer,
-                &mut meta,
-                &mut indexed_files,
-                &mut indexed_docs,
-                &mut skipped,
-                &tool_edges,
-            )?;
-        }
-    }
+    index_transcripts_via_adapters(
+        config,
+        fields,
+        &mut writer,
+        &mut meta,
+        &mut indexed_files,
+        &mut indexed_docs,
+        &mut skipped,
+        &tool_edges,
+        !full,
+    )?;
     tracing::info!(
         full,
         elapsed_ms = transcript_phase.elapsed().as_millis(),
@@ -468,7 +421,8 @@ pub fn spawn_reindex_thread(
             let mut tick = 0_u64;
             loop {
                 tick = tick.wrapping_add(1);
-                let full = full_reindex_every_ticks != 0 && tick.is_multiple_of(full_reindex_every_ticks);
+                let full =
+                    full_reindex_every_ticks != 0 && tick.is_multiple_of(full_reindex_every_ticks);
                 if let Err(e) = try_background_reindex(&index, &config, fields, full) {
                     tracing::error!("background reindex failed: {:#}", e);
                 }
@@ -479,56 +433,6 @@ pub fn spawn_reindex_thread(
 }
 
 // ── Standalone indexing functions (no &self — usable from background thread) ──
-
-pub(super) fn event_to_doc_standalone(
-    event: &parser::ParsedEvent,
-    account: &str,
-    file_path: &str,
-    byte_offset: u64,
-    is_subagent: bool,
-    f: FieldHandles,
-) -> TantivyDocument {
-    build_transcript_doc(event, account, file_path, byte_offset, is_subagent, "", f)
-}
-
-pub(crate) fn build_transcript_doc(
-    event: &parser::ParsedEvent,
-    account: &str,
-    file_path: &str,
-    byte_offset: u64,
-    is_subagent: bool,
-    project_fallback: &str,
-    f: FieldHandles,
-) -> TantivyDocument {
-    let mut doc = TantivyDocument::new();
-    doc.add_text(f.doc_type, "transcript");
-    doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
-    doc.add_text(f.content, &event.content);
-    doc.add_text(f.session_id, &event.session_id);
-    doc.add_text(f.account, account);
-    doc.add_text(f.project, event.cwd.as_deref().unwrap_or(project_fallback));
-    doc.add_text(f.role, event.role.as_ref());
-    doc.add_text(f.file_path, file_path);
-    doc.add_u64(f.byte_offset, byte_offset);
-    doc.add_u64(
-        f.is_subagent,
-        if event.is_subagent || is_subagent {
-            1
-        } else {
-            0
-        },
-    );
-    if let Some(ref ts) = event.timestamp {
-        doc.add_text(f.timestamp, ts);
-    }
-    if let Some(ref branch) = event.git_branch {
-        doc.add_text(f.git_branch, branch);
-    }
-    if let Some(ref slug) = event.agent_slug {
-        doc.add_text(f.agent_slug, slug);
-    }
-    doc
-}
 
 pub(super) fn should_skip_file(
     path_str: &str,
@@ -543,14 +447,15 @@ pub(super) fn should_skip_file(
     }
 }
 
-// Many parameters, each already minimal (FieldHandles/account/writer/meta
-// + three &mut u64 counters). Grouping the counters into a struct would
-// obscure what's being mutated without adding type safety.
+/// Adapter-driven transcript indexing. Replaces the per-provider standalone
+/// loops with a uniform pipeline: each registered adapter discovers locations
+/// (sessions + history), then `read_since` projects normalized events that
+/// flow through `normalized_to_doc` into Tantivy. Tool-edge sidecars stay on
+/// the existing `ParsedEvent` path via `to_parsed_event()`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn index_directory_standalone(
-    dir: &Path,
-    account_name: &str,
-    f: FieldHandles,
+pub(crate) fn index_transcripts_via_adapters(
+    config: &ReindexConfig,
+    fields: FieldHandles,
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
     indexed_files: &mut u64,
@@ -559,150 +464,51 @@ pub(super) fn index_directory_standalone(
     tool_edges: &ToolEdgeContext,
     commit_progress: bool,
 ) -> Result<()> {
-    for entry in WalkDir::new(dir)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
-            continue;
+    let registry = TranscriptAdapterRegistry::from_reindex_config(config);
+    for adapter in registry.adapters() {
+        let sessions = adapter
+            .scan_locations(TranscriptScanTarget::Sessions)
+            .map_err(|err| anyhow::anyhow!("adapter sessions scan failed: {err}"))?;
+        for location in sessions {
+            index_adapter_location(
+                adapter,
+                &location,
+                fields,
+                writer,
+                meta,
+                indexed_files,
+                indexed_docs,
+                skipped,
+                tool_edges,
+                commit_progress,
+            )?;
         }
-
-        let path_str = path.to_string_lossy().to_string();
-        let file_meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let mtime = match file_meta.modified() {
-            Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-            Err(_) => continue,
-        };
-
-        if should_skip_file(&path_str, mtime, file_meta.len(), meta) {
-            *skipped += 1;
-            continue;
-        }
-        if meta.contains_key(&path_str) {
-            writer.delete_term(Term::from_field_text(f.file_path, &path_str));
-        }
-
-        let is_subagent = path_str.contains("/subagents/");
-        let project = extract_project_from_path(path, dir);
-
-        let file = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let reader = BufReader::new(file);
-        let mut offset = 0u64;
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            let line_offset = offset;
-            offset += line.len() as u64 + 1;
-
-            for (event_idx, event) in parser::parse_transcript_line(&line).into_iter().enumerate() {
-                if let Err(err) =
-                    tool_edges.emit_event_edges(&event, account_name, line_offset, event_idx as u32)
-                {
-                    tracing::debug!(error = %err, "failed to emit transcript tool-call edge");
-                }
-                let is_sub = event.is_subagent || is_subagent;
-                let doc = build_transcript_doc(
-                    &event,
-                    account_name,
-                    &path_str,
-                    line_offset,
-                    is_sub,
-                    &project,
-                    f,
-                );
-                writer.add_document(doc)?;
-                *indexed_docs += 1;
-            }
-        }
-
-        meta.insert(
-            path_str,
-            FileMeta {
-                mtime,
-                size: file_meta.len(),
-            },
-        );
-        *indexed_files += 1;
-        if commit_progress && (*indexed_files).is_multiple_of(500) {
-            tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);
-            writer.commit()?;
+        let history = adapter
+            .scan_locations(TranscriptScanTarget::History)
+            .map_err(|err| anyhow::anyhow!("adapter history scan failed: {err}"))?;
+        for location in history {
+            index_adapter_location(
+                adapter,
+                &location,
+                fields,
+                writer,
+                meta,
+                indexed_files,
+                indexed_docs,
+                skipped,
+                tool_edges,
+                false,
+            )?;
         }
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn index_history_standalone(
-    history: &Path,
-    account_name: &str,
-    f: FieldHandles,
-    writer: &mut IndexWriter,
-    meta: &mut HashMap<String, FileMeta>,
-    indexed_files: &mut u64,
-    indexed_docs: &mut u64,
-    skipped: &mut u64,
-    tool_edges: &ToolEdgeContext,
-) -> Result<()> {
-    let path_str = history.to_string_lossy().to_string();
-    let file_meta = fs::metadata(history)?;
-    let mtime = file_meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
-
-    if should_skip_file(&path_str, mtime, file_meta.len(), meta) {
-        *skipped += 1;
-        return Ok(());
-    }
-    if meta.contains_key(&path_str) {
-        writer.delete_term(Term::from_field_text(f.file_path, &path_str));
-    }
-
-    let file = fs::File::open(history)?;
-    let reader = BufReader::new(file);
-    let mut offset = 0u64;
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let line_offset = offset;
-        offset += line.len() as u64 + 1;
-        for (event_idx, event) in parser::parse_history_line(&line).into_iter().enumerate() {
-            if let Err(err) =
-                tool_edges.emit_event_edges(&event, account_name, line_offset, event_idx as u32)
-            {
-                tracing::debug!(error = %err, "failed to emit history tool-call edge");
-            }
-            let doc =
-                event_to_doc_standalone(&event, account_name, &path_str, line_offset, false, f);
-            writer.add_document(doc)?;
-            *indexed_docs += 1;
-        }
-    }
-    meta.insert(
-        path_str,
-        FileMeta {
-            mtime,
-            size: file_meta.len(),
-        },
-    );
-    *indexed_files += 1;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn index_codex_directory_standalone(
-    sessions_dir: &Path,
-    f: FieldHandles,
+fn index_adapter_location(
+    adapter: &dyn TranscriptReadAdapter,
+    location: &TranscriptLocation,
+    fields: FieldHandles,
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
     indexed_files: &mut u64,
@@ -711,142 +517,89 @@ pub(super) fn index_codex_directory_standalone(
     tool_edges: &ToolEdgeContext,
     commit_progress: bool,
 ) -> Result<()> {
-    for entry in WalkDir::new(sessions_dir)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
-            continue;
-        }
+    let path_str = location.path.to_string_lossy().to_string();
+    let file_meta = match fs::metadata(&location.path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    let mtime = match file_meta.modified() {
+        Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        Err(_) => return Ok(()),
+    };
+    let size = file_meta.len();
 
-        let path_str = path.to_string_lossy().to_string();
-        let file_meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let mtime = match file_meta.modified() {
-            Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-            Err(_) => continue,
-        };
-
-        if should_skip_file(&path_str, mtime, file_meta.len(), meta) {
-            *skipped += 1;
-            continue;
-        }
-        if meta.contains_key(&path_str) {
-            writer.delete_term(Term::from_field_text(f.file_path, &path_str));
-        }
-
-        let session_id = extract_codex_session_id(path);
-        let cwd = extract_codex_cwd(path);
-
-        let file = match fs::File::open(path) {
-            Ok(fl) => fl,
-            Err(_) => continue,
-        };
-        let reader = BufReader::new(file);
-        let mut offset = 0u64;
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            let line_offset = offset;
-            offset += line.len() as u64 + 1;
-            for (event_idx, mut event) in parser::parse_codex_line(&line, &session_id)
-                .into_iter()
-                .enumerate()
-            {
-                if event.cwd.is_none() {
-                    event.cwd = cwd.clone();
-                }
-                if let Err(err) =
-                    tool_edges.emit_event_edges(&event, "codex", line_offset, event_idx as u32)
-                {
-                    tracing::debug!(error = %err, "failed to emit codex tool-call edge");
-                }
-                let doc =
-                    event_to_doc_standalone(&event, "codex", &path_str, line_offset, false, f);
-                writer.add_document(doc)?;
-                *indexed_docs += 1;
-            }
-        }
-
-        meta.insert(
-            path_str,
-            FileMeta {
-                mtime,
-                size: file_meta.len(),
-            },
-        );
-        *indexed_files += 1;
-        if commit_progress && (*indexed_files).is_multiple_of(500) {
-            tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);
-            writer.commit()?;
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn index_codex_history_standalone(
-    history: &Path,
-    f: FieldHandles,
-    writer: &mut IndexWriter,
-    meta: &mut HashMap<String, FileMeta>,
-    indexed_files: &mut u64,
-    indexed_docs: &mut u64,
-    skipped: &mut u64,
-    tool_edges: &ToolEdgeContext,
-) -> Result<()> {
-    let path_str = history.to_string_lossy().to_string();
-    let file_meta = fs::metadata(history)?;
-    let mtime = file_meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
-
-    if should_skip_file(&path_str, mtime, file_meta.len(), meta) {
+    if should_skip_file(&path_str, mtime, size, meta) {
         *skipped += 1;
         return Ok(());
     }
     if meta.contains_key(&path_str) {
-        writer.delete_term(Term::from_field_text(f.file_path, &path_str));
+        writer.delete_term(Term::from_field_text(fields.file_path, &path_str));
     }
 
-    let file = fs::File::open(history)?;
-    let reader = BufReader::new(file);
-    let mut offset = 0u64;
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let line_offset = offset;
-        offset += line.len() as u64 + 1;
-        for (event_idx, event) in parser::parse_codex_history_line(&line)
-            .into_iter()
-            .enumerate()
-        {
-            if let Err(err) =
-                tool_edges.emit_event_edges(&event, "codex", line_offset, event_idx as u32)
-            {
-                tracing::debug!(error = %err, "failed to emit codex history tool-call edge");
-            }
-            let doc = event_to_doc_standalone(&event, "codex", &path_str, line_offset, false, f);
-            writer.add_document(doc)?;
-            *indexed_docs += 1;
+    let provider_label = provider_label(location.provider);
+    let account = location.account.as_deref().unwrap_or(provider_label);
+    let project_fallback = location.project.as_deref().unwrap_or("");
+
+    let snapshot = match adapter.load_snapshot(location) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::debug!(
+                path = %location.path.display(),
+                error = %err,
+                "skipping transcript file the adapter could not read"
+            );
+            return Ok(());
         }
+    };
+
+    for event in &snapshot.events {
+        let Some(parsed) = event.to_parsed_event() else {
+            continue;
+        };
+        let line_offset = event.raw.byte_offset.unwrap_or(0);
+        let event_idx = event.raw.event_idx.unwrap_or(0);
+        if let Err(err) = tool_edges.emit_event_edges(&parsed, account, line_offset, event_idx) {
+            tracing::debug!(
+                error = %err,
+                provider = ?location.provider,
+                "failed to emit transcript tool-call edge"
+            );
+        }
+        let Some(doc) = normalized_to_doc(
+            event,
+            account,
+            &path_str,
+            location.is_subagent,
+            project_fallback,
+            fields,
+        ) else {
+            continue;
+        };
+        writer.add_document(doc)?;
+        *indexed_docs += 1;
     }
-    meta.insert(
-        path_str,
-        FileMeta {
-            mtime,
-            size: file_meta.len(),
-        },
-    );
+
+    meta.insert(path_str, FileMeta { mtime, size });
     *indexed_files += 1;
+    if commit_progress && (*indexed_files).is_multiple_of(500) {
+        tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);
+        writer.commit()?;
+    }
     Ok(())
+}
+
+fn provider_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "claude",
+        Provider::Codex => "codex",
+        Provider::Gemini => "gemini",
+        Provider::Copilot => "copilot",
+        Provider::Vibe => "vibe",
+        Provider::Glm => "opencode",
+        Provider::Deepseek => "deepseek",
+        Provider::Inception => "inception",
+        Provider::Workflow => "workflow",
+    }
 }
 
 pub(super) fn human_bytes(bytes: u64) -> String {
@@ -867,12 +620,22 @@ pub(super) fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{MessageRole, ParsedEvent};
+    use crate::entity_ref;
+    use crate::parser::{self, MessageRole, ParsedEvent};
+    use crate::transcripts::adapters::{
+        ClaudeTranscriptAdapter, CodexTranscriptAdapter, TranscriptReadAdapter,
+    };
+    use crate::transcripts::types::{
+        NormalizedTranscriptEvent, RawTranscriptRef, TranscriptStorage,
+    };
+    use serde_json::json;
+    use tantivy::TantivyDocument;
+    use tempfile::tempdir;
 
     #[test]
     fn transcript_docs_include_doc_type_and_parser_version() {
         let (_schema, fields) = crate::index::build_schema();
-        let event = ParsedEvent {
+        let parsed = ParsedEvent {
             role: MessageRole::User,
             content: "schema migration smoke".to_string(),
             session_id: "session-1".to_string(),
@@ -883,14 +646,142 @@ mod tests {
             cwd: None,
             tool_call: None,
         };
-
-        let doc = event_to_doc_standalone(&event, "codex", "/tmp/session.jsonl", 0, false, fields);
+        let raw = RawTranscriptRef::jsonl(
+            Provider::Codex,
+            TranscriptStorage::JsonlFile,
+            "/tmp/session.jsonl",
+            0,
+            0,
+            0,
+        );
+        let normalized = NormalizedTranscriptEvent::from_parsed_event(Provider::Codex, parsed, raw);
+        let doc = normalized_to_doc(
+            &normalized,
+            "codex",
+            "/tmp/session.jsonl",
+            false,
+            "",
+            fields,
+        )
+        .expect("normalized event is indexable");
 
         assert_eq!(first_text(&doc, fields.doc_type), "transcript");
         assert_eq!(
             first_text(&doc, fields.parser_version),
             entity_ref::PARSER_VERSION
         );
+    }
+
+    /// Phase 2 parity guard: the adapter-routed pipeline must produce the same
+    /// doc-shape fields the legacy `parse_transcript_line → build_transcript_doc`
+    /// path produced (content, role, session_id, account, file_path, byte_offset).
+    /// `entity_id` is intentionally additive in the adapter path (Phase 0.4 → 4).
+    #[test]
+    fn claude_adapter_indexing_matches_legacy_doc_fields() {
+        let (_schema, fields) = crate::index::build_schema();
+        let dir = tempdir().unwrap();
+        let projects_dir = dir.path().join("projects").join("-repo");
+        fs::create_dir_all(&projects_dir).unwrap();
+        let path = projects_dir.join("sess-parity.jsonl");
+        let line = json!({
+            "type": "user",
+            "sessionId": "sess-parity",
+            "timestamp": "2026-05-12T00:00:00Z",
+            "message": {"content": "parity matters"}
+        })
+        .to_string();
+        fs::write(&path, format!("{line}\n")).unwrap();
+
+        let adapter =
+            ClaudeTranscriptAdapter::new(vec![("claude".to_string(), dir.path().to_path_buf())]);
+        let location = adapter.locate("sess-parity").unwrap().unwrap();
+        let snapshot = adapter.load_snapshot(&location).unwrap();
+        assert_eq!(snapshot.events.len(), 1);
+        let normalized = &snapshot.events[0];
+
+        let parsed = parser::parse_transcript_line(&line);
+        assert_eq!(parsed.len(), 1);
+        let legacy = &parsed[0];
+
+        let adapter_doc = normalized_to_doc(
+            normalized,
+            location.account.as_deref().unwrap_or("claude"),
+            &path.to_string_lossy(),
+            location.is_subagent,
+            location.project.as_deref().unwrap_or(""),
+            fields,
+        )
+        .expect("normalized event is indexable");
+
+        assert_eq!(first_text(&adapter_doc, fields.doc_type), "transcript");
+        assert_eq!(first_text(&adapter_doc, fields.content), legacy.content);
+        assert_eq!(first_text(&adapter_doc, fields.role), legacy.role.as_ref());
+        assert_eq!(
+            first_text(&adapter_doc, fields.session_id),
+            legacy.session_id
+        );
+        assert_eq!(first_text(&adapter_doc, fields.account), "claude");
+        assert_eq!(
+            first_text(&adapter_doc, fields.file_path),
+            path.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn codex_adapter_indexing_fills_cwd_and_account_label() {
+        let (_schema, fields) = crate::index::build_schema();
+        let dir = tempdir().unwrap();
+        let sessions_dir = dir
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("12");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let path = sessions_dir
+            .join("rollout-2026-05-12T01-02-03-019d8319-6ffe-78b0-904b-4bfdb2a9cdb5.jsonl");
+        let meta = json!({
+            "timestamp": "2026-05-12T01:02:03Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/repo", "base_instructions": "be useful"}
+        })
+        .to_string();
+        let message = json!({
+            "timestamp": "2026-05-12T01:03:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }
+        })
+        .to_string();
+        fs::write(&path, format!("{meta}\n{message}\n")).unwrap();
+
+        let adapter = CodexTranscriptAdapter::new(dir.path().to_path_buf());
+        let location = adapter
+            .locate("019d8319-6ffe-78b0-904b-4bfdb2a9cdb5")
+            .unwrap()
+            .unwrap();
+        let snapshot = adapter.load_snapshot(&location).unwrap();
+        let message_event = snapshot
+            .events
+            .iter()
+            .find(|e| !e.content.is_empty())
+            .expect("message event present");
+
+        let doc = normalized_to_doc(
+            message_event,
+            location.account.as_deref().unwrap_or("codex"),
+            &path.to_string_lossy(),
+            location.is_subagent,
+            location.project.as_deref().unwrap_or(""),
+            fields,
+        )
+        .unwrap();
+
+        assert_eq!(first_text(&doc, fields.account), "codex");
+        assert_eq!(first_text(&doc, fields.project), "/repo");
     }
 
     fn first_text(doc: &TantivyDocument, field: Field) -> String {

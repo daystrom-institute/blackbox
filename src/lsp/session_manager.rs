@@ -33,18 +33,18 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use lsp_types::{
-    notification::{Exit, Initialized, Notification},
-    request::{Initialize, Request, Shutdown},
     ClientCapabilities, CodeActionClientCapabilities, CodeActionKind, CodeActionKindLiteralSupport,
     CodeActionLiteralSupport, InitializeParams, ResourceOperationKind,
     TextDocumentClientCapabilities, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
     WorkspaceFolder,
+    notification::{Exit, Initialized, Notification},
+    request::{Initialize, Request, Shutdown},
 };
 use parking_lot::Mutex;
 use reqwest::Url;
@@ -81,16 +81,18 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             idle_timeout: Duration::from_secs(env_u64("BLACKBOX_LSP_IDLE_SECS", 600)),
-            request_timeout: Duration::from_secs(env_u64(
-                "BLACKBOX_JDTLS_TIMEOUT_SECS",
-                30,
+            request_timeout: Duration::from_secs(env_u64("BLACKBOX_JDTLS_TIMEOUT_SECS", 30)),
+            jdtls_init_timeout: Duration::from_secs(env_u64(
+                "BLACKBOX_JDTLS_INIT_TIMEOUT_SECS",
+                60,
             )),
-            jdtls_init_timeout: Duration::from_secs(env_u64("BLACKBOX_JDTLS_INIT_TIMEOUT_SECS", 60)),
             rust_analyzer_init_timeout: Duration::from_secs(env_u64(
                 "BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS",
                 60,
             )),
-            jdtls_bin: std::env::var("BLACKBOX_JDTLS_BIN").ok().filter(|s| !s.trim().is_empty()),
+            jdtls_bin: std::env::var("BLACKBOX_JDTLS_BIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             rust_analyzer_bin: std::env::var("BLACKBOX_RUST_ANALYZER_BIN")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -184,12 +186,14 @@ impl<'a> LspClient<'a> {
 
     pub fn send_request<R: Request>(&mut self, params: &R::Params) -> Result<u64, LspError> {
         let id = self.next_id();
-        write_request(&mut self.session.stdin, R::METHOD, id, params)
-            .map_err(LspError::Broken)?;
+        write_request(&mut self.session.stdin, R::METHOD, id, params).map_err(LspError::Broken)?;
         Ok(id)
     }
 
-    pub fn send_notification<N: Notification>(&mut self, params: &N::Params) -> Result<(), LspError> {
+    pub fn send_notification<N: Notification>(
+        &mut self,
+        params: &N::Params,
+    ) -> Result<(), LspError> {
         write_notification(&mut self.session.stdin, N::METHOD, params).map_err(LspError::Broken)
     }
 
@@ -271,42 +275,44 @@ impl LspSessionManager {
         let tick = Duration::from_secs(env_u64("BLACKBOX_LSP_EVICT_TICK_SECS", 60));
         std::thread::Builder::new()
             .name("blackbox-lsp-evictor".into())
-            .spawn(move || loop {
-                std::thread::sleep(tick);
-                let Some(inner) = weak.upgrade() else {
-                    return;
-                };
-                if inner.shutting_down.load(Ordering::Relaxed) {
-                    return;
-                }
-                let idle = inner.config.idle_timeout;
-                let now = Instant::now();
-                let stale: Vec<SessionKey> = {
-                    let sessions = inner.sessions.lock();
-                    sessions
-                        .iter()
-                        .filter_map(|(k, sess)| {
-                            // try_lock so we never block on an in-use session.
-                            sess.try_lock().and_then(|s| {
-                                if now.duration_since(s.last_used) > idle {
-                                    Some(k.clone())
-                                } else {
-                                    None
-                                }
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(tick);
+                    let Some(inner) = weak.upgrade() else {
+                        return;
+                    };
+                    if inner.shutting_down.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let idle = inner.config.idle_timeout;
+                    let now = Instant::now();
+                    let stale: Vec<SessionKey> = {
+                        let sessions = inner.sessions.lock();
+                        sessions
+                            .iter()
+                            .filter_map(|(k, sess)| {
+                                // try_lock so we never block on an in-use session.
+                                sess.try_lock().and_then(|s| {
+                                    if now.duration_since(s.last_used) > idle {
+                                        Some(k.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
                             })
-                        })
-                        .collect()
-                };
-                for key in stale {
-                    let removed = inner.sessions.lock().remove(&key);
-                    if let Some(arc) = removed {
-                        if let Some(mut sess) = arc.try_lock() {
-                            tracing::info!(
-                                project = %key.project_root.display(),
-                                language = ?key.language,
-                                "evicting idle LSP session"
-                            );
-                            shutdown_session(&mut sess);
+                            .collect()
+                    };
+                    for key in stale {
+                        let removed = inner.sessions.lock().remove(&key);
+                        if let Some(arc) = removed {
+                            if let Some(mut sess) = arc.try_lock() {
+                                tracing::info!(
+                                    project = %key.project_root.display(),
+                                    language = ?key.language,
+                                    "evicting idle LSP session"
+                                );
+                                shutdown_session(&mut sess);
+                            }
                         }
                     }
                 }
@@ -318,12 +324,7 @@ impl LspSessionManager {
     /// given project+language. Subsequent calls reuse the same child.
     /// On [`LspError::Broken`] the session is dropped from the pool;
     /// the next call respawns.
-    pub fn with_session<F, R>(
-        &self,
-        project_dir: &Path,
-        language: Language,
-        f: F,
-    ) -> Result<R>
+    pub fn with_session<F, R>(&self, project_dir: &Path, language: Language, f: F) -> Result<R>
     where
         F: FnOnce(LspClient<'_>) -> Result<R, LspError>,
     {
@@ -462,14 +463,16 @@ fn spawn_session(key: &SessionKey, config: &Config) -> Result<Session> {
     let init_params = build_init_params(&key.project_root)?;
     let init_id = session.next_id;
     session.next_id += 1;
-    write_request(&mut session.stdin, Initialize::METHOD, init_id, &init_params)
-        .context("sending initialize")?;
+    write_request(
+        &mut session.stdin,
+        Initialize::METHOD,
+        init_id,
+        &init_params,
+    )
+    .context("sending initialize")?;
     let init_timeout = init_timeout_for(key.language, config);
-    let value = read_response(&mut session, init_id, init_timeout).map_err(|e| {
-        anyhow!(
-            "LSP `initialize` did not return within {init_timeout:?}: {e}"
-        )
-    })?;
+    let value = read_response(&mut session, init_id, init_timeout)
+        .map_err(|e| anyhow!("LSP `initialize` did not return within {init_timeout:?}: {e}"))?;
     if let Some(error) = value.get("error") {
         bail!("LSP `initialize` failed: {error}");
     }
@@ -490,10 +493,8 @@ fn spawn_session(key: &SessionKey, config: &Config) -> Result<Session> {
         // BLACKBOX_RUST_ANALYZER_READY_TIMEOUT_SECS (default 30s); on
         // timeout we proceed anyway and let the request fail naturally —
         // the session manager isn't a stop-the-world critical path.
-        let ready_timeout = Duration::from_secs(env_u64(
-            "BLACKBOX_RUST_ANALYZER_READY_TIMEOUT_SECS",
-            30,
-        ));
+        let ready_timeout =
+            Duration::from_secs(env_u64("BLACKBOX_RUST_ANALYZER_READY_TIMEOUT_SECS", 30));
         wait_for_rust_analyzer_ready(&mut session, ready_timeout);
     }
     tracing::info!(
@@ -513,9 +514,7 @@ fn wait_for_rust_analyzer_ready(session: &mut Session, timeout: Duration) {
     loop {
         let now = Instant::now();
         if now >= deadline {
-            tracing::debug!(
-                "rust-analyzer didn't signal ready within {timeout:?}; proceeding"
-            );
+            tracing::debug!("rust-analyzer didn't signal ready within {timeout:?}; proceeding");
             return;
         }
         let value = match read_message(&mut session.reader) {
@@ -561,11 +560,17 @@ fn wait_for_rust_analyzer_ready(session: &mut Session, timeout: Duration) {
 fn launch_argv(language: Language, config: &Config) -> Vec<String> {
     match language {
         Language::Java => {
-            let bin = config.jdtls_bin.clone().unwrap_or_else(|| "jdtls".to_string());
+            let bin = config
+                .jdtls_bin
+                .clone()
+                .unwrap_or_else(|| "jdtls".to_string());
             vec![bin]
         }
         Language::Rust => {
-            let bin = config.rust_analyzer_bin.clone().unwrap_or_else(|| "rust-analyzer".to_string());
+            let bin = config
+                .rust_analyzer_bin
+                .clone()
+                .unwrap_or_else(|| "rust-analyzer".to_string());
             vec![bin]
         }
     }
@@ -594,9 +599,9 @@ fn build_init_params(project_root: &Path) -> Result<InitializeParams> {
                 code_action: Some(CodeActionClientCapabilities {
                     code_action_literal_support: Some(CodeActionLiteralSupport {
                         code_action_kind: CodeActionKindLiteralSupport {
-                            value_set: vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS
-                                .as_str()
-                                .to_string()],
+                            value_set: vec![
+                                CodeActionKind::SOURCE_ORGANIZE_IMPORTS.as_str().to_string(),
+                            ],
                         },
                     }),
                     ..Default::default()
@@ -730,15 +735,26 @@ mod tests {
         let _guard = blackbox::util::test_env_lock();
         let orig_prefixed = std::env::var("BLACKBOX_RUST_ANALYZER_BIN").ok();
 
-        unsafe { std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN"); }
-        unsafe { std::env::set_var("RUST_ANALYZER_BIN", "alias-path"); }
+        unsafe {
+            std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN");
+        }
+        unsafe {
+            std::env::set_var("RUST_ANALYZER_BIN", "alias-path");
+        }
 
         let config = Config::default();
-        assert_eq!(config.rust_analyzer_bin, None,
-            "RUST_ANALYZER_BIN should not be accepted after Phase 5");
+        assert_eq!(
+            config.rust_analyzer_bin, None,
+            "RUST_ANALYZER_BIN should not be accepted after Phase 5"
+        );
 
-        unsafe { std::env::remove_var("RUST_ANALYZER_BIN"); }
-        if let Some(v) = orig_prefixed { unsafe { std::env::set_var("BLACKBOX_RUST_ANALYZER_BIN", v) }; } else { unsafe { std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN") }; }
+        unsafe {
+            std::env::remove_var("RUST_ANALYZER_BIN");
+        }
+        if let Some(v) = orig_prefixed {
+            unsafe { std::env::set_var("BLACKBOX_RUST_ANALYZER_BIN", v) };
+        } else {
+            unsafe { std::env::remove_var("BLACKBOX_RUST_ANALYZER_BIN") };
+        }
     }
 }
-

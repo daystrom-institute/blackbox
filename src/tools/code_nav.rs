@@ -1,6 +1,6 @@
 use crate::code_nav::{
-    code_node_describe, code_query, code_refs, code_symbols, CodeNodeDescribeParams,
-    CodeQueryParams, CodeRefsParams, CodeSymbolSearchParams,
+    CodeNodeDescribeParams, CodeQueryParams, CodeRefsParams, CodeSymbolSearchParams,
+    code_node_describe, code_query, code_refs, code_symbols,
 };
 use crate::server::*;
 use crate::*;

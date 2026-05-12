@@ -144,8 +144,8 @@ pub(crate) async fn orchestrate_stream_handler(
 ) -> axum::response::Sse<
     impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
-    use axum::response::sse::Event;
     use axum::response::Sse;
+    use axum::response::sse::Event;
     let compiled = workflow::compile(req.workflow);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
 
@@ -967,13 +967,9 @@ pub(crate) async fn install_artifact_value(
         }
         artifacts::ArtifactKind::Brofile => {
             let brofile: orchestration::brofile::Brofile = serde_json::from_value(value.clone())?;
-            let written = orchestration::brofile::save_brofile(
-                &brofile,
-                "global",
-                &state.store_dir,
-                None,
-            )
-            .map_err(|e| anyhow::anyhow!("brofile registry write failed: {e}"))?;
+            let written =
+                orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None)
+                    .map_err(|e| anyhow::anyhow!("brofile registry write failed: {e}"))?;
             // Post-install verification — the artifact catalog reports
             // "active" only when the runtime registry can actually see
             // the brofile. Prevents silent G11-style desync where the

@@ -16,7 +16,9 @@ pub fn plan_add_delegate(p: &RefactorPlanParams) -> anyhow::Result<String> {
         .impl_name
         .as_deref()
         .or(p.module_name.as_deref())
-        .ok_or_else(|| anyhow!("impl_name or module_name required to identify the source struct"))?;
+        .ok_or_else(|| {
+            anyhow!("impl_name or module_name required to identify the source struct")
+        })?;
 
     let delegate_field = p
         .delegate_field
@@ -51,7 +53,10 @@ pub fn plan_add_delegate(p: &RefactorPlanParams) -> anyhow::Result<String> {
 
     // ── find struct ───────────────────────────────────────────────────────────
     let struct_item = find_struct_syntax_item_local(&parsed, struct_name).ok_or_else(|| {
-        anyhow!("struct `{struct_name}` not found in {}", source_path.display())
+        anyhow!(
+            "struct `{struct_name}` not found in {}",
+            source_path.display()
+        )
     })?;
 
     let struct_node = rust_node_by_range(
@@ -63,9 +68,7 @@ pub fn plan_add_delegate(p: &RefactorPlanParams) -> anyhow::Result<String> {
     .ok_or_else(|| anyhow!("struct `{struct_name}` AST node not found"))?;
 
     let field_insert_byte = field_decl_list_close_byte(struct_node).ok_or_else(|| {
-        anyhow!(
-            "could not find field_declaration_list closing brace in `{struct_name}`"
-        )
+        anyhow!("could not find field_declaration_list closing brace in `{struct_name}`")
     })?;
 
     // ── find constructors ─────────────────────────────────────────────────────
@@ -114,9 +117,7 @@ pub fn plan_add_delegate(p: &RefactorPlanParams) -> anyhow::Result<String> {
     }];
 
     let plan = RefactorPlan {
-        title: format!(
-            "add delegate field `{delegate_field}: {delegate_type}` to `{struct_name}`"
-        ),
+        title: format!("add delegate field `{delegate_field}: {delegate_type}` to `{struct_name}`"),
         kind: "add_rust_delegate_field".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
@@ -384,10 +385,7 @@ impl BigServer {
         let result = apply_plan(&plan_json);
         // Assignment should appear once and be inside with_count
         let occurrences = result.matches("self.state = ServerState::new()").count();
-        assert_eq!(
-            occurrences, 1,
-            "expected exactly one assignment:\n{result}"
-        );
+        assert_eq!(occurrences, 1, "expected exactly one assignment:\n{result}");
         // The 'new' body should not have the assignment
         let new_fn_idx = result.find("fn new()").unwrap();
         let with_count_idx = result.find("fn with_count").unwrap();

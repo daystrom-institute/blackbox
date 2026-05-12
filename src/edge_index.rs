@@ -1114,14 +1114,18 @@ mod tests {
         let mut seen = HashSet::new();
         index.project_sidecar_edges(dir.path(), &mut seen);
 
-        assert!(index
-            .forward_edges(&source)
-            .iter()
-            .any(|edge| edge.target == second_target));
-        assert!(!index
-            .forward_edges(&source)
-            .iter()
-            .any(|edge| edge.target == first_target));
+        assert!(
+            index
+                .forward_edges(&source)
+                .iter()
+                .any(|edge| edge.target == second_target)
+        );
+        assert!(
+            !index
+                .forward_edges(&source)
+                .iter()
+                .any(|edge| edge.target == first_target)
+        );
     }
 
     #[test]
@@ -1166,14 +1170,18 @@ mod tests {
         let mut seen = HashSet::new();
         index.project_sidecar_edges(dir.path(), &mut seen);
 
-        assert!(index
-            .forward_edges(&source)
-            .iter()
-            .any(|edge| edge.target == managed_target));
-        assert!(index
-            .forward_edges(&source)
-            .iter()
-            .any(|edge| edge.target == legacy_target));
+        assert!(
+            index
+                .forward_edges(&source)
+                .iter()
+                .any(|edge| edge.target == managed_target)
+        );
+        assert!(
+            index
+                .forward_edges(&source)
+                .iter()
+                .any(|edge| edge.target == legacy_target)
+        );
     }
 
     #[test]
@@ -1258,15 +1266,17 @@ mod tests {
         let mut seen = HashSet::new();
         index.project_sidecar_edges(dir.path(), &mut seen);
 
-        assert!(index
-            .forward_edges(&file)
-            .iter()
-            .any(|edge| edge.kind == "EDITED_BY_SESSION"
-                && edge.target
-                    == (EntityRef::Session {
-                        provider: "claude".into(),
-                        session_id: "sess-1".into(),
-                    })));
+        assert!(
+            index
+                .forward_edges(&file)
+                .iter()
+                .any(|edge| edge.kind == "EDITED_BY_SESSION"
+                    && edge.target
+                        == (EntityRef::Session {
+                            provider: "claude".into(),
+                            session_id: "sess-1".into(),
+                        }))
+        );
     }
 
     #[test]

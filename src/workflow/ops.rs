@@ -18,14 +18,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::chunker::{EdgeConfidence, EdgeProvenance};
 use crate::entity_ref::EntityRef;
 
-use super::context::{resolve_arg_value, ArcContext, VarsSchema};
+use super::context::{ArcContext, VarsSchema, resolve_arg_value};
 
 /// Side-effect declaration. Lives in `NodeSpec.on_enter`,
 /// `NodeSpec.on_exit`, `Workflow.on_arc_exit`, `Workflow.on_arc_cancel`.

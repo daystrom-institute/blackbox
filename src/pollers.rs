@@ -28,7 +28,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -142,7 +142,6 @@ impl PollerRegistry {
             prev.abort();
         }
     }
-
 }
 
 /// Load all persisted poller specs from a directory. Bad files are
@@ -199,7 +198,7 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &PollerSpec) ->
                         "poller '{}' iterate selector did not resolve to array (got {})",
                         spec.name,
                         kind_name(&other)
-                    ))
+                    ));
                 }
             }
         }
@@ -361,15 +360,18 @@ mod tests {
         }
         assert_eq!(r.seen.len(), DEDUP_RING_CAP);
         assert!(!r.seen.iter().any(|x| x == "0"));
-        assert!(r
-            .seen
-            .iter()
-            .any(|x| x == &(DEDUP_RING_CAP + 49).to_string()));
+        assert!(
+            r.seen
+                .iter()
+                .any(|x| x == &(DEDUP_RING_CAP + 49).to_string())
+        );
     }
 
     #[test]
     fn render_env_string_substitutes_present_var() {
-        unsafe { std::env::set_var("POLLER_TEST_TOKEN", "abc123"); }
+        unsafe {
+            std::env::set_var("POLLER_TEST_TOKEN", "abc123");
+        }
         assert_eq!(
             render_env_string("token ${env.POLLER_TEST_TOKEN}"),
             "token abc123"
@@ -378,7 +380,9 @@ mod tests {
 
     #[test]
     fn render_env_string_leaves_missing_verbatim() {
-        unsafe { std::env::remove_var("POLLER_TEST_NOT_SET"); }
+        unsafe {
+            std::env::remove_var("POLLER_TEST_NOT_SET");
+        }
         assert_eq!(
             render_env_string("${env.POLLER_TEST_NOT_SET}"),
             "${env.POLLER_TEST_NOT_SET}"
@@ -387,8 +391,12 @@ mod tests {
 
     #[test]
     fn render_env_string_supports_multiple_substitutions() {
-        unsafe { std::env::set_var("PT_BASE", "http://x:8080"); }
-        unsafe { std::env::set_var("PT_PATH", "/api"); }
+        unsafe {
+            std::env::set_var("PT_BASE", "http://x:8080");
+        }
+        unsafe {
+            std::env::set_var("PT_PATH", "/api");
+        }
         assert_eq!(
             render_env_string("${env.PT_BASE}${env.PT_PATH}/items"),
             "http://x:8080/api/items"

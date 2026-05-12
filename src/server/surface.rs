@@ -7,10 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::orchestration::mcp::{
-    expand_pattern, glob_match, McpFilters, normalize_filter_pattern,
-};
-use crate::packets::{apply_with, Packets, Value as AstValue};
+use crate::orchestration::mcp::{McpFilters, expand_pattern, glob_match, normalize_filter_pattern};
+use crate::packets::{Packets, Value as AstValue, apply_with};
 use crate::util::blackbox_mcp_prefix;
 
 // ── Verdict types ─────────────────────────────────────────────────
@@ -56,15 +54,12 @@ impl ToolSurfaceVerdict {
     pub fn permits(&self, tool_name: &str, universe: &[String]) -> bool {
         match self {
             ToolSurfaceVerdict::ToolSurface {
-                allow,
-                disallow,
-                ..
+                allow, disallow, ..
             } => {
                 let bare_name = strip_mcp_prefix(tool_name);
                 let bare_universe: Vec<String> =
                     universe.iter().map(|n| strip_mcp_prefix(n)).collect();
-                let bare_refs: Vec<&str> =
-                    bare_universe.iter().map(|s| s.as_str()).collect();
+                let bare_refs: Vec<&str> = bare_universe.iter().map(|s| s.as_str()).collect();
 
                 for pattern in disallow {
                     let normalized = normalize_filter_pattern(pattern);
@@ -194,9 +189,7 @@ fn strip_mcp_prefix(name: &str) -> String {
 fn verdict_to_filters(verdict: &ToolSurfaceVerdict) -> McpFilters {
     match verdict {
         ToolSurfaceVerdict::ToolSurface {
-            allow,
-            disallow,
-            ..
+            allow, disallow, ..
         } => McpFilters {
             allow: allow.clone(),
             disallow: disallow.clone(),
@@ -207,11 +200,7 @@ fn verdict_to_filters(verdict: &ToolSurfaceVerdict) -> McpFilters {
 
 // ── Tool visibility ────────────────────────────────────────────────
 
-pub fn tool_visible(
-    tool_name: &str,
-    decision: &ToolSurfaceDecision,
-    universe: &[String],
-) -> bool {
+pub fn tool_visible(tool_name: &str, decision: &ToolSurfaceDecision, universe: &[String]) -> bool {
     if decision.is_deny() {
         return false;
     }
@@ -271,10 +260,7 @@ mod tests {
             .compile(&CompileParams {
                 domain: SURFACE_ROUTING_DOMAIN.to_string(),
                 rules: serde_json::Value::Array(rules),
-                classification_lattice: Some(vec![
-                    "tool_surface".to_string(),
-                    "deny".to_string(),
-                ]),
+                classification_lattice: Some(vec!["tool_surface".to_string(), "deny".to_string()]),
                 prefix_inference: Some(Default::default()),
                 scope: Some(scope.to_string()),
                 project: project.map(|s| s.to_string()),
@@ -330,10 +316,7 @@ mod tests {
             disallow: Vec::new(),
             instructions: None,
         };
-        let universe = vec![
-            "bbox_search".to_string(),
-            "bbox_refactor_apply".to_string(),
-        ];
+        let universe = vec!["bbox_search".to_string(), "bbox_refactor_apply".to_string()];
         assert!(verdict.permits("bbox_search", &universe));
         assert!(verdict.permits("bbox_refactor_apply", &universe));
     }
@@ -430,9 +413,7 @@ mod tests {
 
     #[test]
     fn test_verdict_parse_deny_json_string() {
-        let v = AstValue::String(
-            r#"{"route":"deny","reason":"unknown MCP surface"}"#.to_string(),
-        );
+        let v = AstValue::String(r#"{"route":"deny","reason":"unknown MCP surface"}"#.to_string());
         let verdict = ToolSurfaceVerdict::parse(&v).unwrap();
         match verdict {
             ToolSurfaceVerdict::Deny { reason } => {
@@ -494,7 +475,13 @@ mod tests {
         compile_surface_packet(
             &packets,
             vec![
-                surface_rule("readonly", "readonly", &["bbox_search"], &[], "tool_surface"),
+                surface_rule(
+                    "readonly",
+                    "readonly",
+                    &["bbox_search"],
+                    &[],
+                    "tool_surface",
+                ),
                 catchall_deny_rule(),
             ],
             "global",
@@ -517,12 +504,7 @@ mod tests {
             "classification": "tool_surface",
         });
 
-        compile_surface_packet(
-            &packets,
-            vec![bad_rule],
-            "global",
-            None,
-        );
+        compile_surface_packet(&packets, vec![bad_rule], "global", None);
 
         let entity = serde_json::json!({ "surface": "default" });
         let decision = evaluate_tool_surface(&packets, entity, None::<&str>);
@@ -618,8 +600,7 @@ mod tests {
         assert!(!tool_visible("bbox_forget", &decision, &universe));
 
         let entity_global = serde_json::json!({ "surface": "default" });
-        let decision_global =
-            evaluate_tool_surface(&packets, entity_global, None::<&str>);
+        let decision_global = evaluate_tool_surface(&packets, entity_global, None::<&str>);
         assert!(!decision_global.is_deny());
         assert!(!tool_visible("bbox_stats", &decision_global, &universe));
     }
@@ -659,9 +640,6 @@ mod tests {
 
     #[test]
     fn extract_surface_no_match() {
-        assert_eq!(
-            extract_surface_from_uri(Some("foo=bar&baz=qux")),
-            "default"
-        );
+        assert_eq!(extract_surface_from_uri(Some("foo=bar&baz=qux")), "default");
     }
 }

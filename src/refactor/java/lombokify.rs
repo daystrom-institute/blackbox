@@ -151,8 +151,7 @@ pub(crate) fn is_trivial_field_return(body: Node<'_>, field_name: &str, source: 
             let field = expr.child_by_field_name("field");
             match (object, field) {
                 (Some(o), Some(f)) => {
-                    o.kind() == "this"
-                        && f.utf8_text(source.as_bytes()).ok() == Some(field_name)
+                    o.kind() == "this" && f.utf8_text(source.as_bytes()).ok() == Some(field_name)
                 }
                 _ => false,
             }
@@ -244,9 +243,8 @@ pub(crate) fn detect_trivial_getter<'a>(
         if m.is_constructor {
             continue;
         }
-        let name_matches = m.name == primary
-            || Some(&m.name) == boolean_alt.as_ref()
-            || m.name == lombok_form;
+        let name_matches =
+            m.name == primary || Some(&m.name) == boolean_alt.as_ref() || m.name == lombok_form;
         if !name_matches {
             continue;
         }
@@ -284,9 +282,9 @@ pub(crate) fn parse_boolean_getter_strategy(s: Option<&str>) -> Result<BooleanGe
         "skip" => Ok(BooleanGetterStrategy::Skip),
         "bridge" => Ok(BooleanGetterStrategy::Bridge),
         "rename" => Ok(BooleanGetterStrategy::Rename),
-        other => bail!(
-            "boolean_getter_strategy must be one of: skip, bridge, rename; got `{other}`"
-        ),
+        other => {
+            bail!("boolean_getter_strategy must be one of: skip, bridge, rename; got `{other}`")
+        }
     }
 }
 
@@ -324,7 +322,12 @@ pub(crate) fn render_getter_bridge(
 
 /// True iff `body` is a single-statement block of the form
 /// `this.field = paramName;`. Used by setter detection.
-pub(crate) fn is_trivial_field_assignment(body: Node<'_>, field_name: &str, param_name: &str, source: &str) -> bool {
+pub(crate) fn is_trivial_field_assignment(
+    body: Node<'_>,
+    field_name: &str,
+    param_name: &str,
+    source: &str,
+) -> bool {
     if body.kind() != "block" {
         return false;
     }
@@ -370,8 +373,7 @@ pub(crate) fn is_trivial_field_assignment(body: Node<'_>, field_name: &str, para
     if !lhs_ok {
         return false;
     }
-    rhs.kind() == "identifier"
-        && rhs.utf8_text(source.as_bytes()).ok() == Some(param_name)
+    rhs.kind() == "identifier" && rhs.utf8_text(source.as_bytes()).ok() == Some(param_name)
 }
 
 /// Detect the trivial-setter method for `field` among `methods`. Returns
@@ -465,8 +467,7 @@ pub(crate) fn detect_trivial_setter<'a>(
 /// inserts at distinct positions pass through unchanged. Preserves
 /// relative ordering otherwise.
 pub(crate) fn merge_colocated_inserts(edits: Vec<TextEdit>) -> Vec<TextEdit> {
-    let mut by_pos: std::collections::BTreeMap<usize, String> =
-        std::collections::BTreeMap::new();
+    let mut by_pos: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
     let mut others: Vec<TextEdit> = Vec::new();
     let mut insert_order: Vec<usize> = Vec::new();
     for edit in edits {
@@ -547,10 +548,7 @@ pub(crate) fn invocation_chain<'a>(
 ///   * `this.getField()`           → "field"
 pub(crate) fn normalize_field_ref(expr: Node<'_>, source: &str) -> Option<String> {
     match expr.kind() {
-        "identifier" => expr
-            .utf8_text(source.as_bytes())
-            .ok()
-            .map(str::to_string),
+        "identifier" => expr.utf8_text(source.as_bytes()).ok().map(str::to_string),
         "field_access" => {
             let object = expr.child_by_field_name("object")?;
             let field = expr.child_by_field_name("field")?;
@@ -599,10 +597,7 @@ pub(crate) fn normalize_field_ref(expr: Node<'_>, source: &str) -> Option<String
 /// We collect each `.append(thisSide, _)` first-argument and normalize via
 /// `normalize_field_ref`. The detector returns the extracted field-name
 /// sequence so the caller can compare to the class's declared fields.
-pub(crate) fn detect_apache_equals(
-    method: Node<'_>,
-    source: &str,
-) -> Option<Vec<String>> {
+pub(crate) fn detect_apache_equals(method: Node<'_>, source: &str) -> Option<Vec<String>> {
     if !is_public_method_node(method) {
         return None;
     }
@@ -758,7 +753,7 @@ pub(crate) fn detect_apache_tostring(method: Node<'_>, source: &str) -> Option<V
         }
         match args.len() {
             1 => {
-let field = normalize_field_ref(args[0], source)?;
+                let field = normalize_field_ref(args[0], source)?;
                 field_names.push(field);
             }
             2 => {
@@ -1041,12 +1036,10 @@ pub(crate) fn detect_slf4j_logger_field<'a>(
         // value: LoggerFactory.getLogger(<ThisClass>.class)
         let object = value.child_by_field_name("object");
         let method = value.child_by_field_name("name");
-        let object_ok = object
-            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-            == Some("LoggerFactory");
-        let method_ok = method
-            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-            == Some("getLogger");
+        let object_ok =
+            object.and_then(|n| n.utf8_text(source.as_bytes()).ok()) == Some("LoggerFactory");
+        let method_ok =
+            method.and_then(|n| n.utf8_text(source.as_bytes()).ok()) == Some("getLogger");
         if !object_ok || !method_ok {
             continue;
         }
@@ -1061,11 +1054,7 @@ pub(crate) fn detect_slf4j_logger_field<'a>(
         if arg.kind() != "class_literal" {
             continue;
         }
-        let arg_text = arg
-            .utf8_text(source.as_bytes())
-            .ok()
-            .unwrap_or("")
-            .trim();
+        let arg_text = arg.utf8_text(source.as_bytes()).ok().unwrap_or("").trim();
         let expected = format!("{class_name}.class");
         if arg_text != expected {
             continue;
@@ -1099,7 +1088,10 @@ pub(crate) fn method_drop_range(method: Node<'_>, source: &str) -> (usize, usize
             .rposition(|&b| b == b'\n')
             .map(|p| p + 1)
             .unwrap_or(0);
-        if bytes[line_start..probe].iter().all(|&b| b.is_ascii_whitespace()) {
+        if bytes[line_start..probe]
+            .iter()
+            .all(|&b| b.is_ascii_whitespace())
+        {
             probe = line_start;
             start = probe;
         }
@@ -1242,12 +1234,8 @@ pub(crate) fn plan_lombokify_java_class_single(
     }
 
     let class_node = match p.item_names.as_deref().and_then(|n| n.first()) {
-        Some(name) => find_class_declaration_by_name(&parsed, name).ok_or_else(|| {
-            anyhow!(
-                "class `{name}` not found in {}",
-                source_path.display()
-            )
-        })?,
+        Some(name) => find_class_declaration_by_name(&parsed, name)
+            .ok_or_else(|| anyhow!("class `{name}` not found in {}", source_path.display()))?,
         None => find_first_class_declaration(parsed.tree.root_node())
             .ok_or_else(|| anyhow!("no class declaration found in {}", source_path.display()))?,
     };
@@ -1320,10 +1308,7 @@ pub(crate) fn plan_lombokify_java_class_single(
     // Lombok's generated method would change behavior (different field set
     // or different traversal order → different hash values, different
     // equality semantics, different toString format).
-    let field_decl_order: Vec<String> = instance_fields
-        .iter()
-        .map(|f| f.name.clone())
-        .collect();
+    let field_decl_order: Vec<String> = instance_fields.iter().map(|f| f.name.clone()).collect();
     let mut equals_method: Option<Node<'_>> = None;
     let mut hashcode_method: Option<Node<'_>> = None;
     let mut tostring_method: Option<Node<'_>> = None;
@@ -1455,8 +1440,8 @@ pub(crate) fn plan_lombokify_java_class_single(
     // no-arg ctor (same shape we matched as @NoArgsConstructor), so accept
     // either NoArgs or RequiredArgs as the ctor signal.
     let has_final_field = instance_fields.iter().any(|f| f.is_final);
-    let all_fields_final = !instance_fields.is_empty()
-        && instance_fields.iter().all(|f| f.is_final);
+    let all_fields_final =
+        !instance_fields.is_empty() && instance_fields.iter().all(|f| f.is_final);
     let data_eligible = getter_class_level
         && setter_class_level
         && emit_equals_and_hashcode
@@ -1481,30 +1466,33 @@ pub(crate) fn plan_lombokify_java_class_single(
         && allargs_ctor.is_some();
 
     let mut text_edits: Vec<TextEdit> = Vec::new();
-    let mut method_drops_seen: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let mut method_drops_seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // Drop each matched accessor method exactly once. If the method's
     // start_byte is registered in `bridge_replacements`, emit the bridge
     // method text as the replacement instead of empty string.
-    let drop_method =
-        |text_edits: &mut Vec<TextEdit>,
-         seen: &mut std::collections::HashSet<usize>,
-         node: Node<'_>,
-         replacement: Option<&String>| {
-            if !seen.insert(node.start_byte()) {
-                return;
-            }
-            let (start, end) = method_drop_range(node, &parsed.source);
-            text_edits.push(TextEdit {
-                byte_start: start,
-                byte_end: end,
-                replacement: replacement.cloned().unwrap_or_default(),
-            });
-        };
+    let drop_method = |text_edits: &mut Vec<TextEdit>,
+                       seen: &mut std::collections::HashSet<usize>,
+                       node: Node<'_>,
+                       replacement: Option<&String>| {
+        if !seen.insert(node.start_byte()) {
+            return;
+        }
+        let (start, end) = method_drop_range(node, &parsed.source);
+        text_edits.push(TextEdit {
+            byte_start: start,
+            byte_end: end,
+            replacement: replacement.cloned().unwrap_or_default(),
+        });
+    };
     for method_node in field_to_getter.values() {
         let bridge = bridge_replacements.get(&method_node.start_byte());
-        drop_method(&mut text_edits, &mut method_drops_seen, *method_node, bridge);
+        drop_method(
+            &mut text_edits,
+            &mut method_drops_seen,
+            *method_node,
+            bridge,
+        );
     }
     for method_node in field_to_setter.values() {
         drop_method(&mut text_edits, &mut method_drops_seen, *method_node, None);
@@ -1598,10 +1586,8 @@ pub(crate) fn plan_lombokify_java_class_single(
     // stack them on consecutive lines above the field.
     if !getter_class_level || !setter_class_level {
         for field in &instance_fields {
-            let want_getter =
-                !getter_class_level && field_to_getter.contains_key(&field.name);
-            let want_setter =
-                !setter_class_level && field_to_setter.contains_key(&field.name);
+            let want_getter = !getter_class_level && field_to_getter.contains_key(&field.name);
+            let want_setter = !setter_class_level && field_to_setter.contains_key(&field.name);
             if !want_getter && !want_setter {
                 continue;
             }
@@ -1673,8 +1659,7 @@ pub(crate) fn plan_lombokify_java_class_single(
         }
     }
     if !import_block.is_empty() {
-        let (_first_import, last_import_end, package_end) =
-            java_import_block_range(&parsed.source);
+        let (_first_import, last_import_end, package_end) = java_import_block_range(&parsed.source);
         let (insert_at, replacement) = if last_import_end > 0 {
             (last_import_end, import_block)
         } else {

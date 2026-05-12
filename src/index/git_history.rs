@@ -292,7 +292,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::index::{build_schema, register_code_tokenizer, FileMeta};
+    use crate::index::{FileMeta, build_schema, register_code_tokenizer};
 
     fn project() -> ProjectRecord {
         ProjectRecord {

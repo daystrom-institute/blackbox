@@ -223,13 +223,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     selected_methods.sort_by_key(|method| method.item.byte_start);
     let method_text = selected_methods
         .iter()
-        .map(|method| {
-            extract_method_text_with_visibility_floor(
-                &parsed,
-                method,
-                visibility_floor,
-            )
-        })
+        .map(|method| extract_method_text_with_visibility_floor(&parsed, method, visibility_floor))
         .collect::<Vec<_>>()
         .join("\n\n");
     let moved_field_text = selected_fields
@@ -243,9 +237,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .join("\n");
     let moved_constants_text = moved_constant_fields
         .iter()
-        .map(|field| {
-            extract_field_text_with_visibility_floor(&parsed, field, visibility_floor)
-        })
+        .map(|field| extract_field_text_with_visibility_floor(&parsed, field, visibility_floor))
         .collect::<Vec<_>>()
         .join("\n");
     let dependency_field_text = all_target_ctor_params
@@ -309,8 +301,8 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     //
     // Generated accessors honour the same visibility floor used for the
     // moved methods (`package` same-package, `public` cross-package).
-    let rewrite_remaining = !selected_fields.is_empty()
-        && p.rewrite_remaining_accessors.unwrap_or(true);
+    let rewrite_remaining =
+        !selected_fields.is_empty() && p.rewrite_remaining_accessors.unwrap_or(true);
     let accessor_specs: Vec<DelegateAccessorSpec> = if rewrite_remaining {
         selected_fields
             .iter()
@@ -359,8 +351,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // so the import-walker sees them as `Runnable`-typed field accesses and
     // the external-call FIXME finder no longer matches them by method name.
     if !callback_specs.is_empty() {
-        let callback_edits =
-            compute_callback_call_rewrites(&raw_target_content, &callback_specs)?;
+        let callback_edits = compute_callback_call_rewrites(&raw_target_content, &callback_specs)?;
         raw_target_content = apply_text_edits(&raw_target_content, &callback_edits);
     }
 
@@ -422,17 +413,19 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .unwrap_or("auto")
         .to_string();
     if propagate_mode != "none" {
-        let source_annotations = crate::refactor::java::class_dependency::
-            collect_class_level_annotations(class_node, &parsed.source);
+        let source_annotations =
+            crate::refactor::java::class_dependency::collect_class_level_annotations(
+                class_node,
+                &parsed.source,
+            );
         if !source_annotations.is_empty() {
             // Map of well-known annotation -> (generated identifier(s), import FQCN).
             // v1 covers @Slf4j; other Lombok generators (@Getter, @Setter, @Data)
             // generate per-field accessors whose names depend on the source's
             // own fields and aren't worth pattern-matching here. Operators
             // can request them explicitly via mode=all or list:@Data.
-            let auto_map: &[(&str, &[&str], &str)] = &[
-                ("@Slf4j", &["log"], "lombok.extern.slf4j.Slf4j"),
-            ];
+            let auto_map: &[(&str, &[&str], &str)] =
+                &[("@Slf4j", &["log"], "lombok.extern.slf4j.Slf4j")];
             let list_allowlist: Option<Vec<String>> = propagate_mode
                 .strip_prefix("list:")
                 .map(|s| s.split(',').map(|a| a.trim().to_string()).collect());
@@ -551,7 +544,8 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 let Ok(parsed_super) = parse_source_file(path) else {
                     continue;
                 };
-                let Some(super_node) = find_java_type_declaration_by_name(&parsed_super, &super_name)
+                let Some(super_node) =
+                    find_java_type_declaration_by_name(&parsed_super, &super_name)
                 else {
                     continue;
                 };
@@ -563,9 +557,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                     continue;
                 }
                 // All declared methods must be in the extracted set.
-                let all_satisfied = declared
-                    .iter()
-                    .all(|m| extracted_method_names.contains(m));
+                let all_satisfied = declared.iter().all(|m| extracted_method_names.contains(m));
                 if all_satisfied {
                     interface_sources.insert(super_name, ());
                 }
@@ -605,9 +597,9 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 .and_then(|slot| slot.clone());
             if let Some(fqcn) = fqcn_opt.as_ref() {
                 let target_pkg = extract_java_package(&target_content);
-                let same_pkg = target_pkg
-                    .as_deref()
-                    .is_some_and(|pkg| fqcn.strip_suffix(&format!(".{interface_name}")) == Some(pkg));
+                let same_pkg = target_pkg.as_deref().is_some_and(|pkg| {
+                    fqcn.strip_suffix(&format!(".{interface_name}")) == Some(pkg)
+                });
                 if !same_pkg {
                     interface_imports.push(fqcn.clone());
                 }
@@ -742,8 +734,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                     // Field is being moved, not captured as a param.
                     continue;
                 }
-                target_content =
-                    java_insert_fixme_above_mutable_capture(&target_content, capture);
+                target_content = java_insert_fixme_above_mutable_capture(&target_content, capture);
             }
         }
     }
@@ -942,9 +933,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                             continue;
                         }
                         if let Some(name_node) = p.child_by_field_name("name") {
-                            if let Ok(name) =
-                                name_node.utf8_text(parsed.source.as_bytes())
-                            {
+                            if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
                                 getter_map.insert(name.to_string(), name.to_string());
                             }
                         }
@@ -960,7 +949,9 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             if !cross_package {
                 continue;
             }
-            let Some(type_body) = type_node.child_by_field_name("body") else { continue };
+            let Some(type_body) = type_node.child_by_field_name("body") else {
+                continue;
+            };
             let mut fields: Vec<(String, String)> = Vec::new();
             let mut getters: BTreeSet<String> = BTreeSet::new();
             let mut tcur = type_body.walk();
@@ -1072,7 +1063,9 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                             }
                         }
                     }
-                    let Some(body) = tnode.child_by_field_name("body") else { continue };
+                    let Some(body) = tnode.child_by_field_name("body") else {
+                        continue;
+                    };
                     // Also pick up local variables declared inside the
                     // method body whose type matches an inner record/POJO
                     // — the user's call sites often go through
@@ -1107,9 +1100,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                                     if child.kind() != "variable_declarator" {
                                         continue;
                                     }
-                                    if let Some(name_node) =
-                                        child.child_by_field_name("name")
-                                    {
+                                    if let Some(name_node) = child.child_by_field_name("name") {
                                         if let Ok(name) =
                                             name_node.utf8_text(target_content.as_bytes())
                                         {
@@ -1135,8 +1126,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                                     continue;
                                 }
                                 if let Some(name_node) = node.child_by_field_name("name") {
-                                    if let Ok(name) =
-                                        name_node.utf8_text(target_content.as_bytes())
+                                    if let Ok(name) = name_node.utf8_text(target_content.as_bytes())
                                     {
                                         typed_receivers.insert(name.to_string(), simple);
                                     }
@@ -1159,16 +1149,30 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                         if node.kind() != "field_access" {
                             continue;
                         }
-                        let Some(obj) = node.child_by_field_name("object") else { continue };
+                        let Some(obj) = node.child_by_field_name("object") else {
+                            continue;
+                        };
                         if obj.kind() != "identifier" {
                             continue;
                         }
-                        let Ok(obj_name) = obj.utf8_text(target_content.as_bytes()) else { continue };
-                        let Some(ty) = typed_receivers.get(obj_name) else { continue };
-                        let Some(field_node) = node.child_by_field_name("field") else { continue };
-                        let Ok(field_name) = field_node.utf8_text(target_content.as_bytes()) else { continue };
-                        let Some(getter_map) = field_to_getter_by_type.get(ty) else { continue };
-                        let Some(getter) = getter_map.get(field_name) else { continue };
+                        let Ok(obj_name) = obj.utf8_text(target_content.as_bytes()) else {
+                            continue;
+                        };
+                        let Some(ty) = typed_receivers.get(obj_name) else {
+                            continue;
+                        };
+                        let Some(field_node) = node.child_by_field_name("field") else {
+                            continue;
+                        };
+                        let Ok(field_name) = field_node.utf8_text(target_content.as_bytes()) else {
+                            continue;
+                        };
+                        let Some(getter_map) = field_to_getter_by_type.get(ty) else {
+                            continue;
+                        };
+                        let Some(getter) = getter_map.get(field_name) else {
+                            continue;
+                        };
                         edits.push((
                             node.start_byte(),
                             node.end_byte(),
@@ -1269,9 +1273,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             // Prefer javax.inject.Inject as the more portable choice; if the
             // source already imports com.google.inject.Inject, the existing
             // import is unchanged and the new edit is idempotent.
-            if let Some(edit) =
-                java_source_import_edit(&parsed.source, "javax.inject.Inject")
-            {
+            if let Some(edit) = java_source_import_edit(&parsed.source, "javax.inject.Inject") {
                 source_edits.push(edit);
             }
         }
@@ -1315,8 +1317,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // G7: guice_field_inject and manual modes skip ctor wiring entirely.
     // The delegate is populated by the DI container (or by the operator)
     // — no `this.delegate = new Target(...)` assignment.
-    let skip_ctor_wiring =
-        wiring_mode == "guice_field_inject" || wiring_mode == "manual";
+    let skip_ctor_wiring = wiring_mode == "guice_field_inject" || wiring_mode == "manual";
     if skip_ctor_wiring {
         // No ctor wiring to insert. wiring_state stays None so the
         // post-process accessor topo-sort treats this case as "no
@@ -1378,12 +1379,8 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // accessor-rewrite pass below (Gap 1: caller-rewrite zero-width inserts
     // inside an LHS-write RHS must be absorbed into the LHS-write rendering,
     // not added to the global edit list).
-    let caller_edits = java_caller_rewrite_edits(
-        &parsed,
-        method_names,
-        delegate_field,
-        &removed_ranges,
-    )?;
+    let caller_edits =
+        java_caller_rewrite_edits(&parsed, method_names, delegate_field, &removed_ranges)?;
 
     // Gap 18 + Gap 6: rewrite each remaining source-side read/write of a
     // moved field through the delegate's generated getter/setter. Now fires
@@ -1525,7 +1522,9 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                     break;
                 }
             }
-            let Some(method_node) = method_node else { continue };
+            let Some(method_node) = method_node else {
+                continue;
+            };
             // Only wrap PUBLIC non-static methods. Static methods are
             // handled by G19 (class-qualified call auto-rewrite at the
             // call site, not via a source-side wrapper).
@@ -1535,8 +1534,12 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             if java_method_has_modifier(method_node, &parsed.source, "static") {
                 continue;
             }
-            let Some(name_node) = method_node.child_by_field_name("name") else { continue };
-            let Ok(method_name) = name_node.utf8_text(parsed.source.as_bytes()) else { continue };
+            let Some(name_node) = method_node.child_by_field_name("name") else {
+                continue;
+            };
+            let Ok(method_name) = name_node.utf8_text(parsed.source.as_bytes()) else {
+                continue;
+            };
             // Extract return type text — may be void.
             let return_type = method_node
                 .child_by_field_name("type")
@@ -1632,11 +1635,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 .iter()
                 .map(|field| field.name.clone())
                 .collect::<Vec<_>>();
-            compute_remaining_source_accessors(
-                &parsed,
-                &moved_field_names_owned,
-                &skip_ranges,
-            )
+            compute_remaining_source_accessors(&parsed, &moved_field_names_owned, &skip_ranges)
         } else {
             Vec::new()
         };
@@ -1808,11 +1807,10 @@ fn target_content_references_identifier(text: &str, ident: &str) -> bool {
         };
         let pos = cursor + rel;
         let after = pos + needle.len();
-        let prev_ok = pos == 0
-            || {
-                let prev = bytes[pos - 1] as char;
-                !(prev == '_' || prev == '$' || prev.is_ascii_alphanumeric())
-            };
+        let prev_ok = pos == 0 || {
+            let prev = bytes[pos - 1] as char;
+            !(prev == '_' || prev == '$' || prev.is_ascii_alphanumeric())
+        };
         let next_ok = after == bytes.len() || {
             let next = bytes[after] as char;
             !(next == '_' || next == '$' || next.is_ascii_alphanumeric())

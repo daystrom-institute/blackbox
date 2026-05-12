@@ -240,13 +240,17 @@ mod tests {
     fn set_badgey_id_persists() {
         let dir = tempfile::tempdir().unwrap();
         let store = SlackChannelBindings::open(dir.path()).unwrap();
-        assert!(!store
-            .set_badgey_id("T01", "C01", Some("bg-deadbeef-cafef00d".into()))
-            .unwrap());
+        assert!(
+            !store
+                .set_badgey_id("T01", "C01", Some("bg-deadbeef-cafef00d".into()))
+                .unwrap()
+        );
         store.bind(sample("T01", "C01", "ts", "/repo/x")).unwrap();
-        assert!(store
-            .set_badgey_id("T01", "C01", Some("bg-deadbeef-cafef00d".into()))
-            .unwrap());
+        assert!(
+            store
+                .set_badgey_id("T01", "C01", Some("bg-deadbeef-cafef00d".into()))
+                .unwrap()
+        );
         assert_eq!(
             store.lookup("T01", "C01").unwrap().badgey_id.as_deref(),
             Some("bg-deadbeef-cafef00d")

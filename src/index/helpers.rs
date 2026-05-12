@@ -8,6 +8,7 @@ use walkdir::WalkDir;
 
 use super::ReindexConfig;
 use crate::parser;
+use crate::transcripts::types::TranscriptStorage;
 
 /// Extract a human-readable project name from the file path.
 /// Claude Code encodes project paths as directory names: `/home/user/repos/foo` → `-home-user-repos-foo`
@@ -38,6 +39,40 @@ pub fn find_session_file(
 ) -> Option<PathBuf> {
     if session_id.is_empty() || session_id == "pending" {
         return None;
+    }
+
+    let registry_config = ReindexConfig {
+        roots: roots.to_vec(),
+        codex_root: codex_root.map(Path::to_path_buf),
+        meta_path: PathBuf::new(),
+        projects_path: PathBuf::new(),
+        knowledge_path: PathBuf::new(),
+        threads_path: PathBuf::new(),
+        roadmap_path: PathBuf::new(),
+    };
+    let registry = crate::transcripts::adapters::TranscriptAdapterRegistry::from_reindex_config(
+        &registry_config,
+    );
+    for provider in [
+        crate::orchestration::providers::Provider::Claude,
+        crate::orchestration::providers::Provider::Codex,
+        crate::orchestration::providers::Provider::Gemini,
+        crate::orchestration::providers::Provider::Copilot,
+        crate::orchestration::providers::Provider::Vibe,
+        crate::orchestration::providers::Provider::Glm,
+        crate::orchestration::providers::Provider::Deepseek,
+        crate::orchestration::providers::Provider::Inception,
+    ] {
+        if let Ok(Some(location)) = registry.locate(provider, session_id)
+            && matches!(
+                location.storage,
+                TranscriptStorage::JsonlFile
+                    | TranscriptStorage::HistoryJsonl
+                    | TranscriptStorage::JsonFile
+            )
+        {
+            return Some(location.path);
+        }
     }
 
     // Claude layout: <root>/projects/<encoded-project>/<session-id>.jsonl

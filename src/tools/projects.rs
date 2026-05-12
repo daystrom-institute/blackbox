@@ -1,9 +1,9 @@
+use crate::projects::ProjectInitParams;
 use crate::server::*;
 use crate::*;
-use crate::projects::ProjectInitParams;
 use anyhow::Context;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::projects_tools()
@@ -16,7 +16,13 @@ struct ProjectInitResult {
     skipped: Vec<String>,
 }
 
-fn write_or_skip_file(path: &Path, contents: &str, force: bool, created: &mut Vec<String>, skipped: &mut Vec<String>) -> anyhow::Result<()> {
+fn write_or_skip_file(
+    path: &Path,
+    contents: &str,
+    force: bool,
+    created: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+) -> anyhow::Result<()> {
     let path_display = path.to_string_lossy().to_string();
     if path.exists() && !force {
         skipped.push(path_display);
@@ -33,7 +39,12 @@ fn write_or_skip_file(path: &Path, contents: &str, force: bool, created: &mut Ve
     Ok(())
 }
 
-fn write_or_skip_mcp(path: &Path, force: bool, created: &mut Vec<String>, skipped: &mut Vec<String>) -> anyhow::Result<()> {
+fn write_or_skip_mcp(
+    path: &Path,
+    force: bool,
+    created: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+) -> anyhow::Result<()> {
     let path_display = path.to_string_lossy().to_string();
     if path.exists() && !force {
         skipped.push(path_display);
@@ -53,7 +64,10 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
         .canonicalize()
         .context("canonicalizing project path for initialization")?;
     if !project_dir.is_dir() {
-        anyhow::bail!("project path must be an existing directory: {}", project_dir.display());
+        anyhow::bail!(
+            "project path must be an existing directory: {}",
+            project_dir.display()
+        );
     }
 
     let mut created = Vec::new();
@@ -116,7 +130,9 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_project_register", || {
             let record = self.state.projects.write().register_path(&p.path)?;
-            crate::orchestration::mcp::migrate_project_mcp_path(&PathBuf::from(&record.canonical_path))?;
+            crate::orchestration::mcp::migrate_project_mcp_path(&PathBuf::from(
+                &record.canonical_path,
+            ))?;
             let project_config = crate::config::load_project(Path::new(&record.canonical_path))?;
             let project_config_loaded = true;
             if project_config.mcp.enabled == Some(false) {
@@ -144,7 +160,9 @@ impl BlackboxServer {
                         );
                     }
                     Ok(_) => {}
-                    Err(e) => tracing::warn!("artifact auto-discover for {}: {e:#}", record.project_id),
+                    Err(e) => {
+                        tracing::warn!("artifact auto-discover for {}: {e:#}", record.project_id)
+                    }
                 }
             }
             let edges_dir = edge_index::edges_dir_from_bro_store(&self.state.store_dir);
@@ -160,10 +178,9 @@ impl BlackboxServer {
             // are picked up without a daemon restart.
             if let Ok(mut guard) = self.state.bbox_watcher.lock() {
                 if let Some(w) = guard.as_mut() {
-                    if let Err(e) = w.watch_project(
-                        &record.project_id,
-                        Path::new(&record.canonical_path),
-                    ) {
+                    if let Err(e) =
+                        w.watch_project(&record.project_id, Path::new(&record.canonical_path))
+                    {
                         tracing::warn!("watcher add project {}: {e:#}", record.project_id);
                     }
                 }
@@ -277,11 +294,7 @@ impl BlackboxServer {
             let counts = project_ref_counts(&self.state, &record.canonical_path)?;
             let total_refs: u64 = counts
                 .as_object()
-                .map(|m| {
-                    m.values()
-                        .filter_map(|v| v.as_u64())
-                        .sum()
-                })
+                .map(|m| m.values().filter_map(|v| v.as_u64()).sum())
                 .unwrap_or(0);
 
             if dry_run {
@@ -314,11 +327,7 @@ impl BlackboxServer {
                 );
             }
 
-            let removed = self
-                .state
-                .projects
-                .write()
-                .unregister_project(&p.project)?;
+            let removed = self.state.projects.write().unregister_project(&p.project)?;
 
             // Rebuild EdgeIndex so edges that were keyed on the removed
             // project no longer surface in subsequent inspections.
@@ -365,10 +374,17 @@ mod tests {
         assert!(cfg_path.exists());
         assert!(mcp_path.exists());
         assert!(gitignore_path.exists());
-        assert!(result.created.contains(&cfg_path.to_string_lossy().into_owned()));
+        assert!(
+            result
+                .created
+                .contains(&cfg_path.to_string_lossy().into_owned())
+        );
         let store = crate::orchestration::mcp::McpStore::load(&mcp_path).unwrap();
         assert_eq!(store.version, 1);
-        assert_eq!(result.canonical, dir_path.canonicalize().unwrap().to_string_lossy());
+        assert_eq!(
+            result.canonical,
+            dir_path.canonicalize().unwrap().to_string_lossy()
+        );
         assert_eq!(result.skipped.len(), 0);
     }
 
@@ -384,8 +400,16 @@ mod tests {
         let result = init_project_path(&dir_path, false).unwrap();
         let cfg = std::fs::read_to_string(&cfg_path).unwrap();
         assert_eq!(cfg, "# tweaked");
-        assert!(result.skipped.contains(&cfg_path.to_string_lossy().to_string()));
-        assert!(!result.created.contains(&cfg_path.to_string_lossy().to_string()));
+        assert!(
+            result
+                .skipped
+                .contains(&cfg_path.to_string_lossy().to_string())
+        );
+        assert!(
+            !result
+                .created
+                .contains(&cfg_path.to_string_lossy().to_string())
+        );
     }
 
     #[test]
@@ -401,7 +425,11 @@ mod tests {
 
         let contents = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(!contents.contains("# custom"));
-        assert!(result.created.contains(&cfg_path.to_string_lossy().to_string()));
+        assert!(
+            result
+                .created
+                .contains(&cfg_path.to_string_lossy().to_string())
+        );
     }
 
     #[test]
@@ -441,7 +469,10 @@ mod tests {
             .join("committed")
             .join("workflow")
             .join("test-flow.json");
-        assert!(artifact_path.exists(), "artifact not written to scoped path");
+        assert!(
+            artifact_path.exists(),
+            "artifact not written to scoped path"
+        );
     }
 
     #[test]
@@ -478,8 +509,7 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(first[0].version, second[0].version);
         assert_eq!(
-            first[0].content_sha256,
-            second[0].content_sha256,
+            first[0].content_sha256, second[0].content_sha256,
             "hash must be stable across identical installs"
         );
     }

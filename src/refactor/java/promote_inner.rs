@@ -73,8 +73,13 @@ pub(crate) fn plan_promote_java_inner_class(p: &RefactorPlanParams) -> Result<St
         })?;
     validate_java_type_identifier(&inner_name, "inner class name")?;
 
-    let outer_class_node = find_first_class_declaration(parsed.tree.root_node())
-        .ok_or_else(|| anyhow!("no outer class declaration found in {}", source_path.display()))?;
+    let outer_class_node =
+        find_first_class_declaration(parsed.tree.root_node()).ok_or_else(|| {
+            anyhow!(
+                "no outer class declaration found in {}",
+                source_path.display()
+            )
+        })?;
     let outer_body = outer_class_node
         .child_by_field_name("body")
         .ok_or_else(|| anyhow!("outer class has no body"))?;
@@ -83,13 +88,11 @@ pub(crate) fn plan_promote_java_inner_class(p: &RefactorPlanParams) -> Result<St
         outer_body
             .named_children(&mut cursor)
             .find(|child| {
-                matches!(
-                    child.kind(),
-                    "class_declaration" | "record_declaration"
-                ) && child
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
-                    == Some(inner_name.as_str())
+                matches!(child.kind(), "class_declaration" | "record_declaration")
+                    && child
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
+                        == Some(inner_name.as_str())
             })
             .ok_or_else(|| {
                 anyhow!(
@@ -446,9 +449,14 @@ pub(crate) fn analyze_inner_class_outer_refs(
         // assignment_expression: check if LHS resolves to an outer field.
         if node.kind() == "assignment_expression" {
             if let Some(left) = node.child_by_field_name("left") {
-                if let Some(captured_name) =
-                    classify_outer_field_access(left, parsed, outer_fields, inner_field_set, &outer_name, inside_anonymous)
-                {
+                if let Some(captured_name) = classify_outer_field_access(
+                    left,
+                    parsed,
+                    outer_fields,
+                    inner_field_set,
+                    &outer_name,
+                    inside_anonymous,
+                ) {
                     writes.insert(captured_name);
                 }
             }
@@ -458,9 +466,14 @@ pub(crate) fn analyze_inner_class_outer_refs(
             // `field++`, `--field`, etc. — treat as write
             let mut ucur = node.walk();
             for c in node.named_children(&mut ucur) {
-                if let Some(captured) =
-                    classify_outer_field_access(c, parsed, outer_fields, inner_field_set, &outer_name, inside_anonymous)
-                {
+                if let Some(captured) = classify_outer_field_access(
+                    c,
+                    parsed,
+                    outer_fields,
+                    inner_field_set,
+                    &outer_name,
+                    inside_anonymous,
+                ) {
                     writes.insert(captured);
                 }
             }
@@ -469,9 +482,14 @@ pub(crate) fn analyze_inner_class_outer_refs(
 
         // Bare identifier read or `Outer.this.field`. Classify as outer
         // capture if it resolves to an outer field.
-        if let Some(captured_name) =
-            classify_outer_field_access(node, parsed, outer_fields, inner_field_set, &outer_name, inside_anonymous)
-        {
+        if let Some(captured_name) = classify_outer_field_access(
+            node,
+            parsed,
+            outer_fields,
+            inner_field_set,
+            &outer_name,
+            inside_anonymous,
+        ) {
             if !writes.contains(&captured_name) {
                 if !captures.contains_key(&captured_name) {
                     if let Some(field) = outer_fields.get(&captured_name) {
@@ -539,7 +557,9 @@ pub(crate) fn classify_outer_field_access(
                         return None;
                     }
                 }
-                "scoped_identifier" | "scoped_type_identifier" | "type_identifier"
+                "scoped_identifier"
+                | "scoped_type_identifier"
+                | "type_identifier"
                 | "generic_type" => return None,
                 "field_access" => {
                     // `something.field` — `field` part is consumed by the
@@ -632,13 +652,11 @@ pub(crate) fn scan_source_for_inner_class_uses(
     let mut scan = InnerClassUsageScan::default();
     // Find the inner class node's range so we can skip it while walking.
     let inner_range = find_node(parsed.tree.root_node(), |node| {
-        matches!(
-            node.kind(),
-            "class_declaration" | "record_declaration"
-        ) && node
-            .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
-            == Some(inner_name)
+        matches!(node.kind(), "class_declaration" | "record_declaration")
+            && node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
+                == Some(inner_name)
     })
     .map(|n| (n.start_byte(), n.end_byte()));
     let mut stack = vec![parsed.tree.root_node()];
@@ -674,18 +692,16 @@ pub(crate) fn scan_source_for_inner_class_uses(
                     // Skip the `type` slot of an enclosing
                     // `object_creation_expression` — that's an
                     // instantiation we've already counted as a new_site.
-                    let is_new_type_slot = node
-                        .parent()
-                        .and_then(|p| {
-                            if p.kind() == "object_creation_expression" {
-                                p.child_by_field_name("type").map(|t| t.id())
-                            } else {
-                                None
-                            }
-                        })
-                        == Some(node.id());
+                    let is_new_type_slot = node.parent().and_then(|p| {
+                        if p.kind() == "object_creation_expression" {
+                            p.child_by_field_name("type").map(|t| t.id())
+                        } else {
+                            None
+                        }
+                    }) == Some(node.id());
                     if !is_new_type_slot {
-                        scan.non_new_sites.push((node.start_byte(), node.end_byte()));
+                        scan.non_new_sites
+                            .push((node.start_byte(), node.end_byte()));
                     }
                 }
             }
@@ -695,7 +711,8 @@ pub(crate) fn scan_source_for_inner_class_uses(
             if let Some(qualifier) = node.named_children(&mut mcur).next() {
                 if let Ok(text) = qualifier.utf8_text(parsed.source.as_bytes()) {
                     if text.trim() == inner_name {
-                        scan.non_new_sites.push((qualifier.start_byte(), qualifier.end_byte()));
+                        scan.non_new_sites
+                            .push((qualifier.start_byte(), qualifier.end_byte()));
                     }
                 }
             }
@@ -906,8 +923,7 @@ pub(crate) fn extend_existing_ctor_with_captures(
                 if inner_expr.kind() == "explicit_constructor_invocation" {
                     if let Ok(t) = inner_expr.utf8_text(reparse_text.as_bytes()) {
                         if t.trim_start().starts_with("super") {
-                            insert_at_local =
-                                first_stmt.end_byte() - "class __Tmp { ".len();
+                            insert_at_local = first_stmt.end_byte() - "class __Tmp { ".len();
                         }
                     }
                 }

@@ -6,7 +6,7 @@
     clippy::type_complexity,
     clippy::large_enum_variant,
     clippy::enum_variant_names,
-    clippy::let_and_return,
+    clippy::let_and_return
 )]
 
 use std::{
@@ -15,13 +15,13 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use futures::prelude::*;
 use irc::client::prelude::*;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -517,13 +517,13 @@ async fn tail_once(
             if let Ok(value) = serde_json::from_str::<Value>(&payload)
                 && let Some(line) =
                     summarize_tail_event(client, daemon, &value, labels, last_outputs).await
-                {
-                    tx.send(Outbound::Privmsg {
-                        target: channel.to_string(),
-                        body: line,
-                    })
-                    .ok();
-                }
+            {
+                tx.send(Outbound::Privmsg {
+                    target: channel.to_string(),
+                    body: line,
+                })
+                .ok();
+            }
         }
     }
     Err(anyhow!("tail stream ended"))

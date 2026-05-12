@@ -23,9 +23,7 @@ pub(crate) fn plan_inline_mod_to_file_submodule(p: &RefactorPlanParams) -> Resul
         .item_names
         .as_deref()
         .filter(|n| !n.is_empty())
-        .ok_or_else(|| {
-            anyhow!("item_names is required for inline_mod_to_file_submodule")
-        })?;
+        .ok_or_else(|| anyhow!("item_names is required for inline_mod_to_file_submodule"))?;
     if item_names.len() != 1 {
         bail!(
             "inline_mod_to_file_submodule moves exactly one mod at a time; got {} names",
@@ -164,8 +162,7 @@ pub(crate) fn plan_inline_mod_to_file_submodule(p: &RefactorPlanParams) -> Resul
         fixme_count: None,
     };
 
-    validate_plan_shape(&plan)
-        .context("validate inline_mod_to_file_submodule plan")?;
+    validate_plan_shape(&plan).context("validate inline_mod_to_file_submodule plan")?;
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
@@ -175,15 +172,13 @@ pub(crate) fn plan_inline_mod_to_file_submodule(p: &RefactorPlanParams) -> Resul
 ///   same directory: `<dir>/<mod_name>.rs`.
 /// - Any other `<stem>.rs` → submodule lives in `<dir>/<stem>/<mod_name>.rs`.
 fn derive_submodule_target_path(source_path: &Path, mod_name: &str) -> Result<PathBuf> {
-    let parent = source_path.parent().ok_or_else(|| {
-        anyhow!("source path has no parent: {}", source_path.display())
-    })?;
+    let parent = source_path
+        .parent()
+        .ok_or_else(|| anyhow!("source path has no parent: {}", source_path.display()))?;
     let stem = source_path
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| {
-            anyhow!("source path has no file stem: {}", source_path.display())
-        })?;
+        .ok_or_else(|| anyhow!("source path has no file stem: {}", source_path.display()))?;
     let target = if matches!(stem, "mod" | "lib" | "main") {
         parent.join(format!("{mod_name}.rs"))
     } else {
@@ -246,11 +241,7 @@ fn trim_trailing_ws_end(bytes: &[u8], end: usize) -> usize {
 mod tests {
     use super::*;
 
-    fn make_params(
-        source: &Path,
-        mod_name: &str,
-        target: Option<&Path>,
-    ) -> RefactorPlanParams {
+    fn make_params(source: &Path, mod_name: &str, target: Option<&Path>) -> RefactorPlanParams {
         RefactorPlanParams {
             kind: "inline_mod_to_file_submodule".to_string(),
             source: source.to_string_lossy().into_owned(),
@@ -432,10 +423,9 @@ mod tests {
         let target = dir.path().join("custom_target.rs");
         fs::write(&src, "mod foo {\n    fn x() {}\n}\n").unwrap();
         fs::write(&target, "// pre-existing content\nfn keep() {}\n").unwrap();
-        let err =
-            plan_inline_mod_to_file_submodule(&make_params(&src, "foo", Some(&target)))
-                .unwrap_err()
-                .to_string();
+        let err = plan_inline_mod_to_file_submodule(&make_params(&src, "foo", Some(&target)))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("already exists and is non-empty"),
             "expected non-empty-target refusal, got: {err}"
@@ -451,9 +441,8 @@ mod tests {
         let target = dir.path().join("scaffold.rs");
         fs::write(&src, "mod foo {\n    fn x() {}\n}\n").unwrap();
         fs::write(&target, "").unwrap();
-        let plan_json =
-            plan_inline_mod_to_file_submodule(&make_params(&src, "foo", Some(&target)))
-                .expect("empty target should be accepted");
+        let plan_json = plan_inline_mod_to_file_submodule(&make_params(&src, "foo", Some(&target)))
+            .expect("empty target should be accepted");
         let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
         assert_eq!(plan.edits.len(), 2);
     }
@@ -464,10 +453,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("source.rs");
         fs::write(&src, "fn unrelated() {}\n").unwrap();
-        let err =
-            plan_inline_mod_to_file_submodule(&make_params(&src, "missing", None))
-                .unwrap_err()
-                .to_string();
+        let err = plan_inline_mod_to_file_submodule(&make_params(&src, "missing", None))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("not found"),
             "expected not-found error, got: {err}"

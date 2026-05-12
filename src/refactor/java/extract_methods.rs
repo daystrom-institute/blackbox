@@ -20,11 +20,7 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
     let mut selected = select_java_methods_by_name(&parsed, names)?;
     let captured_variables = captured_fields_for_methods(&parsed, &selected);
     let dependency_report = if p.deep_analysis.unwrap_or(false) {
-        analyze_extracted_dependencies(
-            &parsed,
-            &selected,
-            p.project_dir.as_deref().map(Path::new),
-        )
+        analyze_extracted_dependencies(&parsed, &selected, p.project_dir.as_deref().map(Path::new))
     } else {
         Default::default()
     };

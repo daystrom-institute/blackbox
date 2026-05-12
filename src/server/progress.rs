@@ -138,9 +138,7 @@ fn surface_to_filters(
             Err(reason.unwrap_or_else(|| "surface denied".into()))
         }
         crate::server::surface::ToolSurfaceVerdict::ToolSurface {
-            allow,
-            disallow,
-            ..
+            allow, disallow, ..
         } => {
             let mut filters = orchestration::mcp::McpFilters::default();
             for p in allow {
@@ -188,7 +186,8 @@ pub(crate) fn resolve_dispatch_filters(
     if let Some(surface_filters) = surface_to_filters(surface, project_dir, packets)? {
         let universe = crate::tool_docs::all_tool_names_prefixed();
         let universe_refs: Vec<&str> = universe.iter().map(|s| s.as_str()).collect();
-        eff.filters.intersect_allow_from(&surface_filters, &universe_refs);
+        eff.filters
+            .intersect_allow_from(&surface_filters, &universe_refs);
     }
 
     // Per-dispatch overlay merges last (after global, project, default

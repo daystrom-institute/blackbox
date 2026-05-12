@@ -319,7 +319,10 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
             (
                 Some(with_markers),
                 PlanStatus::Blocked,
-                Some(FixmeCount { plan_only: count, warning: 0 }),
+                Some(FixmeCount {
+                    plan_only: count,
+                    warning: 0,
+                }),
             )
         } else {
             (None, PlanStatus::Planned, None)
@@ -386,7 +389,9 @@ pub(crate) fn plan_delete_rust_items(p: &RefactorPlanParams) -> Result<String> {
         .as_deref()
         .is_some_and(|names| !names.is_empty());
     if !has_names {
-        bail!("delete_rust_items requires non-empty item_names; use item_kinds only to narrow deletion matches");
+        bail!(
+            "delete_rust_items requires non-empty item_names; use item_kinds only to narrow deletion matches"
+        );
     }
     let wants_impl_methods = p
         .item_kinds
@@ -1882,9 +1887,9 @@ pub(crate) fn rust_node_by_range<'a>(
 }
 
 use lsp_types::{
-    request::{CodeActionRequest, Rename},
     CodeActionContext, CodeActionKind, CodeActionParams, DocumentChanges, Position, Range,
     RenameParams, TextDocumentIdentifier, TextDocumentPositionParams, Url, WorkspaceEdit,
+    request::{CodeActionRequest, Rename},
 };
 
 use crate::lsp::LspSessionManager;

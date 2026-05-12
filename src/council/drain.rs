@@ -27,24 +27,23 @@ use chrono::Utc;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::SharedState;
 use crate::orchestration::{
-    self as orch,
+    self as orch, AmbientContext,
     brofile::{resolve_brofile, resolve_provider_env},
     mcp::{
-        global_store_path, project_store_path, resolve_effective, write_gemini_policy_file,
-        McpFilters, McpStore,
+        McpFilters, McpStore, global_store_path, project_store_path, resolve_effective,
+        write_gemini_policy_file,
     },
     providers::{ExecOpts, Provider},
-    team::{load_all_teams, Team, TeamMember},
-    AmbientContext,
+    team::{Team, TeamMember, load_all_teams},
 };
-use crate::SharedState;
 
 use super::{
-    charter::build_council_block,
-    envelope::{frame_hash, EnvelopeStatus, InboxEnvelope, ReplyMeta},
-    post::{CouncilPost, ReplyScope},
     CouncilEvent, CouncilState, CouncilStatus, SharedRegistry,
+    charter::build_council_block,
+    envelope::{EnvelopeStatus, InboxEnvelope, ReplyMeta, frame_hash},
+    post::{CouncilPost, ReplyScope},
 };
 
 const TURN_TIMEOUT_SECS: f64 = 600.0;

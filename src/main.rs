@@ -6,7 +6,7 @@
     clippy::type_complexity,
     clippy::large_enum_variant,
     clippy::enum_variant_names,
-    clippy::let_and_return,
+    clippy::let_and_return
 )]
 
 #[cfg(test)]
@@ -52,18 +52,19 @@ mod refactor;
 mod render;
 mod roadmap;
 mod routing;
-mod template;
 mod search;
 mod server;
 mod slack_channel_bindings;
 mod slack_proposal_links;
 mod slack_thread_store;
 mod system_memory;
+mod template;
 #[cfg(test)]
 mod tests;
 mod threads;
 mod tool_docs;
 mod tools;
+mod transcripts;
 mod vectors;
 mod watcher;
 mod webhooks;
@@ -85,9 +86,9 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::RwLock;
 
 use axum::extract::{Query, State as AxumState};
-use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use futures::{stream::Stream, StreamExt};
+use axum::response::sse::{Event, Sse};
+use futures::{StreamExt, stream::Stream};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
@@ -97,11 +98,11 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -114,8 +115,8 @@ use orchestration::{self as orch, TaskStore};
 use packets::{Packets, ScannerConfig};
 use pins::{AmbientPinQuery, PinParams, Pins};
 use projects::{
-    ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry, ProjectRenameParams,
-    ProjectUnregisterParams,
+    ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry,
+    ProjectRenameParams, ProjectUnregisterParams,
 };
 use providers::ProviderContext;
 use roadmap::Roadmap;
@@ -784,9 +785,8 @@ use mcp_tools::inspect::InspectEntityParams;
 use mcp_tools::provenance::ProvenanceParams;
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
-    apply_with as apply_packet_with, packet_matches_query, packet_summary,
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
-    PacketListParams,
+    PacketListParams, apply_with as apply_packet_with, packet_matches_query, packet_summary,
 };
 use refactor::{
     RefactorApplyParams, RefactorPlanParams, RefactorProjectRefsParams, RefactorRunParams,
@@ -1038,7 +1038,10 @@ impl ServerHandler for BlackboxServer {
             let packets = self.state.packets.read();
             server::surface::evaluate_tool_surface(&packets, entity, None::<&str>)
         };
-        if matches!(decision.verdict, server::surface::ToolSurfaceVerdict::Deny { .. }) {
+        if matches!(
+            decision.verdict,
+            server::surface::ToolSurfaceVerdict::Deny { .. }
+        ) {
             let reason = match &decision.verdict {
                 server::surface::ToolSurfaceVerdict::Deny { reason } => {
                     reason.as_deref().unwrap_or("surface denied")
@@ -1062,8 +1065,7 @@ impl ServerHandler for BlackboxServer {
         let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
         let entity = server::surface::build_surface_entity(surface, None);
         let packets = self.state.packets.read();
-        let decision =
-            server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
+        let decision = server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
         drop(packets);
         let universe: Vec<String> = self
             .tool_router
@@ -1086,8 +1088,7 @@ impl ServerHandler for BlackboxServer {
         let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
         let entity = server::surface::build_surface_entity(surface, None);
         let packets = self.state.packets.read();
-        let decision =
-            server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
+        let decision = server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
         drop(packets);
         let universe: Vec<String> = self
             .tool_router
@@ -1113,8 +1114,7 @@ impl ServerHandler for BlackboxServer {
             let surface = self.surface.get().map(|s| s.as_ref()).unwrap_or("default");
             let entity = server::surface::build_surface_entity(surface, None);
             let packets = self.state.packets.read();
-let decision =
-            server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
+            let decision = server::surface::evaluate_tool_surface(&packets, entity, None::<&str>);
             let universe: Vec<String> = self
                 .tool_router
                 .list_all()
@@ -1238,7 +1238,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Transcript index roots - from config or env
     let roots: Vec<(String, PathBuf)> = if let Some(ref roots_str) = cfg.transcripts.roots {
-        roots_str.split(',')
+        roots_str
+            .split(',')
             .filter_map(|entry| {
                 let (name, path) = entry.split_once('=')?;
                 let expanded = if path.starts_with('~') {
@@ -1284,9 +1285,21 @@ async fn main() -> anyhow::Result<()> {
         found
     };
 
-    let codex_root = cfg.transcripts.codex_root
-        .map(|p| if p.to_string_lossy().starts_with('~') { home.join(&p.to_string_lossy()[2..]) } else { p })
-        .or_else(|| std::env::var("TRANSCRIPT_SEARCH_CODEX_ROOT").ok().map(PathBuf::from))
+    let codex_root = cfg
+        .transcripts
+        .codex_root
+        .map(|p| {
+            if p.to_string_lossy().starts_with('~') {
+                home.join(&p.to_string_lossy()[2..])
+            } else {
+                p
+            }
+        })
+        .or_else(|| {
+            std::env::var("TRANSCRIPT_SEARCH_CODEX_ROOT")
+                .ok()
+                .map(PathBuf::from)
+        })
         .or_else(|| {
             let default = home.join(".codex");
             if default.join("sessions").exists() {
@@ -1348,8 +1361,12 @@ async fn main() -> anyhow::Result<()> {
     // Export for provider arg-builders so they can inject `--mcp-config`
     // etc. at dispatch time — ensures dispatched subprocesses see
     // blackbox regardless of which config file their CLI inherits.
-    unsafe { std::env::set_var("BLACKBOX_MCP_URL", &bbox_url); }
-    unsafe { std::env::set_var("BLACKBOX_MCP_NAME", &bbox_mcp_name); }
+    unsafe {
+        std::env::set_var("BLACKBOX_MCP_URL", &bbox_url);
+    }
+    unsafe {
+        std::env::set_var("BLACKBOX_MCP_NAME", &bbox_mcp_name);
+    }
     let report = orchestration::mcp::self_register_blackbox(&bbox_mcp_name, &bbox_url);
     tracing::info!(
         "blackbox MCP self-registration (name={}): {}",
@@ -1403,7 +1420,9 @@ async fn main() -> anyhow::Result<()> {
             if r.active_updated > 0 || r.version_updated > 0 || r.missing_artifacts > 0 {
                 tracing::info!(
                     "Artifact hash backfill: {} active updated, {} version updated, {} missing payloads",
-                    r.active_updated, r.version_updated, r.missing_artifacts
+                    r.active_updated,
+                    r.version_updated,
+                    r.missing_artifacts
                 );
             }
         }
@@ -1846,9 +1865,8 @@ async fn main() -> anyhow::Result<()> {
     {
         let shared_for_hup = shared.clone();
         tokio::spawn(async move {
-            let mut sighup =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                    .expect("install SIGHUP handler");
+            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("install SIGHUP handler");
             loop {
                 let _ = sighup.recv().await;
                 match config::load() {

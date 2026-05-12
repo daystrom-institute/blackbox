@@ -8,9 +8,7 @@ use std::collections::BTreeMap;
 ///
 /// Grammar: `// FIXME(refactor-warning): <category> — <description>. <hints>.`
 pub fn emit_warning_marker(category: &str, description: &str, hints: &str) -> String {
-    format!(
-        "// FIXME(refactor-warning): {category} — {description}. {hints}."
-    )
+    format!("// FIXME(refactor-warning): {category} — {description}. {hints}.")
 }
 
 /// Insert marker lines above each named line in `text`.
@@ -49,11 +47,7 @@ pub fn apply_warning_markers_to_text(text: &str, site_lines: &[(usize, String)])
 
         // Reverse within the same line so the first entry in the slice
         // ends up closest to the code (last inserted).
-        let block: String = markers
-            .iter()
-            .rev()
-            .map(|m| format!("{m}\n"))
-            .collect();
+        let block: String = markers.iter().rev().map(|m| format!("{m}\n")).collect();
 
         result.insert_str(pos, &block);
     }
@@ -98,7 +92,10 @@ mod tests {
     #[test]
     fn apply_markers_inserts_above_specified_line() {
         let text = "line1\nline2\nline3\n";
-        let markers = vec![(2_usize, "// FIXME(refactor-warning): cat — desc. hints.".to_string())];
+        let markers = vec![(
+            2_usize,
+            "// FIXME(refactor-warning): cat — desc. hints.".to_string(),
+        )];
         let result = apply_warning_markers_to_text(text, &markers);
         assert_eq!(
             result,
@@ -293,8 +290,8 @@ impl BigServer {
         );
 
         // new_text should contain the warning marker above the borrow site.
-        let nt = plan_new_text(&plan_json)
-            .expect("expected new_text when emit_applied_markers=true");
+        let nt =
+            plan_new_text(&plan_json).expect("expected new_text when emit_applied_markers=true");
         assert!(
             nt.contains("FIXME(refactor-warning): borrow promotion"),
             "expected warning marker in new_text:\n{nt}"
@@ -327,8 +324,7 @@ impl BigServer {
         let p = make_params_with_markers(&src, "BigServer", "state", &["count"], true);
         let plan_json = plan_update_callers(&p).unwrap();
 
-        let nt = plan_new_text(&plan_json)
-            .expect("expected new_text for parse verification");
+        let nt = plan_new_text(&plan_json).expect("expected new_text for parse verification");
 
         // Post-edit text + markers must parse as valid Rust.
         let mut parser = tree_sitter::Parser::new();

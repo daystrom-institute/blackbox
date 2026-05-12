@@ -492,8 +492,7 @@ fn collect_java_type_references(node: Node<'_>, source: &str, out: &mut HashSet<
                 _ => None,
             };
             if let Some(text) = name_text {
-                if text.chars().next().is_some_and(|c| c.is_uppercase())
-                    && !java_builtin_type(text)
+                if text.chars().next().is_some_and(|c| c.is_uppercase()) && !java_builtin_type(text)
                 {
                     out.insert(text.to_string());
                 }
@@ -618,7 +617,10 @@ fn collect_inner_class_simple_names(
         }
     }
     let next_inside = inside_type_body
-        || matches!(kind, "class_body" | "enum_body" | "record_body" | "interface_body");
+        || matches!(
+            kind,
+            "class_body" | "enum_body" | "record_body" | "interface_body"
+        );
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_inner_class_simple_names(child, source, next_inside, out);
@@ -662,10 +664,7 @@ fn heuristic_java_organize_imports(
 /// AST, adds project-local imports for unresolved simple names, and skips
 /// inner-class simple names (gap 16). On parse failure or when no rewrite is
 /// needed the input string is returned unchanged.
-fn heuristic_java_organize_imports_text(
-    project_dir: &Path,
-    source: &str,
-) -> Result<String> {
+fn heuristic_java_organize_imports_text(project_dir: &Path, source: &str) -> Result<String> {
     let tree = parse_source("java", source)?;
     let Some((start, end, replacement)) =
         compute_java_organize_imports_edit(project_dir, source, &tree)?
@@ -913,10 +912,7 @@ fn java_inject_implements(target_text: &str, class_name: &str, interfaces: &[Str
 /// If an identical import already exists, returns the original text unchanged.
 fn java_inject_import(target_text: &str, fqcn: &str) -> String {
     let import_line = format!("import {fqcn};");
-    if target_text
-        .lines()
-        .any(|line| line.trim() == import_line)
-    {
+    if target_text.lines().any(|line| line.trim() == import_line) {
         return target_text.to_string();
     }
     // Same dedupe shape as java_source_import_edit — skip when a
@@ -1027,10 +1023,7 @@ fn java_insert_fixme_above_calls(
         // `    void runStuff() {` whereas call sites look like
         // `        runStuff();` or `        x = runStuff();`.
         // Find line bounds.
-        let line_start = target_text[..pos]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let line_start = target_text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
         let line_end = target_text[pos..]
             .find('\n')
             .map(|i| pos + i)
@@ -1077,11 +1070,7 @@ fn java_insert_fixme_above_calls(
 /// the previous text-scan only when parsing fails (the target text is
 /// always already parseable at this point, but the fallback keeps the
 /// helper resilient to malformed inputs).
-pub(crate) fn java_qualify_unqualified_calls(
-    text: &str,
-    method: &str,
-    class_name: &str,
-) -> String {
+pub(crate) fn java_qualify_unqualified_calls(text: &str, method: &str, class_name: &str) -> String {
     if let Ok(tree) = parse_source("java", text) {
         let qualifier = format!("{class_name}.");
         let mut inserts: Vec<usize> = Vec::new();
@@ -1164,10 +1153,7 @@ pub(crate) fn java_qualify_unqualified_calls(
             .find('\n')
             .map(|i| pos + i)
             .unwrap_or(bytes.len());
-        let line_start = text[..pos]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let line_start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
         let line = &text[line_start..line_end];
         let looks_like_decl = line.trim_end().ends_with('{');
         if !prev_ok || !next_ok || looks_like_decl {
@@ -1305,9 +1291,7 @@ fn collect_interface_abstract_method_names(
     let path = type_paths.get(interface_name)?.as_ref()?;
     let parsed = parse_source_file(path).ok()?;
     let type_node = find_java_type_declaration_by_name(&parsed, interface_name)?;
-    let body = type_node
-        .child_by_field_name("body")
-        .unwrap_or(type_node);
+    let body = type_node.child_by_field_name("body").unwrap_or(type_node);
     let mut names = HashSet::new();
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
@@ -1315,9 +1299,9 @@ fn collect_interface_abstract_method_names(
             continue;
         }
         let mods = collect_java_modifiers(child);
-        let has_concrete_modifier = mods.iter().any(|(name, _, _)| {
-            matches!(name.as_str(), "default" | "static" | "private")
-        });
+        let has_concrete_modifier = mods
+            .iter()
+            .any(|(name, _, _)| matches!(name.as_str(), "default" | "static" | "private"));
         if has_concrete_modifier {
             continue;
         }
@@ -1669,8 +1653,8 @@ fn collect_identifier_uses<'a>(
     if node.kind() == "identifier" {
         if let Some(access_node) = resolve_field_access(node) {
             if let Ok(text) = node.utf8_text(source.as_bytes()) {
-                let qualified_this = access_node.id() != node.id()
-                    && access_node.kind() == "field_access";
+                let qualified_this =
+                    access_node.id() != node.id() && access_node.kind() == "field_access";
                 out.push((text.to_string(), node, qualified_this));
             }
         }
@@ -1825,9 +1809,7 @@ fn collect_java_super_type_names(class_node: Node<'_>, source: &str) -> Vec<Stri
 /// extraction site can't tell static from instance without semantic data.
 fn collect_java_type_method_names(parsed: &ParsedSource, type_node: Node<'_>) -> HashSet<String> {
     let mut names = HashSet::new();
-    let body = type_node
-        .child_by_field_name("body")
-        .unwrap_or(type_node);
+    let body = type_node.child_by_field_name("body").unwrap_or(type_node);
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
         if matches!(
@@ -1933,10 +1915,7 @@ pub(crate) fn collect_method_invocations<'a>(
             // not `this`. Also cover identifier-only receivers.
             let mut has_explicit_other_receiver = false;
             if let Some(obj) = node.child_by_field_name("object") {
-                let receiver_text = obj
-                    .utf8_text(parsed.source.as_bytes())
-                    .unwrap_or("")
-                    .trim();
+                let receiver_text = obj.utf8_text(parsed.source.as_bytes()).unwrap_or("").trim();
                 if receiver_text != "this" {
                     has_explicit_other_receiver = true;
                 }
@@ -2027,9 +2006,7 @@ pub(crate) fn java_source_class_method_signatures(
     class_node: Node<'_>,
 ) -> BTreeMap<String, JavaSourceMethodInfo> {
     let mut out: BTreeMap<String, JavaSourceMethodInfo> = BTreeMap::new();
-    let body = class_node
-        .child_by_field_name("body")
-        .unwrap_or(class_node);
+    let body = class_node.child_by_field_name("body").unwrap_or(class_node);
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
         if child.kind() == "method_declaration" {
@@ -2192,7 +2169,11 @@ pub(crate) fn analyze_extracted_dependencies(
         if extracted_names.contains(&hit.name) {
             continue;
         }
-        let context = if hit.inside_lambda { "lambda" } else { "direct" };
+        let context = if hit.inside_lambda {
+            "lambda"
+        } else {
+            "direct"
+        };
         let site = ExtractedCallSite {
             line: hit.line,
             column: hit.column,
@@ -2264,7 +2245,10 @@ fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Resul
                 let params: Vec<String> = if inside.trim().is_empty() {
                     Vec::new()
                 } else {
-                    inside.split(',').map(|p| normalize_param_type_text(p)).collect()
+                    inside
+                        .split(',')
+                        .map(|p| normalize_param_type_text(p))
+                        .collect()
                 };
                 (name, Some(params))
             }
@@ -2314,9 +2298,7 @@ fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Resul
                 let chosen: Vec<&JavaMethod> = multi
                     .iter()
                     .copied()
-                    .filter(|m| {
-                        java_method_matches_param_types(parsed, m, wanted)
-                    })
+                    .filter(|m| java_method_matches_param_types(parsed, m, wanted))
                     .collect();
                 match chosen.as_slice() {
                     [m] => selected.push((**m).clone()),
@@ -2403,10 +2385,7 @@ fn java_method_matches_param_types(
     if actual.len() != wanted_types.len() {
         return false;
     }
-    actual
-        .iter()
-        .zip(wanted_types.iter())
-        .all(|(a, w)| a == w)
+    actual.iter().zip(wanted_types.iter()).all(|(a, w)| a == w)
 }
 
 /// Normalize a Java type string for overload matching: strip `final`,
@@ -2880,8 +2859,7 @@ fn select_java_static_final_fields_by_name(
             let mut cursor = node.walk();
             let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
             children.into_iter().find(|child| {
-                child.kind() == "variable_declarator"
-                    || child.kind() == "variable_declarator_id"
+                child.kind() == "variable_declarator" || child.kind() == "variable_declarator_id"
             })
         }
         .ok_or_else(|| anyhow!("could not locate declarator for constant `{expected}`"))?;
@@ -3380,7 +3358,10 @@ fn compute_remaining_accessor_rewrite_edits(
             // Walk past parenthesized/cast wrappers, mirroring classify.
             let mut classify_target = access_node;
             while let Some(parent) = classify_target.parent() {
-                if matches!(parent.kind(), "parenthesized_expression" | "cast_expression") {
+                if matches!(
+                    parent.kind(),
+                    "parenthesized_expression" | "cast_expression"
+                ) {
                     classify_target = parent;
                     continue;
                 }
@@ -3450,9 +3431,8 @@ fn compute_remaining_accessor_rewrite_edits(
     // Per-site RHS sub-edits. Indexed by lhs_write_sites position. Sub-edits
     // are stored in absolute source-byte coordinates and translated to RHS-
     // local indices at render time.
-    let mut rhs_sub_edits: Vec<Vec<TextEdit>> = (0..lhs_write_sites.len())
-        .map(|_| Vec::new())
-        .collect();
+    let mut rhs_sub_edits: Vec<Vec<TextEdit>> =
+        (0..lhs_write_sites.len()).map(|_| Vec::new()).collect();
 
     // Gap 1: caller-rewrite absorption. `java_caller_rewrite_edits` emits
     // zero-width inserts at the start of `method_invocation` nodes (e.g.
@@ -3466,11 +3446,9 @@ fn compute_remaining_accessor_rewrite_edits(
     // residual list to return to the caller.
     let mut residual_caller_edits: Vec<TextEdit> = Vec::new();
     for edit in caller_edits {
-        let absorbed = lhs_write_sites
-            .iter()
-            .position(|site| {
-                edit.byte_start >= site.rhs.start_byte() && edit.byte_end <= site.rhs.end_byte()
-            });
+        let absorbed = lhs_write_sites.iter().position(|site| {
+            edit.byte_start >= site.rhs.start_byte() && edit.byte_end <= site.rhs.end_byte()
+        });
         match absorbed {
             Some(site_idx) => {
                 rhs_sub_edits[site_idx].push(edit);
@@ -3516,7 +3494,10 @@ fn compute_remaining_accessor_rewrite_edits(
         // mirroring classify_access_kind.
         let mut classify_target = access_node;
         while let Some(parent) = classify_target.parent() {
-            if matches!(parent.kind(), "parenthesized_expression" | "cast_expression") {
+            if matches!(
+                parent.kind(),
+                "parenthesized_expression" | "cast_expression"
+            ) {
                 classify_target = parent;
                 continue;
             }
@@ -3641,8 +3622,7 @@ fn compute_remaining_accessor_rewrite_edits(
             prev_end = Some(e.byte_end);
             clean_sub.push(e);
         }
-        let mut rhs_text =
-            parsed.source[site.rhs.start_byte()..site.rhs.end_byte()].to_string();
+        let mut rhs_text = parsed.source[site.rhs.start_byte()..site.rhs.end_byte()].to_string();
         let rhs_base = site.rhs.start_byte();
         for e in clean_sub.iter().rev() {
             let local_start = e.byte_start - rhs_base;
@@ -3832,10 +3812,7 @@ fn resolve_field_access<'a>(node: Node<'a>) -> Option<Node<'a>> {
             // Otherwise the identifier is in the `object` position — a bare
             // read of the field as the qualifier of a further access.
         }
-        "scoped_identifier"
-        | "scoped_type_identifier"
-        | "type_identifier"
-        | "generic_type" => {
+        "scoped_identifier" | "scoped_type_identifier" | "type_identifier" | "generic_type" => {
             return None;
         }
         _ => {}
@@ -4047,9 +4024,8 @@ fn java_caller_rewrite_edits(
                     if let Some(name_node) = node.child_by_field_name("name") {
                         if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
                             if methods.contains(name) {
-                                let prefix = parsed.source
-                                    [node.start_byte()..name_node.start_byte()]
-                                    .trim();
+                                let prefix =
+                                    parsed.source[node.start_byte()..name_node.start_byte()].trim();
                                 if prefix.is_empty() {
                                     edits.push(TextEdit {
                                         byte_start: node.start_byte(),
@@ -4142,10 +4118,7 @@ struct CallbackSpec {
 /// callback for use by `callback_externals`. Returns
 /// `error.bad_input(code=callback_arity_unsupported)` when the method has
 /// more than one parameter (BiConsumer / BiFunction support is future work).
-fn classify_callback_method(
-    parsed: &ParsedSource,
-    method_node: Node<'_>,
-) -> Result<CallbackSpec> {
+fn classify_callback_method(parsed: &ParsedSource, method_node: Node<'_>) -> Result<CallbackSpec> {
     let method_name = method_node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
@@ -4175,11 +4148,7 @@ fn classify_callback_method(
         })
         .collect();
     let (interface_type, invoke_method, extra_import) = match (param_types.len(), is_void) {
-        (0, true) => (
-            "Runnable".to_string(),
-            "run".to_string(),
-            None,
-        ),
+        (0, true) => ("Runnable".to_string(), "run".to_string(), None),
         (0, false) => (
             format!("Supplier<{}>", boxed_for_supplier(return_type_text)),
             "get".to_string(),
@@ -4262,7 +4231,11 @@ fn compute_callback_call_rewrites(
             .and_then(|n| n.utf8_text(target_text.as_bytes()).ok())
             .unwrap_or("()");
         // Strip the surrounding `(` `)` so we can rebuild a clean call.
-        let args_inner = args_text.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        let args_inner = args_text
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
         let replacement = if args_inner.is_empty() {
             format!("{}.{}()", spec.field_name, spec.invoke_method)
         } else {
@@ -4322,7 +4295,10 @@ fn extracted_methods_write_to(
             // access is on the LHS of an assignment or inside an update.
             let mut target = access_node;
             while let Some(parent) = target.parent() {
-                if matches!(parent.kind(), "parenthesized_expression" | "cast_expression") {
+                if matches!(
+                    parent.kind(),
+                    "parenthesized_expression" | "cast_expression"
+                ) {
                     target = parent;
                     continue;
                 }
@@ -4331,9 +4307,7 @@ fn extracted_methods_write_to(
             if let Some(parent) = target.parent() {
                 match parent.kind() {
                     "assignment_expression" => {
-                        if parent.child_by_field_name("left").map(|c| c.id())
-                            == Some(target.id())
-                        {
+                        if parent.child_by_field_name("left").map(|c| c.id()) == Some(target.id()) {
                             return true;
                         }
                     }
@@ -4532,37 +4506,37 @@ fn build_visibility_rewrite_edit(
 }
 
 use lsp_types::{
-    request::CodeActionRequest, CodeActionContext, CodeActionKind, CodeActionParams, Position,
-    Range, TextDocumentIdentifier,
+    CodeActionContext, CodeActionKind, CodeActionParams, Position, Range, TextDocumentIdentifier,
+    request::CodeActionRequest,
 };
 
 use crate::lsp::{LspError, LspSessionManager};
 use crate::projects::Language;
-use cross_file::{MovedStaticItem, compute_cross_file_static_caller_edits};
-pub(crate) use lombokify::plan_lombokify_java_class;
-pub(crate) use promote_inner::plan_promote_java_inner_class;
-pub(crate) use leaf_plans::{
-    jdtls_organize_imports, plan_add_java_implements, plan_extract_java_interface,
-    plan_java_lsp_organize_imports, plan_migrate_java_type_usages,
-};
 pub(crate) use atom_plans::{
     plan_add_java_constructor, plan_add_java_delegate_field, plan_add_java_fields,
     plan_extract_java_nested_classes, plan_move_java_field, plan_rewrite_java_visibility,
 };
+use cross_file::{MovedStaticItem, compute_cross_file_static_caller_edits};
 pub(crate) use extract_class::plan_extract_java_class;
 pub(crate) use extract_methods::plan_extract_java_methods;
+pub(crate) use leaf_plans::{
+    jdtls_organize_imports, plan_add_java_implements, plan_extract_java_interface,
+    plan_java_lsp_organize_imports, plan_migrate_java_type_usages,
+};
+pub(crate) use lombokify::plan_lombokify_java_class;
 pub(crate) use move_and_callers::{plan_move_java_constant, plan_update_java_callers};
+pub(crate) use promote_inner::plan_promote_java_inner_class;
 
-#[cfg(test)]
-mod tests;
-mod lombokify;
-mod promote_inner;
-mod leaf_plans;
 mod atom_plans;
 mod extract_class;
 mod extract_methods;
-mod move_and_callers;
 mod find_usages;
+mod leaf_plans;
+mod lombokify;
+mod move_and_callers;
+mod promote_inner;
+#[cfg(test)]
+mod tests;
 pub(crate) use find_usages::plan_find_java_usages;
 mod rename_symbol;
 pub(crate) use rename_symbol::plan_rename_java_symbol;

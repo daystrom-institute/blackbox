@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};

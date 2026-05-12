@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value as JsonValue;
 
-use super::{placeholder_chunk, Chunk, Edge, SourceFormatChunker};
+use super::{Chunk, Edge, SourceFormatChunker, placeholder_chunk};
 
 pub struct JsonChunker;
 pub struct TomlChunker;
@@ -146,9 +146,11 @@ mod tests {
         let (json_chunks, _) = JsonChunker
             .chunk(Path::new("config.json"), br#"{ "b": 2, "a": 1 }"#)
             .unwrap();
-        assert!(json_chunks
-            .iter()
-            .all(|chunk| chunk.byte_end > chunk.byte_start));
+        assert!(
+            json_chunks
+                .iter()
+                .all(|chunk| chunk.byte_end > chunk.byte_start)
+        );
 
         let (toml_chunks, _) = TomlChunker
             .chunk(
@@ -156,15 +158,19 @@ mod tests {
                 b"[package]\nname = \"x\"\n[dependencies]\n",
             )
             .unwrap();
-        assert!(toml_chunks
-            .iter()
-            .all(|chunk| chunk.byte_end > chunk.byte_start));
+        assert!(
+            toml_chunks
+                .iter()
+                .all(|chunk| chunk.byte_end > chunk.byte_start)
+        );
 
         let (yaml_chunks, _) = YamlChunker
             .chunk(Path::new("config.yaml"), b"a: 1\nb:\n  c: 2\n")
             .unwrap();
-        assert!(yaml_chunks
-            .iter()
-            .all(|chunk| chunk.byte_end > chunk.byte_start));
+        assert!(
+            yaml_chunks
+                .iter()
+                .all(|chunk| chunk.byte_end > chunk.byte_start)
+        );
     }
 }

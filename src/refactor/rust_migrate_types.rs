@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use tree_sitter::Node;
 
 use super::*;
@@ -108,9 +108,7 @@ struct PlanWithMigrationSkipped {
     migration_skipped: Vec<MigrationSkippedSite>,
 }
 
-pub fn plan_migrate_type_usages(
-    p: &crate::refactor::RefactorPlanParams,
-) -> Result<String> {
+pub fn plan_migrate_type_usages(p: &crate::refactor::RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let parsed = parse_rust_file(&source_path)?;
 
@@ -228,8 +226,10 @@ pub fn plan_migrate_type_usages(
         }
     }
 
-    if !matches!(replacement_kind, MigrateReplacementKind::GenericParamTBoundedTrait)
-        && !illegal_sites.is_empty()
+    if !matches!(
+        replacement_kind,
+        MigrateReplacementKind::GenericParamTBoundedTrait
+    ) && !illegal_sites.is_empty()
     {
         migration_skipped.extend(
             illegal_sites
@@ -431,8 +431,7 @@ fn is_in_generic_argument(node: Node<'_>) -> bool {
         return false;
     }
 
-    first_ancestor_kind(node, "generic_type")
-        .is_some()
+    first_ancestor_kind(node, "generic_type").is_some()
         || first_ancestor_kind(node, "generic_type_with_turbofish").is_some()
         || first_ancestor_kind(node, "generic_argument").is_some()
         || first_ancestor_kind(node, "type_arguments").is_some()
@@ -612,12 +611,10 @@ fn collect_line_cols_for_anchor_range(
     sites
         .iter()
         .filter_map(|site| {
-            site.anchor
-                .as_ref()
-                .and_then(|anchor| {
-                    (anchor.start_byte == start && anchor.end_byte == end)
-                        .then_some((site.line, site.column))
-                })
+            site.anchor.as_ref().and_then(|anchor| {
+                (anchor.start_byte == start && anchor.end_byte == end)
+                    .then_some((site.line, site.column))
+            })
         })
         .collect()
 }
@@ -630,7 +627,10 @@ fn has_generic_type_param_t(item: &Node<'_>, source: &str) -> bool {
 }
 
 fn has_t_parameter_name(node: Node<'_>, source: &str) -> bool {
-    if matches!(node.kind(), "type_identifier" | "type_parameter" | "identifier") {
+    if matches!(
+        node.kind(),
+        "type_identifier" | "type_parameter" | "identifier"
+    ) {
         if let Ok(name) = node.utf8_text(source.as_bytes()) {
             if name == "T" {
                 return true;
@@ -650,7 +650,8 @@ fn has_t_parameter_name(node: Node<'_>, source: &str) -> bool {
 fn build_add_generic_param_edit(item: &Node<'_>, source: &str) -> Result<TextEdit> {
     if let Some(tp_node) = item.child_by_field_name("type_parameters") {
         let insert_at = tp_node.end_byte().saturating_sub(1);
-        let inner = &source[tp_node.start_byte().saturating_add(1)..tp_node.end_byte().saturating_sub(1)]
+        let inner = &source
+            [tp_node.start_byte().saturating_add(1)..tp_node.end_byte().saturating_sub(1)]
             .trim();
         let replacement = if inner.is_empty() { "T" } else { ", T" };
         return Ok(TextEdit {
@@ -719,7 +720,9 @@ fn find_name_end(item: &Node<'_>, source: &str) -> usize {
 fn build_where_clause_edit(item: &Node<'_>, source: &str, bound_text: &str) -> Option<TextEdit> {
     if let Some(where_node) = item.child_by_field_name("where_clause") {
         let mut insert_at = where_node.end_byte();
-        while insert_at > where_node.start_byte() && source.as_bytes()[insert_at - 1].is_ascii_whitespace() {
+        while insert_at > where_node.start_byte()
+            && source.as_bytes()[insert_at - 1].is_ascii_whitespace()
+        {
             insert_at -= 1;
         }
         Some(TextEdit {
@@ -920,10 +923,7 @@ fn consume(value: OldService, list: Vec<OldService>) -> OldService {
         ] {
             let (edits, skipped) = plan_for(kind, &source, replacement);
             assert_eq!(skipped.len(), 0, "{kind} should not skip legal positions");
-            assert!(
-                !edits.is_empty(),
-                "{kind} should produce edits"
-            );
+            assert!(!edits.is_empty(), "{kind} should produce edits");
             assert!(
                 edits.iter().all(|edit| edit.replacement == replacement),
                 "{kind} replacement mismatch"
@@ -1160,7 +1160,9 @@ struct Holder {
             callback_externals: None,
             output_path: None,
         });
-        let msg = err.expect_err("impl trait should refuse struct field").to_string();
+        let msg = err
+            .expect_err("impl trait should refuse struct field")
+            .to_string();
         assert!(
             msg.contains("error.bad_input(code=impl_trait_illegal_position)"),
             "message was: {msg}"

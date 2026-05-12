@@ -85,9 +85,11 @@ fn test_code_node_describe_python() {
     let response: CodeNodeDescribeResponse = serde_json::from_str(&response_json).unwrap();
     assert_eq!(response.node_kind, "identifier");
     assert_eq!(response.text.as_deref(), Some("foo"));
-    assert!(response
-        .parent_chain
-        .contains(&"function_definition".to_string()));
+    assert!(
+        response
+            .parent_chain
+            .contains(&"function_definition".to_string())
+    );
     assert_eq!(
         response
             .handoff
@@ -395,10 +397,12 @@ fn test_unsupported_language_error() {
     };
     let result = code_query(&params);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("unsupported source file extension"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported source file extension")
+    );
 }
 
 /// Every code-nav tool must emit `semantic_status = "syntax_only"` at the
@@ -618,8 +622,7 @@ fn code_symbols_live_skips_oversize_files_with_typed_error() {
         response
             .errors
             .iter()
-            .any(|e| e.file.contains("huge.rs")
-                && e.error.contains("file_too_large_for_code_nav")),
+            .any(|e| e.file.contains("huge.rs") && e.error.contains("file_too_large_for_code_nav")),
         "expected huge.rs in errors[] with file_too_large code, got {:?}",
         response.errors
     );
@@ -814,8 +817,7 @@ fn indexed_lane_item_kinds_matches_both_synthetic_and_raw_for_rust_impl_method()
         Some(&index),
     )
     .unwrap();
-    let function_response: CodeSymbolSearchResponse =
-        serde_json::from_str(&function_json).unwrap();
+    let function_response: CodeSymbolSearchResponse = serde_json::from_str(&function_json).unwrap();
     let names: std::collections::HashSet<&str> = function_response
         .items
         .iter()
@@ -860,7 +862,12 @@ fn code_refs_rust_calls_resolve_containing_symbol() {
     assert_eq!(response.language, "rust");
     assert_eq!(response.kind_filter, "calls");
     assert_eq!(response.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
-    assert!(response.refs.iter().all(|r| r.edge_confidence == "heuristic"));
+    assert!(
+        response
+            .refs
+            .iter()
+            .all(|r| r.edge_confidence == "heuristic")
+    );
     let names: std::collections::HashSet<&str> =
         response.refs.iter().map(|r| r.name.as_str()).collect();
     assert!(
@@ -930,7 +937,10 @@ fn code_refs_python_identifiers_with_query_filter() {
     assert_eq!(response.status, "ok");
     assert_eq!(response.language, "python");
     assert!(response.refs.iter().all(|r| r.name.contains("beta")));
-    assert!(response.matching_refs >= 2, "expected at least 2 beta identifiers");
+    assert!(
+        response.matching_refs >= 2,
+        "expected at least 2 beta identifiers"
+    );
 }
 
 /// Unsupported language + non-identifier kind returns a typed
@@ -1025,7 +1035,10 @@ fn code_refs_all_kind_returns_union_in_byte_order() {
     let response: CodeRefsResponse = serde_json::from_str(&json).unwrap();
     let kinds: std::collections::HashSet<&str> =
         response.refs.iter().map(|r| r.kind.as_str()).collect();
-    assert!(kinds.contains("identifier"), "expected identifier refs in 'all'");
+    assert!(
+        kinds.contains("identifier"),
+        "expected identifier refs in 'all'"
+    );
     assert!(
         kinds.contains("call"),
         "expected call refs in 'all'; got {:?}",
@@ -1036,7 +1049,11 @@ fn code_refs_all_kind_returns_union_in_byte_order() {
         assert!(
             window[0].byte_range.0 <= window[1].byte_range.0,
             "refs must be sorted by byte_start; got {:?}",
-            response.refs.iter().map(|r| r.byte_range).collect::<Vec<_>>()
+            response
+                .refs
+                .iter()
+                .map(|r| r.byte_range)
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -1130,11 +1147,7 @@ fn code_refs_records_carry_handoff_with_pre_filled_args() {
 #[test]
 fn code_refs_truncation_reports_limit_reached() {
     let dir = TempDir::new().unwrap();
-    let file = setup_test_file(
-        &dir,
-        "src/lib.rs",
-        "fn main() { a; b; c; d; e; }\n",
-    );
+    let file = setup_test_file(&dir, "src/lib.rs", "fn main() { a; b; c; d; e; }\n");
     let json = code_refs(&CodeRefsParams {
         file,
         project_dir: None,
@@ -1181,7 +1194,11 @@ fn code_symbols_dispatch_defaults_to_live_when_no_index() {
 #[test]
 fn test_code_symbols_rejects_unregistered_project_dir() {
     let dir = TempDir::new().unwrap();
-    setup_test_file(&dir, "src/main/java/Test.java", "class Test { void run() {} }\n");
+    setup_test_file(
+        &dir,
+        "src/main/java/Test.java",
+        "class Test { void run() {} }\n",
+    );
     let params = CodeSymbolSearchParams {
         project_dir: dir.path().to_string_lossy().into_owned(),
         query: None,
@@ -1208,7 +1225,11 @@ fn test_code_symbols_rejects_unregistered_project_dir() {
 #[test]
 fn test_code_symbols_accepts_descendant_of_registered_root() {
     let dir = TempDir::new().unwrap();
-    setup_test_file(&dir, "src/main/java/Test.java", "class Test { void run() {} }\n");
+    setup_test_file(
+        &dir,
+        "src/main/java/Test.java",
+        "class Test { void run() {} }\n",
+    );
     let params = CodeSymbolSearchParams {
         project_dir: dir
             .path()

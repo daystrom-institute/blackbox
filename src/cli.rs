@@ -6,7 +6,7 @@
     clippy::type_complexity,
     clippy::large_enum_variant,
     clippy::enum_variant_names,
-    clippy::let_and_return,
+    clippy::let_and_return
 )]
 
 //! `bro tail` — multi-lane transcript tail for agent orchestration.
@@ -32,7 +32,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -41,9 +41,9 @@ use serde::Deserialize;
 mod council_tui;
 mod parser;
 use parser::{
-    parse_codex_line_rich, parse_copilot_line_rich, parse_gemini_file_rich,
-    parse_transcript_line_rich, parse_vibe_line_rich, EventDetail, MessageRole, SystemSignalKind,
-    TranscriptEvent,
+    EventDetail, MessageRole, SystemSignalKind, TranscriptEvent, parse_codex_line_rich,
+    parse_copilot_line_rich, parse_gemini_file_rich, parse_transcript_line_rich,
+    parse_vibe_line_rich,
 };
 
 // ── Roster fetch ────────────────────────────────────────────────────
@@ -417,9 +417,10 @@ async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
                 }
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload)
                     && let Some(signal) = parse_lane_signal(&value)
-                        && tx.send(signal).is_err() {
-                            return;
-                        }
+                    && tx.send(signal).is_err()
+                {
+                    return;
+                }
             }
         }
         // Stream ended — pause and reconnect.
@@ -615,17 +616,21 @@ impl Lane {
         session_id: Option<&str>,
     ) -> bool {
         if let Some(selector) = bro_selector
-            && selector == self.bro_selector {
-                return true;
-            }
+            && selector == self.bro_selector
+        {
+            return true;
+        }
         if let Some(b) = bro
-            && b == self.bro && self.team == "adhoc" {
-                return true;
-            }
+            && b == self.bro
+            && self.team == "adhoc"
+        {
+            return true;
+        }
         if let (Some(s), Some(lane_sid)) = (session_id, self.session_id.as_deref())
-            && s == lane_sid {
-                return true;
-            }
+            && s == lane_sid
+        {
+            return true;
+        }
         false
     }
 
@@ -693,13 +698,15 @@ impl Lane {
         };
 
         if self.session_id.is_none()
-            && let Some(sid) = session_id {
-                self.session_id = Some(sid.to_string());
-            }
+            && let Some(sid) = session_id
+        {
+            self.session_id = Some(sid.to_string());
+        }
         if self.jsonl_path.is_none()
-            && let Some(path) = jsonl_path {
-                self.jsonl_path = Some(PathBuf::from(path));
-            }
+            && let Some(path) = jsonl_path
+        {
+            self.jsonl_path = Some(PathBuf::from(path));
+        }
         if self.status != LaneStatus::Tailing
             && self.session_id.is_some()
             && self.jsonl_path.is_some()
@@ -1072,7 +1079,9 @@ async fn council_close(args: CouncilCloseArgs) -> anyhow::Result<()> {
 }
 
 async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
-    let base_url = args.url.unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
+    let base_url = args
+        .url
+        .unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
     let mut url = format!("{}/orchestrate/peek", base_url.trim_end_matches('/'));
     if let Some(tid) = &args.thread_id {
         url.push_str(&format!("?thread_id={}", urlencoding_lite(tid)));
@@ -1145,7 +1154,9 @@ async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
 }
 
 async fn orchestrate_list(args: OrchestrateListArgs) -> anyhow::Result<()> {
-    let base_url = args.url.unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
+    let base_url = args
+        .url
+        .unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
     let url = format!("{}/orchestrate/list", base_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let resp = client.get(&url).send().await?;
@@ -1189,7 +1200,9 @@ async fn orchestrate_list(args: OrchestrateListArgs) -> anyhow::Result<()> {
 }
 
 async fn orchestrate_status(args: OrchestrateStatusArgs) -> anyhow::Result<()> {
-    let base_url = args.url.unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
+    let base_url = args
+        .url
+        .unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
     let url = format!(
         "{}/orchestrate/status?thread_id={}",
         base_url.trim_end_matches('/'),
@@ -1253,7 +1266,9 @@ async fn orchestrate_run(args: OrchestrateRunArgs) -> anyhow::Result<()> {
         .with_context(|| format!("reading {}", args.path.display()))?;
     let workflow: serde_json::Value = serde_json::from_str(&workflow_raw)
         .with_context(|| format!("parsing {} as JSON", args.path.display()))?;
-    let base_url = args.url.unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
+    let base_url = args
+        .url
+        .unwrap_or_else(|| default_base_url().unwrap_or_else(|_| "http://127.0.0.1:7264".into()));
     let mut body = serde_json::json!({ "workflow": workflow });
     if let Some(pd) = args.project_dir {
         body["project_dir"] = serde_json::Value::String(pd);
@@ -1659,18 +1674,20 @@ fn handle_mouse(app: &mut App, ev: MouseEvent) {
                 return;
             }
             if let Some(idx) = lane_at(&app.lane_columns, col)
-                && let Some(l) = app.lanes.get_mut(idx) {
-                    l.scroll_from_bottom = l.scroll_from_bottom.saturating_add(3);
-                }
+                && let Some(l) = app.lanes.get_mut(idx)
+            {
+                l.scroll_from_bottom = l.scroll_from_bottom.saturating_add(3);
+            }
         }
         MouseEventKind::ScrollDown => {
             if !in_body {
                 return;
             }
             if let Some(idx) = lane_at(&app.lane_columns, col)
-                && let Some(l) = app.lanes.get_mut(idx) {
-                    l.scroll_from_bottom = l.scroll_from_bottom.saturating_sub(3);
-                }
+                && let Some(l) = app.lanes.get_mut(idx)
+            {
+                l.scroll_from_bottom = l.scroll_from_bottom.saturating_sub(3);
+            }
         }
         _ => {}
     }
@@ -2042,14 +2059,15 @@ fn phase_now(period_ms: u64) -> u64 {
 fn activity_badge(lane: &Lane) -> Span<'static> {
     let now = Instant::now();
     if let Some((t, _)) = &lane.last_failure
-        && now.duration_since(*t) < Duration::from_secs(5) {
-            let bright = phase_now(400) < 200;
-            let color = if bright { Color::Red } else { Color::DarkGray };
-            return Span::styled(
-                " ⚠ FAILED ",
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            );
-        }
+        && now.duration_since(*t) < Duration::from_secs(5)
+    {
+        let bright = phase_now(400) < 200;
+        let color = if bright { Color::Red } else { Color::DarkGray };
+        return Span::styled(
+            " ⚠ FAILED ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        );
+    }
     if lane.active_tasks.is_empty() {
         return Span::raw("");
     }
@@ -2084,12 +2102,13 @@ fn activity_badge(lane: &Lane) -> Span<'static> {
 fn snippet_line(lane: &Lane) -> Line<'static> {
     if lane.active_tasks.is_empty() {
         if let Some((t, err)) = &lane.last_failure
-            && Instant::now().duration_since(*t) < Duration::from_secs(5) {
-                return Line::from(Span::styled(
-                    format!(" ✗ {err}"),
-                    Style::default().fg(Color::Red),
-                ));
-            }
+            && Instant::now().duration_since(*t) < Duration::from_secs(5)
+        {
+            return Line::from(Span::styled(
+                format!(" ✗ {err}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
         return Line::from("");
     }
     let snippet = lane.last_progress_snippet.as_deref().unwrap_or("…");
@@ -2297,12 +2316,13 @@ pub(crate) fn stitch_ordered_list_markers(lines: Vec<Line<'static>>) -> Vec<Line
     let mut iter = lines.into_iter().peekable();
     while let Some(line) = iter.next() {
         if is_ordered_list_marker_only(&line)
-            && let Some(next) = iter.next() {
-                let mut spans = line.spans;
-                spans.extend(next.spans);
-                out.push(Line::from(spans));
-                continue;
-            }
+            && let Some(next) = iter.next()
+        {
+            let mut spans = line.spans;
+            spans.extend(next.spans);
+            out.push(Line::from(spans));
+            continue;
+        }
         out.push(line);
     }
     out

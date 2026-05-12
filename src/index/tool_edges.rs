@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use super::{project_files, ReindexConfig};
+use super::{ReindexConfig, project_files};
 use crate::chunker::{EdgeConfidence, EdgeProvenance};
 use crate::edge_index::Edge;
 use crate::entity_ref::EntityRef;

@@ -44,7 +44,8 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
     // extract_java_class already does. Without this the emitted file
     // has no package decl and no imports, so every type reference
     // fails javac with `cannot find symbol`.
-    let target_package = resolve_java_target_package(p, &parsed.source, &source_path, &target_path)?;
+    let target_package =
+        resolve_java_target_package(p, &parsed.source, &source_path, &target_path)?;
     let source_package = extract_java_package(&parsed.source);
     let cross_package = match (source_package.as_deref(), target_package.as_deref()) {
         (Some(src), Some(tgt)) => src != tgt,
@@ -75,7 +76,12 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
         let raw = parsed
             .source
             .get(class_item.item.leading_trivia_start..class_item.item.byte_end)
-            .ok_or_else(|| anyhow!("invalid nested class range for `{}`", class_item.item.name.as_deref().unwrap_or("(unnamed)")))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid nested class range for `{}`",
+                    class_item.item.name.as_deref().unwrap_or("(unnamed)")
+                )
+            })?;
         let rewritten = rewrite_top_level_class_modifiers(raw, cross_package)?;
         extracted_content.push(rewritten);
     }
@@ -99,8 +105,11 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
         let inner_type_decls =
             collect_sibling_inner_type_names(class_node, &parsed.source, &moved_names);
         if !inner_type_decls.is_empty() {
-            let referenced =
-                qualify_inner_type_refs_in_text(&mut target_content, &inner_type_decls, &source_class_name);
+            let referenced = qualify_inner_type_refs_in_text(
+                &mut target_content,
+                &inner_type_decls,
+                &source_class_name,
+            );
             if !referenced.is_empty() && cross_package {
                 if let Some(src_pkg) = source_package.as_deref() {
                     let fqcn = format!("{src_pkg}.{source_class_name}");
@@ -522,10 +531,7 @@ fn source_references_simple_name_outside(
             continue;
         }
         // Skip nodes inside any deletion range.
-        if deletion_ranges
-            .iter()
-            .any(|(ds, de)| s >= *ds && e <= *de)
-        {
+        if deletion_ranges.iter().any(|(ds, de)| s >= *ds && e <= *de) {
             continue;
         }
         // Skip the moved class's own declaration site (its name_node).
@@ -885,7 +891,9 @@ pub(crate) fn plan_rewrite_java_visibility(p: &RefactorPlanParams) -> Result<Str
         target_visibility,
         "public" | "protected" | "private" | "package"
     ) {
-        bail!("visibility must be one of: public, protected, private, package; got `{target_visibility}`");
+        bail!(
+            "visibility must be one of: public, protected, private, package; got `{target_visibility}`"
+        );
     }
 
     let names = p.item_names.as_deref().unwrap_or_default();

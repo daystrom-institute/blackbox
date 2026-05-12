@@ -2,13 +2,13 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tree_sitter::Node;
 use tree_sitter_language_pack::{
-    get_parser, process, ProcessConfig, ProcessResult, StructureItem, StructureKind,
+    ProcessConfig, ProcessResult, StructureItem, StructureKind, get_parser, process,
 };
 
-use super::{placeholder_chunk, Chunk, Edge, SourceFormatChunker};
+use super::{Chunk, Edge, SourceFormatChunker, placeholder_chunk};
 
 pub struct CodeChunker;
 
@@ -361,10 +361,7 @@ fn collect_ast_symbols(
             byte_start: node.start_byte(),
             byte_end: node.end_byte(),
         });
-        stack.push(SymbolStackFrame {
-            display_name,
-            kind,
-        });
+        stack.push(SymbolStackFrame { display_name, kind });
         walk_children(node, source, language, stack, out);
         stack.pop();
     } else {
@@ -572,7 +569,10 @@ mod tests {
 
         let struct_chunk = chunks
             .iter()
-            .find(|c| c.symbol_exact.as_deref() == Some("S") && c.symbol_kind.as_deref() == Some("struct_item"))
+            .find(|c| {
+                c.symbol_exact.as_deref() == Some("S")
+                    && c.symbol_kind.as_deref() == Some("struct_item")
+            })
             .expect("struct chunk present with symbol_kind=struct_item");
         assert_eq!(struct_chunk.parent_kind, None);
         assert_eq!(struct_chunk.line_start, Some(1));
@@ -617,9 +617,11 @@ impl Display for EntityRef {
         let (chunks, _edges) = CodeChunker
             .chunk(Path::new("src/entity_ref.rs"), source)
             .unwrap();
-        assert!(chunks
-            .iter()
-            .any(|chunk| chunk.content.contains("impl Display for EntityRef")));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.content.contains("impl Display for EntityRef"))
+        );
         assert!(chunks.iter().any(|chunk| chunk.symbol.is_some()));
     }
 

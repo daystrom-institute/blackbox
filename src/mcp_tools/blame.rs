@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::json;
@@ -191,11 +191,7 @@ fn matching_anchors<'a>(
             same_commit.push(edge);
         }
     }
-    if exact.is_empty() {
-        same_commit
-    } else {
-        exact
-    }
+    if exact.is_empty() { same_commit } else { exact }
 }
 
 fn prior_read_edges<'a>(edge_index: &'a EdgeIndex, edit_edge: &Edge) -> Vec<&'a Edge> {

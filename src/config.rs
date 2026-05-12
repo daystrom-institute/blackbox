@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use figment::{
-    providers::{Format, Serialized, Toml},
     Figment,
+    providers::{Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
 
@@ -133,13 +133,27 @@ struct RawDaemonConfig {
     pub poller_min_interval_secs: u64,
 }
 
-fn default_daemon_port() -> u16 { 7264 }
-fn default_daemon_bind() -> String { "127.0.0.1".to_string() }
-fn default_daemon_mcp_name() -> String { "blackbox".to_string() }
-fn default_daemon_shutdown_grace_secs() -> u64 { 15 }
-fn default_daemon_task_ttl_ms() -> u64 { 86400000 } // 24 hours
-fn default_daemon_mcp_session_keepalive_secs() -> u64 { 21600 } // 6 hours
-fn default_daemon_poller_min_interval_secs() -> u64 { 5 }
+fn default_daemon_port() -> u16 {
+    7264
+}
+fn default_daemon_bind() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_daemon_mcp_name() -> String {
+    "blackbox".to_string()
+}
+fn default_daemon_shutdown_grace_secs() -> u64 {
+    15
+}
+fn default_daemon_task_ttl_ms() -> u64 {
+    86400000
+} // 24 hours
+fn default_daemon_mcp_session_keepalive_secs() -> u64 {
+    21600
+} // 6 hours
+fn default_daemon_poller_min_interval_secs() -> u64 {
+    5
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawIndexConfig {
@@ -153,8 +167,12 @@ struct RawIndexConfig {
     pub edge_index_boot_rebuild: bool,
 }
 
-fn default_index_reindex_interval_secs() -> u64 { 120 }
-fn default_index_edge_index_boot_rebuild() -> bool { true }
+fn default_index_reindex_interval_secs() -> u64 {
+    120
+}
+fn default_index_edge_index_boot_rebuild() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawProvenanceConfig {
@@ -162,7 +180,9 @@ struct RawProvenanceConfig {
     pub git_notes_namespace: String,
 }
 
-fn default_provenance_git_notes_namespace() -> String { "bb".to_string() }
+fn default_provenance_git_notes_namespace() -> String {
+    "bb".to_string()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawProviderConfig {
@@ -191,10 +211,18 @@ struct RawLspConfig {
     pub rust_analyzer_bin: Option<String>,
 }
 
-fn default_lsp_idle_timeout_secs() -> u64 { 600 }
-fn default_lsp_request_timeout_secs() -> u64 { 30 }
-fn default_lsp_jdtls_init_timeout_secs() -> u64 { 60 }
-fn default_lsp_rust_analyzer_init_timeout_secs() -> u64 { 60 }
+fn default_lsp_idle_timeout_secs() -> u64 {
+    600
+}
+fn default_lsp_request_timeout_secs() -> u64 {
+    30
+}
+fn default_lsp_jdtls_init_timeout_secs() -> u64 {
+    60
+}
+fn default_lsp_rust_analyzer_init_timeout_secs() -> u64 {
+    60
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawTranscriptConfig {
@@ -338,7 +366,7 @@ impl Config {
     fn raw_defaults(home: &Path) -> RawConfig {
         let _state_dir = crate::util::blackbox_state_dir(home);
         let _data_dir = dirs::data_dir().unwrap_or_else(|| home.join(".local").join("share"));
-        
+
         RawConfig {
             daemon: RawDaemonConfig {
                 port: default_daemon_port(),
@@ -396,106 +424,123 @@ impl Config {
 /// This is a whitelist approach - only explicitly mapped env vars are admitted.
 fn apply_explicit_env(raw: RawConfig) -> RawConfig {
     let mut raw = raw;
-    
+
     // Daemon settings
     if let Ok(port) = std::env::var("BBOX_PORT")
         && !port.trim().is_empty()
-            && let Ok(p) = port.parse() {
-                raw.daemon.port = p;
-            }
-    
+        && let Ok(p) = port.parse()
+    {
+        raw.daemon.port = p;
+    }
+
     if let Ok(bind) = std::env::var("BBOX_BIND")
-        && !bind.trim().is_empty() {
-            raw.daemon.bind = bind;
-        }
-    
+        && !bind.trim().is_empty()
+    {
+        raw.daemon.bind = bind;
+    }
+
     if let Ok(mcp_name) = std::env::var("BLACKBOX_MCP_NAME")
-        && !mcp_name.trim().is_empty() {
-            raw.daemon.mcp_name = mcp_name;
-        }
-    
+        && !mcp_name.trim().is_empty()
+    {
+        raw.daemon.mcp_name = mcp_name;
+    }
+
     if let Ok(keepalive) = std::env::var("BBOX_MCP_SESSION_KEEPALIVE_SECS")
         && !keepalive.trim().is_empty()
-            && let Ok(k) = keepalive.parse() {
-                raw.daemon.mcp_session_keepalive_secs = k;
-            }
-    
+        && let Ok(k) = keepalive.parse()
+    {
+        raw.daemon.mcp_session_keepalive_secs = k;
+    }
+
     // shutdown_grace_secs
     if let Ok(grace) = std::env::var("BLACKBOX_SHUTDOWN_GRACE_SECS")
         && !grace.trim().is_empty()
-            && let Ok(g) = grace.parse() {
-                raw.daemon.shutdown_grace_secs = g;
-            }
-    
+        && let Ok(g) = grace.parse()
+    {
+        raw.daemon.shutdown_grace_secs = g;
+    }
+
     // task_ttl_ms: BRO_TASK_TTL_MS legacy alias
     if let Ok(ttl) = std::env::var("BRO_TASK_TTL_MS")
         && !ttl.trim().is_empty()
-            && let Ok(t) = ttl.parse() {
-                raw.daemon.task_ttl_ms = t;
-            }
-    
+        && let Ok(t) = ttl.parse()
+    {
+        raw.daemon.task_ttl_ms = t;
+    }
+
     // poller_min_interval_secs
     if let Ok(interval) = std::env::var("BBOX_POLLER_MIN_INTERVAL_SECS")
         && !interval.trim().is_empty()
-            && let Ok(i) = interval.parse() {
-                raw.daemon.poller_min_interval_secs = i;
-            }
+        && let Ok(i) = interval.parse()
+    {
+        raw.daemon.poller_min_interval_secs = i;
+    }
 
     // Paths settings
     if let Ok(home) = std::env::var("BRO_HOME")
-        && !home.trim().is_empty() {
-            raw.paths.bro_home = Some(PathBuf::from(home));
-        }
-    
+        && !home.trim().is_empty()
+    {
+        raw.paths.bro_home = Some(PathBuf::from(home));
+    }
+
     // Index settings
     if let Ok(reindex) = std::env::var("BLACKBOX_REINDEX_INTERVAL_SECS")
         && !reindex.trim().is_empty()
-            && let Ok(r) = reindex.parse() {
-                raw.index.reindex_interval_secs = r;
-            }
-    
+        && let Ok(r) = reindex.parse()
+    {
+        raw.index.reindex_interval_secs = r;
+    }
+
     // edge_index_boot_rebuild
     if let Ok(val) = std::env::var("BLACKBOX_EDGE_INDEX_BOOT_REBUILD")
-        && !val.trim().is_empty() {
-            raw.index.edge_index_boot_rebuild = val == "1" || val.eq_ignore_ascii_case("true");
-        }
-    
+        && !val.trim().is_empty()
+    {
+        raw.index.edge_index_boot_rebuild = val == "1" || val.eq_ignore_ascii_case("true");
+    }
+
     // Provenance settings
     if let Ok(ns) = std::env::var("BBOX_GIT_NOTES_NAMESPACE")
-        && !ns.trim().is_empty() {
-            raw.provenance.git_notes_namespace = ns;
-        }
-    
+        && !ns.trim().is_empty()
+    {
+        raw.provenance.git_notes_namespace = ns;
+    }
+
     // LSP settings
     if let Ok(timeout) = std::env::var("BLACKBOX_LSP_IDLE_SECS")
         && !timeout.trim().is_empty()
-            && let Ok(t) = timeout.parse() {
-                raw.lsp.idle_timeout_secs = t;
-            }
+        && let Ok(t) = timeout.parse()
+    {
+        raw.lsp.idle_timeout_secs = t;
+    }
     if let Ok(timeout) = std::env::var("BLACKBOX_JDTLS_TIMEOUT_SECS")
         && !timeout.trim().is_empty()
-            && let Ok(t) = timeout.parse() {
-                raw.lsp.request_timeout_secs = t;
-            }
+        && let Ok(t) = timeout.parse()
+    {
+        raw.lsp.request_timeout_secs = t;
+    }
     if let Ok(timeout) = std::env::var("BLACKBOX_JDTLS_INIT_TIMEOUT_SECS")
         && !timeout.trim().is_empty()
-            && let Ok(t) = timeout.parse() {
-                raw.lsp.jdtls_init_timeout_secs = t;
-            }
+        && let Ok(t) = timeout.parse()
+    {
+        raw.lsp.jdtls_init_timeout_secs = t;
+    }
     if let Ok(timeout) = std::env::var("BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS")
         && !timeout.trim().is_empty()
-            && let Ok(t) = timeout.parse() {
-                raw.lsp.rust_analyzer_init_timeout_secs = t;
-            }
+        && let Ok(t) = timeout.parse()
+    {
+        raw.lsp.rust_analyzer_init_timeout_secs = t;
+    }
     if let Ok(bin) = std::env::var("BLACKBOX_JDTLS_BIN")
-        && !bin.trim().is_empty() {
-            raw.lsp.jdtls_bin = Some(bin);
-        }
+        && !bin.trim().is_empty()
+    {
+        raw.lsp.jdtls_bin = Some(bin);
+    }
     if let Ok(bin) = std::env::var("BLACKBOX_RUST_ANALYZER_BIN")
-        && !bin.trim().is_empty() {
-            raw.lsp.rust_analyzer_bin = Some(bin);
-        }
-    
+        && !bin.trim().is_empty()
+    {
+        raw.lsp.rust_analyzer_bin = Some(bin);
+    }
+
     // Provider bins
     macro_rules! set_provider_bin {
         ($env_var:expr, $field:ident) => {
@@ -506,36 +551,40 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
             }
         };
     }
-    
+
     set_provider_bin!("CLAUDE_BIN", claude_bin);
     set_provider_bin!("CODEX_BIN", codex_bin);
     set_provider_bin!("GEMINI_BIN", gemini_bin);
     set_provider_bin!("COPILOT_BIN", copilot_bin);
     set_provider_bin!("OPENCODE_BIN", opencode_bin);
     set_provider_bin!("VIBE_BIN", vibe_bin);
-    
+
     // VIBE_SESSION_DIR
     if let Ok(dir) = std::env::var("VIBE_SESSION_DIR")
-        && !dir.trim().is_empty() {
-            raw.providers.vibe_session_dir = Some(PathBuf::from(dir));
-        }
-    
+        && !dir.trim().is_empty()
+    {
+        raw.providers.vibe_session_dir = Some(PathBuf::from(dir));
+    }
+
     // Transcript roots
     if let Ok(roots) = std::env::var("TRANSCRIPT_SEARCH_ROOTS")
-        && !roots.trim().is_empty() {
-            raw.transcripts.roots = Some(roots);
-        }
-    
+        && !roots.trim().is_empty()
+    {
+        raw.transcripts.roots = Some(roots);
+    }
+
     // Transcript codex root
     if let Ok(root) = std::env::var("TRANSCRIPT_SEARCH_CODEX_ROOT")
-        && !root.trim().is_empty() {
-            raw.transcripts.codex_root = Some(PathBuf::from(root));
-        }
+        && !root.trim().is_empty()
+    {
+        raw.transcripts.codex_root = Some(PathBuf::from(root));
+    }
     if let Ok(roots) = std::env::var("TRANSCRIPT_SEARCH_ROOTS")
-        && !roots.trim().is_empty() {
-            raw.transcripts.roots = Some(roots);
-        }
-    
+        && !roots.trim().is_empty()
+    {
+        raw.transcripts.roots = Some(roots);
+    }
+
     raw
 }
 
@@ -547,40 +596,36 @@ pub fn load() -> Result<Config> {
 /// Load configuration with custom options.
 pub fn load_with(options: LoadOptions) -> Result<Config> {
     // Determine config file path
-    let config_path = options.config_path
-        .clone()
-        .or_else(selected_config_path);
-    
+    let config_path = options.config_path.clone().or_else(selected_config_path);
+
     // Get home directory for default paths
-    let home = dirs::home_dir()
-        .context("Cannot determine home directory")?;
-    
+    let home = dirs::home_dir().context("Cannot determine home directory")?;
+
     // Build the figment provider stack
     let mut figment = Figment::new();
-    
+
     // Add defaults as the lowest priority
     figment = figment.merge(Serialized::defaults(Config::raw_defaults(&home)));
-    
+
     // Add file provider if path exists (medium priority)
     if let Some(path) = &config_path
-        && path.exists() {
-            figment = figment.merge(Toml::file(path));
-        }
-        // Missing config file is not an error - just skip merging
-    
-    let mut raw: RawConfig = figment
-        .extract()
-        .context("Failed to load configuration")?;
-    
+        && path.exists()
+    {
+        figment = figment.merge(Toml::file(path));
+    }
+    // Missing config file is not an error - just skip merging
+
+    let mut raw: RawConfig = figment.extract().context("Failed to load configuration")?;
+
     // Apply explicit env var overrides (highest priority for env-based settings)
     raw = apply_explicit_env(raw);
-    
+
     // Apply overrides from flag_overrides manually
     raw = apply_flag_overrides(raw, options.flag_overrides);
-    
+
     // Resolve paths
     let paths = resolve_paths(&raw, &home)?;
-    
+
     // Build final config
     Ok(Config {
         daemon: DaemonConfig {
@@ -674,7 +719,7 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     if let Some(poller_min_interval_secs) = overrides.daemon.poller_min_interval_secs {
         raw.daemon.poller_min_interval_secs = poller_min_interval_secs;
     }
-    
+
     if let Some(reindex_interval_secs) = overrides.index.reindex_interval_secs {
         raw.index.reindex_interval_secs = reindex_interval_secs;
     }
@@ -687,7 +732,7 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     if let Some(edge_index_boot_rebuild) = overrides.index.edge_index_boot_rebuild {
         raw.index.edge_index_boot_rebuild = edge_index_boot_rebuild;
     }
-    
+
     // Apply provider overrides
     if let Some(claude_bin) = overrides.providers.claude_bin {
         raw.providers.claude_bin = claude_bin;
@@ -713,7 +758,7 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     if let Some(extra_path) = overrides.providers.extra_path {
         raw.providers.extra_path = extra_path;
     }
-    
+
     // Apply LSP overrides
     if let Some(idle_timeout_secs) = overrides.lsp.idle_timeout_secs {
         raw.lsp.idle_timeout_secs = idle_timeout_secs;
@@ -733,7 +778,7 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     if let Some(rust_analyzer_bin) = overrides.lsp.rust_analyzer_bin {
         raw.lsp.rust_analyzer_bin = rust_analyzer_bin;
     }
-    
+
     // Apply transcript overrides
     if let Some(roots) = overrides.transcripts.roots {
         raw.transcripts.roots = roots;
@@ -741,7 +786,7 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     if let Some(codex_root) = overrides.transcripts.codex_root {
         raw.transcripts.codex_root = codex_root;
     }
-    
+
     // Apply roadmap overrides
     if let Some(write_path) = overrides.roadmap.write_path {
         raw.roadmap.write_path = write_path;
@@ -749,7 +794,7 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     if let Some(template_path) = overrides.roadmap.template_path {
         raw.roadmap.template_path = template_path;
     }
-    
+
     raw
 }
 
@@ -771,11 +816,13 @@ fn expand_tilde(s: &str, home: &Path) -> Result<PathBuf> {
 /// Resolve all path configurations from raw inputs and home directory.
 fn resolve_paths(raw: &RawConfig, home: &Path) -> Result<ResolvedPathConfig> {
     // Start with state_dir from config or default
-    let state_dir = raw.paths.state_dir
+    let state_dir = raw
+        .paths
+        .state_dir
         .clone()
         .map(|p| expand_tilde(&p.to_string_lossy(), home))
         .transpose()?;
-    
+
     // Check for legacy BLACKBOX_STATE_DIR env var - overrides config file
     let state_dir = if let Ok(env_state_dir) = std::env::var("BLACKBOX_STATE_DIR") {
         if !env_state_dir.trim().is_empty() {
@@ -786,99 +833,102 @@ fn resolve_paths(raw: &RawConfig, home: &Path) -> Result<ResolvedPathConfig> {
     } else {
         state_dir
     };
-    
+
     let state_dir = state_dir.unwrap_or_else(|| util::blackbox_state_dir(home));
-    
+
     let data_dir = dirs::data_dir().unwrap_or_else(|| home.join(".local").join("share"));
     let blackbox_data = data_dir.join("blackbox");
-    
+
     // Check for legacy TRANSCRIPT_SEARCH_INDEX_PATH
     let index_path = std::env::var("TRANSCRIPT_SEARCH_INDEX_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| blackbox_data.join("index"));
-    
+
     let knowledge_path = std::env::var("BLACKBOX_KNOWLEDGE_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("blackbox-knowledge.json"));
-    
+
     let threads_path = std::env::var("BLACKBOX_THREADS_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("blackbox-threads.json"));
-    
+
     let roadmap_path = std::env::var("BLACKBOX_ROADMAP_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("blackbox-roadmap.json"));
-    
+
     let notes_path = std::env::var("BLACKBOX_NOTES_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("blackbox-notes.json"));
-    
+
     let pins_path = std::env::var("BLACKBOX_PINS_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("blackbox-pins.json"));
-    
+
     let projects_path = std::env::var("BLACKBOX_PROJECTS_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("projects.json"));
-    
+
     let packets_dir = std::env::var("BLACKBOX_PACKETS_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("packets"));
-    
+
     let artifacts_dir = std::env::var("BLACKBOX_ARTIFACTS_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("artifacts"));
-    
-    let bro_home = raw.paths.bro_home.clone()
+
+    let bro_home = raw
+        .paths
+        .bro_home
+        .clone()
         .map(|p| expand_tilde(&p.to_string_lossy(), home))
         .transpose()?
         .unwrap_or_else(|| state_dir.join("bro"));
-    
+
     let backup_dir = state_dir.join("backups");
-    
+
     let home_path = home;
     let global_common_md = std::env::var("BLACKBOX_GLOBAL_COMMON_MD")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home_path.join(".blackbox").join("BLACKBOX.md"));
-    
+
     let global_claude_md = std::env::var("BLACKBOX_GLOBAL_CLAUDE_MD")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home_path.join(".claude").join("CLAUDE.md"));
-    
+
     let global_codex_md = std::env::var("BLACKBOX_GLOBAL_CODEX_MD")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home_path.join(".codex").join("AGENTS.md"));
-    
+
     let global_gemini_md = std::env::var("BLACKBOX_GLOBAL_GEMINI_MD")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home_path.join(".gemini").join("GEMINI.md"));
-    
+
     Ok(ResolvedPathConfig {
         state_dir,
         knowledge_path,
@@ -904,125 +954,202 @@ mod tests {
     use super::*;
     use std::env;
     use tempfile::tempdir;
-    
+
     #[test]
     fn config_defaults_match_current_daemon_behavior() {
         let _guard = crate::util::test_env_lock();
-        
+
         // Set a temp home
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+
         // Clear all config-related env vars
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BLACKBOX_STATE_DIR"); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        unsafe { env::remove_var("BBOX_BIND"); }
-        
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_STATE_DIR");
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+        unsafe {
+            env::remove_var("BBOX_BIND");
+        }
+
         let config = load().unwrap();
-        
+
         assert_eq!(config.daemon.port, 7264);
         assert_eq!(config.daemon.bind, "127.0.0.1");
         assert_eq!(config.daemon.mcp_name, "blackbox");
         assert_eq!(config.daemon.shutdown_grace_secs, 15);
         assert_eq!(config.daemon.mcp_session_keepalive_secs, 21600);
         assert_eq!(config.daemon.poller_min_interval_secs, 5);
-        
+
         assert_eq!(config.index.reindex_interval_secs, 120);
         assert!(config.index.edge_index_boot_rebuild);
-        
+
         assert_eq!(config.lsp.idle_timeout_secs, 600);
         assert_eq!(config.lsp.request_timeout_secs, 30);
     }
-    
+
     #[test]
     fn config_file_overrides_defaults() {
         let _guard = crate::util::test_env_lock();
-        
+
         // Save and clear env vars that might affect this test
         let orig_bbox_port = env::var("BBOX_PORT").ok();
         let orig_bbox_bind = env::var("BBOX_BIND").ok();
         let orig_blackbox_config = env::var("BLACKBOX_CONFIG").ok();
-        unsafe { env::remove_var("BBOX_PORT"); }
-        unsafe { env::remove_var("BBOX_BIND"); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+        unsafe {
+            env::remove_var("BBOX_BIND");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+
         // Create config file
         let config_dir = home.join(".config").join("blackbox");
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_path = config_dir.join("config.toml");
-        std::fs::write(&config_path, 
+        std::fs::write(
+            &config_path,
             r#"[daemon]
 port = 7300
 bind = "0.0.0.0"
-"#).unwrap();
-        
+"#,
+        )
+        .unwrap();
+
         // Explicitly set BLACKBOX_CONFIG to the test config
-        unsafe { env::set_var("BLACKBOX_CONFIG", &config_path.to_string_lossy().into_owned()); }
-        
+        unsafe {
+            env::set_var(
+                "BLACKBOX_CONFIG",
+                &config_path.to_string_lossy().into_owned(),
+            );
+        }
+
         let config = load().unwrap();
         assert_eq!(config.daemon.port, 7300);
         assert_eq!(config.daemon.bind, "0.0.0.0");
-        
+
         // Restore original env
-        if let Some(v) = orig_bbox_port { unsafe { env::set_var("BBOX_PORT", v) }; } else { unsafe { env::remove_var("BBOX_PORT") }; }
-        if let Some(v) = orig_bbox_bind { unsafe { env::set_var("BBOX_BIND", v) }; } else { unsafe { env::remove_var("BBOX_BIND") }; }
-        if let Some(v) = orig_blackbox_config { unsafe { env::set_var("BLACKBOX_CONFIG", v) }; } else { unsafe { env::remove_var("BLACKBOX_CONFIG") }; }
+        if let Some(v) = orig_bbox_port {
+            unsafe { env::set_var("BBOX_PORT", v) };
+        } else {
+            unsafe { env::remove_var("BBOX_PORT") };
+        }
+        if let Some(v) = orig_bbox_bind {
+            unsafe { env::set_var("BBOX_BIND", v) };
+        } else {
+            unsafe { env::remove_var("BBOX_BIND") };
+        }
+        if let Some(v) = orig_blackbox_config {
+            unsafe { env::set_var("BLACKBOX_CONFIG", v) };
+        } else {
+            unsafe { env::remove_var("BLACKBOX_CONFIG") };
+        }
     }
-    
+
     #[test]
     fn env_overrides_config_file() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+
         // Create config file with port 7300
         let config_dir = home.join(".config").join("blackbox");
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_path = config_dir.join("config.toml");
-        std::fs::write(&config_path, 
+        std::fs::write(
+            &config_path,
             r#"[daemon]
 port = 7300
-"#).unwrap();
-        
+"#,
+        )
+        .unwrap();
+
         // Set env to override
-        unsafe { env::set_var("BBOX_PORT", "7400"); }
-        
+        unsafe {
+            env::set_var("BBOX_PORT", "7400");
+        }
+
         let config = load().unwrap();
         assert_eq!(config.daemon.port, 7400);
     }
-    
+
     #[test]
     fn flag_overrides_env() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        
-        unsafe { env::set_var("BBOX_PORT", "7400"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+
+        unsafe {
+            env::set_var("BBOX_PORT", "7400");
+        }
+
         let overrides = LoadOptions {
             config_path: None,
             flag_overrides: ConfigOverrides {
@@ -1033,108 +1160,188 @@ port = 7300
                 ..Default::default()
             },
         };
-        
+
         let config = load_with(overrides).unwrap();
         assert_eq!(config.daemon.port, 7500);
     }
-    
+
     #[test]
     fn missing_config_file_is_ok() {
         let _guard = crate::util::test_env_lock();
-        
+
         // Save and clear env vars that might affect this test
         let orig_bbox_port = env::var("BBOX_PORT").ok();
         let orig_bbox_bind = env::var("BBOX_BIND").ok();
         let orig_blackbox_config = env::var("BLACKBOX_CONFIG").ok();
-        unsafe { env::remove_var("BBOX_PORT"); }
-        unsafe { env::remove_var("BBOX_BIND"); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+        unsafe {
+            env::remove_var("BBOX_BIND");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+
         // Don't create config file
         let config_dir = home.join(".config").join("blackbox");
         std::fs::create_dir_all(&config_dir).unwrap();
         // No config.toml created
-        
+
         let config = load().unwrap();
         assert_eq!(config.daemon.port, 7264); // defaults
-        
+
         // Restore original env
-        if let Some(v) = orig_bbox_port { unsafe { env::set_var("BBOX_PORT", v) }; } else { unsafe { env::remove_var("BBOX_PORT") }; }
-        if let Some(v) = orig_bbox_bind { unsafe { env::set_var("BBOX_BIND", v) }; } else { unsafe { env::remove_var("BBOX_BIND") }; }
-        if let Some(v) = orig_blackbox_config { unsafe { env::set_var("BLACKBOX_CONFIG", v) }; } else { unsafe { env::remove_var("BLACKBOX_CONFIG") }; }
+        if let Some(v) = orig_bbox_port {
+            unsafe { env::set_var("BBOX_PORT", v) };
+        } else {
+            unsafe { env::remove_var("BBOX_PORT") };
+        }
+        if let Some(v) = orig_bbox_bind {
+            unsafe { env::set_var("BBOX_BIND", v) };
+        } else {
+            unsafe { env::remove_var("BBOX_BIND") };
+        }
+        if let Some(v) = orig_blackbox_config {
+            unsafe { env::set_var("BLACKBOX_CONFIG", v) };
+        } else {
+            unsafe { env::remove_var("BLACKBOX_CONFIG") };
+        }
     }
-    
+
     #[test]
     fn malformed_config_file_errors() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+
         // Create malformed config file
         let config_dir = home.join(".config").join("blackbox");
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_path = config_dir.join("config.toml");
         std::fs::write(&config_path, "this is not valid toml [[[").unwrap();
-        
+
         let result = load();
         assert!(result.is_err());
     }
-    
+
     #[test]
     fn empty_path_env_is_ignored() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+
         // Set empty env var - should be ignored
-        unsafe { env::set_var("BLACKBOX_KNOWLEDGE_PATH", ""); }
-        
+        unsafe {
+            env::set_var("BLACKBOX_KNOWLEDGE_PATH", "");
+        }
+
         let config = load().unwrap();
         // Should use default path, not empty string
-        assert!(config.paths.knowledge_path.to_string_lossy().into_owned().contains("blackbox-knowledge.json"));
-        assert!(!config.paths.knowledge_path.to_string_lossy().into_owned().is_empty());
+        assert!(
+            config
+                .paths
+                .knowledge_path
+                .to_string_lossy()
+                .into_owned()
+                .contains("blackbox-knowledge.json")
+        );
+        assert!(
+            !config
+                .paths
+                .knowledge_path
+                .to_string_lossy()
+                .into_owned()
+                .is_empty()
+        );
     }
-    
+
     #[test]
     fn blackbox_config_env_selects_file() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+
         // Create a custom config at a non-default location
         let custom_config = home.join("custom-config.toml");
-        std::fs::write(&custom_config, 
+        std::fs::write(
+            &custom_config,
             r#"[daemon]
 port = 8000
-"#).unwrap();
-        
-        unsafe { env::set_var("BLACKBOX_CONFIG", &custom_config.to_string_lossy().into_owned()); }
-        
+"#,
+        )
+        .unwrap();
+
+        unsafe {
+            env::set_var(
+                "BLACKBOX_CONFIG",
+                &custom_config.to_string_lossy().into_owned(),
+            );
+        }
+
         let options = LoadOptions {
             config_path: Some(custom_config.clone()),
             flag_overrides: ConfigOverrides::default(),
@@ -1142,184 +1349,339 @@ port = 8000
         let config = load_with(options).unwrap();
         assert_eq!(config.daemon.port, 8000);
     }
-    
+
     #[test]
     fn mcp_session_keepalive_default_is_21600() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BBOX_MCP_SESSION_KEEPALIVE_SECS"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BBOX_MCP_SESSION_KEEPALIVE_SECS");
+        }
+
         let config = load().unwrap();
         assert_eq!(config.daemon.mcp_session_keepalive_secs, 21600);
     }
-    
+
     #[test]
     fn lsp_idle_default_is_600() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BLACKBOX_LSP_IDLE_SECS"); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_LSP_IDLE_SECS");
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+
         let config = load().unwrap();
         assert_eq!(config.lsp.idle_timeout_secs, 600);
     }
-    
+
     #[test]
     fn poller_min_default_is_5() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BBOX_POLLER_MIN_INTERVAL_SECS"); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BBOX_POLLER_MIN_INTERVAL_SECS");
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+
         let config = load().unwrap();
         assert_eq!(config.daemon.poller_min_interval_secs, 5);
     }
-    
+
     #[test]
     fn shutdown_grace_default_is_15() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BLACKBOX_SHUTDOWN_GRACE_SECS"); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_SHUTDOWN_GRACE_SECS");
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+
         let config = load().unwrap();
         assert_eq!(config.daemon.shutdown_grace_secs, 15);
     }
-    
+
     #[test]
     fn jdtls_request_timeout_default_is_30() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BLACKBOX_JDTLS_TIMEOUT_SECS"); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_JDTLS_TIMEOUT_SECS");
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+
         let config = load().unwrap();
         assert_eq!(config.lsp.request_timeout_secs, 30);
     }
-    
+
     #[test]
     fn bro_port_no_longer_overrides_bbox_port() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BBOX_BIND"); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        unsafe { env::set_var("BRO_PORT", "9999"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BBOX_BIND");
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+        unsafe {
+            env::set_var("BRO_PORT", "9999");
+        }
+
         let config = load().unwrap();
-        assert_ne!(config.daemon.port, 9999, "BRO_PORT should not override after Phase 5");
+        assert_ne!(
+            config.daemon.port, 9999,
+            "BRO_PORT should not override after Phase 5"
+        );
         assert_eq!(config.daemon.port, 7264);
-        
-        unsafe { env::remove_var("BRO_PORT"); }
+
+        unsafe {
+            env::remove_var("BRO_PORT");
+        }
     }
-    
+
     #[test]
     fn bro_store_no_longer_overrides_bro_home() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        unsafe { env::remove_var("BRO_HOME"); }
-        unsafe { env::set_var("BRO_STORE", "/tmp/bro-store"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+        unsafe {
+            env::remove_var("BRO_HOME");
+        }
+        unsafe {
+            env::set_var("BRO_STORE", "/tmp/bro-store");
+        }
+
         let config = load().unwrap();
-        assert_ne!(config.paths.bro_home.to_string_lossy(), "/tmp/bro-store", "BRO_STORE should not override after Phase 5");
-        
-        unsafe { env::remove_var("BRO_STORE"); }
+        assert_ne!(
+            config.paths.bro_home.to_string_lossy(),
+            "/tmp/bro-store",
+            "BRO_STORE should not override after Phase 5"
+        );
+
+        unsafe {
+            env::remove_var("BRO_STORE");
+        }
     }
-    
+
     #[test]
     fn rust_analyzer_alias_no_longer_used() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        unsafe { env::remove_var("BLACKBOX_RUST_ANALYZER_BIN"); }
-        unsafe { env::set_var("RUST_ANALYZER_BIN", "/legacy/rust-analyzer"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_RUST_ANALYZER_BIN");
+        }
+        unsafe {
+            env::set_var("RUST_ANALYZER_BIN", "/legacy/rust-analyzer");
+        }
+
         let config = load().unwrap();
-        assert_ne!(config.lsp.rust_analyzer_bin, Some("/legacy/rust-analyzer".to_string()),
-            "RUST_ANALYZER_BIN should not be accepted after Phase 5");
-        
-        unsafe { env::remove_var("RUST_ANALYZER_BIN"); }
+        assert_ne!(
+            config.lsp.rust_analyzer_bin,
+            Some("/legacy/rust-analyzer".to_string()),
+            "RUST_ANALYZER_BIN should not be accepted after Phase 5"
+        );
+
+        unsafe {
+            env::remove_var("RUST_ANALYZER_BIN");
+        }
     }
-    
+
     #[test]
     fn tilde_only_does_not_panic() {
         let _guard = crate::util::test_env_lock();
-        
+
         let dir = tempdir().unwrap();
         let home = dir.path();
-        unsafe { env::set_var("HOME", home); }
-        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")); }
-        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")); }
-        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")); }
-        unsafe { env::remove_var("BLACKBOX_CONFIG"); }
-        unsafe { env::remove_var("BLACKBOX_STATE_DIR"); }
-        unsafe { env::remove_var("BBOX_PORT"); }
-        
+        unsafe {
+            env::set_var("HOME", home);
+        }
+        unsafe {
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        }
+        unsafe {
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        }
+        unsafe {
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_CONFIG");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_STATE_DIR");
+        }
+        unsafe {
+            env::remove_var("BBOX_PORT");
+        }
+
         // Set state_dir to bare "~" in config file - should not panic
         let config_dir = home.join(".config").join("blackbox");
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_path = config_dir.join("config.toml");
-        std::fs::write(&config_path, r#"[paths]
+        std::fs::write(
+            &config_path,
+            r#"[paths]
 state_dir = "~"
-"#).unwrap();
-        unsafe { env::set_var("BLACKBOX_CONFIG", &config_path.to_string_lossy().into_owned()); }
-        
+"#,
+        )
+        .unwrap();
+        unsafe {
+            env::set_var(
+                "BLACKBOX_CONFIG",
+                &config_path.to_string_lossy().into_owned(),
+            );
+        }
+
         let config = load().unwrap();
         assert_eq!(config.paths.state_dir, home);
     }
@@ -1357,7 +1719,10 @@ state_dir = "~"
         project.roadmap.template_path = Some(PathBuf::from("/tmp/project-template.md"));
 
         let merged = merge_project(&base, &project);
-        assert_eq!(merged.roadmap.write_path, Some(PathBuf::from("/tmp/project-roadmap.json")));
+        assert_eq!(
+            merged.roadmap.write_path,
+            Some(PathBuf::from("/tmp/project-roadmap.json"))
+        );
         assert_eq!(
             merged.roadmap.template_path,
             Some(PathBuf::from("/tmp/project-template.md"))

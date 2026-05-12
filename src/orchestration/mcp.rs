@@ -23,10 +23,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::fs::symlink as make_file_symlink;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -419,11 +419,15 @@ pub(crate) fn migrate_project_mcp_path(project_dir: &Path) -> Result<()> {
     }
     if !new_exists {
         if let Some(parent) = canonical_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        fs::rename(&legacy_path, &canonical_path)
-            .with_context(|| format!("moving {} to {}", legacy_path.display(), canonical_path.display()))?;
+        fs::rename(&legacy_path, &canonical_path).with_context(|| {
+            format!(
+                "moving {} to {}",
+                legacy_path.display(),
+                canonical_path.display()
+            )
+        })?;
         make_project_symlink(&canonical_path, &legacy_path)?;
         return Ok(());
     }
@@ -728,7 +732,9 @@ fn register_one(provider: Provider, name: &str, url: &str) -> SelfRegisterOutcom
 /// NotInstalled (don't create it from scratch just for our entry —
 /// that's vibe's job).
 fn register_vibe_file_based(name: &str, url: &str) -> SelfRegisterOutcome {
-    let vibe_home = std::env::var("VIBE_HOME").ok().map(std::path::PathBuf::from);
+    let vibe_home = std::env::var("VIBE_HOME")
+        .ok()
+        .map(std::path::PathBuf::from);
     let config_path = match vibe_home {
         Some(p) => p.join("config.toml"),
         None => match dirs::home_dir() {
@@ -1386,9 +1392,7 @@ fn action_clear_filters(p: &McpToolParams) -> Result<String> {
 
 fn action_sync(p: &McpToolParams) -> Result<String> {
     let path = resolve_scope_path(p)?;
-    let store = crate::json_store::with_store_lock(&path.clone(), || {
-        McpStore::load(&path)
-    })?;
+    let store = crate::json_store::with_store_lock(&path.clone(), || McpStore::load(&path))?;
 
     let mut lines = vec![format!("Syncing {} server(s)…", store.servers.len())];
     for (name, cfg) in &store.servers {
@@ -1519,7 +1523,13 @@ mod tests {
 
         assert!(new_path.exists());
         assert!(legacy_path.exists());
-        assert!(legacy_path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(
+            legacy_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -1545,7 +1555,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", dir.path()); }
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(project.join(".bbox")).unwrap();
@@ -1583,9 +1595,7 @@ mod tests {
             },
             filters: McpFilters::default(),
         };
-        global
-            .save(&global_store_path().unwrap())
-            .unwrap();
+        global.save(&global_store_path().unwrap()).unwrap();
 
         let result = action_list(&McpToolParams {
             action: McpAction::List,
@@ -1735,10 +1745,11 @@ mod tests {
             Some(McpServerConfig::Http { url, .. }) if url == "http://new/mcp"
         ));
         assert_eq!(eff.filters.disallow.len(), 2);
-        assert!(eff
-            .filters
-            .disallow
-            .contains(&"Bash(git push *)".to_string()));
+        assert!(
+            eff.filters
+                .disallow
+                .contains(&"Bash(git push *)".to_string())
+        );
         assert!(eff.filters.disallow.contains(&"Edit(*)".to_string()));
     }
 
@@ -1883,7 +1894,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", tmp.path()); }
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
         let filters = McpFilters {
             disallow: vec!["mcp__blackbox__bro_*".into()],
             allow: vec![],
@@ -1906,7 +1919,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", tmp.path()); }
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
         let filters = McpFilters::default();
         assert!(write_gemini_policy_file("t", &filters).unwrap().is_none());
         match prior {
@@ -1920,7 +1935,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = crate::util::test_env_lock();
         let prior = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", tmp.path()); }
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
         let filters = McpFilters {
             disallow: vec!["Edit".into()],
             allow: vec![],
@@ -1939,7 +1956,10 @@ mod tests {
         let path = dir.path().join("mcp.json");
         let mut store = McpStore::new();
         let mut headers = BTreeMap::new();
-        headers.insert("X-Custom".to_string(), SecretString::Plain("hello".to_string()));
+        headers.insert(
+            "X-Custom".to_string(),
+            SecretString::Plain("hello".to_string()),
+        );
         store.servers.insert(
             "srv".into(),
             McpServerConfig::Http {
@@ -1951,8 +1971,14 @@ mod tests {
         store.save(&path).unwrap();
         // Verify the file contains the bare string (not a JSON object).
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("\"hello\""), "Plain variant must serialize as bare string");
-        assert!(!raw.contains("$secret"), "Plain variant must not emit $secret key");
+        assert!(
+            raw.contains("\"hello\""),
+            "Plain variant must serialize as bare string"
+        );
+        assert!(
+            !raw.contains("$secret"),
+            "Plain variant must not emit $secret key"
+        );
         // Reload and verify the type round-trips.
         let loaded = McpStore::load(&path).unwrap();
         match loaded.servers.get("srv").unwrap() {
@@ -1974,21 +2000,35 @@ mod tests {
                 let mut h = BTreeMap::new();
                 h.insert(
                     "Authorization".into(),
-                    SecretString::Secret { name: "MY_TEST_TOKEN_12345".into() },
+                    SecretString::Secret {
+                        name: "MY_TEST_TOKEN_12345".into(),
+                    },
                 );
                 h
             },
             exclude_tools: Vec::new(),
         };
         // Without the env var set, resolution must fail.
-        unsafe { std::env::remove_var("MY_TEST_TOKEN_12345"); }
-        assert!(cfg.resolve_secrets().is_err(), "missing secret must be an error");
+        unsafe {
+            std::env::remove_var("MY_TEST_TOKEN_12345");
+        }
+        assert!(
+            cfg.resolve_secrets().is_err(),
+            "missing secret must be an error"
+        );
 
         // With it set, resolution must succeed.
-        unsafe { std::env::set_var("MY_TEST_TOKEN_12345", "Bearer xyz123"); }
+        unsafe {
+            std::env::set_var("MY_TEST_TOKEN_12345", "Bearer xyz123");
+        }
         let resolved = cfg.resolve_secrets().unwrap();
-        assert_eq!(resolved.headers.get("Authorization").map(|s| s.as_str()), Some("Bearer xyz123"));
-        unsafe { std::env::remove_var("MY_TEST_TOKEN_12345"); }
+        assert_eq!(
+            resolved.headers.get("Authorization").map(|s| s.as_str()),
+            Some("Bearer xyz123")
+        );
+        unsafe {
+            std::env::remove_var("MY_TEST_TOKEN_12345");
+        }
     }
 
     #[test]
@@ -2001,16 +2041,25 @@ mod tests {
                 headers: {
                     let mut h = BTreeMap::new();
                     // Inline plain-text token in a project file should be rejected.
-                    h.insert("Authorization".into(), SecretString::Plain("Bearer secret".into()));
+                    h.insert(
+                        "Authorization".into(),
+                        SecretString::Plain("Bearer secret".into()),
+                    );
                     h
                 },
                 exclude_tools: Vec::new(),
             },
         );
         let result = validate_project_store(&store);
-        assert!(result.is_err(), "inline sensitive header must be rejected for project stores");
+        assert!(
+            result.is_err(),
+            "inline sensitive header must be rejected for project stores"
+        );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Authorization"), "error must name the offending key");
+        assert!(
+            msg.contains("Authorization"),
+            "error must name the offending key"
+        );
     }
 
     #[test]
@@ -2024,7 +2073,10 @@ mod tests {
                 url: "http://remote/mcp".into(),
                 headers: {
                     let mut h = BTreeMap::new();
-                    h.insert("Authorization".into(), SecretString::Plain("Bearer secret".into()));
+                    h.insert(
+                        "Authorization".into(),
+                        SecretString::Plain("Bearer secret".into()),
+                    );
                     h
                 },
                 exclude_tools: Vec::new(),

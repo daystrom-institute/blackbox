@@ -19,9 +19,9 @@
 
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Per-arc runtime state shared by every node, hook, and packet
 /// evaluation. Owned by `WorkflowRunner` and threaded through.
@@ -554,7 +554,9 @@ mod tests {
     #[test]
     fn render_template_resolves_env_head() {
         let c = ctx();
-        unsafe { std::env::set_var("CTX_TEST_HEAD", "hello"); }
+        unsafe {
+            std::env::set_var("CTX_TEST_HEAD", "hello");
+        }
         let rendered = c.render_template("${env.CTX_TEST_HEAD} world");
         assert_eq!(rendered, "hello world");
     }
@@ -576,7 +578,9 @@ mod tests {
         // expression — that produced the broken
         // `'env.X}/path/${vars.y' did not resolve` error.
         let c = ctx();
-        unsafe { std::env::set_var("CTX_TEST_BASE", "http://host:3000"); }
+        unsafe {
+            std::env::set_var("CTX_TEST_BASE", "http://host:3000");
+        }
         let raw = json!("${env.CTX_TEST_BASE}/repos/${vars.repo}/issues/${vars.issue}");
         let resolved = resolve_arg_value(&c, &raw).unwrap();
         assert_eq!(resolved, json!("http://host:3000/repos/foo/bar/issues/42"));
