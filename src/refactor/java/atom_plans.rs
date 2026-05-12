@@ -280,6 +280,24 @@ fn rewrite_top_level_class_modifiers(raw: &str, cross_package: bool) -> Result<S
         edits.push((insert_at, insert_at, "public ".to_string()));
     }
 
+    // Gap 13: when the class header gets widened, the constructor
+    // declarations inside must follow — otherwise a `private Foo(...)`
+    // ctor blocks callers from constructing the new top-level class
+    // (`error: Foo() has private access in Foo` on cross-package
+    // `new Foo()` sites; `error: Foo() is not visible` for same-pkg
+    // when the class was promoted to package-default). Walk the class
+    // body for constructor_declaration nodes and apply the same strip-
+    // private + maybe-inject-public dance we did on the class header.
+    if let Some(body) = decl.child_by_field_name("body") {
+        let mut c = body.walk();
+        for child in body.named_children(&mut c) {
+            if child.kind() != "constructor_declaration" {
+                continue;
+            }
+            edits.extend(constructor_visibility_edits(child, bytes, cross_package));
+        }
+    }
+
     if edits.is_empty() {
         return Ok(raw.to_string());
     }
@@ -289,6 +307,62 @@ fn rewrite_top_level_class_modifiers(raw: &str, cross_package: bool) -> Result<S
         out.replace_range(start..end, &repl);
     }
     Ok(out)
+}
+
+/// Gap 13: compute visibility edits for one constructor inside a
+/// just-promoted top-level class. Strips `private`; on cross-package
+/// extracts also injects `public ` if neither `public` nor `protected`
+/// already exists. `protected` is left alone — operator may have
+/// chosen it deliberately and widening it to `public` could escalate
+/// API surface unintentionally.
+fn constructor_visibility_edits(
+    ctor: Node<'_>,
+    bytes: &[u8],
+    cross_package: bool,
+) -> Vec<(usize, usize, String)> {
+    let mut edits = Vec::new();
+    let mut ctor_modifiers = None;
+    let mut name_node = None;
+    {
+        let mut c = ctor.walk();
+        for child in ctor.children(&mut c) {
+            match child.kind() {
+                "modifiers" => ctor_modifiers = Some(child),
+                "identifier" => {
+                    if name_node.is_none() {
+                        name_node = Some(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut has_public_or_protected = false;
+    if let Some(mods) = ctor_modifiers {
+        let mut c = mods.walk();
+        for tok in mods.children(&mut c) {
+            match tok.kind() {
+                "private" => {
+                    let start = tok.start_byte();
+                    let mut end = tok.end_byte();
+                    if end < bytes.len() && bytes[end] == b' ' {
+                        end += 1;
+                    }
+                    edits.push((start, end, String::new()));
+                }
+                "public" | "protected" => has_public_or_protected = true,
+                _ => {}
+            }
+        }
+    }
+    if cross_package && !has_public_or_protected {
+        let insert_at = ctor_modifiers
+            .map(|n| n.start_byte())
+            .or_else(|| name_node.map(|n| n.start_byte()))
+            .unwrap_or_else(|| ctor.start_byte());
+        edits.push((insert_at, insert_at, "public ".to_string()));
+    }
+    edits
 }
 
 /// Gap 12: collect simple names of nested classes / interfaces /

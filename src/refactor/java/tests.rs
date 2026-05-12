@@ -6499,3 +6499,180 @@
     fn parsed_source_text(path: &std::path::Path) -> String {
         fs::read_to_string(path).unwrap()
     }
+
+    // Gap 13: cross-package promotion of the class header MUST also
+    // widen the constructor — `private Foo(...)` stays private on the
+    // new top-level class otherwise, and cross-package `new Foo(...)`
+    // callers fail with `Foo() has private access in Foo`.
+    #[test]
+    fn extract_java_nested_classes_cross_package_widens_constructor_to_public() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/com/example");
+        let tgt_pkg = dir.path().join("src/main/java/com/example/queries");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&tgt_pkg).unwrap();
+        let source = src_pkg.join("Outer.java");
+        let target = tgt_pkg.join("Readings.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private static class Readings {\n\
+            \x20       private Readings(int x) { this.x = x; }\n\
+            \x20       int x;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+        // Class header was widened by Gap 10/11. Constructor must now
+        // follow: public Readings(int x).
+        assert!(
+            target_text.contains("public Readings(int x)"),
+            "constructor must be public on cross-package extract: {target_text}"
+        );
+        assert!(
+            !target_text.contains("private Readings("),
+            "private ctor modifier must be stripped: {target_text}"
+        );
+    }
+
+    // Gap 13: same-package promotion keeps the class header at
+    // package-default. The constructor must drop `private` so callers
+    // in the same package can instantiate the now-top-level class —
+    // but doesn't need an explicit `public`.
+    #[test]
+    fn extract_java_nested_classes_same_package_strips_private_ctor() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Outer.java");
+        let target = pkg.join("Readings.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private static class Readings {\n\
+            \x20       private Readings() {}\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+        assert!(
+            target_text.contains("Readings()"),
+            "constructor still exists: {target_text}"
+        );
+        assert!(
+            !target_text.contains("private Readings("),
+            "private ctor modifier stripped: {target_text}"
+        );
+        // Class is package-default (no public); ctor likewise stays
+        // package-default — no spurious `public Readings()`.
+        assert!(
+            !target_text.contains("public Readings("),
+            "same-package ctor should NOT be promoted to public: {target_text}"
+        );
+    }
+
+    // Gap 13: protected constructors are left alone — operator may
+    // have chosen `protected` deliberately, and silently widening it
+    // to `public` would escalate API surface.
+    #[test]
+    fn extract_java_nested_classes_leaves_protected_ctor_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/com/example");
+        let tgt_pkg = dir.path().join("src/main/java/com/example/queries");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&tgt_pkg).unwrap();
+        let source = src_pkg.join("Outer.java");
+        let target = tgt_pkg.join("Readings.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   protected static class Readings {\n\
+            \x20       protected Readings() {}\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+        assert!(
+            target_text.contains("protected Readings()"),
+            "protected ctor must be preserved: {target_text}"
+        );
+        assert!(
+            !target_text.contains("public Readings()"),
+            "protected must NOT be silently widened to public: {target_text}"
+        );
+    }
+
+    // Gap 13: multiple constructors all get rewritten.
+    #[test]
+    fn extract_java_nested_classes_widens_every_constructor() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/com/example");
+        let tgt_pkg = dir.path().join("src/main/java/com/example/queries");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&tgt_pkg).unwrap();
+        let source = src_pkg.join("Outer.java");
+        let target = tgt_pkg.join("Readings.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private static class Readings {\n\
+            \x20       private Readings() {}\n\
+            \x20       private Readings(int x) { this(); }\n\
+            \x20       Readings(int x, int y) { this(x); }\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+        // Both private ctors get public.
+        assert!(
+            target_text.contains("public Readings()"),
+            "first private ctor widened: {target_text}"
+        );
+        assert!(
+            target_text.contains("public Readings(int x)"),
+            "second private ctor widened: {target_text}"
+        );
+        // Package-default ctor gets public on cross-package too —
+        // package-default doesn't satisfy `has_public_or_protected`,
+        // so the cross-package branch injects `public`.
+        assert!(
+            target_text.contains("public Readings(int x, int y)"),
+            "package-default ctor widened on cross-package: {target_text}"
+        );
+        assert!(
+            !target_text.contains("private Readings("),
+            "no surviving private ctor modifier: {target_text}"
+        );
+    }
