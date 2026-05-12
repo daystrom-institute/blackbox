@@ -50,6 +50,7 @@
             summary_only: None,
             propagate_class_annotations: None,
             source_delegate_wrappers: None,
+            wiring_mode: None,
             callback_externals: None,
             output_path: None,
         }
@@ -2296,6 +2297,121 @@
         assert!(
             !target_text.contains("@Slf4j"),
             "none mode must NOT propagate annotations: {target_text}"
+        );
+    }
+
+    // G7: source class with @Inject fields refuses by default — silent
+    // null-capture is the dominant manual-fixup cost on Guice-managed
+    // extracts. Operator must explicitly choose wiring_mode.
+    #[test]
+    fn g7_extract_java_class_refuses_when_inject_detected_without_wiring_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import javax.inject.Inject;\n\
+             public class Admin {\n\
+            \x20   @Inject private Object dep;\n\
+            \x20   public Long save() { return 1L; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["save".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let err = plan_extract_java_class(&params).unwrap_err().to_string();
+        assert!(
+            err.contains("guice_field_injection_detected"),
+            "expected guice_field_injection_detected error, got: {err}"
+        );
+    }
+
+    // G7: wiring_mode=guice_field_inject emits `@Inject private Target
+    // delegate;` on source, skips ctor wiring entirely.
+    #[test]
+    fn g7_wiring_mode_guice_field_inject_emits_inject_decl_skips_ctor_wiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import javax.inject.Inject;\n\
+             public class Admin {\n\
+            \x20   @Inject private Object dep;\n\
+            \x20   public Long save() { return 1L; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["save".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.wiring_mode = Some("guice_field_inject".to_string());
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("@Inject private Service service;"),
+            "@Inject delegate decl must appear: {rewritten}"
+        );
+        // No ctor wiring assignment.
+        assert!(
+            !rewritten.contains("this.service = new Service"),
+            "ctor wiring must be skipped: {rewritten}"
+        );
+    }
+
+    // G7: wiring_mode=manual skips both delegate decl and ctor wiring.
+    #[test]
+    fn g7_wiring_mode_manual_skips_all_source_wiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Admin {\n\
+            \x20   public Long save() { return 1L; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["save".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.wiring_mode = Some("manual".to_string());
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            !rewritten.contains("private final Service service"),
+            "manual mode must not emit delegate field: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("this.service = new Service"),
+            "manual mode must not emit ctor wiring: {rewritten}"
         );
     }
 

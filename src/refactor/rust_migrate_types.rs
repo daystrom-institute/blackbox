@@ -859,6 +859,7 @@ mod tests {
             summary_only: None,
             propagate_class_annotations: None,
             source_delegate_wrappers: None,
+            wiring_mode: None,
             callback_externals: None,
             output_path: None,
         })
@@ -982,6 +983,7 @@ fn consume(input: OldService, output: Vec<OldService>) -> OldService {
             summary_only: None,
             propagate_class_annotations: None,
             source_delegate_wrappers: None,
+            wiring_mode: None,
             callback_externals: None,
             output_path: None,
         });
@@ -1067,6 +1069,7 @@ fn consume<T>(value: OldService, list: Vec<OldService>) {
             summary_only: None,
             propagate_class_annotations: None,
             source_delegate_wrappers: None,
+            wiring_mode: None,
             callback_externals: None,
             output_path: None,
         });
@@ -1153,6 +1156,7 @@ struct Holder {
             summary_only: None,
             propagate_class_annotations: None,
             source_delegate_wrappers: None,
+            wiring_mode: None,
             callback_externals: None,
             output_path: None,
         });

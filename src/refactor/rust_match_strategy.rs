@@ -544,6 +544,7 @@ mod tests {
             summary_only: None,
             propagate_class_annotations: None,
             source_delegate_wrappers: None,
+            wiring_mode: None,
             callback_externals: None,
             project_dir: None,
             output_path: None,

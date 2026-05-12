@@ -433,6 +433,25 @@ pub struct RefactorPlanParams {
     /// handled by G19's class-qualified call auto-rewrite.
     #[serde(default)]
     pub source_delegate_wrappers: Option<bool>,
+    /// `extract_java_class`: how the source class wires the new
+    /// delegate field (G7). Values:
+    /// - `constructor_args` (default for plain-Java classes):
+    ///   `private final <Target> <delegate>;` + `this.<delegate> =
+    ///   new <Target>(...)` in the source's first constructor. Breaks
+    ///   silently on DI-managed classes because the source's `@Inject`
+    ///   fields are still `null` at constructor time.
+    /// - `guice_field_inject`: emit `@Inject private <Target>
+    ///   <delegate>;` on the source, skip ctor wiring entirely. The DI
+    ///   container populates the delegate after construction.
+    /// - `manual`: no source-side wiring (no delegate field decl, no
+    ///   ctor assignment). Operator wires the delegate by hand.
+    ///
+    /// Auto-detect: when this parameter is unset and the source class
+    /// has any `@Inject`-annotated field, the planner refuses with
+    /// `error.bad_input(code=guice_field_injection_detected)` to
+    /// prevent the silent null-capture failure mode.
+    #[serde(default)]
+    pub wiring_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

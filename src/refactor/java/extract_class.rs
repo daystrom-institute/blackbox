@@ -34,6 +34,41 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .collect::<HashSet<_>>();
     let captured_variables = captured_fields_for_methods(&parsed, &selected_methods);
 
+    // G7: wiring_mode resolution. The default `constructor_args` flow
+    // (current behavior) inserts `this.delegate = new Target(...)` into
+    // the source's first constructor. On DI-managed source classes
+    // (Guice/Spring @Inject fields), this captures `null` because
+    // injection happens AFTER the constructor. Auto-detect @Inject on
+    // any source field and refuse early when the operator hasn't
+    // explicitly chosen a wiring_mode — silent null-capture is the
+    // dominant manual fixup cost on planglobal swings.
+    let source_has_inject_fields = java_class_has_inject_field(class_node, &parsed.source);
+    let wiring_mode = match p.wiring_mode.as_deref() {
+        Some(m) => {
+            if !matches!(m, "constructor_args" | "guice_field_inject" | "manual") {
+                bail!(
+                    "error.bad_input(code=invalid_wiring_mode): wiring_mode must be one of \
+                     `constructor_args`, `guice_field_inject`, `manual` (got `{m}`)"
+                );
+            }
+            m.to_string()
+        }
+        None => {
+            if source_has_inject_fields {
+                bail!(
+                    "error.bad_input(code=guice_field_injection_detected): the source class has \
+                     @Inject-annotated fields; the default `constructor_args` wiring would \
+                     capture null references because the DI container injects after the \
+                     constructor runs. Pass `wiring_mode` explicitly: \
+                     `guice_field_inject` to emit `@Inject private <Target> <delegate>;` and \
+                     skip ctor wiring; `manual` to skip source-side wiring entirely; or \
+                     `constructor_args` to acknowledge the captured-null risk explicitly."
+                );
+            }
+            "constructor_args".to_string()
+        }
+    };
+
     // Mutable-capture-with-write refusal. A capture that is (a) non-final on
     // the source, (b) not listed in `move_fields`, and (c) WRITTEN inside any
     // extracted method body cannot be promoted to a `final` constructor
@@ -1077,11 +1112,37 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
 
     let field_insert_at = java_class_body_insert_position(class_node, &parsed.source);
     let delegate_edit_idx = source_edits.len();
+    // G7: source-side delegate field declaration varies by wiring_mode.
+    // - constructor_args: `private final <Target> <delegate>;` (paired
+    //   with `this.delegate = new Target(...)` ctor wiring below).
+    // - guice_field_inject: `@Inject private <Target> <delegate>;`
+    //   (no `final`, no ctor wiring — DI container populates after
+    //   construction).
+    // - manual: skip the delegate field decl entirely. Operator wires
+    //   in their own code.
+    let delegate_decl = match wiring_mode.as_str() {
+        "guice_field_inject" => {
+            format!("\n    @Inject private {target_class_name} {delegate_field};")
+        }
+        "manual" => String::new(),
+        _ => format!("\n    private final {target_class_name} {delegate_field};"),
+    };
     source_edits.push(TextEdit {
         byte_start: field_insert_at,
         byte_end: field_insert_at,
-        replacement: format!("\n    private final {target_class_name} {delegate_field};"),
+        replacement: delegate_decl,
     });
+    // G7: guice_field_inject mode needs the @Inject import on the source.
+    if wiring_mode == "guice_field_inject" {
+        // Prefer javax.inject.Inject as the more portable choice; if the
+        // source already imports com.google.inject.Inject, the existing
+        // import is unchanged and the new edit is idempotent.
+        if let Some(edit) =
+            java_source_import_edit(&parsed.source, "javax.inject.Inject")
+        {
+            source_edits.push(edit);
+        }
+    }
     // Gap 5: when the target type lands in a different package than the source,
     // the source needs `import <target_pkg>.<TargetClass>;` so the new delegate
     // field declaration resolves. Same-package targets resolve implicitly.
@@ -1118,7 +1179,16 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // that introduce `<delegate_field>.<getter>()` reads earlier in the
     // same ctor body — the wiring must come before any such read).
     let mut wiring_state: Option<WiringInsertState> = None;
-    if let Some(constructor) = first_constructor_node(class_node, &parsed.source) {
+    // G7: guice_field_inject and manual modes skip ctor wiring entirely.
+    // The delegate is populated by the DI container (or by the operator)
+    // — no `this.delegate = new Target(...)` assignment.
+    let skip_ctor_wiring =
+        wiring_mode == "guice_field_inject" || wiring_mode == "manual";
+    if skip_ctor_wiring {
+        // No ctor wiring to insert. wiring_state stays None so the
+        // post-process accessor topo-sort treats this case as "no
+        // wiring edit to relocate."
+    } else if let Some(constructor) = first_constructor_node(class_node, &parsed.source) {
         // Gap 7: when any captured-param name refers to a field rather than
         // a constructor parameter, that name is `null` until its own
         // `this.field = ...` assignment runs. Inserting the wiring as the
@@ -1605,6 +1675,41 @@ fn target_content_references_identifier(text: &str, ident: &str) -> bool {
             return true;
         }
         cursor = pos + needle.len();
+    }
+    false
+}
+
+/// G7: return true when any field on the class declaration carries an
+/// `@Inject` annotation (com.google.inject.Inject or javax.inject.Inject).
+/// Matched by simple name only — the actual import is irrelevant for the
+/// auto-detect, both packages route through the same DI container
+/// semantics.
+fn java_class_has_inject_field(class_node: Node<'_>, source: &str) -> bool {
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return false;
+    };
+    let mut bc = body.walk();
+    for child in body.named_children(&mut bc) {
+        if child.kind() != "field_declaration" {
+            continue;
+        }
+        let mut cc = child.walk();
+        for sub in child.children(&mut cc) {
+            if sub.kind() != "modifiers" {
+                continue;
+            }
+            let mut mc = sub.walk();
+            for modifier in sub.children(&mut mc) {
+                if !matches!(modifier.kind(), "marker_annotation" | "annotation") {
+                    continue;
+                }
+                if let Ok(text) = modifier.utf8_text(source.as_bytes()) {
+                    if text.trim_start_matches('@').starts_with("Inject") {
+                        return true;
+                    }
+                }
+            }
+        }
     }
     false
 }
