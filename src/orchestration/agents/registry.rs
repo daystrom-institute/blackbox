@@ -1353,4 +1353,112 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "cheap-agent");
     }
+
+    /// RA-Z1 — supersession + replacement policy.
+    ///
+    /// Regression gate that pins the v1 supersession contract for refactor
+    /// atoms: bro_agent_search excludes superseded versions; bro_agent_list
+    /// without include_superseded excludes them; both surface superseded
+    /// rows only when include_superseded=true; and bro_agent_get with a
+    /// pinned version still resolves the historical snapshot (read path).
+    /// The dispatch-rejects-superseded behavior is exercised by
+    /// src/tools/agents.rs:522 and not duplicated here.
+    #[test]
+    fn supersession_hides_old_versions_from_search_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "atom-v1.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "test-atom",
+                    "version": 1,
+                    "manifest": {
+                        "description": "First version of the test atom.",
+                        "when_to_use": ["before the bump"],
+                        "brofile_inline": {"provider": "claude"}
+                    }
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "atom-v2.json".into(),
+                &serde_json::json!({
+                    "kind": "agent",
+                    "name": "test-atom",
+                    "version": 2,
+                    "supersedes": "test-atom",
+                    "manifest": {
+                        "description": "Second version of the test atom.",
+                        "when_to_use": ["after the bump"],
+                        "brofile_inline": {"provider": "claude"}
+                    }
+                }),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let registry = AgentRegistry::new(&catalog);
+
+        // search excludes superseded by default — gates the
+        // RA-Z1 invariant that v1 disappears from default-search after the
+        // v2 install.
+        let search_default = registry
+            .search("test atom", 10, &SearchFilter::default(), false)
+            .unwrap();
+        let search_versions = search_default
+            .iter()
+            .filter(|r| r.name == "test-atom")
+            .map(|r| r.version.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            search_versions,
+            vec!["2"],
+            "search should only surface active version; got {search_versions:?}"
+        );
+
+        // list without include_superseded excludes v1 too.
+        let list_default = registry.list(&ListFilter::default()).unwrap();
+        let list_versions = list_default
+            .iter()
+            .filter(|r| r.name == "test-atom")
+            .map(|r| r.version.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            list_versions,
+            vec!["2"],
+            "list should hide superseded by default; got {list_versions:?}"
+        );
+
+        // list with include_superseded surfaces both.
+        let list_all = registry
+            .list(&ListFilter {
+                include_superseded: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let history: Vec<(&str, bool)> = list_all
+            .iter()
+            .filter(|r| r.name == "test-atom")
+            .map(|r| (r.version.as_str(), r.active))
+            .collect();
+        assert!(history.contains(&("1", false)));
+        assert!(history.contains(&("2", true)));
+
+        // pinned get on the superseded version resolves the historical
+        // snapshot (read path permits include_superseded=true).
+        let pinned = registry.get("test-atom@v1").unwrap().unwrap();
+        assert_eq!(pinned.version, "1");
+        assert!(!pinned.active);
+        assert_eq!(pinned.metadata.superseded_by.as_deref(), Some("test-atom"));
+    }
 }

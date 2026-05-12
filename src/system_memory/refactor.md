@@ -299,6 +299,43 @@ build. The mechanical alternative to a manually maintained table —
 auto-regeneration from the manifest set — is a `tools/refactor-atom-
 catalog-gen` follow-up.
 
+## Refactor-atom supersession (RA-Z1)
+
+Atom version bumps use the standard artifact-supersede mechanism:
+
+```
+bbox_artifact_supersede(kind="agent", name="<atom>", superseded_by="<atom>")
+```
+
+Concretely, installing a new version with `"supersedes": "<atom>"` in
+the artifact body marks the prior version superseded automatically
+(`install_value_locked_scoped` handles the supersedes chain).
+
+Behavior pinned by `supersession_hides_old_versions_from_search_and_list`:
+
+- `bro_agent_search` excludes superseded versions. Default-search
+  surfaces only the active version.
+- `bro_agent_list` without `include_superseded=true` excludes
+  superseded versions; both surface when `include_superseded=true`.
+- `bro_agent_get(name="<atom>@v<N>")` and `bro_agent_describe(...)`
+  resolve superseded versions (read paths permit `include_superseded
+  =true`).
+- `bro_agent_dispatch(agent="<atom>@v<N>")` REJECTS superseded
+  versions with `agent '...' is not active (superseded or
+  deactivated)` (`src/tools/agents.rs:522`). v1 does NOT add an
+  `allow_superseded` flag to dispatch — the active version is
+  canonical. Operators who need to dispatch an older version must
+  explicitly un-supersede it through the existing
+  `bbox_artifact_supersede` mechanics, or pin to a still-active
+  version.
+
+Every new atom version bump triggers an embedding refresh in the
+`agent_manifest` bucket (existing agent-system behavior; called out
+here so operators understand the cost per version bump).
+
+Removal/cleanup of ancient superseded versions is a separate decision;
+v1 keeps history indefinitely.
+
 ## Refactor-atom distillation path (RA-V2)
 
 The v1 catalog is `provenance: hand_authored` end-to-end. The schema
