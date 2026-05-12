@@ -1,13 +1,27 @@
 # Tmux portal for workflow-native live bro handoff
 
-Status: design proposal v1
+Status: design proposal v3
 Date: 2026-05-12
-Related: `WORKFLOWS.md`, `examples/keystone/`, `design/proposed/supervision.md`
+Related: `WORKFLOWS.md`, `examples/keystone/`, `design/proposed/supervision.md`, `design/proposed/provider-transcript-read-plane.md`
 
 ## 1. Thesis
 
 `tmux` should be treated as a workflow portal, not as a notification
 channel and not as the canonical workflow state store.
+
+The stronger shape is a hybrid:
+
+- **Control plane:** `tmux` owns live steering, human presence, focus,
+  interrupts, approvals, and recovery when a provider's automation surface is
+  weak.
+- **Read plane:** provider transcripts/session stores are the canonical
+  source for automation, clean status, task summaries, and workflow state
+  transitions.
+
+Pane capture is useful evidence of what a human would see, but it is noisy,
+terminal-width dependent, and lossy. It should not be the primary parser for
+what happened in an agent turn when a provider transcript or event store is
+available.
 
 The normal operator flow has two terminals:
 
@@ -36,6 +50,7 @@ Validated locally with `tmux-mcp-rs` and live TUIs:
 | Claude Code | Normal TUI captures cleanly, accepts mid-turn typed input, shows queued-message state, and submits the queued message after the active shell tool completes. |
 | OpenCode | Normal TUI accepts mid-turn input and marks it `QUEUED`. Output is noisier because the TUI exposes thinking/status chrome. Interrupt semantics need more provider-specific testing. |
 | Window handoff | `move_window(@20, targetSessionId=$19)` moved a live Codex TUI window into the attached `admin` session. Moving it back required recreating the source session because tmux deletes an empty source session after its only window moves. |
+| Window projection | Local `link-window` support in `/home/invidious/repos/tmux-mcp` linked live Codex window `@20` into `admin` while the original `codex-rs-smoke` session still listed and owned the same window. This validates portal projection without ownership transfer. |
 
 The useful discovery is that TUI-driven steering is not merely blind text
 paste. The major CLIs expose visible queue or interrupt states in the pane.
@@ -76,8 +91,10 @@ struct PortalHandle {
     node: String,
     actor: String,
     task_id: String,
-    provider: String,
-    session_id: Option<String>,
+    provider: Provider,
+    session_id: String,
+    transcript_location: Option<TranscriptLocation>,
+    transcript_cursor: Option<TranscriptCursor>,
     tmux_session_id: String,
     tmux_window_id: String,
     tmux_pane_id: String,
@@ -87,6 +104,9 @@ struct PortalHandle {
 
 The handle is task metadata, not output. It should appear in
 `bro_arc_status`, `bro tail`, and notes only by reference.
+`TranscriptLocation` and `TranscriptCursor` come from
+`provider-transcript-read-plane.md`; tmux mode must not define a parallel
+read-source model.
 
 ## 4. Portal hook ops
 
@@ -296,16 +316,55 @@ the source session.
 
 ## 9. Provider processors
 
-Pane capture is display text, not transcript. Provider-specific processors
-should turn noisy TUI text into operational hints:
+There are two processor classes.
+
+### 9.1 Read processors
+
+Read processors normalize provider transcript/session stores into a common
+event stream. These are the source of truth for workflow automation and are
+specified in `provider-transcript-read-plane.md`.
+
+Normalized events should be provider-neutral enough for workflow gates. The
+canonical shape lives in `provider-transcript-read-plane.md`; tmux mode uses
+it but does not own it. A typical event has this form:
+
+```json
+{
+  "provider": "codex|claude|opencode",
+  "session_id": "...",
+  "sequence": "...",
+  "role": "user|assistant|tool|system",
+  "kind": "message|tool_call|tool_result|error|status",
+  "text": "...",
+  "raw_ref": {
+    "store": "jsonl|sqlite|api",
+    "path": "...",
+    "record_id": "..."
+  }
+}
+```
+
+Provider storage shapes and adapter rules are intentionally not duplicated
+here. The read-plane proposal owns those details for Claude/Codex JSONL,
+Gemini JSON chat files, OpenCode SQLite/export, Copilot JSONL, and Vibe.
+Tmux provider profiles only describe how to start, steer, interrupt, and
+clean up each live TUI.
+
+### 9.2 TUI processors
+
+Pane capture is display text, not transcript. TUI processors should turn
+noisy live text into operational hints only:
 
 | Provider | Useful markers |
 |---|---|
 | Codex | `Messages to be submitted after next tool call`, `background terminal running`, `/stop`, `esc to interrupt`, MCP startup warnings. |
 | Claude | queued-message footer, shell running state, token/status footer, background shell manager hints. |
 | OpenCode | `QUEUED`, `esc again to interrupt`, thinking/status chrome, command block boundaries. |
+| Gemini | prompt-ready state, command-running state, resume/fork warnings if visible. |
+| Copilot | prompt-ready state, approval/tool-running state, task-complete status. |
+| Vibe | prompt-ready state, tool-running state, session-log path if visible. |
 
-Processors should produce advisory state:
+TUI processors should produce advisory state:
 
 ```json
 {
@@ -316,31 +375,61 @@ Processors should produce advisory state:
 }
 ```
 
-They should not be canonical workflow state. The arc context and task
-registry remain authoritative.
+They should not be canonical workflow state. The arc context, task registry,
+and read processors remain authoritative.
+
+### 9.3 Hybrid loop
+
+The intended loop is:
+
+```text
+workflow dispatch
+  -> start provider TUI in hidden tmux actor window
+  -> record PortalHandle + TranscriptLocation + TranscriptCursor
+  -> read structured provider events for automation
+  -> on attention, link/focus actor window in portal
+  -> human steers via tmux
+  -> continue reading structured events until the node resolves
+```
+
+This keeps tmux as the live control surface while letting blackbox reason
+over transcript-quality data.
+
+If the read-plane adapter fails while a workflow gate is waiting, the
+workflow follows the degradation rule in `provider-transcript-read-plane.md`:
+retry briefly, then block with the adapter error and include any TUI snapshot
+only as diagnostic evidence.
 
 ## 10. Implementation sketch
 
 1. Add `terminal_mode` and `portal_policy` to actor schema.
-2. Extend task metadata with `PortalHandle`.
-3. Add a tmux control module with provider profiles:
+2. Depend on the provider transcript read plane for `TranscriptLocation`,
+   `TranscriptCursor`, and normalized provider events.
+3. Extend task metadata with `PortalHandle`.
+4. Add a tmux control module with provider profiles:
    - start command
    - submit action
    - soft-queue markers
    - interrupt action
    - cleanup action
-4. Add hook ops: `portal_focus`, `portal_release`,
+5. Add hook ops: `portal_focus`, `portal_release`,
    `portal_status_snapshot`, `portal_cleanup`.
-5. Add `bro_arc_status` portal fields:
+6. Add `bro_arc_status` portal fields:
    - active portal handles
    - portal target session
    - attention queue
-6. Add `link-window` support to `tmux-mcp-rs` or use `move-window` as the
+7. Add `link-window` support to `tmux-mcp-rs` or use `move-window` as the
    first implementation with explicit bookkeeping updates.
-7. Adapt Keystone as the first reference workflow:
+8. Adapt Keystone as the first reference workflow:
    - implementer actor `terminal_mode="tmux"`
    - focus on mechanical failure / parse failure / wait timeout
    - cleanup on arc exit.
+9. Add startup reconciliation for orphaned portal state:
+   - scan daemon-owned tmux container sessions and portal windows
+   - match pane/window titles or metadata against known arc/task ids
+   - unlink stale portal projections
+   - preserve still-running actor windows when the task store still knows
+     about them
 
 ### 10.1 `tmux-mcp-rs` link-window patch points
 
@@ -389,3 +478,7 @@ Semantics to verify manually after implementation:
    summaries?
 6. Should provider processors live in blackbox, in a sidecar, or as
    tmux-portal packet rules?
+7. For OpenCode, is `event`/`event_sequence` stable enough to serve as the
+   primary cursor, or should v1 poll `message`/`part` directly?
+8. Should `PortalHandle` persist transcript locators directly, or should it
+   reference provider-specific task metadata that owns them?
