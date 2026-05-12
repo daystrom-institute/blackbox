@@ -272,6 +272,24 @@ binds to a different brofile (e.g., `code-reviewer-persona`) means the
 atom's tool surface is not actually narrowed; the manifest lint pass
 (RA-S1) rejects such manifests on install.
 
+## Refactor atom catalog
+
+Shipped refactor atoms (RA-A* / RA-X*) — discover via
+`bro_agent_search(<intent phrase>)`, install via
+`bbox_artifact_install(kind="agent", source="examples/agents/refactor/<name>.json")`,
+dispatch via `bro_agent_dispatch(agent="<name>", args={...})`.
+
+| Atom | Status | Cost | Plan kind(s) | Purpose |
+|---|---|---|---|---|
+| `rust-impl-partition-graph` | shipped (v1, RA-A1) | cheap | `rust_impl_partition_analysis` (RX-G1) | Produce method/field/call graph for a Rust impl block; analysis-only |
+
+Per-atom manifests live at `examples/agents/refactor/<atom>.json`. The
+shared prompt template and base outputs schema (RA-T1) under the same
+directory are reference files — manifest installers inline the
+filled-in form. The CI catalog-completeness check (RA-D1, follow-up)
+will assert every `examples/agents/refactor/<name>.json` has a row
+here.
+
 ## Refactor-atom install lint (RA-S1)
 
 A manifest is treated as a refactor atom — and subject to the refactor-atom

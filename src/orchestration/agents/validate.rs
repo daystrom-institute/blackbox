@@ -1949,6 +1949,40 @@ mod tests {
     }
 
     #[test]
+    fn shipped_rust_impl_partition_graph_passes_lint() {
+        let src = include_str!("../../../examples/agents/refactor/rust-impl-partition-graph.json");
+        let v: serde_json::Value =
+            serde_json::from_str(src).expect("rust-impl-partition-graph.json parses");
+        assert!(is_refactor_atom_artifact(&v, None));
+        validate_refactor_atom_install(&v, None)
+            .expect("shipped rust-impl-partition-graph atom passes lint");
+
+        let schema_raw = include_str!("../../../schema/agent.schema.json");
+        let schema: serde_json::Value =
+            serde_json::from_str(schema_raw).expect("agent schema valid JSON");
+        let compiled = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .compile(&schema)
+            .expect("agent schema compiles");
+        assert!(
+            compiled.is_valid(&v),
+            "rust-impl-partition-graph rejected by agent schema: {:?}",
+            compiled
+                .validate(&v)
+                .err()
+                .map(|errs| errs.map(|e| e.to_string()).collect::<Vec<_>>())
+        );
+
+        let warnings = refactor_atom_install_warnings(&v, None);
+        for w in &warnings {
+            assert!(
+                w.contains("bbox_refactor_run"),
+                "unexpected refactor_atom warning on analysis-only atom: {w}"
+            );
+        }
+    }
+
+    #[test]
     fn refactor_atom_warning_skipped_when_not_refactor() {
         let v = serde_json::json!({
             "kind": "agent",
