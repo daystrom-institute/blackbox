@@ -271,3 +271,27 @@ bind to one of these personas via `brofile_ref`. Authoring an atom that
 binds to a different brofile (e.g., `code-reviewer-persona`) means the
 atom's tool surface is not actually narrowed; the manifest lint pass
 (RA-S1) rejects such manifests on install.
+
+## Shared atom contract (RA-T1)
+
+Every refactor atom embeds the same five-step protocol
+(ground → plan with `deep_analysis=true` → decide → apply-or-block →
+done-note) and the same base outputs.schema (status / plan_path /
+files_touched / fixme_count / deep_analysis_summary / cargo_result /
+block_reason / done_note_id). Reference files:
+
+- `examples/agents/refactor/_template.prompt.md` — the prompt template
+  with `{{...}}` placeholders. Atom manifests inline the filled-in form
+  under `inputs.prompt_template`. The artifact installer does not yet
+  support shared-template includes; the `tools/refactor-atom-fill`
+  helper (follow-up) keeps manifests in sync mechanically.
+- `examples/agents/refactor/_base.outputs.schema.json` — the base
+  outputs.schema every atom unions with atom-specific fields. Advisory
+  in v1: dispatch does not validate the agent's emission against the
+  schema; the RA-S1 lint warns when a manifest's `outputs.schema`
+  drops one or more of the base fields.
+
+`fixme_count` is split into `plan_only` (FIXMEs the plan emitted with
+no associated edit) and `warning` (FIXMEs emitted alongside an applied
+edit, flagging operator follow-up) per the two-prefix FIXME grammar in
+`sm-refactor-rust`.
