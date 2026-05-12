@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::chunker::code::{language_for_path, parser_for_language, ts_language_for_name};
+use crate::index::{first_text, first_u64, optional_text};
 use crate::projects::ProjectRecord;
 use crate::refactor::{
     parse_report, resolve_path, ParseReport, RefactorStatus, RefactorStatusParams, SyntaxItem,
@@ -35,6 +36,51 @@ pub const MAX_CODE_NAV_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// the caller can narrow with `path_contains`, `languages`, or a tighter
 /// `project_dir` and re-run.
 pub const MAX_CODE_NAV_SCANNED_FILES: usize = 5000;
+
+/// Derive the **refactor-vocabulary** kind from a raw tree-sitter node
+/// kind plus the nearest enclosing symbol kind.
+///
+/// `refactor::status` (the live `bbox_code_symbols` source) synthesises
+/// a small number of kinds that do not exist as raw tree-sitter nodes —
+/// most notably Rust `impl_method` for a `function_item` whose parent
+/// symbol is an `impl_item`. The indexed lane only has access to the
+/// raw tree-sitter kinds (`symbol_kind`) and the enclosing-symbol kind
+/// (`parent_kind`); this function reproduces the synthesis so indexed
+/// records can carry the same `kind` value as live records.
+///
+/// New synthesis cases must be added here AND mirrored in
+/// `refactor::status` (or vice versa) to keep the two lanes in sync.
+/// As of CN-T2 there is exactly one documented case: Rust impl methods.
+/// See `src/refactor/rust.rs:rust_impl_methods_in` for the live-side
+/// synthesis that this function inverts.
+pub fn refactor_kind_for(
+    language: &str,
+    symbol_kind: &str,
+    parent_kind: Option<&str>,
+) -> String {
+    match (language, symbol_kind, parent_kind) {
+        ("rust", "function_item", Some("impl_item")) => "impl_method".to_string(),
+        _ => symbol_kind.to_string(),
+    }
+}
+
+/// Reverse of `refactor_kind_for`: derive `(symbol_kind, parent_kind)`
+/// from a refactor-vocabulary kind. Used by the live lane when it has
+/// `refactor_kind` from `refactor::status` but needs to surface the
+/// raw tree-sitter kinds on the response shape too. Returns
+/// `(refactor_kind.to_string(), None)` for kinds with no documented
+/// synthesis — honest about the parent-context loss in that direction.
+pub fn symbol_kind_from_refactor(
+    language: &str,
+    refactor_kind: &str,
+) -> (String, Option<String>) {
+    match (language, refactor_kind) {
+        ("rust", "impl_method") => {
+            ("function_item".to_string(), Some("impl_item".to_string()))
+        }
+        _ => (refactor_kind.to_string(), None),
+    }
+}
 
 /// Typed error response shared by every code-nav tool. Recoverable
 /// failure modes (file too large, project not registered, file not
@@ -205,6 +251,10 @@ pub struct CodeSymbolSearchParams {
     #[serde(default)]
     pub languages: Option<Vec<String>>,
     /// Optional exact refactor item kinds, e.g. ["impl_method", "method_declaration"].
+    /// Matches against either the refactor synthetic kind (`kind`) OR
+    /// the raw tree-sitter `symbol_kind`, so the same filter works on
+    /// both lanes — passing `["function_item"]` and `["impl_method"]`
+    /// to an indexed lane both return Rust impl methods.
     #[serde(default)]
     pub item_kinds: Option<Vec<String>>,
     /// Optional case-sensitive substring matched against the relative path before parsing.
@@ -214,11 +264,57 @@ pub struct CodeSymbolSearchParams {
     #[serde(default)]
     pub limit: Option<usize>,
     /// Maximum supported source files to parse. Defaults to 5000 and is capped at 5000.
+    /// Only meaningful for `mode="live"` — the indexed lane reads the
+    /// project's tantivy docs directly and has no per-file parse cost.
     #[serde(default)]
     pub file_limit: Option<usize>,
     /// Include syntax attributes from bbox_refactor_status. Defaults false.
+    /// Only meaningful for `mode="live"` — the indexed lane does not
+    /// surface attributes.
     #[serde(default)]
     pub include_attributes: Option<bool>,
+    /// Which lane answers the query:
+    /// - `"indexed"` (default after CN-D3 lands a populated index):
+    ///   reads stored project_file docs from tantivy. Fast, no parse
+    ///   cost, no walker. Returns the same record shape as `"live"`.
+    ///   If the tantivy index does not yet contain `symbol_kind` for
+    ///   this project, the response is empty — caller falls back to
+    ///   `mode="live"`.
+    /// - `"live"`: walks the project tree and parses every supported
+    ///   source file via `bbox_refactor_status`. Honours
+    ///   `file_limit`, `include_attributes`, and respects the
+    ///   shared `MAX_CODE_NAV_SCANNED_FILES` cap.
+    /// Default: `"indexed"`.
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// Which lane `code_symbols` should answer with. Stable string values
+/// chosen so a future "auto" mode can be added without breaking the
+/// "indexed" / "live" enum identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeSymbolMode {
+    Indexed,
+    Live,
+}
+
+impl CodeSymbolMode {
+    pub fn from_param(raw: Option<&str>) -> Result<Self> {
+        match raw.map(str::trim).filter(|s| !s.is_empty()) {
+            None | Some("indexed") => Ok(Self::Indexed),
+            Some("live") => Ok(Self::Live),
+            Some(other) => Err(anyhow!(
+                "unknown mode {other:?}; expected \"indexed\" or \"live\""
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Indexed => "indexed",
+            Self::Live => "live",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -238,6 +334,10 @@ pub struct CodeQueryResponse {
 pub struct CodeSymbolSearchResponse {
     pub status: String,
     pub project_dir: String,
+    /// Which lane answered the query: `"indexed"` or `"live"`. Always
+    /// present so callers can compare results across modes
+    /// programmatically.
+    pub mode: String,
     pub scanned_files: usize,
     pub matched_files: usize,
     pub matching_items: usize,
@@ -253,7 +353,21 @@ pub struct CodeSymbolSearchResponse {
 pub struct CodeSymbolSearchItem {
     pub file: String,
     pub language: String,
+    /// Refactor synthetic kind, matching the `bbox_refactor_status` /
+    /// `bbox_refactor_plan` vocabulary. For Rust impl methods this is
+    /// `"impl_method"`. Use this for refactor-plan filtering.
     pub kind: String,
+    /// Raw tree-sitter node kind (CN-D1). For Rust impl methods this
+    /// is `"function_item"`. Use this for grammar-shape filtering.
+    /// `None` for live-lane records whose refactor kind has no
+    /// documented synthesis (lookup is best-effort).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_kind: Option<String>,
+    /// Kind of the nearest enclosing symbol-producing ancestor.
+    /// `None` at file top level OR on live-lane records whose
+    /// `refactor_kind` does not have a documented parent synthesis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub byte_range: (usize, usize),
@@ -618,6 +732,59 @@ fn refactor_handoff(
     }
 }
 
+/// Handoff builder for the indexed lane. Mirrors `status_item_handoff`
+/// but takes the raw fields stored in tantivy (name/kind/ranges)
+/// instead of a `SyntaxItem`, so the indexed lane can produce the
+/// exact same shape without re-parsing.
+fn indexed_handoff(
+    file: &str,
+    project_dir: &str,
+    language: &str,
+    name: Option<&str>,
+    refactor_kind: &str,
+    byte_range: (usize, usize),
+    line_range: (usize, usize),
+) -> CodeRefactorHandoff {
+    let nearest_refactor_item = Some(CodeNodeSummary {
+        kind: refactor_kind.to_string(),
+        name: name.map(str::to_string),
+        byte_range,
+        line_range,
+        column_range: (1, 1),
+    });
+    let refactor_status = name.map(|n| CodeRefactorStatusHint {
+        tool: "bbox_refactor_status".to_string(),
+        arguments: CodeRefactorStatusHintArgs {
+            file: file.to_string(),
+            project_dir: Some(project_dir.to_string()),
+            item_names: vec![n.to_string()],
+            item_kinds: vec![refactor_kind.to_string()],
+            limit: 50,
+            include_attributes: false,
+        },
+    });
+    let query = name
+        .map(str::to_string)
+        .or_else(|| Some(refactor_kind.to_string()));
+    CodeRefactorHandoff {
+        nearest_refactor_item,
+        refactor_status,
+        project_refs: CodeProjectRefsHint {
+            tool: "bbox_refactor_project_refs".to_string(),
+            arguments: CodeProjectRefsHintArgs {
+                file: file.to_string(),
+                project_dir: Some(project_dir.to_string()),
+                query,
+                limit: 20,
+                include_excerpt: false,
+            },
+        },
+        note: format!(
+            "Indexed code-symbol match for {language}. Same handoff shape as live mode; the indexed lane reads stored project_file docs from tantivy without parsing. Use bbox_refactor_status to confirm exact item names/kinds before planning edits."
+        ),
+    }
+}
+
 fn status_item_handoff(
     file: &str,
     project_dir: Option<&str>,
@@ -704,7 +871,47 @@ fn parse_code_nav_source(
     })
 }
 
-pub fn code_symbols(p: &CodeSymbolSearchParams, registered: &[ProjectRecord]) -> Result<String> {
+/// Dispatcher: `bbox_code_symbols` entry point. Reads `params.mode`
+/// and routes to `code_symbols_indexed` or `code_symbols_live`.
+///
+/// `idx` is `Some` when the call is coming through the MCP handler
+/// (which has the daemon's TranscriptIndex). Tests pass `None` to
+/// exercise the live lane directly; if such a test asks for
+/// `mode="indexed"` it gets a typed error telling it to upgrade.
+pub fn code_symbols(
+    p: &CodeSymbolSearchParams,
+    registered: &[ProjectRecord],
+    idx: Option<&crate::index::TranscriptIndex>,
+) -> Result<String> {
+    // Default mode rules:
+    // - Caller explicitly set `mode`: honour it (Indexed requires idx).
+    // - Caller left `mode` unset and we have an index: default to
+    //   Indexed (fast path).
+    // - Caller left `mode` unset and we have no index (test path):
+    //   default to Live.
+    let mode = match p.mode.as_deref() {
+        Some(raw) => CodeSymbolMode::from_param(Some(raw))?,
+        None if idx.is_some() => CodeSymbolMode::Indexed,
+        None => CodeSymbolMode::Live,
+    };
+    match mode {
+        CodeSymbolMode::Indexed => match idx {
+            Some(index) => code_symbols_indexed(p, registered, index),
+            None => Err(anyhow!(
+                "mode=\"indexed\" requires a TranscriptIndex; pass one via the MCP handler or use mode=\"live\""
+            )),
+        },
+        CodeSymbolMode::Live => code_symbols_live(p, registered),
+    }
+}
+
+/// Live lane. Walks the project tree, parses each supported source via
+/// `refactor::status`, and returns refactor-vocabulary records. Suffers
+/// per-file parse cost; capped by `MAX_CODE_NAV_SCANNED_FILES`.
+pub fn code_symbols_live(
+    p: &CodeSymbolSearchParams,
+    registered: &[ProjectRecord],
+) -> Result<String> {
     let project_dir = PathBuf::from(&p.project_dir)
         .canonicalize()
         .with_context(|| format!("failed to resolve project_dir {}", p.project_dir))?;
@@ -803,10 +1010,14 @@ pub fn code_symbols(p: &CodeSymbolSearchParams, registered: &[ProjectRecord]) ->
             if items.len() >= limit {
                 continue;
             }
+            let (symbol_kind, parent_kind) =
+                symbol_kind_from_refactor(&status.language, &item.kind);
             items.push(CodeSymbolSearchItem {
                 file: rel_path.clone(),
                 language: status.language.clone(),
                 kind: item.kind.clone(),
+                symbol_kind: Some(symbol_kind),
+                parent_kind,
                 name: item.name.clone(),
                 byte_range: (item.byte_start, item.byte_end),
                 line_range: (item.line_start, item.line_end),
@@ -815,10 +1026,17 @@ pub fn code_symbols(p: &CodeSymbolSearchParams, registered: &[ProjectRecord]) ->
         }
     }
 
+    items.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.byte_range.0.cmp(&b.byte_range.0))
+    });
+
     let truncated = file_limit_hit || matching_items > items.len();
     let response = CodeSymbolSearchResponse {
         status: "ok".to_string(),
         project_dir: project_dir_arg,
+        mode: CodeSymbolMode::Live.label().to_string(),
         scanned_files,
         matched_files: matched_file_paths.len(),
         matching_items,
@@ -826,6 +1044,254 @@ pub fn code_symbols(p: &CodeSymbolSearchParams, registered: &[ProjectRecord]) ->
         truncated,
         items,
         errors,
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
+    };
+    Ok(serde_json::to_string_pretty(&response)?)
+}
+
+/// Indexed lane. Reads `project_file` docs from tantivy and returns
+/// the same record shape as the live lane but without any parse cost.
+/// Requires CN-D3 fields (`symbol_kind`, `parent_kind`, `byte_end`,
+/// `line_start`, `line_end`, `project_id`) to be populated, which
+/// happens on first reindex after the daemon picks up the bumped
+/// schema version.
+pub fn code_symbols_indexed(
+    p: &CodeSymbolSearchParams,
+    registered: &[ProjectRecord],
+    idx: &crate::index::TranscriptIndex,
+) -> Result<String> {
+    use tantivy::collector::TopDocs;
+    use tantivy::query::{BooleanQuery, Occur, Query as QueryTrait, TermQuery};
+    use tantivy::schema::IndexRecordOption;
+    use tantivy::{TantivyDocument, Term};
+
+    let project_dir = PathBuf::from(&p.project_dir)
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project_dir {}", p.project_dir))?;
+    if !project_dir.is_dir() {
+        return Err(anyhow!("project_dir must be a directory"));
+    }
+    if let Some(err_json) = check_project_dir_registered(&project_dir, registered)? {
+        return Ok(err_json);
+    }
+
+    // Map project_dir → project_id via the registered-roots scan
+    // (registered_for the same check above already accepted us).
+    let project_id = registered
+        .iter()
+        .filter(|rec| {
+            let root = PathBuf::from(&rec.canonical_path);
+            let canon = root.canonicalize().unwrap_or(root);
+            project_dir == canon || project_dir.starts_with(&canon)
+        })
+        // Prefer the deepest registered ancestor when worktrees nest
+        // (e.g. .claude/worktrees/foo under transcript-search).
+        .max_by_key(|rec| rec.canonical_path.len())
+        .map(|rec| rec.project_id.clone())
+        .ok_or_else(|| {
+            anyhow!("internal: project_dir passed gate but no project_id resolved")
+        })?;
+    let project_dir_arg = project_dir.to_string_lossy().into_owned();
+
+    let limit = p.limit.unwrap_or(100).min(1000);
+    let language_filter: Vec<String> = p
+        .languages
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let kind_filter: Vec<String> = p
+        .item_kinds
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let fields = idx.field_handles();
+    let mut clauses: Vec<(Occur, Box<dyn QueryTrait>)> = vec![
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.doc_type, "project_file"),
+                IndexRecordOption::Basic,
+            )),
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.project_id, &project_id),
+                IndexRecordOption::Basic,
+            )),
+        ),
+    ];
+
+    // Languages: union (Should) across the requested set, wrapped in
+    // a Must so any-match is required.
+    if !language_filter.is_empty() {
+        let lang_clauses: Vec<(Occur, Box<dyn QueryTrait>)> = language_filter
+            .iter()
+            .map(|lang| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(fields.language, lang),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn QueryTrait>,
+                )
+            })
+            .collect();
+        clauses.push((Occur::Must, Box::new(BooleanQuery::new(lang_clauses))));
+    }
+
+    // Kinds: accept either the refactor-vocabulary token (matches the
+    // synthesised `kind` after live-side projection) or the raw
+    // tree-sitter `symbol_kind` token. We probe both fields.
+    if !kind_filter.is_empty() {
+        let kind_clauses: Vec<(Occur, Box<dyn QueryTrait>)> = kind_filter
+            .iter()
+            .flat_map(|kind| {
+                [
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.symbol_kind, kind),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn QueryTrait>,
+                    ),
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(fields.symbol_kind, kind),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn QueryTrait>,
+                    ),
+                ]
+            })
+            .collect();
+        clauses.push((Occur::Must, Box::new(BooleanQuery::new(kind_clauses))));
+    }
+
+    let query: Box<dyn QueryTrait> = Box::new(BooleanQuery::new(clauses));
+    let index_handle = idx.index_handle();
+    let reader = index_handle
+        .reader_builder()
+        .reload_policy(tantivy::ReloadPolicy::Manual)
+        .try_into()?;
+    let searcher: tantivy::Searcher = {
+        let r: tantivy::IndexReader = reader;
+        r.searcher()
+    };
+
+    // Tantivy can't post-filter on substring; we over-fetch a bit and
+    // apply path/name/excerpt-style filtering after stored-field load.
+    let over_fetch = limit.saturating_mul(4).max(64);
+    let hits = searcher.search(&*query, &TopDocs::with_limit(over_fetch))?;
+
+    let mut items: Vec<CodeSymbolSearchItem> = Vec::new();
+    let mut matched_file_paths = std::collections::HashSet::new();
+    let mut matching_items = 0usize;
+
+    for (_score, addr) in hits {
+        let doc: TantivyDocument = searcher.doc(addr)?;
+        let stored_file_path = first_text(&doc, fields.file_path);
+        let rel_path = if let Ok(rel) =
+            std::path::Path::new(&stored_file_path).strip_prefix(&project_dir)
+        {
+            rel.to_string_lossy().into_owned()
+        } else {
+            stored_file_path.clone()
+        };
+
+        if let Some(path_contains) =
+            p.path_contains.as_deref().filter(|s| !s.is_empty())
+        {
+            if !rel_path.contains(path_contains) {
+                continue;
+            }
+        }
+
+        let language = optional_text(&doc, fields.language).unwrap_or_default();
+        let symbol_kind_raw = optional_text(&doc, fields.symbol_kind);
+        let parent_kind_raw = optional_text(&doc, fields.parent_kind);
+        // Indexed-only docs that predate CN-D3 don't have symbol_kind.
+        // Skip them — the live lane is the fallback for pre-reindex
+        // states.
+        let Some(symbol_kind) = symbol_kind_raw.clone() else {
+            continue;
+        };
+        let refactor_kind =
+            refactor_kind_for(&language, &symbol_kind, parent_kind_raw.as_deref());
+        let symbol_display = optional_text(&doc, fields.symbol);
+        let symbol_exact = optional_text(&doc, fields.symbol_exact);
+        let name = symbol_exact.or(symbol_display.clone());
+
+        // Substring filter on name/path/kind, mirroring live lane.
+        if let Some(query) = p.query.as_deref().filter(|s| !s.is_empty()) {
+            let in_name = name.as_deref().is_some_and(|n| n.contains(query));
+            let in_kind = refactor_kind.contains(query) || symbol_kind.contains(query);
+            let in_path = rel_path.contains(query);
+            if !(in_name || in_kind || in_path) {
+                continue;
+            }
+        }
+
+        let byte_start = first_u64(&doc, fields.byte_offset) as usize;
+        let byte_end = first_u64(&doc, fields.byte_end) as usize;
+        let line_start = first_u64(&doc, fields.line_start) as usize;
+        let line_end = first_u64(&doc, fields.line_end) as usize;
+
+        matching_items += 1;
+        matched_file_paths.insert(rel_path.clone());
+        if items.len() >= limit {
+            continue;
+        }
+
+        let handoff = indexed_handoff(
+            &rel_path,
+            &project_dir_arg,
+            &language,
+            name.as_deref(),
+            &refactor_kind,
+            (byte_start, byte_end),
+            (line_start, line_end),
+        );
+
+        items.push(CodeSymbolSearchItem {
+            file: rel_path,
+            language,
+            kind: refactor_kind,
+            symbol_kind: Some(symbol_kind),
+            parent_kind: parent_kind_raw,
+            name,
+            byte_range: (byte_start, byte_end),
+            line_range: (line_start, line_end),
+            handoff,
+        });
+    }
+
+    items.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.byte_range.0.cmp(&b.byte_range.0))
+    });
+
+    let truncated = matching_items > items.len();
+    let response = CodeSymbolSearchResponse {
+        status: "ok".to_string(),
+        project_dir: project_dir_arg,
+        mode: CodeSymbolMode::Indexed.label().to_string(),
+        // Indexed lane has no per-file scan; report 0 to keep the
+        // field present (response shape stable across modes) while
+        // signalling the asymmetry honestly.
+        scanned_files: 0,
+        matched_files: matched_file_paths.len(),
+        matching_items,
+        returned_items: items.len(),
+        truncated,
+        items,
+        errors: Vec::new(),
         semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
     };
     Ok(serde_json::to_string_pretty(&response)?)

@@ -32,7 +32,8 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_code_symbols", || {
             let projects = self.state.projects.read().list();
-            code_symbols(&p, &projects)
+            let idx = self.state.idx.read();
+            code_symbols(&p, &projects, Some(&*idx))
         })
     }
 

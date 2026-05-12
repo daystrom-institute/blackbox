@@ -176,8 +176,9 @@ fn test_code_symbols_finds_java_method_line_ranges_without_rg() {
         limit: None,
         file_limit: None,
         include_attributes: Some(false),
+        mode: None,
     };
-    let response_json = code_symbols(&params, &registered_for(&dir)).unwrap();
+    let response_json = code_symbols(&params, &registered_for(&dir), None).unwrap();
     let response: CodeSymbolSearchResponse = serde_json::from_str(&response_json).unwrap();
     assert_eq!(response.scanned_files, 1);
     assert_eq!(response.matching_items, 1);
@@ -395,8 +396,10 @@ fn test_code_nav_tools_always_label_semantic_status_syntax_only() {
             limit: None,
             file_limit: None,
             include_attributes: Some(false),
+            mode: None,
         },
         &registered_for(&dir),
+        None,
     )
     .unwrap();
     let symbols_response: CodeSymbolSearchResponse =
@@ -406,6 +409,113 @@ fn test_code_nav_tools_always_label_semantic_status_syntax_only() {
         SEMANTIC_STATUS_SYNTAX_ONLY
     );
     assert_eq!(symbols_response.semantic_status, "syntax_only");
+}
+
+/// CN-T2: refactor_kind_for is the load-bearing function that lets
+/// the indexed and live lanes return the same `kind` field on Rust
+/// impl methods. New synthesis cases must be added to this function
+/// AND mirrored in refactor::status. Lock the current contract here.
+#[test]
+fn refactor_kind_for_synthesises_rust_impl_method() {
+    // The only documented synthesis as of CN-T2 landing.
+    assert_eq!(
+        refactor_kind_for("rust", "function_item", Some("impl_item")),
+        "impl_method"
+    );
+    // Top-level Rust functions stay function_item.
+    assert_eq!(
+        refactor_kind_for("rust", "function_item", None),
+        "function_item"
+    );
+    // Other languages: no synthesis today.
+    assert_eq!(
+        refactor_kind_for("java", "method_declaration", Some("class_declaration")),
+        "method_declaration"
+    );
+    // Unknown language: pass through.
+    assert_eq!(refactor_kind_for("haskell", "function", None), "function");
+}
+
+/// CN-T2: reverse derivation used by the live lane to fill
+/// symbol_kind/parent_kind when only the refactor synthetic kind is
+/// available. Asymmetric — only documented synthesis pairs are
+/// recovered.
+#[test]
+fn symbol_kind_from_refactor_recovers_rust_impl_method_parent() {
+    assert_eq!(
+        symbol_kind_from_refactor("rust", "impl_method"),
+        ("function_item".to_string(), Some("impl_item".to_string()))
+    );
+    // No synthesis → pass through with no parent claim.
+    assert_eq!(
+        symbol_kind_from_refactor("rust", "struct_item"),
+        ("struct_item".to_string(), None)
+    );
+    assert_eq!(
+        symbol_kind_from_refactor("java", "method_declaration"),
+        ("method_declaration".to_string(), None)
+    );
+}
+
+/// CN-T2: live-lane records must carry both `kind` (refactor synth)
+/// and `symbol_kind` (raw tree-sitter) for every entry. For Rust impl
+/// methods specifically, both must round-trip and parent_kind must
+/// resolve to `impl_item`.
+#[test]
+fn code_symbols_live_lane_populates_symbol_kind_and_parent_kind() {
+    let dir = TempDir::new().unwrap();
+    setup_test_file(
+        &dir,
+        "src/lib.rs",
+        "pub struct S;\n\nimpl S {\n    pub fn run(&self) -> i32 { 1 }\n}\n",
+    );
+    let params = CodeSymbolSearchParams {
+        project_dir: dir.path().to_string_lossy().into_owned(),
+        query: None,
+        languages: Some(vec!["rust".to_string()]),
+        item_kinds: None,
+        path_contains: None,
+        limit: None,
+        file_limit: None,
+        include_attributes: None,
+        mode: Some("live".to_string()),
+    };
+    let json = code_symbols(&params, &registered_for(&dir), None).unwrap();
+    let response: CodeSymbolSearchResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response.status, "ok");
+    assert_eq!(response.mode, "live");
+
+    let method = response
+        .items
+        .iter()
+        .find(|it| it.kind == "impl_method")
+        .expect("impl_method record present");
+    assert_eq!(method.symbol_kind.as_deref(), Some("function_item"));
+    assert_eq!(method.parent_kind.as_deref(), Some("impl_item"));
+    assert_eq!(method.name.as_deref(), Some("run"));
+}
+
+/// CN-T2: when no index is provided, the dispatcher must default to
+/// mode="live" rather than failing. Tests historically don't pass an
+/// index; this guards that contract.
+#[test]
+fn code_symbols_dispatch_defaults_to_live_when_no_index() {
+    let dir = TempDir::new().unwrap();
+    setup_test_file(&dir, "src/lib.rs", "fn main() {}\n");
+    let params = CodeSymbolSearchParams {
+        project_dir: dir.path().to_string_lossy().into_owned(),
+        query: None,
+        languages: None,
+        item_kinds: None,
+        path_contains: None,
+        limit: None,
+        file_limit: None,
+        include_attributes: None,
+        mode: None, // unset
+    };
+    let json = code_symbols(&params, &registered_for(&dir), None).unwrap();
+    let response: CodeSymbolSearchResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response.mode, "live");
 }
 
 /// `bbox_code_symbols` must refuse a `project_dir` that is neither a
@@ -425,9 +535,10 @@ fn test_code_symbols_rejects_unregistered_project_dir() {
         limit: None,
         file_limit: None,
         include_attributes: None,
+        mode: None,
     };
     // Empty registry — dir is not registered nor a descendant.
-    let response_json = code_symbols(&params, &[]).unwrap();
+    let response_json = code_symbols(&params, &[], None).unwrap();
     let response: CodeNavErrorResponse = serde_json::from_str(&response_json).unwrap();
     assert_eq!(response.status, "error");
     assert_eq!(response.code, "project_not_registered");
@@ -457,8 +568,9 @@ fn test_code_symbols_accepts_descendant_of_registered_root() {
         limit: None,
         file_limit: None,
         include_attributes: None,
+        mode: None,
     };
-    let response_json = code_symbols(&params, &registered_for(&dir)).unwrap();
+    let response_json = code_symbols(&params, &registered_for(&dir), None).unwrap();
     let response: CodeSymbolSearchResponse = serde_json::from_str(&response_json).unwrap();
     assert_eq!(response.status, "ok");
     assert!(response.matching_items >= 1);

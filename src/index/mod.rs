@@ -536,22 +536,22 @@ impl TranscriptIndex {
     }
 }
 
-fn first_text(doc: &TantivyDocument, field: Field) -> String {
+pub(crate) fn first_text(doc: &TantivyDocument, field: Field) -> String {
     optional_text(doc, field).unwrap_or_default()
 }
 
-fn optional_text(doc: &TantivyDocument, field: Field) -> Option<String> {
+pub(crate) fn optional_text(doc: &TantivyDocument, field: Field) -> Option<String> {
     doc.get_all(field).next().and_then(|value| match value {
         tantivy::schema::OwnedValue::Str(text) => Some(text.clone()),
         _ => None,
     })
 }
 
-fn optional_u64(doc: &TantivyDocument, field: Field) -> Option<u64> {
+pub(crate) fn optional_u64(doc: &TantivyDocument, field: Field) -> Option<u64> {
     doc.get_first(field).and_then(|v| v.as_value().as_u64())
 }
 
-fn first_u64(doc: &TantivyDocument, field: Field) -> u64 {
+pub(crate) fn first_u64(doc: &TantivyDocument, field: Field) -> u64 {
     doc.get_all(field)
         .next()
         .and_then(|value| match value {
