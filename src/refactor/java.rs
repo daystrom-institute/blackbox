@@ -4267,3 +4267,5 @@ mod atom_plans;
 mod extract_class;
 mod extract_methods;
 mod move_and_callers;
+mod find_usages;
+pub(crate) use find_usages::plan_find_java_usages;
