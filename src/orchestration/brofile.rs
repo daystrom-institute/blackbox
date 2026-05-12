@@ -622,7 +622,9 @@ mod tests {
         let src = include_str!("../../examples/brofiles/java-refactor-persona.json");
         let bf: Brofile = serde_json::from_str(src).expect("java-refactor-persona parses");
         assert_eq!(bf.name, "java-refactor-persona");
-        assert_eq!(bf.provider, Provider::Claude);
+        assert_eq!(bf.provider, Provider::Codex);
+        assert_eq!(bf.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(bf.effort.as_deref(), Some("medium"));
         let lens = bf.lens.as_deref().unwrap_or("");
         assert!(lens.contains("bbox refactor primitives"));
         assert!(
