@@ -41,7 +41,12 @@ is correspondingly thinner — 4 atoms cover what 7 Rust atoms cover —
 
 ## Gap 1 — `java_public_api_guard`
 
-**Status:** unimplemented.
+**Status:** LANDED 2026-05-11 on `java-tool-gaps-tranche-5`. Closing
+commit ships the plan kind, dispatcher wiring, and 7 tests covering
+the full severity matrix (breaking / caution / info), the mixed-
+worst-case rule, directory-scoped scan with build-dir skip, and the
+plan_status snake_case serialization contract. See
+`src/refactor/java/public_api_guard.rs`.
 
 **Rust counterpart:** `rust_public_api_guard` (RX-G2),
 `src/refactor/rust_public_api.rs`. Returns a `PublicApiReport` with
@@ -124,7 +129,16 @@ walk; non-project callers are not detected, same as Rust's guard).
 
 ## Gap 2 — `java_class_dependency_analysis`
 
-**Status:** unimplemented as a standalone plan kind.
+**Status:** LANDED 2026-05-11 on `java-tool-gaps-tranche-5`. Closing
+commit ships the plan kind, dispatcher wiring, and 5 tests covering
+class metadata + class-level annotations + methods + fields + inner
+types, named-class selection via `module_name`/`impl_name`, the
+outer-only filter (inner-class methods correctly excluded), and the
+plan_status snake_case serialization contract. The v1 omits the
+explicit edge graph (method_to_method / method_to_field /
+method_to_inherited) per the contract sketch — that v2 wraps the
+existing `analyze_extracted_dependencies` per-method walker into a
+whole-class stitcher. See `src/refactor/java/class_dependency.rs`.
 
 **Rust counterpart:** `rust_impl_partition_analysis` (RX-G1),
 `src/refactor/mod.rs::plan_rust_impl_partition_analysis`. Returns a
