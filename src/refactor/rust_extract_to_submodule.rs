@@ -58,18 +58,29 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
 
     let visibility = p.visibility.as_deref().unwrap_or("pub(super)");
     let visibility_prefix = rust_decl_visibility_prefix(Some(visibility))?;
+    let target_stem = target_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "target {} has no file stem; cannot derive submodule name",
+                target_path.display()
+            )
+        })?;
     let module_name: String = match p.module_name.as_deref() {
-        Some(name) => name.to_string(),
-        None => target_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                anyhow!(
-                    "module_name not given and target {} has no file stem to derive from",
-                    target_path.display()
-                )
-            })?
-            .to_string(),
+        Some(name) if !name.is_empty() => {
+            if name != target_stem {
+                bail!(
+                    "module_name `{name}` does not match target file stem `{target_stem}`. \
+                     Rust's `mod <name>;` declaration in the parent points at \
+                     `<parent_dir>/<name>.rs` — they must agree or rustc won't \
+                     resolve the module. Rename the target file or omit module_name \
+                     to derive from the stem."
+                );
+            }
+            name.to_string()
+        }
+        _ => target_stem.to_string(),
     };
     validate_rust_identifier(&module_name, "module_name")?;
     let target_prelude = p.target_prelude.as_deref().unwrap_or("use super::*;");
@@ -784,9 +795,12 @@ mod tests {
         );
     }
 
-    // Gate: explicit module_name overrides target-stem derivation.
+    // Gate: explicit module_name that disagrees with the target file
+    // stem is refused — Rust resolves `mod <name>;` against
+    // `<parent_dir>/<name>.rs`, so mismatched names produce an orphan
+    // target file.
     #[test]
-    fn explicit_module_name_overrides_stem() {
+    fn rejects_module_name_target_stem_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("parent.rs");
         let tgt = dir.path().join("parent/internal.rs");
@@ -794,16 +808,32 @@ mod tests {
         fs::write(&src, "fn x() {}\n").unwrap();
         let mut params = make_params(&src, &tgt, &["x"], Some(vec!["function_item"]));
         params.module_name = Some("private_helpers".to_string());
+        let err = plan_extract_rust_items_to_submodule(&params)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not match target file stem"),
+            "expected mismatch refusal, got: {err}"
+        );
+    }
+
+    // Gate: explicit module_name that MATCHES the target file stem is
+    // accepted (idempotent with the auto-derivation).
+    #[test]
+    fn explicit_module_name_matching_stem_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/internal.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        fs::write(&src, "fn caller() { x(); }\nfn x() {}\n").unwrap();
+        let mut params = make_params(&src, &tgt, &["x"], Some(vec!["function_item"]));
+        params.module_name = Some("internal".to_string());
         let plan_json = plan_extract_rust_items_to_submodule(&params).unwrap();
         let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
         let source_after = apply_file_edit(&src, &plan.edits[0]);
-        // Note: target stem is "internal" but module_name forces "private_helpers".
-        // This case would create a mismatch (mod private_helpers; points to ?), but
-        // the plan kind doesn't enforce target-stem == module_name. Operator's
-        // responsibility to keep them aligned.
         assert!(
-            source_after.contains("mod private_helpers;"),
-            "explicit module name should override: {source_after}"
+            source_after.contains("mod internal;"),
+            "module name should pass through: {source_after}"
         );
     }
 
