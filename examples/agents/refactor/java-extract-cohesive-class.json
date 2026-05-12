@@ -1,0 +1,147 @@
+{
+  "kind": "agent",
+  "name": "java-extract-cohesive-class",
+  "version": 1,
+  "_contract": "refactor-atom/v1",
+  "manifest": {
+    "description": "Extract a cohesive Java cluster — methods + field moves + delegate wiring + caller delegation + accessor rewrites + cross-package widening — into a new class via the composite extract_java_class plan kind.",
+    "when_to_use": [
+      "a class has a tight cluster of methods + fields that belong together (e.g. one grid + its data provider + the methods that build them)",
+      "splitting a Vaadin view or service class along a clear functional seam",
+      "the operator has identified the methods and fields and wants the composite plan to handle delegate wiring + caller rewrites + visibility + import organization in one pass"
+    ],
+    "anti_patterns": [
+      "do not use when the cluster includes a non-static inner class with outer captures — chain java-promote-inner-class first",
+      "do not use to lift a method subset onto a NEW interface — use java-extract-interface for the interface shape",
+      "do not use on non-Java files",
+      "do not pass an inner-class name in item_names — extract_java_class hard-refuses with nested_class_in_item_names"
+    ],
+    "brofile_ref": "java-refactor-persona",
+    "filter_overlay": {
+      "allow": [],
+      "disallow": []
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source",
+          "target",
+          "module_name",
+          "item_names",
+          "delegate_field"
+        ],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string" },
+          "target": { "type": "string" },
+          "module_name": {
+            "type": "string",
+            "description": "Target class name. extract_java_class derives the file class wrapper from this when the target file is missing."
+          },
+          "item_names": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "description": "Method names to move. Pass `methodName(Type1, Type2)` to disambiguate overloads."
+          },
+          "move_fields": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Instance fields to move with the methods. Triggers accessor generation + remaining-source rewrites by default."
+          },
+          "delegate_field": {
+            "type": "string",
+            "description": "Name of the delegate field added to the source class for the new target."
+          },
+          "target_prelude": {
+            "type": "string",
+            "description": "Explicit package + import header for the target file. Overrides path-derived package resolution."
+          },
+          "rewrite_remaining_accessors": {
+            "type": "boolean",
+            "description": "Defaults to true when move_fields is non-empty. Pass false to opt out of source-side delegate.getX()/.setX() rewrites + target accessor generation."
+          },
+          "callback_externals": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Source-class methods to thread as functional-interface callbacks (Runnable / Supplier / Consumer / Function) instead of leaving FIXME markers. Two-plus-arg methods refuse with callback_arity_unsupported."
+          },
+          "visibility": {
+            "enum": ["package", "public"],
+            "description": "Floor for moved-method visibility. Defaults to package for same-package extracts, public for cross-package."
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Validation command + args. Defaults to [\"mvn\", \"compile\"] when omitted."
+          }
+        }
+      },
+      "prompt_template": "You are java-extract-cohesive-class. Charter: Extract a cohesive Java cluster into a new class via the composite extract_java_class plan.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}}\",\n                     languages=[\"java\"], item_kinds=[\"class_declaration\", \"method_declaration\"])\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm every name in {{item_names}} resolves on the source class. For\n   overloaded methods, copy the exact `methodName(Type1, Type2)` signature\n   suffix from bbox_code_symbols — bare ambiguous names refuse with\n   method_overload_ambiguous.\n\n2. Plan with deep_analysis=true (REQUIRED for atoms):\n   bbox_refactor_plan(kind=\"extract_java_class\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\", target=\"{{target}}\",\n                      module_name=\"{{module_name}}\",\n                      item_names={{item_names}},\n                      move_fields={{move_fields}},\n                      delegate_field=\"{{delegate_field}}\",\n                      callback_externals={{callback_externals}},\n                      rewrite_remaining_accessors={{rewrite_remaining_accessors}},\n                      target_prelude=\"{{target_prelude}}\",\n                      visibility=\"{{visibility}}\")\n   Inspect the response: captured_variables (with source_mutable +\n   source_static_final flags), external_calls, inherited_dependencies,\n   remaining_source_accessors, remaining_source_constant_refs. The\n   generated target carries FIXME markers for every unresolved external\n   call, inherited call, mutable capture, and partial implements clause.\n\n3. Decide:\n   - HARD REFUSAL codes (plan kind returns these directly):\n     - mutable_capture_with_write: extracted body writes to a non-final\n       source field NOT in move_fields. Surface the offending fields in\n       block_reason; the operator must add them to move_fields.\n     - nested_class_in_item_names: an inner-class name was passed.\n       Surface the hint to use java-promote-inner-class first.\n     - method_overload_ambiguous / method_overload_no_match: signature\n       disambiguation failed. Surface the available overloads.\n     - callback_arity_unsupported: a callback_externals method takes 2+\n       args. Surface the offending method.\n   - SOFT REFUSAL (operator decision): if external_calls and\n     inherited_dependencies are non-empty AND the FIXME count exceeds\n     operator tolerance, save the plan via output_path and emit\n     bbox_note(kind=\"blocked\") with the FIXME summary + plan_path.\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(confirm=true, steps=[\n     <extract_java_class step>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"]; pass [\"./gradlew\",\n   \"compileJava\"] or [\"mvn\", \"test\"] depending on the project's build\n   system and validation strictness. extract_java_class does not yet\n   support intra-run rust_compile_fix_round-style repair; the compile\n   step is required=true and rolls back on failure.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: methods moved, fields\n     moved, FIXMEs by kind (external/inherited/mutable_capture/implements),\n     cross-package status, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside your filter_overlay.\n- Never invent method/field names from the user prompt — re-derive from\n  bbox_code_symbols / bbox_refactor_status.\n- Never apply when status=blocked.\n- Never pass an inner-class name in item_names.\n- Never silently drop FIXMEs from the done-note summary — operators need\n  to know what survives unresolved.\n\nInputs:\n{{project_dir}} {{source}} {{target}} {{module_name}} {{item_names}} {{move_fields}} {{delegate_field}} {{target_prelude}} {{rewrite_remaining_accessors}} {{callback_externals}} {{visibility}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": { "type": "integer", "minimum": 0 },
+              "warning": { "type": "integer", "minimum": 0 },
+              "by_kind": {
+                "type": "object",
+                "properties": {
+                  "external_call": { "type": "integer", "minimum": 0 },
+                  "inherited_call": { "type": "integer", "minimum": 0 },
+                  "mutable_capture": { "type": "integer", "minimum": 0 },
+                  "implements_partial": { "type": "integer", "minimum": 0 }
+                }
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "captured_variables, external_calls, inherited_dependencies, remaining_source_accessors, remaining_source_constant_refs subsets."
+          },
+          "cargo_result": {
+            "type": "object",
+            "description": "Misnamed in the base schema for Java atoms; carries mvn/gradle command + exit_code + summary + rolled_back. The runner output shape is shared across languages.",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "methods_moved": { "type": "array", "items": { "type": "string" } },
+          "fields_moved": { "type": "array", "items": { "type": "string" } },
+          "constants_moved": { "type": "array", "items": { "type": "string" } },
+          "delegate_field": { "type": "string" },
+          "target_package": { "type": "string" },
+          "cross_package": { "type": "boolean" }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "composition": {
+      "chainable_after": ["java-promote-inner-class"],
+      "parallel_safe": false
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-11T00:00:00Z"
+    }
+  }
+}
