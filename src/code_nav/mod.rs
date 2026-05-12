@@ -159,9 +159,27 @@ pub struct CodeNavErrorResponse {
     /// Always `"error"`. Pair with `code` for typed dispatch; pair with
     /// `message` for human display.
     pub status: String,
-    /// Stable machine-readable code. One of:
-    /// `file_too_large_for_code_nav`, `project_not_registered`,
-    /// `file_outside_registered_projects`.
+    /// Stable machine-readable code. Documented values (the
+    /// `sm-refactor` system-memory entry lists the same set and is
+    /// the agent-facing source of truth):
+    /// - `file_too_large_for_code_nav` — source exceeds
+    ///   `MAX_CODE_NAV_FILE_BYTES`. Carries `file_bytes` +
+    ///   `max_bytes`.
+    /// - `project_not_registered` — `project_dir` is not a
+    ///   registered root nor a descendant of one. Carries
+    ///   `registered_projects` list.
+    /// - `invalid_code_symbols_mode` —
+    ///   `bbox_code_symbols(mode=...)` was not `"indexed"` /
+    ///   `"live"`.
+    /// - `invalid_code_refs_kind` —
+    ///   `bbox_code_refs(kind=...)` was not `"calls"` /
+    ///   `"imports"` / `"fields"` / `"identifiers"` / `"all"`.
+    /// - `unsupported_language_for_code_refs` — language has no
+    ///   curated reference query and the requested `kind` is not
+    ///   `"identifiers"`. Suggestion names the fallback.
+    /// New codes added in future tools should follow the same
+    /// `<surface>_<failure>` shape and be added to this list +
+    /// the `sm-refactor` error vocabulary in lock step.
     pub code: String,
     /// One-line human-readable summary.
     pub message: String,
@@ -1911,7 +1929,7 @@ fn code_ref_handoff(
             },
         },
         note: format!(
-            "Syntax-only reference capture for {language}. edge_confidence=\"heuristic\" — same-name match is not binding resolution. Use bbox_refactor_status to confirm the defining item before planning edits; use bbox_refactor_project_refs to ground project_file entity refs."
+            "Syntax-only reference capture for {language}. edge_confidence=\"heuristic\" — this is the syntax anchor at the reference site; it does NOT identify the callee/definition (use LSP via bbox_refactor_plan or graph traversal via bbox_inspect_entity for that). The handoff `item_names` targets the *containing* refactor item, i.e. the edit container surrounding this site — use bbox_refactor_status to confirm it before planning edits in this file; use bbox_refactor_project_refs to ground project_file entity refs."
         ),
     }
 }

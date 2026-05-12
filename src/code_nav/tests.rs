@@ -1070,8 +1070,8 @@ fn code_refs_invalid_kind_returns_typed_error_response() {
 /// CN-T1 closing fix: every bbox_code_refs record carries a
 /// `handoff` block with pre-filled bbox_refactor_status and
 /// bbox_refactor_project_refs argument shapes. The CN-X2 audit
-/// claims "handoff blocks on every code-nav response" — this test
-/// locks the claim for code_refs.
+/// claims "handoff on every code-nav tool's success records" —
+/// this test locks the claim for code_refs.
 #[test]
 fn code_refs_records_carry_handoff_with_pre_filled_args() {
     let dir = TempDir::new().unwrap();
