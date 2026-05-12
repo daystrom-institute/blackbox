@@ -53,6 +53,22 @@ pub struct ProjectRenameParams {
     pub dry_run: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectUnregisterParams {
+    /// Project to unregister. Accepts project_id, registered
+    /// canonical_path, or an absolute path resolving to a registered project.
+    pub project: String,
+    /// Remove the registry entry even when project-scoped state
+    /// (knowledge, threads, notes, pins, ...) still references it.
+    /// Default false: the call refuses with the live ref counts so the
+    /// caller can migrate or accept the orphaning explicitly.
+    #[serde(default)]
+    pub force: Option<bool>,
+    /// Preview without modifying the registry.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct ProjectRecord {
     pub project_id: String,
@@ -294,6 +310,28 @@ impl ProjectRegistry {
             record,
             moved_on_disk: move_on_disk && !dry_run,
             dry_run,
+        })
+    }
+
+    /// Resolve `raw` (project_id, canonical_path, or absolute path) without
+    /// mutating the registry. Returns `None` when no match is registered.
+    pub fn resolve(&self, raw: &str) -> Result<Option<ProjectRecord>> {
+        Ok(self
+            .resolve_project_index(raw)?
+            .map(|idx| self.store.projects[idx].clone()))
+    }
+
+    pub fn unregister_project(&mut self, raw: &str) -> Result<ProjectRecord> {
+        let store_path = self.path.clone();
+        let raw = raw.to_string();
+        crate::json_store::with_store_lock(&store_path, || {
+            self.reload()?;
+            let idx = self
+                .resolve_project_index(&raw)?
+                .with_context(|| format!("project not registered: {raw}"))?;
+            let removed = self.store.projects.remove(idx);
+            self.save()?;
+            Ok(removed)
         })
     }
 
@@ -544,6 +582,59 @@ mod tests {
         let registered_again = registry.register_path(&new_path).unwrap();
         assert_eq!(registered_again.project_id, old_record.project_id);
         assert_eq!(registry.list().len(), 1);
+    }
+
+    #[test]
+    fn unregister_removes_entry_and_is_repeatable_after_reregister() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let store_path = dir.path().join("projects.json");
+        let mut registry = ProjectRegistry::open(&store_path).unwrap();
+
+        let record = registry.register_path(&project).unwrap();
+        assert_eq!(registry.list().len(), 1);
+
+        let removed = registry.unregister_project(&record.project_id).unwrap();
+        assert_eq!(removed.project_id, record.project_id);
+        assert_eq!(registry.list().len(), 0);
+
+        // Re-registering the same path yields the same project_id (derived
+        // from canonical realpath), so an unregister+register round-trip
+        // leaves project-scoped state (keyed on project_id) reachable again.
+        let again = registry.register_path(&project).unwrap();
+        assert_eq!(again.project_id, record.project_id);
+    }
+
+    #[test]
+    fn unregister_unknown_project_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("projects.json");
+        let mut registry = ProjectRegistry::open(&store_path).unwrap();
+        let err = registry.unregister_project("nonexistent").unwrap_err();
+        assert!(err.to_string().contains("project not registered"));
+    }
+
+    #[test]
+    fn unregister_accepts_canonical_path_and_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let canonical = fs::canonicalize(&project).unwrap();
+        let store_path = dir.path().join("projects.json");
+        let mut registry = ProjectRegistry::open(&store_path).unwrap();
+
+        registry.register_path(&project).unwrap();
+        registry
+            .unregister_project(&canonical.to_string_lossy())
+            .unwrap();
+        assert_eq!(registry.list().len(), 0);
+
+        registry.register_path(&project).unwrap();
+        registry
+            .unregister_project(&project.to_string_lossy())
+            .unwrap();
+        assert_eq!(registry.list().len(), 0);
     }
 
     #[test]

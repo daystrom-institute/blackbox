@@ -313,6 +313,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use to inspect registered roots or confirm symlink aliases collapsed.",
         example: None,
     },
+    ToolDoc {
+        name: "bbox_project_unregister",
+        category: ToolCategory::Projects,
+        summary: "Unregister a project root from the bbox project registry. Accepts project (project_id, registered canonical_path, or absolute path). Removes the registry entry only; does NOT delete project-scoped state (knowledge, threads, notes, pins, packets, Slack bindings, teams, councils, whiteboards, pollers, crons) keyed on the project_id, which is derived from the canonical realpath and is stable across unregister+re-register. By default refuses when refs still exist and returns the counts; pass force=true to orphan them, or bbox_project_rename to migrate first. dry_run=true previews counts without mutating the registry.",
+        when_to_use: "Use to drop a stale or accidentally-registered project root without hand-editing projects.json. Prefer `dry_run=true` first to see what is still attached, then `bbox_project_rename` to migrate or `force=true` to accept orphaning.",
+        example: Some(r#"bbox_project_unregister(project="/home/me/repos/dead-project", dry_run=true)"#),
+    },
     // ── Refactor mechanization ───────────────────────────────────────
     ToolDoc {
         name: "bbox_code_symbols",
