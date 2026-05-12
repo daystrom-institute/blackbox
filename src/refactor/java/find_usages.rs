@@ -76,6 +76,7 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
         .item_kinds
         .as_deref()
         .map(|ks| ks.iter().map(String::as_str).collect());
+    let declaring_class = p.declaring_class.as_deref();
 
     let mut usages: Vec<JavaUsage> = Vec::new();
     for entry in walkdir::WalkDir::new(project_dir)
@@ -100,7 +101,14 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
         if parsed.language != "java" {
             continue;
         }
-        collect_usages_in_file(&parsed, path, &symbol_set, kind_filter.as_ref(), &mut usages);
+        collect_usages_in_file(
+            &parsed,
+            path,
+            &symbol_set,
+            kind_filter.as_ref(),
+            declaring_class,
+            &mut usages,
+        );
     }
 
     // Stable order: by path, then byte_start.
@@ -168,6 +176,7 @@ fn collect_usages_in_file(
     path: &Path,
     symbol_set: &HashSet<&str>,
     kind_filter: Option<&HashSet<&str>>,
+    declaring_class: Option<&str>,
     out: &mut Vec<JavaUsage>,
 ) {
     let src = parsed.source.as_bytes();
@@ -200,6 +209,11 @@ fn collect_usages_in_file(
             // is handled by the type_identifier branch when it's a
             // class reference; field receivers go through field_access.
             "method_invocation" => {
+                if let Some(dc) = declaring_class {
+                    if !method_invocation_receiver_matches_declaring_class(parsed, node, dc) {
+                        continue;
+                    }
+                }
                 if let Some(name_node) = node.child_by_field_name("name") {
                     if let Ok(text) = name_node.utf8_text(src) {
                         if symbol_set.contains(text) {
@@ -307,6 +321,98 @@ fn collect_usages_in_file(
             _ => {}
         }
     }
+}
+
+/// G9 declaring_class filter heuristic.
+///
+/// For a `method_invocation` node, check whether its receiver expression
+/// resolves to a field declared as `<visibility> <modifiers> <DeclaringClass>
+/// <fieldName>` in the enclosing class. Only `private final` fields are
+/// considered (the standard dependency-injection pattern). The receiver
+/// must be either a bare identifier matching the field name, or
+/// `this.<fieldName>`.
+///
+/// Heuristic limits (v1):
+/// - Only checks `private final` fields. Fields with other visibility
+///   (package-private, protected, public) are not matched, even if typed
+///   as the declaring class.
+/// - Receiver-less calls (bare `save()` inside the declaring class itself)
+///   are not matched — those are usually intra-cluster calls and not
+///   cross-class usage sites the operator is looking for.
+/// - Chained receivers (`service.getDao().save()`) are not resolved.
+/// - No type hierarchy / import resolution — the field type must be a
+///   simple name matching `declaring_class` exactly.
+fn method_invocation_receiver_matches_declaring_class(
+    parsed: &ParsedSource,
+    method_node: Node<'_>,
+    declaring_class: &str,
+) -> bool {
+    let Some(object) = method_node.child_by_field_name("object") else {
+        return false;
+    };
+    let Some(receiver_name) = method_invocation_receiver_name(object, &parsed.source) else {
+        return false;
+    };
+    let Some(class_node) = enclosing_java_class(method_node) else {
+        return false;
+    };
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if child.kind() != "field_declaration" {
+            continue;
+        }
+        let mods = collect_java_modifiers(child);
+        let is_private = mods.iter().any(|(name, _, _)| name == "private");
+        let is_final = mods.iter().any(|(name, _, _)| name == "final");
+        if !is_private || !is_final {
+            continue;
+        }
+        let Some(field_name) = java_field_declaration_name(child, &parsed.source) else {
+            continue;
+        };
+        if field_name != receiver_name {
+            continue;
+        }
+        let Some(field_type) = java_field_type_text(child, &parsed.source) else {
+            continue;
+        };
+        if field_type == declaring_class {
+            return true;
+        }
+    }
+    false
+}
+
+fn method_invocation_receiver_name(object: Node<'_>, source: &str) -> Option<String> {
+    match object.kind() {
+        "identifier" => object.utf8_text(source.as_bytes()).ok().map(str::to_string),
+        "field_access" => {
+            let field_node = object.child_by_field_name("field")?;
+            let object_node = object.child_by_field_name("object")?;
+            if object_node.kind() == "this" {
+                field_node.utf8_text(source.as_bytes()).ok().map(str::to_string)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn enclosing_java_class(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "class_declaration" | "record_declaration" | "interface_declaration" | "enum_declaration"
+        ) {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
 }
 
 /// True when `node` IS the `name` child of its parent — meaning this
@@ -679,6 +785,47 @@ mod tests {
         assert_eq!(prod_count, 1, "expected exactly one production usage: {by_path:?}");
         assert_eq!(v["production_sites"].as_u64().unwrap(), 1);
         assert_eq!(v["test_sites"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn g9_declaring_class_filters_by_field_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("Decl.java"),
+            "package com.example;\n\
+             class RepoDao { void save() {} }\n\
+             class OtherDao { void save() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("Caller.java"),
+            "package com.example;\n\
+             class Caller {\n\
+            \x20   private final RepoDao repoDao = new RepoDao();\n\
+            \x20   private final OtherDao otherDao = new OtherDao();\n\
+            \x20   void run() {\n\
+            \x20       repoDao.save();\n\
+            \x20       otherDao.save();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = make_params(dir.path(), &["save"]);
+        params.declaring_class = Some("RepoDao".to_string());
+        let response = plan_find_java_usages(&params).unwrap();
+        let v = parse_response(&response);
+        let usages = v["usages"].as_array().unwrap();
+        let invocations: Vec<&str> = usages
+            .iter()
+            .map(|u| u["context"].as_str().unwrap())
+            .collect();
+        assert_eq!(usages.len(), 1, "receiver filter should include only repoDao call: {invocations:?}");
+        assert!(
+            invocations[0].contains("repoDao.save()"),
+            "filtered usage must be repoDao call: {invocations:?}"
+        );
     }
 
     // Gate: refuses when project_dir is missing.
