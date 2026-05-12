@@ -422,6 +422,17 @@ pub struct RefactorPlanParams {
     /// propagate.
     #[serde(default)]
     pub propagate_class_annotations: Option<String>,
+    /// `extract_java_class`: when true, generate thin wrapper methods on
+    /// the source class for each moved public non-static method that
+    /// route through the delegate field (G5). Makes public-method moves
+    /// source-API-compatible — cross-file callers holding references to
+    /// the source class continue to compile against the wrapper, which
+    /// delegates to the target. Default `false` (current behavior:
+    /// moved public methods break cross-file callers until manual
+    /// migration). Static moved methods are NOT wrapped — they're
+    /// handled by G19's class-qualified call auto-rewrite.
+    #[serde(default)]
+    pub source_delegate_wrappers: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -49,6 +49,7 @@
             declaring_class: None,
             summary_only: None,
             propagate_class_annotations: None,
+            source_delegate_wrappers: None,
             callback_externals: None,
             output_path: None,
         }
@@ -2295,6 +2296,91 @@
         assert!(
             !target_text.contains("@Slf4j"),
             "none mode must NOT propagate annotations: {target_text}"
+        );
+    }
+
+    // G5: source_delegate_wrappers=true generates thin wrapper methods on
+    // the source for each moved public non-static method. Cross-file
+    // callers holding references to the source class continue to
+    // compile against the wrapper, which delegates to the target.
+    #[test]
+    fn g5_extract_java_class_generates_source_delegate_wrappers() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Admin {\n\
+            \x20   public Long save(int id, String name) { return (long) id; }\n\
+            \x20   public void remove(int id) { }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["save".to_string(), "remove".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.source_delegate_wrappers = Some(true);
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("public Long save(int id, String name)"),
+            "save wrapper signature must appear: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("return service.save(id, name);"),
+            "save wrapper body must delegate: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("public void remove(int id)"),
+            "remove wrapper signature must appear: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("service.remove(id);")
+                && !rewritten.contains("return service.remove"),
+            "void wrapper must not have return: {rewritten}"
+        );
+    }
+
+    // G5: with source_delegate_wrappers default (false / unset), no
+    // wrappers are emitted.
+    #[test]
+    fn g5_extract_java_class_no_wrappers_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Admin {\n\
+            \x20   public Long save(int id) { return (long) id; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["save".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            !rewritten.contains("public Long save(int id)"),
+            "no wrapper without source_delegate_wrappers=true: {rewritten}"
         );
     }
 

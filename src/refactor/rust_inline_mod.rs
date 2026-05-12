@@ -286,6 +286,7 @@ mod tests {
             declaring_class: None,
             summary_only: None,
             propagate_class_annotations: None,
+            source_delegate_wrappers: None,
         }
     }
 

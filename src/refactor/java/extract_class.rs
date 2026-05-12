@@ -1298,6 +1298,97 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         ));
     }
 
+    // G5: source-side delegate wrappers. When enabled, generate a thin
+    // wrapper method on the source for each moved PUBLIC non-static
+    // method. The wrapper signature matches the original; the body
+    // delegates to the target via the new delegate field. Cross-file
+    // callers holding references to the source class continue to
+    // compile against the wrapper.
+    if p.source_delegate_wrappers.unwrap_or(false) {
+        let mut wrappers: Vec<String> = Vec::new();
+        for method in &selected_methods {
+            // Find the method declaration node by matching byte range.
+            let mut method_node: Option<Node<'_>> = None;
+            let mut stack = vec![class_node];
+            while let Some(node) = stack.pop() {
+                let mut c = node.walk();
+                for ch in node.named_children(&mut c) {
+                    stack.push(ch);
+                }
+                if node.kind() == "method_declaration"
+                    && node.start_byte() == method.item.byte_start
+                {
+                    method_node = Some(node);
+                    break;
+                }
+            }
+            let Some(method_node) = method_node else { continue };
+            // Only wrap PUBLIC non-static methods. Static methods are
+            // handled by G19 (class-qualified call auto-rewrite at the
+            // call site, not via a source-side wrapper).
+            if !java_method_has_modifier(method_node, &parsed.source, "public") {
+                continue;
+            }
+            if java_method_has_modifier(method_node, &parsed.source, "static") {
+                continue;
+            }
+            let Some(name_node) = method_node.child_by_field_name("name") else { continue };
+            let Ok(method_name) = name_node.utf8_text(parsed.source.as_bytes()) else { continue };
+            // Extract return type text — may be void.
+            let return_type = method_node
+                .child_by_field_name("type")
+                .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
+                .unwrap_or("void");
+            // Parameter list — verbatim text from source so generics +
+            // annotations + final keywords carry through.
+            let params_text = method_node
+                .child_by_field_name("parameters")
+                .and_then(|n| n.utf8_text(parsed.source.as_bytes()).ok())
+                .unwrap_or("()");
+            // Argument names for the delegate call.
+            let mut arg_names: Vec<String> = Vec::new();
+            if let Some(params) = method_node.child_by_field_name("parameters") {
+                let mut pc = params.walk();
+                for p_node in params.named_children(&mut pc) {
+                    if p_node.kind() != "formal_parameter" && p_node.kind() != "spread_parameter" {
+                        continue;
+                    }
+                    if let Some(name_n) = p_node.child_by_field_name("name") {
+                        if let Ok(text) = name_n.utf8_text(parsed.source.as_bytes()) {
+                            arg_names.push(text.to_string());
+                        }
+                    }
+                }
+            }
+            let args_joined = arg_names.join(", ");
+            let body = if return_type.trim() == "void" {
+                format!("        {delegate_field}.{method_name}({args_joined});")
+            } else {
+                format!("        return {delegate_field}.{method_name}({args_joined});")
+            };
+            let wrapper = format!(
+                "\n    public {return_type} {method_name}{params_text} {{\n{body}\n    }}\n"
+            );
+            wrappers.push(wrapper);
+        }
+        if !wrappers.is_empty() {
+            // Insert wrappers at the position immediately before the
+            // class body's closing brace.
+            if let Some(body) = class_node.child_by_field_name("body") {
+                let insert_at = body.end_byte().saturating_sub(1);
+                let mut joined = String::new();
+                for w in wrappers {
+                    joined.push_str(&w);
+                }
+                source_edits.push(TextEdit {
+                    byte_start: insert_at,
+                    byte_end: insert_at,
+                    replacement: joined,
+                });
+            }
+        }
+    }
+
     source_edits.sort_by_key(|edit| edit.byte_start);
     ensure_non_overlapping(&source_edits)?;
 
