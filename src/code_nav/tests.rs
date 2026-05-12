@@ -314,3 +314,70 @@ fn test_unsupported_language_error() {
         .to_string()
         .contains("unsupported source file extension"));
 }
+
+/// Every code-nav tool must emit `semantic_status = "syntax_only"` at the
+/// top level. The design boundary in
+/// `design/proposed/code-nav-symbolic-exploration.md` forbids surfaces that
+/// promise binding-aware answers without going through LSP / compiler /
+/// graph confidence — this test locks that invariant mechanically so it
+/// cannot drift from the doc.
+#[test]
+fn test_code_nav_tools_always_label_semantic_status_syntax_only() {
+    let dir = TempDir::new().unwrap();
+    let rs_file = setup_test_file(&dir, "test.rs", "fn main() { println!(\"x\"); }");
+    let java_file = setup_test_file(
+        &dir,
+        "src/main/java/Test.java",
+        "class Test {\n  void run() {}\n}\n",
+    );
+
+    let query_response_json = code_query(&CodeQueryParams {
+        file: rs_file.clone(),
+        query: "(function_item name: (identifier) @name)".to_string(),
+        project_dir: None,
+        language: None,
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let query_response: CodeQueryResponse = serde_json::from_str(&query_response_json).unwrap();
+    assert_eq!(query_response.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
+    assert_eq!(query_response.semantic_status, "syntax_only");
+
+    let describe_response_json = code_node_describe(&CodeNodeDescribeParams {
+        file: rs_file,
+        line: 1,
+        column: 4,
+        project_dir: None,
+        include_siblings: None,
+        include_text: None,
+    })
+    .unwrap();
+    let describe_response: CodeNodeDescribeResponse =
+        serde_json::from_str(&describe_response_json).unwrap();
+    assert_eq!(
+        describe_response.semantic_status,
+        SEMANTIC_STATUS_SYNTAX_ONLY
+    );
+    assert_eq!(describe_response.semantic_status, "syntax_only");
+
+    let _ = java_file;
+    let symbols_response_json = code_symbols(&CodeSymbolSearchParams {
+        project_dir: dir.path().to_string_lossy().into_owned(),
+        query: Some("run".to_string()),
+        languages: Some(vec!["java".to_string()]),
+        item_kinds: None,
+        path_contains: None,
+        limit: None,
+        file_limit: None,
+        include_attributes: Some(false),
+    })
+    .unwrap();
+    let symbols_response: CodeSymbolSearchResponse =
+        serde_json::from_str(&symbols_response_json).unwrap();
+    assert_eq!(
+        symbols_response.semantic_status,
+        SEMANTIC_STATUS_SYNTAX_ONLY
+    );
+    assert_eq!(symbols_response.semantic_status, "syntax_only");
+}

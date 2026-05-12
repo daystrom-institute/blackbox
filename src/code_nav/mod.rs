@@ -15,6 +15,15 @@ use crate::refactor::{
 #[cfg(test)]
 mod tests;
 
+/// Top-level `semantic_status` value for every code-nav tool response.
+///
+/// Code-nav tools (`bbox_code_query`, `bbox_code_node_describe`,
+/// `bbox_code_symbols`) are syntax locators, not binding-aware lookups.
+/// Per the design boundary in `design/proposed/code-nav-symbolic-exploration.md`,
+/// any tool that returns syntactic references must label them as
+/// syntax-derived so agents do not mistake them for semantic facts.
+pub const SEMANTIC_STATUS_SYNTAX_ONLY: &str = "syntax_only";
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CodeQueryParams {
     pub file: String,
@@ -150,6 +159,7 @@ pub struct CodeNodeDescribeResponse {
     pub next_sibling: Option<CodeNodeSibling>,
     pub handoff: CodeRefactorHandoff,
     pub parse_report: ParseReport,
+    pub semantic_status: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -654,7 +664,7 @@ pub fn code_symbols(p: &CodeSymbolSearchParams) -> Result<String> {
         truncated,
         items,
         errors,
-        semantic_status: "syntax_only".to_string(),
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
     };
     Ok(serde_json::to_string_pretty(&response)?)
 }
@@ -730,7 +740,7 @@ pub fn code_query(p: &CodeQueryParams) -> Result<String> {
         truncated: matching_captures > captures.len(),
         captures,
         parse_report: report,
-        semantic_status: "syntax_only".to_string(),
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
     };
 
     Ok(serde_json::to_string_pretty(&response)?)
@@ -866,6 +876,7 @@ pub fn code_node_describe(p: &CodeNodeDescribeParams) -> Result<String> {
         next_sibling,
         handoff,
         parse_report: report,
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
     };
 
     Ok(serde_json::to_string_pretty(&response)?)
