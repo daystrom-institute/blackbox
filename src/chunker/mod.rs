@@ -23,6 +23,22 @@ pub struct Chunk {
     pub language: Option<String>,
     pub symbol: Option<String>,
     pub symbol_exact: Option<String>,
+    /// Raw tree-sitter node kind for the symbol-producing node. Populated
+    /// by code chunks built from a `SymbolSpec`; `None` for chunks
+    /// without a tree-sitter kind (non-code, structure-pack fallback
+    /// before tree-sitter parse, etc.). See CN-D1 in
+    /// `design/proposed/code-nav-symbolic-exploration-impl.md`.
+    pub symbol_kind: Option<String>,
+    /// Kind of the nearest enclosing symbol-producing ancestor, or
+    /// `None` at file top level. Required for deterministic indexed
+    /// `refactor_kind_for` derivation; see CN-T2.
+    pub parent_kind: Option<String>,
+    /// 1-based line of `byte_start` in the source. `None` for non-line
+    /// oriented sources or chunks without source-line metadata.
+    pub line_start: Option<u32>,
+    /// 1-based line of `byte_end` in the source. `None` for non-line
+    /// oriented sources or chunks without source-line metadata.
+    pub line_end: Option<u32>,
     pub content: String,
     pub byte_start: u64,
     pub byte_end: u64,
@@ -89,6 +105,10 @@ pub(crate) fn placeholder_chunk(
         language: language.map(str::to_string),
         symbol: None,
         symbol_exact: None,
+        symbol_kind: None,
+        parent_kind: None,
+        line_start: None,
+        line_end: None,
         content: content.into(),
         byte_start,
         byte_end,

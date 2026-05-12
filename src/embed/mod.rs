@@ -1034,6 +1034,13 @@ fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
         language: doc.language.clone(),
         symbol: doc.symbol.clone(),
         symbol_exact: doc.symbol_exact.clone(),
+        // The new chunk-metadata fields are not yet stored in tantivy
+        // (lands in CN-D3) and not yet projected onto the document
+        // model used here. Leave them None until the schema bump.
+        symbol_kind: None,
+        parent_kind: None,
+        line_start: None,
+        line_end: None,
         content: doc.content.clone(),
         byte_start: doc.byte_offset,
         byte_end,
