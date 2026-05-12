@@ -1653,7 +1653,7 @@ fn java_type_kind_label(node: Node<'_>) -> &'static str {
 }
 
 /// Method invocation discovered inside an extracted method body.
-struct InvocationHit<'a> {
+pub(crate) struct InvocationHit<'a> {
     name: String,
     /// True if the call has an explicit receiver (foo.bar(), this.bar(),
     /// SomeType.bar()). Only unqualified calls and `this.`-qualified calls
@@ -1670,7 +1670,7 @@ struct InvocationHit<'a> {
 /// Walk a method declaration's body and collect every method_invocation,
 /// noting the enclosing method name and whether the call is inside a
 /// lambda_expression ancestor before reaching the enclosing method.
-fn collect_method_invocations<'a>(
+pub(crate) fn collect_method_invocations<'a>(
     method_node: Node<'a>,
     enclosing_method_name: &str,
     parsed: &'a ParsedSource,
@@ -1782,7 +1782,7 @@ fn java_method_signature_text(method_node: Node<'_>, source: &str) -> (String, b
 /// For every method on the source class, return a map from method name to
 /// (signature, partial). Constructors are intentionally excluded — they're
 /// resolved via `new`, not method invocation.
-fn java_source_class_method_signatures(
+pub(crate) fn java_source_class_method_signatures(
     parsed: &ParsedSource,
     class_node: Node<'_>,
 ) -> BTreeMap<String, (String, bool)> {
@@ -1811,7 +1811,7 @@ fn java_source_class_method_signatures(
 /// build a map of inherited method name -> (declaring type name, kind).
 /// The first declaration found along BFS wins, mirroring Java's nearest-
 /// ancestor resolution. Cycles are guarded via a visited set.
-fn collect_inherited_method_declarations(
+pub(crate) fn collect_inherited_method_declarations(
     project_dir: &Path,
     source_class_node: Node<'_>,
     parsed: &ParsedSource,

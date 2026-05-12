@@ -80,6 +80,15 @@ pub(crate) fn plan_java_class_dependency_analysis(p: &RefactorPlanParams) -> Res
     // Inner types directly declared inside this class body.
     let inner_types = collect_direct_inner_types(class_node, &parsed.source);
 
+    // v2 edge graph: intra-class call / field-access / inherited edges.
+    let edges = compute_class_edges(
+        class_node,
+        &parsed,
+        &methods,
+        &fields,
+        p.project_dir.as_deref().map(Path::new),
+    );
+
     let body = serde_json::json!({
         "status": "ok",
         "kind": "java_class_dependency_analysis",
@@ -101,6 +110,7 @@ pub(crate) fn plan_java_class_dependency_analysis(p: &RefactorPlanParams) -> Res
         "methods": methods,
         "fields": fields,
         "inner_types": inner_types,
+        "edges": edges,
     });
     Ok(serde_json::to_string_pretty(&body)?)
 }
@@ -134,6 +144,306 @@ struct InnerTypeEntry {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     is_implicitly_static: bool,
     line_range: (usize, usize),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MethodToMethodEdge {
+    from: String,
+    to: String,
+    context: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MethodToFieldEdge {
+    method: String,
+    field: String,
+    kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MethodToInheritedEdge {
+    from: String,
+    to: String,
+    source_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EdgeGraph {
+    method_to_method: Vec<MethodToMethodEdge>,
+    method_to_field: Vec<MethodToFieldEdge>,
+    method_to_inherited: Vec<MethodToInheritedEdge>,
+}
+
+/// Walk every method body in the class and build intra-class edge graph.
+fn compute_class_edges<'a>(
+    class_node: Node<'a>,
+    parsed: &'a ParsedSource,
+    class_methods: &[MethodEntry],
+    class_fields: &[FieldEntry],
+    project_dir: Option<&Path>,
+) -> EdgeGraph {
+    let class_source = &parsed.source;
+    let field_names: HashSet<&str> = class_fields.iter().map(|f| f.name.as_str()).collect();
+    let method_names_for_class: BTreeMap<String, (String, bool)> = {
+        let mut m = BTreeMap::new();
+        for method in class_methods {
+            m.insert(method.name.clone(), (String::new(), false));
+        }
+        m
+    };
+
+    // Build inherited method map: method_name -> (source_type, source_kind)
+    let inherited_methods: BTreeMap<String, (String, String)> = match project_dir {
+        Some(dir) => collect_inherited_method_declarations(dir, class_node, parsed),
+        None => BTreeMap::new(),
+    };
+
+    // Collect invocations from EVERY method body in the class.
+    // Re-find each method node in the tree.
+    let mut mm_edges: Vec<MethodToMethodEdge> = Vec::new();
+    let mut mf_edges: Vec<MethodToFieldEdge> = Vec::new();
+    let mut mi_edges: Vec<MethodToInheritedEdge> = Vec::new();
+
+    for method in class_methods {
+        let Some(method_node) = find_node(parsed.tree.root_node(), |node| {
+            (node.kind() == "method_declaration" || node.kind() == "constructor_declaration")
+                && method_name_matches(node, &method.name, class_source)
+        }) else {
+            continue;
+        };
+
+        // --- method_to_method: intra-class invocations ---
+        let mut invocations: Vec<InvocationHit<'_>> = Vec::new();
+        collect_method_invocations(method_node, &method.name, parsed, &mut invocations);
+        for hit in &invocations {
+            if hit.has_explicit_other_receiver {
+                continue;
+            }
+            // Self-call is not an edge.
+            if hit.name == method.name {
+                continue;
+            }
+            if method_names_for_class.contains_key(&hit.name) {
+                // Also check the call is not inside an inner class method (already filtered
+                // by collect_method_invocations which skips nested declarations).
+                let context = if hit.inside_lambda { "lambda" } else { "direct" };
+                mm_edges.push(MethodToMethodEdge {
+                    from: method.name.clone(),
+                    to: hit.name.clone(),
+                    context: context.to_string(),
+                });
+            }
+        }
+
+        // --- method_to_field: identifier resolution against class fields ---
+        let mut field_acc: Vec<(String, String)> = Vec::new();
+        walk_field_accesses(method_node, &method.name, class_source, &field_names, &mut field_acc);
+        for (fname, kind) in field_acc {
+            mf_edges.push(MethodToFieldEdge {
+                method: method.name.clone(),
+                field: fname,
+                kind,
+            });
+        }
+
+        // --- method_to_inherited: calls to inherited methods ---
+        for hit in &invocations {
+            if hit.has_explicit_other_receiver {
+                continue;
+            }
+            if method_names_for_class.contains_key(&hit.name) {
+                continue; // class-local, handled above
+            }
+            if let Some((source, source_kind)) = inherited_methods.get(&hit.name) {
+                mi_edges.push(MethodToInheritedEdge {
+                    from: method.name.clone(),
+                    to: format!("{source}.{}", hit.name),
+                    source_kind: source_kind.clone(),
+                });
+            }
+        }
+    }
+
+    EdgeGraph {
+        method_to_method: mm_edges,
+        method_to_field: mf_edges,
+        method_to_inherited: mi_edges,
+    }
+}
+
+/// True when the node's name field matches `name`.
+fn method_name_matches(node: Node<'_>, name: &str, source: &str) -> bool {
+    node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        == Some(name)
+}
+
+/// Walk a method body and collect identifier references that match declared
+/// fields, classifying each as "read" or "write".
+fn walk_field_accesses<'a>(
+    method_node: Node<'a>,
+    _method_name: &str,
+    source: &'a str,
+    field_names: &HashSet<&str>,
+    out: &mut Vec<(String, String)>,
+) {
+    fn walk_inner<'a>(
+        node: Node<'a>,
+        source: &'a str,
+        field_names: &HashSet<&str>,
+        inside_nested_method: bool,
+        out: &mut Vec<(String, String)>,
+    ) {
+        let kind = node.kind();
+        // Don't recurse into nested method/class/record/interface/enum declarations.
+        if inside_nested_method && (kind == "method_declaration" || kind == "constructor_declaration") {
+            return;
+        }
+        if matches!(
+            kind,
+            "class_declaration" | "record_declaration" | "interface_declaration" | "enum_declaration"
+        ) {
+            return;
+        }
+
+        // Detect field writes:
+        // assignment_expression: check if left child is a matching identifier
+        if kind == "assignment_expression" {
+            if let Some(left) = node.child_by_field_name("left") {
+                if let Ok(text) = left.utf8_text(source.as_bytes()) {
+                    let trimmed = text.trim();
+                    if field_names.contains(trimmed) {
+                        out.push((trimmed.to_string(), "write".to_string()));
+                        return; // don't double-count
+                    }
+                }
+                // Also handle this.fieldName = value (field_access lhs)
+                if left.kind() == "field_access" {
+                    if let Some(obj) = left.child_by_field_name("object") {
+                        if let Ok(obj_text) = obj.utf8_text(source.as_bytes()) {
+                            if obj_text.trim() == "this" {
+                                if let Some(field) = left.child_by_field_name("field") {
+                                    if let Ok(ftext) = field.utf8_text(source.as_bytes()) {
+                                        if field_names.contains(ftext.trim()) {
+                                            out.push((ftext.trim().to_string(), "write".to_string()));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // update_expression (++ / --): check operand
+        if kind == "update_expression" {
+            if let Some(operand) = node.child_by_field_name("operand") {
+                if let Ok(text) = operand.utf8_text(source.as_bytes()) {
+                    let trimmed = text.trim();
+                    if field_names.contains(trimmed) {
+                        out.push((trimmed.to_string(), "write".to_string()));
+                        return;
+                    }
+                }
+                if operand.kind() == "field_access" {
+                    if let Some(obj) = operand.child_by_field_name("object") {
+                        if let Ok(obj_text) = obj.utf8_text(source.as_bytes()) {
+                            if obj_text.trim() == "this" {
+                                if let Some(field) = operand.child_by_field_name("field") {
+                                    if let Ok(ftext) = field.utf8_text(source.as_bytes()) {
+                                        if field_names.contains(ftext.trim()) {
+                                            out.push((ftext.trim().to_string(), "write".to_string()));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Detect field reads: bare identifier matching a field name,
+        // or this.fieldName field_access.
+        if kind == "identifier" {
+            if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                if field_names.contains(text.trim()) {
+                    // Skip identifiers inside field_access object position
+                    // (those are the "object" not the "field" reference)
+                    if let Some(parent) = node.parent() {
+                        let parent_kind = parent.kind();
+                        if parent_kind == "field_access" {
+                            let is_object = parent
+                                .child_by_field_name("object")
+                                .map(|o| o.start_byte() == node.start_byte())
+                                .unwrap_or(false);
+                            if is_object {
+                                // Recurse into children and return to avoid adding as a read
+                                let mut c = node.walk();
+                                for ch in node.named_children(&mut c) {
+                                    walk_inner(ch, source, field_names, inside_nested_method, out);
+                                }
+                                return;
+                            }
+                        }
+                        // Skip identifiers that are method_invocation names
+                        if parent_kind == "method_invocation" {
+                            let is_name = parent
+                                .child_by_field_name("name")
+                                .map(|n| n.start_byte() == node.start_byte())
+                                .unwrap_or(false);
+                            if is_name {
+                                // Recurse
+                                let mut c = node.walk();
+                                for ch in node.named_children(&mut c) {
+                                    walk_inner(ch, source, field_names, inside_nested_method, out);
+                                }
+                                return;
+                            }
+                        }
+                        // Skip identifiers that are type identifiers (uppercase check is a heuristic)
+                        if parent_kind == "type_identifier" || parent_kind.ends_with("type_identifier") {
+                            let mut c = node.walk();
+                            for ch in node.named_children(&mut c) {
+                                walk_inner(ch, source, field_names, inside_nested_method, out);
+                            }
+                            return;
+                        }
+                    }
+                    out.push((text.trim().to_string(), "read".to_string()));
+                    return;
+                }
+            }
+        }
+
+        // Detect this.fieldName reads
+        if kind == "field_access" {
+            if let Some(obj) = node.child_by_field_name("object") {
+                if let Ok(obj_text) = obj.utf8_text(source.as_bytes()) {
+                    if obj_text.trim() == "this" {
+                        if let Some(field) = node.child_by_field_name("field") {
+                            if let Ok(ftext) = field.utf8_text(source.as_bytes()) {
+                                if field_names.contains(ftext.trim()) {
+                                    out.push((ftext.trim().to_string(), "read".to_string()));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk_inner(child, source, field_names, inside_nested_method, out);
+        }
+    }
+
+    walk_inner(method_node, source, field_names, false, out);
 }
 
 fn collect_class_level_annotations(class_node: Node<'_>, source: &str) -> Vec<String> {
@@ -497,6 +807,9 @@ mod tests {
         assert_eq!(inner_types[0]["name"], "Inner");
     }
 
+    // G3: a record nested inside a class is implicitly static even without
+    // the `static` keyword. is_static reflects the keyword; is_implicitly_static
+    // is true for record_declaration nodes.
     #[test]
     fn g3_record_inner_type_carries_implicitly_static_flag() {
         let dir = tempfile::tempdir().unwrap();
@@ -518,6 +831,7 @@ mod tests {
         let inner_types = v["inner_types"].as_array().unwrap();
         assert_eq!(inner_types.len(), 2);
 
+        // Record: is_static=false (no keyword), is_implicitly_static=true
         let rec = inner_types
             .iter()
             .find(|t| t["name"] == "InnerRecord")
@@ -526,12 +840,186 @@ mod tests {
         assert_eq!(rec["is_static"], false);
         assert_eq!(rec["is_implicitly_static"], true);
 
+        // Static class: is_static=true, is_implicitly_static absent (skip when false)
         let cls = inner_types
             .iter()
             .find(|t| t["name"] == "StaticInner")
             .unwrap();
         assert_eq!(cls["kind"], "class");
         assert_eq!(cls["is_static"], true);
-        assert!(cls.get("is_implicitly_static").is_none());
+        assert!(cls.get("is_implicitly_static").is_none(), "is_implicitly_static should not appear for non-records");
+    }
+
+    // G1 v2: method_to_method edges — intra-class calls between methods.
+    #[test]
+    fn g1_v2_emits_method_to_method_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Outer.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   public void methodA() { methodB(); }\n\
+            \x20   public void methodB() { methodC(); }\n\
+            \x20   public void methodC() {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let response = plan_java_class_dependency_analysis(&make_params(&source))
+            .expect("analysis should succeed");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        let edges = &v["edges"];
+        let m2m = edges["method_to_method"].as_array().unwrap();
+        // methodA → methodB, methodB → methodC
+        assert_eq!(m2m.len(), 2, "expected 2 method_to_method edges, got {m2m:?}");
+
+        let ab = m2m.iter().find(|e| {
+            e["from"] == "methodA" && e["to"] == "methodB"
+        });
+        assert!(ab.is_some(), "missing methodA→methodB edge: {m2m:?}");
+        assert_eq!(ab.unwrap()["context"], "direct");
+
+        let bc = m2m.iter().find(|e| {
+            e["from"] == "methodB" && e["to"] == "methodC"
+        });
+        assert!(bc.is_some(), "missing methodB→methodC edge: {m2m:?}");
+        assert_eq!(bc.unwrap()["context"], "direct");
+
+        // No self-edges
+        let self_edges: Vec<&serde_json::Value> = m2m.iter()
+            .filter(|e| e["from"] == e["to"])
+            .collect();
+        assert!(self_edges.is_empty(), "self-call edges should not appear: {self_edges:?}");
+    }
+
+    // G1 v2: method_to_field read/write split.
+    #[test]
+    fn g1_v2_emits_method_to_field_read_write_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Outer.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private int counter;\n\
+            \x20   private String name;\n\
+            \x20   public void readMethod() {\n\
+            \x20       System.out.println(counter);\n\
+            \x20   }\n\
+            \x20   public void writeMethod() {\n\
+            \x20       counter = 42;\n\
+            \x20   }\n\
+            \x20   public void readWriteMethod() {\n\
+            \x20       this.name = \"hello\";\n\
+            \x20       System.out.println(this.name);\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let response = plan_java_class_dependency_analysis(&make_params(&source))
+            .expect("analysis should succeed");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        let edges = &v["edges"];
+        let m2f = edges["method_to_field"].as_array().unwrap();
+        // readMethod reads counter, writeMethod writes counter, readWriteMethod writes name + reads name
+        assert_eq!(m2f.len(), 4, "expected 4 method_to_field edges, got {m2f:?}");
+
+        // readMethod → counter read
+        assert!(
+            m2f.iter().any(|e| {
+                e["method"] == "readMethod" && e["field"] == "counter" && e["kind"] == "read"
+            }),
+            "missing readMethod→counter/read: {m2f:?}"
+        );
+
+        // writeMethod → counter write
+        assert!(
+            m2f.iter().any(|e| {
+                e["method"] == "writeMethod" && e["field"] == "counter" && e["kind"] == "write"
+            }),
+            "missing writeMethod→counter/write: {m2f:?}"
+        );
+
+        // readWriteMethod → name write (this.name = ...)
+        assert!(
+            m2f.iter().any(|e| {
+                e["method"] == "readWriteMethod" && e["field"] == "name" && e["kind"] == "write"
+            }),
+            "missing readWriteMethod→name/write: {m2f:?}"
+        );
+
+        // readWriteMethod → name read (this.name in println)
+        assert!(
+            m2f.iter().any(|e| {
+                e["method"] == "readWriteMethod" && e["field"] == "name" && e["kind"] == "read"
+            }),
+            "missing readWriteMethod→name/read: {m2f:?}"
+        );
+    }
+
+    // G1 v2: method_to_inherited edges — calls to inherited methods.
+    #[test]
+    fn g1_v2_emits_method_to_inherited_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path();
+
+        // Create a superclass in the project dir.
+        fs::write(
+            project_dir.join("Super.java"),
+            "package com.example;\n\
+             public class Super {\n\
+            \x20   public void inheritedMethod1() {}\n\
+            \x20   public int inheritedMethod2() { return 42; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        // Create the subclass being analyzed.
+        let source = project_dir.join("Sub.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Sub extends Super {\n\
+            \x20   public void callerMethod() {\n\
+            \x20       inheritedMethod1();\n\
+            \x20       int x = inheritedMethod2();\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = make_params(&source);
+        params.project_dir = Some(project_dir.to_string_lossy().into_owned());
+        let response = plan_java_class_dependency_analysis(&params)
+            .expect("analysis should succeed");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        let edges = &v["edges"];
+        let m2i = edges["method_to_inherited"].as_array().unwrap();
+        // callerMethod calls inheritedMethod1 (on Super, class) and inheritedMethod2 (on Super, class)
+        assert_eq!(m2i.len(), 2, "expected 2 method_to_inherited edges, got {m2i:?}");
+
+        // Each edge: from="callerMethod", source_kind="class"
+        for edge in m2i {
+            assert_eq!(edge["from"], "callerMethod", "unexpected from: {edge}");
+            assert_eq!(edge["source_kind"], "class", "unexpected source_kind: {edge}");
+        }
+
+        let to_values: Vec<&str> = m2i
+            .iter()
+            .map(|e| e["to"].as_str().unwrap())
+            .collect();
+        assert!(
+            to_values.contains(&"Super.inheritedMethod1"),
+            "missing Super.inheritedMethod1 in {to_values:?}"
+        );
+        assert!(
+            to_values.contains(&"Super.inheritedMethod2"),
+            "missing Super.inheritedMethod2 in {to_values:?}"
+        );
     }
 }
