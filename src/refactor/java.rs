@@ -290,17 +290,15 @@ fn java_source_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
     // Skip the new import when the source already has any single-type
     // import with the same simple name.
     //
-    // G7-FU-v2: also skip when any wildcard import (`import x.y.*;`) is
-    // present in the source. Without classpath resolution we can't tell
-    // whether the wildcard's package actually contains the desired
-    // simple name, but the conservative call is to skip — adding the
-    // new explicit import changes which type binds when the wildcard
-    // DOES contain a same-name type (e.g. `import com.google.inject.*;`
-    // already provides `Inject`, and adding `javax.inject.Inject` flips
-    // the binding silently). The cost of a false positive ("operator has
-    // to add the import manually") is far below the cost of a silent
-    // semantic flip.
+    // Wildcard guard: skip only when an existing wildcard import covers
+    // the SAME package as the new import (in which case the explicit
+    // import is redundant and the source already binds the simple name
+    // from that wildcard). Foreign wildcards (`import a.b.*;` while
+    // adding `import x.y.Foo;`) don't supply the new simple name and
+    // must not block the addition — the previous blanket skip was too
+    // aggressive and silently dropped legitimate imports.
     let desired_simple = fqcn.rsplit('.').next().unwrap_or("");
+    let desired_pkg = java_fqcn_package(fqcn);
     if !desired_simple.is_empty() {
         for line in source.lines() {
             if let Some(existing) = java_import_simple_name(line) {
@@ -308,8 +306,10 @@ fn java_source_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
                     return None;
                 }
             }
-            if java_import_has_wildcard(line) {
-                return None;
+            if let Some(wildcard_pkg) = java_import_wildcard_package(line) {
+                if Some(wildcard_pkg.as_str()) == desired_pkg {
+                    return None;
+                }
             }
         }
     }
@@ -341,22 +341,25 @@ fn java_source_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
     })
 }
 
-/// G7-FU-v2: true when the import line is a wildcard like
-/// `import x.y.*;` (skipping `import static x.y.*;` static wildcards —
-/// those don't introduce type names into the simple-name namespace).
-fn java_import_has_wildcard(import_line: &str) -> bool {
-    let Some(body) = import_line
+/// Return the package prefix of a non-static wildcard import, e.g.
+/// `import a.b.*;` → `Some("a.b")`. Returns `None` for non-wildcard,
+/// static wildcard, or malformed import lines.
+fn java_import_wildcard_package(import_line: &str) -> Option<String> {
+    let body = import_line
         .trim()
         .strip_prefix("import ")
         .and_then(|s| s.strip_suffix(';'))
-        .map(str::trim)
-    else {
-        return false;
-    };
+        .map(str::trim)?;
     if body.starts_with("static ") {
-        return false;
+        return None;
     }
-    body.ends_with(".*")
+    body.strip_suffix(".*").map(str::to_string)
+}
+
+/// Return the package prefix of a fully-qualified class name, e.g.
+/// `a.b.Foo` → `Some("a.b")`. Returns `None` for unqualified names.
+fn java_fqcn_package(fqcn: &str) -> Option<&str> {
+    fqcn.rsplit_once('.').map(|(pkg, _)| pkg)
 }
 
 fn java_import_simple_name(import_line: &str) -> Option<String> {
@@ -916,11 +919,12 @@ fn java_inject_import(target_text: &str, fqcn: &str) -> String {
     {
         return target_text.to_string();
     }
-    // G7-FU-v2: same dedupe shape as java_source_import_edit — skip when
-    // a different FQCN with the same simple name is already imported, or
-    // when any wildcard import is present (could supply the simple name
-    // from a different package, silently flipping the binding).
+    // Same dedupe shape as java_source_import_edit — skip when a
+    // different FQCN with the same simple name is already imported, or
+    // when an existing wildcard import covers the SAME package as the
+    // new import (in which case it's redundant).
     let desired_simple = fqcn.rsplit('.').next().unwrap_or("");
+    let desired_pkg = java_fqcn_package(fqcn);
     if !desired_simple.is_empty() {
         for line in target_text.lines() {
             if let Some(existing) = java_import_simple_name(line) {
@@ -928,8 +932,10 @@ fn java_inject_import(target_text: &str, fqcn: &str) -> String {
                     return target_text.to_string();
                 }
             }
-            if java_import_has_wildcard(line) {
-                return target_text.to_string();
+            if let Some(wildcard_pkg) = java_import_wildcard_package(line) {
+                if Some(wildcard_pkg.as_str()) == desired_pkg {
+                    return target_text.to_string();
+                }
             }
         }
     }

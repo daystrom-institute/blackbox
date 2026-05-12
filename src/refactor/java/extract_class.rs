@@ -721,21 +721,30 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         // semantic bug — surface it as a FIXME directly above the
         // generated `private final <Type> <name>;` line so it travels with
         // the target file rather than getting buried in JSON.
-        for capture in &captured_variables {
-            if !capture.source_mutable {
-                continue;
+        //
+        // Under wiring_mode=guice_field_inject the target also @Inject-
+        // constructs, so its captured ctor params are freshly resolved
+        // by the DI container at construction time and don't carry a
+        // stale snapshot of the source field. Suppress the FIXMEs in
+        // that mode — they're misleading noise.
+        let suppress_mutable_capture_fixmes = wiring_mode == "guice_field_inject";
+        if !suppress_mutable_capture_fixmes {
+            for capture in &captured_variables {
+                if !capture.source_mutable {
+                    continue;
+                }
+                if capture.source_static_final {
+                    // Static-finals route through the Gap 20 constants path —
+                    // they aren't constructor params and can't be "snapshotted".
+                    continue;
+                }
+                if moved_field_set.contains(capture.name.as_str()) {
+                    // Field is being moved, not captured as a param.
+                    continue;
+                }
+                target_content =
+                    java_insert_fixme_above_mutable_capture(&target_content, capture);
             }
-            if capture.source_static_final {
-                // Static-finals route through the Gap 20 constants path —
-                // they aren't constructor params and can't be "snapshotted".
-                continue;
-            }
-            if moved_field_set.contains(capture.name.as_str()) {
-                // Field is being moved, not captured as a param.
-                continue;
-            }
-            target_content =
-                java_insert_fixme_above_mutable_capture(&target_content, capture);
         }
     }
 
@@ -1063,12 +1072,84 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                             }
                         }
                     }
+                    let Some(body) = tnode.child_by_field_name("body") else { continue };
+                    // Also pick up local variables declared inside the
+                    // method body whose type matches an inner record/POJO
+                    // — the user's call sites often go through
+                    // `var r = fetchRecord(...); r.field`. Without this,
+                    // only method-parameter receivers get rewritten and
+                    // local-variable receivers leak through as raw
+                    // bare-field reads.
+                    let mut decl_stack = vec![body];
+                    while let Some(node) = decl_stack.pop() {
+                        let mut dc = node.walk();
+                        for ch in node.named_children(&mut dc) {
+                            decl_stack.push(ch);
+                        }
+                        match node.kind() {
+                            "local_variable_declaration" => {
+                                let Some(ty_node) = node.child_by_field_name("type") else {
+                                    continue;
+                                };
+                                let Ok(ty_text) = ty_node.utf8_text(target_content.as_bytes())
+                                else {
+                                    continue;
+                                };
+                                let simple = ty_text
+                                    .rsplit_once('.')
+                                    .map(|(_, s)| s.trim().to_string())
+                                    .unwrap_or_else(|| ty_text.trim().to_string());
+                                if !field_to_getter_by_type.contains_key(&simple) {
+                                    continue;
+                                }
+                                let mut vc = node.walk();
+                                for child in node.named_children(&mut vc) {
+                                    if child.kind() != "variable_declarator" {
+                                        continue;
+                                    }
+                                    if let Some(name_node) =
+                                        child.child_by_field_name("name")
+                                    {
+                                        if let Ok(name) =
+                                            name_node.utf8_text(target_content.as_bytes())
+                                        {
+                                            typed_receivers
+                                                .insert(name.to_string(), simple.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            "enhanced_for_statement" => {
+                                let Some(ty_node) = node.child_by_field_name("type") else {
+                                    continue;
+                                };
+                                let Ok(ty_text) = ty_node.utf8_text(target_content.as_bytes())
+                                else {
+                                    continue;
+                                };
+                                let simple = ty_text
+                                    .rsplit_once('.')
+                                    .map(|(_, s)| s.trim().to_string())
+                                    .unwrap_or_else(|| ty_text.trim().to_string());
+                                if !field_to_getter_by_type.contains_key(&simple) {
+                                    continue;
+                                }
+                                if let Some(name_node) = node.child_by_field_name("name") {
+                                    if let Ok(name) =
+                                        name_node.utf8_text(target_content.as_bytes())
+                                    {
+                                        typed_receivers.insert(name.to_string(), simple);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     if typed_receivers.is_empty() {
                         continue;
                     }
                     // Walk this method's body for field_access on those
                     // receivers.
-                    let Some(body) = tnode.child_by_field_name("body") else { continue };
                     let mut bstack = vec![body];
                     while let Some(node) = bstack.pop() {
                         let mut bc = node.walk();

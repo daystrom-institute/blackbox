@@ -2550,6 +2550,179 @@
         );
     }
 
+    // G13/G20/G21 followup: a foreign wildcard import on the source
+    // (e.g. `import java.util.*;`) used to short-circuit ALL subsequent
+    // import additions on both source and target via the over-aggressive
+    // wildcard guard. The guard now skips only when the wildcard's
+    // package equals the new import's package — foreign wildcards no
+    // longer hide new imports.
+    #[test]
+    fn extract_java_class_foreign_wildcard_does_not_block_new_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_pkg = dir.path().join("src/main/java/a");
+        let b_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&a_pkg).unwrap();
+        fs::create_dir_all(&b_pkg).unwrap();
+        let source = a_pkg.join("Admin.java");
+        let target = b_pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import java.util.*;\n\
+             public class Admin {\n\
+            \x20   public List<String> all() { return new ArrayList<>(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["all".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        // Source must gain `import b.Service;` even though `import java.util.*;`
+        // is present. Imports are emitted as individual TextEdits on the
+        // source file (plan.edits[0]).
+        let source_edits = &plan.edits[0].edits;
+        let has_target_import = source_edits
+            .iter()
+            .any(|edit| edit.replacement.contains("import b.Service;"));
+        assert!(
+            has_target_import,
+            "foreign wildcard must not block source-side target import: {:?}",
+            source_edits.iter().map(|e| &e.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    // G13 followup: a foreign wildcard import on the target body used to
+    // block the Slf4j import even when @Slf4j was propagated.
+    #[test]
+    fn g13_extract_java_class_slf4j_import_added_under_foreign_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Worker.java");
+        let target = pkg.join("Helpers.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import java.util.*;\n\
+             import lombok.extern.slf4j.Slf4j;\n\
+             @Slf4j\n\
+             public class Worker {\n\
+            \x20   public void doIt() { log.info(\"running\"); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["doIt".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("import lombok.extern.slf4j.Slf4j;"),
+            "Slf4j import must be added even when target has a foreign wildcard: {target_text}"
+        );
+        assert!(
+            target_text.contains("@Slf4j"),
+            "@Slf4j must still be propagated: {target_text}"
+        );
+    }
+
+    // G17 followup: bare record-component reads on LOCAL variables (not
+    // just method parameters) get rewritten to accessor calls. Common
+    // shape: `Record r = lookup(...); r.field`.
+    #[test]
+    fn g17_extract_java_class_rewrites_record_local_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Holder.java");
+        let target = pkg.join("Helpers.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Holder {\n\
+            \x20   public record Detail(String label, int qty) {}\n\
+            \x20   public Detail lookup() { return new Detail(\"x\", 1); }\n\
+            \x20   public String describe() {\n\
+            \x20       Detail d = lookup();\n\
+            \x20       return d.label + \":\" + d.qty;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["describe".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("d.label()"),
+            "record local-var component must rewrite to accessor: {target_text}"
+        );
+        assert!(
+            target_text.contains("d.qty()"),
+            "record local-var component must rewrite to accessor: {target_text}"
+        );
+    }
+
+    // G7 cosmetic followup: under wiring_mode=guice_field_inject the
+    // target also @Inject-constructs its captured ctor params, so the
+    // "non-final source snapshot" warning doesn't apply. The
+    // mutable_capture FIXME comment must NOT be emitted.
+    #[test]
+    fn g7_guice_field_inject_suppresses_mutable_capture_fixmes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import javax.inject.Inject;\n\
+             public class Admin {\n\
+            \x20   @Inject private Object dep;\n\
+            \x20   public String useDep() { return dep.toString(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["useDep".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.wiring_mode = Some("guice_field_inject".to_string());
+        params.deep_analysis = Some(true);
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            !target_text.contains("FIXME: mutable capture"),
+            "guice_field_inject must suppress mutable_capture FIXMEs: {target_text}"
+        );
+    }
+
     // G19 + G14: external_calls that resolve to a public-static method on
     // the source class get auto-qualified at the call site to
     // `<SourceClass>.<method>(...)` and DO NOT receive a FIXME. The

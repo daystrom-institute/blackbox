@@ -168,19 +168,24 @@ real; if your concern is on the list, the planner already handles it.
   `private final` fields + public `getX()` / `isX()` accessors), and
   the extract is cross-package, `param.field` accesses in the extracted
   body get rewritten to `param.getField()` / `param.isField()`. Lookup
-  is conservative: only handles direct parameter receivers (not locals
-  or chained accesses), only triggers on inner types declared inside
-  the source class, and only fires when the inner type has a matching
-  public getter. Same-package extracts leave bare access alone.
+  walks BOTH method parameters AND local-variable declarations whose
+  explicit declared type matches (`Detail d = lookup(); d.field` works;
+  `var d = lookup()` does not — type inference is out of scope). The
+  rewrite only triggers on inner types declared inside the source class
+  and only fires when the inner type has a matching public getter.
+  Same-package extracts leave POJO bare access alone.
 - **Java record components route through bare-name accessors.** When
   the moved methods access a component of a source-class `record` inner
-  type (`param.componentName`), the planner rewrites to
-  `param.componentName()` — records auto-generate private final backing
-  fields and public accessors named after the component (no `get`
-  prefix). Triggers SAME-package too — record private fields aren't
-  package-accessible, so the rewrite is needed for any extract out of
-  the declaring class. POJO inner-type rewriting stays cross-package
-  gated; record-component rewriting is unconditional.
+  type (`param.componentName` or `localVar.componentName`), the planner
+  rewrites to `param.componentName()` — records auto-generate private
+  final backing fields and public accessors named after the component
+  (no `get` prefix). Same receiver-discovery path as the POJO rewrite:
+  method parameters AND local variables with explicit record-type
+  declarations both get rewritten. Triggers SAME-package too — record
+  private fields aren't package-accessible, so the rewrite is needed
+  for any extract out of the declaring class. POJO inner-type rewriting
+  stays cross-package gated; record-component rewriting is
+  unconditional.
 - **Source-class inner type references are qualified + widened.** When
   extracted bodies reference an inner type (enum, class, record, or
   interface) declared inside the source class — bare `InnerType`,
@@ -675,9 +680,20 @@ but never narrows below the cross-package requirement.
 
   **Import dedupe.** `@Inject` lives in two packages (`com.google.inject`
   and `javax.inject`). The import-injection paths skip when the source
-  already imports either FQCN (same simple name) AND when any wildcard
-  import is present (could supply the simple name from a different
-  package and silently flip binding).
+  already imports either FQCN (same simple name) AND when a wildcard
+  import covers the SAME package as the new import (in which case the
+  explicit form is redundant). Foreign wildcards from unrelated packages
+  do NOT block import addition — the previous blanket skip silently
+  dropped legitimate imports on any source carrying `import java.util.*;`
+  or similar.
+
+  **Guice mutable-capture suppression.** Under
+  `wiring_mode=guice_field_inject` the target also `@Inject`-constructs,
+  so its captured ctor params are freshly injected at construction time
+  and do NOT carry a stale snapshot of the source field. The
+  Gap-29 "mutable capture promoted to final ctor param" FIXME is
+  suppressed in that mode — it warns about a failure mode that doesn't
+  apply.
 
 - **`source_delegate_wrappers`** — when `true`, generate thin wrapper
   methods on the source for each moved public non-static method. Each
