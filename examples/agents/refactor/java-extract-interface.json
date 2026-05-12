@@ -1,0 +1,124 @@
+{
+  "kind": "agent",
+  "name": "java-extract-interface",
+  "version": 1,
+  "_contract": "refactor-atom/v1",
+  "manifest": {
+    "description": "Extract a Java interface from a class (method signatures + implements clause + visibility widening) with optional caller-side migration to the new interface type.",
+    "when_to_use": [
+      "a concrete class has a public method surface callers should depend on by interface, not concretion",
+      "operator wants mockability for the named methods",
+      "decoupling a service implementation from its consumers"
+    ],
+    "anti_patterns": [
+      "do not use to lift methods into a NEW class with shared state — use java-extract-cohesive-class for that shape",
+      "do not use on non-Java files",
+      "do not migrate_call_sites when callers live in other Maven/Gradle modules without acknowledge_public_api_change (prompt-discipline gate; structured preflight pending java_public_api_guard plan kind)"
+    ],
+    "brofile_ref": "java-refactor-persona",
+    "filter_overlay": {
+      "allow": [],
+      "disallow": []
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target", "module_name"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string" },
+          "target": {
+            "type": "string",
+            "description": "Path for the new .java interface file."
+          },
+          "module_name": {
+            "type": "string",
+            "description": "Interface name. Defaults inside the plan kind to the class name with `Default` prefix stripped if absent."
+          },
+          "impl_name": {
+            "type": "string",
+            "description": "Optional class name to target when source has multiple classes. Defaults to the first class."
+          },
+          "item_names": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Method names to include in the interface. Defaults to all public non-static methods when omitted."
+          },
+          "migrate_call_sites": {
+            "type": "boolean",
+            "description": "When true, chain migrate_java_type_usages after the extract to swap the concretion type for the interface at call-site type-use positions."
+          },
+          "migrate_callers_in": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Files where migrate_java_type_usages should run. Required when migrate_call_sites=true."
+          },
+          "acknowledge_public_api_change": {
+            "type": "boolean",
+            "description": "Operator-authority opt-out when migrate_call_sites=true and the concretion is part of the project's public API. MUST be operator-explicit per RX-V1 — no default. Prompt-discipline-only until java_public_api_guard ships (JAVA_GAP.md, Gap 1)."
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "prompt_template": "You are java-extract-interface. Charter: Extract an interface from a class and optionally migrate callers to depend on the interface.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{impl_name}}\",\n                     languages=[\"java\"], item_kinds=[\"class_declaration\", \"method_declaration\"])\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm method names in {{item_names}} resolve. If migrate_call_sites=\n   true, also ground every file in {{migrate_callers_in}} to confirm the\n   concretion type appears at type-use positions.\n\n2. Plan with deep_analysis=true (extract first, migrate second):\n   bbox_refactor_plan(kind=\"extract_java_interface\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\", target=\"{{target}}\",\n                      module_name=\"{{module_name}}\",\n                      impl_name=\"{{impl_name}}\",\n                      item_names={{item_names}})\n   Inspect the response for visibility widening (private/package methods\n   listed in item_names get widened to public on the source class — the\n   widening is necessary for the interface contract).\n\n   IF {{migrate_call_sites}} == true:\n     For each file F in {{migrate_callers_in}}:\n       bbox_refactor_plan(kind=\"migrate_java_type_usages\",\n                          project_dir=\"{{project_dir}}\", source=F,\n                          module_name=\"{{impl_name}}\",\n                          new_text=\"{{module_name}}\")\n     migrate_java_type_usages skips `new ConcreteImpl(...)`, method calls,\n     `.class`, `instanceof`, and cast positions — only type-use sites are\n     rewritten.\n\n3. Decide:\n   - PROMPT-DISCIPLINE GATE (no plan-kind enforcement until\n     java_public_api_guard ships per JAVA_GAP.md Gap 1):\n     IF {{migrate_call_sites}} == true AND {{acknowledge_public_api_change}}\n     != true AND any file in {{migrate_callers_in}} is in a different\n     Maven/Gradle module from the source: emit bbox_note(kind=\"blocked\",\n     body=<concrete diagnostic naming the cross-module callers + plan_path>)\n     and return status=\"blocked\". The atom MUST NOT default\n     acknowledge_public_api_change.\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(confirm=true, steps=[\n     <extract_java_interface step>,\n     /* migrate_java_type_usages steps, one per file in migrate_callers_in */\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: interface name,\n     methods lifted, methods widened to public, callers migrated,\n     validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside your filter_overlay.\n- Never default acknowledge_public_api_change — operator-authority is\n  explicit. Surface the cross-module caller list when blocking.\n- Never apply when status=blocked.\n- Never invent method names from the user prompt.\n\nNote: structured preflight via a Java public-API guard plan kind is\nblocked on JAVA_GAP.md Gap 1; this atom relies on prompt-discipline\nfor the operator-authority gate until the plan kind ships.\n\nInputs:\n{{project_dir}} {{source}} {{target}} {{module_name}} {{impl_name}} {{item_names}} {{migrate_call_sites}} {{migrate_callers_in}} {{acknowledge_public_api_change}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": { "type": "integer", "minimum": 0 },
+              "warning": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "interface_file": { "type": "string" },
+          "methods_lifted": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "methods_widened_to_public": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "callers_migrated": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "composition": {
+      "chainable_after": [],
+      "parallel_safe": false
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-11T00:00:00Z"
+    }
+  }
+}
