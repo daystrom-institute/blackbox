@@ -72,6 +72,12 @@ re-derive the gap analysis.
    error — they read the whole file into memory before
    parsing. This is fine for the typical case; the cap is a
    defence-in-depth follow-up.
+6. `CodeNodeDescribeResponse` does not currently carry a
+   top-level `semantic_status` field (`src/code_nav/mod.rs`
+   around the `CodeNodeDescribeResponse` struct), while
+   `CodeQueryResponse` and `CodeSymbolSearchResponse` both do.
+   The design's syntax-vs-semantic labeling rule is therefore
+   silently violated on the describe surface. CN-S2 fixes this.
 
 **Realizes.** Section "Current State" of the design doc.
 
@@ -106,9 +112,13 @@ multi-file work".
   stays a `Result<CodeNavParsedSource>` for non-cap failures; the cap
   is reported as a structured error response by each tool wrapper,
   not an `anyhow!` bail, so the agent can keep reasoning.
-- `code_symbols` consults `bbox_project_register` state via
-  `crate::orchestration` (or whichever module owns the registered
-  project list — confirm at implementation time) and rejects
+- `code_symbols` consults the registered project list via
+  `self.state.projects.read().list()` on the daemon handler side
+  (mirrors `src/tools/refactor.rs:55,69`), so the registry source
+  is `crate::projects::ProjectRegistry`. The free function in
+  `src/code_nav/mod.rs` gains a `registered_projects: &[ProjectRecord]`
+  parameter; the `#[tool]` handler in `src/tools/code_nav.rs`
+  threads the read-lock snapshot through. `code_symbols` rejects
   `project_dir` paths that are not a registered project root *or* a
   descendant of one. The error response includes
   `registered_projects: [...]` to make recovery cheap.
@@ -195,12 +205,15 @@ extraction into the `SymbolSpec` value type.
 
 - Add `pub kind: String` to `SymbolSpec` in `src/chunker/code.rs`.
 - `collect_ast_symbols` populates `kind = node.kind().to_string()`
-  for every emitted symbol. For Rust `impl_item` (custom display
-  path) the kind stays `"impl_item"`; for Elixir `call` symbols
-  promoted to defmodule/def/defp/defmacro, the kind is the matched
-  marker (e.g. `"defmodule"`), not the parent grammar's `"call"` —
-  this gives agents the meaningful name without leaking grammar
-  quirks.
+  for every emitted symbol — strictly the raw tree-sitter node
+  kind, per the design's "must be the tree-sitter node kind"
+  rule. For Rust `impl_item` the kind stays `"impl_item"`. For
+  Elixir, the parent grammar node is `"call"` — keep it as
+  `"call"` on `symbol_kind` and surface the
+  defmodule/def/defp/defmacro distinction via a separate
+  optional `symbol_kind_display` field if a future caller needs
+  it (out of scope for CN-D1; flagged as a follow-up rather than
+  silently overloading the contract).
 - `collect_structure_item` (the `tree_sitter_language_pack`
   fallback) populates `kind` from the
   `StructureItem` shape — best-effort mapping documented in code
@@ -259,26 +272,57 @@ downstream consumers (index, refs, embeddings) see it.
 
 ---
 
-### CN-D3 — tantivy `symbol_kind` field
+### CN-D3 — tantivy `symbol_kind` field + queryable extras + schema bump
 
-**Scope.** Store and index `symbol_kind` in the tantivy schema so
-`mode="indexed"` filtering does not require post-filtering.
+**Scope.** Add `symbol_kind` to the tantivy schema **and** the
+extra stored fields the indexed `code_symbols` lane needs
+(`project_id`, `byte_end`, `line_start`, `line_end`), **and** bump
+the schema version in the same phase. Splitting the field-write
+from the version bump is unsafe: `TranscriptIndex::open_or_create`
+calls `reset_index_on_schema_mismatch` before opening
+(`src/index/mod.rs:149`), and the mismatch check compares only
+`schema_version.txt` against `INDEX_SCHEMA_VERSION`
+(`src/index/mod.rs:584`). Writing new fields with an unchanged
+marker means a daemon binary with the new `FieldHandles` will open
+an old tantivy directory whose schema does not contain those
+fields — read-back panics or quietly returns nothing.
 
-**Realizes.** Data Model Changes bullet 3.
+**Realizes.** Data Model Changes bullets 3 and 6 — merged because
+mismatch detection forces them to land together.
 
 **Components.**
 
-- Add `pub symbol_kind: Field` to the schema struct in
-  `src/index/mod.rs`, alongside `symbol` and `symbol_exact`.
-- Register the field with `builder.add_text_field("symbol_kind", STRING | STORED)`
-  in the schema builder. STRING tokenization (not TEXT) — kinds are
-  exact lookup tokens.
-- Index path (chunk → tantivy doc) writes `symbol_kind` when
-  `Chunk.symbol_kind` is `Some`.
+- Add to the schema struct in `src/index/mod.rs`:
+  - `pub symbol_kind: Field` — `STRING | STORED` (exact-token
+    lookup).
+  - `pub project_id: Field` — `STRING | STORED`. Today's
+    `project_file` docs include the canonical path and the exact
+    `entity_id` but no queryable `project_id` token
+    (`src/index/project_files.rs:114,127`); the indexed
+    `code_symbols` lane needs a fast term filter, so this field
+    is added now and populated from the project record.
+  - `pub byte_end: Field` — `u64 STORED`. Current schema only
+    stores `byte_offset` (`src/index/mod.rs:42,550`); the indexed
+    lane needs both ends to return a `byte_range` tuple matching
+    the live lane.
+  - `pub line_start: Field`, `pub line_end: Field` — `u64 STORED`,
+    derived at chunk-index time so the indexed read path does not
+    have to re-open the source file.
+- Index path (chunk → tantivy doc) writes the new fields whenever
+  the chunk supplies them. Code chunks always do; non-code
+  chunks may leave the line fields zero — readers must treat
+  `line_start == 0` on a non-code chunk as "unknown" and not
+  surface it.
 - Read path: extend the document-extraction helpers (the
   `optional_text(&doc, self.fields.symbol_*)` cluster around
-  line 388 of `src/index/mod.rs`) to surface `symbol_kind` on
+  `src/index/mod.rs:385-389`) to surface the new fields on
   search-result rows.
+- Bump `INDEX_SCHEMA_VERSION` from
+  `agentic-corpus-g5-symbol-tokenized` to
+  `agentic-corpus-g6-symbol-kind-and-ranges`. Suffix is
+  descriptive, not load-bearing — exact name TBD at landing.
+- `agentic-corpus-release-notes.md` entry describing the bump
+  and the on-first-startup reindex cost.
 - `bbox_hybrid_search` keeps its existing behaviour — no new
   query-side filter exposed in this phase. CN-T2 introduces the
   filter on the typed `bbox_code_symbols` surface, not on the
@@ -286,52 +330,46 @@ downstream consumers (index, refs, embeddings) see it.
 
 **Gates.**
 
-- Schema builds; no panic on existing indices because the field is
-  additive and STORED.
+- A daemon binary built from this phase, started against a
+  populated pre-bump index, detects the version skew via
+  `reset_index_on_schema_mismatch` and rebuilds cleanly.
 - New unit test indexing one Rust + one Java chunk and asserting
-  the stored field round-trips its kind string.
+  every new field round-trips.
+- `bbox_stats` returns a sane doc count post-rebuild.
+- No regression in `bbox_hybrid_search` quality on a stored
+  fixture corpus (smoke test, not a full eval).
 
 **Follow-ups.**
 
-- Whether to ALSO add `symbol_kind` to the embedding source
-  projection (current source docs include `symbol` and
-  `symbol_exact`). Default: yes — see CN-D4. Tracked as a
-  dependency, not a separate follow-up.
+- Whether to also store the `byte_offset → line_offset`
+  conversion at write time as a single string token for
+  jump-to-line UIs. Defer until a real caller asks.
 
 ---
 
-### CN-D4 — embedding source-doc + `project_refs` output
+### CN-D4 — `bbox_refactor_project_refs` carries `symbol_kind`
 
-**Scope.** Make `symbol_kind` visible to embedding routes and to
-`bbox_refactor_project_refs` callers without forcing a separate
-fetch.
+**Scope.** Surface `symbol_kind` on every emitted project-ref
+record. No embedding work in this phase — see CN-D5 for that path.
 
-**Realizes.** Data Model Changes bullets 4 and 5.
+**Realizes.** Data Model Changes bullet 5 (project refs).
 
 **Components.**
 
-- Embedding source-doc projection: extend the projector that
-  builds the text the embedder sees for each `project_file` chunk
-  to include the kind as a labeled segment (e.g.
-  `"kind: function_item"`). Keep formatting stable — embedding
-  recomputation is gated by the schema version bump in CN-D5, not
-  by this prose.
 - `bbox_refactor_project_refs` response carries `symbol_kind` on
   each emitted ref. The field is optional in the JSON for backward
   compatibility (callers parsing the old shape continue to work);
   emitted whenever the underlying chunk has `symbol_kind = Some(_)`.
 - Tool-doc entry for `bbox_refactor_project_refs` updated to
   mention the new field.
+- Backward-compatibility test: a deserialiser that ignores
+  unknown fields parses both old and new response shapes.
 
 **Gates.**
 
 - `bbox_refactor_project_refs` on a known Rust file returns
   records with `symbol_kind: "function_item"` /
   `"impl_item"` / `"struct_item"` as appropriate.
-- Embedding recomputation is NOT triggered by this phase on its
-  own — CN-D5 owns the schema-version cut.
-- Backward-compatibility test: a deserialiser that ignores
-  unknown fields parses both old and new response shapes.
 
 **Follow-ups.**
 
@@ -339,44 +377,67 @@ fetch.
 
 ---
 
-### CN-D5 — schema-version bump + reindex requirement
+### CN-D5 — embedder text + content-hash invalidation (optional)
 
-**Scope.** Cut the schema version so daemons rebuild indices that
-predate `symbol_kind`. This phase is the last in the data-model
-chain; landing it activates the indexed lane in CN-T2.
+**Scope.** Make the embedder *actually* see `symbol_kind` and
+recompute affected vectors. Required only if vector search
+should benefit from the new field; pure indexed-symbol lookup
+in CN-T2 does not depend on it. Spelled out because the design
+doc bullet 4 ("embedding source docs that include `symbol_kind`")
+is not realised by metadata alone given today's plumbing.
 
-**Realizes.** Data Model Changes bullet 6.
+**Realizes.** Data Model Changes bullet 4.
 
 **Components.**
 
-- Bump `INDEX_SCHEMA_VERSION` in `src/index/mod.rs` from
-  `agentic-corpus-g5-symbol-tokenized` to
-  `agentic-corpus-g6-symbol-kind`. Exact name TBD at landing —
-  the suffix is descriptive, not load-bearing.
-- Existing schema-mismatch path in the index bootstrap deletes
-  and rebuilds the tantivy directory; verify on a populated test
-  fixture that startup detects the version skew and rebuilds
-  cleanly.
-- `agentic-corpus-release-notes.md` entry describing the bump,
-  the new `symbol_kind` field, and the on-first-startup reindex
-  cost.
-- `bbox_embed_status` recheck: vector routes recompute against
-  the new source docs once they exist. No code change needed —
-  document the operator observation.
+- Today, `enqueue_project_file` (`src/embed_queue.rs:153`) builds
+  the embedder request from `chunk.content` verbatim, and the
+  dedupe key on the consumer side is `(entity_id, content_hash)`
+  where `content_hash = chunk.chunk_hash` (`src/embed_queue.rs:163,
+  src/embed/queue.rs:722`). Adding `symbol_kind` to chunk
+  metadata does NOT change either the embed text or the dedupe
+  key — so without an explicit invalidation move, no
+  recomputation happens.
+- Introduce a small `project_file_embed_text(chunk: &Chunk) -> String`
+  builder in `src/embed_queue.rs` that emits, when chunk metadata
+  is present, a header line of the form
+  `// language: rust\n// symbol: foo::bar\n// kind: function_item\n`
+  followed by `chunk.content`. Pure-content chunks (no symbol,
+  no kind) keep the original `chunk.content` exactly to avoid
+  unnecessary recomputation. Header format is stable and
+  versioned (see below).
+- `enqueue_project_file` rebuilds `chunk_hash` against the
+  embedder text by piping it through the existing
+  `content_hash(...)` helper (`src/embed_queue.rs:406`), keeping
+  the chunk-internal `chunk.chunk_hash` (used by the tantivy
+  doc id and provenance) untouched. The result is that the
+  embedder sees the new text AND the dedupe key flips, forcing
+  recomputation only for the affected entries. Two-key plumbing
+  is the minimal change; alternative designs (a separate
+  `embed_hash` field on `Chunk`) are out of scope for this
+  phase.
+- Header version constant (`PROJECT_FILE_EMBED_TEXT_V1` or
+  similar) gates future format changes.
+- `bbox_embed_status` documents the expected one-time recompute
+  burst after this phase lands. No code change; release note
+  only.
 
 **Gates.**
 
-- Existing test fixture indices get rebuilt on first daemon start
-  after the bump.
-- `bbox_stats` returns a sane doc count post-rebuild.
-- No regression in `bbox_hybrid_search` quality on a stored
-  fixture corpus (smoke test, not a full eval).
+- New unit test in `src/embed_queue.rs` showing
+  `project_file_embed_text` is stable for a chunk with no
+  metadata (== `chunk.content`) and changes when `symbol_kind` is
+  present.
+- New integration test showing the embedder dedupe key changes
+  for a chunk whose `symbol_kind` becomes populated after a
+  reindex.
 
 **Follow-ups.**
 
-- If the embedding cost on a large host is severe, gate the
-  embed recomputation behind an opt-in env var. Defer until
-  observed.
+- Add per-route opt-in if the recompute cost on a large host is
+  severe (env var or config field). Defer until observed.
+- Promote the embed-text builder to a trait if a second consumer
+  needs to assemble similar metadata-augmented text.
 
 ---
 
@@ -395,6 +456,14 @@ extractor" gap in Real Gaps section 5.
 - New module entry `src/code_nav/refs.rs` (or a `refs` submodule
   inside `mod.rs` if file size stays reasonable) implementing
   `code_refs(&CodeRefsParams) -> Result<String>`.
+- New `#[tool]` handler `bbox_code_refs` added to
+  `src/tools/code_nav.rs` (mirrors the existing three handlers),
+  re-exporting `code_refs` from the `crate::code_nav` module.
+- `mod` declaration / pub exports in `src/code_nav/mod.rs`
+  expose `CodeRefsParams` and `code_refs`.
+- `src/tool_docs.rs` stanza added (see CN-X1 for the full prose;
+  this phase lands the minimum entry needed to satisfy the
+  every-`#[tool]`-has-a-stanza compile-time assertion).
 - Param struct mirrors the design signature exactly:
   - `file: String`
   - `project_dir: Option<String>`
@@ -464,8 +533,12 @@ indexed lane. Live behaviour stays available and reachable via
 **Realizes.** Design Phase 3 plus the "No ergonomic indexed symbol
 search" gap in Real Gaps section 3.
 
-**Dependencies.** CN-D1 through CN-D5 must all be landed — the
-indexed path needs `symbol_kind` in tantivy.
+**Dependencies.** CN-D1 through CN-D3 must be landed (the indexed
+path needs `symbol_kind`, `project_id`, `byte_end`, `line_start`,
+`line_end` in tantivy plus the schema-version bump). CN-D4 is
+strictly required for nothing in this phase but is a natural
+neighbour; CN-D5 is optional (only matters if the indexed lane
+should benefit from kind-aware vector text).
 
 **Components.**
 
@@ -474,13 +547,38 @@ indexed path needs `symbol_kind` in tantivy.
   CN-D5, transitional default `live` if shipped before the
   data-model phases land (kept as a compile-time switch so the
   tool stays usable mid-migration).
+- **Live vs indexed `kind` contract.** This is the
+  load-bearing piece. Today's live lane sources `SyntaxItem.kind`
+  from `refactor::status`, which surfaces synthetic kinds like
+  `"impl_method"` for Rust impl methods
+  (`src/code_nav/mod.rs:363`-area). The proposed indexed lane
+  sources `symbol_kind` from `Chunk.symbol_kind`, which CN-D1
+  pins to the raw tree-sitter node kind — `"function_item"` for
+  the same Rust method. The two views are NOT the same. The
+  contract for this phase is:
+  - Indexed records carry `symbol_kind` (tree-sitter node kind)
+    and `refactor_kind` (the synthetic refactor item kind,
+    sourced from a small mapping table colocated with
+    `refactor::status`'s synthesizer). Both fields are present
+    on indexed records.
+  - Live records carry `refactor_kind` natively (unchanged
+    today) and a derived `symbol_kind` produced by reverse
+    mapping. Both fields are present on live records.
+  - The `kind` filter on `CodeSymbolSearchParams.item_kinds`
+    accepts BOTH vocabularies and matches against either field
+    after canonicalisation.
+  - Tool-doc + `sm-refactor` text spells out the dual
+    vocabulary so agents do not guess.
 - Indexed lane:
   - Builds a tantivy `BooleanQuery` over the `project_file`
-    document type with the requested `project_dir` (matched via
-    `project_id` lookup), optional `language` filter,
+    document type with the requested `project_dir` resolved to
+    a project_id via `self.state.projects.read().lookup_by_dir(...)`
+    on the handler side, optional `language` filter,
     `symbol`/`symbol_exact` substring or term match, optional
     `path` substring (via `path_tokens`), and `symbol_kind` term
-    filter when supplied.
+    filter when supplied. Filter uses the
+    `project_id`/`byte_end`/`line_start`/`line_end` fields added
+    in CN-D3 — without those, this lane cannot land.
   - Reads `byte_range`, `line_range`, `chunk_hash`, and ref
     components from the stored fields; reconstructs the
     `handoff` block from `path_tokens` + `chunk_hash` exactly as
@@ -505,12 +603,15 @@ indexed path needs `symbol_kind` in tantivy.
   returns `status: "needs_reindex"` with a recovery hint, not
   empty results.
 - `mode="indexed"` on a project WITH a fresh index returns the
-  same items as `mode="live"` within an agreed equivalence
-  (sort order may differ; the set of `(file, byte_range, kind,
-  name)` tuples must match modulo files filtered by
-  CODE_SYMBOL_SKIP_DIRS).
-- Indexed lane is materially faster on a 1000-file fixture
-  project — wall-clock smoke test, not a strict perf gate.
+  same logical items as `mode="live"` for the same query.
+  Equivalence is defined over the canonicalised set of
+  `(file, byte_start, byte_end, symbol_kind, refactor_kind, name)`
+  tuples, modulo files filtered by `CODE_SYMBOL_SKIP_DIRS` and
+  modulo the explicit mapping table between synthetic refactor
+  kinds and raw tree-sitter node kinds. The mapping table lives
+  in code with a unit test enumerating known pairs (e.g.
+  `impl_method` ↔ `function_item` for Rust); equivalence is a
+  property test over that table.
 
 **Follow-ups.**
 
@@ -616,7 +717,7 @@ semantic rename.").
 Acceptance Criteria after CN-T3 and CN-X1 land and tick each one
 off against landed behaviour. Mechanical, but it's the named close.
 
-**Realizes.** All five Acceptance Criteria.
+**Realizes.** All six Acceptance Criteria.
 
 **Components.**
 
@@ -626,11 +727,14 @@ off against landed behaviour. Mechanical, but it's the named close.
   2. Query and node-describe tools return bounded responses
      with parse diagnostics.
   3. Kind-filtered indexed symbol search is not exposed until
-     `symbol_kind` exists (CN-D5).
+     `symbol_kind` exists (CN-D3).
   4. Existing graph navigation remains the preferred route for
      indexed callers, callees, and evidence bundles.
   5. Generic structural declaration rewrites are not named like
      semantic rename.
+  6. Tests cover at least Rust, JavaScript/TypeScript, Python,
+     and Java query or node-describe behaviour, plus one
+     unsupported-language error path (CN-T3).
 
 **Gates.**
 
@@ -651,7 +755,11 @@ off against landed behaviour. Mechanical, but it's the named close.
 CN-0  (audit, informational)
 CN-S1 ───► CN-T1
 CN-S2 ───► CN-T1
-CN-D1 ─► CN-D2 ─► CN-D3 ─► CN-D4 ─► CN-D5 ─► CN-T2
+CN-D1 ─► CN-D2 ─► CN-D3 ─► CN-T2
+                  └─► CN-D4 (parallel with CN-T2 once D3 lands)
+                  └─► CN-D5 (optional; required only if
+                              vector search must benefit from
+                              kind-aware embed text)
 CN-S1 ───► CN-T2
 CN-T1, CN-T2, CN-T3 ───► CN-X1 ───► CN-X2
 CN-S1 ───► CN-T3
@@ -660,6 +768,11 @@ CN-S1 ───► CN-T3
 Phases inside a dependency chain are strictly ordered; the chains
 can land in parallel. CN-X1 / CN-X2 close the loop and depend on
 every tool phase.
+
+Note the merge of the original CN-D3 ("add field") and CN-D5
+("bump version") into a single CN-D3 phase. Splitting them is
+unsafe given `reset_index_on_schema_mismatch` — see CN-D3's Scope
+note for the mechanism.
 
 ---
 
