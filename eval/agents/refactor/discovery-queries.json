@@ -81,6 +81,12 @@
       "query": "produce a class shaped inventory for a java class with methods fields inner types",
       "expected_agents": ["java-class-dependency-graph"],
       "forbidden_agents": []
+    },
+    {
+      "id": "find-java-find-usages",
+      "query": "find every project wide caller of a java method or field",
+      "expected_agents": ["java-find-usages"],
+      "forbidden_agents": []
     }
   ],
   "anti_pattern_queries": [

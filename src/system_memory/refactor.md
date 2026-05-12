@@ -296,6 +296,7 @@ dispatch via `bro_agent_dispatch(agent="<name>", args={...})`.
 | `java-lombokify` | shipped (v1, RA-X4) | expensive | `lombokify_java_class` (single-file or bulk-dir) + optional `java_lsp_organize_imports` | Convert hand-rolled POJO boilerplate (getters/setters/equals/hashCode/toString/canonical ctors/SLF4J) into Lombok annotations; operator-authority `boolean_getter_strategy` (skip / bridge / rename); cost_class=expensive to match bulk-dir worst case |
 | `java-public-api-guard` | shipped (v1, RA-X5) | normal | `java_public_api_guard` | Report public-API delta of a proposed Java refactor as advisory severity; preflight for `java-extract-interface` and standalone audit; closes JAVA_GAP.md Gap 1 |
 | `java-class-dependency-graph` | shipped (v1, RA-X6) | cheap | `java_class_dependency_analysis` | Class-shaped inventory — methods + fields + inner types + class-level annotations — for operator review before partition decisions; analysis-only preflight to `java-extract-cohesive-class`; closes JAVA_GAP.md Gap 2 |
+| `java-find-usages` | shipped (v1) | cheap | `find_java_usages` | Project-wide reference walk for one or more simple Java names with optional `declaring_class` filter; production_sites/test_sites tally; optional `output_path` + `summary_only` for large reports; analysis-only sibling to `java-public-api-guard` |
 
 Per-atom manifests live at `examples/agents/refactor/<atom>.json`. The
 shared prompt template and base outputs schema (RA-T1) under the same

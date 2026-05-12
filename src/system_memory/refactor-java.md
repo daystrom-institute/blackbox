@@ -14,6 +14,7 @@ note.
 |---|---|
 | `java-class-dependency-graph` | Class inventory — methods + fields + inner types + annotations — for partition review (analysis-only) |
 | `java-public-api-guard` | Public-API delta advisory; preflight for mutating atoms (analysis-only) |
+| `java-find-usages` | Project-wide reference walk with optional `declaring_class` filter + test/prod tally (analysis-only) |
 | `java-extract-cohesive-class` | Composite cluster extraction — methods + field moves + delegate + caller rewrites + cross-package widening |
 | `java-promote-inner-class` | Promote non-static inner with captures into a top-level class with final ctor params |
 | `java-extract-interface` | Extract interface from class + optional caller type migration; v2 runs a structured public-API guard preflight |

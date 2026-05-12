@@ -166,6 +166,15 @@
         "module_name": "DashboardView"
       },
       "expect_response_fields": ["status", "class", "methods", "fields", "inner_types", "annotations_class_level"]
+    },
+    {
+      "id": "dispatch-java-find-usages-planonly",
+      "agent": "java-find-usages",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "item_names": ["refreshGrid"]
+      },
+      "expect_response_fields": ["status", "total_usages", "production_sites", "test_sites"]
     }
   ]
 }

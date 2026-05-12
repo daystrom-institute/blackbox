@@ -187,6 +187,15 @@
         "bbox_note:done"
       ],
       "done_note_required": true
+    },
+    {
+      "agent": "java-find-usages",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_plan:find_java_usages",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }

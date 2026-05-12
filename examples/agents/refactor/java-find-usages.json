@@ -1,0 +1,111 @@
+{
+  "kind": "agent",
+  "name": "java-find-usages",
+  "version": 1,
+  "_contract": "refactor-atom/v1",
+  "manifest": {
+    "description": "Project-wide reference walk for one or more simple Java names — type-position, method-invocation, field-access, method-reference, import. Analysis-only.",
+    "when_to_use": [
+      "preflight before a rename, move, or visibility-narrowing refactor — confirm where the symbol is actually called",
+      "post-flight after java-public-api-guard reports caution — enumerate the cross-package call sites the guard heuristic surfaced",
+      "auditing a method or class for cross-file impact before extracting it"
+    ],
+    "anti_patterns": [
+      "do not use as a clustering algorithm — this atom reports usages, not partitions",
+      "do not use to mutate code — the underlying plan kind is analysis-only",
+      "do not use on non-Java files",
+      "do not pass globally common names (`getId`, `getName`, `equals`) without `declaring_class` — the simple-name match can return hundreds of unrelated sites"
+    ],
+    "brofile_ref": "java-refactor-persona",
+    "filter_overlay": {
+      "allow": [],
+      "disallow": []
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "item_names"],
+        "properties": {
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the Java project root."
+          },
+          "item_names": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "description": "Simple names to search for — method, class, interface, record, enum, field, or parameter names."
+          },
+          "declaring_class": {
+            "type": "string",
+            "description": "Optional. When set, restrict usages to ones where the receiver type plausibly resolves to this class. Recommended whenever item_names contains a method name that isn't globally unique (G9)."
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Optional. When set, write the full usage report JSON to this filename under $BLACKBOX_STATE_DIR/refactor/plans/ and return a compact digest in the response (G10). Plain filename only — absolute paths and `..` traversal are rejected."
+          },
+          "summary_only": {
+            "type": "boolean",
+            "description": "Optional. When true, response includes per-name counts and top-5 example sites per name only — no full enumeration. Combines with output_path."
+          }
+        }
+      },
+      "prompt_template": "You are java-find-usages. Charter: Enumerate project-wide call sites for the given simple Java name(s) — analysis only, never mutating.\n\nProtocol (analysis-only — steps 3 and 4 are skipped):\n\n1. Ground the targets structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{item_names[0]}}\",\n                     languages=[\"java\"])\n   Confirm at least one declaration site exists for each name in {{item_names}}.\n   If none resolves, refuse early via bbox_note(kind=\"blocked\").\n\n2. Plan with deep_analysis=true:\n   bbox_refactor_plan(kind=\"find_java_usages\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      item_names={{item_names}},\n                      declaring_class=\"{{declaring_class}}\",\n                      output_path=\"{{output_path}}\",\n                      summary_only={{summary_only}})\n   The plan kind walks every `.java` under project_dir (skipping target/,\n   build/, .gradle/, node_modules/, .git/) and reports each usage with\n   (path, line, column, context, usage_kind, is_test_site). Top-level\n   response carries production_sites + test_sites tallies (G6) and, when\n   output_path or summary_only is set, a compact digest in place of the\n   full enumeration.\n\n   When declaring_class is set, the plan filters usages to ones where\n   the receiver identifier matches a field on the receiver's enclosing\n   class whose declared type is the named class (G9 v1 heuristic). The\n   filter misses receiver-less calls within the declaring class itself,\n   but those are intra-class and an intra-class refactor handles them\n   without the find_usages atom.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: total usages, production_sites,\n     test_sites, top-3 call files, mode (full | digest | summary_only)>).\n   If output_path was set, include the plan_path that holds the full\n   report so the operator can re-read it later.\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside your filter_overlay.\n- Never mutate code from this atom — analysis only.\n- Never run with a common method name (e.g. `getId`) unless\n  declaring_class is also set — surface block_reason instead.\n- Surface is_test_site tallies in the done note when production_sites > 0\n  and test_sites > 0 — the operator's caller migration plan is different\n  for the two (Mockito spy rewrites for tests vs production-caller\n  migration).\n\nInputs:\n{{project_dir}} {{item_names}} {{declaring_class}} {{output_path}} {{summary_only}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": { "type": "integer", "minimum": 0 },
+              "warning": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "total_usages": { "type": "integer", "minimum": 0 },
+          "production_sites": { "type": "integer", "minimum": 0 },
+          "test_sites": { "type": "integer", "minimum": 0 },
+          "unique_call_files": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "usage_summary_by_name": {
+            "type": "object",
+            "additionalProperties": { "type": "integer" }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "composition": {
+      "chainable_after": ["java-public-api-guard"],
+      "parallel_safe": true
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-12T00:00:00Z"
+    }
+  }
+}
