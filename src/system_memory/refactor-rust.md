@@ -5,29 +5,34 @@ blackbox refactor tools.
 
 ## Current Capability
 
-Rust is the first writable backend.
+Rust is the first writable backend. Plan dispatcher exposes the kinds below;
+ask `bbox_refactor_plan` (dry-run) before `bbox_refactor_apply(confirm=true)`.
 
-- Inspect: supported with `bbox_refactor_status`.
-- Plan: supported with `bbox_refactor_plan(kind="extract_rust_items")` and
-  `bbox_refactor_plan(kind="extract_rust_impl_methods")` and
-  `bbox_refactor_plan(kind="delete_rust_items")` and
-  `bbox_refactor_plan(kind="add_rust_router_to_sum")` and
-  `bbox_refactor_plan(kind="add_rust_mod_decl")` and
-  `bbox_refactor_plan(kind="add_rust_use_decl")` and
-  `bbox_refactor_plan(kind="copy_rust_mod_decls")` and
-  `bbox_refactor_plan(kind="rewrite_rust_mod_visibility")` and
-  `bbox_refactor_plan(kind="rewrite_rust_item_visibility")` and
-  `bbox_refactor_plan(kind="rust_lsp_rename")` and
-  `bbox_refactor_plan(kind="rust_organize_imports")`.
-- Apply: supported with `bbox_refactor_apply(confirm=true)`.
-- Compound run: supported with `bbox_refactor_run(confirm=true)` for ordered
-  primitive plans and command validation steps, with rollback across
-  primitive-plan file writes if a later required plan or command step fails.
-- Semantic rename: supported with `rust_lsp_rename`, backed by rust-analyzer
-  `textDocument/rename` and emitted as normal hash-checked `FileEdit`s.
-- Import organization: supported per file with `rust_organize_imports`, backed
-  by rust-analyzer `source.organizeImports`. Missing-import repair is still
-  compiler/LSP-guided.
+Inspect: `bbox_refactor_status`. Apply: `bbox_refactor_apply(confirm=true)`.
+Compound: `bbox_refactor_run(confirm=true)` runs ordered plan + command steps
+with rollback across primitive-plan file writes if a later required step fails.
+
+Plan kinds, grouped by intent:
+
+- Syntactic moves / deletes: `extract_rust_items`, `extract_rust_impl_methods`,
+  `lift_rust_inherent_to_free`, `extract_rust_trait`, `move_rust_struct_fields`,
+  `delete_rust_items`, `move_file`.
+- Caller / accessor rewrites: `update_rust_callers`, `migrate_rust_type_usages`,
+  `add_rust_delegate_field`, `add_rust_router_to_sum`.
+- Module wiring: `add_rust_mod_decl`, `add_rust_use_decl`, `copy_rust_mod_decls`.
+- Visibility: `rewrite_rust_mod_visibility`, `rewrite_rust_item_visibility`,
+  `rewrite_rust_field_visibility`.
+- LSP-backed (rust-analyzer): `rust_lsp_rename` (semantic rename),
+  `rust_organize_imports` (per-file `source.organizeImports`),
+  `rust_ra_move_item_to_module` (semantic move + cross-file caller rewrite),
+  `rust_ra_classify_callbacks` (resolve method callees via goto-definition).
+- Analysis only (no FileEdits): `rust_impl_partition_analysis` (impl-method
+  graph for split planning), `rust_public_api_guard` (advisory for visibility
+  changes touching public API).
+- Run-loop integration: `rust_compile_fix_round` (classify a `capture=rustc_json`
+  step's diagnostics into use-decl / visibility / replace proposals).
+- Generic primitives (language-agnostic, useful in compound runs):
+  `replace_text`, `write_file`, `ensure_toml_table`.
 
 Tree-sitter language: `rust`.
 
@@ -81,6 +86,83 @@ Writable plan kinds:
   multiple files.
 - `rust_organize_imports`: request rust-analyzer `source.organizeImports` for
   `source` and emit the resulting workspace edit as normal hash-checked edits.
+- `rust_ra_move_item_to_module`: rust-analyzer `refactor.move` code action.
+  Moves a named top-level item AND rewrites callers across the workspace.
+  Accepts `function_item`, `struct_item`, `enum_item`, `trait_item`,
+  `type_item`, `const_item`, `static_item`, `mod_item`. Refuses `impl_method`
+  (use `extract_rust_impl_methods` instead). Requires `target` to be a path
+  RA recognizes as a sibling/child module; if RA returns no code action you
+  see `error.lsp_unavailable: no move-to-module code action found for <name>`.
+  In practice RA wants the destination declared inside the source's module
+  (or a sibling under a shared parent), so scaffold `mod target;` and the
+  empty target file before requesting the move.
+- `rust_ra_classify_callbacks`: walks call sites of named methods in `source`
+  and asks rust-analyzer `textDocument/definition` to resolve where each
+  callee is declared. Returns `resolved_callbacks` (one entry per method with
+  declaring item/kind and call-site previews) without editing any file. Use
+  before an extract to see whether a moved cluster would still resolve.
+- `lift_rust_inherent_to_free`: lift named methods out of an inherent `impl`
+  block into free functions in another file. Methods that capture state, take
+  `&self` / `&mut self`, or otherwise depend on the impl receiver are refused
+  with structured `refusal_reasons`; eligible methods move with their bodies
+  and the source-side impl method is deleted. Useful for splitting a god-impl.
+- `extract_rust_trait`: extract a trait declaration from named methods of an
+  inherent `impl` block. Requires `impl_name`, `module_name` (the new trait
+  name), `item_names`. Emits the trait into `target`, generates an
+  `impl <Trait> for <Type>` block forwarding to the moved bodies, and reports
+  object-safety hazards (`generic_methods`, `self_by_value_methods`,
+  `associated_constants`, `dyn_compatible`) plus `trait_in_scope_required`
+  for call sites that need to import the trait.
+- `migrate_rust_type_usages`: rewrite `module_name::OldType` usages to a new
+  type. Pass `module_name` (the path qualifier), `old_text` (the old simple
+  name + optional position constraint such as `OldType@type_position`), and
+  `new_text` (the replacement). Skipped sites surface in `migration_skipped`
+  with reasons (illegal-position, ambiguous import, etc.).
+- `move_rust_struct_fields`: move named fields from one struct to another
+  (same file or across files). Pass `item_names` (field names),
+  `impl_name`-or-`module_name` (source struct), `target` (destination file
+  containing the destination struct), optional `visibility`, and
+  `toml_entries={"acknowledge_repr": true}` when the source struct has a
+  non-default `#[repr(...)]`. With `deep_analysis=true` reports
+  `remaining_source_accessors` and `inherited_generics`.
+- `add_rust_delegate_field`: add `<visibility> <delegate_field>: <delegate_type>`
+  to a named struct and wire `self.<delegate_field> = <delegate_type>::new()`
+  into matching constructor bodies. Constructor names default to `["new"]`;
+  override via `item_names`. Custom init expression via
+  `toml_entries={"init_expr": "..."}`.
+- `update_rust_callers`: rewrite source-side reads/writes of moved fields or
+  methods through a `delegate_field` getter/setter. Pass `delegate_field`,
+  `item_names` (moved member names), optional `impl_name`/`module_name` for
+  the source struct, optional `target` + `delegate_type` so the rewriter can
+  consult the delegate struct for Copy-whitelist behavior. Sites it refuses
+  to rewrite surface as `unrewriteable` / `overlapping` / `borrow_promotions`.
+- `move_file`: rename one file to another with hash protection. No content
+  rewrite, no caller updates — purely a file-system move guarded by the
+  refactor envelope (sha256 check, atomic rename, rollback).
+- `rust_impl_partition_analysis` (analysis-only): build the call/state graph
+  of methods inside one `impl` block. Pass `source` + `impl_name` (or
+  `module_name`). Returns `partition_graph`; no FileEdits. Use before a split
+  to see which methods cluster together.
+- `rust_public_api_guard` (analysis-only): score a proposed set of changes
+  against the file's public API surface and report severity / touched-item
+  delta. `toml_entries={"proposed_changes": [...]}` carries the change set.
+  Returns `public_api_report`; no FileEdits.
+- `rust_compile_fix_round`: classify `RustcDiagnostic` messages (captured by a
+  prior compound-run command step with `capture="rustc_json"`) into
+  `use-decl-add`, `visibility-rewrite`, or `replace_text` proposals. Use only
+  inside `bbox_refactor_run`; the run-loop hook fetches the diagnostics from
+  the capture-context ref named by `toml_entries["diagnostics_ref"]`
+  (default `"last"`).
+- `replace_text` (generic): exact-string replace within one file. Refuses on
+  zero matches; refuses on multiple matches unless `replace_all=true`. Use
+  for grounded textual residue after a semantic operation (fixture metadata,
+  literal strings, dead links) — not as a substitute for `rust_lsp_rename`.
+- `write_file` (generic): replace an entire file with `new_text`, or create
+  it if missing. Hash-checked against the current bytes (or empty bytes for
+  a new file). Used for the scaffolding-then-RA-move pattern.
+- `ensure_toml_table` (generic): insert/merge a TOML table with the supplied
+  `toml_table` name and `toml_entries` map. Idempotent — re-running does not
+  duplicate keys. Useful for `Cargo.toml` adjustments inside a compound run.
 
 Compound run steps:
 
@@ -249,9 +331,39 @@ Apply refuses stale file hashes. It reparses changed supported source files and
 writes atomically with rollback on write failure. Apply is scoped to registered
 projects and refuses dirty git files by default; use
 `allow_dirty_worktree=true` only when you intentionally planned against current
-uncommitted edits. For disposable practice worktrees, pass
-`allow_unregistered_paths=true` to skip project registration while keeping hash,
-dirty-file, parse, and atomic-write safeguards.
+uncommitted edits. For unregistered projects, pass `allow_unregistered_paths=true`
+to skip project registration while keeping hash, dirty-file, parse, and
+atomic-write safeguards.
+
+DO NOT call `bbox_project_register` just to satisfy the apply path's project
+check — registration triggers the project-bootstrap-arc (full indexing, chunking,
+embedding) which is expensive. `allow_unregistered_paths=true` is the correct
+escape hatch for ad-hoc work.
+
+### Plan transport for large refactors
+
+The MCP transport caps inline parameter size. For `extract_java_class`,
+`extract_rust_trait`, multi-file extracts, or any plan likely to exceed a few
+hundred KB of JSON, write the plan to disk and apply by path:
+
+```text
+bbox_refactor_plan(
+  kind=...,
+  source=...,
+  output_path="my-plan.json",   # relative; resolves under $BLACKBOX_STATE_DIR/refactor/plans/
+  ...
+)
+# Returns RefactorPlanSummary (counts only); the full plan is on disk.
+
+bbox_refactor_apply(
+  plan_path="my-plan.json",
+  confirm=true,
+  allow_unregistered_paths=true,  # if applicable
+)
+```
+
+`plan` and `plan_path` are mutually exclusive. `plan` accepts a JSON object
+returned directly from a no-`output_path` plan call; do NOT stringify it.
 
 4. Run the Rust toolchain:
 
@@ -263,13 +375,54 @@ cargo test --bin blackboxd
 
 Use a narrower test command when the changed package has a clearer local test.
 
+## Splitting a monster file with RA-move
+
+The killer combination for breaking up a sprawling module is
+`add_rust_mod_decl` + scaffold target file + `rust_ra_move_item_to_module`.
+The semantic move rewrites callers across the workspace, which the syntactic
+`extract_rust_items` does not.
+
+Sequence:
+
+1. Scaffold the destination — create the empty file (or stub) with a doc
+   comment + `use super::*;`. Use the `write_file` plan kind for the scaffold
+   inside a compound run, or just write it with conventional file ops.
+2. Declare the module so RA can see it. For a child module of `parent.rs`,
+   the file goes at `parent/<child>.rs` AND `parent.rs` gets
+   `mod <child>;` via `add_rust_mod_decl`.
+3. Run `cargo check` once so RA picks up the new module. RA needs an indexed
+   workspace; new files added between RA sessions may be invisible until the
+   project is reloaded.
+4. Plan the move: `rust_ra_move_item_to_module(source, target, item_names,
+   item_kinds)`. Apply it.
+5. Run `cargo check` again. RA's workspace edit usually handles cross-file
+   caller rewrites, but visibility may need a follow-up
+   `rewrite_rust_item_visibility(visibility="pub(crate)")` if the moved item
+   was private.
+
+If RA returns `error.lsp_unavailable: no move-to-module code action found
+for <name>`, the most common causes (in observed order):
+
+- Target is a sibling of source's module, not a submodule. RA only offers
+  the move when the destination is reachable as a child of the current
+  module. Fix: nest the target inside source's module.
+- Target file isn't declared with `mod` anywhere in the workspace yet.
+- Source workspace hasn't been re-indexed since the target file was added
+  (especially in CI / disposable worktrees). Re-run `cargo check` and retry.
+- Item is unmoveable for semantic reasons (e.g., depends on a non-pub item
+  that can't follow it). Inspect with `rust_impl_partition_analysis` first.
+
 ## Safety Rules
 
 - Treat tree-sitter success as syntax validation, not semantic proof.
 - Do not use structural moves for macro-heavy code without `cargo check`.
-- Moving an item can require module declarations, `pub` visibility changes,
-  import cleanup, or call-site path edits. The current refactor tools do not
-  do that automatically.
+- Moving an item with the SYNTACTIC tools (`extract_rust_items`,
+  `extract_rust_impl_methods`, `lift_rust_inherent_to_free`, `move_file`,
+  `move_rust_struct_fields`) does NOT rewrite cross-file callers. Pair with
+  `update_rust_callers` (delegate-based), `migrate_rust_type_usages` (type
+  alias migration), or follow up with `cargo check` + `rust_compile_fix_round`
+  inside a compound run. The SEMANTIC tool `rust_ra_move_item_to_module`
+  rewrites callers via RA's workspace edit.
 - Plain `//` comments above a method are not treated as owned method trivia
   unless attached to an attribute/doc block. Convert durable method comments to
   rustdoc before moving when the comment must follow the method.
@@ -281,3 +434,10 @@ Use a narrower test command when the changed package has a clearer local test.
   after the semantic operation is already done.
 - For broad autonomous restructuring, use a durable bro plus reviewer loop; the
   refactor tools supply mechanical edits, not architectural judgment.
+- `bbox_project_register` is NOT a workaround for the apply path's project
+  check. It triggers full project indexing (chunk + embed + edge emit) which
+  is expensive. Use `allow_unregistered_paths=true` instead.
+- For plans whose JSON exceeds the MCP transport budget (large extracts,
+  multi-file rewrites), use the `output_path` / `plan_path` round-trip.
+  Stringifying a plan to pass to `bbox_refactor_apply(plan=...)` fails with
+  `expected struct RefactorPlan`; pass a JSON object or use `plan_path`.
