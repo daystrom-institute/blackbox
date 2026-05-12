@@ -1,0 +1,67 @@
+{
+  "name": "refactor-extract-interface-and-migrate",
+  "version": 1,
+  "actors": {},
+  "start": "ExtractInterface",
+  "vars_schema": {
+    "project_dir": { "kind": "string", "required": true },
+    "source": { "kind": "string", "required": true },
+    "target": { "kind": "string", "required": true },
+    "module_name": { "kind": "string", "required": true },
+    "impl_name": { "kind": "any" },
+    "item_names": { "kind": "any" },
+    "migrate_callers_in": { "kind": "any", "required": true },
+    "acknowledge_public_api_change": { "kind": "any" },
+    "validation_cmd": { "kind": "any" },
+    "extract_handle": { "kind": "any" },
+    "extract_output": { "kind": "any" }
+  },
+  "nodes": {
+    "ExtractInterface": {
+      "prompt": "Dispatch java-extract-interface with migrate_call_sites=true and migrate_callers_in pre-populated by the workflow caller. The atom handles the structured prompt-discipline gate for acknowledge_public_api_change — when callers in migrate_callers_in cross Maven/Gradle module boundaries and the operator hasn't acknowledged, the atom blocks before any bbox_refactor_run(confirm=true) starts. Once JAVA_GAP.md Gap 1 (java_public_api_guard) ships, this gate becomes structurally enforced via a separate preflight plan.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "java-extract-interface",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source": "${vars.source}",
+                "target": "${vars.target}",
+                "module_name": "${vars.module_name}",
+                "impl_name": "${vars.impl_name}",
+                "item_names": "${vars.item_names}",
+                "migrate_call_sites": true,
+                "migrate_callers_in": "${vars.migrate_callers_in}",
+                "acknowledge_public_api_change": "${vars.acknowledge_public_api_change}",
+                "apply": true,
+                "validation_cmd": "${vars.validation_cmd}"
+              }
+            },
+            "timeout_secs": 900
+          },
+          "into_var": "extract_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.extract_handle.task_id}",
+              "timeout_seconds": 900
+            },
+            "timeout_secs": 920
+          },
+          "into_var": "extract_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

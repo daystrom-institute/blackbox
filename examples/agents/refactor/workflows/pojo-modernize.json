@@ -1,0 +1,57 @@
+{
+  "name": "refactor-pojo-modernize",
+  "version": 1,
+  "actors": {},
+  "start": "Lombokify",
+  "vars_schema": {
+    "project_dir": { "kind": "string", "required": true },
+    "source_dir": { "kind": "string", "required": true },
+    "boolean_getter_strategy": { "kind": "any" },
+    "validation_cmd": { "kind": "any" },
+    "lombokify_handle": { "kind": "any" },
+    "lombokify_output": { "kind": "any" }
+  },
+  "nodes": {
+    "Lombokify": {
+      "prompt": "Single-phase workflow: bulk-dir lombokify with follow_with_organize_imports=true. The atom walks every .java under source_dir, lombokifies hand-rolled POJO boilerplate, then runs java_lsp_organize_imports per touched file to prune the now-unused EqualsBuilder / HashCodeBuilder / ToStringBuilder imports (Lombok generates these inline; the source imports become dead). Validation step compiles the project to confirm the modernization didn't break anything. Files that don't qualify (non-POJOs, validation-bearing setters, subset equals, etc.) appear in plan.leftovers as audit output — non-empty leftovers are EXPECTED in legacy trees.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "java-lombokify",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source": "${vars.source_dir}",
+                "boolean_getter_strategy": "${vars.boolean_getter_strategy}",
+                "follow_with_organize_imports": true,
+                "apply": true,
+                "validation_cmd": "${vars.validation_cmd}"
+              }
+            },
+            "timeout_secs": 1800
+          },
+          "into_var": "lombokify_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.lombokify_handle.task_id}",
+              "timeout_seconds": 1800
+            },
+            "timeout_secs": 1820
+          },
+          "into_var": "lombokify_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

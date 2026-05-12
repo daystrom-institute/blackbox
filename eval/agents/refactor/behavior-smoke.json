@@ -107,6 +107,66 @@
         "expected_block_reason_substring": "cross-partition"
       },
       "done_note_required": true
+    },
+    {
+      "agent": "java-extract-cohesive-class",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_class",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "mutable-capture-with-write",
+        "expected_block_reason_substring": "mutable_capture_with_write"
+      },
+      "done_note_required": true
+    },
+    {
+      "agent": "java-promote-inner-class",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:promote_java_inner_class",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "static-inner-class",
+        "expected_block_reason_substring": "static_inner_class_in_promote"
+      },
+      "done_note_required": true
+    },
+    {
+      "agent": "java-extract-interface",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_interface",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "cross-module-callers-without-acknowledge",
+        "expected_block_reason_substring": "public api"
+      },
+      "done_note_required": true
+    },
+    {
+      "agent": "java-lombokify",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:lombokify_java_class",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "lombok-not-on-classpath",
+        "expected_block_reason_substring": "Lombok"
+      },
+      "done_note_required": true
     }
   ]
 }

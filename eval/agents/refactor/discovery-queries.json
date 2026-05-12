@@ -45,6 +45,30 @@
       "query": "carve a multi domain rust impl block into per domain modules",
       "expected_agents": ["rust-split-god-impl"],
       "forbidden_agents": []
+    },
+    {
+      "id": "find-java-extract-cohesive-class",
+      "query": "extract a cohesive java cluster with methods fields delegate wiring",
+      "expected_agents": ["java-extract-cohesive-class"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-java-promote-inner-class",
+      "query": "promote a non static java inner class with outer captures",
+      "expected_agents": ["java-promote-inner-class"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-java-extract-interface",
+      "query": "extract a java interface from a class and migrate callers",
+      "expected_agents": ["java-extract-interface"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-java-lombokify",
+      "query": "modernize java pojo boilerplate with lombok annotations",
+      "expected_agents": ["java-lombokify"],
+      "forbidden_agents": []
     }
   ],
   "anti_pattern_queries": [
@@ -65,6 +89,24 @@
       "id": "anti-trait-dyn-incompatible",
       "query": "make struct mockable when methods take self by value",
       "agent": "rust-trait-from-impl",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-java-extract-on-inner-class-name",
+      "query": "extract a java inner class using extract_java_class item_names",
+      "agent": "java-extract-cohesive-class",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-promote-static-inner",
+      "query": "promote a static java inner class",
+      "agent": "java-promote-inner-class",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-lombokify-without-classpath",
+      "query": "convert pojo to lombok when lombok is not on the classpath",
+      "agent": "java-lombokify",
       "expect_matched_anti_pattern": true
     }
   ]

@@ -89,6 +89,57 @@
         "apply": false
       },
       "expect_response_fields": ["status", "partitions"]
+    },
+    {
+      "id": "dispatch-java-extract-cohesive-class-planonly",
+      "agent": "java-extract-cohesive-class",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "target": "src/main/java/com/example/DashboardMeterGrid.java",
+        "module_name": "DashboardMeterGrid",
+        "item_names": ["getMeterGrid", "refreshMeterData"],
+        "move_fields": ["meterGrid", "meterDataProvider"],
+        "delegate_field": "meterGrid",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "methods_moved", "fields_moved", "delegate_field"]
+    },
+    {
+      "id": "dispatch-java-promote-inner-class-planonly",
+      "agent": "java-promote-inner-class",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/Outer.java",
+        "target": "src/main/java/com/example/Promoted.java",
+        "module_name": "Promoted",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "promoted_class_name", "captures"]
+    },
+    {
+      "id": "dispatch-java-extract-interface-planonly",
+      "agent": "java-extract-interface",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ServiceImpl.java",
+        "target": "src/main/java/com/example/Service.java",
+        "module_name": "Service",
+        "item_names": ["process", "validate"],
+        "apply": false
+      },
+      "expect_response_fields": ["status", "interface_file", "methods_lifted"]
+    },
+    {
+      "id": "dispatch-java-lombokify-planonly",
+      "agent": "java-lombokify",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/Pair.java",
+        "boolean_getter_strategy": "skip",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "files_lombokified", "annotation_distribution"]
     }
   ]
 }
