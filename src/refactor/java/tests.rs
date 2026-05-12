@@ -107,6 +107,8 @@
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+            cwd: None,
+            force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1380,6 +1382,8 @@
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+            cwd: None,
+            force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1431,6 +1435,8 @@
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+            cwd: None,
+            force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1558,6 +1564,8 @@
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+            cwd: None,
+            force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -5957,6 +5965,8 @@
                 confirm: Some(true),
                 allow_dirty_worktree: Some(true),
                 allow_unregistered_paths: Some(true),
+            cwd: None,
+            force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -5981,6 +5991,8 @@
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+            cwd: None,
+            force_path: None,
             },
             &[],
         )
@@ -6017,6 +6029,8 @@
                 confirm: Some(true),
                 allow_dirty_worktree: Some(true),
                 allow_unregistered_paths: Some(true),
+            cwd: None,
+            force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -6086,6 +6100,8 @@
                 confirm: Some(true),
                 allow_dirty_worktree: Some(true),
                 allow_unregistered_paths: Some(true),
+            cwd: None,
+            force_path: None,
             },
             &[project_record(dir.path())],
         )

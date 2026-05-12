@@ -218,6 +218,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -274,6 +276,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -335,6 +339,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -386,6 +392,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -446,6 +454,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -506,6 +516,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -560,6 +572,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -618,6 +632,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -673,6 +689,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -727,6 +745,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -849,6 +869,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -904,6 +926,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1694,6 +1718,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1746,6 +1772,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1798,6 +1826,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1850,6 +1880,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1902,6 +1934,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -1955,6 +1989,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2008,6 +2044,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2057,6 +2095,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2110,6 +2150,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2191,6 +2233,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2246,6 +2290,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2329,6 +2375,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2379,6 +2427,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2428,6 +2478,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2480,6 +2532,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2560,6 +2614,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2604,6 +2660,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2731,6 +2789,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2815,6 +2875,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -2864,6 +2926,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -3006,6 +3070,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -3055,6 +3121,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(dir.path())],
         )
@@ -3156,6 +3224,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
             },
             &[project_record(project.path())],
         )
@@ -3204,6 +3274,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                cwd: None,
+                force_path: None,
             },
             &[],
         )
@@ -4228,6 +4300,8 @@ impl Cache {
                 confirm: Some(true),
                 allow_dirty_worktree: Some(true),
                 allow_unregistered_paths: Some(true),
+                cwd: None,
+                force_path: None,
             },
             &[ProjectRecord {
                 project_id: "test".into(),
@@ -4314,6 +4388,8 @@ impl Cache {
                 confirm: Some(true),
                 allow_dirty_worktree: Some(true),
                 allow_unregistered_paths: Some(true),
+                cwd: None,
+                force_path: None,
             },
             &[ProjectRecord {
                 project_id: "test".into(),
@@ -4378,6 +4454,157 @@ impl Cache {
                 count,
                 expected_count,
                 "fixture {fixture_name}: marker count {count} != findings count {expected_count}"
+            );
+        }
+    }
+
+    fn g15_project_record(path: &std::path::Path) -> ProjectRecord {
+        ProjectRecord {
+            project_id: "g15-test-project".to_string(),
+            repo_id: None,
+            canonical_path: fs::canonicalize(path).unwrap().to_string_lossy().into_owned(),
+            registered_at: "2026-05-12T00:00:00Z".to_string(),
+            is_git_repo: true,
+            languages: Default::default(),
+        }
+    }
+
+    // G15: bbox_refactor_apply refuses to apply when the caller's cwd
+    // is in a different git toplevel than the plan's recorded paths,
+    // unless `force_path=true`. Without the guard, plans built against
+    // the main checkout silently contaminate the main tree when the
+    // operator's session had switched into a worktree between plan and
+    // apply.
+    #[test]
+    fn g15_apply_refuses_cross_worktree_without_force_path() {
+        // Two separate temp dirs simulate plan-toplevel vs cwd-toplevel.
+        let plan_repo = tempfile::tempdir().unwrap();
+        let cwd_repo = tempfile::tempdir().unwrap();
+        for repo in [plan_repo.path(), cwd_repo.path()] {
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(repo)
+                .status()
+                .expect("git init");
+        }
+        // A plan edit anchored against plan_repo. Build the plan via
+        // serde_json so we don't have to track every field on RefactorPlan.
+        let plan_file = plan_repo.path().join("a.rs");
+        let original = b"fn old() {}\n";
+        fs::write(&plan_file, original).unwrap();
+        let plan_value = serde_json::json!({
+            "title": "g15-test",
+            "kind": "replace_text",
+            "semantic_status": "syntax_only",
+            "dry_run": false,
+            "edits": [{
+                "path": plan_file.to_string_lossy(),
+                "original_sha256": sha256_hex(original),
+                "edits": [{
+                    "byte_start": 3,
+                    "byte_end": 6,
+                    "replacement": "new"
+                }]
+            }],
+            "validations": [],
+            "items": [],
+        });
+
+        // cwd in a different repo — should refuse.
+        let result = apply(
+            &RefactorApplyParams {
+                plan: plan_value.clone(),
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+                cwd: Some(cwd_repo.path().to_string_lossy().into_owned()),
+                force_path: None,
+            },
+            &[g15_project_record(plan_repo.path())],
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cross_worktree_apply"),
+            "expected cross_worktree_apply refusal, got: {err}"
+        );
+
+        // Same call with force_path=true bypasses the G15 guard.
+        // We don't assert the apply succeeds (it may fail later on a
+        // sha mismatch or validation), only that the G15 refusal
+        // doesn't fire.
+        let result_force = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+                cwd: Some(cwd_repo.path().to_string_lossy().into_owned()),
+                force_path: Some(true),
+            },
+            &[g15_project_record(plan_repo.path())],
+        );
+        if let Err(err) = &result_force {
+            assert!(
+                !err.to_string().contains("cross_worktree_apply"),
+                "force_path=true must bypass G15 refusal, got: {err}"
+            );
+        }
+    }
+
+    // G15: when cwd's git toplevel matches the plan's, apply proceeds
+    // without the cross_worktree refusal (sanity for the happy path).
+    #[test]
+    fn g15_apply_proceeds_when_cwd_matches_plan_toplevel() {
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(repo.path())
+            .status()
+            .expect("git init");
+        let file = repo.path().join("a.rs");
+        let original = b"fn old() {}\n";
+        fs::write(&file, original).unwrap();
+        let plan_value = serde_json::json!({
+            "title": "g15-match",
+            "kind": "replace_text",
+            "semantic_status": "syntax_only",
+            "dry_run": false,
+            "edits": [{
+                "path": file.to_string_lossy(),
+                "original_sha256": sha256_hex(original),
+                "edits": [{
+                    "byte_start": 3,
+                    "byte_end": 6,
+                    "replacement": "new"
+                }]
+            }],
+            "validations": [],
+            "items": [],
+        });
+
+        let result = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+                cwd: Some(repo.path().to_string_lossy().into_owned()),
+                force_path: None,
+            },
+            &[g15_project_record(repo.path())],
+        );
+        // The G15 guard must not fire when cwd's toplevel matches
+        // the plan's. Apply may still fail at a later validation
+        // step in this minimal fixture; we assert only the G15 check.
+        if let Err(err) = &result {
+            assert!(
+                !err.to_string().contains("cross_worktree_apply"),
+                "matching toplevels must not trigger G15 refusal, got: {err}"
             );
         }
     }

@@ -406,6 +406,19 @@ pub struct RefactorApplyParams {
     /// Use true only for disposable practice worktrees or isolated smoke tests.
     #[serde(default)]
     pub allow_unregistered_paths: Option<bool>,
+    /// Caller's working directory. When set, apply checks that the plan
+    /// was built against the same git worktree as `cwd`. Mismatch refuses
+    /// with `cross_worktree_apply` unless `force_path=true`. Used by
+    /// background-job and worktree-isolation flows where the operator
+    /// switched worktrees between plan and apply. (G15)
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Default false. When true, bypasses the `cross_worktree_apply`
+    /// refusal and writes to the plan's recorded paths verbatim. Use
+    /// only when the operator explicitly wants the original (main
+    /// checkout) paths despite the cwd mismatch. (G15)
+    #[serde(default)]
+    pub force_path: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1197,6 +1210,41 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
     };
     validate_plan_shape(&plan)?;
 
+    // G15: refuse to apply across git-worktree boundaries unless the
+    // caller explicitly opted in. The plan stores absolute paths at
+    // plan-generation time; if the caller switched worktrees after
+    // planning, applying writes to the original (main-checkout) paths
+    // and silently contaminates other sessions. When the caller passes
+    // `cwd` we compare git toplevels and refuse mismatches.
+    if p.force_path != Some(true) {
+        if let Some(cwd_str) = p.cwd.as_deref() {
+            let cwd_path = PathBuf::from(cwd_str);
+            let plan_anchor: Option<PathBuf> = plan
+                .edits
+                .first()
+                .map(|e| PathBuf::from(&e.path))
+                .or_else(|| {
+                    plan.file_moves
+                        .first()
+                        .map(|m| PathBuf::from(&m.source_path))
+                });
+            if let Some(plan_anchor) = plan_anchor {
+                let cwd_top = crate::git::git_root_for_path(&cwd_path);
+                let plan_top = crate::git::git_root_for_path(&plan_anchor);
+                if let (Some(c), Some(pp)) = (cwd_top.as_ref(), plan_top.as_ref()) {
+                    if c != pp {
+                        bail!(
+                            "cross_worktree_apply: plan was generated against `{}` but apply is running from `{}`. \
+                             Re-plan from the current worktree, or pass `force_path=true` to write to the plan's recorded paths.",
+                            pp.display(),
+                            c.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // RX-A2: refuse blocked plans before touching any files.
     if plan.plan_status == PlanStatus::Blocked {
         bail!(
@@ -1679,6 +1727,8 @@ pub fn run_with_ctx(
                             confirm: Some(true),
                             allow_dirty_worktree: Some(true),
                             allow_unregistered_paths: p.allow_unregistered_paths,
+                            cwd: None,
+                            force_path: None,
                         },
                         projects,
                     ) {

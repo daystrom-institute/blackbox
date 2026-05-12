@@ -272,6 +272,8 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                cwd: None,
+                force_path: None,
             },
             &[],
         )
