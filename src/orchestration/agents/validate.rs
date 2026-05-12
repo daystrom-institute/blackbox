@@ -1952,6 +1952,85 @@ mod tests {
     /// shared `_*` reference files) and asserts each one passes the
     /// refactor-atom lint and validates against the agent schema. New atoms
     /// landing under that path are picked up automatically.
+    /// RA-E1: the eval/agents/refactor/ suites parse cleanly AND every
+    /// shipped atom has at least one discovery query and one behavior-smoke
+    /// entry. The recording AgentDispatchAdapter that interprets the
+    /// behavior-smoke entries against the manifest's prompt template is a
+    /// follow-up; this gate covers the artifact alignment so eval drift
+    /// surfaces at build time.
+    #[test]
+    fn refactor_atom_eval_suites_cover_every_shipped_atom() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_root.join("examples/agents/refactor");
+        let mut atom_names: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("refactor agents dir exists") {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let filename = path.file_name().unwrap().to_string_lossy().to_string();
+            if filename.starts_with('_') {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read manifest");
+            let v: serde_json::Value = serde_json::from_str(&src).expect("manifest parses");
+            atom_names.push(v["name"].as_str().expect("manifest name").to_string());
+        }
+
+        let eval_dir = crate_root.join("eval/agents/refactor");
+        let discovery: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(eval_dir.join("discovery-queries.json"))
+                .expect("read discovery-queries.json"),
+        )
+        .expect("discovery-queries.json parses");
+        let dispatch: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(eval_dir.join("dispatch-scenarios.json"))
+                .expect("read dispatch-scenarios.json"),
+        )
+        .expect("dispatch-scenarios.json parses");
+        let behavior: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(eval_dir.join("behavior-smoke.json"))
+                .expect("read behavior-smoke.json"),
+        )
+        .expect("behavior-smoke.json parses");
+
+        let discovery_agents: std::collections::HashSet<String> = discovery["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|q| q["expected_agents"].as_array().unwrap().iter())
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let dispatch_agents: std::collections::HashSet<String> = dispatch["scenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["agent"].as_str().unwrap().to_string())
+            .collect();
+        let behavior_agents: std::collections::HashSet<String> = behavior["atoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["agent"].as_str().unwrap().to_string())
+            .collect();
+
+        for name in &atom_names {
+            assert!(
+                discovery_agents.contains(name),
+                "eval/agents/refactor/discovery-queries.json missing {name}"
+            );
+            assert!(
+                dispatch_agents.contains(name),
+                "eval/agents/refactor/dispatch-scenarios.json missing {name}"
+            );
+            assert!(
+                behavior_agents.contains(name),
+                "eval/agents/refactor/behavior-smoke.json missing {name}"
+            );
+        }
+    }
+
     /// RA-D1: the sm-refactor catalog must list every shipped atom under
     /// `examples/agents/refactor/<name>.json` exactly once. A new atom that
     /// lands without a catalog row fails this test — the failure message

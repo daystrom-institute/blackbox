@@ -299,6 +299,39 @@ build. The mechanical alternative to a manually maintained table —
 auto-regeneration from the manifest set — is a `tools/refactor-atom-
 catalog-gen` follow-up.
 
+## Refactor-atom eval coverage (RA-E1)
+
+Per-atom eval artifacts live under `eval/agents/refactor/`:
+
+- `discovery-queries.json` — per-atom queries matching `when_to_use`,
+  plus anti-pattern queries with `expect_matched_anti_pattern: true`.
+  Runs in **keyword-only mode** in CI (`include_vectors=false`) to
+  stay deterministic. Vector-ready mode is gated on every shipped
+  atom showing `embedding_pending=false` and tolerates ranking
+  fluctuation.
+- `dispatch-scenarios.json` — per-atom install + dispatch round trip
+  with a fixture input and an `expect_response_fields` shape
+  assertion. The fixture paths use `${FIXTURE_RUST_PROJECT}` for the
+  Rust project root; future eval-runner integration resolves them.
+- `behavior-smoke.json` — per-atom `expected_plan_sequence` listing
+  the bbox_refactor_* tool calls the atom's prompt template
+  encodes, plus an optional `block_reachability` fixture and the
+  expected block_reason substring. NOT exhaustive semantic
+  testing (that's RX-per-plan-kind territory).
+
+`refactor_atom_eval_suites_cover_every_shipped_atom` (RA-E1) asserts
+every atom under `examples/agents/refactor/<name>.json` appears in all
+three eval suites; eval drift fails the build.
+
+The **recording AgentDispatchAdapter** that interprets behavior-smoke
+entries against the prompt template (registering a fake adapter per
+the impl doc's Codex round-2/3 design, parsing the template's
+bbox_refactor_* markers in order and asserting the simulated tool-call
+sequence matches `expected_plan_sequence`) is tracked as a follow-up.
+v1 ships the deterministic artifact alignment; live LLM dispatch is a
+secondary integration check (marked slow/live) that requires the
+adapter implementation.
+
 ## Refactor-atom supersession (RA-Z1)
 
 Atom version bumps use the standard artifact-supersede mechanism:

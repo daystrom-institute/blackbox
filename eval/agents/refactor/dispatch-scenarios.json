@@ -1,0 +1,94 @@
+{
+  "suite": "refactor-agent-dispatch",
+  "version": 1,
+  "notes": "Per-atom dispatch scenarios with a fixture input and a response-shape assertion. The eval runner installs each atom, calls bro_agent_dispatch with the fixture args, and asserts the returned response shape contains the named fields. The recording adapter (see behavior-smoke.json) is the v1 default for behavior assertions; this suite covers the install-then-dispatch surface only.",
+  "scenarios": [
+    {
+      "id": "dispatch-impl-partition-graph",
+      "agent": "rust-impl-partition-graph",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file": "src/main.rs",
+        "impl_name": "impl Foo"
+      },
+      "expect_response_fields": ["status", "methods", "fields", "edges"]
+    },
+    {
+      "id": "dispatch-public-api-guard",
+      "agent": "rust-public-api-guard",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source": "src/lib.rs"
+      },
+      "expect_response_fields": ["status", "advisory_severity"]
+    },
+    {
+      "id": "dispatch-test-island-extract-planonly",
+      "agent": "rust-test-island-extract",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file_or_dir": "src/main.rs",
+        "target_dir": "src/tests",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "extracted_test_files"]
+    },
+    {
+      "id": "dispatch-state-extract-planonly",
+      "agent": "rust-state-extract",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file": "src/main.rs",
+        "source_struct": "Foo",
+        "target_struct_name": "FooState",
+        "target_module_path": "src/foo_state.rs",
+        "field_names": ["a", "b", "c"],
+        "delegate_field": "state",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "delegate_field", "accessors_generated"]
+    },
+    {
+      "id": "dispatch-trait-from-impl-planonly",
+      "agent": "rust-trait-from-impl",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file": "src/main.rs",
+        "source_struct": "Foo",
+        "trait_name": "FooApi",
+        "target_file": "src/foo_api.rs",
+        "method_names": ["bar", "baz"],
+        "apply": false
+      },
+      "expect_response_fields": ["status", "trait_file", "methods_lifted", "object_safe"]
+    },
+    {
+      "id": "dispatch-error-migrate-planonly",
+      "agent": "rust-error-migrate",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file_or_module": "src/error.rs",
+        "from_type": "OldErr",
+        "to_type": "NewErr",
+        "error_mapping": {"OldErr::Bad(msg)": "NewErr::Bad { msg }"},
+        "apply": false
+      },
+      "expect_response_fields": ["status", "signatures_rewritten", "construction_sites_rewritten"]
+    },
+    {
+      "id": "dispatch-split-god-impl-planonly",
+      "agent": "rust-split-god-impl",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file": "src/main.rs",
+        "impl_name": "impl BigStruct",
+        "partition": {
+          "search": ["search_a", "search_b"],
+          "knowledge": ["knowledge_a", "knowledge_b"]
+        },
+        "apply": false
+      },
+      "expect_response_fields": ["status", "partitions"]
+    }
+  ]
+}

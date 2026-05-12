@@ -1,0 +1,71 @@
+{
+  "suite": "refactor-agent-discovery",
+  "version": 1,
+  "search_mode": "keyword",
+  "notes": "Keyword-only mode (include_vectors=false) keeps discovery deterministic in CI. Vector-ready mode (include_vectors=true) is an opt-in gate that requires embedding_pending=false on every shipped atom before running.",
+  "queries": [
+    {
+      "id": "find-impl-partition-graph",
+      "query": "produce method field call graph for a rust impl block",
+      "expected_agents": ["rust-impl-partition-graph"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-public-api-guard",
+      "query": "report public api delta of a proposed rust refactor",
+      "expected_agents": ["rust-public-api-guard"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-test-island-extract",
+      "query": "peel cfg test mod tests blocks into sibling files",
+      "expected_agents": ["rust-test-island-extract"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-state-extract",
+      "query": "pull a self field cluster into a separate struct with delegate",
+      "expected_agents": ["rust-state-extract"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-trait-from-impl",
+      "query": "lift a method subset into a trait and impl trait for struct",
+      "expected_agents": ["rust-trait-from-impl"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-error-migrate",
+      "query": "rewrite a rust module error type with public api preflight",
+      "expected_agents": ["rust-error-migrate"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-split-god-impl",
+      "query": "carve a multi domain rust impl block into per domain modules",
+      "expected_agents": ["rust-split-god-impl"],
+      "forbidden_agents": []
+    }
+  ],
+  "anti_pattern_queries": [
+    {
+      "id": "anti-graph-as-clusterer",
+      "query": "decide partition for rust impl",
+      "agent": "rust-impl-partition-graph",
+      "expect_matched_anti_pattern": true,
+      "notes": "anti-pattern query — should match anti_pattern field when exclude_anti_pattern_matches=false; should NOT return when exclude_anti_pattern_matches=true."
+    },
+    {
+      "id": "anti-guard-as-permission",
+      "query": "approve this public api change",
+      "agent": "rust-public-api-guard",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-trait-dyn-incompatible",
+      "query": "make struct mockable when methods take self by value",
+      "agent": "rust-trait-from-impl",
+      "expect_matched_anti_pattern": true
+    }
+  ]
+}
