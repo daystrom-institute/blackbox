@@ -1224,6 +1224,62 @@ mod tests {
     }
 
     #[test]
+    fn refactor_run_expands_split_rust_impl_methods_to_submodule() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("engine.rs");
+        fs::write(
+            &source,
+            "struct WorkflowRunner;\n\nimpl WorkflowRunner {\n    fn run_fanout(&self) {}\n}\n",
+        )
+        .unwrap();
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "targeted_tests".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("run_fanout".to_string())]),
+        );
+
+        let response = run(
+            &RefactorRunParams {
+                title: "split fanout methods".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "split_rust_impl_methods_to_submodule".into(),
+                        source: "engine.rs".into(),
+                        target: Some("engine/fanout.rs".into()),
+                        item_names: Some(vec!["run_fanout".into()]),
+                        impl_name: Some("impl WorkflowRunner".into()),
+                        toml_entries: Some(entries),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "planned");
+        let kinds = run_response
+            .steps
+            .iter()
+            .filter_map(|step| step.kind.as_deref())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"add_rust_mod_decl"));
+        assert!(kinds.contains(&"extract_rust_impl_methods"));
+        assert!(kinds.contains(&"rust_compile_fix_round"));
+        assert!(run_response.steps.iter().any(|step| {
+            step.title.as_deref() == Some("cargo check --message-format=json")
+        }));
+        assert!(run_response.steps.iter().any(|step| {
+            step.title.as_deref() == Some("cargo test run_fanout")
+        }));
+    }
+
+    #[test]
     fn refactor_run_rolls_back_when_later_plan_fails() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");

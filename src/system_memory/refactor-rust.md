@@ -69,7 +69,9 @@ Plan kinds, grouped by intent:
   item graph + external reference hints + suggested clusters),
   `rust_public_api_guard` (advisory for visibility changes touching public API).
 - Run-loop integration: `rust_compile_fix_round` (classify a `capture=rustc_json`
-  step's diagnostics into use-decl / visibility / replace proposals).
+  step's diagnostics into use-decl / visibility / replace proposals),
+  `split_rust_impl_methods_to_submodule` (a `bbox_refactor_run` plan-step macro
+  that expands to method extraction + wiring + cargo-check repair).
 - Generic primitives (language-agnostic, useful in compound runs):
   `replace_text`, `write_file`, `ensure_toml_table`.
 
@@ -88,6 +90,15 @@ Writable plan kinds:
   `super::...` references one module deeper (`super::super::...`). If the
   parent file still references a moved method after deletion and `visibility`
   was not supplied, the moved method is widened to `pub(super)`.
+- `split_rust_impl_methods_to_submodule`: use inside `bbox_refactor_run`, not
+  `bbox_refactor_plan`. Expands to `add_rust_mod_decl` (idempotent via optional
+  skip), `extract_rust_impl_methods`, optional `rust_organize_imports` on the
+  target, `cargo check --message-format=json` with rustc JSON capture,
+  `rust_compile_fix_round`, final `cargo check`, and optional targeted tests.
+  Inputs mirror `extract_rust_impl_methods`; `module_name` defaults to the
+  target file stem, `target_prelude` defaults to `use super::*;`, and
+  `item_kinds` defaults to `["impl_method"]`. `toml_entries` supports
+  `skip_organize_imports=true` and `targeted_tests=["test_name", ...]`.
 - `delete_rust_items`: delete named top-level Rust items or named impl methods
   in place. `item_names` is required; use `item_kinds` only to narrow matches.
   Use `item_kinds=["impl_method"]` plus `impl_name` when method names are

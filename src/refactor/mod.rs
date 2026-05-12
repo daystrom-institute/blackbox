@@ -1589,7 +1589,9 @@ pub fn run_with_ctx(
     let mut files_written = Vec::new();
     let mut capture_ctx = RunCaptureContext::default();
 
-    for (idx, step) in p.steps.iter().enumerate() {
+    let steps = expand_refactor_run_steps(&p.steps, &project_dir)?;
+
+    for (idx, step) in steps.iter().enumerate() {
         match step {
             RefactorRunStep::Plan { params, optional } => {
                 let mut step_params = params.clone();
@@ -2164,6 +2166,172 @@ pub fn run_with_ctx(
         rollback_errors: Vec::new(),
         obligations: capture_ctx.obligation_reports(),
     })?)
+}
+
+fn expand_refactor_run_steps(
+    steps: &[RefactorRunStep],
+    project_dir: &Path,
+) -> Result<Vec<RefactorRunStep>> {
+    let mut expanded = Vec::new();
+    for step in steps {
+        match step {
+            RefactorRunStep::Plan { params, optional }
+                if params.kind == "split_rust_impl_methods_to_submodule" =>
+            {
+                expanded.extend(expand_split_rust_impl_methods_step(params, *optional, project_dir)?);
+            }
+            _ => expanded.push(step.clone()),
+        }
+    }
+    Ok(expanded)
+}
+
+fn expand_split_rust_impl_methods_step(
+    params: &RefactorPlanParams,
+    optional: bool,
+    project_dir: &Path,
+) -> Result<Vec<RefactorRunStep>> {
+    let target = params
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("target is required for split_rust_impl_methods_to_submodule"))?;
+    let project_dir_arg = path_string(project_dir);
+    let target_path = resolve_path(Some(&project_dir_arg), target)?;
+    let module_name = params
+        .module_name
+        .clone()
+        .or_else(|| {
+            target_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "target {} has no file stem; cannot derive module_name",
+                target_path.display()
+            )
+        })?;
+    validate_rust_identifier(&module_name, "module_name")?;
+
+    let mut add_mod = RefactorPlanParams {
+        kind: "add_rust_mod_decl".to_string(),
+        source: params.source.clone(),
+        module_name: Some(module_name),
+        project_dir: Some(project_dir_arg.clone()),
+        ..Default::default()
+    };
+    if params.visibility.as_deref() == Some("pub") || params.visibility.as_deref() == Some("pub(crate)") {
+        add_mod.visibility = params.visibility.clone();
+    }
+
+    let mut extract = params.clone();
+    extract.kind = "extract_rust_impl_methods".to_string();
+    extract.project_dir = Some(project_dir_arg.clone());
+    if extract.item_kinds.as_ref().is_none_or(Vec::is_empty) {
+        extract.item_kinds = Some(vec!["impl_method".to_string()]);
+    }
+    if extract.target_prelude.as_ref().is_none_or(|text| text.trim().is_empty()) {
+        extract.target_prelude = Some("use super::*;".to_string());
+    }
+
+    let mut compile_fix_entries = BTreeMap::new();
+    compile_fix_entries.insert(
+        "diagnostics_ref".to_string(),
+        serde_json::Value::String("last".to_string()),
+    );
+
+    let skip_organize_imports = toml_bool(&params.toml_entries, "skip_organize_imports");
+    let targeted_tests = toml_str_array(&params.toml_entries, "targeted_tests");
+
+    let mut steps = vec![
+        RefactorRunStep::Plan {
+            params: add_mod,
+            optional: true,
+        },
+        RefactorRunStep::Plan {
+            params: extract,
+            optional,
+        },
+    ];
+    if !skip_organize_imports {
+        steps.push(RefactorRunStep::Plan {
+            params: RefactorPlanParams {
+                kind: "rust_organize_imports".to_string(),
+                source: target.to_string(),
+                project_dir: Some(project_dir_arg.clone()),
+                ..Default::default()
+            },
+            optional: true,
+        });
+    }
+    steps.extend([
+        RefactorRunStep::Command {
+            command: "cargo".to_string(),
+            args: vec!["check".to_string(), "--message-format=json".to_string()],
+            cwd: None,
+            touches: Vec::new(),
+            required: None,
+            capture: Some(CaptureSpec::RustcJson),
+            on_failure: Some(OnFailure::ContinueForRepair),
+        },
+        RefactorRunStep::Plan {
+            params: RefactorPlanParams {
+                kind: "rust_compile_fix_round".to_string(),
+                source: String::new(),
+                project_dir: Some(project_dir_arg),
+                toml_entries: Some(compile_fix_entries),
+                ..Default::default()
+            },
+            optional: true,
+        },
+        RefactorRunStep::Command {
+            command: "cargo".to_string(),
+            args: vec!["check".to_string()],
+            cwd: None,
+            touches: Vec::new(),
+            required: Some(true),
+            capture: None,
+            on_failure: None,
+        },
+    ]);
+    for test_name in targeted_tests {
+        steps.push(RefactorRunStep::Command {
+            command: "cargo".to_string(),
+            args: vec!["test".to_string(), test_name],
+            cwd: None,
+            touches: Vec::new(),
+            required: Some(true),
+            capture: None,
+            on_failure: None,
+        });
+    }
+    Ok(steps)
+}
+
+fn toml_bool(entries: &Option<BTreeMap<String, serde_json::Value>>, key: &str) -> bool {
+    entries
+        .as_ref()
+        .and_then(|entries| entries.get(key))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn toml_str_array(
+    entries: &Option<BTreeMap<String, serde_json::Value>>,
+    key: &str,
+) -> Vec<String> {
+    entries
+        .as_ref()
+        .and_then(|entries| entries.get(key))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn append_report(
