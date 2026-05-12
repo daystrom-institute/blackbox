@@ -29,6 +29,15 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         Default::default()
     };
 
+    // Gap 17: detect cross-class instance-method moves before sorting
+    // (we need the original byte_starts to map back to method_declaration
+    // nodes via find_node). When ANY selected method is instance-level
+    // (not static) AND the target file's stem differs from the source
+    // class name, emit a structured advisory in the plan response so
+    // the operator knows callers via the old receiver type will break.
+    let cross_class_advisory =
+        compute_cross_class_instance_move_advisory(&parsed, &selected, &source_path, &target_path);
+
     selected.sort_by_key(|m| std::cmp::Reverse(m.item.byte_start));
 
     let mut source_edits = Vec::new();
@@ -141,5 +150,103 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         fixme_count: None,
     };
 
+    // Gap 17: when a cross-class instance-method move was detected,
+    // attach the advisory to the response body. The standard plan
+    // shape doesn't have a slot for this, so we serialize the plan,
+    // re-parse as a Value, splice the field in, and re-serialize.
+    // Keeps RefactorPlan struct unchanged.
+    if let Some(advisory) = cross_class_advisory {
+        let mut value = serde_json::to_value(&plan)?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "cross_class_instance_move_advisory".to_string(),
+                serde_json::to_value(&advisory)?,
+            );
+        }
+        return Ok(serde_json::to_string_pretty(&value)?);
+    }
     Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+/// Gap 17: instance-method cross-class move advisory shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CrossClassInstanceMoveAdvisory {
+    code: String,
+    source_class: String,
+    target_class_simple_name: String,
+    instance_methods: Vec<String>,
+    message: String,
+}
+
+/// Gap 17: returns a populated advisory when ANY selected method is
+/// instance-level (no `static` modifier) AND the target file path's
+/// stem differs from the source class name. The advisory tells the
+/// operator that callers holding a reference of the source-class type
+/// will fail to compile after the move, and points them at
+/// `find_java_usages` to enumerate the breakage scope.
+fn compute_cross_class_instance_move_advisory(
+    parsed: &ParsedSource,
+    selected: &[JavaMethod],
+    source_path: &Path,
+    target_path: &Path,
+) -> Option<CrossClassInstanceMoveAdvisory> {
+    // Identify the enclosing class for each selected method, and
+    // collect the instance-level ones.
+    let source_class_name = find_first_class_declaration(parsed.tree.root_node())
+        .map(|n| java_class_name(n, &parsed.source))?;
+    let target_simple = target_path
+        .file_stem()
+        .and_then(|s| s.to_str())?
+        .to_string();
+    if source_class_name == target_simple {
+        // Same simple name on both sides (sibling-class style move
+        // within an inheritance pair, or just a target with the same
+        // file stem). Operator knows what they're doing.
+        return None;
+    }
+    let _ = source_path; // currently only used as anchor for the parse
+
+    let mut instance_methods: Vec<String> = Vec::new();
+    for method in selected {
+        let Some(name) = method.item.name.as_deref() else {
+            continue;
+        };
+        let node = find_node(parsed.tree.root_node(), |n: Node<'_>| {
+            n.kind() == "method_declaration"
+                && n.start_byte() == method.item.byte_start
+                && n.end_byte() == method.item.byte_end
+        });
+        let Some(node) = node else {
+            continue;
+        };
+        if !method_is_static(node) {
+            instance_methods.push(name.to_string());
+        }
+    }
+    if instance_methods.is_empty() {
+        return None;
+    }
+    Some(CrossClassInstanceMoveAdvisory {
+        code: "cross_class_instance_method_move".to_string(),
+        source_class: source_class_name.clone(),
+        target_class_simple_name: target_simple.clone(),
+        instance_methods: instance_methods.clone(),
+        message: format!(
+            "Instance method(s) {names} are being moved from `{source_class_name}` to a \
+             different class `{target_simple}`. Callers that hold a reference of type \
+             `{source_class_name}` and invoke the method via `<instance>.<method>(...)` \
+             will fail to compile after the move — `extract_java_methods` does NOT \
+             rewrite their receiver type. Either: (a) make the method `static` first \
+             and rely on the cross-file static caller rewrite (Gap 4), (b) leave a \
+             thin forwarder on `{source_class_name}` that delegates to \
+             `{target_simple}`, or (c) run `bbox_refactor_plan(kind=\"find_java_usages\", \
+             item_names=[<method>])` to enumerate cross-file callers and rewire them \
+             manually after apply.",
+            names = instance_methods
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    })
 }

@@ -6682,6 +6682,121 @@
         );
     }
 
+    // Gap 17: instance-method cross-class move surfaces an advisory.
+    // Pre-fix the operator got a green plan + apply followed by a
+    // silent javac break on every cross-file caller. v1 emits a
+    // structured advisory pointing at find_java_usages for breakage
+    // enumeration.
+    #[test]
+    fn extract_java_methods_emits_cross_class_advisory_for_instance_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("MeterAdmin.java");
+        let target = pkg.join("SamplePointAdmin.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class MeterAdmin {\n\
+            \x20   public String fetchName(long id) { return \"\"; }\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            &target,
+            "package com.example;\npublic class SamplePointAdmin {}\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_methods", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["fetchName".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let response_json = plan_extract_java_methods(&params).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+        let advisory = v
+            .get("cross_class_instance_move_advisory")
+            .expect("advisory must surface for cross-class instance-method move");
+        assert_eq!(advisory["code"], "cross_class_instance_method_move");
+        assert_eq!(advisory["source_class"], "MeterAdmin");
+        assert_eq!(advisory["target_class_simple_name"], "SamplePointAdmin");
+        let methods = advisory["instance_methods"].as_array().unwrap();
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0], "fetchName");
+        let message = advisory["message"].as_str().unwrap();
+        assert!(
+            message.contains("find_java_usages"),
+            "advisory must point at find_java_usages for enumeration: {message}"
+        );
+    }
+
+    // Gap 17: static method moves do NOT trigger the advisory — the
+    // cross-file static caller rewrite (Gap 4) covers those cases.
+    #[test]
+    fn extract_java_methods_no_advisory_for_static_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("MeterAdmin.java");
+        let target = pkg.join("SamplePointAdmin.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class MeterAdmin {\n\
+            \x20   public static String labelOf(long id) { return \"\"; }\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            &target,
+            "package com.example;\npublic class SamplePointAdmin {}\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_methods", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["labelOf".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let response_json = plan_extract_java_methods(&params).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+        assert!(
+            v.get("cross_class_instance_move_advisory").is_none(),
+            "no advisory expected for static method move: {response_json}"
+        );
+    }
+
+    // Gap 17: mixed instance + static — only the instance methods
+    // appear in the advisory.
+    #[test]
+    fn extract_java_methods_advisory_lists_only_instance_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Source.java");
+        let target = pkg.join("Target.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Source {\n\
+            \x20   public String iMethod() { return \"\"; }\n\
+            \x20   public static String sMethod() { return \"\"; }\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(&target, "package com.example;\npublic class Target {}\n").unwrap();
+        let mut params = java_plan_params("extract_java_methods", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["iMethod".to_string(), "sMethod".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let response_json = plan_extract_java_methods(&params).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+        let advisory = v
+            .get("cross_class_instance_move_advisory")
+            .expect("advisory required since iMethod is instance-level");
+        let methods = advisory["instance_methods"].as_array().unwrap();
+        let names: Vec<&str> = methods.iter().map(|m| m.as_str().unwrap()).collect();
+        assert!(names.contains(&"iMethod"));
+        assert!(!names.contains(&"sMethod"));
+    }
+
     // Gap 16: extract_java_methods to an EXISTING target now appends
     // each missing import from source's import block to the target's
     // import block. The structural method-append already worked; this
