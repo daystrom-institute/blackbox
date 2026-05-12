@@ -2217,6 +2217,75 @@
         );
     }
 
+    // G19 + G14: external_calls that resolve to a public-static method on
+    // the source class get auto-qualified at the call site to
+    // `<SourceClass>.<method>(...)` and DO NOT receive a FIXME. The
+    // source-class import is already added by the existing post-extract
+    // pass; the call site needs the class qualifier prepended to compile.
+    // Also asserts G8: ExternalCall entries carry source_visibility +
+    // source_is_static + recommended_resolution metadata.
+    #[test]
+    fn g19_extract_java_class_auto_qualifies_public_static_external() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_pkg = dir.path().join("src/main/java/a");
+        let b_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&a_pkg).unwrap();
+        fs::create_dir_all(&b_pkg).unwrap();
+        let source = a_pkg.join("Admin.java");
+        let target = b_pkg.join("Helpers.java");
+        // `baseQuery()` is public static. The cluster's `runQuery` calls
+        // it unqualified; after extract the call must become
+        // `Admin.baseQuery()` to resolve from package b.
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Admin {\n\
+            \x20   public static String baseQuery() { return \"q\"; }\n\
+            \x20   public String runQuery() { return baseQuery() + \"!\"; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["runQuery".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.deep_analysis = Some(true);
+
+        let plan_text = plan_extract_java_class(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+
+        // G19: target body qualifies the call. No FIXME for this call.
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("Admin.baseQuery()"),
+            "public-static external must be auto-qualified: {target_text}"
+        );
+        assert!(
+            !target_text.contains("FIXME: external call `baseQuery`"),
+            "public-static external must skip the FIXME marker: {target_text}"
+        );
+        assert!(
+            target_text.contains("import a.Admin;"),
+            "cross-package: source-class import still added: {target_text}"
+        );
+
+        // G8: external_calls entry carries the metadata.
+        let ext_calls = &plan.external_calls;
+        let base = ext_calls
+            .iter()
+            .find(|c| c.method == "baseQuery")
+            .expect("baseQuery must appear in external_calls");
+        assert_eq!(base.source_visibility.as_deref(), Some("public"));
+        assert!(base.source_is_static);
+        assert_eq!(
+            base.recommended_resolution.as_deref(),
+            Some("cross_class_static_call")
+        );
+    }
+
     // G18: method_reference qualifier on a source-class inner type
     // (`Inner::new`, `Inner::method`) gets rewritten to
     // `<SourceClass>.<Inner>::new` on the moved body. Without this,

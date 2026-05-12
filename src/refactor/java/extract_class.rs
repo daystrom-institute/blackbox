@@ -156,6 +156,10 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // if the target ends up in a different package than the source, the
     // floor escalates to `public`.
     let source_package = extract_java_package(&parsed.source);
+    // Source class name is needed early for G19 auto-qualify of
+    // public-static external calls (which fires before the existing
+    // inner-type-qualify pass).
+    let source_class_name = java_class_name(class_node, &parsed.source);
     // Gap 2: derive the target package via the unified resolver. Precedence is
     // target_prelude > existing target file's package > source-root-derived from
     // target_path > source's package (same-directory targets only) > hard error.
@@ -482,18 +486,46 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         // already threaded through the target as functional-interface
         // callbacks (call sites rewritten to `field.run()` / `.accept(...)`
         // etc.); they are NOT external calls that need a FIXME.
+        //
+        // G19 + G14: public-static externals get auto-qualified to
+        // `<SourceClass>.<method>(...)` and skip the FIXME entirely.
+        // The import to the source class is already added by the
+        // existing post-extract pass; the call site just needs the
+        // class qualifier prepended to compile.
         let callback_names: HashSet<&str> = callback_specs
             .iter()
             .map(|c| c.method_name.as_str())
             .collect();
+        let mut qualified_static_externals = false;
         for call in &class_dependency_report.external_calls {
             if callback_names.contains(call.method.as_str()) {
+                continue;
+            }
+            let is_public_static =
+                call.source_is_static && call.source_visibility.as_deref() == Some("public");
+            if is_public_static {
+                target_content = java_qualify_unqualified_calls(
+                    &target_content,
+                    &call.method,
+                    &source_class_name,
+                );
+                qualified_static_externals = true;
                 continue;
             }
             let fixme = fixme_external_call(&call.method);
             let (next, _count) =
                 java_insert_fixme_above_calls(&target_content, &call.method, &fixme);
             target_content = next;
+        }
+        // G19: cross-package qualifications of public-static externals
+        // need the source-class import on the target. Same import the
+        // inner-type-qualifier pass adds when it qualifies an inner type
+        // reference — share the path.
+        if qualified_static_externals && cross_package {
+            if let Some(src_pkg) = source_package.as_deref() {
+                let source_fqcn = format!("{src_pkg}.{source_class_name}");
+                target_content = java_inject_import(&target_content, &source_fqcn);
+            }
         }
 
         // Gap 23 (class branch): for inherited deps with source_kind=="class",
@@ -564,7 +596,6 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         }
         map
     };
-    let source_class_name = java_class_name(class_node, &parsed.source);
     let mut referenced_inner_types: BTreeSet<String> = BTreeSet::new();
     if !inner_type_decls.is_empty() {
         // Walk the assembled target text for type_identifier references

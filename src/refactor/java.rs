@@ -994,6 +994,71 @@ fn java_insert_fixme_above_calls(
     (out, inserted)
 }
 
+/// Rewrite unqualified call sites of `method` in `text` to be qualified
+/// by `class_name` (e.g. `myMethod(arg)` → `SourceClass.myMethod(arg)`).
+/// Uses the same unqualified-call detection heuristic as
+/// `java_insert_fixme_above_calls`: skip matches preceded by `.`, `:`,
+/// or an identifier char, and require `(` after the name (call form,
+/// not declaration). Used by G19 to auto-qualify public-static external
+/// calls instead of emitting FIXMEs.
+pub(crate) fn java_qualify_unqualified_calls(
+    text: &str,
+    method: &str,
+    class_name: &str,
+) -> String {
+    let bytes = text.as_bytes();
+    let needle = method.as_bytes();
+    let qualifier = format!("{class_name}.");
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut cursor = 0usize;
+    let mut copy_from = 0usize;
+    while cursor + needle.len() <= bytes.len() {
+        let Some(rel) = text[cursor..].find(method) else {
+            break;
+        };
+        let pos = cursor + rel;
+        let after = pos + needle.len();
+        let prev_ok = if pos == 0 {
+            true
+        } else {
+            let prev = bytes[pos - 1] as char;
+            !(prev == '.'
+                || prev == ':'
+                || prev == '_'
+                || prev == '$'
+                || prev.is_ascii_alphanumeric())
+        };
+        let mut tail = after;
+        while tail < bytes.len() && (bytes[tail] == b' ' || bytes[tail] == b'\t') {
+            tail += 1;
+        }
+        let next_ok = tail < bytes.len() && bytes[tail] == b'(';
+        // Skip the method's own declaration line — same heuristic as
+        // java_insert_fixme_above_calls.
+        let line_end = text[pos..]
+            .find('\n')
+            .map(|i| pos + i)
+            .unwrap_or(bytes.len());
+        let line_start = text[..pos]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let line = &text[line_start..line_end];
+        let looks_like_decl = line.trim_end().ends_with('{');
+        if !prev_ok || !next_ok || looks_like_decl {
+            cursor = pos + needle.len();
+            continue;
+        }
+        // Insert `<class_name>.` immediately before the method name.
+        out.push_str(&text[copy_from..pos]);
+        out.push_str(&qualifier);
+        copy_from = pos;
+        cursor = after;
+    }
+    out.push_str(&text[copy_from..]);
+    out
+}
+
 /// Build the standard FIXME comment block for an unresolved external call.
 fn fixme_external_call(method: &str) -> Vec<String> {
     vec![
@@ -1823,11 +1888,24 @@ fn java_method_signature_text(method_node: Node<'_>, source: &str) -> (String, b
 /// For every method on the source class, return a map from method name to
 /// (signature, partial). Constructors are intentionally excluded — they're
 /// resolved via `new`, not method invocation.
+<<<<<<< HEAD
 pub(crate) fn java_source_class_method_signatures(
+=======
+/// G8: per-source-method metadata for ExternalCall classification.
+#[derive(Debug, Clone)]
+pub(crate) struct JavaSourceMethodInfo {
+    pub signature: String,
+    pub signature_partial: bool,
+    pub visibility: String,
+    pub is_static: bool,
+}
+
+fn java_source_class_method_signatures(
+>>>>>>> d17e2dc (feat(java/extract_class): G19+G14 auto-qualify + G8 visibility hints)
     parsed: &ParsedSource,
     class_node: Node<'_>,
-) -> BTreeMap<String, (String, bool)> {
-    let mut out: BTreeMap<String, (String, bool)> = BTreeMap::new();
+) -> BTreeMap<String, JavaSourceMethodInfo> {
+    let mut out: BTreeMap<String, JavaSourceMethodInfo> = BTreeMap::new();
     let body = class_node
         .child_by_field_name("body")
         .unwrap_or(class_node);
@@ -1837,15 +1915,55 @@ pub(crate) fn java_source_class_method_signatures(
             if let Some(name_node) = child.child_by_field_name("name") {
                 if let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) {
                     let (sig, partial) = java_method_signature_text(child, &parsed.source);
+                    let visibility = java_method_visibility(child, &parsed.source);
+                    let is_static = java_method_has_modifier(child, &parsed.source, "static");
                     // First definition wins; overloads collapse to one entry
                     // since we can't distinguish them at the call site without
                     // full type resolution.
-                    out.entry(name.to_string()).or_insert((sig, partial));
+                    out.entry(name.to_string()).or_insert(JavaSourceMethodInfo {
+                        signature: sig,
+                        signature_partial: partial,
+                        visibility,
+                        is_static,
+                    });
                 }
             }
         }
     }
     out
+}
+
+/// Return a method declaration's visibility — "public", "protected",
+/// "private", or "package" for the default (no explicit modifier).
+fn java_method_visibility(method_node: Node<'_>, source: &str) -> String {
+    if java_method_has_modifier(method_node, source, "public") {
+        "public".into()
+    } else if java_method_has_modifier(method_node, source, "protected") {
+        "protected".into()
+    } else if java_method_has_modifier(method_node, source, "private") {
+        "private".into()
+    } else {
+        "package".into()
+    }
+}
+
+/// Whether a method declaration carries a specific modifier keyword.
+fn java_method_has_modifier(method_node: Node<'_>, source: &str, keyword: &str) -> bool {
+    let mut cursor = method_node.walk();
+    for child in method_node.children(&mut cursor) {
+        if child.kind() != "modifiers" {
+            continue;
+        }
+        let mut mc = child.walk();
+        for modifier in child.children(&mut mc) {
+            if let Ok(text) = modifier.utf8_text(source.as_bytes()) {
+                if text == keyword {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Walk `extends` / `implements` chains starting from a source class to
@@ -1960,14 +2078,29 @@ pub(crate) fn analyze_extracted_dependencies(
             in_method: hit.in_method.clone(),
             context: context.to_string(),
         };
-        if let Some((sig, partial)) = source_methods.get(&hit.name) {
+        if let Some(info) = source_methods.get(&hit.name) {
             // External: declared on source class body.
+            // G8: surface source method visibility + is_static, plus a
+            // recommended_resolution hint. Public-static externals get
+            // `cross_class_static_call` (auto-resolved at apply by G19).
+            // Private externals can only realistically be moved with
+            // the cluster, so recommend `add_to_item_names`.
+            let recommended = if info.is_static && info.visibility == "public" {
+                Some("cross_class_static_call".to_string())
+            } else if info.visibility == "private" {
+                Some("add_to_item_names".to_string())
+            } else {
+                None
+            };
             let entry = external
                 .entry(hit.name.clone())
                 .or_insert_with(|| ExternalCall {
                     method: hit.name.clone(),
-                    signature: sig.clone(),
-                    signature_partial: *partial,
+                    signature: info.signature.clone(),
+                    signature_partial: info.signature_partial,
+                    source_visibility: Some(info.visibility.clone()),
+                    source_is_static: info.is_static,
+                    recommended_resolution: recommended,
                     call_sites: Vec::new(),
                 });
             entry.call_sites.push(site);

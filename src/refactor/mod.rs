@@ -183,6 +183,26 @@ pub struct ExternalCall {
     /// declaring method node could not be fully recovered.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub signature_partial: bool,
+    /// G8: source method's declared visibility. One of "public",
+    /// "protected", "package", "private", or absent when modifiers
+    /// could not be recovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_visibility: Option<String>,
+    /// G8: source method is declared `static`. Public-static calls
+    /// are auto-qualified to `<SourceClass>.<method>(...)` at G19;
+    /// non-static externals need other resolution (callback, delegate,
+    /// inject source instance, drop).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source_is_static: bool,
+    /// G8: recommended resolution for the operator. One of:
+    /// `cross_class_static_call` (auto-resolved at apply by G19),
+    /// `add_to_item_names` (move the method with the cluster),
+    /// `add_to_callback_externals` (thread as functional-interface),
+    /// `inject_source_instance` (operator wires source as a dep on target),
+    /// `drop_the_call` (void return, side effect doesn't apply).
+    /// Absent when the planner cannot recommend one resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_resolution: Option<String>,
     pub call_sites: Vec<ExtractedCallSite>,
 }
 
