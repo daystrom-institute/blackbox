@@ -640,6 +640,43 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 ));
                 referenced_inner_types.insert(text.to_string());
             }
+            // G18: method_reference qualifier position. `Inner::new`,
+            // `Inner::method`, `Inner::staticMethod` move to the target
+            // unqualified and fail to resolve there because `Inner` is
+            // a member of the source class, not the target's package.
+            // tree-sitter-java parses `method_reference` with the
+            // qualifier as the first named child (identifier or
+            // type_identifier). Rewrite the qualifier to
+            // `<SourceClass>.<Inner>`.
+            let mut stack3 = vec![target_tree.root_node()];
+            while let Some(node) = stack3.pop() {
+                let mut c = node.walk();
+                for ch in node.named_children(&mut c) {
+                    stack3.push(ch);
+                }
+                if node.kind() != "method_reference" {
+                    continue;
+                }
+                let mut qc = node.walk();
+                let Some(qualifier) = node.named_children(&mut qc).next() else {
+                    continue;
+                };
+                if !matches!(qualifier.kind(), "identifier" | "type_identifier") {
+                    continue;
+                }
+                let Ok(text) = qualifier.utf8_text(target_content.as_bytes()) else {
+                    continue;
+                };
+                if !inner_type_decls.contains_key(text) {
+                    continue;
+                }
+                edits.push((
+                    qualifier.start_byte(),
+                    qualifier.end_byte(),
+                    format!("{source_class_name}.{text}"),
+                ));
+                referenced_inner_types.insert(text.to_string());
+            }
             edits.sort_by_key(|e| e.0);
             // Dedupe overlapping edits (e.g., a type_identifier inside a
             // method_invocation receiver matched twice).

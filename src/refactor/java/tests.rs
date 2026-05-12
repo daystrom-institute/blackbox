@@ -2217,6 +2217,55 @@
         );
     }
 
+    // G18: method_reference qualifier on a source-class inner type
+    // (`Inner::new`, `Inner::method`) gets rewritten to
+    // `<SourceClass>.<Inner>::new` on the moved body. Without this,
+    // the unqualified method reference doesn't resolve from the target
+    // package.
+    #[test]
+    fn g18_extract_java_class_qualifies_inner_type_method_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_pkg = dir.path().join("src/main/java/a");
+        let b_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&a_pkg).unwrap();
+        fs::create_dir_all(&b_pkg).unwrap();
+        let source = a_pkg.join("Runtime.java");
+        let target = b_pkg.join("Helpers.java");
+        // The moved method uses `Detail::new` as a method reference —
+        // Detail is an inner record on Runtime. After extraction the
+        // unqualified `Detail::new` doesn't resolve in package b.
+        fs::write(
+            &source,
+            "package a;\n\
+             import java.util.function.Supplier;\n\
+             public class Runtime {\n\
+            \x20   record Detail(int x) {}\n\
+            \x20   Supplier<Detail> factory() { return Detail::new; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["factory".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("Runtime.Detail::new"),
+            "inner-type method reference must be qualified: {target_text}"
+        );
+        // Cross-package: target imports the source class.
+        assert!(
+            target_text.contains("import a.Runtime;"),
+            "target must import source class for cross-package qualified ref: {target_text}"
+        );
+    }
+
     // Cross-package extracts rewrite bare-field access on source-class
     // inner-type DTOs to the matching public getter. Same-package extracts
     // leave bare access alone (still resolves).
