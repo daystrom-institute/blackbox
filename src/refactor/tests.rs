@@ -55,6 +55,63 @@ mod tests {
             .contains("alpha"));
     }
 
+    /// CN-D4 contract: project_refs records carry symbol_kind,
+    /// parent_kind, line_start, and line_end whenever the chunk
+    /// supplies them. The fields are optional in JSON
+    /// (`skip_serializing_if`) so pre-CN-D4 callers continue to parse
+    /// the new shape — but new callers can drive synthesis decisions
+    /// without a follow-up bbox_refactor_status call.
+    #[test]
+    fn project_refs_records_carry_symbol_and_parent_kinds_with_line_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("lib.rs"),
+            "pub struct S;\n\nimpl S {\n    pub fn run(&self) -> i32 { 1 }\n}\n",
+        )
+        .unwrap();
+
+        let text = project_refs(&RefactorProjectRefsParams {
+            file: "src/lib.rs".into(),
+            project_dir: Some(dir.path().to_string_lossy().to_string()),
+            query: None,
+            limit: Some(20),
+            include_excerpt: Some(false),
+        })
+        .unwrap();
+        let parsed: RefactorProjectRefs = serde_json::from_str(&text).unwrap();
+        assert!(parsed.status == "ok");
+
+        // The Rust source above produces an `impl_item` chunk and a
+        // `function_item` chunk inside it. The function_item record
+        // must carry parent_kind = impl_item.
+        let method_ref = parsed
+            .chunks
+            .iter()
+            .find(|c| c.symbol_kind.as_deref() == Some("function_item"))
+            .expect("function_item chunk present for impl method");
+        assert_eq!(method_ref.parent_kind.as_deref(), Some("impl_item"));
+        // Qualified name is `<impl header>::run`; bare name asserted via
+        // the symbol field containing "run".
+        assert!(
+            method_ref.symbol.as_deref().map(|s| s.contains("run")).unwrap_or(false),
+            "expected method symbol to contain 'run', got {:?}",
+            method_ref.symbol
+        );
+        assert!(method_ref.line_start.is_some());
+        assert!(method_ref.line_end.is_some());
+
+        // Top-level struct: symbol_kind=struct_item, parent_kind=None.
+        let struct_ref = parsed
+            .chunks
+            .iter()
+            .find(|c| c.symbol_kind.as_deref() == Some("struct_item"))
+            .expect("struct_item chunk present");
+        assert_eq!(struct_ref.parent_kind, None);
+        assert_eq!(struct_ref.line_start, Some(1));
+    }
+
     #[test]
     fn status_lists_top_level_rust_items_with_attrs() {
         let dir = tempfile::tempdir().unwrap();

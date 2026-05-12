@@ -738,6 +738,29 @@ pub struct ProjectFileChunkRef {
     pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// Raw tree-sitter node kind for the chunk's symbol-producing
+    /// node (CN-D1 / CN-D4). For Rust impl methods this is
+    /// `"function_item"`; the synthetic refactor vocabulary
+    /// (`"impl_method"`) is produced by `refactor::status` on a
+    /// separate surface. `None` for non-code chunks and chunks
+    /// without a tree-sitter kind. Field is optional in JSON for
+    /// backward compatibility — callers parsing the pre-CN-D4 shape
+    /// continue to work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_kind: Option<String>,
+    /// Kind of the nearest enclosing symbol-producing ancestor
+    /// (CN-D1 / CN-D4). Useful for callers that want to disambiguate
+    /// e.g. top-level functions from impl methods without consulting
+    /// `bbox_refactor_status`. `None` at file top level or for non-code
+    /// chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_kind: Option<String>,
+    /// 1-based start line in the source file (CN-D2 / CN-D4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u32>,
+    /// 1-based end line in the source file (CN-D2 / CN-D4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u32>,
     pub byte_start: u64,
     pub byte_end: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -921,6 +944,10 @@ pub fn project_refs(p: &RefactorProjectRefsParams) -> Result<String> {
                 chunk_kind: chunk.chunk_kind,
                 language: chunk.language,
                 symbol: chunk.symbol,
+                symbol_kind: chunk.symbol_kind,
+                parent_kind: chunk.parent_kind,
+                line_start: chunk.line_start,
+                line_end: chunk.line_end,
                 byte_start: chunk.byte_start,
                 byte_end: chunk.byte_end,
                 excerpt: include_excerpt.then(|| excerpt(&chunk.content, 320)),
