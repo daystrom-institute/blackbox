@@ -407,6 +407,47 @@ fn collect_java_type_references(node: Node<'_>, source: &str, out: &mut HashSet<
             }
         }
     }
+    // G16: annotation references. `@Nullable`, `@Transactional`, custom
+    // domain annotations referenced in moved bodies and method signatures
+    // need their imports preserved on the extracted target. tree-sitter-
+    // java parses:
+    //   - `marker_annotation` for `@Foo` (no args)
+    //   - `annotation` for `@Foo(args)` and `@Foo(key = "value")`
+    //   - `annotated_type` for `@Nullable String foo` — the annotation
+    //     itself parses as one of the above as a child.
+    // The annotation's name is the first named child (`identifier`,
+    // `scoped_identifier`, or `type_identifier`). For scoped names like
+    // `@some.pkg.Annot` the simple name is the last segment — we add the
+    // simple name to the type-reference set so the organize-imports pass
+    // can route through the project type index just like type_identifier
+    // references. JDK built-ins (`@Override`, `@Deprecated`,
+    // `@SuppressWarnings`) are already in java_builtin_type and get
+    // filtered out.
+    if matches!(node.kind(), "marker_annotation" | "annotation") {
+        let mut cursor = node.walk();
+        if let Some(name_node) = node.named_children(&mut cursor).next() {
+            let name_text = match name_node.kind() {
+                "identifier" | "type_identifier" => name_node.utf8_text(source.as_bytes()).ok(),
+                "scoped_identifier" => {
+                    // scoped_identifier wraps `pkg.Name` — the simple name
+                    // is its last named child.
+                    let mut sc = name_node.walk();
+                    name_node
+                        .named_children(&mut sc)
+                        .last()
+                        .and_then(|c| c.utf8_text(source.as_bytes()).ok())
+                }
+                _ => None,
+            };
+            if let Some(text) = name_text {
+                if text.chars().next().is_some_and(|c| c.is_uppercase())
+                    && !java_builtin_type(text)
+                {
+                    out.insert(text.to_string());
+                }
+            }
+        }
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_java_type_references(child, source, out);

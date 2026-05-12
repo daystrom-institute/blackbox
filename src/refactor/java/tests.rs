@@ -1252,6 +1252,54 @@
         // explicit import.
     }
 
+    // G16: organize-imports walks `annotation` and `marker_annotation`
+    // nodes. `@Nullable` referenced in a method signature must keep its
+    // import — without the walker hitting annotation nodes the import
+    // gets pruned and the moved body fails to compile.
+    #[test]
+    fn g16_organize_imports_preserves_annotation_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let ann_dir = dir.path().join("src/main/java/com/x/ann");
+        let ui_dir = dir.path().join("src/main/java/com/x/ui");
+        fs::create_dir_all(&ann_dir).unwrap();
+        fs::create_dir_all(&ui_dir).unwrap();
+        fs::write(
+            ann_dir.join("MyNullable.java"),
+            "package com.x.ann;\npublic @interface MyNullable {}\n",
+        )
+        .unwrap();
+        let source = ui_dir.join("Svc.java");
+        // The annotation appears as a parameter and a method-level
+        // marker_annotation. Without the G16 walker, the heuristic
+        // would treat the import as unused and prune it.
+        fs::write(
+            &source,
+            "package com.x.ui;\n\
+             import com.x.ann.MyNullable;\n\
+             public class Svc {\n\
+            \x20   @MyNullable\n\
+            \x20   public String greet(@MyNullable String who) { return who; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("java_lsp_organize_imports", &source);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan_text =
+            plan_java_lsp_organize_imports(&params, &PlanContext::default()).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+        if let Some(edit) = plan.edits.first().and_then(|fe| fe.edits.first()) {
+            assert!(
+                edit.replacement.contains("import com.x.ann.MyNullable;"),
+                "annotation reference must keep its import — G16 walker missing: {}",
+                edit.replacement
+            );
+        }
+        // No-edit case is also acceptable: it means the heuristic saw the
+        // import as used and didn't rewrite. Either outcome means the
+        // import survived.
+    }
+
     // Gap 28: two unrelated wildcards plus a standalone explicit from a
     // third (uncovered) package — all three preserved.
     #[test]
