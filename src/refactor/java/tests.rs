@@ -2217,6 +2217,56 @@
         );
     }
 
+    // G17: bare-component access on a source-class record (`param.field`
+    // where `field` is a record component) gets rewritten to the
+    // accessor call (`param.field()`). Triggers even on same-package
+    // extracts because records' backing fields are private — bare
+    // access fails compile across any class boundary.
+    #[test]
+    fn g17_extract_java_class_rewrites_record_component_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Holder.java");
+        let target = pkg.join("Helpers.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Holder {\n\
+            \x20   public record Detail(String label, int qty) {}\n\
+            \x20   public String describe(Detail d) {\n\
+            \x20       return d.label + \":\" + d.qty;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["describe".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        // d.label → d.label() ; d.qty → d.qty()
+        assert!(
+            target_text.contains("d.label()"),
+            "record component must rewrite to accessor: {target_text}"
+        );
+        assert!(
+            target_text.contains("d.qty()"),
+            "record component must rewrite to accessor: {target_text}"
+        );
+        // Bare access must be gone.
+        assert!(
+            !target_text.contains("d.label +") && !target_text.contains("d.qty;"),
+            "bare record component access must be rewritten: {target_text}"
+        );
+    }
+
     // G19 + G14: external_calls that resolve to a public-static method on
     // the source class get auto-qualified at the call site to
     // `<SourceClass>.<method>(...)` and DO NOT receive a FIXME. The

@@ -730,11 +730,53 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // fails to compile from a different package. The inner type often
     // already declares a public getter (`getDirection()`); rewrite the
     // bare access to the getter call so cross-package extracts compile
-    // without manual fixup. Same-package extracts retain bare access.
-    if cross_package && !inner_type_decls.is_empty() {
+    // without manual fixup.
+    //
+    // G17: Java records use `componentName()` accessor naming (no `get`
+    // prefix), and the auto-generated backing fields are private. Cross-
+    // CLASS bare access fails regardless of package — same-package
+    // extracts hit the same compile error a cross-package extract would
+    // for a POJO. So record components get rewritten unconditionally
+    // when the inner type is a record_declaration; POJO rewriting stays
+    // gated on cross_package.
+    let any_inner_records = inner_type_decls
+        .values()
+        .any(|node| node.kind() == "record_declaration");
+    if (cross_package || any_inner_records) && !inner_type_decls.is_empty() {
         let mut field_to_getter_by_type: BTreeMap<String, BTreeMap<String, String>> =
             BTreeMap::new();
         for (type_name, type_node) in &inner_type_decls {
+            // G17: record components. tree-sitter-java exposes the
+            // record header parameters via the `parameters` field on
+            // record_declaration. Each formal_parameter has a `name`
+            // child; the accessor is the bare component name (no prefix).
+            if type_node.kind() == "record_declaration" {
+                if let Some(params) = type_node.child_by_field_name("parameters") {
+                    let mut pc = params.walk();
+                    let mut getter_map: BTreeMap<String, String> = BTreeMap::new();
+                    for p in params.named_children(&mut pc) {
+                        if p.kind() != "formal_parameter" {
+                            continue;
+                        }
+                        if let Some(name_node) = p.child_by_field_name("name") {
+                            if let Ok(name) =
+                                name_node.utf8_text(parsed.source.as_bytes())
+                            {
+                                getter_map.insert(name.to_string(), name.to_string());
+                            }
+                        }
+                    }
+                    if !getter_map.is_empty() {
+                        field_to_getter_by_type.insert(type_name.clone(), getter_map);
+                    }
+                }
+                continue;
+            }
+            // POJO path is cross-package-only. Same-package extracts
+            // retain bare access for non-record inner types.
+            if !cross_package {
+                continue;
+            }
             let Some(type_body) = type_node.child_by_field_name("body") else { continue };
             let mut fields: Vec<(String, String)> = Vec::new();
             let mut getters: BTreeSet<String> = BTreeSet::new();
