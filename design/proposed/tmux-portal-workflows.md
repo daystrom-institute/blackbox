@@ -342,6 +342,40 @@ registry remain authoritative.
    - focus on mechanical failure / parse failure / wait timeout
    - cleanup on arc exit.
 
+### 10.1 `tmux-mcp-rs` link-window patch points
+
+Local inspection of `bnomei/tmux-mcp` (`tmux-mcp-rs 0.2.1`) showed that
+`link-window` is a small addition, mechanically parallel to
+`move-window`. A local clone at `/home/invidious/repos/tmux-mcp` now carries
+that patch and Codex is configured to use its release binary.
+
+Patch points:
+
+| File | Change |
+|---|---|
+| `src/server.rs` | Add `LinkWindowInput` next to `MoveWindowInput`; add `#[tool(name = "link-window", ...)] async fn link_window(...)`; enforce source window session and target session policy like `move_window`. |
+| `src/tmux.rs` | Add `link_window(window_id, target_session_id, target_index, socket)` that executes `tmux link-window -s <window> -t <target[:idx]>`. |
+| `src/security.rs` | Add `"link-window"` to the existing `allow_move` bucket next to `move-window`. |
+| `src/test_support.rs` | Add `link-window` to the stub command matchers. |
+| `src/server.rs` tests | Mirror existing `move_window_denied_and_error`, allowed-session rejection, and happy-path tests. |
+| `README.md` / skills | Document link vs move: link for portal projection, move for ownership transfer. |
+
+Baseline upstream test suite passed locally before changes:
+
+```text
+cargo test: 297 passed (6 suites, 3.38s)
+```
+
+Semantics to verify manually after implementation:
+
+1. Link an actor window into `admin`; confirm the source session remains
+   alive and still lists the same window.
+2. Close/unlink only the portal projection; confirm the actor window keeps
+   running in the source session.
+3. If tmux reports linked windows with the same `@id` in both sessions,
+   store `(session_id, window_id)` pairs in `PortalHandle` rather than
+   assuming `window_id` alone describes ownership.
+
 ## 11. Open questions
 
 1. Should every durable actor default to `record_only` tmux mode?
@@ -355,4 +389,3 @@ registry remain authoritative.
    summaries?
 6. Should provider processors live in blackbox, in a sidecar, or as
    tmux-portal packet rules?
-
