@@ -85,16 +85,22 @@ pub fn symbol_kind_from_refactor(
 /// Build the tantivy boolean clauses that match a single
 /// `item_kinds` token on the indexed lane. The token may be either a
 /// raw tree-sitter node kind (matches `symbol_kind` directly) OR a
-/// refactor synthetic kind that decomposes into a (symbol_kind,
-/// parent_kind) constraint.
+/// refactor synthetic kind that decomposes into a (language,
+/// symbol_kind, parent_kind) constraint.
 ///
 /// Returns a vector of clauses — one entry for the raw-kind probe
 /// plus, when the token has a documented synthesis, an additional
-/// `BooleanQuery(Must symbol_kind=X AND Must parent_kind=Y)`. Caller
-/// ORs them together inside a containing `BooleanQuery`.
+/// `BooleanQuery(Must language=L AND Must symbol_kind=X AND Must
+/// parent_kind=Y)`. Caller ORs them together inside a containing
+/// `BooleanQuery`.
 ///
 /// Synthesis cases live here AND in `refactor_kind_for` — the two
-/// must stay in sync. New synthesis needs an entry in BOTH.
+/// must stay in sync. New synthesis needs an entry in BOTH. The
+/// language guard inside the synthesis BooleanQuery mirrors the
+/// `(language, symbol_kind, parent_kind)` match in
+/// `refactor_kind_for` so a non-Rust grammar that happens to emit a
+/// `function_item` under an `impl_item` does not get reported as
+/// `impl_method`.
 fn indexed_kind_filter_for(
     fields: crate::index::FieldHandles,
     kind: &str,
@@ -108,9 +114,17 @@ fn indexed_kind_filter_for(
         IndexRecordOption::Basic,
     ));
 
-    // Synthesis decompositions. Mirror of refactor_kind_for cases.
+    // Synthesis decompositions. Mirror of refactor_kind_for cases —
+    // grep "refactor_kind_for" before adding a new case here.
     let synth: Option<Box<dyn Query>> = match kind {
         "impl_method" => Some(Box::new(BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(fields.language, "rust"),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ),
             (
                 Occur::Must,
                 Box::new(TermQuery::new(
@@ -398,10 +412,16 @@ pub struct CodeSymbolSearchResponse {
     pub truncated: bool,
     /// Why the response is truncated, when it is. Stable strings:
     /// - `"limit_reached"`: more items matched than `limit` allowed
-    ///   to be returned; bump `limit` or narrow the filters.
-    /// - `"file_limit_reached"`: live lane hit
-    ///   `MAX_CODE_NAV_SCANNED_FILES`; narrow `path_contains` /
-    ///   `languages` / `project_dir`.
+    ///   to be returned; `matching_items` is exact. Bump `limit` or
+    ///   narrow the filters.
+    /// - `"file_limit_reached"`: **live lane only** — the walker hit
+    ///   `MAX_CODE_NAV_SCANNED_FILES` before finishing. Narrow
+    ///   `path_contains` / `languages` / `project_dir`.
+    /// - `"scan_cap_reached"`: **indexed lane only** — the tantivy
+    ///   match count exceeded the post-filter scan cap (5000) AND
+    ///   the result must be post-filtered (`query` or
+    ///   `path_contains` is set). `matching_items` is a lower
+    ///   bound, not exact. Narrow the search.
     /// Omitted from JSON when `truncated=false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation_reason: Option<String>,
@@ -1301,16 +1321,38 @@ pub fn code_symbols_indexed(
             .as_deref()
             .is_some_and(|q| !q.is_empty());
     const INDEXED_SCAN_CAP: usize = 5000;
+
+    // Three honest paths:
+    //
+    // 1. has_post_filter=false: every tantivy hit is a valid match.
+    //    Count() gives us the exact total; fetch limit + small
+    //    headroom; `truncated = total > items.len()` =>
+    //    `limit_reached`. `scan_cap_reached` is NEVER reported on
+    //    this path because the fetch ceiling is bound by `limit`,
+    //    not by what tantivy could return.
+    //
+    // 2. has_post_filter=true and tantivy match count <=
+    //    INDEXED_SCAN_CAP: fetch all of them. Post-filter walks the
+    //    full set; the post-filtered count is exact. Truncation is
+    //    `limit_reached` if post-filtered > items.len().
+    //
+    // 3. has_post_filter=true and tantivy matches > INDEXED_SCAN_CAP:
+    //    fetch the cap, walk what we got, and set
+    //    `truncation_reason = "scan_cap_reached"` so the caller
+    //    knows there may be more matches past the cap and that
+    //    `matching_items` is a lower bound.
+    use tantivy::collector::Count;
+    let total_hits = searcher.search(&*query, &Count)?;
     let fetch_cap = if has_post_filter {
-        INDEXED_SCAN_CAP
+        total_hits.min(INDEXED_SCAN_CAP)
     } else {
-        // Fast path: no post-filter → fetch just enough to honour
-        // limit + a small headroom so `matching_items` is still
-        // honest if filters elsewhere drop a few.
-        limit.saturating_mul(2).max(64).min(INDEXED_SCAN_CAP)
+        // No post-filter: just enough to fill `limit` + headroom so
+        // we have a coverage signal if anything (shouldn't) gets
+        // dropped during stored-field load.
+        limit.saturating_mul(2).max(64).min(total_hits)
     };
     let hits = searcher.search(&*query, &TopDocs::with_limit(fetch_cap))?;
-    let scan_cap_hit = hits.len() >= fetch_cap;
+    let scan_cap_hit = has_post_filter && total_hits > INDEXED_SCAN_CAP;
 
     let mut items: Vec<CodeSymbolSearchItem> = Vec::new();
     let mut matched_file_paths = std::collections::HashSet::new();
@@ -1402,15 +1444,9 @@ pub fn code_symbols_indexed(
 
     let truncated = matching_items > items.len() || scan_cap_hit;
     // scan_cap_hit dominates limit_reached because the caller needs
-    // to know the count itself is a lower bound (more matches may
-    // exist past the scan cap) before they trust the
-    // `matching_items` number.
-    let truncation_reason = if scan_cap_hit && matching_items > items.len() {
-        Some("scan_cap_reached".to_string())
-    } else if scan_cap_hit {
-        // Edge case: the scan filled the cap exactly with items we
-        // returned. Still flag it so the caller can decide whether
-        // to widen the scan.
+    // to know the count itself is a lower bound — more matches may
+    // exist past the cap that we never even inspected.
+    let truncation_reason = if scan_cap_hit {
         Some("scan_cap_reached".to_string())
     } else if matching_items > items.len() {
         Some("limit_reached".to_string())

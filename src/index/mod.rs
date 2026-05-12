@@ -238,6 +238,16 @@ impl TranscriptIndex {
         self.reader.searcher()
     }
 
+    /// Force the shared reader to pick up newly committed segments.
+    /// Production paths rely on `ReloadPolicy::OnCommit` so reload
+    /// happens automatically; tests that commit + immediately query
+    /// in the same thread can hit a race where the reader hasn't
+    /// observed the commit yet. Call this in tests after `commit()`.
+    #[cfg(test)]
+    pub(crate) fn reader_reload_for_test(&self) {
+        let _ = self.reader.reload();
+    }
+
     /// Get the field handles for the background thread.
     pub fn field_handles(&self) -> FieldHandles {
         self.fields
@@ -943,7 +953,7 @@ mod code_tokenizer;
 mod git_history;
 mod helpers;
 mod knowledge_docs;
-mod project_files;
+pub(crate) mod project_files;
 mod reindex;
 mod roadmap_docs;
 mod search;
