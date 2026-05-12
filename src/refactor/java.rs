@@ -500,6 +500,204 @@ fn build_java_type_index(project_dir: &Path) -> Result<JavaTypeIndex> {
     Ok(idx)
 }
 
+/// Gap 4: a moved item whose cross-file `OldOwner.<item>` references need
+/// rewriting after `extract_java_class` runs. Only static members qualify
+/// for the cross-file pass — instance methods still resolve through the
+/// source-side delegate field, which is private and unreachable from
+/// other files (a future iteration could surface a forwarding-method
+/// advisory for instance calls).
+struct MovedStaticItem {
+    name: String,
+    /// `"method"` for static method calls, `"field"` for static-final
+    /// constant accesses. Drives which AST node shapes we match.
+    kind: &'static str,
+}
+
+/// Gap 4: compute caller-rewrite FileEdits for every `.java` file in the
+/// project that references `<old_class>.<moved_item>` as a static call or
+/// field access. The source file and the target file are excluded — both
+/// already have edits computed via the in-file rewriter and the target
+/// renderer respectively. Files under `target/`, `build/`, `.gradle/`,
+/// `node_modules/`, and `.git/` are skipped (build outputs, vendored
+/// trees).
+fn compute_cross_file_static_caller_edits(
+    project_dir: &Path,
+    source_path: &Path,
+    target_path: &Path,
+    old_class: &str,
+    new_class: &str,
+    target_package: Option<&str>,
+    moved_items: &[MovedStaticItem],
+) -> Vec<FileEdit> {
+    if moved_items.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let canonical_source = fs::canonicalize(source_path).ok();
+    let canonical_target = fs::canonicalize(target_path).ok();
+    let method_names: HashSet<&str> = moved_items
+        .iter()
+        .filter(|m| m.kind == "method")
+        .map(|m| m.name.as_str())
+        .collect();
+    let field_names: HashSet<&str> = moved_items
+        .iter()
+        .filter(|m| m.kind == "field")
+        .map(|m| m.name.as_str())
+        .collect();
+    for entry in walkdir::WalkDir::new(project_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("java") {
+            continue;
+        }
+        if path.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some("target" | "build" | ".gradle" | "node_modules" | ".git")
+            )
+        }) {
+            continue;
+        }
+        let canonical_path = fs::canonicalize(path).ok();
+        if canonical_path.is_some()
+            && (canonical_path == canonical_source || canonical_path == canonical_target)
+        {
+            continue;
+        }
+        let Ok(parsed) = parse_source_file(path) else {
+            continue;
+        };
+        if parsed.language != "java" {
+            continue;
+        }
+        let qualifier_edits = compute_static_qualifier_rewrite_edits(
+            &parsed,
+            old_class,
+            new_class,
+            &method_names,
+            &field_names,
+        );
+        if qualifier_edits.is_empty() {
+            continue;
+        }
+        let mut all_edits = qualifier_edits;
+        if let Some(target_pkg) = target_package {
+            let fqcn = if target_pkg.is_empty() {
+                new_class.to_string()
+            } else {
+                format!("{target_pkg}.{new_class}")
+            };
+            if let Some(import_edit) = java_source_import_edit(&parsed.source, &fqcn) {
+                all_edits.push(import_edit);
+            }
+        }
+        all_edits.sort_by_key(|e| e.byte_start);
+        out.push(FileEdit {
+            path: path_string(path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: all_edits,
+            new_text: None,
+        });
+    }
+    out
+}
+
+/// Scan one parsed Java file for `<old_class>.<name>` references where
+/// `<name>` is a moved method or field. Emits a TextEdit per match that
+/// rewrites the `<old_class>` identifier in the qualifier slot to
+/// `<new_class>`. The dotted name and arg list / suffix stay intact.
+fn compute_static_qualifier_rewrite_edits(
+    parsed: &ParsedSource,
+    old_class: &str,
+    new_class: &str,
+    method_names: &HashSet<&str>,
+    field_names: &HashSet<&str>,
+) -> Vec<TextEdit> {
+    let mut edits = Vec::new();
+    let source_bytes = parsed.source.as_bytes();
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "method_invocation" => {
+                if let (Some(object), Some(name)) = (
+                    node.child_by_field_name("object"),
+                    node.child_by_field_name("name"),
+                ) {
+                    if object.kind() == "identifier"
+                        && object.utf8_text(source_bytes).ok() == Some(old_class)
+                    {
+                        if let Ok(name_text) = name.utf8_text(source_bytes) {
+                            if method_names.contains(name_text) {
+                                edits.push(TextEdit {
+                                    byte_start: object.start_byte(),
+                                    byte_end: object.end_byte(),
+                                    replacement: new_class.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "field_access" => {
+                // `OldClass.PROTREND` parses as field_access; the qualifier
+                // is the `object` child (an identifier) and the constant
+                // name is the `field` child (an identifier).
+                if let (Some(object), Some(field)) = (
+                    node.child_by_field_name("object"),
+                    node.child_by_field_name("field"),
+                ) {
+                    if object.kind() == "identifier"
+                        && object.utf8_text(source_bytes).ok() == Some(old_class)
+                    {
+                        if let Ok(field_text) = field.utf8_text(source_bytes) {
+                            if field_names.contains(field_text) {
+                                edits.push(TextEdit {
+                                    byte_start: object.start_byte(),
+                                    byte_end: object.end_byte(),
+                                    replacement: new_class.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "method_reference" => {
+                // `OldClass::method` — qualifier is the first named child.
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.named_children(&mut cursor).collect();
+                if children.len() == 2 {
+                    let qualifier = children[0];
+                    let name_node = children[1];
+                    if qualifier.kind() == "identifier"
+                        && qualifier.utf8_text(source_bytes).ok() == Some(old_class)
+                        && name_node.kind() == "identifier"
+                    {
+                        if let Ok(name_text) = name_node.utf8_text(source_bytes) {
+                            if method_names.contains(name_text) {
+                                edits.push(TextEdit {
+                                    byte_start: qualifier.start_byte(),
+                                    byte_end: qualifier.end_byte(),
+                                    replacement: new_class.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    edits.sort_by_key(|e| e.byte_start);
+    edits
+}
+
 /// Walk a Java parse tree adding nested class/interface/record/enum
 /// names to `out`. `inside_type_body` indicates whether the current
 /// node is contained in a type body (i.e. would yield an inner
@@ -3796,6 +3994,104 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             Vec::new()
         };
 
+    // Gap 4: cross-file caller rewrites for moved static members. Every
+    // `OldClass.<static>` reference in other project files gets its
+    // qualifier rewritten to `NewClass`. Only static methods + moved
+    // constants qualify here — instance methods on the source class still
+    // resolve through the source-side private delegate field, which is
+    // unreachable from other files (a future iteration could surface a
+    // forwarding-method advisory for cross-file instance callers).
+    let mut moved_static_items: Vec<MovedStaticItem> = Vec::new();
+    for method in &selected_methods {
+        let Some(method_name) = method.item.name.as_deref() else {
+            continue;
+        };
+        let method_node = find_node(parsed.tree.root_node(), |node| {
+            (node.kind() == "method_declaration" || node.kind() == "constructor_declaration")
+                && node.start_byte() == method.item.byte_start
+                && node.end_byte() == method.item.byte_end
+        });
+        if let Some(node) = method_node {
+            if method_is_static(node) {
+                moved_static_items.push(MovedStaticItem {
+                    name: method_name.to_string(),
+                    kind: "method",
+                });
+            }
+        }
+    }
+    // moved_constant_fields covers static-final captures of extracted
+    // methods (the Gap-20 path). selected_fields covers explicit
+    // `move_fields` entries — when an operator moves a constant via
+    // move_fields without it being captured, it lands here. Both
+    // populate the cross-file rewrite list.
+    for field in &moved_constant_fields {
+        moved_static_items.push(MovedStaticItem {
+            name: field.name.clone(),
+            kind: "field",
+        });
+    }
+    for field in &selected_fields {
+        // Already covered by moved_constant_fields?
+        if moved_constant_fields.iter().any(|f| f.name == field.name) {
+            continue;
+        }
+        let field_node = find_node(parsed.tree.root_node(), |node| {
+            node.kind() == "field_declaration"
+                && node.start_byte() == field.item.byte_start
+                && node.end_byte() == field.item.byte_end
+        });
+        if let Some(node) = field_node {
+            if has_java_modifier(node, "static") && has_java_modifier(node, "final") {
+                moved_static_items.push(MovedStaticItem {
+                    name: field.name.clone(),
+                    kind: "field",
+                });
+            }
+        }
+    }
+    let cross_file_edits = if let Some(project_dir) = p.project_dir.as_deref() {
+        compute_cross_file_static_caller_edits(
+            Path::new(project_dir),
+            &source_path,
+            &target_path,
+            &source_class_name,
+            &target_class_name,
+            target_package.as_deref(),
+            &moved_static_items,
+        )
+    } else {
+        Vec::new()
+    };
+
+    let mut all_edits = vec![
+        FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: source_edits,
+            new_text: None,
+        },
+        FileEdit {
+            path: path_string(&target_path),
+            original_sha256: sha256_hex(&original_target_bytes),
+            edits: vec![TextEdit {
+                byte_start: 0,
+                byte_end: original_target_bytes.len(),
+                replacement: target_content,
+            }],
+            new_text: None,
+        },
+    ];
+    let mut all_validations: Vec<ValidationStep> = parse_validation_step_for_path(&source_path)
+        .into_iter()
+        .chain(parse_validation_step_for_path(&target_path))
+        .collect();
+    for fe in &cross_file_edits {
+        let caller_path = PathBuf::from(&fe.path);
+        all_validations.extend(parse_validation_step_for_path(&caller_path));
+    }
+    all_edits.extend(cross_file_edits);
+
     let plan = RefactorPlan {
         title: format!(
             "Extract Java class {} from {}",
@@ -3806,28 +4102,8 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
-        edits: vec![
-            FileEdit {
-                path: path_string(&source_path),
-                original_sha256: sha256_hex(parsed.source.as_bytes()),
-                edits: source_edits,
-                new_text: None,
-            },
-            FileEdit {
-                path: path_string(&target_path),
-                original_sha256: sha256_hex(&original_target_bytes),
-                edits: vec![TextEdit {
-                    byte_start: 0,
-                    byte_end: original_target_bytes.len(),
-                    replacement: target_content,
-                }],
-                new_text: None,
-            },
-        ],
-        validations: parse_validation_step_for_path(&source_path)
-            .into_iter()
-            .chain(parse_validation_step_for_path(&target_path))
-            .collect(),
+        edits: all_edits,
+        validations: all_validations,
         items: selected_methods
             .into_iter()
             .map(|method| method.item)
@@ -13224,6 +13500,265 @@ mod tests {
              field-assign idx: {assign_idx}\n\
              wiring idx:       {wiring_idx}\n\
              source:\n{rewritten}",
+        );
+    }
+
+    // Gap 4: cross-file static-method callers in OTHER files get their
+    // qualifier rewritten from `OldClass.foo()` to `NewClass.foo()` after
+    // extract_java_class moves a static method to the target. Pre-fix the
+    // planner only rewrote callers inside the source file; the project
+    // didn't link because OldClass no longer declared `foo`.
+    #[test]
+    fn extract_java_class_rewrites_cross_file_static_method_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/a");
+        let dst_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&dst_pkg).unwrap();
+        let source = src_pkg.join("Composition.java");
+        let target = dst_pkg.join("Converters.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Composition {\n\
+            \x20   public static int getHistoryItems() { return 42; }\n\
+             }\n",
+        )
+        .unwrap();
+        // Two other files in the project, each referencing the soon-to-be-
+        // moved static method via `Composition.getHistoryItems()`.
+        let caller_a = src_pkg.join("Report.java");
+        fs::write(
+            &caller_a,
+            "package a;\n\
+             public class Report {\n\
+            \x20   int run() { return Composition.getHistoryItems(); }\n\
+             }\n",
+        )
+        .unwrap();
+        let caller_b = src_pkg.join("Dialog.java");
+        fs::write(
+            &caller_b,
+            "package a;\n\
+             public class Dialog {\n\
+            \x20   int load() { return Composition.getHistoryItems() + 1; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Converters".to_string());
+        params.delegate_field = Some("converters".to_string());
+        params.item_names = Some(vec!["getHistoryItems".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+
+        // Three FileEdits: source, target, and the cross-file caller in
+        // the SAME-package case. (Plus another caller — both should show
+        // up.) Verify both callers are rewritten with the new class name.
+        let caller_paths: Vec<&str> = plan.edits.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            caller_paths.iter().any(|p| p.ends_with("Report.java")),
+            "Report.java must appear in plan.edits: {caller_paths:?}"
+        );
+        assert!(
+            caller_paths.iter().any(|p| p.ends_with("Dialog.java")),
+            "Dialog.java must appear in plan.edits: {caller_paths:?}"
+        );
+
+        // Apply edits one by one against each file and check content.
+        for fe in &plan.edits {
+            if !fe.path.ends_with(".java") || fe.path.ends_with("Composition.java") {
+                continue;
+            }
+            if fe.path.ends_with("Converters.java") {
+                continue;
+            }
+            let original = fs::read_to_string(&fe.path).unwrap();
+            let mut sorted = fe.edits.clone();
+            sorted.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
+            let mut rewritten = original.clone();
+            for edit in &sorted {
+                rewritten.replace_range(edit.byte_start..edit.byte_end, &edit.replacement);
+            }
+            assert!(
+                rewritten.contains("Converters.getHistoryItems()"),
+                "{} must rewrite qualifier to Converters.getHistoryItems(): {rewritten}",
+                fe.path
+            );
+            assert!(
+                !rewritten.contains("Composition.getHistoryItems()"),
+                "{} must drop the old Composition.getHistoryItems(): {rewritten}",
+                fe.path
+            );
+        }
+    }
+
+    // Gap 4: cross-file callers of a moved STATIC CONSTANT get rewritten.
+    // `OldClass.PROTREND` accesses parse as field_access; same rewrite
+    // mechanism applies. Target package = source package (no extra import
+    // needed in that case).
+    #[test]
+    fn extract_java_class_rewrites_cross_file_static_field_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Dialog.java");
+        let target = pkg.join("Empties.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Dialog {\n\
+            \x20   public static final String PROTREND = \"Protrend\";\n\
+            \x20   public void noop() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let caller = pkg.join("Export.java");
+        fs::write(
+            &caller,
+            "package a;\n\
+             public class Export {\n\
+            \x20   String tag() { return Dialog.PROTREND; }\n\
+            \x20   String suffix() { return Dialog.PROTREND + \"!\"; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Empties".to_string());
+        params.delegate_field = Some("empties".to_string());
+        params.item_names = Some(vec!["noop".to_string()]);
+        params.move_fields = Some(vec!["PROTREND".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let caller_edit = plan
+            .edits
+            .iter()
+            .find(|e| e.path.ends_with("Export.java"))
+            .expect("Export.java caller must be rewritten");
+        let original = fs::read_to_string(&caller_edit.path).unwrap();
+        let mut sorted = caller_edit.edits.clone();
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
+        let mut rewritten = original.clone();
+        for edit in &sorted {
+            rewritten.replace_range(edit.byte_start..edit.byte_end, &edit.replacement);
+        }
+        assert!(
+            rewritten.contains("Empties.PROTREND"),
+            "constant qualifier must be rewritten: {rewritten}"
+        );
+        assert!(
+            !rewritten.matches("Dialog.PROTREND").next().is_some(),
+            "old qualifier must not survive: {rewritten}"
+        );
+    }
+
+    // Gap 4: cross-package extracts add `import <target_pkg>.<NewClass>;`
+    // to each rewritten caller so the new qualified name resolves.
+    #[test]
+    fn extract_java_class_cross_file_callers_get_import_for_new_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/a");
+        let dst_pkg = dir.path().join("src/main/java/b");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&dst_pkg).unwrap();
+        let source = src_pkg.join("Composition.java");
+        let target = dst_pkg.join("Converters.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Composition {\n\
+            \x20   public static int getHistoryItems() { return 42; }\n\
+             }\n",
+        )
+        .unwrap();
+        let caller = src_pkg.join("Report.java");
+        fs::write(
+            &caller,
+            "package a;\n\
+             public class Report {\n\
+            \x20   int run() { return Composition.getHistoryItems(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Converters".to_string());
+        params.delegate_field = Some("converters".to_string());
+        params.item_names = Some(vec!["getHistoryItems".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let caller_edit = plan
+            .edits
+            .iter()
+            .find(|e| e.path.ends_with("Report.java"))
+            .expect("Report.java caller must be rewritten");
+        let imports_emitted: String = caller_edit
+            .edits
+            .iter()
+            .map(|e| e.replacement.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            imports_emitted.contains("import b.Converters;"),
+            "cross-package caller must get import for the new class: {imports_emitted}"
+        );
+    }
+
+    // Gap 4: instance methods are NOT rewritten cross-file. The source
+    // delegate field is private and unreachable from other files, so
+    // there's no safe automated rewrite — the operator handles those.
+    // Static-only rewrites keep the surface narrow + correct.
+    #[test]
+    fn extract_java_class_does_not_rewrite_cross_file_instance_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Composition.java");
+        let target = pkg.join("Converters.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             public class Composition {\n\
+            \x20   public int getHistoryItems() { return 42; }\n\
+             }\n",
+        )
+        .unwrap();
+        let caller = pkg.join("Report.java");
+        fs::write(
+            &caller,
+            "package a;\n\
+             public class Report {\n\
+            \x20   int run(Composition c) { return c.getHistoryItems(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Converters".to_string());
+        params.delegate_field = Some("converters".to_string());
+        params.item_names = Some(vec!["getHistoryItems".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        // Report.java must NOT appear in plan.edits — instance methods
+        // resolved on a Composition reference, not a class qualifier.
+        let touched_report = plan.edits.iter().any(|e| e.path.ends_with("Report.java"));
+        assert!(
+            !touched_report,
+            "instance-method call on a variable must not trigger cross-file rewrite"
         );
     }
 
