@@ -82,6 +82,59 @@ pub fn symbol_kind_from_refactor(
     }
 }
 
+/// Build the tantivy boolean clauses that match a single
+/// `item_kinds` token on the indexed lane. The token may be either a
+/// raw tree-sitter node kind (matches `symbol_kind` directly) OR a
+/// refactor synthetic kind that decomposes into a (symbol_kind,
+/// parent_kind) constraint.
+///
+/// Returns a vector of clauses — one entry for the raw-kind probe
+/// plus, when the token has a documented synthesis, an additional
+/// `BooleanQuery(Must symbol_kind=X AND Must parent_kind=Y)`. Caller
+/// ORs them together inside a containing `BooleanQuery`.
+///
+/// Synthesis cases live here AND in `refactor_kind_for` — the two
+/// must stay in sync. New synthesis needs an entry in BOTH.
+fn indexed_kind_filter_for(
+    fields: crate::index::FieldHandles,
+    kind: &str,
+) -> Vec<Box<dyn tantivy::query::Query>> {
+    use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+    use tantivy::schema::IndexRecordOption;
+    use tantivy::Term;
+
+    let raw_probe: Box<dyn Query> = Box::new(TermQuery::new(
+        Term::from_field_text(fields.symbol_kind, kind),
+        IndexRecordOption::Basic,
+    ));
+
+    // Synthesis decompositions. Mirror of refactor_kind_for cases.
+    let synth: Option<Box<dyn Query>> = match kind {
+        "impl_method" => Some(Box::new(BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(fields.symbol_kind, "function_item"),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(fields.parent_kind, "impl_item"),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ),
+        ]))),
+        _ => None,
+    };
+
+    match synth {
+        Some(s) => vec![raw_probe, s],
+        None => vec![raw_probe],
+    }
+}
+
 /// Typed error response shared by every code-nav tool. Recoverable
 /// failure modes (file too large, project not registered, file not
 /// under any registered project) return this shape as JSON instead of
@@ -343,6 +396,15 @@ pub struct CodeSymbolSearchResponse {
     pub matching_items: usize,
     pub returned_items: usize,
     pub truncated: bool,
+    /// Why the response is truncated, when it is. Stable strings:
+    /// - `"limit_reached"`: more items matched than `limit` allowed
+    ///   to be returned; bump `limit` or narrow the filters.
+    /// - `"file_limit_reached"`: live lane hit
+    ///   `MAX_CODE_NAV_SCANNED_FILES`; narrow `path_contains` /
+    ///   `languages` / `project_dir`.
+    /// Omitted from JSON when `truncated=false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<String>,
     pub items: Vec<CodeSymbolSearchItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<CodeSymbolSearchError>,
@@ -890,7 +952,10 @@ pub fn code_symbols(
     // - Caller left `mode` unset and we have no index (test path):
     //   default to Live.
     let mode = match p.mode.as_deref() {
-        Some(raw) => CodeSymbolMode::from_param(Some(raw))?,
+        Some(raw) => match CodeSymbolMode::from_param(Some(raw)) {
+            Ok(m) => m,
+            Err(_) => return Ok(err_invalid_code_symbols_mode(raw)?),
+        },
         None if idx.is_some() => CodeSymbolMode::Indexed,
         None => CodeSymbolMode::Live,
     };
@@ -903,6 +968,25 @@ pub fn code_symbols(
         },
         CodeSymbolMode::Live => code_symbols_live(p, registered),
     }
+}
+
+/// Build the JSON for a `invalid_code_symbols_mode` error response.
+fn err_invalid_code_symbols_mode(raw: &str) -> Result<String> {
+    let response = CodeNavErrorResponse {
+        status: "error".to_string(),
+        code: "invalid_code_symbols_mode".to_string(),
+        message: format!(
+            "mode {raw:?} is not valid for bbox_code_symbols; expected \"indexed\" or \"live\""
+        ),
+        suggestion: "Pass mode=\"indexed\" (default when the daemon has a populated index) or mode=\"live\" to walk and reparse the project tree.".to_string(),
+        file: None,
+        file_bytes: None,
+        max_bytes: None,
+        project_dir: None,
+        registered_projects: Vec::new(),
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
+    };
+    Ok(serde_json::to_string_pretty(&response)?)
 }
 
 /// Live lane. Walks the project tree, parses each supported source via
@@ -978,6 +1062,26 @@ pub fn code_symbols_live(
         }
         scanned_files += 1;
 
+        // Per-file size gate. refactor::status will read the whole file,
+        // so stat first and skip files that exceed MAX_CODE_NAV_FILE_BYTES.
+        // Report a typed per-file error so the agent sees what was skipped
+        // rather than wondering why a matching symbol is missing.
+        if let Ok(metadata) = fs::metadata(path) {
+            if metadata.len() > MAX_CODE_NAV_FILE_BYTES {
+                if errors.len() < 20 {
+                    errors.push(CodeSymbolSearchError {
+                        file: rel_path.clone(),
+                        error: format!(
+                            "file_too_large_for_code_nav: {} bytes (cap {})",
+                            metadata.len(),
+                            MAX_CODE_NAV_FILE_BYTES
+                        ),
+                    });
+                }
+                continue;
+            }
+        }
+
         let status_params = RefactorStatusParams {
             file: rel_path.clone(),
             project_dir: Some(project_dir_arg.clone()),
@@ -1033,6 +1137,17 @@ pub fn code_symbols_live(
     });
 
     let truncated = file_limit_hit || matching_items > items.len();
+    // File-limit-hit dominates: if we stopped walking, the user
+    // needs to narrow the scan first; the limit-vs-fetched mismatch
+    // is a secondary concern they can't fix until the walk
+    // completes.
+    let truncation_reason = if file_limit_hit {
+        Some("file_limit_reached".to_string())
+    } else if matching_items > items.len() {
+        Some("limit_reached".to_string())
+    } else {
+        None
+    };
     let response = CodeSymbolSearchResponse {
         status: "ok".to_string(),
         project_dir: project_dir_arg,
@@ -1042,6 +1157,7 @@ pub fn code_symbols_live(
         matching_items,
         returned_items: items.len(),
         truncated,
+        truncation_reason,
         items,
         errors,
         semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
@@ -1145,49 +1261,56 @@ pub fn code_symbols_indexed(
         clauses.push((Occur::Must, Box::new(BooleanQuery::new(lang_clauses))));
     }
 
-    // Kinds: accept either the refactor-vocabulary token (matches the
-    // synthesised `kind` after live-side projection) or the raw
-    // tree-sitter `symbol_kind` token. We probe both fields.
+    // Kinds: accept BOTH vocabularies on a single filter list:
+    // - raw tree-sitter kinds (e.g. `"function_item"`) match the
+    //   stored `symbol_kind` field directly
+    // - refactor synthetic kinds (e.g. `"impl_method"`) decompose
+    //   into a constraint on (symbol_kind, parent_kind), e.g.
+    //   impl_method => symbol_kind=function_item AND
+    //                  parent_kind=impl_item
+    // The set of synthesis cases lives in `indexed_kind_filter_for`
+    // alongside `refactor_kind_for`.
     if !kind_filter.is_empty() {
         let kind_clauses: Vec<(Occur, Box<dyn QueryTrait>)> = kind_filter
             .iter()
-            .flat_map(|kind| {
-                [
-                    (
-                        Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(fields.symbol_kind, kind),
-                            IndexRecordOption::Basic,
-                        )) as Box<dyn QueryTrait>,
-                    ),
-                    (
-                        Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(fields.symbol_kind, kind),
-                            IndexRecordOption::Basic,
-                        )) as Box<dyn QueryTrait>,
-                    ),
-                ]
-            })
+            .flat_map(|kind| indexed_kind_filter_for(fields, kind))
+            .map(|q| (Occur::Should, q))
             .collect();
         clauses.push((Occur::Must, Box::new(BooleanQuery::new(kind_clauses))));
     }
 
     let query: Box<dyn QueryTrait> = Box::new(BooleanQuery::new(clauses));
-    let index_handle = idx.index_handle();
-    let reader = index_handle
-        .reader_builder()
-        .reload_policy(tantivy::ReloadPolicy::Manual)
-        .try_into()?;
-    let searcher: tantivy::Searcher = {
-        let r: tantivy::IndexReader = reader;
-        r.searcher()
-    };
+    // Snapshot the shared daemon reader (cheap; avoids the per-call
+    // reader-build that codex round-1 review flagged).
+    let searcher = idx.searcher();
 
-    // Tantivy can't post-filter on substring; we over-fetch a bit and
-    // apply path/name/excerpt-style filtering after stored-field load.
-    let over_fetch = limit.saturating_mul(4).max(64);
-    let hits = searcher.search(&*query, &TopDocs::with_limit(over_fetch))?;
+    // The indexed lane can't push `query`/`path_contains` substring
+    // filters into tantivy — they're free-text substrings, not
+    // tokenisable. We over-fetch up to a high cap and post-filter; if
+    // we hit the cap with `matching_items > items.len()` we set
+    // `truncation_reason = "scan_cap_reached"` so the caller knows the
+    // count is a lower bound. Without an explicit `query`/path filter
+    // the tantivy-level filter is exact, so `limit` itself is the
+    // truthful upper bound.
+    let has_post_filter = p
+        .query
+        .as_deref()
+        .is_some_and(|q| !q.is_empty())
+        || p
+            .path_contains
+            .as_deref()
+            .is_some_and(|q| !q.is_empty());
+    const INDEXED_SCAN_CAP: usize = 5000;
+    let fetch_cap = if has_post_filter {
+        INDEXED_SCAN_CAP
+    } else {
+        // Fast path: no post-filter → fetch just enough to honour
+        // limit + a small headroom so `matching_items` is still
+        // honest if filters elsewhere drop a few.
+        limit.saturating_mul(2).max(64).min(INDEXED_SCAN_CAP)
+    };
+    let hits = searcher.search(&*query, &TopDocs::with_limit(fetch_cap))?;
+    let scan_cap_hit = hits.len() >= fetch_cap;
 
     let mut items: Vec<CodeSymbolSearchItem> = Vec::new();
     let mut matched_file_paths = std::collections::HashSet::new();
@@ -1277,7 +1400,23 @@ pub fn code_symbols_indexed(
             .then(a.byte_range.0.cmp(&b.byte_range.0))
     });
 
-    let truncated = matching_items > items.len();
+    let truncated = matching_items > items.len() || scan_cap_hit;
+    // scan_cap_hit dominates limit_reached because the caller needs
+    // to know the count itself is a lower bound (more matches may
+    // exist past the scan cap) before they trust the
+    // `matching_items` number.
+    let truncation_reason = if scan_cap_hit && matching_items > items.len() {
+        Some("scan_cap_reached".to_string())
+    } else if scan_cap_hit {
+        // Edge case: the scan filled the cap exactly with items we
+        // returned. Still flag it so the caller can decide whether
+        // to widen the scan.
+        Some("scan_cap_reached".to_string())
+    } else if matching_items > items.len() {
+        Some("limit_reached".to_string())
+    } else {
+        None
+    };
     let response = CodeSymbolSearchResponse {
         status: "ok".to_string(),
         project_dir: project_dir_arg,
@@ -1290,6 +1429,7 @@ pub fn code_symbols_indexed(
         matching_items,
         returned_items: items.len(),
         truncated,
+        truncation_reason,
         items,
         errors: Vec::new(),
         semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),

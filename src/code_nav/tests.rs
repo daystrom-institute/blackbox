@@ -495,6 +495,111 @@ fn code_symbols_live_lane_populates_symbol_kind_and_parent_kind() {
     assert_eq!(method.name.as_deref(), Some("run"));
 }
 
+/// CN-T2 fix: invalid `mode` returns a typed `CodeNavErrorResponse`
+/// (status="error", code="invalid_code_symbols_mode") — never an
+/// anyhow bail. Agents already know how to parse the typed shape from
+/// every other recoverable error.
+#[test]
+fn code_symbols_invalid_mode_returns_typed_error_response() {
+    let dir = TempDir::new().unwrap();
+    let params = CodeSymbolSearchParams {
+        project_dir: dir.path().to_string_lossy().into_owned(),
+        query: None,
+        languages: None,
+        item_kinds: None,
+        path_contains: None,
+        limit: None,
+        file_limit: None,
+        include_attributes: None,
+        mode: Some("nope".to_string()),
+    };
+    let json = code_symbols(&params, &registered_for(&dir), None).unwrap();
+    let response: CodeNavErrorResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response.status, "error");
+    assert_eq!(response.code, "invalid_code_symbols_mode");
+    assert_eq!(response.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
+    assert!(response.message.contains("nope"));
+    assert!(response.suggestion.contains("indexed"));
+    assert!(response.suggestion.contains("live"));
+}
+
+/// CN-T2 fix: live lane stats each candidate file and skips ones over
+/// MAX_CODE_NAV_FILE_BYTES, surfacing the skip as a typed per-file
+/// error in `errors[]` so the caller knows what was dropped.
+#[test]
+fn code_symbols_live_skips_oversize_files_with_typed_error() {
+    let dir = TempDir::new().unwrap();
+    setup_test_file(&dir, "src/small.rs", "fn small() {}\n");
+
+    let mut oversize = String::with_capacity(MAX_CODE_NAV_FILE_BYTES as usize + 1024);
+    oversize.push_str("fn huge() {}\n");
+    while (oversize.len() as u64) <= MAX_CODE_NAV_FILE_BYTES {
+        oversize.push_str("// padding to exceed the code-nav file cap\n");
+    }
+    setup_test_file(&dir, "src/huge.rs", &oversize);
+
+    let params = CodeSymbolSearchParams {
+        project_dir: dir.path().to_string_lossy().into_owned(),
+        query: None,
+        languages: Some(vec!["rust".to_string()]),
+        item_kinds: None,
+        path_contains: None,
+        limit: None,
+        file_limit: None,
+        include_attributes: None,
+        mode: Some("live".to_string()),
+    };
+    let json = code_symbols(&params, &registered_for(&dir), None).unwrap();
+    let response: CodeSymbolSearchResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response.status, "ok");
+    assert!(
+        response
+            .errors
+            .iter()
+            .any(|e| e.file.contains("huge.rs")
+                && e.error.contains("file_too_large_for_code_nav")),
+        "expected huge.rs in errors[] with file_too_large code, got {:?}",
+        response.errors
+    );
+    assert!(
+        response
+            .items
+            .iter()
+            .any(|it| it.file.contains("small.rs") && it.name.as_deref() == Some("small")),
+        "expected small.rs symbol present, got {:?}",
+        response.items
+    );
+}
+
+/// CN-T2 fix: indexed kind filter must decompose `"impl_method"`
+/// (refactor synthetic) into `symbol_kind=function_item AND
+/// parent_kind=impl_item` — otherwise the previous Boolean shape
+/// (two identical Should probes on symbol_kind) silently returned
+/// zero rows for any synthetic-kind filter. Lock the decomposition
+/// contract.
+#[test]
+fn indexed_kind_filter_decomposes_impl_method() {
+    let fields = make_test_field_handles();
+    let raw_clauses = indexed_kind_filter_for(fields, "function_item");
+    assert_eq!(raw_clauses.len(), 1, "raw kind => single probe");
+
+    let synth_clauses = indexed_kind_filter_for(fields, "impl_method");
+    assert_eq!(
+        synth_clauses.len(),
+        2,
+        "synthetic kind => raw probe + decomposition (got {})",
+        synth_clauses.len()
+    );
+
+    let unknown_clauses = indexed_kind_filter_for(fields, "some_future_synthetic");
+    assert_eq!(unknown_clauses.len(), 1);
+}
+
+fn make_test_field_handles() -> crate::index::FieldHandles {
+    let (_schema, fields) = crate::index::build_schema();
+    fields
+}
+
 /// CN-T2: when no index is provided, the dispatcher must default to
 /// mode="live" rather than failing. Tests historically don't pass an
 /// index; this guards that contract.

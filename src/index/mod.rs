@@ -229,6 +229,15 @@ impl TranscriptIndex {
         self.index.clone()
     }
 
+    /// Snapshot a searcher off the shared `IndexReader`. Cheap — the
+    /// reader is `OnCommit`-driven and segment-arc-cloned. Use this
+    /// from per-call tool handlers instead of
+    /// `reader_builder().try_into()` (which builds a fresh reader and
+    /// forces per-call segment loads).
+    pub(crate) fn searcher(&self) -> tantivy::Searcher {
+        self.reader.searcher()
+    }
+
     /// Get the field handles for the background thread.
     pub fn field_handles(&self) -> FieldHandles {
         self.fields
