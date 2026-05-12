@@ -996,6 +996,10 @@ pub(crate) async fn install_artifact_value(
                 },
             };
             orchestration::agents::validate::validate_agent_install(&value, &ctx)?;
+            orchestration::agents::validate::validate_refactor_atom_install(
+                &value,
+                Some(p.source.as_str()),
+            )?;
             drop(catalog);
             let manifest_value = value
                 .get("manifest")
@@ -1023,7 +1027,13 @@ pub(crate) async fn install_artifact_value(
             let agent_ref = orchestration::agents::types::AgentRef { name, version };
             manifest.embedding = Some(embed_queue::agent_manifest_embedding(&agent_ref, &manifest));
             value["manifest"]["embedding"] = serde_json::to_value(&manifest.embedding)?;
-            let install_warnings = agent_install_warnings(state, &manifest);
+            let mut install_warnings = agent_install_warnings(state, &manifest);
+            install_warnings.extend(
+                orchestration::agents::validate::refactor_atom_install_warnings(
+                    &value,
+                    Some(p.source.as_str()),
+                ),
+            );
             installed_agent = Some((agent_ref, manifest, install_warnings));
         }
     }

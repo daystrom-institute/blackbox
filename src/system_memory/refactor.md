@@ -272,6 +272,44 @@ binds to a different brofile (e.g., `code-reviewer-persona`) means the
 atom's tool surface is not actually narrowed; the manifest lint pass
 (RA-S1) rejects such manifests on install.
 
+## Refactor-atom install lint (RA-S1)
+
+A manifest is treated as a refactor atom — and subject to the refactor-atom
+lint — when one of:
+
+- Top-level `"_contract": "refactor-atom/v1"` field is present (authoring
+  convention; refactor atom templates include this).
+- Artifact source path contains `examples/agents/refactor/`.
+
+There is no opt-out flag in v1: an operator who wants different semantics
+either drops the contract marker or hosts the manifest outside the refactor
+path. `schema/agent.schema.json` has `additionalProperties: false` at the
+manifest level, so adding a top-level escape-hatch field would itself be
+rejected by the generic schema.
+
+**Hard rejects** (install fails with
+`error.bad_input(code=refactor_atom_lint_failed)`):
+
+- `brofile_ref` is not one of `rust-refactor-persona` /
+  `java-refactor-persona`. Refactor atoms layered on a permissive persona
+  have no mechanical tool-surface restriction — `filter_overlay` can only
+  ADD denies.
+- `inputs.schema` declares an `acknowledge_*` field with a `default` value
+  (any default). Operator-authority opt-outs must be operator-explicit per
+  RX-V1.
+
+**Warnings** (install succeeds, surfaced via `install_warnings`):
+
+- `filter_overlay.allow` non-empty — refactor atoms narrow via additional
+  denies only.
+- `outputs.schema` drops one or more RA-T1 base fields (status, plan_path,
+  files_touched, fixme_count, deep_analysis_summary, cargo_result,
+  block_reason, done_note_id).
+- `inputs.prompt_template` is missing one or more protocol markers
+  (`bbox_refactor_plan`, `bbox_refactor_run`, `bbox_note(kind=`).
+  Analysis-only atoms legitimately skip `bbox_refactor_run`; the warning
+  is informational in that case.
+
 ## Shared atom contract (RA-T1)
 
 Every refactor atom embeds the same five-step protocol
