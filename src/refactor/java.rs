@@ -4269,3 +4269,5 @@ mod extract_methods;
 mod move_and_callers;
 mod find_usages;
 pub(crate) use find_usages::plan_find_java_usages;
+mod rename_symbol;
+pub(crate) use rename_symbol::plan_rename_java_symbol;

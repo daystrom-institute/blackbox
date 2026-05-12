@@ -11,7 +11,27 @@ hand-rolled boilerplate (POJO DOJO).
 
 - Inspect: supported with `bbox_refactor_status`.
 - Plan/apply: method extraction, composite class extraction, nested class extraction, field moves/adds, constructor creation, delegate-field wiring, caller delegation, interface extraction, visibility rewriting, implements clause injection, type-use migration, import organization, and `lombokify_java_class` (POJO boilerplate → Lombok annotations).
-- Semantic rename: not supported natively by blackbox yet; use JDT, IntelliJ, Eclipse, or another Java language-server/refactoring workflow.
+- Find usages: supported with `bbox_refactor_plan(kind="find_java_usages")`.
+  Walks every `.java` file under `project_dir` and reports
+  AST-grounded references (type position, method invocation, field
+  access, method reference, import) for the supplied simple name(s).
+  Analysis-only; no FileEdits. Foundation for the semantic-rename
+  primitive below.
+- Semantic rename: supported with `bbox_refactor_plan(kind="rename_java_symbol")`.
+  Project-wide rename of a class / interface / record / enum / method
+  / field / parameter / type-parameter by simple name. Rewrites
+  declaration sites AND every reference (type position, method
+  invocation, field access, method reference, import). When the
+  renamed symbol is a top-level class declared in a file matching the
+  old name, the response surfaces a `file_rename_advisory` listing
+  the suggested `OldName.java` → `NewName.java` rename — the operator
+  follows up with `move_file` or `git mv`. Optional `item_kinds`
+  narrows which categories of declaration get touched (e.g. only
+  `class_declaration` + `type_reference` to leave a same-named local
+  variable alone). For semantic-grade accuracy on disambiguation
+  (e.g. method overloads that share a name), JDTLS-backed rename is
+  the right escape hatch — but the standalone primitive lands every
+  reference its tree-sitter walker can see.
 - Import/package repair: `java_lsp_organize_imports` prefers a warm
   per-project JDTLS session (lazy-spawned, reused across calls, idle-evicted
   by the daemon) and falls back to tree-sitter plus project type scanning
