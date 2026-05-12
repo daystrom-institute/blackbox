@@ -134,9 +134,16 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
         })
         .to_string();
 
-    let package_decl = extract_java_package(&parsed.source)
-        .map(|pkg| format!("package {};\n", pkg))
-        .unwrap_or_default();
+    // Gap 14: use java_default_target_prelude so the interface file
+    // gets BOTH a package decl AND every import from the source. Tree-
+    // sitter / javac don't error on unused imports (just unused-import
+    // warnings), and copying the full set means every signature type
+    // (project types, JDK, third-party) resolves out of the box. A
+    // follow-up `java_lsp_organize_imports` can prune later if the
+    // operator cares about minimal imports.
+    let target_pkg =
+        resolve_java_target_package(p, &parsed.source, &source_path, &target_path).ok().flatten();
+    let prelude = java_default_target_prelude(p, &parsed.source, target_pkg.as_deref());
 
     let methods = java_methods(&parsed);
     let class_methods: Vec<&JavaMethod> = methods
@@ -252,10 +259,7 @@ let ident = chunk.split_whitespace().last().unwrap_or("").trim();
     };
 
     let mut interface_content = String::new();
-    if !package_decl.is_empty() {
-        interface_content.push_str(&package_decl);
-        interface_content.push('\n');
-    }
+    interface_content.push_str(&prelude);
     interface_content.push_str(&format!(
         "public interface {}{} {{\n",
         interface_name, interface_type_params

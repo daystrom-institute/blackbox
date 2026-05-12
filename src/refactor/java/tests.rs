@@ -6626,6 +6626,136 @@
         );
     }
 
+    // Gap 14: extract_java_interface now copies imports from the
+    // source class — without them every signature type fails javac
+    // with `cannot find symbol`.
+    #[test]
+    fn extract_java_interface_copies_source_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("MeterAdmin.java");
+        let target = pkg.join("MeterRepository.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.List;\n\
+             import org.apache.commons.lang3.tuple.Pair;\n\
+             public class MeterAdmin {\n\
+            \x20   public List<Pair<String, String>> listAll() { return null; }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_interface", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("MeterRepository".to_string());
+        params.impl_name = Some("MeterAdmin".to_string());
+        params.item_names = Some(vec!["listAll".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_interface(&params).unwrap()).unwrap();
+        let target_edit = plan
+            .edits
+            .iter()
+            .find(|e| e.path.ends_with("MeterRepository.java"))
+            .expect("interface target FileEdit present");
+        let target_text = &target_edit.edits[0].replacement;
+        assert!(
+            target_text.starts_with("package com.example;"),
+            "package decl preserved: {target_text}"
+        );
+        assert!(
+            target_text.contains("import java.util.List;"),
+            "List import copied: {target_text}"
+        );
+        assert!(
+            target_text.contains("import org.apache.commons.lang3.tuple.Pair;"),
+            "Pair import copied: {target_text}"
+        );
+        assert!(
+            target_text.contains("public interface MeterRepository"),
+            "interface decl present: {target_text}"
+        );
+        assert!(
+            target_text.contains("List<Pair<String, String>> listAll"),
+            "signature preserved: {target_text}"
+        );
+    }
+
+    // Gap 16: extract_java_methods to an EXISTING target now appends
+    // each missing import from source's import block to the target's
+    // import block. The structural method-append already worked; this
+    // closes the cannot-find-symbol gap.
+    #[test]
+    fn extract_java_methods_into_existing_target_appends_missing_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("MeterAdmin.java");
+        let target = pkg.join("SamplePointAdmin.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.List;\n\
+             import org.apache.commons.lang3.tuple.Pair;\n\
+             public class MeterAdmin {\n\
+            \x20   public Pair<String, String> fetchById(long id) { return null; }\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            &target,
+            "package com.example;\n\
+             import java.util.Map;\n\
+             public class SamplePointAdmin {\n\
+            \x20   void existing() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_methods", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["fetchById".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_methods(&params).unwrap()).unwrap();
+        let target_edit = plan
+            .edits
+            .iter()
+            .find(|e| e.path.ends_with("SamplePointAdmin.java"))
+            .expect("existing target FileEdit present");
+        let target_text = &target_edit.edits[0].replacement;
+        // Existing import preserved.
+        assert!(
+            target_text.contains("import java.util.Map;"),
+            "existing import preserved: {target_text}"
+        );
+        // Missing imports for moved method types added.
+        assert!(
+            target_text.contains("import org.apache.commons.lang3.tuple.Pair;"),
+            "Pair import from source added: {target_text}"
+        );
+        // List wasn't used by the moved method but Gap 16's v1
+        // conservatively copies ALL source imports; that's OK because
+        // unused imports are a warning, not an error.
+        assert!(
+            target_text.contains("import java.util.List;"),
+            "all source imports copied (conservative): {target_text}"
+        );
+        // Method body landed.
+        assert!(
+            target_text.contains("fetchById(long id)"),
+            "moved method present: {target_text}"
+        );
+        // Existing method preserved.
+        assert!(
+            target_text.contains("void existing()"),
+            "existing target method preserved: {target_text}"
+        );
+        // Idempotency: java.util.Map shouldn't get duplicated.
+        let map_count = target_text.matches("import java.util.Map;").count();
+        assert_eq!(map_count, 1, "Map import duplicated: {target_text}");
+    }
+
     // Gap 13: multiple constructors all get rewritten.
     #[test]
     fn extract_java_nested_classes_widens_every_constructor() {

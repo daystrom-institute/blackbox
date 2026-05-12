@@ -54,6 +54,27 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
 
     let target_content = if target_path.exists() {
         let mut text = String::from_utf8(original_target_bytes.clone()).unwrap_or_default();
+        // Gap 16: when the target already has content, the structural
+        // append (insert method before final `}`) leaves the moved
+        // method's type references unimported. Diff source's imports
+        // against target's existing import block and inject each
+        // missing one. java_inject_import is idempotent — duplicate
+        // checks are baked in. Conservative: copies ALL imports from
+        // source, not just the ones the moved method needs; unused
+        // imports are a javac warning, not an error.
+        let source_imports = extract_java_imports(&parsed.source);
+        for import_line in &source_imports {
+            if let Some(fqcn) = import_line
+                .trim()
+                .strip_prefix("import ")
+                .and_then(|s| s.trim().strip_suffix(';'))
+                .map(|s| s.trim().to_string())
+            {
+                if !fqcn.is_empty() {
+                    text = java_inject_import(&text, &fqcn);
+                }
+            }
+        }
         let insert_at = text.rfind('}').unwrap_or(text.len());
         text.insert_str(
             insert_at,
