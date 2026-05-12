@@ -857,6 +857,7 @@ mod tests {
             boolean_getter_strategy: None,
             declaring_class: None,
             summary_only: None,
+            propagate_class_annotations: None,
             callback_externals: None,
             output_path: None,
         })
@@ -978,6 +979,7 @@ fn consume(input: OldService, output: Vec<OldService>) -> OldService {
             boolean_getter_strategy: None,
             declaring_class: None,
             summary_only: None,
+            propagate_class_annotations: None,
             callback_externals: None,
             output_path: None,
         });
@@ -1061,6 +1063,7 @@ fn consume<T>(value: OldService, list: Vec<OldService>) {
             boolean_getter_strategy: None,
             declaring_class: None,
             summary_only: None,
+            propagate_class_annotations: None,
             callback_externals: None,
             output_path: None,
         });
@@ -1145,6 +1148,7 @@ struct Holder {
             boolean_getter_strategy: None,
             declaring_class: None,
             summary_only: None,
+            propagate_class_annotations: None,
             callback_externals: None,
             output_path: None,
         });

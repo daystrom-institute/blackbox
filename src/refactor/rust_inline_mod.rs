@@ -285,6 +285,7 @@ mod tests {
             output_path: None,
             declaring_class: None,
             summary_only: None,
+            propagate_class_annotations: None,
         }
     }
 

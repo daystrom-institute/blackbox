@@ -331,6 +331,107 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         }
     }
 
+    // G13: propagate class-level annotations from source to target when
+    // the moved body references identifiers that the annotation processor
+    // generated. Without this, every @Slf4j source class produces an
+    // uncompilable target because the moved log.info(...) call references
+    // a generated `log` field that doesn't exist on the target.
+    //
+    // mode = auto (default): scan moved bodies for known annotation-
+    //   processor-generated identifiers; propagate the responsible
+    //   annotation and its import when the source carries it.
+    // mode = all: copy every class-level annotation.
+    // mode = none: current behavior, no propagation.
+    // mode = list:@A,@B: operator-supplied allowlist.
+    let propagate_mode = p
+        .propagate_class_annotations
+        .as_deref()
+        .unwrap_or("auto")
+        .to_string();
+    if propagate_mode != "none" {
+        let source_annotations = crate::refactor::java::class_dependency::
+            collect_class_level_annotations(class_node, &parsed.source);
+        if !source_annotations.is_empty() {
+            // Map of well-known annotation -> (generated identifier(s), import FQCN).
+            // v1 covers @Slf4j; other Lombok generators (@Getter, @Setter, @Data)
+            // generate per-field accessors whose names depend on the source's
+            // own fields and aren't worth pattern-matching here. Operators
+            // can request them explicitly via mode=all or list:@Data.
+            let auto_map: &[(&str, &[&str], &str)] = &[
+                ("@Slf4j", &["log"], "lombok.extern.slf4j.Slf4j"),
+            ];
+            let list_allowlist: Option<Vec<String>> = propagate_mode
+                .strip_prefix("list:")
+                .map(|s| s.split(',').map(|a| a.trim().to_string()).collect());
+            let mut propagations: Vec<(String, Option<String>)> = Vec::new();
+            for raw in &source_annotations {
+                let simple = raw.trim();
+                // Strip args from `@Foo(...)`: keep `@Foo`.
+                let head = simple
+                    .find('(')
+                    .map(|i| &simple[..i])
+                    .unwrap_or(simple)
+                    .trim()
+                    .to_string();
+                let should_propagate = match propagate_mode.as_str() {
+                    "all" => true,
+                    "auto" => {
+                        if let Some((_name, generated_ids, _fqcn)) =
+                            auto_map.iter().find(|(n, _, _)| *n == head)
+                        {
+                            // Check whether any moved method body references
+                            // a generated identifier.
+                            generated_ids.iter().any(|gid| {
+                                target_content_references_identifier(&target_content, gid)
+                            })
+                        } else {
+                            false
+                        }
+                    }
+                    _ => list_allowlist
+                        .as_ref()
+                        .map(|l| l.iter().any(|a| a == &head))
+                        .unwrap_or(false),
+                };
+                if !should_propagate {
+                    continue;
+                }
+                let fqcn = auto_map
+                    .iter()
+                    .find(|(n, _, _)| *n == head)
+                    .map(|(_, _, fqcn)| fqcn.to_string());
+                propagations.push((raw.trim().to_string(), fqcn));
+            }
+            if !propagations.is_empty() {
+                // Inject `@A\n@B\n` right before the `public class <Name>` line.
+                let needle = format!("public class {target_class_name}");
+                if let Some(decl_pos) = target_content.find(&needle) {
+                    let line_start = target_content[..decl_pos]
+                        .rfind('\n')
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    let mut annotations_block = String::new();
+                    for (annot, _) in &propagations {
+                        annotations_block.push_str(annot);
+                        annotations_block.push('\n');
+                    }
+                    let mut patched =
+                        String::with_capacity(target_content.len() + annotations_block.len());
+                    patched.push_str(&target_content[..line_start]);
+                    patched.push_str(&annotations_block);
+                    patched.push_str(&target_content[line_start..]);
+                    target_content = patched;
+                }
+                // Inject imports for known annotations.
+                for (_, fqcn) in &propagations {
+                    if let Some(fqcn) = fqcn.as_deref() {
+                        target_content = java_inject_import(&target_content, fqcn);
+                    }
+                }
+            }
+        }
+    }
+
     // Gap 22 / Gap 23: scaffold unresolved deps in the generated target text.
     // Only meaningful when deep_analysis was on (the report is empty otherwise).
     if p.deep_analysis.unwrap_or(false) {
@@ -1384,4 +1485,35 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         fixme_count: None,
     };
     Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+/// G13: simple word-boundary check for whether the target body
+/// references a bare identifier. Used by the propagate_class_annotations
+/// auto-mode detection to decide whether moved bodies reference an
+/// annotation-processor-generated identifier (e.g. `log` for @Slf4j).
+fn target_content_references_identifier(text: &str, ident: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = ident.as_bytes();
+    let mut cursor = 0usize;
+    while cursor + needle.len() <= bytes.len() {
+        let Some(rel) = text[cursor..].find(ident) else {
+            return false;
+        };
+        let pos = cursor + rel;
+        let after = pos + needle.len();
+        let prev_ok = pos == 0
+            || {
+                let prev = bytes[pos - 1] as char;
+                !(prev == '_' || prev == '$' || prev.is_ascii_alphanumeric())
+            };
+        let next_ok = after == bytes.len() || {
+            let next = bytes[after] as char;
+            !(next == '_' || next == '$' || next.is_ascii_alphanumeric())
+        };
+        if prev_ok && next_ok {
+            return true;
+        }
+        cursor = pos + needle.len();
+    }
+    false
 }

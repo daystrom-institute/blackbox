@@ -48,6 +48,7 @@
             boolean_getter_strategy: None,
             declaring_class: None,
             summary_only: None,
+            propagate_class_annotations: None,
             callback_externals: None,
             output_path: None,
         }
@@ -2214,6 +2215,86 @@
         assert!(
             rewritten.contains("enum Mode") && !rewritten.contains("private enum Mode"),
             "inner enum private widened to package floor: {rewritten}"
+        );
+    }
+
+    // G13: when the source class carries `@Slf4j` and the moved methods
+    // reference the generated `log` field, propagate `@Slf4j` + its
+    // import to the target. Default mode is `auto`; without the
+    // propagation the target fails to compile because `log` is
+    // undefined.
+    #[test]
+    fn g13_extract_java_class_auto_propagates_slf4j_when_log_referenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Worker.java");
+        let target = pkg.join("Helpers.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import lombok.extern.slf4j.Slf4j;\n\
+             @Slf4j\n\
+             public class Worker {\n\
+            \x20   public void doIt() { log.info(\"running\"); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["doIt".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("@Slf4j"),
+            "auto mode must propagate @Slf4j when log is referenced: {target_text}"
+        );
+        assert!(
+            target_text.contains("import lombok.extern.slf4j.Slf4j;"),
+            "auto mode must inject the Slf4j import: {target_text}"
+        );
+    }
+
+    // G13: when propagate_class_annotations=none (or not auto-eligible),
+    // the target has no @Slf4j even if the source did.
+    #[test]
+    fn g13_extract_java_class_none_mode_strips_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Worker.java");
+        let target = pkg.join("Helpers.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import lombok.extern.slf4j.Slf4j;\n\
+             @Slf4j\n\
+             public class Worker {\n\
+            \x20   public void doIt() { log.info(\"running\"); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Helpers".to_string());
+        params.delegate_field = Some("helpers".to_string());
+        params.item_names = Some(vec!["doIt".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.propagate_class_annotations = Some("none".to_string());
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            !target_text.contains("@Slf4j"),
+            "none mode must NOT propagate annotations: {target_text}"
         );
     }
 

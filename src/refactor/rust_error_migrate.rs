@@ -468,6 +468,7 @@ mod tests {
             boolean_getter_strategy: None,
             declaring_class: None,
             summary_only: None,
+            propagate_class_annotations: None,
             callback_externals: None,
             output_path: None,
         })

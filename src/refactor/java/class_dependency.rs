@@ -446,7 +446,7 @@ fn walk_field_accesses<'a>(
     walk_inner(method_node, source, field_names, false, out);
 }
 
-fn collect_class_level_annotations(class_node: Node<'_>, source: &str) -> Vec<String> {
+pub(crate) fn collect_class_level_annotations(class_node: Node<'_>, source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = class_node.walk();
     for child in class_node.children(&mut cursor) {
@@ -635,6 +635,7 @@ mod tests {
             boolean_getter_strategy: None,
             declaring_class: None,
             summary_only: None,
+            propagate_class_annotations: None,
             callback_externals: None,
             output_path: None,
         }
