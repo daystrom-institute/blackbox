@@ -282,6 +282,7 @@ dispatch via `bro_agent_dispatch(agent="<name>", args={...})`.
 | Atom | Status | Cost | Plan kind(s) | Purpose |
 |---|---|---|---|---|
 | `rust-impl-partition-graph` | shipped (v1, RA-A1) | cheap | `rust_impl_partition_analysis` (RX-G1) | Produce method/field/call graph for a Rust impl block; analysis-only |
+| `rust-public-api-guard` | shipped (v1, RA-A2) | normal | `rust_public_api_guard` (RX-G2) | Report public-API delta of a proposed refactor as advisory severity; preflight for mutating atoms |
 
 Per-atom manifests live at `examples/agents/refactor/<atom>.json`. The
 shared prompt template and base outputs schema (RA-T1) under the same
