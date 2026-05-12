@@ -194,34 +194,50 @@ roll-forward-only: every phase preserves backward compatibility with
 older indices until CN-D5 bumps the schema version and forces a
 reindex.
 
-### CN-D1 — `SymbolSpec.kind` field
+### CN-D1 — `SymbolSpec.kind` + `parent_kind`
 
-**Scope.** Carry the tree-sitter node kind from chunker symbol
-extraction into the `SymbolSpec` value type.
+**Scope.** Carry both the tree-sitter node kind AND the immediate
+named-parent kind from chunker symbol extraction into the
+`SymbolSpec` value type. Parent kind is required because raw node
+kind alone is ambiguous — a Rust `function_item` inside an
+`impl_item` is what `refactor::status` synthesizes as
+`"impl_method"`, and indexed records need to be able to derive that
+synthetic vocabulary deterministically without re-parsing the file.
 
 **Realizes.** Data Model Changes bullet 1.
 
 **Components.**
 
-- Add `pub kind: String` to `SymbolSpec` in `src/chunker/code.rs`.
-- `collect_ast_symbols` populates `kind = node.kind().to_string()`
-  for every emitted symbol — strictly the raw tree-sitter node
-  kind, per the design's "must be the tree-sitter node kind"
-  rule. For Rust `impl_item` the kind stays `"impl_item"`. For
-  Elixir, the parent grammar node is `"call"` — keep it as
-  `"call"` on `symbol_kind` and surface the
-  defmodule/def/defp/defmacro distinction via a separate
-  optional `symbol_kind_display` field if a future caller needs
-  it (out of scope for CN-D1; flagged as a follow-up rather than
-  silently overloading the contract).
+- Add to `SymbolSpec` in `src/chunker/code.rs`:
+  - `pub kind: String` — raw tree-sitter node kind.
+  - `pub parent_kind: Option<String>` — kind of the nearest
+    named ancestor that produced a containing symbol, or
+    `None` at file top level. Empty / unnamed parents are
+    skipped.
+- `collect_ast_symbols` threads a `parent_kind: Option<&str>`
+  alongside the existing `parents: &mut Vec<String>` it already
+  threads, and populates both fields per the design's
+  "must be the tree-sitter node kind" rule. For Rust:
+  - Top-level `function_item` → `kind="function_item"`,
+    `parent_kind=None`.
+  - `function_item` inside `impl_item` → `kind="function_item"`,
+    `parent_kind=Some("impl_item")`.
+- Rust `impl_item` keeps `kind="impl_item"`. Elixir keeps
+  `kind="call"` (raw tree-sitter), with the
+  defmodule/def/defp/defmacro distinction deferred to a
+  separate optional display field per the design's "must be the
+  tree-sitter node kind" rule.
 - `collect_structure_item` (the `tree_sitter_language_pack`
-  fallback) populates `kind` from the
-  `StructureItem` shape — best-effort mapping documented in code
-  comments; falls back to `"unknown"` when no kind is available.
+  fallback) populates `kind` from the `StructureItem` shape and
+  `parent_kind` from the immediate parent's kind on the walk
+  stack — best-effort mapping documented in code comments;
+  falls back to `"unknown"` when no kind is available.
 - Unit tests in `src/chunker/code.rs` covering at least Rust,
-  Java, Python, TypeScript, and Elixir fixtures: assert the
-  emitted `SymbolSpec.kind` matches the tree-sitter grammar's
-  documented node kind.
+  Java, Python, TypeScript, and Elixir fixtures. Assertions:
+  - `SymbolSpec.kind` matches the tree-sitter grammar's
+    documented node kind.
+  - For Rust, a method declared inside `impl_item` has
+    `parent_kind = Some("impl_item")`.
 
 **Gates.**
 
@@ -239,32 +255,46 @@ extraction into the `SymbolSpec` value type.
 
 ---
 
-### CN-D2 — `Chunk.symbol_kind` field
+### CN-D2 — `Chunk.symbol_kind`, `parent_kind`, and line ranges
 
-**Scope.** Plumb `symbol_kind` through the chunk record so
-downstream consumers (index, refs, embeddings) see it.
+**Scope.** Plumb the kind metadata AND line ranges through the
+chunk record so downstream consumers (index, refs, embeddings) see
+them without re-opening source files.
 
-**Realizes.** Data Model Changes bullet 2.
+**Realizes.** Data Model Changes bullet 2; also makes CN-D3's
+indexed line-range fields populatable.
 
 **Components.**
 
-- Add `pub symbol_kind: Option<String>` to `Chunk` in
-  `src/chunker/mod.rs`, after `symbol_exact`.
-- `chunks_from_symbols` writes `chunk.symbol_kind = Some(spec.kind)`
-  alongside `chunk.symbol` and `chunk.symbol_exact`.
-- Update `placeholder_chunk` / `Chunk::default`-style initializers
-  to default the new field to `None`. Non-code chunkers
-  (`markdown.rs`, `text.rs`) leave it `None`.
+- Add to `Chunk` in `src/chunker/mod.rs`, after `symbol_exact`:
+  - `pub symbol_kind: Option<String>` — copied from
+    `SymbolSpec.kind`.
+  - `pub parent_kind: Option<String>` — copied from
+    `SymbolSpec.parent_kind`. Optional today, but required for
+    deterministic indexed `refactor_kind` derivation in CN-T2.
+  - `pub line_start: Option<u32>` — 1-based line of `byte_start`,
+    derived at chunk build time from the same source buffer the
+    chunker already holds. `None` for non-line-oriented sources.
+  - `pub line_end: Option<u32>` — 1-based line of `byte_end`.
+- `chunks_from_symbols` writes all four fields when the chunk is
+  built from a `SymbolSpec`. Line conversion uses the existing
+  `line_col(...)`-style helper or a fresh `byte_to_line(source, byte)`
+  in `src/chunker/code.rs`.
+- Update `placeholder_chunk` / `Chunk::default`-style initialisers
+  to default the new fields to `None`. Non-code chunkers
+  (`markdown.rs`, `text.rs`) leave them `None`.
 - All `Chunk` construction sites in `src/index/` and `src/refactor/`
   that build chunks from scratch (e.g. test fixtures, agentic-corpus
-  build helpers) get the new field; default to `None` when no
-  kind is known.
+  build helpers) get the new fields; default to `None` when no
+  metadata is known.
 
 **Gates.**
 
 - `cargo build` and `cargo test --bin blackboxd` pass.
-- Existing index round-trip tests still match — the new field is
-  additive.
+- A unit test asserts `line_start <= line_end` for any chunk
+  whose `byte_start <= byte_end`.
+- Existing index round-trip tests still match — the new fields
+  are additive.
 
 **Follow-ups.**
 
@@ -294,7 +324,11 @@ mismatch detection forces them to land together.
 
 - Add to the schema struct in `src/index/mod.rs`:
   - `pub symbol_kind: Field` — `STRING | STORED` (exact-token
-    lookup).
+    lookup). Raw tree-sitter node kind.
+  - `pub parent_kind: Field` — `STRING | STORED`. Required so
+    indexed records can derive synthetic `refactor_kind` (e.g.
+    Rust `impl_method = function_item + parent impl_item`)
+    without re-parsing the source file. See CN-T2.
   - `pub project_id: Field` — `STRING | STORED`. Today's
     `project_file` docs include the canonical path and the exact
     `entity_id` but no queryable `project_id` token
@@ -305,14 +339,16 @@ mismatch detection forces them to land together.
     stores `byte_offset` (`src/index/mod.rs:42,550`); the indexed
     lane needs both ends to return a `byte_range` tuple matching
     the live lane.
-  - `pub line_start: Field`, `pub line_end: Field` — `u64 STORED`,
-    derived at chunk-index time so the indexed read path does not
-    have to re-open the source file.
+  - `pub line_start: Field`, `pub line_end: Field` — `u64 STORED`.
+    Sourced from `Chunk.line_start` / `Chunk.line_end` added in
+    CN-D2.
 - Index path (chunk → tantivy doc) writes the new fields whenever
-  the chunk supplies them. Code chunks always do; non-code
-  chunks may leave the line fields zero — readers must treat
-  `line_start == 0` on a non-code chunk as "unknown" and not
-  surface it.
+  the chunk supplies them. Code chunks built from a `SymbolSpec`
+  always do; non-code chunks may leave the line and kind fields
+  unset — readers MUST treat an absent (or zero) value as
+  "unknown" and not surface it. The read-side helpers use
+  `optional_u64` / `optional_text` exactly as the existing
+  field reads do.
 - Read path: extend the document-extraction helpers (the
   `optional_text(&doc, self.fields.symbol_*)` cluster around
   `src/index/mod.rs:385-389`) to surface the new fields on
@@ -549,36 +585,62 @@ should benefit from kind-aware vector text).
   tool stays usable mid-migration).
 - **Live vs indexed `kind` contract.** This is the
   load-bearing piece. Today's live lane sources `SyntaxItem.kind`
-  from `refactor::status`, which surfaces synthetic kinds like
-  `"impl_method"` for Rust impl methods
-  (`src/code_nav/mod.rs:363`-area). The proposed indexed lane
-  sources `symbol_kind` from `Chunk.symbol_kind`, which CN-D1
-  pins to the raw tree-sitter node kind — `"function_item"` for
-  the same Rust method. The two views are NOT the same. The
-  contract for this phase is:
-  - Indexed records carry `symbol_kind` (tree-sitter node kind)
-    and `refactor_kind` (the synthetic refactor item kind,
-    sourced from a small mapping table colocated with
-    `refactor::status`'s synthesizer). Both fields are present
-    on indexed records.
+  from `refactor::status`, which surfaces mostly raw tree-sitter
+  kinds (`refactor::status` uses `node.kind()` directly at
+  `src/refactor/mod.rs:2595`-area for the generic path, and Java
+  uses raw method/constructor kinds at
+  `src/refactor/java.rs:74`-area) plus one known synthetic case:
+  Rust `impl_method`, synthesised in `src/refactor/rust.rs:1809`-area
+  for `function_item` nodes whose parent is `impl_item`. The
+  proposed indexed lane sources `symbol_kind` from
+  `Chunk.symbol_kind`, which CN-D1 pins to the raw tree-sitter
+  node kind. The two views diverge ONLY at the synthetic cases.
+  The contract for this phase is:
+  - Indexed records carry `symbol_kind` (raw tree-sitter node
+    kind, from CN-D3) and `parent_kind` (raw tree-sitter parent
+    kind, from CN-D3). On the read path, the indexed lane
+    derives `refactor_kind` deterministically from
+    `(language, symbol_kind, parent_kind)` using the same
+    synthesiser logic the live lane runs — extracted into a
+    pure function `refactor_kind_for(language, symbol_kind,
+    parent_kind: Option<&str>) -> String` shared by both
+    `refactor::status` (where it lives today implicitly) and
+    the indexed `code_symbols` lane. Both `symbol_kind` and
+    `refactor_kind` end up on every indexed record. Today's
+    synthesiser surface is small (`impl_method` is the only
+    documented synthesis), so the function stays small; if
+    future languages add synthesised kinds, the function is
+    the single place to update.
   - Live records carry `refactor_kind` natively (unchanged
-    today) and a derived `symbol_kind` produced by reverse
-    mapping. Both fields are present on live records.
+    today as the existing `kind` field) and gain `symbol_kind`
+    via the same shared function, reverse-projected from the
+    syntax item's node kind.
   - The `kind` filter on `CodeSymbolSearchParams.item_kinds`
     accepts BOTH vocabularies and matches against either field
     after canonicalisation.
   - Tool-doc + `sm-refactor` text spells out the dual
     vocabulary so agents do not guess.
 - Indexed lane:
+  - Resolves `project_dir` to a project_id on the handler side
+    in `src/tools/code_nav.rs` by taking
+    `self.state.projects.read().list()` (a clone-snapshot per
+    `ProjectRegistry::list` at `src/projects.rs:300`) and
+    matching the canonicalised `project_dir` against
+    `ProjectRecord.canonical_path` (field at
+    `src/projects.rs:57`). No new `lookup_by_dir` helper is
+    introduced; the existing `list()` + linear scan is fine for
+    the project-count cardinality the daemon sees. Refactor
+    apply uses the same pattern (`src/tools/refactor.rs:55,69`).
+    If profiling later shows the linear scan is hot, a typed
+    helper can be added — out of scope here.
   - Builds a tantivy `BooleanQuery` over the `project_file`
-    document type with the requested `project_dir` resolved to
-    a project_id via `self.state.projects.read().lookup_by_dir(...)`
-    on the handler side, optional `language` filter,
-    `symbol`/`symbol_exact` substring or term match, optional
-    `path` substring (via `path_tokens`), and `symbol_kind` term
-    filter when supplied. Filter uses the
-    `project_id`/`byte_end`/`line_start`/`line_end` fields added
-    in CN-D3 — without those, this lane cannot land.
+    document type with that project_id, optional `language`
+    filter, `symbol`/`symbol_exact` substring or term match,
+    optional `path` substring (via `path_tokens`), and
+    `symbol_kind` term filter when supplied. Filter uses the
+    `project_id`/`parent_kind`/`byte_end`/`line_start`/`line_end`
+    fields added in CN-D3 — without those, this lane cannot
+    land.
   - Reads `byte_range`, `line_range`, `chunk_hash`, and ref
     components from the stored fields; reconstructs the
     `handoff` block from `path_tokens` + `chunk_hash` exactly as
@@ -606,12 +668,14 @@ should benefit from kind-aware vector text).
   same logical items as `mode="live"` for the same query.
   Equivalence is defined over the canonicalised set of
   `(file, byte_start, byte_end, symbol_kind, refactor_kind, name)`
-  tuples, modulo files filtered by `CODE_SYMBOL_SKIP_DIRS` and
-  modulo the explicit mapping table between synthetic refactor
-  kinds and raw tree-sitter node kinds. The mapping table lives
-  in code with a unit test enumerating known pairs (e.g.
-  `impl_method` ↔ `function_item` for Rust); equivalence is a
-  property test over that table.
+  tuples, modulo files filtered by `CODE_SYMBOL_SKIP_DIRS`. Both
+  lanes compute `refactor_kind` via the same
+  `refactor_kind_for(language, symbol_kind, parent_kind)`
+  function, so the tuple comparison is a direct set equality —
+  not a mapping-table reconciliation. A unit test enumerates
+  known synthesis cases (Rust `function_item` + `impl_item`
+  parent ↔ `impl_method`) and runs the equivalence check on a
+  fixture project containing each case.
 
 **Follow-ups.**
 
