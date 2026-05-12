@@ -1290,9 +1290,19 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
     // planning, applying writes to the original (main-checkout) paths
     // and silently contaminates other sessions. When the caller passes
     // `cwd` we compare git toplevels and refuse mismatches.
+    // G15 + G15-FU: fire the cross-worktree refusal even when the caller
+    // omits `cwd`. Default external MCP clients (Claude Code, Codex CLI)
+    // don't routinely thread their working directory through; without the
+    // env::current_dir fallback the guard becomes opt-in and the original
+    // breaking class is back. force_path=true is the explicit operator
+    // bypass for callers that legitimately want plan-recorded paths.
     if p.force_path != Some(true) {
-        if let Some(cwd_str) = p.cwd.as_deref() {
-            let cwd_path = PathBuf::from(cwd_str);
+        let cwd_path: Option<PathBuf> = p
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(cwd_path) = cwd_path {
             let plan_anchor: Option<PathBuf> = plan
                 .edits
                 .first()
@@ -1801,7 +1811,13 @@ pub fn run_with_ctx(
                             confirm: Some(true),
                             allow_dirty_worktree: Some(true),
                             allow_unregistered_paths: p.allow_unregistered_paths,
-                            cwd: None,
+                            // G15-FU: pass the run's project_dir as cwd
+                            // so the cross-worktree guard compares the
+                            // run's tree (not the daemon's cwd) against
+                            // the plan's tree. Same-tree runs pass; a
+                            // run dispatched against a different tree
+                            // than the plan was built for refuses.
+                            cwd: Some(p.project_dir.clone()),
                             force_path: None,
                         },
                         projects,

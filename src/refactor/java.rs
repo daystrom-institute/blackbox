@@ -284,6 +284,23 @@ fn java_source_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
     if source.lines().any(|line| line.trim() == import_line) {
         return None;
     }
+    // G7-FU: dedupe by simple name too. Two FQCNs sharing a simple name
+    // (e.g. `com.google.inject.Inject` vs `javax.inject.Inject`) can't
+    // both be imported — Java rejects duplicate simple-name imports.
+    // Skip the new import when the source already has any single-type
+    // import with the same simple name. Wildcard imports (`*`) are not
+    // a collision because they don't introduce a binding for the simple
+    // name until resolution.
+    let desired_simple = fqcn.rsplit('.').next().unwrap_or("");
+    if !desired_simple.is_empty() {
+        for line in source.lines() {
+            if let Some(existing) = java_import_simple_name(line) {
+                if existing == desired_simple {
+                    return None;
+                }
+            }
+        }
+    }
     let mut last_import_end: Option<usize> = None;
     let mut package_end: Option<usize> = None;
     let mut offset = 0usize;
@@ -347,6 +364,8 @@ fn java_builtin_type(name: &str) -> bool {
             | "Override"
             | "Deprecated"
             | "SuppressWarnings"
+            | "FunctionalInterface"
+            | "SafeVarargs"
     )
 }
 
@@ -996,16 +1015,69 @@ fn java_insert_fixme_above_calls(
 
 /// Rewrite unqualified call sites of `method` in `text` to be qualified
 /// by `class_name` (e.g. `myMethod(arg)` → `SourceClass.myMethod(arg)`).
-/// Uses the same unqualified-call detection heuristic as
-/// `java_insert_fixme_above_calls`: skip matches preceded by `.`, `:`,
-/// or an identifier char, and require `(` after the name (call form,
-/// not declaration). Used by G19 to auto-qualify public-static external
-/// calls instead of emitting FIXMEs.
+///
+/// G19-FU: AST-based rewrite via tree-sitter-java. Walks
+/// `method_invocation` nodes with no `object` (receiver) field — those
+/// are the unqualified calls. Strings, comments, and matching
+/// occurrences inside larger identifiers are skipped by the parser
+/// alone — they never produce a method_invocation node. Falls back to
+/// the previous text-scan only when parsing fails (the target text is
+/// always already parseable at this point, but the fallback keeps the
+/// helper resilient to malformed inputs).
 pub(crate) fn java_qualify_unqualified_calls(
     text: &str,
     method: &str,
     class_name: &str,
 ) -> String {
+    if let Ok(tree) = parse_source("java", text) {
+        let qualifier = format!("{class_name}.");
+        let mut inserts: Vec<usize> = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let mut c = node.walk();
+            for ch in node.named_children(&mut c) {
+                stack.push(ch);
+            }
+            if node.kind() != "method_invocation" {
+                continue;
+            }
+            // Unqualified call: no `object` field on the invocation.
+            // (Receiver-bearing calls like `foo.method(...)` have one.)
+            if node.child_by_field_name("object").is_some() {
+                continue;
+            }
+            let Some(name_node) = node.child_by_field_name("name") else {
+                continue;
+            };
+            let Ok(name_text) = name_node.utf8_text(text.as_bytes()) else {
+                continue;
+            };
+            if name_text != method {
+                continue;
+            }
+            inserts.push(name_node.start_byte());
+        }
+        // Apply inserts right-to-left so earlier offsets remain valid.
+        inserts.sort_unstable();
+        inserts.dedup();
+        if inserts.is_empty() {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len() + inserts.len() * qualifier.len());
+        let mut last = 0usize;
+        for at in inserts {
+            out.push_str(&text[last..at]);
+            out.push_str(&qualifier);
+            last = at;
+        }
+        out.push_str(&text[last..]);
+        return out;
+    }
+    // Fallback: byte scan (pre-G19-FU behavior). Reached only on
+    // unparseable input. The scan rejects matches preceded by an
+    // identifier char / `.` / `:`, requires `(` after the name, and
+    // skips method-declaration lines, but doesn't recognize string
+    // literals or comments — so the AST path is strongly preferred.
     let bytes = text.as_bytes();
     let needle = method.as_bytes();
     let qualifier = format!("{class_name}.");

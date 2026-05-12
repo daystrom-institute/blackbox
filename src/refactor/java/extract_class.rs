@@ -256,7 +256,38 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     let constructor_text = if all_target_ctor_params.is_empty() {
         String::new()
     } else {
-        java_constructor_decl(&target_class_name, "public", &all_target_ctor_params, true, None)?
+        let raw = java_constructor_decl(
+            &target_class_name,
+            "public",
+            &all_target_ctor_params,
+            true,
+            None,
+        )?;
+        // G7-FU: under guice_field_inject the source field-injects the
+        // delegate. Guice needs an `@Inject` constructor on the target
+        // to populate its captured ctor params. The annotation goes on
+        // the line immediately preceding `public <TargetClass>(...)`.
+        // We also need to inject the `javax.inject.Inject` import on
+        // the target; that's handled below when the source-side decl
+        // path emits it.
+        if p.wiring_mode.as_deref() == Some("guice_field_inject") {
+            let needle = format!("public {target_class_name}(");
+            if let Some(pos) = raw.find(&needle) {
+                let line_start = raw[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let mut out = String::with_capacity(raw.len() + 16);
+                out.push_str(&raw[..line_start]);
+                // Match the constructor's leading indent.
+                let indent: String = raw[line_start..pos].chars().collect();
+                out.push_str(&indent);
+                out.push_str("@Inject\n");
+                out.push_str(&raw[line_start..]);
+                out
+            } else {
+                raw
+            }
+        } else {
+            raw
+        }
     };
 
     // Gap 18 + Gap 6: generate getter/setter methods on the target for each
@@ -364,6 +395,13 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         if let Some(fqcn) = spec.extra_import.as_deref() {
             target_content = java_inject_import(&target_content, fqcn);
         }
+    }
+
+    // G7-FU: guice_field_inject mode added `@Inject` to the target's
+    // constructor — the target needs the `javax.inject.Inject` import
+    // so the annotation resolves.
+    if wiring_mode == "guice_field_inject" && !all_target_ctor_params.is_empty() {
+        target_content = java_inject_import(&target_content, "javax.inject.Inject");
     }
 
     // G13: propagate class-level annotations from source to target when
@@ -1431,13 +1469,26 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 }
             }
             let args_joined = arg_names.join(", ");
+            // G5-FU: preserve any `throws T1, T2` clause from the original
+            // method. tree-sitter-java exposes it as a `throws`-kind child
+            // sibling of `parameters`. Without this, delegating to a moved
+            // method that declares checked exceptions fails compilation.
+            let throws_clause: String = {
+                let mut cursor = method_node.walk();
+                method_node
+                    .children(&mut cursor)
+                    .find(|c| c.kind() == "throws")
+                    .and_then(|c| c.utf8_text(parsed.source.as_bytes()).ok())
+                    .map(|s| format!(" {}", s.trim()))
+                    .unwrap_or_default()
+            };
             let body = if return_type.trim() == "void" {
                 format!("        {delegate_field}.{method_name}({args_joined});")
             } else {
                 format!("        return {delegate_field}.{method_name}({args_joined});")
             };
             let wrapper = format!(
-                "\n    public {return_type} {method_name}{params_text} {{\n{body}\n    }}\n"
+                "\n    public {return_type} {method_name}{params_text}{throws_clause} {{\n{body}\n    }}\n"
             );
             wrappers.push(wrapper);
         }
