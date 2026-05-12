@@ -296,6 +296,35 @@ filled-in form. The CI catalog-completeness check (RA-D1, follow-up)
 will assert every `examples/agents/refactor/<name>.json` has a row
 here.
 
+## Refactor-atom distillation path (RA-V2)
+
+The v1 catalog is `provenance: hand_authored` end-to-end. The schema
+already carries `AgentProvenance::Distilled` (`src/orchestration/agents/
+types.rs:170`) — distilled atoms enter the catalog by the same path
+as hand-authored atoms (`bbox_artifact_install(kind="agent",
+source=…)`) but declare:
+
+- `provenance.kind = "distilled"`
+- `provenance.distilled_by` — agent or pipeline name that produced
+  the manifest
+- `provenance.evidence_session_ids` — session refs the distiller
+  mined for the pattern
+- `provenance.created_from_threads` — thread refs the distiller
+  walked
+
+The install path materializes agentic-corpus edges from distilled
+manifests back to source sessions/threads automatically
+(`src/server/routes.rs::persist_agent_provenance_edges`).
+
+The distiller itself is **out of scope for this skeleton**. A
+badgey-flavor pipeline that mines the corpus for recurring refactor
+task shapes and proposes new atoms is acknowledged in
+`design/refactor-agents.md` "Provenance — distillation path" and
+tracked separately from RA-* phases. When the distiller lands, the
+RA-S1 refactor-atom lint applies to distilled manifests
+unchanged — the `_contract: "refactor-atom/v1"` marker and the
+recognized-personas list bind identically regardless of provenance.
+
 ## Refactor-atom composition (RA-V1)
 
 v1 atom composition is hand-wired through workflows. The
