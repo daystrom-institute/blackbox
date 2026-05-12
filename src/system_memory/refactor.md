@@ -292,9 +292,12 @@ dispatch via `bro_agent_dispatch(agent="<name>", args={...})`.
 Per-atom manifests live at `examples/agents/refactor/<atom>.json`. The
 shared prompt template and base outputs schema (RA-T1) under the same
 directory are reference files — manifest installers inline the
-filled-in form. The CI catalog-completeness check (RA-D1, follow-up)
-will assert every `examples/agents/refactor/<name>.json` has a row
-here.
+filled-in form. `sm_refactor_catalog_lists_every_shipped_atom` (RA-D1)
+asserts every `examples/agents/refactor/<name>.json` has a row in
+this table; new atoms that land without a catalog entry fail the
+build. The mechanical alternative to a manually maintained table —
+auto-regeneration from the manifest set — is a `tools/refactor-atom-
+catalog-gen` follow-up.
 
 ## Refactor-atom distillation path (RA-V2)
 

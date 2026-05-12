@@ -1952,6 +1952,57 @@ mod tests {
     /// shared `_*` reference files) and asserts each one passes the
     /// refactor-atom lint and validates against the agent schema. New atoms
     /// landing under that path are picked up automatically.
+    /// RA-D1: the sm-refactor catalog must list every shipped atom under
+    /// `examples/agents/refactor/<name>.json` exactly once. A new atom that
+    /// lands without a catalog row fails this test — the failure message
+    /// names the missing atoms so the author knows which row to add.
+    #[test]
+    fn sm_refactor_catalog_lists_every_shipped_atom() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_root.join("examples/agents/refactor");
+
+        let mut atom_names: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("refactor agents dir exists") {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let filename = path.file_name().unwrap().to_string_lossy().to_string();
+            if filename.starts_with('_') {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read manifest");
+            let v: serde_json::Value = serde_json::from_str(&src).expect("manifest parses");
+            let name = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_else(|| panic!("{filename}: missing top-level name"))
+                .to_string();
+            atom_names.push(name);
+        }
+        atom_names.sort();
+
+        let catalog =
+            std::fs::read_to_string(crate_root.join("src/system_memory/refactor.md"))
+                .expect("read sm-refactor");
+
+        let mut missing: Vec<&str> = Vec::new();
+        for name in &atom_names {
+            let needle = format!("`{name}`");
+            if !catalog.contains(&needle) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "sm-refactor catalog is missing rows for shipped atoms: {:?}. \
+             Add a row to the \"Refactor atom catalog\" table in \
+             src/system_memory/refactor.md.",
+            missing
+        );
+    }
+
     /// RA-V1: every reference workflow under
     /// examples/agents/refactor/workflows/ parses as a Workflow and compiles
     /// cleanly. The workflows are operator-runnable artifacts; if the engine
