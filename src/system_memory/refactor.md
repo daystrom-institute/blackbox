@@ -284,6 +284,7 @@ dispatch via `bro_agent_dispatch(agent="<name>", args={...})`.
 | `rust-impl-partition-graph` | shipped (v1, RA-A1) | cheap | `rust_impl_partition_analysis` (RX-G1) | Produce method/field/call graph for a Rust impl block; analysis-only |
 | `rust-public-api-guard` | shipped (v1, RA-A2) | normal | `rust_public_api_guard` (RX-G2) | Report public-API delta of a proposed refactor as advisory severity; preflight for mutating atoms |
 | `rust-test-island-extract` | shipped (v1, RA-A3) | normal | `extract_rust_items`, `add_rust_mod_decl`, `rust_compile_fix_round` | Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files |
+| `rust-state-extract` | shipped (v1, RA-A4) | normal | `extract_rust_items`, `move_rust_struct_fields`, `add_rust_delegate_field`, `update_rust_callers`, `rust_compile_fix_round` | Pull a self.<field> cluster into a separate struct + delegate; operator-authority `acknowledge_repr` for #[repr(C)] / #[repr(packed)] |
 
 Per-atom manifests live at `examples/agents/refactor/<atom>.json`. The
 shared prompt template and base outputs schema (RA-T1) under the same

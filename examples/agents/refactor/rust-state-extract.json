@@ -1,0 +1,107 @@
+{
+  "kind": "agent",
+  "name": "rust-state-extract",
+  "version": 1,
+  "_contract": "refactor-atom/v1",
+  "manifest": {
+    "description": "Pull a cluster of self.<field> reads into a separate struct, wire as a delegate, and rewrite source-side accesses conservatively.",
+    "when_to_use": [
+      "5+ fields on a struct are read/written together as a logical cluster",
+      "operator wants to break a circular dependency by extracting a sub-state",
+      "operator wants to make a field cluster independently testable"
+    ],
+    "anti_patterns": [
+      "do not use to strategize complex initialization order — the atom wires constructors mechanically, not by reasoning about timing",
+      "do not use on #[repr(C)] or #[repr(packed)] structs unless acknowledge_repr=true is provided (operator-authority opt-out)",
+      "do not use when a different atom (rust-impl-partition-graph) would help operator decide which fields cluster"
+    ],
+    "brofile_ref": "rust-refactor-persona",
+    "filter_overlay": {
+      "allow": [],
+      "disallow": []
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source_file",
+          "source_struct",
+          "target_struct_name",
+          "target_module_path",
+          "field_names",
+          "delegate_field"
+        ],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source_file": { "type": "string" },
+          "source_struct": { "type": "string" },
+          "target_struct_name": { "type": "string" },
+          "target_module_path": { "type": "string" },
+          "field_names": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "delegate_field": { "type": "string" },
+          "acknowledge_repr": {
+            "type": "boolean",
+            "description": "Operator-authority opt-out for #[repr(C)] / #[repr(packed)] sources. MUST be operator-explicit per RX-V1 — no default."
+          },
+          "apply": { "type": "boolean" },
+          "validation_bin": { "type": "string" }
+        }
+      },
+      "prompt_template": "You are rust-state-extract. Charter: Pull a self.<field> cluster into a separate struct + delegate.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{source_struct}}\",\n                     languages=[\"rust\"], item_kinds=[\"struct_item\"])\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Copy exact field names from the struct's field_declaration_list. Confirm\n   every name in {{field_names}} resolves. If the struct carries #[repr(C)]\n   or #[repr(packed)], check inputs.acknowledge_repr — if false/missing,\n   prepare to block.\n\n2. Plan with deep_analysis=true:\n   bbox_refactor_plan(kind=\"extract_rust_items\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      target=\"{{target_module_path}}\",\n                      item_names=[\"<placeholder>\"])  // generate target struct\n   bbox_refactor_plan(kind=\"move_rust_struct_fields\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      source_struct=\"{{source_struct}}\",\n                      target_struct=\"{{target_struct_name}}\",\n                      field_names={{field_names}})\n   bbox_refactor_plan(kind=\"add_rust_delegate_field\",\n                      source=\"{{source_file}}\", source_struct=\"{{source_struct}}\",\n                      delegate_field=\"{{delegate_field}}\",\n                      target_struct=\"{{target_struct_name}}\")\n   bbox_refactor_plan(kind=\"update_rust_callers\",\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      delegate_field=\"{{delegate_field}}\",\n                      field_names={{field_names}},\n                      emit_applied_markers=true)\n\n3. Decide:\n   - If grounding found #[repr(C)] / #[repr(packed)] AND\n     inputs.acknowledge_repr != true: emit\n     bbox_note(kind=\"blocked\", body=<concrete diagnostic naming the repr +\n     plan_path>) and return status=\"blocked\". The atom MUST NOT default\n     acknowledge_repr; operator-authority is explicit (RX-V1).\n   - If move_rust_struct_fields reports captured_self_fields outside\n     {{field_names}} that imply unstated cluster members, surface in the\n     done note and proceed only when {{apply}} is false (plan-only).\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(confirm=true, steps=[\n     <extract_rust_items step>,\n     <move_rust_struct_fields step>,\n     <add_rust_delegate_field step>,\n     <update_rust_callers step>,\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true}\n   ])\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: delegate_field,\n     accessors_generated count, remaining_source_accessors count,\n     unrewriteable_accessors count, cargo result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside your filter_overlay.\n- Never default acknowledge_repr — operator-authority is explicit.\n- Never proceed past cargo check failure (runner rolls back per RX-F2b).\n- Never apply when status=blocked.\n\nInputs:\n{{project_dir}} {{source_file}} {{source_struct}} {{target_struct_name}} {{target_module_path}} {{field_names}} {{delegate_field}} {{acknowledge_repr}} {{apply}} {{validation_bin}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": { "type": "integer", "minimum": 0 },
+              "warning": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "delegate_field": { "type": "string" },
+          "accessors_generated": { "type": "integer", "minimum": 0 },
+          "remaining_source_accessors": { "type": "integer", "minimum": 0 },
+          "unrewriteable_accessors": { "type": "integer", "minimum": 0 },
+          "borrow_promotions": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "composition": {
+      "chainable_after": ["rust-impl-partition-graph"],
+      "parallel_safe": false
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-11T00:00:00Z"
+    }
+  }
+}
