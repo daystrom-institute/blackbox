@@ -772,6 +772,239 @@ fn make_test_field_handles() -> crate::index::FieldHandles {
     fields
 }
 
+// ── CN-T1: bbox_code_refs ────────────────────────────────────────────
+
+/// Rust calls: simple function-call captures with containing_symbol
+/// resolution to the enclosing fn.
+#[test]
+fn code_refs_rust_calls_resolve_containing_symbol() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(
+        &dir,
+        "src/lib.rs",
+        "fn outer() { println!(\"hi\"); helper(); }\nfn helper() {}\n",
+    );
+    let json = code_refs(&CodeRefsParams {
+        file,
+        project_dir: None,
+        kind: "calls".to_string(),
+        query: None,
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let response: CodeRefsResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response.status, "ok");
+    assert_eq!(response.language, "rust");
+    assert_eq!(response.kind_filter, "calls");
+    assert_eq!(response.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
+    assert!(response.refs.iter().all(|r| r.edge_confidence == "heuristic"));
+    let names: std::collections::HashSet<&str> =
+        response.refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        names.contains("helper"),
+        "expected `helper` call; got {:?}",
+        names
+    );
+    let helper_ref = response
+        .refs
+        .iter()
+        .find(|r| r.name == "helper")
+        .expect("helper ref present");
+    assert_eq!(helper_ref.kind, "call");
+    assert_eq!(
+        helper_ref.containing_symbol.as_deref(),
+        Some("outer"),
+        "containing_symbol must resolve to the enclosing fn"
+    );
+}
+
+/// Java imports: the curated query emits one `@import` per
+/// import_declaration node.
+#[test]
+fn code_refs_java_imports() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(
+        &dir,
+        "src/Foo.java",
+        "package x;\nimport java.util.List;\nimport java.util.Map;\nclass Foo {}\n",
+    );
+    let json = code_refs(&CodeRefsParams {
+        file,
+        project_dir: None,
+        kind: "imports".to_string(),
+        query: None,
+        limit: None,
+        include_text: Some(true),
+    })
+    .unwrap();
+    let response: CodeRefsResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response.status, "ok");
+    assert_eq!(response.language, "java");
+    assert_eq!(response.matching_refs, 2);
+    assert!(response.refs.iter().all(|r| r.kind == "import"));
+}
+
+/// Python identifiers: filter by query substring narrows the
+/// notoriously-large identifier set to a single symbol.
+#[test]
+fn code_refs_python_identifiers_with_query_filter() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(
+        &dir,
+        "src/m.py",
+        "def alpha():\n    return beta() + gamma\n\ndef beta():\n    return 1\n",
+    );
+    let json = code_refs(&CodeRefsParams {
+        file,
+        project_dir: None,
+        kind: "identifiers".to_string(),
+        query: Some("beta".to_string()),
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let response: CodeRefsResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response.status, "ok");
+    assert_eq!(response.language, "python");
+    assert!(response.refs.iter().all(|r| r.name.contains("beta")));
+    assert!(response.matching_refs >= 2, "expected at least 2 beta identifiers");
+}
+
+/// Unsupported language + non-identifier kind returns a typed
+/// error response with code `unsupported_language_for_code_refs`.
+/// Same kind="identifiers" on that language falls back to the
+/// generic walker.
+#[test]
+fn code_refs_unsupported_language_typed_error_for_non_identifier_kind() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(&dir, "x.erl", "foo() -> ok.\n");
+
+    let calls_json = code_refs(&CodeRefsParams {
+        file: file.clone(),
+        project_dir: None,
+        kind: "calls".to_string(),
+        query: None,
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let calls_err: CodeNavErrorResponse = serde_json::from_str(&calls_json).unwrap();
+    assert_eq!(calls_err.status, "error");
+    assert_eq!(calls_err.code, "unsupported_language_for_code_refs");
+    assert!(calls_err.suggestion.contains("identifiers"));
+
+    let ids_json = code_refs(&CodeRefsParams {
+        file,
+        project_dir: None,
+        kind: "identifiers".to_string(),
+        query: None,
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let ids_response: CodeRefsResponse = serde_json::from_str(&ids_json).unwrap();
+    assert_eq!(ids_response.status, "ok", "identifiers fallback must work");
+    // The generic walker emits records for nodes literally named
+    // `"identifier"`. Erlang uses different node kinds (`atom`,
+    // `variable`, ...), so the count here may be 0 — that's an
+    // honest limitation of the fallback. The test asserts the
+    // shape, not the count.
+    assert_eq!(ids_response.kind_filter, "identifiers");
+    assert_eq!(ids_response.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
+}
+
+/// CN-S1 file-size gate must apply to code_refs the same way it
+/// applies to code_query / code_node_describe / code_symbols.
+#[test]
+fn code_refs_rejects_oversize_files_with_typed_error() {
+    let dir = TempDir::new().unwrap();
+    let mut oversize = String::with_capacity(MAX_CODE_NAV_FILE_BYTES as usize + 1024);
+    oversize.push_str("fn main() {}\n");
+    while (oversize.len() as u64) <= MAX_CODE_NAV_FILE_BYTES {
+        oversize.push_str("// padding line\n");
+    }
+    let file = setup_test_file(&dir, "huge.rs", &oversize);
+
+    let json = code_refs(&CodeRefsParams {
+        file,
+        project_dir: None,
+        kind: "calls".to_string(),
+        query: None,
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let err: CodeNavErrorResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(err.status, "error");
+    assert_eq!(err.code, "file_too_large_for_code_nav");
+    assert!(err.file_bytes.unwrap() > MAX_CODE_NAV_FILE_BYTES);
+}
+
+/// `kind="all"` returns calls + imports + fields + identifiers
+/// merged into one record list, with stable byte-order sorting.
+#[test]
+fn code_refs_all_kind_returns_union_in_byte_order() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(
+        &dir,
+        "src/lib.rs",
+        "use std::fs;\nfn main() { let x = 1; fs::read(\"p\"); x.field; }\n",
+    );
+    let json = code_refs(&CodeRefsParams {
+        file,
+        project_dir: None,
+        kind: "all".to_string(),
+        query: None,
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let response: CodeRefsResponse = serde_json::from_str(&json).unwrap();
+    let kinds: std::collections::HashSet<&str> =
+        response.refs.iter().map(|r| r.kind.as_str()).collect();
+    assert!(kinds.contains("identifier"), "expected identifier refs in 'all'");
+    assert!(
+        kinds.contains("call"),
+        "expected call refs in 'all'; got {:?}",
+        kinds
+    );
+    // Stable byte-order: each record's byte_start must be >= prev.
+    for window in response.refs.windows(2) {
+        assert!(
+            window[0].byte_range.0 <= window[1].byte_range.0,
+            "refs must be sorted by byte_start; got {:?}",
+            response.refs.iter().map(|r| r.byte_range).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// `limit` truncates the returned set; `matching_refs` reflects the
+/// pre-truncation total; `truncation_reason="limit_reached"` fires.
+#[test]
+fn code_refs_truncation_reports_limit_reached() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(
+        &dir,
+        "src/lib.rs",
+        "fn main() { a; b; c; d; e; }\n",
+    );
+    let json = code_refs(&CodeRefsParams {
+        file,
+        project_dir: None,
+        kind: "identifiers".to_string(),
+        query: None,
+        limit: Some(2),
+        include_text: None,
+    })
+    .unwrap();
+    let response: CodeRefsResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response.returned_refs, 2);
+    assert!(response.matching_refs > response.returned_refs);
+    assert!(response.truncated);
+    assert_eq!(response.truncation_reason.as_deref(), Some("limit_reached"));
+}
+
 /// CN-T2: when no index is provided, the dispatcher must default to
 /// mode="live" rather than failing. Tests historically don't pass an
 /// index; this guards that contract.

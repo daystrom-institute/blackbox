@@ -1,6 +1,6 @@
 use crate::code_nav::{
-    code_node_describe, code_query, code_symbols, CodeNodeDescribeParams, CodeQueryParams,
-    CodeSymbolSearchParams,
+    code_node_describe, code_query, code_refs, code_symbols, CodeNodeDescribeParams,
+    CodeQueryParams, CodeRefsParams, CodeSymbolSearchParams,
 };
 use crate::server::*;
 use crate::*;
@@ -46,5 +46,16 @@ impl BlackboxServer {
         Parameters(p): Parameters<CodeNodeDescribeParams>,
     ) -> CallToolResult {
         Self::run("bbox_code_node_describe", || code_node_describe(&p))
+    }
+
+    #[tool(
+        name = "bbox_code_refs",
+        description = "Extract syntactic references (calls, imports, fields, identifiers) from one source file. Per-language tree-sitter queries; identifiers fallback for unsupported languages. Records are syntax-only with edge_confidence=\"heuristic\"."
+    )]
+    pub(crate) fn bbox_code_refs(
+        &self,
+        Parameters(p): Parameters<CodeRefsParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_code_refs", || code_refs(&p))
     }
 }

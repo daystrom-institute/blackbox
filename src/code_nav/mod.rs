@@ -490,6 +490,88 @@ pub struct CodeNodeDescribeParams {
     pub include_text: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodeRefsParams {
+    /// Source file to extract references from. Absolute or
+    /// project-relative when `project_dir` is set.
+    pub file: String,
+    /// Project root (resolves relative `file`; subject to the CN-S1
+    /// file-size gate). Optional — when omitted the file path must
+    /// be absolute and the gate still applies.
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    /// Which references to extract. Stable values:
+    /// - `"calls"`: function-call sites
+    /// - `"imports"`: import / use declarations
+    /// - `"fields"`: field-access expressions
+    /// - `"identifiers"`: every identifier occurrence
+    /// - `"all"`: union of the above
+    pub kind: String,
+    /// Optional case-sensitive substring filter on the reference's
+    /// display name. Useful for narrowing `"identifiers"` (which is
+    /// otherwise huge) to a single symbol.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Maximum returned records. Defaults to 200, capped at 1000.
+    /// Truncation is signalled via `truncation_reason` in the
+    /// response.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Include a short text excerpt on each record. Defaults false.
+    #[serde(default)]
+    pub include_text: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CodeRefsResponse {
+    pub status: String,
+    pub path: String,
+    pub language: String,
+    /// Echoes the `kind` request parameter so callers can dispatch.
+    pub kind_filter: String,
+    pub matching_refs: usize,
+    pub returned_refs: usize,
+    pub truncated: bool,
+    /// Stable values: `"limit_reached"` when more refs matched than
+    /// `limit` allowed; omitted when `truncated=false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<String>,
+    pub refs: Vec<CodeRefRecord>,
+    pub parse_report: ParseReport,
+    /// Always `"syntax_only"` — these are tree-sitter captures, not
+    /// binding-aware references. Use LSP / refactor graph for binding
+    /// authority.
+    pub semantic_status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CodeRefRecord {
+    /// Reference category: `"call"`, `"import"`, `"field"`, or
+    /// `"identifier"`.
+    pub kind: String,
+    /// Displayed name (the identifier text at the capture site).
+    pub name: String,
+    /// Raw tree-sitter node kind that produced the capture.
+    pub node_kind: String,
+    pub byte_range: (usize, usize),
+    pub line_range: (usize, usize),
+    pub column_range: (usize, usize),
+    /// Nearest enclosing symbol-producing ancestor's display name,
+    /// when walking the parent chain finds one cheaply. Same notion
+    /// of "containing symbol" as `Chunk.parent_kind`. `None` at file
+    /// top level or when no symbol-producing ancestor is found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containing_symbol: Option<String>,
+    /// Always `"heuristic"`. These are syntax captures, not binding
+    /// resolution — even when a call site's `name` matches an
+    /// indexed symbol exactly, that's a name collision until LSP /
+    /// the refactor graph confirms.
+    pub edge_confidence: String,
+    /// Source excerpt when the caller requested `include_text=true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CodeNodeDescribeResponse {
     pub status: String,
@@ -1468,6 +1550,347 @@ pub fn code_symbols_indexed(
         truncation_reason,
         items,
         errors: Vec::new(),
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
+    };
+    Ok(serde_json::to_string_pretty(&response)?)
+}
+
+/// Per-language tree-sitter S-expression query strings for
+/// `bbox_code_refs`. Each query emits four capture names:
+/// `@call`, `@import`, `@field`, `@identifier`. The caller filters
+/// by capture name to honour the requested `kind`. Adding a new
+/// language: emit those four capture names; if the grammar has no
+/// useful pattern for a kind, omit it — the kind will return empty
+/// records for that language rather than erroring.
+fn code_refs_query_for(language: &str) -> Option<&'static str> {
+    match language {
+        "rust" => Some(
+            r#"
+            (call_expression function: (_) @call)
+            (use_declaration argument: (_) @import)
+            (field_expression field: (_) @field)
+            (identifier) @identifier
+            "#,
+        ),
+        "java" => Some(
+            r#"
+            (method_invocation name: (_) @call)
+            (import_declaration) @import
+            (field_access field: (_) @field)
+            (identifier) @identifier
+            "#,
+        ),
+        "python" => Some(
+            r#"
+            (call function: (_) @call)
+            (import_statement) @import
+            (import_from_statement) @import
+            (attribute attribute: (_) @field)
+            (identifier) @identifier
+            "#,
+        ),
+        "typescript" | "javascript" => Some(
+            r#"
+            (call_expression function: (_) @call)
+            (import_statement) @import
+            (member_expression property: (_) @field)
+            (identifier) @identifier
+            "#,
+        ),
+        "go" => Some(
+            r#"
+            (call_expression function: (_) @call)
+            (import_spec) @import
+            (selector_expression field: (_) @field)
+            (identifier) @identifier
+            "#,
+        ),
+        _ => None,
+    }
+}
+
+/// Return the set of capture names that match the requested `kind`
+/// filter. `"all"` accepts every capture; named filters accept only
+/// the matching capture.
+fn code_refs_capture_filter(kind: &str) -> Result<&'static [&'static str]> {
+    match kind {
+        "calls" => Ok(&["call"]),
+        "imports" => Ok(&["import"]),
+        "fields" => Ok(&["field"]),
+        "identifiers" => Ok(&["identifier"]),
+        "all" => Ok(&["call", "import", "field", "identifier"]),
+        _ => Err(anyhow!(
+            "unknown kind {kind:?}; expected one of calls/imports/fields/identifiers/all"
+        )),
+    }
+}
+
+/// Walk up the tree from `node` and return the display name of the
+/// nearest symbol-producing ancestor (same notion of "containing
+/// symbol" as `SymbolSpec.parent_kind`). Best-effort — returns
+/// `None` at file top level or when no ancestor is symbol-producing.
+fn containing_symbol_for(node: tree_sitter::Node<'_>, source: &str, language: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        // Skip wrapper nodes; only return when the AST node itself
+        // is one we'd treat as a symbol (function_item / impl_item /
+        // class_declaration / ...). Reuse chunker::code's predicate
+        // by emulating it inline — we keep the symbol-node set in
+        // exactly one place (the chunker) but can mirror enough of
+        // it here for the common cases.
+        let kind = parent.kind();
+        if matches!(
+            kind,
+            "function_item"
+                | "function_definition"
+                | "function_declaration"
+                | "method_definition"
+                | "method_declaration"
+                | "impl_item"
+                | "class_definition"
+                | "class_declaration"
+                | "struct_item"
+                | "enum_item"
+                | "enum_declaration"
+                | "trait_item"
+                | "interface_declaration"
+        ) {
+            // Find the `name` child of the ancestor; that's the
+            // display name we report.
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                if let Ok(s) = name_node.utf8_text(source.as_bytes()) {
+                    return Some(s.to_string());
+                }
+            }
+            // Rust impl headers have no `name` field — use the
+            // whole header text up to the `{`.
+            if language == "rust" && kind == "impl_item" {
+                // Slice the source up to the body's start to
+                // mimic `impl_header` from the chunker.
+                if let Some(body) = parent.child_by_field_name("body") {
+                    let header = &source[parent.start_byte()..body.start_byte()];
+                    return Some(header.trim().to_string());
+                }
+            }
+            return None;
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+pub fn code_refs(p: &CodeRefsParams) -> Result<String> {
+    use tree_sitter::{Query, QueryCursor, StreamingIterator};
+
+    let path = resolve_path(p.project_dir.as_deref(), &p.file)?;
+    if let Some(err_json) = check_code_nav_file_size(&path)? {
+        return Ok(err_json);
+    }
+    let parsed = parse_code_nav_source(&path, None)?;
+    let language = parsed.language.clone();
+
+    let capture_filter = code_refs_capture_filter(&p.kind)?;
+    let query_text = match code_refs_query_for(&language) {
+        Some(q) => q,
+        None => {
+            // Unsupported language: only `identifiers` can fall back
+            // to a generic walker. For other kinds, return a typed
+            // error so the caller knows to switch tools.
+            if p.kind == "identifiers" {
+                // Generic walker fallback (rare path).
+                return code_refs_generic_identifiers(&parsed, p);
+            }
+            let response = CodeNavErrorResponse {
+                status: "error".to_string(),
+                code: "unsupported_language_for_code_refs".to_string(),
+                message: format!(
+                    "{language} has no curated tree-sitter query for {kind:?}; \
+                     `identifiers` is the only kind that falls back to the generic walker.",
+                    kind = p.kind
+                ),
+                suggestion: format!(
+                    "Either pass kind=\"identifiers\" (works on any tree-sitter language), \
+                     or use bbox_code_query with a grammar-native S-expression."
+                ),
+                file: Some(path.to_string_lossy().into_owned()),
+                file_bytes: None,
+                max_bytes: None,
+                project_dir: p.project_dir.clone(),
+                registered_projects: Vec::new(),
+                semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
+            };
+            return Ok(serde_json::to_string_pretty(&response)?);
+        }
+    };
+
+    let ts_lang = ts_language_for_name(&language)?;
+    let query = Query::new(&ts_lang, query_text)
+        .map_err(|e| anyhow!("internal: invalid code_refs query for {language}: {e}"))?;
+    let capture_names = query.capture_names();
+
+    let limit = p.limit.unwrap_or(200).min(1000);
+    let include_text = p.include_text.unwrap_or(false);
+    let name_filter = p.query.as_deref().filter(|s| !s.is_empty());
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, parsed.tree.root_node(), parsed.source.as_bytes());
+
+    let mut matching_refs = 0usize;
+    let mut records: Vec<CodeRefRecord> = Vec::new();
+
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            let capture_name = capture_names[cap.index as usize];
+            if !capture_filter.contains(&capture_name) {
+                continue;
+            }
+            let node = cap.node;
+            let Ok(name) = node.utf8_text(parsed.source.as_bytes()) else {
+                continue;
+            };
+            if let Some(filter) = name_filter {
+                if !name.contains(filter) {
+                    continue;
+                }
+            }
+            matching_refs += 1;
+            if records.len() >= limit {
+                continue;
+            }
+            let start = node.start_position();
+            let end = node.end_position();
+            let text = if include_text {
+                Some(excerpt(name, 200))
+            } else {
+                None
+            };
+            records.push(CodeRefRecord {
+                kind: capture_to_ref_kind(capture_name).to_string(),
+                name: name.to_string(),
+                node_kind: node.kind().to_string(),
+                byte_range: (node.start_byte(), node.end_byte()),
+                line_range: (start.row + 1, end.row + 1),
+                column_range: (start.column + 1, end.column + 1),
+                containing_symbol: containing_symbol_for(node, &parsed.source, &language),
+                edge_confidence: "heuristic".to_string(),
+                text,
+            });
+        }
+    }
+
+    // Stable ordering by (byte_start, byte_end) so successive calls
+    // return records in the same order.
+    records.sort_by_key(|r| (r.byte_range.0, r.byte_range.1));
+
+    let truncated = matching_refs > records.len();
+    let truncation_reason = if truncated {
+        Some("limit_reached".to_string())
+    } else {
+        None
+    };
+
+    let response = CodeRefsResponse {
+        status: "ok".to_string(),
+        path: path.to_string_lossy().into_owned(),
+        language,
+        kind_filter: p.kind.clone(),
+        matching_refs,
+        returned_refs: records.len(),
+        truncated,
+        truncation_reason,
+        refs: records,
+        parse_report: parse_report(parsed.tree.root_node()),
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
+    };
+    Ok(serde_json::to_string_pretty(&response)?)
+}
+
+/// Map a query capture name to the public `kind` value on
+/// `CodeRefRecord`. The two vocabularies diverge by a trailing `s`
+/// — the request param is plural (`"calls"`), but each record's own
+/// kind is singular (`"call"`).
+fn capture_to_ref_kind(capture: &str) -> &'static str {
+    match capture {
+        "call" => "call",
+        "import" => "import",
+        "field" => "field",
+        "identifier" => "identifier",
+        _ => "identifier",
+    }
+}
+
+/// Generic identifier-only walker for languages without a curated
+/// code_refs query. Walks every named node and emits a record for
+/// each `identifier` node it finds.
+fn code_refs_generic_identifiers(parsed: &CodeNavParsedSource, p: &CodeRefsParams) -> Result<String> {
+    let limit = p.limit.unwrap_or(200).min(1000);
+    let include_text = p.include_text.unwrap_or(false);
+    let name_filter = p.query.as_deref().filter(|s| !s.is_empty());
+
+    let mut cursor = parsed.tree.walk();
+    let mut stack = vec![parsed.tree.root_node()];
+    let mut matching_refs = 0usize;
+    let mut records: Vec<CodeRefRecord> = Vec::new();
+
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            if let Ok(name) = node.utf8_text(parsed.source.as_bytes()) {
+                let matches_filter = name_filter
+                    .map(|f| name.contains(f))
+                    .unwrap_or(true);
+                if matches_filter {
+                    matching_refs += 1;
+                    if records.len() < limit {
+                        let start = node.start_position();
+                        let end = node.end_position();
+                        records.push(CodeRefRecord {
+                            kind: "identifier".to_string(),
+                            name: name.to_string(),
+                            node_kind: node.kind().to_string(),
+                            byte_range: (node.start_byte(), node.end_byte()),
+                            line_range: (start.row + 1, end.row + 1),
+                            column_range: (start.column + 1, end.column + 1),
+                            containing_symbol: containing_symbol_for(
+                                node,
+                                &parsed.source,
+                                &parsed.language,
+                            ),
+                            edge_confidence: "heuristic".to_string(),
+                            text: if include_text {
+                                Some(excerpt(name, 200))
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+
+    records.sort_by_key(|r| (r.byte_range.0, r.byte_range.1));
+
+    let truncated = matching_refs > records.len();
+    let truncation_reason = if truncated {
+        Some("limit_reached".to_string())
+    } else {
+        None
+    };
+
+    let response = CodeRefsResponse {
+        status: "ok".to_string(),
+        path: parsed.path.to_string_lossy().into_owned(),
+        language: parsed.language.clone(),
+        kind_filter: p.kind.clone(),
+        matching_refs,
+        returned_refs: records.len(),
+        truncated,
+        truncation_reason,
+        refs: records,
+        parse_report: parse_report(parsed.tree.root_node()),
         semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
     };
     Ok(serde_json::to_string_pretty(&response)?)
