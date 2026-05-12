@@ -2,7 +2,7 @@
 
 Status: design proposal v2
 Date: 2026-05-12
-Related: `design/proposed/tmux-portal-workflows.md`, `WORKFLOWS.md`
+Related: `design/proposed/provider-transcript-read-plane-impl.md`, `design/proposed/tmux-portal-workflows.md`, `WORKFLOWS.md`
 
 ## 1. Thesis
 
