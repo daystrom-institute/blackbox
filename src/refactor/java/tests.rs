@@ -7602,6 +7602,50 @@ class Example {\n\
         );
     }
 
+    // G7-FU-v2: source carrying a wildcard Guice import must NOT receive
+    // an explicit javax.inject.Inject — the wildcard already supplies an
+    // `Inject` binding and the new explicit import would silently flip
+    // which one resolves bare. Conservative: any wildcard in the source
+    // blocks the explicit add.
+    #[test]
+    fn g7_fu_v2_wildcard_import_blocks_javax_inject_addition() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import com.google.inject.*;\n\
+             public class Admin {\n\
+            \x20   @Inject private Object dep;\n\
+            \x20   public Long save() { return 1L; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["save".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.wiring_mode = Some("guice_field_inject".to_string());
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("import com.google.inject.*;"),
+            "wildcard import must survive: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("import javax.inject.Inject;"),
+            "wildcard import must block adding `javax.inject.Inject`: {rewritten}"
+        );
+    }
+
     // G16-FU: @FunctionalInterface and @SafeVarargs are JDK built-in
     // annotation types — java_builtin_type must classify them as such so
     // the organize-imports heuristic doesn't try to resolve them as
