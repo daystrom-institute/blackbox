@@ -125,7 +125,15 @@ pub(crate) fn build_project_file_doc(
         doc.add_text(f.path_tokens, symbol.as_str());
     }
     doc.add_u64(f.byte_offset, chunk.byte_start);
+    doc.add_u64(f.byte_end, chunk.byte_end);
+    if let Some(line_start) = chunk.line_start {
+        doc.add_u64(f.line_start, line_start as u64);
+    }
+    if let Some(line_end) = chunk.line_end {
+        doc.add_u64(f.line_end, line_end as u64);
+    }
     doc.add_u64(f.is_subagent, 0);
+    doc.add_text(f.project_id, &project.project_id);
     doc.add_text(f.chunk_kind, &chunk.chunk_kind);
     doc.add_text(f.chunk_hash, &chunk.chunk_hash);
     doc.add_text(f.entity_id, &entity_id);
@@ -137,6 +145,12 @@ pub(crate) fn build_project_file_doc(
     }
     if let Some(symbol_exact) = &chunk.symbol_exact {
         doc.add_text(f.symbol_exact, symbol_exact);
+    }
+    if let Some(symbol_kind) = &chunk.symbol_kind {
+        doc.add_text(f.symbol_kind, symbol_kind);
+    }
+    if let Some(parent_kind) = &chunk.parent_kind {
+        doc.add_text(f.parent_kind, parent_kind);
     }
     if let Some(repo_id) = &project.repo_id {
         doc.add_text(f.repo_id, repo_id);

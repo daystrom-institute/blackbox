@@ -12,7 +12,7 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g5-symbol-tokenized";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g6-symbol-kind-and-ranges";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -40,10 +40,31 @@ pub struct FieldHandles {
     /// files literally named voyage.rs / queue.rs over arbitrary content matches.
     pub path_tokens: Field,
     pub byte_offset: Field,
+    /// End byte of the chunk in the source file (CN-D3). Stored so the
+    /// indexed code_symbols lane can return a `byte_range: (start,
+    /// end)` tuple matching the live lane without re-reading the
+    /// source file.
+    #[allow(dead_code)]
+    pub byte_end: Field,
+    /// 1-based start line in the source file (CN-D3). Sourced from
+    /// `Chunk.line_start`.
+    #[allow(dead_code)]
+    pub line_start: Field,
+    /// 1-based end line in the source file (CN-D3). Sourced from
+    /// `Chunk.line_end`.
+    #[allow(dead_code)]
+    pub line_end: Field,
     pub git_branch: Field,
     pub is_subagent: Field,
     pub agent_slug: Field,
     pub doc_type: Field,
+    /// Project ID as a queryable STRING term (CN-D3). Previously a
+    /// project_file doc carried the canonical path + entity_id but no
+    /// fast `project_id` filter; the indexed code_symbols lane needs
+    /// one. Populated whenever the chunk has a non-empty
+    /// `chunk.project_id`.
+    #[allow(dead_code)]
+    pub project_id: Field,
     #[allow(dead_code)]
     pub chunk_kind: Field,
     #[allow(dead_code)]
@@ -52,6 +73,17 @@ pub struct FieldHandles {
     pub symbol: Field,
     #[allow(dead_code)]
     pub symbol_exact: Field,
+    /// Raw tree-sitter node kind for the chunk's symbol (CN-D3). See
+    /// CN-D1 / CN-D2 for how the value is sourced. STRING-tokenized
+    /// so kind filters are exact-match.
+    #[allow(dead_code)]
+    pub symbol_kind: Field,
+    /// Kind of the nearest enclosing symbol-producing ancestor (CN-D3).
+    /// Required so the indexed code_symbols lane can derive
+    /// `refactor_kind_for(language, symbol_kind, parent_kind)` without
+    /// re-parsing.
+    #[allow(dead_code)]
+    pub parent_kind: Field,
     #[allow(dead_code)]
     pub code_content: Field,
     #[allow(dead_code)]
@@ -548,10 +580,14 @@ pub(crate) fn build_schema() -> (Schema, FieldHandles) {
         file_path: builder.add_text_field("file_path", STRING | STORED),
         path_tokens: builder.add_text_field("path_tokens", code_options.clone()),
         byte_offset: builder.add_u64_field("byte_offset", STORED),
+        byte_end: builder.add_u64_field("byte_end", STORED),
+        line_start: builder.add_u64_field("line_start", STORED),
+        line_end: builder.add_u64_field("line_end", STORED),
         git_branch: builder.add_text_field("git_branch", STRING | STORED),
         is_subagent: builder.add_u64_field("is_subagent", INDEXED | STORED),
         agent_slug: builder.add_text_field("agent_slug", STRING | STORED),
         doc_type: builder.add_text_field("doc_type", STRING | STORED),
+        project_id: builder.add_text_field("project_id", STRING | STORED),
         chunk_kind: builder.add_text_field("chunk_kind", STRING | STORED),
         language: builder.add_text_field("language", STRING | STORED),
         // Use code_tokenizer on `symbol` so qualified names like
@@ -562,6 +598,8 @@ pub(crate) fn build_schema() -> (Schema, FieldHandles) {
         // as one token, so the snake_case query never aligns).
         symbol: builder.add_text_field("symbol", code_options.clone()),
         symbol_exact: builder.add_text_field("symbol_exact", STRING | STORED),
+        symbol_kind: builder.add_text_field("symbol_kind", STRING | STORED),
+        parent_kind: builder.add_text_field("parent_kind", STRING | STORED),
         code_content: builder.add_text_field("code_content", code_options),
         chunk_hash: builder.add_text_field("chunk_hash", STRING | STORED),
         entity_id: builder.add_text_field("entity_id", STRING | STORED),
@@ -725,6 +763,92 @@ mod tests {
             })
             .unwrap();
         assert!(result.contains("/tmp/repo/src/lib.rs"), "{result}");
+    }
+
+    /// CN-D3 contract: project_file docs carry symbol_kind, parent_kind,
+    /// byte_end, line_start, line_end, and a queryable project_id term.
+    /// Without these stored fields the indexed code_symbols lane in
+    /// CN-T2 cannot operate. Verify each round-trips through tantivy.
+    #[test]
+    fn project_file_doc_round_trips_symbol_kind_parent_kind_line_ranges_and_project_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        let index = TranscriptIndex::open_or_create(
+            &index_path,
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let project = crate::projects::ProjectRecord {
+            project_id: "proj-cn-d3".into(),
+            repo_id: Some("repo-cn-d3".into()),
+            canonical_path: "/tmp/repo".into(),
+            registered_at: "2026-05-05T17:30:00Z".into(),
+            is_git_repo: true,
+            languages: Default::default(),
+        };
+        let chunk = crate::chunker::Chunk {
+            project_id: "proj-cn-d3".into(),
+            file_path: PathBuf::from("src/lib.rs"),
+            rel_path_hash: "abcd1234".into(),
+            chunk_kind: "code_block".into(),
+            chunk_hash: "f".repeat(64),
+            occurrence_idx: 0,
+            language: Some("rust".into()),
+            symbol: Some("S::run".into()),
+            symbol_exact: Some("run".into()),
+            symbol_kind: Some("function_item".into()),
+            parent_kind: Some("impl_item".into()),
+            line_start: Some(3),
+            line_end: Some(3),
+            content: "fn run(&self) {}".into(),
+            byte_start: 19,
+            byte_end: 35,
+        };
+        let doc = project_files::build_project_file_doc(
+            &chunk,
+            &project,
+            Path::new("/tmp/repo/src/lib.rs"),
+            None,
+            index.field_handles(),
+        );
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        index.reader.reload().unwrap();
+
+        let searcher = index.reader.searcher();
+        let fields = index.field_handles();
+        let term_query = TermQuery::new(
+            Term::from_field_text(fields.project_id, "proj-cn-d3"),
+            IndexRecordOption::Basic,
+        );
+        let hits = searcher
+            .search(&term_query, &tantivy::collector::TopDocs::with_limit(2))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "project_id term must locate the doc");
+
+        let stored: TantivyDocument = searcher.doc(hits[0].1).unwrap();
+        assert_eq!(
+            optional_text(&stored, fields.symbol_kind).as_deref(),
+            Some("function_item")
+        );
+        assert_eq!(
+            optional_text(&stored, fields.parent_kind).as_deref(),
+            Some("impl_item")
+        );
+        assert_eq!(optional_u64(&stored, fields.byte_offset), Some(19));
+        assert_eq!(optional_u64(&stored, fields.byte_end), Some(35));
+        assert_eq!(optional_u64(&stored, fields.line_start), Some(3));
+        assert_eq!(optional_u64(&stored, fields.line_end), Some(3));
+        assert_eq!(
+            optional_text(&stored, fields.project_id).as_deref(),
+            Some("proj-cn-d3")
+        );
     }
 
     #[test]
