@@ -6250,3 +6250,252 @@
             "target text must parse cleanly: {target_text:?} (report={report:?})"
         );
     }
+
+    // Gap 11: cross-package extract of an inner class that's still
+    // referenced by sibling inner / outer-method code in source needs
+    // `import <target-pkg>.<MovedClass>;` injected into source so the
+    // bare-name references continue to resolve.
+    #[test]
+    fn extract_java_nested_classes_cross_package_adds_source_import_for_surviving_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/com/example");
+        let tgt_pkg = dir.path().join("src/main/java/com/example/queries");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&tgt_pkg).unwrap();
+        let source = src_pkg.join("Outer.java");
+        let target = tgt_pkg.join("Readings.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private static class Readings { int x; }\n\
+            \x20   Readings findReadings() { return new Readings(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        // Apply source edits to inspect post-deletion source.
+        let mut source_after = parsed_source_text(&source);
+        let mut sorted_source = plan.edits[0].edits.clone();
+        sorted_source.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
+        for edit in &sorted_source {
+            source_after.replace_range(edit.byte_start..edit.byte_end, &edit.replacement);
+        }
+        assert!(
+            source_after.contains("import com.example.queries.Readings;"),
+            "source should gain target-package import for surviving bare refs: {source_after}"
+        );
+        // Bare-name reference in source body survives (still binds to
+        // the imported class).
+        assert!(
+            source_after.contains("Readings findReadings() { return new Readings(); }"),
+            "source body keeps bare-name references; resolves via new import: {source_after}"
+        );
+    }
+
+    // Gap 11: same-package extracts do NOT inject the source import
+    // (the moved class lives in the same package — bare name resolves
+    // without an import).
+    #[test]
+    fn extract_java_nested_classes_same_package_does_not_inject_source_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Outer.java");
+        let target = pkg.join("Readings.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private static class Readings { int x; }\n\
+            \x20   Readings findReadings() { return new Readings(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let mut source_after = parsed_source_text(&source);
+        let mut sorted_source = plan.edits[0].edits.clone();
+        sorted_source.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
+        for edit in &sorted_source {
+            source_after.replace_range(edit.byte_start..edit.byte_end, &edit.replacement);
+        }
+        assert!(
+            !source_after.contains("import com.example.Readings;"),
+            "same-package extract must not inject a same-package import: {source_after}"
+        );
+    }
+
+    // Gap 11: when the moved class has NO surviving references in
+    // source (declaration was its only mention), the source import is
+    // skipped — adding it would just create an unused-import warning.
+    #[test]
+    fn extract_java_nested_classes_skips_source_import_when_no_surviving_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/com/example");
+        let tgt_pkg = dir.path().join("src/main/java/com/example/queries");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&tgt_pkg).unwrap();
+        let source = src_pkg.join("Outer.java");
+        let target = tgt_pkg.join("Orphan.java");
+        // Outer doesn't reference Orphan outside its declaration.
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private static class Orphan { int x; }\n\
+            \x20   void noop() {}\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Orphan".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let mut source_after = parsed_source_text(&source);
+        let mut sorted_source = plan.edits[0].edits.clone();
+        sorted_source.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
+        for edit in &sorted_source {
+            source_after.replace_range(edit.byte_start..edit.byte_end, &edit.replacement);
+        }
+        assert!(
+            !source_after.contains("import com.example.queries.Orphan;"),
+            "no surviving refs → no source import: {source_after}"
+        );
+    }
+
+    // Gap 12: moved body that references ANOTHER source-class inner
+    // type (sibling enum / class) gets the reference qualified to
+    // `<SourceClass>.<InnerType>` on the new top-level target. Cross-
+    // package targets also gain `import <source-pkg>.<SourceClass>;`.
+    #[test]
+    fn extract_java_nested_classes_qualifies_sibling_inner_type_refs_cross_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_pkg = dir.path().join("src/main/java/com/example");
+        let tgt_pkg = dir.path().join("src/main/java/com/example/queries");
+        fs::create_dir_all(&src_pkg).unwrap();
+        fs::create_dir_all(&tgt_pkg).unwrap();
+        let source = src_pkg.join("Outer.java");
+        let target = tgt_pkg.join("Readings.java");
+        // Readings references Mode (sibling enum on Outer) AND
+        // Mode.READ (enum constant). Both should be qualified.
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   public enum Mode { READ, WRITE }\n\
+            \x20   private static class Readings {\n\
+            \x20       Mode mode = Mode.READ;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+
+        assert!(
+            target_text.contains("Outer.Mode mode = Outer.Mode.READ"),
+            "Mode references should be qualified to Outer.Mode: {target_text}"
+        );
+        assert!(
+            target_text.contains("import com.example.Outer;"),
+            "cross-package target should import source class: {target_text}"
+        );
+    }
+
+    // Gap 12: same-package extracts qualify the inner type but do NOT
+    // inject the source-class import (same package — qualified
+    // `Outer.Mode` resolves without an import).
+    #[test]
+    fn extract_java_nested_classes_qualifies_sibling_inner_type_refs_same_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Outer.java");
+        let target = pkg.join("Readings.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   public enum Mode { READ, WRITE }\n\
+            \x20   private static class Readings {\n\
+            \x20       Mode mode = Mode.READ;\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+        assert!(
+            target_text.contains("Outer.Mode mode = Outer.Mode.READ"),
+            "Mode references should be qualified: {target_text}"
+        );
+        assert!(
+            !target_text.contains("import com.example.Outer;"),
+            "same-package target must not inject same-package source import: {target_text}"
+        );
+    }
+
+    // Gap 12: don't qualify references to the moved class itself
+    // (it's now top-level in the target file — qualifying it would
+    // create `Outer.Readings` inside the Readings declaration body).
+    #[test]
+    fn extract_java_nested_classes_does_not_qualify_self_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Outer.java");
+        let target = pkg.join("Readings.java");
+        // Readings has a self-referential static factory.
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private static class Readings {\n\
+            \x20       static Readings empty() { return new Readings(); }\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = java_plan_params("extract_java_nested_classes", &source);
+        params.target = Some(path_string(&target));
+        params.item_names = Some(vec!["Readings".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_nested_classes(&params).unwrap()).unwrap();
+        let target_text = &plan.edits[1].edits[0].replacement;
+        assert!(
+            !target_text.contains("Outer.Readings"),
+            "self-references on the moved class must NOT be qualified: {target_text}"
+        );
+    }
+
+    // Helper for the Gap 11 tests above.
+    fn parsed_source_text(path: &std::path::Path) -> String {
+        fs::read_to_string(path).unwrap()
+    }

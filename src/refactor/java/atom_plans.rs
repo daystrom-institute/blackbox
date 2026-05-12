@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
@@ -80,7 +81,63 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
     }
     extracted_content.reverse();
 
-    let target_content = format!("{}{}\n", prelude, extracted_content.join("\n\n"));
+    let mut target_content = format!("{}{}\n", prelude, extracted_content.join("\n\n"));
+
+    // Gap 12: qualify references to OTHER source-class inner types in the
+    // moved body. Same machinery as extract_java_class's inner-type
+    // qualification (Gap 7). Bare `Mode` (where Mode is a sibling inner
+    // enum of the source class) needs to become `Outer.Mode` on the new
+    // top-level target, and cross-package targets need
+    // `import <source-pkg>.<SourceClass>;` so the qualifier resolves.
+    let class_node_opt = find_first_class_declaration(parsed.tree.root_node());
+    let moved_names: HashSet<String> = selected
+        .iter()
+        .filter_map(|c| c.item.name.clone())
+        .collect();
+    if let Some(class_node) = class_node_opt {
+        let source_class_name = java_class_name(class_node, &parsed.source);
+        let inner_type_decls =
+            collect_sibling_inner_type_names(class_node, &parsed.source, &moved_names);
+        if !inner_type_decls.is_empty() {
+            let referenced =
+                qualify_inner_type_refs_in_text(&mut target_content, &inner_type_decls, &source_class_name);
+            if !referenced.is_empty() && cross_package {
+                if let Some(src_pkg) = source_package.as_deref() {
+                    let fqcn = format!("{src_pkg}.{source_class_name}");
+                    target_content = java_inject_import(&target_content, &fqcn);
+                }
+            }
+        }
+    }
+
+    // Gap 11: cross-package extracts leave sibling-inner / outer-method
+    // references to the moved class in source — they used to resolve via
+    // the nested scope and now need `import <target-pkg>.<MovedClass>;`
+    // for the bare name to bind to the new top-level class.
+    if cross_package {
+        if let Some(target_pkg) = target_package.as_deref() {
+            let deletion_ranges: Vec<(usize, usize)> = selected
+                .iter()
+                .map(|c| (c.item.leading_trivia_start, c.item.byte_end))
+                .collect();
+            for class_item in &selected {
+                let Some(name) = class_item.item.name.as_deref() else {
+                    continue;
+                };
+                if !source_references_simple_name_outside(&parsed, name, &deletion_ranges) {
+                    continue;
+                }
+                let fqcn = if target_pkg.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{target_pkg}.{name}")
+                };
+                if let Some(import_edit) = java_source_import_edit(&parsed.source, &fqcn) {
+                    source_edits.push(import_edit);
+                }
+            }
+        }
+    }
 
     let original_target_bytes = if target_path.exists() {
         fs::read(&target_path)?
@@ -232,6 +289,177 @@ fn rewrite_top_level_class_modifiers(raw: &str, cross_package: bool) -> Result<S
         out.replace_range(start..end, &repl);
     }
     Ok(out)
+}
+
+/// Gap 12: collect simple names of nested classes / interfaces /
+/// records / enums declared directly inside the source class body,
+/// EXCLUDING the items being moved (we don't want to rewrite a moved
+/// class's own declaration name to `Outer.MovedClass`).
+fn collect_sibling_inner_type_names(
+    class_node: Node<'_>,
+    source: &str,
+    moved_names: &HashSet<String>,
+) -> BTreeMap<String, ()> {
+    let mut map = BTreeMap::new();
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return map;
+    };
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if !matches!(
+            child.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(name) = name_node.utf8_text(source.as_bytes()) else {
+            continue;
+        };
+        if moved_names.contains(name) {
+            continue;
+        }
+        map.insert(name.to_string(), ());
+    }
+    map
+}
+
+/// Gap 12: walk the assembled target text for `type_identifier` nodes
+/// and uppercase-receiver `identifier` nodes that match a sibling
+/// inner-type name, and rewrite each to `<SourceClass>.<InnerType>`.
+/// Already-qualified references inside `scoped_type_identifier` are
+/// left alone. Returns the set of inner-type names actually rewritten
+/// (used to decide whether to inject the source-class import).
+fn qualify_inner_type_refs_in_text(
+    target_text: &mut String,
+    inner_type_decls: &BTreeMap<String, ()>,
+    source_class_name: &str,
+) -> BTreeSet<String> {
+    let mut referenced = BTreeSet::new();
+    let Ok(tree) = parse_source("java", target_text) else {
+        return referenced;
+    };
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    // Pass 1: type_identifier nodes (`InnerType` as a type position).
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut c = node.walk();
+        for ch in node.named_children(&mut c) {
+            stack.push(ch);
+        }
+        if node.kind() != "type_identifier" {
+            continue;
+        }
+        let Ok(text) = node.utf8_text(target_text.as_bytes()) else {
+            continue;
+        };
+        if !inner_type_decls.contains_key(text) {
+            continue;
+        }
+        if node
+            .parent()
+            .map(|p| p.kind() == "scoped_type_identifier")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        edits.push((
+            node.start_byte(),
+            node.end_byte(),
+            format!("{source_class_name}.{text}"),
+        ));
+        referenced.insert(text.to_string());
+    }
+    // Pass 2: uppercase-receiver identifier nodes
+    // (`InnerEnum.VALUE` or `InnerType.staticCall()`).
+    let mut stack2 = vec![tree.root_node()];
+    while let Some(node) = stack2.pop() {
+        let mut c = node.walk();
+        for ch in node.named_children(&mut c) {
+            stack2.push(ch);
+        }
+        if !matches!(node.kind(), "method_invocation" | "field_access") {
+            continue;
+        }
+        let Some(receiver) = node.child_by_field_name("object") else {
+            continue;
+        };
+        if receiver.kind() != "identifier" {
+            continue;
+        }
+        let Ok(text) = receiver.utf8_text(target_text.as_bytes()) else {
+            continue;
+        };
+        if !inner_type_decls.contains_key(text) {
+            continue;
+        }
+        edits.push((
+            receiver.start_byte(),
+            receiver.end_byte(),
+            format!("{source_class_name}.{text}"),
+        ));
+        referenced.insert(text.to_string());
+    }
+    edits.sort_by_key(|e| e.0);
+    edits.dedup_by_key(|e| e.0);
+    // Apply in reverse order to preserve earlier byte offsets.
+    edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+    for (start, end, repl) in edits {
+        target_text.replace_range(start..end, &repl);
+    }
+    referenced
+}
+
+/// Gap 11: returns true when the source file has at least one
+/// `type_identifier` or `identifier` token matching `name` outside any
+/// of the deletion ranges. Used to decide whether the source needs
+/// `import <target-pkg>.<MovedClass>;` post-move so sibling-inner
+/// references still resolve.
+fn source_references_simple_name_outside(
+    parsed: &ParsedSource,
+    name: &str,
+    deletion_ranges: &[(usize, usize)],
+) -> bool {
+    let bytes = parsed.source.as_bytes();
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut c = node.walk();
+        for ch in node.named_children(&mut c) {
+            stack.push(ch);
+        }
+        // type_identifier covers bare `MovedClass` in type position
+        // (variable decl, parameter, return type, generic argument).
+        // identifier covers uppercase-receiver call/field-access.
+        if !matches!(node.kind(), "type_identifier" | "identifier") {
+            continue;
+        }
+        let s = node.start_byte();
+        let e = node.end_byte();
+        if e - s != name.len() {
+            continue;
+        }
+        if &bytes[s..e] != name.as_bytes() {
+            continue;
+        }
+        // Skip nodes inside any deletion range.
+        if deletion_ranges
+            .iter()
+            .any(|(ds, de)| s >= *ds && e <= *de)
+        {
+            continue;
+        }
+        // Skip the moved class's own declaration site (its name_node).
+        // declaration name positions are handled by the deletion-range
+        // check above (the whole declaration is inside the deletion).
+        return true;
+    }
+    false
 }
 
 pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
