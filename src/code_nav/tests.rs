@@ -134,6 +134,68 @@ fn test_code_query_javascript() {
     assert_eq!(response.captures[0].text.as_deref(), Some("hello"));
 }
 
+/// CN-T3 (Acceptance Criterion 6): explicit TypeScript coverage on
+/// `bbox_code_query` and `bbox_code_node_describe`. Existing tests
+/// cover Rust, Python (describe), Java, JavaScript; TS shares the
+/// JavaScript curated query but rides a different grammar via
+/// tree_sitter_typescript, so coverage here pins the
+/// language-pack mapping for `.ts`.
+#[test]
+fn test_code_query_typescript() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(
+        &dir,
+        "src/m.ts",
+        "function greet(name: string): string { return name; }\n",
+    );
+    let params = CodeQueryParams {
+        file,
+        query: "(function_declaration name: (identifier) @name)".to_string(),
+        project_dir: None,
+        language: None,
+        limit: None,
+        include_text: Some(true),
+    };
+    let response_json = code_query(&params).unwrap();
+    let response: CodeQueryResponse = serde_json::from_str(&response_json).unwrap();
+    assert_eq!(response.language, "typescript");
+    assert_eq!(response.captures[0].text.as_deref(), Some("greet"));
+    assert_eq!(response.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
+}
+
+/// CN-T3: TypeScript node-describe parallels the Python case from
+/// CN-S2 era — exercise the node-describe path on a TS class
+/// method to confirm parent_chain resolution + semantic_status.
+#[test]
+fn test_code_node_describe_typescript() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(
+        &dir,
+        "src/m.ts",
+        "class C {\n  run(): void {\n    return;\n  }\n}\n",
+    );
+    let params = CodeNodeDescribeParams {
+        file,
+        line: 2,
+        column: 3, // `run`
+        project_dir: None,
+        include_siblings: Some(false),
+        include_text: Some(true),
+    };
+    let response_json = code_node_describe(&params).unwrap();
+    let response: CodeNodeDescribeResponse = serde_json::from_str(&response_json).unwrap();
+    assert_eq!(response.language, "typescript");
+    assert!(
+        response
+            .parent_chain
+            .iter()
+            .any(|kind| kind == "class_declaration"),
+        "TS class method describe must include class_declaration in parent_chain; got {:?}",
+        response.parent_chain
+    );
+    assert_eq!(response.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
+}
+
 #[test]
 fn test_code_query_handoff_suggests_refactor_status_for_java_method() {
     let dir = TempDir::new().unwrap();
