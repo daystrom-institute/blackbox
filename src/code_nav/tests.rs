@@ -1041,6 +1041,90 @@ fn code_refs_all_kind_returns_union_in_byte_order() {
     }
 }
 
+/// CN-T1 closing fix: invalid `kind` on bbox_code_refs returns a
+/// typed CodeNavErrorResponse (code="invalid_code_refs_kind"),
+/// matching the shape used by invalid_code_symbols_mode and the
+/// other recoverable errors. Was anyhow-bailing before.
+#[test]
+fn code_refs_invalid_kind_returns_typed_error_response() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(&dir, "src/lib.rs", "fn main() {}\n");
+    let json = code_refs(&CodeRefsParams {
+        file,
+        project_dir: None,
+        kind: "nope".to_string(),
+        query: None,
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let err: CodeNavErrorResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(err.status, "error");
+    assert_eq!(err.code, "invalid_code_refs_kind");
+    assert_eq!(err.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
+    assert!(err.message.contains("nope"));
+    assert!(err.suggestion.contains("calls"));
+    assert!(err.suggestion.contains("identifiers"));
+}
+
+/// CN-T1 closing fix: every bbox_code_refs record carries a
+/// `handoff` block with pre-filled bbox_refactor_status and
+/// bbox_refactor_project_refs argument shapes. The CN-X2 audit
+/// claims "handoff blocks on every code-nav response" — this test
+/// locks the claim for code_refs.
+#[test]
+fn code_refs_records_carry_handoff_with_pre_filled_args() {
+    let dir = TempDir::new().unwrap();
+    let file = setup_test_file(
+        &dir,
+        "src/lib.rs",
+        "fn outer() { helper(); }\nfn helper() {}\n",
+    );
+    let json = code_refs(&CodeRefsParams {
+        file,
+        project_dir: None,
+        kind: "calls".to_string(),
+        query: None,
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let response: CodeRefsResponse = serde_json::from_str(&json).unwrap();
+    let helper_ref = response
+        .refs
+        .iter()
+        .find(|r| r.name == "helper")
+        .expect("helper ref present");
+    // handoff carries nearest_refactor_item describing the ref itself.
+    let near = helper_ref
+        .handoff
+        .nearest_refactor_item
+        .as_ref()
+        .expect("nearest_refactor_item present");
+    assert_eq!(near.name.as_deref(), Some("helper"));
+    // refactor_status pre-filled with the containing symbol when
+    // available, falling back to the ref name; item_kinds empty
+    // because we can't infer the defining kind from a ref site.
+    let status_hint = helper_ref
+        .handoff
+        .refactor_status
+        .as_ref()
+        .expect("refactor_status present");
+    assert_eq!(status_hint.tool, "bbox_refactor_status");
+    assert_eq!(status_hint.arguments.item_names, vec!["outer"]); // containing symbol
+    assert!(status_hint.arguments.item_kinds.is_empty());
+    // project_refs pre-filled with the same query name so callers
+    // can ground via project_file entity refs.
+    assert_eq!(
+        helper_ref.handoff.project_refs.tool,
+        "bbox_refactor_project_refs"
+    );
+    assert_eq!(
+        helper_ref.handoff.project_refs.arguments.query.as_deref(),
+        Some("outer")
+    );
+}
+
 /// `limit` truncates the returned set; `matching_refs` reflects the
 /// pre-truncation total; `truncation_reason="limit_reached"` fires.
 #[test]

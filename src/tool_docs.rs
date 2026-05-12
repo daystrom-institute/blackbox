@@ -345,7 +345,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_code_refs",
         category: ToolCategory::Refactor,
-        summary: "Extract syntactic references (calls, imports, fields, identifiers) from one source file. Per-language tree-sitter queries; identifiers fallback for unsupported languages.",
+        summary: "Extract syntactic references (calls, imports, fields, identifiers) from one source file. Per-language tree-sitter queries; identifiers fallback for unsupported languages. Records are syntax-only with edge_confidence=\"heuristic\".",
         when_to_use: "Use when you need to enumerate what one file calls / imports / accesses without running an LSP. Pass `kind` in {calls, imports, fields, identifiers, all}; the response carries per-record byte_range, line_range, containing_symbol, edge_confidence=\"heuristic\", and semantic_status=\"syntax_only\" — these are syntax captures, NOT binding-aware resolution. For binding authority use LSP via bbox_refactor_plan, or graph traversal via bbox_inspect_entity. Curated grammars: Rust, Java, Python, TypeScript, JavaScript, Go; other languages fall back to the generic identifier walker for kind=\"identifiers\" only.",
         example: Some(r#"bbox_code_refs(file="src/main.rs", kind="calls", query="parse")"#),
     },

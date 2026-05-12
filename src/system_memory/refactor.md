@@ -22,7 +22,14 @@ refactorable item names. Use `bbox_code_node_describe` when you have a
 line/column and need local grammar shape. Use `bbox_code_query` when the file
 is known and you need a custom tree-sitter pattern. Use `bbox_code_refs` when
 you want every call site / import / field access / identifier occurrence in
-one file without re-parsing yourself. Every response carries
+one file without re-parsing yourself; curated tree-sitter queries cover Rust,
+Java, Python, TypeScript, JavaScript, Go — other languages return a typed
+`unsupported_language_for_code_refs` error for non-`identifiers` kinds.
+`kind="identifiers"` falls back to a generic walker that emits records for
+nodes literally named `identifier`; grammars that use different
+identifier-like kinds (Erlang's `atom`/`variable`, e.g.) will return zero
+records — use `bbox_code_query` with a grammar-native S-expression when that
+happens. Every response carries
 `semantic_status: "syntax_only"` and per-record `edge_confidence:
 "heuristic"` (on `bbox_code_refs`) — these are syntactic captures, NOT
 binding resolution. For binding authority, use LSP via `bbox_refactor_plan`
@@ -91,9 +98,14 @@ modes rather than bailing. The agent reads `code` for typed dispatch and
   project_id}, ...]`.
 - `invalid_code_symbols_mode` — `mode` was something other than
   `"indexed"` / `"live"`.
+- `invalid_code_refs_kind` — `bbox_code_refs(kind=...)` was something
+  other than `"calls"` / `"imports"` / `"fields"` / `"identifiers"` /
+  `"all"`.
 - `unsupported_language_for_code_refs` — language has no curated
   reference query and the requested `kind` is not `"identifiers"`. Use
-  `bbox_code_query` instead, or switch to `kind="identifiers"`.
+  `bbox_code_query` instead, or switch to `kind="identifiers"`
+  (shape-only fallback; may return zero on grammars that don't use
+  `identifier` nodes).
 
 Every error response carries `semantic_status: "syntax_only"` so the
 labelling invariant holds across both ok and error paths.

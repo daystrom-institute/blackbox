@@ -570,6 +570,12 @@ pub struct CodeRefRecord {
     /// Source excerpt when the caller requested `include_text=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Pre-filled handoff suggestions for the next call. Same shape
+    /// as `bbox_code_symbols` / `bbox_code_node_describe` records:
+    /// agents can read `.handoff.refactor_status.arguments` to find
+    /// the exact refactor inventory call that grounds this ref.
+    /// Use these instead of guessing argument shapes.
+    pub handoff: CodeRefactorHandoff,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1611,18 +1617,40 @@ fn code_refs_query_for(language: &str) -> Option<&'static str> {
 
 /// Return the set of capture names that match the requested `kind`
 /// filter. `"all"` accepts every capture; named filters accept only
-/// the matching capture.
-fn code_refs_capture_filter(kind: &str) -> Result<&'static [&'static str]> {
+/// the matching capture. Unknown kinds return `Ok(None)`; callers
+/// translate that into the `invalid_code_refs_kind` typed error.
+fn code_refs_capture_filter(kind: &str) -> Option<&'static [&'static str]> {
     match kind {
-        "calls" => Ok(&["call"]),
-        "imports" => Ok(&["import"]),
-        "fields" => Ok(&["field"]),
-        "identifiers" => Ok(&["identifier"]),
-        "all" => Ok(&["call", "import", "field", "identifier"]),
-        _ => Err(anyhow!(
-            "unknown kind {kind:?}; expected one of calls/imports/fields/identifiers/all"
-        )),
+        "calls" => Some(&["call"]),
+        "imports" => Some(&["import"]),
+        "fields" => Some(&["field"]),
+        "identifiers" => Some(&["identifier"]),
+        "all" => Some(&["call", "import", "field", "identifier"]),
+        _ => None,
     }
+}
+
+/// Build the JSON for an `invalid_code_refs_kind` error response.
+fn err_invalid_code_refs_kind(raw: &str) -> Result<String> {
+    let response = CodeNavErrorResponse {
+        status: "error".to_string(),
+        code: "invalid_code_refs_kind".to_string(),
+        message: format!(
+            "kind {raw:?} is not valid for bbox_code_refs; expected one of \
+             \"calls\", \"imports\", \"fields\", \"identifiers\", \"all\""
+        ),
+        suggestion:
+            "Pass kind=\"calls\" / \"imports\" / \"fields\" / \"identifiers\" / \"all\". \
+             Use kind=\"all\" if you want the union; narrow with `query` for substring filtering."
+                .to_string(),
+        file: None,
+        file_bytes: None,
+        max_bytes: None,
+        project_dir: None,
+        registered_projects: Vec::new(),
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
+    };
+    Ok(serde_json::to_string_pretty(&response)?)
 }
 
 /// Walk up the tree from `node` and return the display name of the
@@ -1689,7 +1717,10 @@ pub fn code_refs(p: &CodeRefsParams) -> Result<String> {
     let parsed = parse_code_nav_source(&path, None)?;
     let language = parsed.language.clone();
 
-    let capture_filter = code_refs_capture_filter(&p.kind)?;
+    let capture_filter = match code_refs_capture_filter(&p.kind) {
+        Some(filter) => filter,
+        None => return err_invalid_code_refs_kind(&p.kind),
+    };
     let query_text = match code_refs_query_for(&language) {
         Some(q) => q,
         None => {
@@ -1709,7 +1740,9 @@ pub fn code_refs(p: &CodeRefsParams) -> Result<String> {
                     kind = p.kind
                 ),
                 suggestion: format!(
-                    "Either pass kind=\"identifiers\" (works on any tree-sitter language), \
+                    "Either pass kind=\"identifiers\" (shape-only fallback — emits records \
+                     for nodes literally named `identifier`; may return zero on grammars \
+                     that use different identifier-like kinds, e.g. Erlang's `atom`/`variable`), \
                      or use bbox_code_query with a grammar-native S-expression."
                 ),
                 file: Some(path.to_string_lossy().into_owned()),
@@ -1764,16 +1797,33 @@ pub fn code_refs(p: &CodeRefsParams) -> Result<String> {
             } else {
                 None
             };
+            let containing_symbol =
+                containing_symbol_for(node, &parsed.source, &language);
+            let byte_range = (node.start_byte(), node.end_byte());
+            let line_range = (start.row + 1, end.row + 1);
+            let column_range = (start.column + 1, end.column + 1);
+            let handoff = code_ref_handoff(
+                &p.file,
+                p.project_dir.as_deref(),
+                &language,
+                name,
+                node.kind(),
+                byte_range,
+                line_range,
+                column_range,
+                containing_symbol.as_deref(),
+            );
             records.push(CodeRefRecord {
                 kind: capture_to_ref_kind(capture_name).to_string(),
                 name: name.to_string(),
                 node_kind: node.kind().to_string(),
-                byte_range: (node.start_byte(), node.end_byte()),
-                line_range: (start.row + 1, end.row + 1),
-                column_range: (start.column + 1, end.column + 1),
-                containing_symbol: containing_symbol_for(node, &parsed.source, &language),
+                byte_range,
+                line_range,
+                column_range,
+                containing_symbol,
                 edge_confidence: "heuristic".to_string(),
                 text,
+                handoff,
             });
         }
     }
@@ -1803,6 +1853,67 @@ pub fn code_refs(p: &CodeRefsParams) -> Result<String> {
         semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
     };
     Ok(serde_json::to_string_pretty(&response)?)
+}
+
+/// Handoff builder for `bbox_code_refs` records. Same shape as
+/// `bbox_code_symbols` / `bbox_code_node_describe` records so agents
+/// don't have to special-case. The `nearest_refactor_item` reports
+/// the ref site itself (its kind / name / byte_range / line_range);
+/// `refactor_status` pre-fills item_names with the containing symbol
+/// when known (a more specific target for refactor planning), or the
+/// ref name otherwise; `project_refs` pre-fills query with the same
+/// name so callers can ground via project_file entity refs.
+fn code_ref_handoff(
+    file: &str,
+    project_dir: Option<&str>,
+    language: &str,
+    name: &str,
+    node_kind: &str,
+    byte_range: (usize, usize),
+    line_range: (usize, usize),
+    column_range: (usize, usize),
+    containing_symbol: Option<&str>,
+) -> CodeRefactorHandoff {
+    let nearest_refactor_item = Some(CodeNodeSummary {
+        kind: node_kind.to_string(),
+        name: Some(name.to_string()),
+        byte_range,
+        line_range,
+        column_range,
+    });
+    let status_target = containing_symbol.unwrap_or(name);
+    let refactor_status = Some(CodeRefactorStatusHint {
+        tool: "bbox_refactor_status".to_string(),
+        arguments: CodeRefactorStatusHintArgs {
+            file: file.to_string(),
+            project_dir: project_dir.map(str::to_string),
+            item_names: vec![status_target.to_string()],
+            // We don't know the refactor item kind from a ref site
+            // (a `call` capture is an identifier inside a call_expr,
+            // not the definition); leave item_kinds empty so
+            // bbox_refactor_status matches on item_names alone.
+            item_kinds: Vec::new(),
+            limit: 50,
+            include_attributes: false,
+        },
+    });
+    CodeRefactorHandoff {
+        nearest_refactor_item,
+        refactor_status,
+        project_refs: CodeProjectRefsHint {
+            tool: "bbox_refactor_project_refs".to_string(),
+            arguments: CodeProjectRefsHintArgs {
+                file: file.to_string(),
+                project_dir: project_dir.map(str::to_string),
+                query: Some(status_target.to_string()),
+                limit: 20,
+                include_excerpt: false,
+            },
+        },
+        note: format!(
+            "Syntax-only reference capture for {language}. edge_confidence=\"heuristic\" — same-name match is not binding resolution. Use bbox_refactor_status to confirm the defining item before planning edits; use bbox_refactor_project_refs to ground project_file entity refs."
+        ),
+    }
 }
 
 /// Map a query capture name to the public `kind` value on
@@ -1843,24 +1954,40 @@ fn code_refs_generic_identifiers(parsed: &CodeNavParsedSource, p: &CodeRefsParam
                     if records.len() < limit {
                         let start = node.start_position();
                         let end = node.end_position();
+                        let byte_range = (node.start_byte(), node.end_byte());
+                        let line_range = (start.row + 1, end.row + 1);
+                        let column_range = (start.column + 1, end.column + 1);
+                        let containing_symbol = containing_symbol_for(
+                            node,
+                            &parsed.source,
+                            &parsed.language,
+                        );
+                        let handoff = code_ref_handoff(
+                            &p.file,
+                            p.project_dir.as_deref(),
+                            &parsed.language,
+                            name,
+                            node.kind(),
+                            byte_range,
+                            line_range,
+                            column_range,
+                            containing_symbol.as_deref(),
+                        );
                         records.push(CodeRefRecord {
                             kind: "identifier".to_string(),
                             name: name.to_string(),
                             node_kind: node.kind().to_string(),
-                            byte_range: (node.start_byte(), node.end_byte()),
-                            line_range: (start.row + 1, end.row + 1),
-                            column_range: (start.column + 1, end.column + 1),
-                            containing_symbol: containing_symbol_for(
-                                node,
-                                &parsed.source,
-                                &parsed.language,
-                            ),
+                            byte_range,
+                            line_range,
+                            column_range,
+                            containing_symbol,
                             edge_confidence: "heuristic".to_string(),
                             text: if include_text {
                                 Some(excerpt(name, 200))
                             } else {
                                 None
                             },
+                            handoff,
                         });
                     }
                 }

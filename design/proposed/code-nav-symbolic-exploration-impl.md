@@ -872,11 +872,18 @@ The design-doc Acceptance Criteria from
 1. **Tool docs explain syntax-only vs graph vs LSP semantics.**
    ✓ `src/tool_docs.rs` stanzas for `bbox_code_symbols`,
    `bbox_code_query`, `bbox_code_node_describe`, and
-   `bbox_code_refs` each name the syntax-only label, the dual
-   vocabulary, and the handoff to LSP / refactor plan / graph
-   surfaces. `src/system_memory/refactor.md` carries the longer
-   discussion + error-shape reference. Re-rendered into provider
-   files on daemon startup via the `bb-tool-reference` mechanism.
+   `bbox_code_refs` each name the syntax-only label and the
+   handoff to LSP / refactor plan / graph surfaces. The
+   dual-vocabulary (refactor synthetic vs raw tree-sitter)
+   discussion is specific to `bbox_code_symbols` (the only tool
+   that surfaces both kinds on the same record) and lives in
+   that stanza plus `sm-refactor`. `src/system_memory/refactor.md`
+   carries the longer discussion + error-shape reference.
+   Re-rendered into provider files on daemon startup via the
+   `bb-tool-reference` mechanism.
+   `tool_docs::tests::description_summary_parity` enforces that
+   the `#[tool(description=...)]` strings in handlers match the
+   `ToolDoc.summary` strings in `tool_docs.rs` byte-for-byte.
 
 2. **Query and node-describe tools return bounded responses with
    parse diagnostics.**
@@ -896,12 +903,15 @@ The design-doc Acceptance Criteria from
 
 4. **Existing graph navigation remains the preferred route for
    indexed callers, callees, and evidence bundles.**
-   ✓ Handoff blocks on every code-nav response point at
-   `bbox_refactor_status` / `bbox_refactor_project_refs`; the
-   sm-refactor memory explicitly directs binding-authority
+   ✓ Every code-nav tool's success records carry a `handoff` block
+   pointing at `bbox_refactor_status` / `bbox_refactor_project_refs`
+   with pre-filled argument shapes (`bbox_code_symbols` items,
+   `bbox_code_query` captures, `bbox_code_node_describe` response
+   root, and — after CN-T1's closing fix — `bbox_code_refs`
+   records). `sm-refactor` explicitly directs binding-authority
    questions to `bbox_inspect_entity` / `bbox_find_paths` /
-   `bbox_bundle_evidence`. `bbox_code_refs` records carry
-   `edge_confidence: "heuristic"` so callers cannot mistake
+   `bbox_bundle_evidence`. `bbox_code_refs` records additionally
+   carry `edge_confidence: "heuristic"` so callers cannot mistake
    syntax matches for graph-resolved references.
 
 5. **Generic structural declaration rewrites are not named like
