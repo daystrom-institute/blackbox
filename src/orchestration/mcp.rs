@@ -197,6 +197,56 @@ pub fn validate_project_store(store: &McpStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parsed view of a filter pattern that targets an MCP server's tool
+/// surface. Wire format is the canonical `mcp__<server>__<pattern>`
+/// string — the type lives at parsing/recomposition boundaries only,
+/// so JSON schemas, brofile files, and on-disk filters keep their
+/// existing shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolRef {
+    pub server: String,
+    pub pattern: String,
+}
+
+impl McpToolRef {
+    /// Parse a `mcp__<server>__<pattern>` string. Returns `None` for
+    /// any input that isn't in MCP form — callers route those through
+    /// the provider's native non-MCP path (Bash, Edit, etc.).
+    pub fn parse(s: &str) -> Option<Self> {
+        let rest = s.strip_prefix("mcp__")?;
+        let (server, pattern) = rest.split_once("__")?;
+        if server.is_empty() || pattern.is_empty() {
+            return None;
+        }
+        Some(Self {
+            server: server.to_string(),
+            pattern: pattern.to_string(),
+        })
+    }
+
+    pub fn is_glob(&self) -> bool {
+        self.pattern.contains('*') || self.pattern.contains('?')
+    }
+
+    pub fn is_blackbox(&self) -> bool {
+        self.server == crate::util::blackbox_mcp_name()
+    }
+}
+
+impl std::fmt::Display for McpToolRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mcp__{}__{}", self.server, self.pattern)
+    }
+}
+
+impl std::str::FromStr for McpToolRef {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| format!("not a valid mcp tool ref: {s}"))
+    }
+}
+
 /// Filter rules — mirrors what each provider's `--disallowedTools` /
 /// `--deny-tool` / `--exclude-tools` flag accepts, in a canonical form
 /// translated at dispatch time.
@@ -924,16 +974,23 @@ pub fn gemini_policy_dir() -> Option<PathBuf> {
 /// on `mcpName` + `toolName`, so filtering outside an MCP server is
 /// out of scope for this translator.
 pub fn render_gemini_policy_toml(filters: &McpFilters) -> String {
-    let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
-    let prefix = crate::tool_docs::blackbox_mcp_prefix();
+    let universe: Vec<&str> = crate::tool_docs::all_tool_names();
     let mcp_name = crate::util::blackbox_mcp_name();
 
     let mut disabled: Vec<String> = Vec::new();
     for p in filters.disallow.iter().map(|p| normalize_filter_pattern(p)) {
-        let Some(stripped) = p.strip_prefix(&prefix) else {
+        let Some(tool) = McpToolRef::parse(&p) else {
             continue;
         };
-        for t in expand_pattern(stripped, &universe) {
+        if !tool.is_blackbox() {
+            continue;
+        }
+        let names = if tool.is_glob() {
+            expand_pattern(&tool.pattern, &universe)
+        } else {
+            vec![tool.pattern.clone()]
+        };
+        for t in names {
             if !disabled.contains(&t) {
                 disabled.push(t);
             }

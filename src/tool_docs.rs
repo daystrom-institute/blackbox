@@ -1206,18 +1206,12 @@ fn system_memory_hint(doc: &ToolDoc) -> Option<String> {
 
 // ── Filter translation helpers ───────────────────────────────────────
 
-/// Bare names of every orchestration + refactor tool. Used by
-/// provider filter translators that can't accept glob patterns (Codex,
-/// Gemini's policy engine) to expand `bro_*` / `bbox_refactor_*`
-/// patterns into a concrete list.
-pub fn orchestration_tool_names() -> Vec<&'static str> {
-    TOOL_DOCS
-        .iter()
-        .filter(|d| {
-            d.category == ToolCategory::Orchestration || d.category == ToolCategory::Refactor
-        })
-        .map(|d| d.name)
-        .collect()
+/// Bare names of every tool in the blackbox catalog. Used as the
+/// universe for glob expansion by provider filter translators that
+/// can't accept glob patterns natively (Codex's `disabled_tools` /
+/// `enabled_tools`, Gemini's policy engine).
+pub fn all_tool_names() -> Vec<&'static str> {
+    TOOL_DOCS.iter().map(|d| d.name).collect()
 }
 
 /// All tool names from the static TOOL_DOCS catalog, with MCP prefix

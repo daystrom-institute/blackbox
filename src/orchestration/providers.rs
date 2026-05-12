@@ -917,45 +917,40 @@ fn emit_codex_filter_overrides(args: &mut Vec<String>, patterns: &[String], key:
 }
 
 fn codex_group_patterns_by_server(patterns: &[String]) -> Vec<(String, Vec<String>)> {
-    let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
-    let bb_prefix = crate::tool_docs::blackbox_mcp_prefix();
+    let universe: Vec<&str> = crate::tool_docs::all_tool_names();
     let mut by_server: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for p in patterns
         .iter()
         .map(|p| super::mcp::normalize_filter_pattern(p))
     {
-        let Some(rest) = p.strip_prefix("mcp__") else {
+        let Some(tool) = super::mcp::McpToolRef::parse(&p) else {
             tracing::debug!(target: "blackbox::filter",
                 "codex skipping non-MCP pattern (filter scope is mcp_servers.*): {p}");
             continue;
         };
-        let Some((server, tool_pat)) = rest.split_once("__") else {
-            tracing::warn!(target: "blackbox::filter",
-                "codex skipping malformed MCP pattern (expected mcp__<server>__<tool>): {p}");
-            continue;
-        };
-        let group = by_server.entry(server.to_string()).or_default();
-        if p.starts_with(&bb_prefix) {
-            let expanded = super::mcp::expand_pattern(tool_pat, &universe);
-            if expanded.is_empty() {
+        let group = by_server.entry(tool.server.clone()).or_default();
+        let names: Vec<String> = if tool.is_glob() {
+            if tool.is_blackbox() {
+                let expanded = super::mcp::expand_pattern(&tool.pattern, &universe);
+                if expanded.is_empty() {
+                    tracing::warn!(target: "blackbox::filter",
+                        "codex blackbox glob matched zero tools (typo or stale name?): {p}");
+                    continue;
+                }
+                expanded
+            } else {
                 tracing::warn!(target: "blackbox::filter",
-                    "codex blackbox pattern matched zero tools (typo or stale name?): {p}");
+                    "codex glob on non-blackbox server (no tool universe to expand against): {p}");
                 continue;
             }
-            for t in expanded {
-                if !group.contains(&t) {
-                    group.push(t);
-                }
-            }
-        } else if !tool_pat.contains('*') && !tool_pat.contains('?') {
-            let t = tool_pat.to_string();
+        } else {
+            vec![tool.pattern.clone()]
+        };
+        for t in names {
             if !group.contains(&t) {
                 group.push(t);
             }
-        } else {
-            tracing::warn!(target: "blackbox::filter",
-                "codex glob on non-blackbox server (no tool universe to expand against): {p}");
         }
     }
     by_server
@@ -977,27 +972,30 @@ fn copilot_format_mcp_tool(full: &str) -> Option<String> {
 }
 
 /// Expand filter patterns for providers that accept full MCP tool
-/// names (Claude, Copilot). `mcp__<blackbox-name>__bro_*` style globs become
-/// concrete `mcp__<blackbox-name>__bro_exec`, `mcp__<blackbox-name>__bro_resume`, …
-/// entries. Non-blackbox patterns pass through unchanged — they're
-/// likely already in a valid native form like `Bash(git push *)`.
+/// names (Claude, Copilot). Blackbox globs (`mcp__<blackbox-name>__bro_*`)
+/// expand to concrete `mcp__<blackbox-name>__bro_exec`, etc. Non-MCP
+/// patterns (e.g. `Bash(git push *)`) pass through unchanged.
 fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
-    let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
-    let prefix = crate::tool_docs::blackbox_mcp_prefix();
+    let universe: Vec<&str> = crate::tool_docs::all_tool_names();
     let mut out = Vec::new();
     for p in patterns
         .iter()
         .map(|p| super::mcp::normalize_filter_pattern(p))
     {
-        if let Some(stripped) = p.strip_prefix(&prefix) {
-            for bare in super::mcp::expand_pattern(stripped, &universe) {
-                let full = format!("{prefix}{bare}");
-                if !out.contains(&full) {
-                    out.push(full);
+        match super::mcp::McpToolRef::parse(&p) {
+            Some(tool) if tool.is_blackbox() && tool.is_glob() => {
+                for bare in super::mcp::expand_pattern(&tool.pattern, &universe) {
+                    let full = format!("mcp__{}__{}", tool.server, bare);
+                    if !out.contains(&full) {
+                        out.push(full);
+                    }
                 }
             }
-        } else if !out.contains(&p) {
-            out.push(p.clone());
+            _ => {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
         }
     }
     out
