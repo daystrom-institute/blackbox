@@ -131,6 +131,8 @@ struct InnerTypeEntry {
     name: String,
     kind: String,
     is_static: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    is_implicitly_static: bool,
     line_range: (usize, usize),
 }
 
@@ -240,12 +242,14 @@ fn collect_direct_inner_types(class_node: Node<'_>, source: &str) -> Vec<InnerTy
             continue;
         };
         let is_static = has_java_modifier(child, "static");
+        let is_implicitly_static = child.kind() == "record_declaration";
         let (start_line, _) = line_col(source, child.start_byte());
         let (end_line, _) = line_col(source, child.end_byte());
         out.push(InnerTypeEntry {
             name: name.to_string(),
             kind: kind.to_string(),
             is_static,
+            is_implicitly_static,
             line_range: (start_line, end_line),
         });
     }
@@ -491,5 +495,43 @@ mod tests {
         let inner_types = v["inner_types"].as_array().unwrap();
         assert_eq!(inner_types.len(), 1);
         assert_eq!(inner_types[0]["name"], "Inner");
+    }
+
+    #[test]
+    fn g3_record_inner_type_carries_implicitly_static_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Outer.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             public class Outer {\n\
+            \x20   private record InnerRecord(int x) {}\n\
+            \x20   public static class StaticInner { int y; }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let response = plan_java_class_dependency_analysis(&make_params(&source))
+            .expect("analysis should succeed");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        let inner_types = v["inner_types"].as_array().unwrap();
+        assert_eq!(inner_types.len(), 2);
+
+        let rec = inner_types
+            .iter()
+            .find(|t| t["name"] == "InnerRecord")
+            .unwrap();
+        assert_eq!(rec["kind"], "record");
+        assert_eq!(rec["is_static"], false);
+        assert_eq!(rec["is_implicitly_static"], true);
+
+        let cls = inner_types
+            .iter()
+            .find(|t| t["name"] == "StaticInner")
+            .unwrap();
+        assert_eq!(cls["kind"], "class");
+        assert_eq!(cls["is_static"], true);
+        assert!(cls.get("is_implicitly_static").is_none());
     }
 }
