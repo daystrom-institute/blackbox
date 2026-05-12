@@ -43,7 +43,25 @@ hand-rolled boilerplate (POJO DOJO).
   AST-grounded references (type position, method invocation, field
   access, method reference, import) for the supplied simple name(s).
   Analysis-only; no FileEdits. Foundation for the semantic-rename
-  primitive below.
+  primitive below. Optional params:
+  - `declaring_class: String` — filter results to usages whose
+    receiver expression plausibly resolves to a field of that type
+    on the enclosing class. v1 heuristic walks the enclosing class
+    for `private final <DeclaringClass> <field>;` declarations and
+    keeps only call sites whose receiver identifier is one of those
+    field names. Use this whenever the simple name isn't globally
+    unique (common method names like `getId`, `getName` return
+    hundreds of unrelated sites without it).
+  - `output_path: String` — write the full report JSON to a filename
+    under `$BLACKBOX_STATE_DIR/refactor/plans/` and return a compact
+    digest (`total_usages`, `unique_call_files`,
+    `usage_summary_by_name`) instead. Avoids MCP transport-cap
+    blowups on common names.
+  - `summary_only: bool` — return per-name counts + top-5 example
+    call sites only. Combines with `output_path`.
+  - Each usage entry carries `is_test_site: bool` (true when the
+    file's path has a `src/test/java/` ancestor). Top-level response
+    carries `production_sites` and `test_sites` tallies.
 - Semantic rename: supported with `bbox_refactor_plan(kind="rename_java_symbol")`.
   Project-wide rename of a class / interface / record / enum / method
   / field / parameter / type-parameter by simple name. Rewrites
@@ -128,6 +146,22 @@ real; if your concern is on the list, the planner already handles it.
   target, the operator-facing FIXME lists "drop the call" alongside
   the three structural fixes (add to extracted set / callback interface
   / inject source instance).
+- **Public-static cross-class calls are auto-qualified.** When
+  `deep_analysis: true` classifies an external_call as a `public static`
+  method on the source class, the planner rewrites the unqualified call
+  in the moved body to `<SourceClass>.<method>(...)` and **skips the
+  FIXME marker**. The source-class import is added to cross-package
+  targets. Detection is AST-driven (`method_invocation` nodes with no
+  `object` field) — string literals and `// ...` comments containing
+  the method name are skipped at parser level.
+- **`external_calls` entries carry visibility + recommended resolution.**
+  Each `ExternalCall` in the deep_analysis report has
+  `source_visibility` (`public`/`protected`/`package`/`private`),
+  `source_is_static` (bool), and `recommended_resolution`. Heuristic:
+  public-static → `cross_class_static_call` (auto-resolved by the
+  qualifier rewrite above); private → `add_to_item_names` (high
+  confidence — privates have no out-of-class callers); other shapes
+  leave `recommended_resolution` absent for operator decision.
 - **Cross-package bare-field access on inner-type DTOs routes through
   getters.** When the moved methods take a parameter typed as a
   source-class inner type (`public static class Ticket` with
@@ -138,16 +172,27 @@ real; if your concern is on the list, the planner already handles it.
   or chained accesses), only triggers on inner types declared inside
   the source class, and only fires when the inner type has a matching
   public getter. Same-package extracts leave bare access alone.
+- **Java record components route through bare-name accessors.** When
+  the moved methods access a component of a source-class `record` inner
+  type (`param.componentName`), the planner rewrites to
+  `param.componentName()` — records auto-generate private final backing
+  fields and public accessors named after the component (no `get`
+  prefix). Triggers SAME-package too — record private fields aren't
+  package-accessible, so the rewrite is needed for any extract out of
+  the declaring class. POJO inner-type rewriting stays cross-package
+  gated; record-component rewriting is unconditional.
 - **Source-class inner type references are qualified + widened.** When
   extracted bodies reference an inner type (enum, class, record, or
   interface) declared inside the source class — bare `InnerType`,
-  `InnerType.VALUE`, or `InnerType.staticCall()` — the planner rewrites
-  each reference to `<SourceClass>.<InnerType>` on the target, adds an
-  `import <source-package>.<SourceClass>;` to cross-package targets, and
-  widens the inner type's source-side visibility to the same floor used
-  for moved methods (`package` same-pkg, `public` cross-pkg). Inner types
-  already at/above the floor stay unchanged. References the operator
-  already qualified as `Outer.Inner` are left alone.
+  `InnerType.VALUE`, `InnerType.staticCall()`, OR method-reference
+  qualifier (`InnerType::new`, `InnerType::method`) — the planner
+  rewrites each reference to `<SourceClass>.<InnerType>` on the target,
+  adds an `import <source-package>.<SourceClass>;` to cross-package
+  targets, and widens the inner type's source-side visibility to the
+  same floor used for moved methods (`package` same-pkg, `public`
+  cross-pkg). Inner types already at/above the floor stay unchanged.
+  References the operator already qualified as `Outer.Inner` are
+  left alone.
 - **Overloaded methods disambiguated by signature suffix.** `item_names`
   accepts entries like `"methodName(Type1, Type2)"` to pick one specific
   overload by parameter types. Bare `"methodName"` still works when the
@@ -606,6 +651,53 @@ type implicitly. An explicit `visibility` parameter on the plan acts as
 an additional floor — the planner widens further if you ask for `public`,
 but never narrows below the cross-package requirement.
 
+### Optional parameters on `extract_java_class`
+
+- **`wiring_mode`** — how the source class wires the new delegate field.
+  Values:
+  - `constructor_args` (default for plain-Java classes): `private final
+    <Target> <delegate>;` + `this.<delegate> = new <Target>(...)` in
+    the source's first constructor.
+  - `guice_field_inject`: emit `@Inject private <Target> <delegate>;`
+    on the source, skip ctor wiring entirely. The DI container
+    populates the delegate after construction. The target's
+    constructor also gets `@Inject` and `import javax.inject.Inject;`
+    so DI can construct it with its captured ctor params.
+  - `manual`: skip source-side wiring (no delegate field, no ctor
+    assignment). Operator wires in their own code.
+
+  **Auto-detect refusal.** When `wiring_mode` is unset AND the source
+  class has any `@Inject`-annotated field, the planner refuses with
+  `error.bad_input(code=guice_field_injection_detected)` — the
+  default `constructor_args` flow would capture null because injection
+  happens AFTER the constructor. Pass `wiring_mode` explicitly to
+  proceed.
+
+  **Import dedupe.** `@Inject` lives in two packages (`com.google.inject`
+  and `javax.inject`). The import-injection paths skip when the source
+  already imports either FQCN (same simple name) AND when any wildcard
+  import is present (could supply the simple name from a different
+  package and silently flip binding).
+
+- **`source_delegate_wrappers`** — when `true`, generate thin wrapper
+  methods on the source for each moved public non-static method. Each
+  wrapper has the original method's signature (parameters + `throws`
+  clause preserved) and a body that delegates to the new field:
+  `return <delegate>.<method>(args);` (or bare call for void returns).
+  Cross-file callers holding references to the source class continue
+  to compile against the wrapper. Default `false` (preserves the
+  current breaking-extract behavior). Static methods are NOT wrapped
+  — they're handled by the public-static auto-qualify rewrite.
+
+- **`propagate_class_annotations`** — controls whether class-level
+  annotations on the source class propagate to the target. Values:
+  - `auto` (default): scan moved bodies for identifiers generated by
+    known annotation processors. v1 covers `@Slf4j` → `log` (with
+    `import lombok.extern.slf4j.Slf4j;`).
+  - `all`: copy every class-level annotation verbatim, no detection.
+  - `none`: strip everything (the legacy behavior).
+  - `list:@A,@B`: operator-supplied allowlist.
+
 Pass `deep_analysis: true` to also receive:
 
 - `external_calls` and `inherited_dependencies` (same shape as in step 3
@@ -714,6 +806,15 @@ The uppercase-initial check is convention-based; lower-case identifiers
 in receiver position are treated as values, not types. False positives
 (an uppercase-initial local variable that violates convention) resolve
 as "no matching type" in the project index and get silently dropped.
+
+The walker also visits `marker_annotation` and `annotation` nodes,
+capturing the annotation's simple name (`@Nullable`, `@Transactional`,
+custom annotations, plus the qualified-name form `@some.pkg.Annot`).
+JDK annotation builtins (`@Override`, `@Deprecated`, `@SuppressWarnings`,
+`@FunctionalInterface`, `@SafeVarargs`) are filtered out; everything
+else routes through the project type index for import preservation.
+`annotated_type` nodes (`@Nullable String foo`) parse with the
+annotation as a child, so they are covered too.
 
 This means the operator no longer needs a follow-up
 `java_lsp_organize_imports` call solely to prune Vaadin-`@Route` or
@@ -1146,7 +1247,8 @@ gradle test
 
 - Do not apply Rust plan kinds to Java files.
 - Tree-sitter does not enforce package/path consistency, generic type binding, annotation processing, Lombok/generated code, or classpath semantics.
-- **Annotation-processor-generated members are invisible to dependency analysis.** The `inherited_dependencies` walk traverses `extends` / `implements` chains in the project type index — it does not run annotation processors. Class-level annotations that generate members (Lombok `@Slf4j` → `log`, `@Data` / `@Getter` / `@Setter` → accessors, MapStruct-generated mappers, etc.) are not surfaced as inherited dependencies. If the extracted method body references such a generated member (`log.info(...)` from `@Slf4j` on the source class), the extracted target must either re-declare the same class-level annotation or accept the member as a constructor-injected dependency. The composite plan does not propagate class-level annotations between source and target.
+- **Annotation-processor-generated members are invisible to dependency analysis.** The `inherited_dependencies` walk traverses `extends` / `implements` chains in the project type index — it does not run annotation processors. Class-level annotations that generate members (Lombok `@Slf4j` → `log`, `@Data` / `@Getter` / `@Setter` → accessors, MapStruct-generated mappers, etc.) are not surfaced as inherited dependencies. The composite plan **does** propagate the `@Slf4j` annotation (and its import) to the target when moved bodies reference `log` — see `propagate_class_annotations` below. Other annotation processors (`@Data`, `@Getter`, `@Setter`) generate per-field accessors whose identifiers depend on source-class field names and are not pattern-matched in `auto` mode; request them explicitly via `propagate_class_annotations=all` or `list:@Foo,@Bar`.
+- **`bbox_refactor_apply` refuses cross-worktree applies.** When the caller passes `cwd` (or the daemon's working directory resolves to a different git toplevel than the plan's recorded paths), apply bails with `error.cross_worktree_apply` rather than silently writing to the plan-time paths. Re-plan from the current worktree, or pass `force_path=true` to write to the plan's recorded paths anyway. When the caller omits `cwd` AND the daemon's `env::current_dir()` resolves outside any git tree (typical for systemd-managed daemons with `WorkingDirectory=$HOME`), the same refusal fires — pass `cwd` or `project_dir` from the dispatching tool to identify the caller's worktree.
 - `java_lsp_organize_imports` is strongest with `jdtls` installed and available
   in the system path. JDTLS is now run as a warm per-project session reused
   across calls, so cold-start cost is paid once per `(project_dir, java)`
