@@ -21,18 +21,39 @@ impl BlackboxServer {
     )]
     pub(crate) fn bbox_inbox(&self, Parameters(p): Parameters<InboxParams>) -> CallToolResult {
         Self::run("bbox_inbox", || {
+            let import_report = if p.import_gap_spool.unwrap_or(false) {
+                let projects = self.state.projects.read();
+                let mut notes = self.state.notes.write();
+                let state_dir = self.state.config.read().paths.state_dir.clone();
+                Some(gap_spool::import_gap_spool(
+                    &mut notes, &projects, &state_dir,
+                )?)
+            } else {
+                None
+            };
+
             let kb = self.state.kb.read();
             let threads = self.state.threads.read();
             let notes = self.state.notes.read();
             let task_store = self.state.task_store.read();
-            inbox::compute_inbox(
+            let inbox = inbox::compute_inbox(
                 &kb,
                 &threads,
                 &notes,
                 &task_store,
                 &self.state.whiteboards,
                 &p,
-            )
+            )?;
+            if let Some(report) = import_report {
+                let rendered = report.render();
+                if rendered.is_empty() {
+                    Ok(inbox)
+                } else {
+                    Ok(format!("{rendered}{inbox}"))
+                }
+            } else {
+                Ok(inbox)
+            }
         })
     }
 }

@@ -499,7 +499,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_note",
         category: ToolCategory::Notes,
         summary: "Record a structured side-channel note while working.",
-        when_to_use: "Executors emit high-signal notes during work; orchestrators mostly read them. Always emit `done` before returning. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy.",
+        when_to_use: "Executors emit high-signal notes during work; orchestrators mostly read them. Always emit `done` before returning. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy. For substrate gaps that other projects could plausibly hit too, use the `blackbox.gap_note.v1` JSON envelope inside `kind=\"followup\"`; do not invent a `bbox_gap` tool. See `sm-gap-notes` via `bbox_knowledge`.",
         example: Some(
             r#"bbox_note(kind="dispute", body="brief assumes schema is additive — migration 0042 makes it subtractive")"#,
         ),
@@ -525,7 +525,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_inbox",
         category: ToolCategory::Inbox,
         summary: "Aggregate attention layer across every store.",
-        when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view.",
+        when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view. Gap reports filed as `blackbox.gap_note.v1` followups surface here too; pass `import_gap_spool=true`, `aggregate_gaps=true`, or `check_gap_closeouts=true` for the gap workflow helpers. See `sm-gap-notes` via `bbox_knowledge`.",
         example: Some(r#"bbox_inbox(project="/repo/x", stale_days=3)"#),
     },
     // ── Artifact catalog ─────────────────────────────────────────────

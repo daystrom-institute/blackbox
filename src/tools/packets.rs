@@ -103,19 +103,41 @@ impl BlackboxServer {
         description = "Log a packet-authoring gap: 'I wanted to compile a rule but the AST couldn't express it'. Use when you fall back to prose, ad-hoc code, or a different tool because a primitive you needed isn't available. The `description` names what you wanted; `ast_feature_requested` names the primitive you wished existed (e.g. `RateCmp`, `StringMatches`, `Within{temporal}`). These gaps are the highest-signal input for prioritizing new AST primitives — every gap logged is a vote for what the packet system can't yet say. Query via bbox_packet_events(op='gap')."
     )]
     pub(crate) fn bbox_packet_gap(&self, Parameters(p): Parameters<GapParams>) -> CallToolResult {
-        Self::run("bbox_packet_gap", || {
-            let ev = self.state.packets.read().log_gap(
+        let start = std::time::Instant::now();
+        let tool = "bbox_packet_gap";
+
+        let ev = {
+            let guard = self.state.packets.read();
+            match guard.log_gap(
                 &p.description,
                 p.domain.as_deref(),
                 p.attempted_sketch.as_deref(),
                 p.fallback_used.as_deref(),
                 p.ast_feature_requested.as_deref(),
-            )?;
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "logged": true,
-                "timestamp": ev.timestamp,
-                "note": "Thank you — this gap is now queryable via bbox_packet_events(op='gap')",
-            }))?)
-        })
+            ) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %e, "err");
+                    return Self::err_text(&format!("Error: {e:#}"));
+                }
+            }
+        };
+
+        let warning = Packets::emit_companion_gap_note(&self.state.notes, &ev, &p);
+
+        let mut response = serde_json::json!({
+            "logged": true,
+            "timestamp": ev.timestamp,
+            "note": "Thank you — this gap is now queryable via bbox_packet_events(op='gap')",
+        });
+        if let Some(w) = warning {
+            response["companion_note_warning"] = Value::String(w);
+        }
+
+        let text = serde_json::to_string_pretty(&response).unwrap_or_default();
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = text.len(), "ok");
+        Self::ok_text(&text)
     }
 }

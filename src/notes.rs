@@ -5,6 +5,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
@@ -128,6 +129,7 @@ pub enum NoteKind {
     Clone,
     Copy,
     PartialEq,
+    Eq,
     Default,
     Serialize,
     Deserialize,
@@ -183,6 +185,95 @@ impl NoteStore {
             version: 1,
             notes: Vec::new(),
         }
+    }
+}
+
+// ── Gap-note view ─────────────────────────────────────────────────
+
+const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GapImpact {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl GapImpact {
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("critical") => Self::Critical,
+            Some("high") => Self::High,
+            Some("low") => Self::Low,
+            Some("medium") | None => Self::Medium,
+            Some(_) => Self::Medium,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+pub struct GapNoteView<'a> {
+    pub note: &'a Note,
+    pub title: String,
+    pub gap_kind: Option<String>,
+    pub domain: Option<String>,
+    pub impact: GapImpact,
+    pub blocking_level: Option<String>,
+    pub dedupe_key: Option<String>,
+    pub wanted_capability: Option<String>,
+}
+
+impl<'a> GapNoteView<'a> {
+    pub fn parse(note: &'a Note) -> Option<Self> {
+        if note.kind != NoteKind::Followup {
+            return None;
+        }
+
+        let value = serde_json::from_str::<Value>(&note.body).ok()?;
+        let object = value.as_object()?;
+        if object.get("type").and_then(Value::as_str) != Some(GAP_NOTE_TYPE) {
+            return None;
+        }
+
+        Some(Self {
+            note,
+            title: string_field(object, "title")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| truncate_chars(&note.body, 120)),
+            gap_kind: string_field(object, "gap_kind"),
+            domain: string_field(object, "domain"),
+            impact: GapImpact::parse(object.get("impact").and_then(Value::as_str)),
+            blocking_level: string_field(object, "blocking_level"),
+            dedupe_key: string_field(object, "dedupe_key"),
+            wanted_capability: string_field(object, "wanted_capability"),
+        })
+    }
+}
+
+fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
     }
 }
 
@@ -518,6 +609,25 @@ mod tests {
         (dir, notes)
     }
 
+    fn followup_note(body: &str) -> Note {
+        Note {
+            id: "note-00000001".into(),
+            kind: NoteKind::Followup,
+            body: body.into(),
+            task_id: None,
+            session_id: None,
+            project: Some("/repo/x".into()),
+            thread_id: None,
+            provider: None,
+            bro: None,
+            resolution: NoteResolution::Unresolved,
+            created_at: "2026-05-12T00:00:00Z".into(),
+            updated_at: "2026-05-12T00:00:00Z".into(),
+            resolved_at: None,
+            resolution_note: None,
+        }
+    }
+
     #[test]
     fn create_and_list() {
         let (_tmp, mut notes) = mk_store();
@@ -553,6 +663,68 @@ mod tests {
             .unwrap();
         assert!(out.contains("brief conflates schemas"));
         assert!(out.contains("bro=executor"));
+    }
+
+    #[test]
+    fn gap_note_compact_json_body_parses() {
+        let note = followup_note(
+            r#"{"type":"blackbox.gap_note.v1","title":"Packet AST cannot express regex","gap_kind":"packet_ast","domain":"review-policy","impact":"high","blocking_level":"workaround_available","dedupe_key":"packet_ast/review-policy/regex","wanted_capability":"regex matching"}"#,
+        );
+
+        let view = GapNoteView::parse(&note).unwrap();
+
+        assert_eq!(view.note.id, "note-00000001");
+        assert_eq!(view.title, "Packet AST cannot express regex");
+        assert_eq!(view.gap_kind.as_deref(), Some("packet_ast"));
+        assert_eq!(view.domain.as_deref(), Some("review-policy"));
+        assert_eq!(view.impact, GapImpact::High);
+        assert_eq!(view.blocking_level.as_deref(), Some("workaround_available"));
+        assert_eq!(
+            view.dedupe_key.as_deref(),
+            Some("packet_ast/review-policy/regex")
+        );
+        assert_eq!(view.wanted_capability.as_deref(), Some("regex matching"));
+    }
+
+    #[test]
+    fn gap_note_pretty_json_body_parses() {
+        let body = serde_json::to_string_pretty(&serde_json::json!({
+            "type": "blackbox.gap_note.v1",
+            "title": "Need synonym matching",
+            "impact": "critical"
+        }))
+        .unwrap();
+        let note = followup_note(&body);
+
+        let view = GapNoteView::parse(&note).unwrap();
+
+        assert_eq!(view.title, "Need synonym matching");
+        assert_eq!(view.impact, GapImpact::Critical);
+    }
+
+    #[test]
+    fn gap_note_missing_type_is_ignored() {
+        let note = followup_note(r#"{"title":"Missing type","impact":"high"}"#);
+
+        assert!(GapNoteView::parse(&note).is_none());
+    }
+
+    #[test]
+    fn gap_note_malformed_json_is_ignored() {
+        let note = followup_note(r#"{"type":"blackbox.gap_note.v1""#);
+
+        assert!(GapNoteView::parse(&note).is_none());
+    }
+
+    #[test]
+    fn gap_note_unknown_impact_ranks_as_medium() {
+        let note = followup_note(
+            r#"{"type":"blackbox.gap_note.v1","title":"Unknown impact","impact":"urgent"}"#,
+        );
+
+        let view = GapNoteView::parse(&note).unwrap();
+
+        assert_eq!(view.impact, GapImpact::Medium);
     }
 
     #[test]

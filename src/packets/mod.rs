@@ -154,6 +154,18 @@ pub struct Packet {
     pub merged_from: Vec<String>,
 }
 
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars().take(48) {
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
 fn default_rank_lookup_key() -> String {
     "role".to_string()
 }
@@ -270,9 +282,6 @@ impl Packets {
         Ok(events)
     }
 
-    /// Record a packet-authoring gap — "I wanted to compile but the
-    /// AST couldn't express this." High-signal input for prioritizing
-    /// new predicate primitives.
     pub fn log_gap(
         &self,
         description: &str,
@@ -311,6 +320,82 @@ impl Packets {
         }
         self.append_event(&ev);
         Ok(ev)
+    }
+
+    pub fn gap_dedupe_key(
+        domain: Option<&str>,
+        ast_feature_requested: Option<&str>,
+        description: &str,
+    ) -> String {
+        let slug = match ast_feature_requested {
+            Some(f) if !f.trim().is_empty() => f.trim().to_string(),
+            _ => slugify(description),
+        };
+        format!("packet_ast/{}/{}", domain.unwrap_or("unknown"), slug)
+    }
+
+    pub fn build_gap_note_body(ev: &PacketEvent, params: &GapParams, dedupe_key: &str) -> String {
+        let body = serde_json::json!({
+            "type": "blackbox.gap_note.v1",
+            "title": format!("Packet AST gap: {}",
+                ev.domain.as_deref()
+                    .or(params.ast_feature_requested.as_deref())
+                    .unwrap_or("unknown")),
+            "gap_kind": "packet_ast",
+            "domain": ev.domain,
+            "wanted_capability": params.description,
+            "missing_primitive": params.ast_feature_requested,
+            "fallback_used": params.fallback_used,
+            "impact": "medium",
+            "blocking_level": "workaround_available",
+            "evidence": [format!("packet-event:gap:{}", ev.timestamp)],
+            "dedupe_key": dedupe_key,
+            "notes": params.attempted_sketch,
+        });
+        body.to_string()
+    }
+
+    pub fn emit_companion_gap_note(
+        notes_lock: &parking_lot::RwLock<crate::notes::Notes>,
+        ev: &PacketEvent,
+        params: &GapParams,
+    ) -> Option<String> {
+        let dedupe_key = Self::gap_dedupe_key(
+            ev.domain.as_deref(),
+            params.ast_feature_requested.as_deref(),
+            &params.description,
+        );
+
+        {
+            let notes = notes_lock.read();
+            let already_reported = notes.all().iter().any(|n| {
+                !matches!(n.resolution, crate::notes::NoteResolution::Addressed)
+                    && crate::notes::GapNoteView::parse(n)
+                        .and_then(|v| v.dedupe_key)
+                        .as_deref()
+                        == Some(dedupe_key.as_str())
+            });
+            if already_reported {
+                return None;
+            }
+        }
+
+        let body = Self::build_gap_note_body(ev, params, &dedupe_key);
+        let note_params = crate::notes::NoteParams {
+            kind: "followup".to_string(),
+            body,
+            task_id: None,
+            session_id: None,
+            project: None,
+            thread_id: None,
+            provider: None,
+            bro: None,
+        };
+
+        match notes_lock.write().create(&note_params) {
+            Ok(_) => None,
+            Err(e) => Some(format!("companion gap note failed: {e:#}")),
+        }
     }
 
     fn save_packet(&self, packet: &Packet) -> Result<()> {
@@ -359,7 +444,7 @@ impl Packets {
     }
 
     /// Load the latest packet for a given domain, with project-scoped override.
-    /// 
+    ///
     /// Project-scoped packets take precedence: if a project is specified and
     /// a packet with matching domain and scope="project" exists for that project,
     /// it is returned. Otherwise, falls back to the latest global packet with
@@ -370,20 +455,17 @@ impl Packets {
         project: Option<&str>,
     ) -> Result<Option<Packet>> {
         let all = self.list_all()?;
-        
+
         // Collect matching packets
-        let mut matches: Vec<&Packet> = all
-            .iter()
-            .filter(|p| p.domain == domain)
-            .collect();
-        
+        let mut matches: Vec<&Packet> = all.iter().filter(|p| p.domain == domain).collect();
+
         if matches.is_empty() {
             return Ok(None);
         }
-        
+
         // Sort by created_at descending (newest first)
         matches.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        
+
         // If project specified, look for project-scoped packet first
         if let Some(proj) = project {
             for packet in &matches {
@@ -392,14 +474,14 @@ impl Packets {
                 }
             }
         }
-        
+
         // Fall back to global packet or first project packet without project match
         for packet in &matches {
             if packet.scope == "global" {
                 return Ok(Some((*packet).clone()));
             }
         }
-        
+
         // Return the newest matching packet regardless of scope
         Ok(Some((*matches[0]).clone()))
     }
@@ -4014,6 +4096,280 @@ mod tests {
     }
 
     #[test]
+    fn companion_gap_note_created() {
+        let dir = TempDir::new().unwrap();
+        let packets = Packets::open(dir.path()).unwrap();
+        let notes_path = dir.path().join("notes.json");
+        let notes = crate::notes::Notes::open(&notes_path).unwrap();
+        let notes_lock = parking_lot::RwLock::new(notes);
+
+        let ev = packets
+            .log_gap(
+                "wanted regex matching on log messages",
+                Some("auth"),
+                Some("CountInWindow{...}"),
+                Some("prose rubric"),
+                Some("StringMatches"),
+            )
+            .unwrap();
+
+        let params = GapParams {
+            description: "wanted regex matching on log messages".into(),
+            domain: Some("auth".into()),
+            attempted_sketch: Some("CountInWindow{...}".into()),
+            fallback_used: Some("prose rubric".into()),
+            ast_feature_requested: Some("StringMatches".into()),
+        };
+
+        let warning = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
+        assert!(warning.is_none(), "should succeed without warning");
+
+        let notes = notes_lock.read();
+        assert_eq!(notes.all().len(), 1);
+        let note = &notes.all()[0];
+        assert_eq!(note.kind, crate::notes::NoteKind::Followup);
+
+        let parsed = crate::notes::GapNoteView::parse(note).unwrap();
+        assert_eq!(parsed.gap_kind.as_deref(), Some("packet_ast"));
+        assert_eq!(parsed.domain.as_deref(), Some("auth"));
+        assert_eq!(
+            parsed.dedupe_key.as_deref(),
+            Some("packet_ast/auth/StringMatches")
+        );
+        assert_eq!(
+            parsed.wanted_capability.as_deref(),
+            Some("wanted regex matching on log messages")
+        );
+    }
+
+    #[test]
+    fn companion_gap_note_deduplicates() {
+        let dir = TempDir::new().unwrap();
+        let packets = Packets::open(dir.path()).unwrap();
+        let notes_path = dir.path().join("notes.json");
+        let notes = crate::notes::Notes::open(&notes_path).unwrap();
+        let notes_lock = parking_lot::RwLock::new(notes);
+
+        let params = GapParams {
+            description: "wanted regex".into(),
+            domain: Some("auth".into()),
+            attempted_sketch: None,
+            fallback_used: None,
+            ast_feature_requested: Some("StringMatches".into()),
+        };
+
+        let ev = packets
+            .log_gap(
+                "wanted regex",
+                Some("auth"),
+                None,
+                None,
+                Some("StringMatches"),
+            )
+            .unwrap();
+        let _ = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
+        assert_eq!(notes_lock.read().all().len(), 1);
+
+        let ev2 = packets
+            .log_gap(
+                "wanted regex",
+                Some("auth"),
+                None,
+                None,
+                Some("StringMatches"),
+            )
+            .unwrap();
+        let _ = Packets::emit_companion_gap_note(&notes_lock, &ev2, &params);
+        assert_eq!(
+            notes_lock.read().all().len(),
+            1,
+            "second call should not create a duplicate"
+        );
+    }
+
+    #[test]
+    fn companion_gap_note_deduplicates_acknowledged() {
+        let dir = TempDir::new().unwrap();
+        let packets = Packets::open(dir.path()).unwrap();
+        let notes_path = dir.path().join("notes.json");
+        let notes = crate::notes::Notes::open(&notes_path).unwrap();
+        let notes_lock = parking_lot::RwLock::new(notes);
+
+        let params = GapParams {
+            description: "no rate predicate".into(),
+            domain: Some("rate-limit".into()),
+            attempted_sketch: None,
+            fallback_used: None,
+            ast_feature_requested: Some("RateCmp".into()),
+        };
+
+        let ev = packets
+            .log_gap(
+                "no rate predicate",
+                Some("rate-limit"),
+                None,
+                None,
+                Some("RateCmp"),
+            )
+            .unwrap();
+        let _ = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
+        let note_id = notes_lock.read().all()[0].id.clone();
+
+        notes_lock
+            .write()
+            .resolve(&crate::notes::NoteResolveParams {
+                id: note_id,
+                resolution: "acknowledged".into(),
+                note: None,
+            })
+            .unwrap();
+
+        let ev2 = packets
+            .log_gap(
+                "no rate predicate",
+                Some("rate-limit"),
+                None,
+                None,
+                Some("RateCmp"),
+            )
+            .unwrap();
+        let _ = Packets::emit_companion_gap_note(&notes_lock, &ev2, &params);
+        assert_eq!(
+            notes_lock.read().all().len(),
+            1,
+            "acknowledged gap note should block new companion"
+        );
+    }
+
+    #[test]
+    fn companion_gap_note_allows_after_addressed() {
+        let dir = TempDir::new().unwrap();
+        let packets = Packets::open(dir.path()).unwrap();
+        let notes_path = dir.path().join("notes.json");
+        let notes = crate::notes::Notes::open(&notes_path).unwrap();
+        let notes_lock = parking_lot::RwLock::new(notes);
+
+        let params = GapParams {
+            description: "no temporal window".into(),
+            domain: Some("retry".into()),
+            attempted_sketch: None,
+            fallback_used: None,
+            ast_feature_requested: Some("Within{temporal}".into()),
+        };
+
+        let ev = packets
+            .log_gap(
+                "no temporal window",
+                Some("retry"),
+                None,
+                None,
+                Some("Within{temporal}"),
+            )
+            .unwrap();
+        let _ = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
+        let note_id = notes_lock.read().all()[0].id.clone();
+
+        notes_lock
+            .write()
+            .resolve(&crate::notes::NoteResolveParams {
+                id: note_id,
+                resolution: "addressed".into(),
+                note: Some("implemented RateCmp".into()),
+            })
+            .unwrap();
+
+        let ev2 = packets
+            .log_gap(
+                "no temporal window",
+                Some("retry"),
+                None,
+                None,
+                Some("Within{temporal}"),
+            )
+            .unwrap();
+        let _ = Packets::emit_companion_gap_note(&notes_lock, &ev2, &params);
+        assert_eq!(
+            notes_lock.read().all().len(),
+            2,
+            "addressed gap note should allow new companion"
+        );
+    }
+
+    #[test]
+    fn packet_event_survives_note_failure() {
+        let dir = TempDir::new().unwrap();
+        let packets = Packets::open(dir.path()).unwrap();
+        let broken_path = dir.path().join("notes.json");
+        let notes = crate::notes::Notes::open(&broken_path).unwrap();
+        std::fs::create_dir(&broken_path).unwrap();
+        let notes_lock = parking_lot::RwLock::new(notes);
+
+        let params = GapParams {
+            description: "some gap".into(),
+            domain: None,
+            attempted_sketch: None,
+            fallback_used: None,
+            ast_feature_requested: Some("Foo".into()),
+        };
+
+        let ev = packets
+            .log_gap("some gap", None, None, None, Some("Foo"))
+            .unwrap();
+
+        let warning = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
+        assert!(
+            warning.is_some(),
+            "note creation should fail on unwritable path"
+        );
+        assert!(warning.unwrap().contains("companion gap note failed"));
+
+        let events = packets
+            .list_events(Some("gap"), None, None, None, 10)
+            .unwrap();
+        assert_eq!(events.len(), 1, "packet event must survive note failure");
+    }
+
+    #[test]
+    fn gap_dedupe_key_uses_ast_feature_over_description() {
+        let key = Packets::gap_dedupe_key(Some("auth"), Some("StringMatches"), "fallback text");
+        assert_eq!(key, "packet_ast/auth/StringMatches");
+    }
+
+    #[test]
+    fn gap_dedupe_key_slugifies_description_when_no_feature() {
+        let key = Packets::gap_dedupe_key(None, None, "wanted rate limiting!!");
+        assert_eq!(key, "packet_ast/unknown/wanted-rate-limiting");
+    }
+
+    #[test]
+    fn build_gap_note_body_is_valid_json() {
+        let dir = TempDir::new().unwrap();
+        let packets = Packets::open(dir.path()).unwrap();
+        let ev = packets
+            .log_gap("test gap", Some("x"), None, None, Some("Y"))
+            .unwrap();
+        let params = GapParams {
+            description: "test gap".into(),
+            domain: Some("x".into()),
+            attempted_sketch: Some("sketch".into()),
+            fallback_used: Some("fallback".into()),
+            ast_feature_requested: Some("Y".into()),
+        };
+        let body = Packets::build_gap_note_body(&ev, &params, "packet_ast/x/Y");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["type"], "blackbox.gap_note.v1");
+        assert_eq!(v["gap_kind"], "packet_ast");
+        assert_eq!(v["domain"], "x");
+        assert_eq!(v["missing_primitive"], "Y");
+        assert_eq!(v["wanted_capability"], "test gap");
+        assert_eq!(v["notes"], "sketch");
+        assert_eq!(v["fallback_used"], "fallback");
+        assert_eq!(v["impact"], "medium");
+        assert_eq!(v["blocking_level"], "workaround_available");
+        assert!(v["evidence"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
     fn list_events_filters_and_newest_first() {
         let (_d, packets) = tmp_packets();
         // Fire a mix of operations.
@@ -4036,13 +4392,15 @@ mod tests {
             .iter()
             .find(|e| e.op == "gap")
             .expect("at least one gap event");
-        assert!(first_gap
-            .details
-            .get("description")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("gap B"));
+        assert!(
+            first_gap
+                .details
+                .get("description")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("gap B")
+        );
 
         // Filter by op=gap — should be two.
         let gaps = packets

@@ -494,6 +494,47 @@ pub const SYSTEM_MEMORIES: &[SystemMemory] = &[
         content: include_str!("side-channel-notes.md"),
     },
     SystemMemory {
+        id: "sm-gap-notes",
+        title: "Gap notes — report substrate gaps via bbox_note",
+        tags: &[
+            // Direct names
+            "gap",
+            "gap-note",
+            "gap-notes",
+            "blackbox.gap_note.v1",
+            "substrate",
+            "substrate-gap",
+            "missing-primitive",
+            "missing-capability",
+            "field-report",
+            // bbox_note surface
+            "bbox_note",
+            "followup",
+            "note-backed-gap-log",
+            // gap_kind vocabulary — subject-facing vocabulary cold agents
+            // will reach for when they hit the gap, before they have learned
+            // the envelope name. Tags ensure bbox_knowledge queries from
+            // those angles route to this runbook.
+            "packet_ast",
+            "tooling",
+            "agent-gap",
+            "workflow-gap",
+            "refactor_primitive",
+            "mcp_surface",
+            "ontology",
+            "eval_coverage",
+            "docs_runbook",
+            // Operator workflow
+            "dedupe_key",
+            "impact",
+            "blocking_level",
+            "addresses-gap-note",
+            "close-out",
+            "runbook",
+        ],
+        content: include_str!("gap-notes.md"),
+    },
+    SystemMemory {
         id: "sm-transcript-retrieval",
         title: "Transcript retrieval — search, cite, context, session, messages",
         tags: &[
@@ -983,5 +1024,60 @@ mod tests {
                 m.id
             );
         }
+    }
+
+    #[test]
+    fn gap_notes_memory_embedded_and_teaches_envelope() {
+        let m = get("sm-gap-notes").expect("sm-gap-notes must exist");
+        assert!(
+            m.content.len() > 500,
+            "embedded gap-notes.md too short (got {} bytes)",
+            m.content.len()
+        );
+        // The runbook must teach the canonical envelope tag verbatim — agents
+        // route gap notes by exact match on this string.
+        assert!(
+            m.content.contains("blackbox.gap_note.v1"),
+            "runbook must cite the canonical envelope type"
+        );
+        // It must route to the existing surface, not a new tool.
+        assert!(
+            m.content.contains("bbox_note(kind=\"followup\")"),
+            "runbook must point at bbox_note(kind=\"followup\")"
+        );
+        // Non-regression: do not teach a `bbox_gap` tool.
+        assert!(
+            !m.content.contains("bbox_gap("),
+            "runbook must not invent a bbox_gap tool"
+        );
+    }
+
+    #[test]
+    fn search_finds_gap_notes_by_subject_vocabulary() {
+        // Subject-facing query — an agent that hit the gap before learning
+        // the envelope name should still land here.
+        let hits = search(Some("substrate gap"));
+        assert!(
+            hits.iter().any(|m| m.id == "sm-gap-notes"),
+            "subject query 'substrate gap' must surface sm-gap-notes"
+        );
+        // Routing tag query.
+        let envelope_hits = search(Some("blackbox.gap_note.v1"));
+        assert!(envelope_hits.iter().any(|m| m.id == "sm-gap-notes"));
+        // Canonical id query.
+        let id_hits = search(Some("sm-gap-notes"));
+        assert_eq!(id_hits.len(), 1);
+        assert_eq!(id_hits[0].id, "sm-gap-notes");
+    }
+
+    #[test]
+    fn gap_notes_memory_is_distinct_from_side_channel_notes() {
+        // The two runbooks describe orthogonal concerns — keep them
+        // separate so a future agent doesn't collapse the gap-note
+        // envelope into an eighth NoteKind.
+        let gap = get("sm-gap-notes").expect("sm-gap-notes must exist");
+        let scn = get("sm-side-channel-notes").expect("sm-side-channel-notes must exist");
+        assert_ne!(gap.id, scn.id);
+        assert_ne!(gap.content, scn.content);
     }
 }

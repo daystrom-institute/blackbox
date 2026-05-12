@@ -28,6 +28,8 @@ pub mod entity_ref;
 #[cfg(test)]
 #[path = "../eval/check.rs"]
 mod eval_check;
+mod gap_closeout;
+mod gap_spool;
 mod git;
 mod inbox;
 mod index;
