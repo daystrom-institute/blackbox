@@ -130,10 +130,28 @@ Writable plan kinds:
   to `pub(super)`. `module_name` defaults to the target file stem.
   `target_prelude` defaults to `use super::*;`. Visibility transforms
   are baked into the target FileEdit's replacement text, not emitted as
-  separate ordering-dependent edits. Refuses non-empty existing targets
-  and refuses `impl_method` (use `extract_rust_impl_methods`).
-  Idempotent on the source's `mod`/`use` decls — re-running over an
-  already-wired parent doesn't duplicate them.
+  separate ordering-dependent edits. Refuses `impl_method` (use
+  `extract_rust_impl_methods`). Idempotent on the source's `mod`/`use`
+  decls — re-running over an already-wired parent doesn't duplicate
+  them.
+
+  Extra knobs via `toml_entries`:
+  - `use_decl_visibility` (default `private`): visibility of the
+    re-export. Set to `pub(crate)` when the parent uses `use foo::*;`
+    glob to bring moved entry-points into a dispatcher's scope — the
+    private default keeps the import scoped to the parent file only.
+  - `use_decl_items` (default = auto-detect): explicit subset of
+    `item_names` to re-export. The default auto-prunes the use_decl to
+    only those moved names whose simple identifier still appears
+    somewhere in the source after the deletions land. Names whose only
+    references were inside the moved items themselves are dropped from
+    the use_decl entirely (no spurious unused-import warning).
+  - `merge_into_existing_target` (default `false`): append moved item
+    blocks to an existing non-empty target instead of refusing. Useful
+    for incremental batching multiple plan calls into the same
+    submodule file. When true, the target's prelude is preserved as-is
+    and new blocks are concatenated at the end with blank-line
+    separators.
 - `move_rust_items_with_callers`: extracts items AND walks the project
   rewriting cross-file callers. For each moved item, every
   `<source_simple>::<item>` occurrence in any other `.rs` file gets the

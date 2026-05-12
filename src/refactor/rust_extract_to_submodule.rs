@@ -6,27 +6,42 @@
 //! roundtrips when splitting a monster module. Inputs:
 //!
 //! - `source`: parent module file.
-//! - `target`: new submodule file (must be empty or missing).
+//! - `target`: new submodule file (empty/missing by default; pass
+//!   `toml_entries.merge_into_existing_target=true` to append to a
+//!   non-empty target).
 //! - `item_names` + optional `item_kinds`: items to move.
 //! - `module_name`: defaults to the target file stem. Used for the
 //!   `mod <module_name>;` declaration on the parent.
 //! - `visibility`: visibility floor applied to moved items AND their
 //!   struct fields (when moving a struct). Defaults to `pub(super)`.
 //! - `target_prelude`: text inserted at the top of the new file before
-//!   the moved items. Defaults to `use super::*;`.
+//!   the moved items. Defaults to `use super::*;`. Ignored when
+//!   `merge_into_existing_target=true` (existing prelude survives).
+//! - `toml_entries.use_decl_visibility`: visibility of the auto-emitted
+//!   re-export in the parent. `private` (default), `pub`, `pub(crate)`,
+//!   or `pub(super)`. Set to `pub(crate)` when the parent's `use M::*;`
+//!   pattern is what brings moved entry-points into the dispatcher's
+//!   scope.
+//! - `toml_entries.use_decl_items`: explicit subset of `item_names` to
+//!   re-export in the parent. Defaults to auto-detect — only items
+//!   whose simple name still appears in the source after the deletions
+//!   land are re-exported. This avoids the "use submodule::<33 names>"
+//!   noise emitted by v1.
+//! - `toml_entries.merge_into_existing_target`: append moved items to
+//!   an existing non-empty target instead of refusing. Defaults to
+//!   false.
 //!
 //! Behavior:
-//! - Source FileEdit: `mod <module_name>;` insertion, `use
-//!   <module_name>::{...};` insertion, deletion of each moved item's
-//!   leading-trivia-to-trailing-trivia span. Edits are merged into one
-//!   FileEdit sorted by byte offset.
+//! - Source FileEdit: `mod <module_name>;` insertion (skipped if
+//!   already declared), `<vis>use <module_name>::{...};` insertion
+//!   (only for names still referenced in the post-deletion source),
+//!   deletion of each moved item's leading-trivia-to-trailing-trivia
+//!   span. Edits are merged into one FileEdit sorted by byte offset.
 //! - Target FileEdit: writes the prelude + the moved item texts with
 //!   item-level visibility AND struct-field visibility already bumped
 //!   to `visibility`. The visibility transforms are baked into the
 //!   target text, not emitted as separate edits — so the plan applies
 //!   in one pass with no edit ordering dependencies.
-//!
-//! Refuses to overwrite a non-empty target.
 
 use super::*;
 
@@ -70,12 +85,70 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
         moved_blocks.push(render_item_with_visibility_bumped(&parsed, item, visibility_prefix)?);
     }
 
+    // v2 knobs out of toml_entries.
+    let use_decl_visibility = read_toml_str(&p.toml_entries, "use_decl_visibility")
+        .unwrap_or_else(|| "private".to_string());
+    let use_decl_visibility_prefix = match use_decl_visibility.trim() {
+        "" | "private" => "",
+        "pub" => "pub ",
+        "pub(crate)" => "pub(crate) ",
+        "pub(super)" => "pub(super) ",
+        other => bail!(
+            "unsupported use_decl_visibility `{other}`; expected one of: \
+             private, pub, pub(crate), pub(super)"
+        ),
+    };
+    let explicit_use_decl_items: Option<Vec<String>> =
+        read_toml_str_array(&p.toml_entries, "use_decl_items");
+    let merge_into_existing_target = read_toml_bool(
+        &p.toml_entries,
+        "merge_into_existing_target",
+    )
+    .unwrap_or(false);
+
     // Source-side: mod_decl + use_decl insertions (skip if already present).
     let mod_decl_edit =
         compute_mod_decl_edit_idempotent(&parsed.source, &items, &module_name)?;
-    let use_path_str = build_use_path(&module_name, &selected);
-    let use_decl_edit =
-        compute_use_decl_edit_idempotent(&parsed.source, &items, &use_path_str)?;
+
+    // Auto-prune the re-export list: when the operator didn't pass
+    // `use_decl_items` explicitly, scan the source for surviving
+    // identifier references to each moved name. Names whose every
+    // occurrence is inside a deletion range need no re-export.
+    let deletion_ranges: Vec<(usize, usize)> = selected
+        .iter()
+        .map(|item| (item.leading_trivia_start, item.trailing_trivia_end))
+        .collect();
+    let re_export_names: Vec<String> = match explicit_use_decl_items {
+        Some(names) => {
+            // Validate every requested name is in the move set.
+            let move_set: HashSet<&str> = selected
+                .iter()
+                .filter_map(|i| i.name.as_deref())
+                .collect();
+            for n in &names {
+                if !move_set.contains(n.as_str()) {
+                    bail!(
+                        "use_decl_items entry `{n}` is not in item_names; \
+                         can only re-export moved items"
+                    );
+                }
+            }
+            names
+        }
+        None => survivors_referenced_in_source(&parsed.source, &deletion_ranges, &selected),
+    };
+
+    let use_decl_edit = if re_export_names.is_empty() {
+        None
+    } else {
+        let use_path_str = build_use_path_for_names(&module_name, &re_export_names);
+        compute_use_decl_edit_idempotent(
+            &parsed.source,
+            &items,
+            &use_path_str,
+            use_decl_visibility_prefix,
+        )?
+    };
 
     // Source-side deletions for each moved item.
     let mut source_edits: Vec<TextEdit> = selected
@@ -96,35 +169,61 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
     ensure_non_overlapping(&source_edits)
         .context("extract_rust_items_to_submodule source edits overlap")?;
 
-    // Target-side: refuse non-empty existing target, then write the
-    // prelude + visibility-bumped moved blocks.
+    // Target-side: support either fresh-write (default) or append-to-existing
+    // (merge_into_existing_target=true).
     let target_source = fs::read_to_string(&target_path).unwrap_or_default();
-    if !target_source.trim().is_empty() {
+    let target_has_content = !target_source.trim().is_empty();
+    if target_has_content && !merge_into_existing_target {
         bail!(
-            "target file {} already exists and is non-empty; this plan kind \
-             refuses to overwrite",
+            "target file {} already exists and is non-empty; pass \
+             toml_entries.merge_into_existing_target=true to append moved \
+             items to the existing content",
             target_path.display()
         );
     }
-    let mut target_body = String::new();
-    if !target_prelude.is_empty() {
-        target_body.push_str(target_prelude.trim_end());
-        target_body.push_str("\n\n");
-    }
-    for (i, block) in moved_blocks.iter().enumerate() {
-        if i > 0 {
+    let target_edit = if target_has_content {
+        // Append-only: preserve existing content, add moved items at the
+        // end with a blank-line separator. No new prelude.
+        let mut appended = String::new();
+        if !target_source.ends_with('\n') {
+            appended.push('\n');
+        }
+        appended.push('\n');
+        for (i, block) in moved_blocks.iter().enumerate() {
+            if i > 0 {
+                appended.push_str("\n\n");
+            }
+            appended.push_str(block.trim_start_matches('\n').trim_end_matches('\n'));
+        }
+        if !appended.ends_with('\n') {
+            appended.push('\n');
+        }
+        TextEdit {
+            byte_start: target_source.len(),
+            byte_end: target_source.len(),
+            replacement: appended,
+        }
+    } else {
+        // Fresh write: prelude + moved blocks.
+        let mut target_body = String::new();
+        if !target_prelude.is_empty() {
+            target_body.push_str(target_prelude.trim_end());
             target_body.push_str("\n\n");
         }
-        let trimmed = block.trim_start_matches('\n').trim_end_matches('\n');
-        target_body.push_str(trimmed);
-    }
-    if !target_body.ends_with('\n') {
-        target_body.push('\n');
-    }
-    let target_edit = TextEdit {
-        byte_start: 0,
-        byte_end: target_source.len(),
-        replacement: target_body,
+        for (i, block) in moved_blocks.iter().enumerate() {
+            if i > 0 {
+                target_body.push_str("\n\n");
+            }
+            target_body.push_str(block.trim_start_matches('\n').trim_end_matches('\n'));
+        }
+        if !target_body.ends_with('\n') {
+            target_body.push('\n');
+        }
+        TextEdit {
+            byte_start: 0,
+            byte_end: target_source.len(),
+            replacement: target_body,
+        }
     };
 
     let plan = RefactorPlan {
@@ -326,14 +425,15 @@ fn compute_mod_decl_edit_idempotent(
     }))
 }
 
-/// Idempotent `use <use_path>;` insertion. Returns None when the same
-/// declaration already exists verbatim.
+/// Idempotent `<vis>use <use_path>;` insertion. Returns None when the
+/// same declaration already exists verbatim.
 fn compute_use_decl_edit_idempotent(
     source: &str,
     items: &[SyntaxItem],
     use_path: &str,
+    visibility_prefix: &str,
 ) -> Result<Option<TextEdit>> {
-    let declaration = format!("use {use_path};");
+    let declaration = format!("{visibility_prefix}use {use_path};");
     if source.lines().any(|line| line.trim() == declaration) {
         return Ok(None);
     }
@@ -364,20 +464,104 @@ fn compute_use_decl_edit_idempotent(
     }))
 }
 
-/// Build a `<module>::{Name1, fn2, ...}` use path from selected items.
-/// Single-item form is `<module>::Name`. Multi-item form lists every
-/// moved item alphabetically inside `{}`.
-fn build_use_path(module_name: &str, selected: &[&SyntaxItem]) -> String {
-    let mut names: Vec<&str> = selected
-        .iter()
-        .filter_map(|i| i.name.as_deref())
-        .collect();
-    names.sort();
-    match names.as_slice() {
+/// Build a `<module>::Name` (single) or `<module>::{Name1, fn2, ...}`
+/// (multi) use path from the supplied name list. Names are sorted
+/// alphabetically for stable diffs across plan re-runs.
+fn build_use_path_for_names(module_name: &str, names: &[String]) -> String {
+    let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+    sorted.sort();
+    match sorted.as_slice() {
         [] => module_name.to_string(),
         [single] => format!("{module_name}::{single}"),
         many => format!("{module_name}::{{{}}}", many.join(", ")),
     }
+}
+
+/// Auto-detect which moved item names are still referenced in the
+/// post-deletion source. Returns the subset of `selected` item names
+/// whose simple identifier appears at least once OUTSIDE every
+/// deletion range. Word-boundary checked so `MyTypeFoo` doesn't match
+/// `MyType`.
+fn survivors_referenced_in_source(
+    source: &str,
+    deletion_ranges: &[(usize, usize)],
+    selected: &[&SyntaxItem],
+) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    for item in selected {
+        let Some(name) = item.name.as_deref() else {
+            continue;
+        };
+        let needle = name.as_bytes();
+        let nlen = needle.len();
+        let mut i = 0;
+        let mut found = false;
+        while i + nlen <= bytes.len() {
+            if &bytes[i..i + nlen] != needle {
+                i += 1;
+                continue;
+            }
+            // Word boundary checks.
+            let prev_ok = i == 0 || !is_rust_ident_byte(bytes[i - 1]);
+            let next_ok =
+                i + nlen == bytes.len() || !is_rust_ident_byte(bytes[i + nlen]);
+            if !prev_ok || !next_ok {
+                i += 1;
+                continue;
+            }
+            // Reject if INSIDE any deletion range.
+            let in_deletion = deletion_ranges
+                .iter()
+                .any(|(s, e)| i >= *s && i + nlen <= *e);
+            if !in_deletion {
+                found = true;
+                break;
+            }
+            i = i + nlen;
+        }
+        if found {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+fn is_rust_ident_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+/// Pull a string out of toml_entries by key. Treats missing key,
+/// non-string value, and empty string identically (returns None).
+fn read_toml_str(
+    entries: &Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    key: &str,
+) -> Option<String> {
+    entries
+        .as_ref()?
+        .get(key)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn read_toml_bool(
+    entries: &Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    key: &str,
+) -> Option<bool> {
+    entries.as_ref()?.get(key)?.as_bool()
+}
+
+fn read_toml_str_array(
+    entries: &Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    key: &str,
+) -> Option<Vec<String>> {
+    let arr = entries.as_ref()?.get(key)?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -440,17 +624,22 @@ mod tests {
         out
     }
 
-    // Gate: end-to-end — struct + free fn moved, mod_decl + use_decl
-    // injected, visibility bumped on item AND fields.
+    // Gate: end-to-end — struct + free fn moved, mod_decl emitted,
+    // use_decl emitted ONLY for moved names still referenced in the
+    // source after deletion (auto-prune). Visibility bumped on item
+    // AND fields.
     #[test]
     fn moves_struct_and_fn_with_visibility_bump_and_wiring() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("parent.rs");
         let tgt = dir.path().join("parent/child.rs");
         fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        // outer() references helper() and Hidden — those references
+        // survive after the move, so the auto-prune keeps both names
+        // in the re-export.
         fs::write(
             &src,
-            "pub fn outer() {}\n\nstruct Hidden {\n    name: String,\n    kind: u32,\n}\n\nfn helper() -> usize { 42 }\n",
+            "pub fn outer() -> Hidden {\n    let _ = helper();\n    Hidden { name: String::new(), kind: 0 }\n}\n\nstruct Hidden {\n    name: String,\n    kind: u32,\n}\n\nfn helper() -> usize { 42 }\n",
         )
         .unwrap();
 
@@ -478,7 +667,7 @@ mod tests {
             "use_decl missing: {source_after}"
         );
         assert!(
-            !source_after.contains("struct Hidden"),
+            !source_after.contains("struct Hidden {"),
             "Hidden struct should be removed from source: {source_after}"
         );
         assert!(
@@ -574,7 +763,8 @@ mod tests {
         let src = dir.path().join("parent.rs");
         let tgt = dir.path().join("parent/cross_file.rs");
         fs::create_dir_all(tgt.parent().unwrap()).unwrap();
-        fs::write(&src, "fn x() {}\n").unwrap();
+        // `caller` references `x` so the auto-prune keeps `x` in the use_decl.
+        fs::write(&src, "fn caller() { x(); }\nfn x() {}\n").unwrap();
         let plan_json = plan_extract_rust_items_to_submodule(&make_params(
             &src,
             &tgt,
@@ -617,7 +807,8 @@ mod tests {
         );
     }
 
-    // Gate: refuse to overwrite a non-empty existing target.
+    // Gate: refuse to overwrite a non-empty existing target unless the
+    // operator opts in via merge_into_existing_target.
     #[test]
     fn refuses_non_empty_target() {
         let dir = tempfile::tempdir().unwrap();
@@ -635,8 +826,9 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("already exists and is non-empty"),
-            "expected non-empty refusal, got: {err}"
+            err.contains("already exists and is non-empty")
+                && err.contains("merge_into_existing_target"),
+            "expected non-empty refusal pointing at merge flag, got: {err}"
         );
     }
 
@@ -689,5 +881,266 @@ mod tests {
         let use_count = source_after.matches("use child::x;").count();
         assert_eq!(mod_count, 1, "mod_decl duplicated: {source_after}");
         assert_eq!(use_count, 1, "use_decl duplicated: {source_after}");
+    }
+
+    // ── v2 features ──────────────────────────────────────────────────
+
+    // Gate: auto-prune — when a moved item has NO surviving references
+    // in the source after deletion, no use_decl is emitted (the import
+    // would be unused).
+    #[test]
+    fn auto_prune_omits_use_decl_when_no_surviving_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        // unrelated() doesn't reference Helper at all. After Helper
+        // moves, no surviving reference → no use_decl.
+        fs::write(
+            &src,
+            "fn unrelated() -> usize { 0 }\nstruct Helper { x: u32 }\n",
+        )
+        .unwrap();
+        let plan_json = plan_extract_rust_items_to_submodule(&make_params(
+            &src,
+            &tgt,
+            &["Helper"],
+            Some(vec!["struct_item"]),
+        ))
+        .unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        let source_after = apply_file_edit(&src, &plan.edits[0]);
+        assert!(
+            !source_after.contains("use child::Helper"),
+            "auto-prune should omit unused use_decl: {source_after}"
+        );
+        // mod_decl is still emitted (rustc needs it to find the file).
+        assert!(
+            source_after.contains("mod child;"),
+            "mod_decl still required: {source_after}"
+        );
+    }
+
+    // Gate: auto-prune keeps only the subset of moved names that are
+    // still referenced after deletion. Selectively pruned re-export.
+    #[test]
+    fn auto_prune_keeps_only_referenced_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        // outer() references only Used, not Internal.
+        fs::write(
+            &src,
+            "fn outer() -> Used { Used }\nstruct Used;\nstruct Internal;\n",
+        )
+        .unwrap();
+        let plan_json = plan_extract_rust_items_to_submodule(&make_params(
+            &src,
+            &tgt,
+            &["Used", "Internal"],
+            Some(vec!["struct_item"]),
+        ))
+        .unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        let source_after = apply_file_edit(&src, &plan.edits[0]);
+        // Only Used should appear in the use_decl.
+        assert!(
+            source_after.contains("use child::Used;"),
+            "Used should be re-exported: {source_after}"
+        );
+        assert!(
+            !source_after.contains("Internal"),
+            "Internal should not appear in use_decl or anywhere remaining: {source_after}"
+        );
+    }
+
+    // Gate: toml_entries.use_decl_visibility=pub(crate) emits
+    // `pub(crate) use ...` so glob imports on the parent can re-export
+    // the moved names.
+    #[test]
+    fn use_decl_visibility_pub_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        fs::write(&src, "fn caller() { x(); }\nfn x() {}\n").unwrap();
+        let mut params = make_params(&src, &tgt, &["x"], Some(vec!["function_item"]));
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "use_decl_visibility".to_string(),
+            serde_json::Value::String("pub(crate)".to_string()),
+        );
+        params.toml_entries = Some(entries);
+        let plan_json = plan_extract_rust_items_to_submodule(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        let source_after = apply_file_edit(&src, &plan.edits[0]);
+        assert!(
+            source_after.contains("pub(crate) use child::x;"),
+            "use_decl should have pub(crate) prefix: {source_after}"
+        );
+    }
+
+    // Gate: invalid use_decl_visibility refused with an actionable message.
+    #[test]
+    fn rejects_unknown_use_decl_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        fs::write(&src, "fn caller() { x(); }\nfn x() {}\n").unwrap();
+        let mut params = make_params(&src, &tgt, &["x"], Some(vec!["function_item"]));
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "use_decl_visibility".to_string(),
+            serde_json::Value::String("pub(in foo)".to_string()),
+        );
+        params.toml_entries = Some(entries);
+        let err = plan_extract_rust_items_to_submodule(&params)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unsupported use_decl_visibility"),
+            "expected visibility refusal, got: {err}"
+        );
+    }
+
+    // Gate: toml_entries.use_decl_items overrides auto-detect with an
+    // operator-supplied subset (must be ⊆ item_names).
+    #[test]
+    fn use_decl_items_explicit_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        // outer() references both. Auto-prune would keep both. Override
+        // shrinks the use_decl to just `x`.
+        fs::write(
+            &src,
+            "fn outer() { x(); y(); }\nfn x() {}\nfn y() {}\n",
+        )
+        .unwrap();
+        let mut params = make_params(&src, &tgt, &["x", "y"], Some(vec!["function_item"]));
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "use_decl_items".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("x".to_string())]),
+        );
+        params.toml_entries = Some(entries);
+        let plan_json = plan_extract_rust_items_to_submodule(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        let source_after = apply_file_edit(&src, &plan.edits[0]);
+        assert!(
+            source_after.contains("use child::x;"),
+            "use_decl should include x: {source_after}"
+        );
+        assert!(
+            !source_after.contains("use child::y;")
+                && !source_after.contains("use child::{x, y}")
+                && !source_after.contains("use child::{y, x}"),
+            "use_decl should NOT include y: {source_after}"
+        );
+    }
+
+    // Gate: explicit use_decl_items must be a subset of item_names.
+    #[test]
+    fn rejects_use_decl_items_not_in_move_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        fs::write(&src, "fn x() {}\nfn y() {}\n").unwrap();
+        let mut params = make_params(&src, &tgt, &["x"], Some(vec!["function_item"]));
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "use_decl_items".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("y".to_string())]),
+        );
+        params.toml_entries = Some(entries);
+        let err = plan_extract_rust_items_to_submodule(&params)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not in item_names"),
+            "expected subset refusal, got: {err}"
+        );
+    }
+
+    // Gate: merge_into_existing_target=true appends to a non-empty
+    // target instead of refusing. Preserves existing content + prelude.
+    #[test]
+    fn merge_into_existing_target_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        fs::write(&src, "fn caller() { added(); }\nfn added() {}\n").unwrap();
+        // Existing target has a prelude + one item.
+        fs::write(
+            &tgt,
+            "use super::*;\n\npub(super) fn already_here() {}\n",
+        )
+        .unwrap();
+        let mut params = make_params(&src, &tgt, &["added"], Some(vec!["function_item"]));
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "merge_into_existing_target".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        params.toml_entries = Some(entries);
+        let plan_json = plan_extract_rust_items_to_submodule(&params)
+            .expect("merge should succeed");
+        let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        let target_after = apply_file_edit(&tgt, &plan.edits[1]);
+        // Original content preserved.
+        assert!(
+            target_after.contains("use super::*;"),
+            "existing prelude preserved: {target_after}"
+        );
+        assert!(
+            target_after.contains("pub(super) fn already_here"),
+            "existing item preserved: {target_after}"
+        );
+        // New item appended.
+        assert!(
+            target_after.contains("pub(super) fn added"),
+            "new item appended: {target_after}"
+        );
+        // Order: existing item appears before the new one.
+        let already_idx = target_after.find("already_here").unwrap();
+        let added_idx = target_after.find("fn added").unwrap();
+        assert!(
+            already_idx < added_idx,
+            "existing item should appear before new one: {target_after}"
+        );
+    }
+
+    // Gate: merge_into_existing_target=true on an EMPTY/missing target
+    // behaves identically to the default (fresh write with prelude).
+    #[test]
+    fn merge_flag_on_empty_target_writes_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("parent.rs");
+        let tgt = dir.path().join("parent/child.rs");
+        fs::create_dir_all(tgt.parent().unwrap()).unwrap();
+        fs::write(&src, "fn caller() { x(); }\nfn x() {}\n").unwrap();
+        let mut params = make_params(&src, &tgt, &["x"], Some(vec!["function_item"]));
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "merge_into_existing_target".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        params.toml_entries = Some(entries);
+        let plan_json = plan_extract_rust_items_to_submodule(&params).unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        let target_after = apply_file_edit(&tgt, &plan.edits[1]);
+        assert!(
+            target_after.contains("use super::*;"),
+            "prelude should be written on empty target: {target_after}"
+        );
+        assert!(
+            target_after.contains("pub(super) fn x"),
+            "item should be written: {target_after}"
+        );
     }
 }
