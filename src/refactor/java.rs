@@ -1287,6 +1287,16 @@ fn constructor_body_insert_position(constructor: Node<'_>, source: &str) -> usiz
         .unwrap_or_else(|| find_open_brace_position(constructor, source) + 1)
 }
 
+/// Gap 8: state carried between the wiring-insert decision and the
+/// post-accessor-rewrite ordering-conflict diagnostic pass.
+struct WiringInsertState {
+    /// Index into `source_edits` of the wiring TextEdit.
+    edit_idx: usize,
+    /// Constructor body `[start, end)` byte range. None when the source
+    /// constructor has no parsable body node.
+    body_range: Option<(usize, usize)>,
+}
+
 /// Collect identifier names declared as parameters of the constructor.
 fn constructor_parameter_names(constructor: Node<'_>, source: &str) -> HashSet<String> {
     let mut names = HashSet::new();
@@ -3540,6 +3550,11 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             args.join(", ")
         )
     };
+    // Track the wiring edit so we can post-process its position after the
+    // accessor-rewrite pass (Gap 8: topo-sort wiring against accessor edits
+    // that introduce `<delegate_field>.<getter>()` reads earlier in the
+    // same ctor body — the wiring must come before any such read).
+    let mut wiring_state: Option<WiringInsertState> = None;
     if let Some(constructor) = first_constructor_node(class_node, &parsed.source) {
         // Gap 7: when any captured-param name refers to a field rather than
         // a constructor parameter, that name is `null` until its own
@@ -3559,7 +3574,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             .map(|p| p.name.as_str())
             .filter(|name| !ctor_params.contains(*name))
             .collect();
-        let insert_at = if field_only_captures.is_empty() {
+        let lower_bound = if field_only_captures.is_empty() {
             constructor_body_insert_position(constructor, &parsed.source)
         } else {
             match last_field_assign_end_in_constructor(
@@ -3571,17 +3586,18 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
                 None => constructor_body_insert_position(constructor, &parsed.source),
             }
         };
-        let replacement = if field_only_captures.is_empty() {
-            format!("\n        {assignment}")
-        } else {
-            // We're inserting after a `;` end — start with a newline to make
-            // the new statement appear on its own line below the previous.
-            format!("\n        {assignment}")
-        };
+        let body_range = constructor
+            .child_by_field_name("body")
+            .map(|b| (b.start_byte(), b.end_byte()));
+        let edit_idx = source_edits.len();
         source_edits.push(TextEdit {
-            byte_start: insert_at,
-            byte_end: insert_at,
-            replacement,
+            byte_start: lower_bound,
+            byte_end: lower_bound,
+            replacement: format!("\n        {assignment}"),
+        });
+        wiring_state = Some(WiringInsertState {
+            edit_idx,
+            body_range,
         });
     } else {
         let class_name = java_class_name(class_node, &parsed.source);
@@ -3634,6 +3650,56 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     } else {
         source_edits.extend(caller_edits);
     }
+
+    // Gap 8: surface a stacked-extract ordering conflict when an accessor
+    // rewrite earlier in the same ctor body would read `<delegate_field>`
+    // before the planned wiring assigns it (compile-time
+    // `variable <name> might not have been initialized`).
+    //
+    // We DON'T auto-rewrite: the only safe move would be pulling wiring
+    // back past its field-only-capture lower bound (Gap 7's invariant),
+    // which trades the compile error for a silent null-capture of those
+    // captures. A proper fix needs to also relocate the field-only-capture
+    // assignments themselves, which is invasive. For v1 the planner just
+    // emits a tracing warning with diagnostics — the operator then either
+    // (a) swaps statements manually, or (b) re-orders the extract sequence
+    // so the delegate field exists before its consumers in the source ctor.
+    if let Some(state) = wiring_state.as_ref() {
+        if let Some((body_start, body_end)) = state.body_range {
+            let wiring_pos = source_edits[state.edit_idx].byte_start;
+            let earliest_accessor_in_ctor = source_edits
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != state.edit_idx)
+                .map(|(_, e)| e)
+                .filter(|e| e.byte_start >= body_start && e.byte_end <= body_end)
+                .map(|e| e.byte_start)
+                .filter(|pos| *pos < wiring_pos)
+                .min();
+            if let Some(min_pos) = earliest_accessor_in_ctor {
+                let (acc_line, _) = line_col(&parsed.source, min_pos);
+                let (wir_line, _) = line_col(&parsed.source, wiring_pos);
+                tracing::warn!(
+                    target = "refactor",
+                    kind = "extract_java_class",
+                    code = "ctor_wiring_ordering_conflict",
+                    delegate_field = %delegate_field,
+                    wiring_line = wir_line,
+                    accessor_line = acc_line,
+                    "stacked-extract: delegate `{}` is read by an accessor \
+                     rewrite at line {} but its wiring assignment lands at line {} — \
+                     the post-apply ctor will fail to compile with \
+                     `variable {} might not have been initialized`. Swap the \
+                     two statements manually after apply.",
+                    delegate_field,
+                    acc_line,
+                    wir_line,
+                    delegate_field,
+                );
+            }
+        }
+    }
+    let _ = wiring_state; // suppress unused-binding warning when no rewrites land
 
     // Constants whose declaration is moving lose their bare-name binding in
     // the source. Rewrite every remaining source-side reference (outside the
@@ -13144,6 +13210,75 @@ mod tests {
              field-assign idx: {assign_idx}\n\
              wiring idx:       {wiring_idx}\n\
              source:\n{rewritten}",
+        );
+    }
+
+    // Gap 8 smoke: stacked extracts can leave the source ctor with a
+    // delegate-read accessor rewrite ABOVE the delegate's own wiring
+    // assignment when the second extract's field-only captures push the
+    // wiring further down (Gap 7's lower bound). The planner does not
+    // auto-rewrite the conflict — moving wiring above the lower bound
+    // would silently null-capture the field-only captures, which is worse
+    // than a compile error — but it MUST emit a tracing::warn and run to
+    // completion so the operator gets the rewritten file plus a diagnostic
+    // log line. This test guards the planner against regressing into a
+    // crash on the conflict path.
+    #[test]
+    fn extract_java_class_diagnoses_ctor_wiring_ordering_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Dashboard.java");
+        let target = dir.path().join("Binder.java");
+        // `compMap` is being moved into Binder. `helper` is a field-only
+        // capture for `setup()` (assigned via `this.helper = h;`). The
+        // pre-existing `this.emptyChecks = ...` line reads `compMap` — the
+        // accessor rewriter will turn it into `binder.getCompMap()`. The
+        // field-only-capture lower bound forces wiring to land AFTER
+        // `this.helper = h;`, which is BELOW the rewritten emptyChecks line.
+        // Conflict.
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.*;\n\
+             class Dashboard {\n\
+            \x20   private final Helper helper;\n\
+            \x20   private final EmptyChecks emptyChecks;\n\
+            \x20   private Map<String, Object> compMap = new HashMap<>();\n\
+            \x20   Dashboard(Helper h) {\n\
+            \x20       this.emptyChecks = new EmptyChecks(compMap);\n\
+            \x20       this.helper = h;\n\
+            \x20   }\n\
+            \x20   void setup() { compMap.put(\"k\", helper.fetch()); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Binder".to_string());
+        params.delegate_field = Some("binder".to_string());
+        params.item_names = Some(vec!["setup".to_string()]);
+        params.move_fields = Some(vec!["compMap".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan = serde_json::from_str(
+            &plan_extract_java_class(&params)
+                .expect("planner must run to completion on the conflict path"),
+        )
+        .unwrap();
+        // The rewrite happens, edits apply cleanly. The resulting Java is
+        // still broken at compile time — that's the documented v1 behavior.
+        // Future iterations may move the field-only-capture assignments
+        // ahead of the conflicting accessor rewrite, eliminating the
+        // conflict entirely. For now the operator sees the warning in the
+        // daemon log and swaps statements manually.
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("binder.getCompMap()"),
+            "accessor rewrite must still fire: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("this.binder = new Binder("),
+            "wiring assignment must still be inserted: {rewritten}"
         );
     }
 

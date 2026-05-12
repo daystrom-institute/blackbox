@@ -3207,7 +3207,7 @@ struct ParseErrorLocation {
     is_missing: bool,
 }
 
-pub(crate) fn parse_report_with_locations(
+fn parse_report_with_locations(
     root: Node<'_>,
 ) -> (ParseReport, Vec<ParseErrorLocation>) {
     let mut report = ParseReport {
