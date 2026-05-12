@@ -16,7 +16,13 @@ Plan kinds, grouped by intent:
 
 - Syntactic moves / deletes: `extract_rust_items`, `extract_rust_impl_methods`,
   `lift_rust_inherent_to_free`, `extract_rust_trait`, `move_rust_struct_fields`,
-  `delete_rust_items`, `move_file`.
+  `delete_rust_items`, `move_file`,
+  `inline_mod_to_file_submodule` (inline `mod foo { ... }` → `foo.rs` + `mod foo;`),
+  `extract_rust_items_to_submodule` (compound: scaffold + mod_decl + visibility
+  bump + extract + use_decl + struct-field visibility — five primitive
+  roundtrips collapsed into one plan),
+  `move_rust_items_with_callers` (extract_rust_items + cross-file caller-prefix
+  rewrite).
 - Caller / accessor rewrites: `update_rust_callers`, `migrate_rust_type_usages`,
   `add_rust_delegate_field`, `add_rust_router_to_sum`.
 - Module wiring: `add_rust_mod_decl`, `add_rust_use_decl`, `copy_rust_mod_decls`.
@@ -24,8 +30,13 @@ Plan kinds, grouped by intent:
   `rewrite_rust_field_visibility`.
 - LSP-backed (rust-analyzer): `rust_lsp_rename` (semantic rename),
   `rust_organize_imports` (per-file `source.organizeImports`),
-  `rust_ra_move_item_to_module` (semantic move + cross-file caller rewrite),
   `rust_ra_classify_callbacks` (resolve method callees via goto-definition).
+- LSP-backed but BROKEN: `rust_ra_move_item_to_module` — RA's `refactor.move`
+  code-action kind only backs the `move_module_to_file` and `move_to_mod_rs`
+  assists. Neither accepts caller-supplied destinations. The `target` param
+  is title-only. Reach for `inline_mod_to_file_submodule` (inline mod case)
+  or `extract_rust_items_to_submodule` / `move_rust_items_with_callers`
+  (cross-file case) instead.
 - Analysis only (no FileEdits): `rust_impl_partition_analysis` (impl-method
   graph for split planning), `rust_public_api_guard` (advisory for visibility
   changes touching public API).
@@ -86,19 +97,54 @@ Writable plan kinds:
   multiple files.
 - `rust_organize_imports`: request rust-analyzer `source.organizeImports` for
   `source` and emit the resulting workspace edit as normal hash-checked edits.
-- `rust_ra_move_item_to_module`: requests rust-analyzer's `refactor.move`
-  code action at the named item's byte range. **The tool name oversells its
-  behavior.** The `target` parameter is title-only — it is NOT sent to RA;
-  RA decides the destination itself. In observed practice (rust-analyzer
-  1.95) the action does not fire for top-level items moved between sibling
-  modules, nor for inline `mod foo { ... }` blocks moved to a file. Expect
-  `error.lsp_unavailable: no move-to-module code action found for <name>`
-  for most realistic use cases. Until either the tool or the RA assist
-  catches up, use `extract_rust_items` (top-level items) or a manual
-  body-extract + `mod foo;` declaration rewrite (inline-mod-to-file).
-  Accepts `function_item`, `struct_item`, `enum_item`, `trait_item`,
-  `type_item`, `const_item`, `static_item`, `mod_item`. Refuses
-  `impl_method` (use `extract_rust_impl_methods`).
+- `rust_ra_move_item_to_module`: **BROKEN; prefer the alternatives below.**
+  Requests rust-analyzer's `refactor.move` code action. That kind backs
+  only two RA assists: `move_module_to_file` (inline `mod foo { ... }` →
+  `foo.rs`) and `move_to_mod_rs` (file → `mod.rs` migration). NEITHER
+  accepts a caller-supplied destination — RA picks the target itself. The
+  tool's `target` parameter is title-only; it is NOT sent to RA. In
+  observed practice (rust-analyzer 1.95) the action does not fire for
+  top-level items moved between sibling modules, nor for inline `mod foo
+  { ... }` blocks. Expect `error.lsp_unavailable: no move-to-module code
+  action found for <name>` for most realistic uses.
+  Replace with: `inline_mod_to_file_submodule` (inline-mod-to-file) or
+  `extract_rust_items_to_submodule` / `move_rust_items_with_callers`
+  (cross-file moves). Accepts `function_item`, `struct_item`,
+  `enum_item`, `trait_item`, `type_item`, `const_item`, `static_item`,
+  `mod_item`. Refuses `impl_method`.
+- `inline_mod_to_file_submodule`: extract the body of an inline
+  `mod foo { ... }` block into a sibling submodule file, replacing the
+  block with `mod foo;`. Outer attributes (`#[cfg(test)]`, doc comments)
+  stay attached to the retained declaration. Target path auto-derives:
+  `parent.rs` → `parent/<name>.rs`; `lib.rs` / `main.rs` / `mod.rs` →
+  `<name>.rs` (flat sibling). Explicit `target` overrides. Refuses
+  non-empty existing targets and refuses already-file submodule
+  declarations (`mod foo;` with no body). Body de-indentation strips the
+  longest run of leading spaces common to every non-blank line; tabs
+  pass through verbatim (`cargo fmt` after).
+- `extract_rust_items_to_submodule`: compound plan that collapses the
+  five-step ceremony for splitting a Rust module into one plan. Does
+  scaffolded target + `mod <module_name>;` insertion + visibility bump
+  on every moved item AND its struct fields + extract + `use
+  <module_name>::{...};` re-import in the parent. `visibility` defaults
+  to `pub(super)`. `module_name` defaults to the target file stem.
+  `target_prelude` defaults to `use super::*;`. Visibility transforms
+  are baked into the target FileEdit's replacement text, not emitted as
+  separate ordering-dependent edits. Refuses non-empty existing targets
+  and refuses `impl_method` (use `extract_rust_impl_methods`).
+  Idempotent on the source's `mod`/`use` decls — re-running over an
+  already-wired parent doesn't duplicate them.
+- `move_rust_items_with_callers`: extracts items AND walks the project
+  rewriting cross-file callers. For each moved item, every
+  `<source_simple>::<item>` occurrence in any other `.rs` file gets the
+  prefix segment rewritten to `<target_simple>`, including occurrences
+  inside `use` declarations. Word-boundary checked (`mod_ax::moved` is
+  left alone). `module_name` overrides the source simple-name default
+  (file stem); `target_prelude` overrides the target simple-name
+  default. v1 limits: simple-name segment match only (FQN that skip the
+  source module aren't matched), multi-import use trees not split,
+  no alias awareness. Pair with `extract_rust_items_to_submodule` when
+  you also need visibility bumps + a `use` decl in the source's parent.
 - `rust_ra_classify_callbacks`: walks call sites of named methods in `source`
   and asks rust-analyzer `textDocument/definition` to resolve where each
   callee is declared. Returns `resolved_callbacks` (one entry per method with
@@ -380,48 +426,71 @@ Use a narrower test command when the changed package has a clearer local test.
 
 ## Splitting a monster file
 
-Don't reach for `rust_ra_move_item_to_module` first — RA's code action
-declines for most realistic moves. The working sequence uses the
-syntactic tools end-to-end:
+### Case 1: extract a cluster of top-level items into a new submodule file
 
-1. Scaffold the destination file (`Write` or `write_file`) — empty file
-   with a doc comment + `use super::*;`. For a child module of `parent.rs`,
-   the file goes at `parent/<child>.rs`.
-2. `add_rust_mod_decl(source="parent.rs", module_name="child")` — adds
-   `mod child;` so rustc sees the new file.
-3. `rewrite_rust_item_visibility(visibility="pub(super)", item_names=...)`
-   — bump every item that will move so the parent module can call it
-   after the move. Use `pub(crate)` instead when callers are further away.
-4. `extract_rust_items(source, target, item_names, item_kinds)` — move
-   the named items literally. Tree-sitter validates both files.
-5. `add_rust_use_decl(source="parent.rs", use_path="child::{Name1, fn2}")`
-   — bring the moved names back into scope so existing call sites compile
-   without qualifier changes.
-6. If the moved items are structs with private fields constructed outside
-   the new module, `rewrite_rust_field_visibility(visibility="pub(super)",
-   item_names=[StructName])` so the parent can still build them. Forgetting
-   this surfaces as `E0451: fields ... of struct ... are private`.
-7. `cargo check` + relevant test suite. Iterate if visibility errors fire.
+One plan: `extract_rust_items_to_submodule`. Inputs:
 
-### Inline `mod foo { ... }` → `foo.rs` submodule file
+```text
+bbox_refactor_plan(
+  kind="extract_rust_items_to_submodule",
+  source="src/refactor/java.rs",
+  target="src/refactor/java/cross_file.rs",
+  item_names=["MovedStaticItem", "compute_cross_file_static_caller_edits",
+              "compute_static_qualifier_rewrite_edits"],
+  item_kinds=["struct_item", "function_item"],
+  project_dir="/abs/project/root",
+  # defaults: visibility="pub(super)", module_name=target_stem,
+  # target_prelude="use super::*;"
+)
+```
 
-No bbox plan kind handles this transform in one shot today. `extract_rust_items`
-moves the WHOLE `mod foo { ... }` block verbatim to the target, which leaves
-the target with a redundant nested module. `rust_ra_move_item_to_module`
-declines (see above). Until the tool catches up, do it manually:
+The plan covers: scaffold target + `mod cross_file;` in parent + visibility
+bumps (item + struct fields) + extract + `use cross_file::{...};` in parent.
+Apply, `cargo check`, done.
 
-1. Read the body content of the inline mod (lines between the opening `{`
-   and closing `}`).
-2. Write that body as `foo.rs` (drop one indentation level if you want,
-   though rustc doesn't care).
-3. Replace the inline `mod foo { ... }` block in the parent with
-   `mod foo;` (preserve any `#[cfg(test)]` attribute).
-4. `cargo check` + tests.
+If callers in OTHER project files reference the moved items via
+`<old_module_simple>::<Item>`, run `move_rust_items_with_callers`
+separately to rewrite them — `extract_rust_items_to_submodule` only
+handles the parent's own call sites.
 
-For `#[cfg(test)] mod tests { ... }` specifically this is mechanical and
-safe — the tests retain access to the parent's private items via
-`use super::*;` because `mod tests;` keeps the tests module nested under
-the same parent.
+### Case 2: inline `mod foo { ... }` → `foo.rs` submodule file
+
+One plan: `inline_mod_to_file_submodule`. Inputs:
+
+```text
+bbox_refactor_plan(
+  kind="inline_mod_to_file_submodule",
+  source="src/refactor/java.rs",
+  item_names=["tests"],
+  # target defaults to src/refactor/java/tests.rs
+  project_dir="/abs/project/root",
+)
+```
+
+Pulls the body of the inline mod into a sibling submodule file, replaces
+the block with `mod tests;`, preserves outer attributes (`#[cfg(test)]`,
+doc comments). Operator gets a 6k-line file split in one apply.
+
+### Case 3: move items between modules with workspace-wide caller rewrite
+
+One plan: `move_rust_items_with_callers`. Same shape as Case 1 but walks
+the whole project and rewrites every `<source_simple>::<item>` occurrence
+in any `.rs` file. v1 covers the simple-name path segment match; complex
+use-tree splitting and FQN paths that skip the source segment require
+manual cleanup after.
+
+### When to fall back to the syntactic primitives
+
+The original 5-step ceremony (`add_rust_mod_decl` →
+`rewrite_rust_item_visibility` → `extract_rust_items` → `add_rust_use_decl`
+→ `rewrite_rust_field_visibility`) is still the right escape hatch when:
+
+- You want different visibility per moved item (the compound primitive
+  applies one visibility to everything).
+- The target file already has handwritten content that should be
+  preserved (the compound primitive refuses non-empty targets).
+- You're moving impl methods — use `extract_rust_impl_methods` for that
+  case; the compound primitive refuses `impl_method` kind.
 
 ## Safety Rules
 
