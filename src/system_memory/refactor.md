@@ -296,6 +296,47 @@ filled-in form. The CI catalog-completeness check (RA-D1, follow-up)
 will assert every `examples/agents/refactor/<name>.json` has a row
 here.
 
+## Refactor-atom composition (RA-V1)
+
+v1 atom composition is hand-wired through workflows. The
+`composition.chainable_after`, `parallel_safe`, and `fan_out_aggregator`
+fields on each manifest are signals to workflow authors and to the
+agent-search ranker — the manifest fields do not autoload at runtime
+per `design/agent-system-impl.md` §608. There is no `bro_agent_compose`
+consumer in v1; atom-to-atom dispatch is a v2 path.
+
+Three canonical composition shapes ship as reference workflow JSONs
+under `examples/agents/refactor/workflows/`:
+
+- **`state-extract-then-split.json`** — `rust-state-extract` →
+  `rust-split-god-impl`. State extraction lands first so the
+  partitioned impl references a clean state struct via the
+  delegate field.
+- **`error-migrate-with-guard.json`** — `rust-public-api-guard` →
+  `rust-error-migrate`. The workflow-level guard call gives the
+  operator a separate audit trail; the migrate atom additionally
+  runs its OWN preflight internally and blocks on
+  acknowledge_public_api_change unless operator-explicit.
+- **`partition-graph-then-split.json`** — `rust-impl-partition-graph` →
+  operator review → `rust-split-god-impl`. The graph atom produces
+  structural facts; the operator-supplied partition variable drives
+  the splitter.
+
+Reference workflows install through `bbox_artifact_install(kind=
+"workflow", source="examples/agents/refactor/workflows/<name>.json")`
+and dispatch via `bro_orchestrate_run(workflow="refactor-<name>",
+vars={...})`. The test
+`refactor_atom_reference_workflows_parse_and_compile` asserts each
+one parses as a `Workflow` and compiles cleanly; drift fails the
+test.
+
+Fan-out across languages is supported through the workflow engine's
+existing `Fork` / `Wait` primitives — `parallel_safe: false` on
+individual atoms doesn't prevent fan-out, because parallel dispatches
+run against DIFFERENT files / projects, not against each other.
+Future v2 composition (`bro_agent_compose`) is acknowledged in
+`design/agent-system-impl.md` §608 but is not required by v1.
+
 ## Refactor-atom install lint (RA-S1)
 
 A manifest is treated as a refactor atom — and subject to the refactor-atom

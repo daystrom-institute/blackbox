@@ -1,0 +1,100 @@
+{
+  "name": "refactor-partition-graph-then-split",
+  "version": 1,
+  "actors": {},
+  "start": "GraphAnalysis",
+  "vars_schema": {
+    "project_dir": { "kind": "string", "required": true },
+    "source_file": { "kind": "string", "required": true },
+    "impl_name": { "kind": "string", "required": true },
+    "partition": { "kind": "any", "required": true },
+    "allow_cross_partition_delegation": { "kind": "any" },
+    "validation_bin": { "kind": "any" },
+    "graph_handle": { "kind": "any" },
+    "graph_output": { "kind": "any" },
+    "split_handle": { "kind": "any" },
+    "split_output": { "kind": "any" }
+  },
+  "nodes": {
+    "GraphAnalysis": {
+      "prompt": "Phase 1 (analysis): dispatch rust-impl-partition-graph to enumerate methods/fields/edges on the target impl. Operator review of the graph drives partition design (workflow's partition var). This step is cost_class=cheap and parallel_safe.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "rust-impl-partition-graph",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source_file": "${vars.source_file}",
+                "impl_name": "${vars.impl_name}"
+              }
+            },
+            "timeout_secs": 180
+          },
+          "into_var": "graph_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.graph_handle.task_id}",
+              "timeout_seconds": 180
+            },
+            "timeout_secs": 200
+          },
+          "into_var": "graph_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "SplitImpl" }
+    },
+    "SplitImpl": {
+      "prompt": "Phase 2: with the graph available for operator review, dispatch rust-split-god-impl against the operator-decided partition. RX-R2 cross-partition classification runs inside the atom (mandatory).",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "rust-split-god-impl",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source_file": "${vars.source_file}",
+                "impl_name": "${vars.impl_name}",
+                "partition": "${vars.partition}",
+                "allow_cross_partition_delegation": "${vars.allow_cross_partition_delegation}",
+                "apply": true,
+                "validation_bin": "${vars.validation_bin}"
+              }
+            },
+            "timeout_secs": 900
+          },
+          "into_var": "split_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.split_handle.task_id}",
+              "timeout_seconds": 900
+            },
+            "timeout_secs": 920
+          },
+          "into_var": "split_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

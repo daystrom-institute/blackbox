@@ -1952,6 +1952,36 @@ mod tests {
     /// shared `_*` reference files) and asserts each one passes the
     /// refactor-atom lint and validates against the agent schema. New atoms
     /// landing under that path are picked up automatically.
+    /// RA-V1: every reference workflow under
+    /// examples/agents/refactor/workflows/ parses as a Workflow and compiles
+    /// cleanly. The workflows are operator-runnable artifacts; if the engine
+    /// can't compile them, the docs are wrong.
+    #[test]
+    fn refactor_atom_reference_workflows_parse_and_compile() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_root.join("examples/agents/refactor/workflows");
+        let entries = std::fs::read_dir(&dir).expect("refactor workflows dir exists");
+        let mut found = 0usize;
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            found += 1;
+            let src = std::fs::read_to_string(&path).expect("read workflow");
+            let spec: crate::workflow::Workflow = serde_json::from_str(&src)
+                .unwrap_or_else(|e| panic!("{name} did not parse as Workflow: {e}"));
+            crate::workflow::compile(spec)
+                .unwrap_or_else(|e| panic!("{name} failed to compile: {e}"));
+        }
+        assert!(
+            found >= 1,
+            "expected at least one reference workflow under examples/agents/refactor/workflows/"
+        );
+    }
+
     #[test]
     fn every_shipped_refactor_atom_passes_lint_and_schema() {
         let schema_raw = include_str!("../../../schema/agent.schema.json");

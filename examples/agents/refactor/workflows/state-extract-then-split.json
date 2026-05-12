@@ -1,0 +1,113 @@
+{
+  "name": "refactor-state-extract-then-split",
+  "version": 1,
+  "actors": {},
+  "start": "ExtractState",
+  "vars_schema": {
+    "project_dir": { "kind": "string", "required": true },
+    "source_file": { "kind": "string", "required": true },
+    "source_struct": { "kind": "string", "required": true },
+    "target_struct_name": { "kind": "string", "required": true },
+    "target_module_path": { "kind": "string", "required": true },
+    "field_names": { "kind": "any", "required": true },
+    "delegate_field": { "kind": "string", "required": true },
+    "acknowledge_repr": { "kind": "any" },
+    "impl_name": { "kind": "string", "required": true },
+    "partition": { "kind": "any", "required": true },
+    "allow_cross_partition_delegation": { "kind": "any" },
+    "validation_bin": { "kind": "any" },
+    "state_handle": { "kind": "any" },
+    "state_output": { "kind": "any" },
+    "split_handle": { "kind": "any" },
+    "split_output": { "kind": "any" }
+  },
+  "nodes": {
+    "ExtractState": {
+      "prompt": "Phase 1: dispatch rust-state-extract to pull the field cluster into its own struct and wire the delegate. The split step depends on a clean delegate field.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "rust-state-extract",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source_file": "${vars.source_file}",
+                "source_struct": "${vars.source_struct}",
+                "target_struct_name": "${vars.target_struct_name}",
+                "target_module_path": "${vars.target_module_path}",
+                "field_names": "${vars.field_names}",
+                "delegate_field": "${vars.delegate_field}",
+                "acknowledge_repr": "${vars.acknowledge_repr}",
+                "apply": true,
+                "validation_bin": "${vars.validation_bin}"
+              }
+            },
+            "timeout_secs": 600
+          },
+          "into_var": "state_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.state_handle.task_id}",
+              "timeout_seconds": 600
+            },
+            "timeout_secs": 620
+          },
+          "into_var": "state_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "SplitImpl" }
+    },
+    "SplitImpl": {
+      "prompt": "Phase 2: with the state struct extracted and delegate wired, dispatch rust-split-god-impl to carve the now-narrower impl into per-domain modules.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_agent_dispatch",
+            "arguments": {
+              "agent": "rust-split-god-impl",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source_file": "${vars.source_file}",
+                "impl_name": "${vars.impl_name}",
+                "partition": "${vars.partition}",
+                "allow_cross_partition_delegation": "${vars.allow_cross_partition_delegation}",
+                "apply": true,
+                "validation_bin": "${vars.validation_bin}"
+              }
+            },
+            "timeout_secs": 900
+          },
+          "into_var": "split_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.split_handle.task_id}",
+              "timeout_seconds": 900
+            },
+            "timeout_secs": 920
+          },
+          "into_var": "split_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}
