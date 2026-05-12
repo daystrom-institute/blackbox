@@ -24,7 +24,7 @@ future multimodal path:
   migration, not just new route names in TOML.
 
 This doc supersedes only the embedding-model selection and multimodal-routing
-parts of `design/agentic-corpus.md` and `design/agentic-corpus-impl.md`. The
+parts of `design/archive/agentic-corpus.md` and `design/archive/agentic-corpus-impl.md`. The
 chunker registry, bucket model, HNSW partitioning, and RRF fusion strategy stay.
 
 ## Current Baseline

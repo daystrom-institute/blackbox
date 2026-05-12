@@ -1,6 +1,6 @@
 # Rust Refactor Expansion — implementation skeleton
 
-Companion to `design/refactor-rust-expansion.md`. Each phase names a
+Companion to `design/archive/refactor-rust-expansion.md`. Each phase names a
 discrete implementation chunk: scope, realizes, components, gates,
 known follow-ups. Phases are dependency-ordered. No timelines —
 landing a phase unblocks dependents; landing all phases realizes the
@@ -32,7 +32,7 @@ unrelated blast radius.
 three-tier `SyntaxOnly` / `IndexedHints` / `LspVerified` taxonomy
 described in the design doc.
 
-**Realizes.** `design/refactor-rust-expansion.md` "Boundary — three
+**Realizes.** `design/archive/refactor-rust-expansion.md` "Boundary — three
 semantic tiers".
 
 **Components.**
@@ -86,7 +86,7 @@ read) to resolve under the slot. This is a behavior change to
 existing code (today's `output_path` resolves relative to
 `project_dir` or `cwd` per `src/refactor/mod.rs:293`).
 
-**Realizes.** `design/refactor-rust-expansion.md` "Plan output size
+**Realizes.** `design/archive/refactor-rust-expansion.md` "Plan output size
 and `output_path`"; "Cross-Surface Invariants — Plan-file slot
 policy".
 
@@ -135,7 +135,7 @@ policy".
 JSON and stashes the result in a per-run scratch struct. No
 transaction-semantics change in this phase.
 
-**Realizes.** `design/refactor-rust-expansion.md` §10 "Runner
+**Realizes.** `design/archive/refactor-rust-expansion.md` §10 "Runner
 extension" subsection (the capture half).
 
 **Components.**
@@ -178,7 +178,7 @@ extension" subsection (the capture half).
 command steps; obligations tracked; multi-soft-fail composition
 with terminal-success commit policy.
 
-**Realizes.** `design/refactor-rust-expansion.md` §10 "Repair
+**Realizes.** `design/archive/refactor-rust-expansion.md` §10 "Repair
 transaction invariant"; "Multi-repair composition".
 
 **Components.**
@@ -270,7 +270,7 @@ through `extract_rust_impl_methods`'s plan path. Without this
 phase, passing `deep_analysis: true` on a Rust plan kind has no
 effect.
 
-**Realizes.** `design/refactor-rust-expansion.md` §1
+**Realizes.** `design/archive/refactor-rust-expansion.md` §1
 "`extract_rust_impl_methods` with `deep_analysis: true`" entry
 point.
 
@@ -317,7 +317,7 @@ point.
 types → `unknown_copy`). Detect interior-mutation calls on `Cell` /
 `RefCell` / `Mutex` / `RwLock` / atomics.
 
-**Realizes.** `design/refactor-rust-expansion.md` §1
+**Realizes.** `design/archive/refactor-rust-expansion.md` §1
 `captured_self_fields` section + Copy whitelist.
 
 **Components.**
@@ -379,7 +379,7 @@ types → `unknown_copy`). Detect interior-mutation calls on `Cell` /
 method-call shape in moved bodies into `unresolved_callbacks`. No
 resolution attempt — site list only.
 
-**Realizes.** `design/refactor-rust-expansion.md` §1
+**Realizes.** `design/archive/refactor-rust-expansion.md` §1
 `unresolved_callbacks` section.
 
 **Components.**
@@ -418,7 +418,7 @@ resolution attempt — site list only.
 to type parameters, where-clause bounds, and explicit lifetimes
 declared on the host impl block. Report; do not auto-inject.
 
-**Realizes.** `design/refactor-rust-expansion.md` §1
+**Realizes.** `design/archive/refactor-rust-expansion.md` §1
 `inherited_generics` / `inherited_bounds` / `captured_lifetimes`.
 
 **Components.**
@@ -452,7 +452,7 @@ plan is in `status: blocked`. Plan-only markers exist in saved plan
 JSON's target text only; the apply path refuses applied plans in
 blocked state.
 
-**Realizes.** `design/refactor-rust-expansion.md` §1 "FIXME marker
+**Realizes.** `design/archive/refactor-rust-expansion.md` §1 "FIXME marker
 grammar"; "FIXME grammar default".
 
 **Components.**
@@ -495,7 +495,7 @@ grammar"; "FIXME grammar default".
 **Scope.** New plan kind. Move named fields between structs;
 `deep_analysis: true` reports `remaining_source_accessors`.
 
-**Realizes.** `design/refactor-rust-expansion.md` §2.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §2.
 
 **Components.**
 - Plan kind dispatched from the plan dispatcher in
@@ -537,7 +537,7 @@ grammar"; "FIXME grammar default".
 separated from `update_rust_callers` because that one is the risky
 rewrite engine.
 
-**Realizes.** `design/refactor-rust-expansion.md` §3
+**Realizes.** `design/archive/refactor-rust-expansion.md` §3
 `add_rust_delegate_field` half.
 
 **Components.**
@@ -568,7 +568,7 @@ conservative table: only Copy-whitelisted rvalue reads and
 unambiguous method calls are rewritten; everything else goes to
 `unrewriteable_accessors`.
 
-**Realizes.** `design/refactor-rust-expansion.md` §3
+**Realizes.** `design/archive/refactor-rust-expansion.md` §3
 `update_rust_callers` half.
 
 **Components.**
@@ -638,7 +638,7 @@ unambiguous method calls are rewritten; everything else goes to
 `impl Trait for Struct`. Structural object-safety check;
 `semantic_status: IndexedHints`.
 
-**Realizes.** `design/refactor-rust-expansion.md` §4.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §4.
 
 **Components.**
 - New plan kind. Inputs: `source`, `target`, `module_name`,
@@ -685,7 +685,7 @@ unambiguous method calls are rewritten; everything else goes to
 **Scope.** Restructure (per Codex round-2): `replacement_kind` enum,
 per-site legality reporting rather than free-text replacement.
 
-**Realizes.** `design/refactor-rust-expansion.md` §5.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §5.
 
 **Components.**
 - Plan kind. Inputs: `source`, `module_name` (old type),
@@ -725,7 +725,7 @@ downgrade.
 consts/statics, modules). Items only for v1; impl methods stay with
 `extract_rust_impl_methods` per Codex round-3.
 
-**Realizes.** `design/refactor-rust-expansion.md` §8.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §8.
 
 **Components.**
 - New plan kind. Inputs: `source`, `target`, `item_names`,
@@ -761,7 +761,7 @@ consts/statics, modules). Items only for v1; impl methods stay with
 by RX-A1c. Promotes the deep_analysis report's `semantic_status` to
 `LspVerified` for the resolved subset.
 
-**Realizes.** `design/refactor-rust-expansion.md` §9.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §9.
 
 **Components.**
 - New plan kind. Inputs: `source`, `item_names` (methods whose
@@ -797,7 +797,7 @@ diagnostics from RX-F2a/F2b's runner extension; produces a
 reviewable `RefactorPlan`. **Depends on RX-F2b for the obligation
 machinery.**
 
-**Realizes.** `design/refactor-rust-expansion.md` §10 planner
+**Realizes.** `design/archive/refactor-rust-expansion.md` §10 planner
 extension subsection.
 
 **Components.**
@@ -871,7 +871,7 @@ extension subsection.
 rewrites only. `?`-site conversion gaps surface via RX-C1's
 compile-fix round, which this plan kind composes after.
 
-**Realizes.** `design/refactor-rust-expansion.md` §6.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §6.
 
 **Components.**
 - Plan kind. Inputs: `source`, `item_names`, `old_text`, `new_text`,
@@ -903,7 +903,7 @@ compile-fix round, which this plan kind composes after.
 **Scope.** Move impl methods whose bodies don't read `self` into
 free functions in a child module; rewrite call sites.
 
-**Realizes.** `design/refactor-rust-expansion.md` §7.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §7.
 
 **Components.**
 - Body walk for `self.<x>` / `Self::<x>` (other than `Self` in
@@ -934,7 +934,7 @@ free functions in a child module; rewrite call sites.
 **Scope.** Graph-only output. Methods, fields, edges. Clustering
 is a SEPARATE concern.
 
-**Realizes.** `design/refactor-rust-expansion.md` §11.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §11.
 
 **Components.**
 - Plan kind. Inputs: `source`, `impl_name`.
@@ -960,7 +960,7 @@ is a SEPARATE concern.
 **Scope.** Precondition analysis for plans touching `pub` items.
 No FileEdits; emits structured deltas.
 
-**Realizes.** `design/refactor-rust-expansion.md` §13.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §13.
 
 **Components.**
 - Plan kind. Inputs: `source` (file or directory),
@@ -989,7 +989,7 @@ No FileEdits; emits structured deltas.
 data + ProviderDriver behavior modules from a match-on-enum shape.
 Targeted at `src/orchestration/providers.rs`.
 
-**Realizes.** `design/refactor-rust-expansion.md` §12.
+**Realizes.** `design/archive/refactor-rust-expansion.md` §12.
 
 **Components.**
 - Plan kind. Inputs: `source`, `enum_name`,
@@ -1022,7 +1022,7 @@ Targeted at `src/orchestration/providers.rs`.
 emit warnings. Marker emission only; per-kind warning-site
 detection is RX-W1b.
 
-**Realizes.** `design/refactor-rust-expansion.md` §1 FIXME marker
+**Realizes.** `design/archive/refactor-rust-expansion.md` §1 FIXME marker
 grammar (warning prefix).
 
 **Components.**
@@ -1052,7 +1052,7 @@ grammar (warning prefix).
 **Scope.** Wire `update_rust_callers`'s `borrow_promotions` report
 to emit warning markers when `emit_applied_markers: true`.
 
-**Realizes.** `design/refactor-rust-expansion.md` §1 FIXME marker
+**Realizes.** `design/archive/refactor-rust-expansion.md` §1 FIXME marker
 grammar applied case.
 
 **Components.**
@@ -1089,7 +1089,7 @@ grammar applied case.
 infer. v1 is doc + the response field below; runtime enforcement
 is v2.
 
-**Realizes.** `design/refactor-rust-expansion.md` "Cross-Surface
+**Realizes.** `design/archive/refactor-rust-expansion.md` "Cross-Surface
 Invariants — Operator-authority opt-outs".
 
 **Components.**
@@ -1118,7 +1118,7 @@ Invariants — Operator-authority opt-outs".
 atom-dispatched `bbox_refactor_run` invocations. v1 is doc +
 atom-prompt-template encoding; v2 adds runner-side enforcement.
 
-**Realizes.** `design/refactor-rust-expansion.md` "Cross-Surface
+**Realizes.** `design/archive/refactor-rust-expansion.md` "Cross-Surface
 Invariants — `bbox_refactor_run` command step allowlist for atoms".
 
 **Components.**
@@ -1141,7 +1141,7 @@ Invariants — `bbox_refactor_run` command step allowlist for atoms".
 `rust_ra_classify_callbacks` (RX-R2) fail closed when
 rust-analyzer is unavailable. No silent downgrade to syntax-only.
 
-**Realizes.** `design/refactor-rust-expansion.md` "Cross-Surface
+**Realizes.** `design/archive/refactor-rust-expansion.md` "Cross-Surface
 Invariants — RA-backed plan kinds fail closed".
 
 **Components.**

@@ -151,7 +151,7 @@ claim is narrower than "Slack tokens live in the sidecar":
 - `design/badgey.md` §6.3 (inbox triage), §6.4 (close-loops), §6.5
   (proposals) — the conversational surfaces that benefit most from
   Slack interactivity.
-- `design/agentic-corpus.md` §6 (entity refs), §7.3 (chunkers) — the
+- `design/archive/agentic-corpus.md` §6 (entity refs), §7.3 (chunkers) — the
   substrate the Phase II Slack-as-entity tie-in slots into.
 - `slack-blocks` (Rust crate) — Block Kit JSON builders. Optional
   ergonomic dependency for sidecar-side Block composition; not

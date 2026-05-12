@@ -10,7 +10,7 @@ Phases tagged `[marker]` sit at known dependency positions but await
 detail fleshing. Deliberation rounds will pick which markers to flesh
 out next.
 
-This skeleton assumes `design/agentic-corpus-impl.md` Phase F4 (artifact
+This skeleton assumes `design/archive/agentic-corpus-impl.md` Phase F4 (artifact
 catalog) has landed; badgey's brofiles + workflows + packets all install
 through the existing `bbox_artifact_install`.
 

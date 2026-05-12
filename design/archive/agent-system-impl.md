@@ -6,7 +6,7 @@ it's done), known follow-ups, and the design-doc sections it
 realizes. Phases are dependency-ordered. No timelines — landing one
 phase unblocks dependents, landing all phases realizes the design.
 
-This skeleton assumes `design/agentic-corpus-impl.md` Phase F4
+This skeleton assumes `design/archive/agentic-corpus-impl.md` Phase F4
 (artifact catalog) and the agentic-corpus vector store substrate
 (F3 + E1-E3 of that doc) have landed. The agent system is upstream
 of `design/badgey-impl.md` Phase A0; landing all phases here
@@ -88,7 +88,7 @@ AS-T3 (`bro_agent_search`) queries this bucket.
 and the `EntityRef::Agent { name, version }` variant to its grammar.
 
 **Realizes.** `design/agent-system.md` §16.1 #3,
-`design/agentic-corpus.md` §6.1 (extension), §6.2 (extension).
+`design/archive/agentic-corpus.md` §6.1 (extension), §6.2 (extension).
 
 **Components.**
 - `EntityType` enum gains `Agent` variant.

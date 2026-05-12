@@ -124,4 +124,7 @@ Client config (all point to the same daemon):
 
 ## Design Docs
 
-- `design/knowledge-store.md` — knowledge store v2: layer architecture, absorption, entry schema, rendering pipeline, migration path.
+- `design/archive/knowledge-store.md` — knowledge store v2: layer architecture, absorption, entry schema, rendering pipeline, migration path.
+- `design/agentic-corpus-data-export-policy.md` — per-bucket embedding-route data-export policy (Voyage vs Ollama).
+- `design/archive/` — shipped designs (agentic-corpus, refactor-rust-expansion, agent-system, bro-slack, mcp-surfaces, etc.).
+- `design/proposed/` — open designs awaiting implementation.

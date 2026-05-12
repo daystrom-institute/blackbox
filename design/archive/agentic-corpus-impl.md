@@ -1,6 +1,6 @@
 # Agentic corpus — implementation skeleton
 
-Companion to `design/agentic-corpus.md`. Each phase below names a discrete
+Companion to `design/archive/agentic-corpus.md`. Each phase below names a discrete
 implementation chunk: scope, components, gates (what proves it's done),
 known follow-ups, and the design-doc sections it realizes. Phases are
 dependency-ordered. No timelines — landing one phase unblocks dependents,
@@ -182,7 +182,7 @@ formats only), §12.1 (bootstrap arc structure).
 
 **Gates.**
 - Bootstrap this repo: arc completes; `bbox_search(query="agentic-corpus")`
-  returns hits from `design/agentic-corpus.md`.
+  returns hits from `design/archive/agentic-corpus.md`.
 - `bbox_search(query="trait SourceFormatChunker")` returns the design doc
   (no code chunker yet).
 - Re-running the arc on the same project is idempotent (content-hash dedup

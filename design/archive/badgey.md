@@ -12,7 +12,7 @@
 
 ## 1. Thesis
 
-The agentic-corpus search surface (`design/agentic-corpus.md` §4) gives the
+The agentic-corpus search surface (`design/archive/agentic-corpus.md` §4) gives the
 calling LLM graph-native primitives but expects it to learn the
 seed → inspect → traverse → bundle protocol. The MCP descriptions cue the
 loop, but cold providers without `CLAUDE.md` baked don't reliably follow
@@ -295,7 +295,7 @@ from a scout.
 
 ## 3. Sources
 
-- `design/agentic-corpus.md` — substrate badgey navigates. §6 entity
+- `design/archive/agentic-corpus.md` — substrate badgey navigates. §6 entity
   model, §4 search surface, §9 edge taxonomy, §14-15 provenance machinery.
 - `src/orchestration/brofile.rs` + lens composition — badgey is one
   brofile (plus `badgey-scout`).

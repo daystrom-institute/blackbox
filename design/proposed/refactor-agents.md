@@ -2,8 +2,8 @@
 
 Date: 2026-05-10 (rev 2 — applies codex-gpt55 review convergence)
 Status: design proposal, pure design (no implementation phasing)
-Related: `design/agent-system.md`, `design/agent-system-impl.md`,
-`design/refactor-rust-expansion.md`, `sm-refactor`, `sm-refactor-rust`,
+Related: `design/archive/agent-system.md`, `design/archive/agent-system-impl.md`,
+`design/archive/refactor-rust-expansion.md`, `sm-refactor`, `sm-refactor-rust`,
 `sm-refactor-java`, `sm-agentic-opening-sequence`
 
 ## Problem
@@ -33,7 +33,7 @@ name mismatch; skipping step 8 means applying through unresolved
 captures; skipping step 9 means the orchestrator's inbox doesn't surface
 the result.
 
-The bbox agent infrastructure (`design/agent-system.md`, implemented at
+The bbox agent infrastructure (`design/archive/agent-system.md`, implemented at
 `src/orchestration/agents/` and exposed via `bro_agent_list / search /
 describe / dispatch / get`) is the right surface for this. An agent is:
 
@@ -111,7 +111,7 @@ mechanism.
 spawning (`src/tools/agents.rs:656`). Malformed args fail before any
 tool fires. This part is mechanical.
 
-`outputs.schema` is **advisory** in v1 (`design/agent-system.md:432`).
+`outputs.schema` is **advisory** in v1 (`design/archive/agent-system.md:432`).
 The dispatch path returns `{session, task_id, resolved_brofile,
 merged_filters, agentLabel}` (`src/tools/agents.rs:781`); it does not
 validate that the agent actually returned the declared output shape.
@@ -126,7 +126,7 @@ shape.
 
 `composition.chainable_after`, `parallel_safe`, `fan_out_aggregator`
 exist in the manifest struct (`src/orchestration/agents/types.rs:113`),
-but per `design/agent-system-impl.md:608` there is no
+but per `design/archive/agent-system-impl.md:608` there is no
 `bro_agent_compose` consumer in v1. Workflows hand-wire composition
 through the existing workflow engine; the manifest fields are signal
 for those workflow authors, not autoload by the runtime.
@@ -163,7 +163,7 @@ Two compensating controls in v1:
 1. **Brofile denial of `Write`, `Edit`, `Bash`.** The atom literally
    cannot shell out or write files outside the refactor surface. The
    only mutation path is `bbox_refactor_run` command steps.
-2. **Command-allowlist invariant** (`design/refactor-rust-expansion.md`
+2. **Command-allowlist invariant** (`design/archive/refactor-rust-expansion.md`
    "Cross-Surface Invariants"). Atom-dispatched runs are
    prompt-disciplined to use only the `cargo check / test / clippy /
    fmt / build` allowlist for command steps, and mutating commands
@@ -422,7 +422,7 @@ Every refactor atom declares (advisory in v1):
 ```
 
 `fixme_count` is split (`plan_only` vs `warning`) to reflect the
-two-prefix FIXME grammar in `design/refactor-rust-expansion.md`.
+two-prefix FIXME grammar in `design/archive/refactor-rust-expansion.md`.
 
 ## Catalog — initial Rust atoms
 
@@ -516,7 +516,7 @@ exposes `acknowledge_repr` or `acknowledge_public_api_change`): the
 atom passes these flags through from operator-supplied inputs to the
 underlying plan kind. The atom MUST NOT default them, MUST NOT infer
 them from context, and MUST NOT silently set them after a refusal.
-See `design/refactor-rust-expansion.md` "Operator-authority opt-outs"
+See `design/archive/refactor-rust-expansion.md` "Operator-authority opt-outs"
 for the full statement.
 
 ### `rust-test-island-extract`
@@ -590,7 +590,7 @@ different validation command (`mvn test` / `./gradlew test`).
 A polyglot interface-extraction workflow can fan-out across this atom
 and `rust-trait-from-impl` with a `merge-refactor-results` aggregator
 (once that aggregator exists; aspirational in v1 per
-`design/agent-system-impl.md:608`).
+`design/archive/agent-system-impl.md:608`).
 
 ## Composition patterns
 
@@ -645,12 +645,12 @@ ranked agents by:
 Selection-by-cue is the same pattern Claude's native `.claude/agents/*.md`
 files use; refactor atoms get it for every provider through the bbox
 MCP surface, without bbox having to read or ship in Claude's file
-format (`design/agent-system.md` §2.1).
+format (`design/archive/agent-system.md` §2.1).
 
 ## Provenance — distillation path (acknowledged, out of scope)
 
 Initial catalog is `provenance: hand_authored`. The agent system's
-distillation hook (`design/agent-system.md` §1.1) leaves space for a
+distillation hook (`design/archive/agent-system.md` §1.1) leaves space for a
 badgey-flavor distiller to mine the corpus for recurring refactor task
 shapes and propose new atoms with `provenance: distilled` plus
 agentic-corpus edges back to source sessions. The `AgentProvenance::Distilled`

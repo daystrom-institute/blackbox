@@ -5,7 +5,7 @@ implementation chunk: scope, realizes, components, gates, known
 follow-ups. Phases are dependency-ordered. No timelines — landing a
 phase unblocks dependents; landing all phases realizes the design.
 
-This skeleton depends on `design/refactor-rust-expansion-impl.md`
+This skeleton depends on `design/archive/refactor-rust-expansion-impl.md`
 (prefix `RX-`). Minimum dependencies before any atom-impl phase
 lands:
 
@@ -29,7 +29,7 @@ Phases are prefixed `RA-` to disambiguate from `RX-` (Rust expansion),
 `AS-` (agent system), and other plan prefixes.
 
 This skeleton also assumes the existing agent infrastructure
-(`design/agent-system.md` and `design/agent-system-impl.md` Phases
+(`design/archive/agent-system.md` and `design/archive/agent-system-impl.md` Phases
 AS-D1 through at least AS-I2) has landed: `ArtifactKind::Agent`,
 `bro_agent_*` MCP tools, manifest schema validation, embedding bucket
 `agent_manifest`, and dispatch path at
@@ -581,7 +581,7 @@ intra-prompt preflight-then-run, not atom-to-atom dispatch.
   guard already cleared, so the repair-transaction invariant
   (RX-F2b) governs only the mutating sequence.
 - v2 atom-to-atom dispatch (per
-  `design/agent-system-impl.md:608`) is NOT used here; v1
+  `design/archive/agent-system-impl.md:608`) is NOT used here; v1
   composition is intra-prompt sequencing of preflight + run.
 
 **Gates.**
@@ -605,7 +605,7 @@ intra-prompt preflight-then-run, not atom-to-atom dispatch.
 
 **Follow-ups.**
 - v2 atom-to-atom composition is tracked in
-  `design/agent-system-impl.md:608` but not required by RA-A6.
+  `design/archive/agent-system-impl.md:608` but not required by RA-A6.
 
 ---
 
@@ -734,7 +734,7 @@ without modification.
 **Scope.** Document the v1 composition story: `chainable_after`,
 `parallel_safe`, `fan_out_aggregator` are signals to workflow
 authors; the manifest fields do not autoload at runtime per
-`design/agent-system-impl.md` §608. Workflows hand-wire atom
+`design/archive/agent-system-impl.md` §608. Workflows hand-wire atom
 chains.
 
 **Realizes.** `design/refactor-agents.md` "Composition — aspirational
@@ -758,7 +758,7 @@ in v1"; "Composition patterns".
 
 **Follow-ups.**
 - v2 composition primitive (`bro_agent_compose` per
-  `design/agent-system-impl.md` §608) — not in this skeleton.
+  `design/archive/agent-system-impl.md` §608) — not in this skeleton.
 
 ---
 
@@ -1050,7 +1050,7 @@ Recommended landing order:
   RX-V2).
 - Atom-internal composition of other atoms (today's composition
   is operator/workflow-driven; future
-  `design/agent-system-impl.md` §608 work enables atom-to-atom
+  `design/archive/agent-system-impl.md` §608 work enables atom-to-atom
   chains).
 - Auto-distillation of atoms from corpus evidence (RA-V2 doc only;
   distiller implementation separate).

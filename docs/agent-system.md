@@ -139,4 +139,4 @@ See also:
 
 - [Rule Packets](rule-packets.md) — agents use packets for deterministic classification
 - [Workflow Engine](workflows.md) — agents are dispatched as workflow nodes
-- Design docs: `design/agent-system.md`, `design/agent-system-impl.md`
+- Design docs: `design/archive/agent-system.md`, `design/archive/agent-system-impl.md`
