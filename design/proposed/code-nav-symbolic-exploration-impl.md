@@ -211,9 +211,14 @@ synthetic vocabulary deterministically without re-parsing the file.
 - Add to `SymbolSpec` in `src/chunker/code.rs`:
   - `pub kind: String` — raw tree-sitter node kind.
   - `pub parent_kind: Option<String>` — kind of the nearest
-    named ancestor that produced a containing symbol, or
-    `None` at file top level. Empty / unnamed parents are
-    skipped.
+    enclosing **symbol-producing** ancestor (i.e. the most recent
+    entry pushed onto the `parents` stack in `collect_ast_symbols`),
+    or `None` at file top level. **Not** the immediate tree-sitter
+    `node.parent().kind()` — that would frequently be
+    `declaration_list` / `block` / similar wrapper kinds, which
+    carry no synthesis signal. Empty / unnamed AST parents are
+    skipped during the walk; the field captures the kind of the
+    containing symbol, not the raw AST shape.
 - `collect_ast_symbols` threads a `parent_kind: Option<&str>`
   alongside the existing `parents: &mut Vec<String>` it already
   threads, and populates both fields per the design's
