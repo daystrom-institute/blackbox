@@ -263,8 +263,14 @@ Two personas ship as reference artifacts:
   `rust_refactor_persona_matches_design_spec` in
   `src/orchestration/brofile.rs`; allow/disallow drift fails the test.
 
-- **`java-refactor-persona`** — same shape, Java-flavored lens. Ships
-  only when Java atoms (RA-X1) are introduced.
+- **`java-refactor-persona`** at `examples/brofiles/java-refactor-persona.json`.
+  Same allow/disallow shape as the Rust persona — the refactor + grounding
+  tool surface is language-agnostic at the MCP layer; only the lens prose
+  differs. Java lens calls out `mvn` / `gradle` validation and the
+  annotation-processor-invisibility caveat (Lombok `@Slf4j` / `@Data`
+  generate members invisible to dependency analysis). Cross-language
+  symmetry verified by `rust_and_java_refactor_personas_share_tool_surface`
+  in `src/orchestration/brofile.rs`.
 
 Refactor-atom manifests under `examples/agents/refactor/*.json` MUST
 bind to one of these personas via `brofile_ref`. Authoring an atom that

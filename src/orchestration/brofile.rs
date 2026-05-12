@@ -618,6 +618,101 @@ mod tests {
     }
 
     #[test]
+    fn java_refactor_persona_matches_design_spec() {
+        let src = include_str!("../../examples/brofiles/java-refactor-persona.json");
+        let bf: Brofile = serde_json::from_str(src).expect("java-refactor-persona parses");
+        assert_eq!(bf.name, "java-refactor-persona");
+        assert_eq!(bf.provider, Provider::Claude);
+        let lens = bf.lens.as_deref().unwrap_or("");
+        assert!(lens.contains("bbox refactor primitives"));
+        assert!(
+            lens.contains("Lombok") || lens.contains("annotation"),
+            "Java lens should reference Java-specific caveats (Lombok / annotation processors)"
+        );
+
+        let f = bf.filters.expect("filters present");
+
+        let expected_allow: Vec<&str> = vec![
+            "mcp__blackbox__bbox_code_symbols",
+            "mcp__blackbox__bbox_code_node_describe",
+            "mcp__blackbox__bbox_code_query",
+            "mcp__blackbox__bbox_refactor_status",
+            "mcp__blackbox__bbox_refactor_project_refs",
+            "mcp__blackbox__bbox_refactor_plan",
+            "mcp__blackbox__bbox_refactor_apply",
+            "mcp__blackbox__bbox_refactor_run",
+            "mcp__blackbox__bbox_note",
+            "mcp__blackbox__bbox_thread",
+            "mcp__blackbox__bbox_pin",
+            "mcp__blackbox__bbox_inspect_entity",
+            "mcp__blackbox__bbox_hybrid_search",
+            "Read",
+            "Grep",
+            "Glob",
+        ];
+        let expected_disallow: Vec<&str> = vec![
+            "mcp__blackbox__bbox_forget",
+            "mcp__blackbox__bbox_decide",
+            "mcp__blackbox__bbox_learn",
+            "mcp__blackbox__bbox_remember",
+            "mcp__blackbox__bbox_render",
+            "mcp__blackbox__bro_*",
+            "Bash",
+            "Write",
+            "Edit",
+        ];
+
+        let allow_set: std::collections::BTreeSet<&str> =
+            f.allow.iter().map(String::as_str).collect();
+        let expected_allow_set: std::collections::BTreeSet<&str> =
+            expected_allow.iter().copied().collect();
+        assert_eq!(
+            allow_set, expected_allow_set,
+            "java-refactor-persona allow list drifted from design spec"
+        );
+
+        let disallow_set: std::collections::BTreeSet<&str> =
+            f.disallow.iter().map(String::as_str).collect();
+        let expected_disallow_set: std::collections::BTreeSet<&str> =
+            expected_disallow.iter().copied().collect();
+        assert_eq!(
+            disallow_set, expected_disallow_set,
+            "java-refactor-persona disallow list drifted from design spec"
+        );
+    }
+
+    /// Rust + Java refactor personas should expose the same allow/disallow
+    /// sets — the refactor + grounding tool surface is language-agnostic at
+    /// the MCP layer. Only the lens prose differs. The cross-language symmetry
+    /// is load-bearing for refactor-atom interchange between brofiles.
+    #[test]
+    fn rust_and_java_refactor_personas_share_tool_surface() {
+        let rust_src = include_str!("../../examples/brofiles/rust-refactor-persona.json");
+        let java_src = include_str!("../../examples/brofiles/java-refactor-persona.json");
+        let rust: Brofile = serde_json::from_str(rust_src).unwrap();
+        let java: Brofile = serde_json::from_str(java_src).unwrap();
+
+        let r = rust.filters.unwrap();
+        let j = java.filters.unwrap();
+        let r_allow: std::collections::BTreeSet<&str> =
+            r.allow.iter().map(String::as_str).collect();
+        let j_allow: std::collections::BTreeSet<&str> =
+            j.allow.iter().map(String::as_str).collect();
+        let r_disallow: std::collections::BTreeSet<&str> =
+            r.disallow.iter().map(String::as_str).collect();
+        let j_disallow: std::collections::BTreeSet<&str> =
+            j.disallow.iter().map(String::as_str).collect();
+        assert_eq!(
+            r_allow, j_allow,
+            "refactor personas should expose identical allow sets"
+        );
+        assert_eq!(
+            r_disallow, j_disallow,
+            "refactor personas should expose identical disallow sets"
+        );
+    }
+
+    #[test]
     fn test_brofile_with_model_effort() {
         let dir = temp_store();
         let bf = Brofile {
