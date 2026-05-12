@@ -7473,3 +7473,39 @@ class Example {\n\
             "exactly one qualified occurrence, no spurious rewrites: {result}"
         );
     }
+
+    // G5-FU: source_delegate_wrappers preserves `throws` clauses from the
+    // original method signature on the generated wrapper method.
+    #[test]
+    fn g5_fu_wrapper_preserves_throws_clause() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import java.io.IOException;\n\
+             public class Admin {\n\
+             \x20   public String save(int id) throws IOException { return String.valueOf(id); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["save".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.source_delegate_wrappers = Some(true);
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let rewritten = apply_source_edits(&plan, &source);
+        assert!(
+            rewritten.contains("public String save(int id) throws IOException {"),
+            "wrapper must preserve throws clause: {rewritten}"
+        );
+    }
