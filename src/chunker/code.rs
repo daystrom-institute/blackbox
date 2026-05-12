@@ -4,18 +4,53 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use tree_sitter::Node;
-use tree_sitter_language_pack::{get_parser, process, ProcessConfig, ProcessResult, StructureItem};
+use tree_sitter_language_pack::{
+    get_parser, process, ProcessConfig, ProcessResult, StructureItem, StructureKind,
+};
 
 use super::{placeholder_chunk, Chunk, Edge, SourceFormatChunker};
 
 pub struct CodeChunker;
 
+/// One extracted source symbol with enough context for both refactor
+/// inventory (qualified + bare names) and code-nav indexing (raw
+/// tree-sitter node kind + nearest enclosing symbol kind).
+///
+/// `kind` is the raw tree-sitter node kind from the AST walk
+/// (e.g. `"function_item"`, `"impl_item"`, `"class_declaration"`,
+/// `"call"` for Elixir defmodule/def/defp/defmacro). Per the design
+/// in `design/proposed/code-nav-symbolic-exploration.md`, this must
+/// stay raw — any synthesised vocabulary (`impl_method`, etc.) is
+/// derived at read time by `refactor_kind_for(language, kind,
+/// parent_kind)`. The structure-pack fallback path cannot read
+/// tree-sitter kinds and emits the language-pack `StructureKind`
+/// label instead (a best-effort approximation; see
+/// `structure_kind_label`).
+///
+/// `parent_kind` is the kind of the **nearest enclosing
+/// symbol-producing ancestor** — i.e. the kind of the most recent
+/// `SymbolSpec` pushed onto the walk stack. It is **not**
+/// `node.parent().kind()`, which would frequently be a wrapper like
+/// `declaration_list` / `block` and carry no synthesis signal.
+/// `None` at file top level.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SymbolSpec {
     qualified_name: String,
     bare_name: String,
+    kind: String,
+    parent_kind: Option<String>,
     byte_start: usize,
     byte_end: usize,
+}
+
+/// One entry on the walk stack: containing-symbol display name +
+/// containing-symbol kind. Display name feeds `qualify`; kind feeds
+/// `SymbolSpec.parent_kind`. Co-located in one struct so the two
+/// stacks can never desync.
+#[derive(Debug, Clone)]
+struct SymbolStackFrame {
+    display_name: String,
+    kind: String,
 }
 
 impl SourceFormatChunker for CodeChunker {
@@ -231,24 +266,59 @@ fn structure_symbol_specs(processed: &ProcessResult, source: &str) -> Vec<Symbol
 fn collect_structure_item(
     item: &StructureItem,
     source: &str,
-    parents: &mut Vec<String>,
+    stack: &mut Vec<SymbolStackFrame>,
     out: &mut Vec<SymbolSpec>,
 ) {
     let Some(bare_name) = item.name.as_ref().filter(|name| !name.is_empty()) else {
         return;
     };
-    let qualified_name = qualify(parents, bare_name);
+    let qualified_name = qualify(stack, bare_name);
+    let kind = structure_kind_label(&item.kind);
+    let parent_kind = stack.last().map(|frame| frame.kind.clone());
     out.push(SymbolSpec {
         qualified_name: qualified_name.clone(),
         bare_name: bare_name.clone(),
+        kind: kind.clone(),
+        parent_kind,
         byte_start: item.span.start_byte.min(source.len()),
         byte_end: item.span.end_byte.min(source.len()),
     });
-    parents.push(bare_name.clone());
+    stack.push(SymbolStackFrame {
+        display_name: bare_name.clone(),
+        kind,
+    });
     for child in &item.children {
-        collect_structure_item(child, source, parents, out);
+        collect_structure_item(child, source, stack, out);
     }
-    parents.pop();
+    stack.pop();
+}
+
+/// Map the `tree_sitter_language_pack` abstract `StructureKind` to a
+/// lowercase string label.
+///
+/// **This deviates from the design's "must be the tree-sitter node
+/// kind" rule** because the structure-pack fallback path runs when
+/// the AST walker (`ast_symbol_specs`) produces no symbols — typically
+/// for languages outside the curated AST grammar set. We have no
+/// `node.kind()` to surface; the language-pack's abstract categories
+/// are the most precise label we can attach. Documented as a
+/// best-effort fallback in
+/// `design/proposed/code-nav-symbolic-exploration-impl.md` (CN-D1).
+fn structure_kind_label(kind: &StructureKind) -> String {
+    match kind {
+        StructureKind::Function => "function".to_string(),
+        StructureKind::Method => "method".to_string(),
+        StructureKind::Class => "class".to_string(),
+        StructureKind::Struct => "struct".to_string(),
+        StructureKind::Interface => "interface".to_string(),
+        StructureKind::Enum => "enum".to_string(),
+        StructureKind::Module => "module".to_string(),
+        StructureKind::Trait => "trait".to_string(),
+        StructureKind::Impl => "impl".to_string(),
+        StructureKind::Namespace => "namespace".to_string(),
+        StructureKind::Other(other) if !other.is_empty() => other.clone(),
+        StructureKind::Other(_) => "unknown".to_string(),
+    }
 }
 
 fn ast_symbol_specs(root: Node<'_>, source: &str, language: &str) -> Vec<SymbolSpec> {
@@ -261,23 +331,30 @@ fn collect_ast_symbols(
     node: Node<'_>,
     source: &str,
     language: &str,
-    parents: &mut Vec<String>,
+    stack: &mut Vec<SymbolStackFrame>,
     out: &mut Vec<SymbolSpec>,
 ) {
     let symbol = symbol_name(node, source, language);
     if let Some((bare_name, display_name)) = symbol {
-        let qualified_name = qualify(parents, &display_name);
+        let qualified_name = qualify(stack, &display_name);
+        let kind = node.kind().to_string();
+        let parent_kind = stack.last().map(|frame| frame.kind.clone());
         out.push(SymbolSpec {
             qualified_name: qualified_name.clone(),
             bare_name,
+            kind: kind.clone(),
+            parent_kind,
             byte_start: node.start_byte(),
             byte_end: node.end_byte(),
         });
-        parents.push(display_name);
-        walk_children(node, source, language, parents, out);
-        parents.pop();
+        stack.push(SymbolStackFrame {
+            display_name,
+            kind,
+        });
+        walk_children(node, source, language, stack, out);
+        stack.pop();
     } else {
-        walk_children(node, source, language, parents, out);
+        walk_children(node, source, language, stack, out);
     }
 }
 
@@ -285,12 +362,12 @@ fn walk_children(
     node: Node<'_>,
     source: &str,
     language: &str,
-    parents: &mut Vec<String>,
+    stack: &mut Vec<SymbolStackFrame>,
     out: &mut Vec<SymbolSpec>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_ast_symbols(child, source, language, parents, out);
+        collect_ast_symbols(child, source, language, stack, out);
     }
 }
 
@@ -444,11 +521,16 @@ fn node_text(node: Node<'_>, source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn qualify(parents: &[String], name: &str) -> String {
-    if parents.is_empty() {
+fn qualify(stack: &[SymbolStackFrame], name: &str) -> String {
+    if stack.is_empty() {
         name.to_string()
     } else {
-        format!("{}::{name}", parents.join("::"))
+        let joined = stack
+            .iter()
+            .map(|frame| frame.display_name.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        format!("{joined}::{name}")
     }
 }
 
@@ -482,6 +564,117 @@ impl Display for EntityRef {
             .iter()
             .any(|chunk| chunk.content.contains("impl Display for EntityRef")));
         assert!(chunks.iter().any(|chunk| chunk.symbol.is_some()));
+    }
+
+    /// Helper: parse `source` with `language`, then run the AST symbol
+    /// walker and return the produced SymbolSpecs.
+    fn ast_specs_for(language: &str, source: &str) -> Vec<SymbolSpec> {
+        let mut parser = parser_for_language(language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        ast_symbol_specs(tree.root_node(), source, language)
+    }
+
+    /// Rust impl methods are the load-bearing case for CN-T2's indexed
+    /// vs live equivalence: a `function_item` whose enclosing symbol is
+    /// an `impl_item` is what `refactor::status` synthesises as
+    /// `impl_method`. The indexed lane only has access to the raw
+    /// tree-sitter kinds, so `parent_kind` must carry `impl_item` here
+    /// or the synthesis derivation cannot reproduce.
+    #[test]
+    fn symbolspec_kind_and_parent_kind_for_rust_impl_method() {
+        let source = "struct S; impl S { fn run(&self) {} fn stop(&self) {} }";
+        let specs = ast_specs_for("rust", source);
+
+        let struct_spec = specs.iter().find(|s| s.bare_name == "S").unwrap();
+        assert_eq!(struct_spec.kind, "struct_item");
+        assert_eq!(struct_spec.parent_kind, None);
+
+        let run = specs.iter().find(|s| s.bare_name == "run").unwrap();
+        assert_eq!(run.kind, "function_item");
+        assert_eq!(run.parent_kind.as_deref(), Some("impl_item"));
+
+        let stop = specs.iter().find(|s| s.bare_name == "stop").unwrap();
+        assert_eq!(stop.kind, "function_item");
+        assert_eq!(stop.parent_kind.as_deref(), Some("impl_item"));
+    }
+
+    /// Top-level Rust functions must have `parent_kind = None` so the
+    /// indexed lane does not accidentally synthesise them as
+    /// `impl_method`.
+    #[test]
+    fn symbolspec_top_level_rust_function_has_no_parent_kind() {
+        let source = "fn standalone() {}";
+        let specs = ast_specs_for("rust", source);
+        let spec = specs.iter().find(|s| s.bare_name == "standalone").unwrap();
+        assert_eq!(spec.kind, "function_item");
+        assert_eq!(spec.parent_kind, None);
+    }
+
+    /// Java method declarations live under `class_body` (the immediate
+    /// AST parent), but `parent_kind` tracks the nearest *enclosing
+    /// symbol* — the class declaration — not the wrapper node.
+    #[test]
+    fn symbolspec_java_method_parent_kind_is_class_declaration() {
+        let source = "class Test { void run() {} void stop() {} }";
+        let specs = ast_specs_for("java", source);
+        let class = specs.iter().find(|s| s.bare_name == "Test").unwrap();
+        assert_eq!(class.kind, "class_declaration");
+        assert_eq!(class.parent_kind, None);
+        let run = specs.iter().find(|s| s.bare_name == "run").unwrap();
+        assert_eq!(run.kind, "method_declaration");
+        assert_eq!(run.parent_kind.as_deref(), Some("class_declaration"));
+    }
+
+    /// Python functions inside classes get `parent_kind =
+    /// class_definition`. Methods at module top level get `None`.
+    #[test]
+    fn symbolspec_python_method_vs_top_level() {
+        let source = "class C:\n    def m(self):\n        pass\n\ndef top():\n    pass\n";
+        let specs = ast_specs_for("python", source);
+        let class = specs.iter().find(|s| s.bare_name == "C").unwrap();
+        assert_eq!(class.kind, "class_definition");
+        assert_eq!(class.parent_kind, None);
+        let method = specs.iter().find(|s| s.bare_name == "m").unwrap();
+        assert_eq!(method.kind, "function_definition");
+        assert_eq!(method.parent_kind.as_deref(), Some("class_definition"));
+        let top = specs.iter().find(|s| s.bare_name == "top").unwrap();
+        assert_eq!(top.kind, "function_definition");
+        assert_eq!(top.parent_kind, None);
+    }
+
+    /// TypeScript class method: `method_definition` enclosed by
+    /// `class_declaration`. Top-level function: `function_declaration`
+    /// with `parent_kind = None`.
+    #[test]
+    fn symbolspec_typescript_class_method_vs_top_level() {
+        let source = "class C { run() {} }\nfunction top() {}\n";
+        let specs = ast_specs_for("typescript", source);
+        let class = specs.iter().find(|s| s.bare_name == "C").unwrap();
+        assert_eq!(class.kind, "class_declaration");
+        assert_eq!(class.parent_kind, None);
+        let method = specs.iter().find(|s| s.bare_name == "run").unwrap();
+        assert_eq!(method.kind, "method_definition");
+        assert_eq!(method.parent_kind.as_deref(), Some("class_declaration"));
+        let top = specs.iter().find(|s| s.bare_name == "top").unwrap();
+        assert_eq!(top.kind, "function_declaration");
+        assert_eq!(top.parent_kind, None);
+    }
+
+    /// Elixir keeps `kind = "call"` (the raw tree-sitter node kind for
+    /// defmodule / def / defp / defmacro). The promotion to a more
+    /// specific marker is deferred to a separate `symbol_kind_display`
+    /// surface (out of scope for CN-D1). Per the design doc, raw node
+    /// kind is the contract.
+    #[test]
+    fn symbolspec_elixir_keeps_raw_call_kind() {
+        let source = "defmodule M do\n  def run, do: :ok\nend\n";
+        let specs = ast_specs_for("elixir", source);
+        let module = specs.iter().find(|s| s.bare_name == "M").unwrap();
+        assert_eq!(module.kind, "call");
+        assert_eq!(module.parent_kind, None);
+        let func = specs.iter().find(|s| s.bare_name == "run").unwrap();
+        assert_eq!(func.kind, "call");
+        assert_eq!(func.parent_kind.as_deref(), Some("call"));
     }
 
     #[test]
