@@ -287,6 +287,7 @@ dispatch via `bro_agent_dispatch(agent="<name>", args={...})`.
 | `rust-state-extract` | shipped (v1, RA-A4) | normal | `extract_rust_items`, `move_rust_struct_fields`, `add_rust_delegate_field`, `update_rust_callers`, `rust_compile_fix_round` | Pull a self.<field> cluster into a separate struct + delegate; operator-authority `acknowledge_repr` for #[repr(C)] / #[repr(packed)] |
 | `rust-trait-from-impl` | shipped (v1, RA-A5) | normal | `extract_rust_trait`, `migrate_rust_type_usages`, `rust_compile_fix_round` | Lift method subset into trait + impl Trait for Struct; HARD REFUSES migrate_call_sites=true when dyn_compatible=false |
 | `rust-error-migrate` | shipped (v1, RA-A6) | normal | `rewrite_rust_error_type` (RX-E1), `rust_public_api_guard` (preflight, RX-G2), `rust_compile_fix_round` (RX-C1) | Rewrite a module's error type; `rust_public_api_guard` runs as PREFLIGHT (outside the mutating run); operator-authority `acknowledge_public_api_change` |
+| `rust-split-god-impl` | shipped (v1, RA-A7, headline) | expensive | `extract_rust_impl_methods`, `rust_ra_classify_callbacks` (RX-R2, REQUIRED), `add_rust_router_to_sum`, `add_rust_mod_decl`, `rewrite_rust_item_visibility`, `rust_organize_imports`, `rust_compile_fix_round` | Carve multi-domain impl block into per-domain modules; mandatory RA-backed cross-partition call classification; fail-closed on lsp_unavailable (RX-V3) |
 
 Per-atom manifests live at `examples/agents/refactor/<atom>.json`. The
 shared prompt template and base outputs schema (RA-T1) under the same
