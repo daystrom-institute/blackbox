@@ -43,6 +43,11 @@
 //! - `item_kinds` (optional): subset of
 //!   `["type_reference", "method_invocation", "field_access",
 //!   "method_reference", "import"]` to narrow the report.
+//! - `summary_only` (optional): when true, return per-name counts + top 5
+//!   example call sites per matched name instead of full enumeration.
+//! - `declaring_class` (optional): when set, only include method invocations
+//!   where the receiver is a `private final <DeclaringClass> <field>` of the
+//!   enclosing class.
 //!
 //! v1 limits:
 //! - Simple-name match only. `import` resolution is reported but not
@@ -58,7 +63,7 @@
 //! consume it.
 
 use super::*;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
     let project_dir_str = p
@@ -77,6 +82,7 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
         .as_deref()
         .map(|ks| ks.iter().map(String::as_str).collect());
     let declaring_class = p.declaring_class.as_deref();
+    let summary_only = p.summary_only.unwrap_or(false);
 
     let mut usages: Vec<JavaUsage> = Vec::new();
     for entry in walkdir::WalkDir::new(project_dir)
@@ -114,17 +120,26 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
     // Stable order: by path, then byte_start.
     usages.sort_by(|a, b| a.path.cmp(&b.path).then(a.byte_start.cmp(&b.byte_start)));
 
-    let count = usages.len();
+    let usage_count = usages.len();
     let production_sites = usages.iter().filter(|u| !u.is_test_site).count();
     let test_sites = usages.iter().filter(|u| u.is_test_site).count();
-    let body = serde_json::json!({
+    let unique_call_files = usages.iter().map(|u| u.path.as_str()).collect::<HashSet<_>>().len();
+    let mut usage_summary_by_name: BTreeMap<String, usize> = BTreeMap::new();
+    for usage in &usages {
+        *usage_summary_by_name
+            .entry(usage.matched_name.clone())
+            .or_insert(0) += 1;
+    }
+    let usage_examples_by_name = top_usage_examples_by_name(&usages, 5);
+    let title = format!(
+        "find {} symbol(s) across {}",
+        names.len(),
+        path_string(project_dir)
+    );
+    let mut body = serde_json::json!({
         "status": "ok",
         "kind": "find_java_usages",
-        "title": format!(
-            "find {} symbol(s) across {}",
-            names.len(),
-            path_string(project_dir)
-        ),
+        "title": title,
         "semantic_status": SemanticStatus::SyntaxOnly,
         "dry_run": true,
         "file_moves": [],
@@ -133,11 +148,58 @@ pub(crate) fn plan_find_java_usages(p: &RefactorPlanParams) -> Result<String> {
         "items": [],
         "leftovers": [],
         "plan_status": PlanStatus::Planned,
-        "usage_count": count,
+        "usage_count": usage_count,
+        "total_usages": usage_count,
+        "unique_call_files": unique_call_files,
+        "usage_summary_by_name": usage_summary_by_name.clone(),
         "production_sites": production_sites,
         "test_sites": test_sites,
-        "usages": usages,
     });
+
+    if p.output_path.is_some() {
+        let output_path = p
+            .output_path
+            .as_deref()
+            .ok_or_else(|| anyhow!("output_path must be provided to write full report"))?;
+        let plan_path = plan_slot::resolve_plan_write_path(output_path)?;
+        if let Some(parent) = plan_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("creating parent directory for plan output: {}", parent.display())
+                })?;
+            }
+        }
+        let mut summary = serde_json::json!({
+            "status": "ok",
+            "kind": "find_java_usages",
+            "title": title,
+            "semantic_status": SemanticStatus::SyntaxOnly,
+            "dry_run": true,
+            "plan_path": path_string(&plan_path),
+            "file_moves": [],
+            "edits": [],
+            "validations": [],
+            "items": [],
+            "leftovers": [],
+            "plan_status": PlanStatus::Planned,
+            "total_usages": usage_count,
+            "unique_call_files": unique_call_files,
+            "usage_summary_by_name": usage_summary_by_name,
+        });
+        if summary_only {
+            summary["usage_examples_by_name"] = serde_json::to_value(usage_examples_by_name)?;
+        }
+        body["usages"] = serde_json::to_value(usages)?;
+        fs::write(&plan_path, serde_json::to_string_pretty(&body)?)
+            .with_context(|| format!("writing plan JSON to {}", plan_path.display()))?;
+        return Ok(serde_json::to_string_pretty(&summary)?);
+    }
+
+    if summary_only {
+        body["usage_examples_by_name"] = serde_json::to_value(usage_examples_by_name)?;
+    } else {
+        body["usages"] = serde_json::to_value(usages)?;
+    }
     Ok(serde_json::to_string_pretty(&body)?)
 }
 
@@ -169,6 +231,43 @@ fn is_test_site_path(path: &Path) -> bool {
         }
     }
     false
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageExample {
+    path: String,
+    line: usize,
+    column: usize,
+    byte_start: usize,
+    byte_end: usize,
+    context: String,
+    is_test_site: bool,
+    usage_kind: String,
+    matched_name: String,
+}
+
+fn top_usage_examples_by_name(
+    usages: &[JavaUsage],
+    max_per_name: usize,
+) -> BTreeMap<String, Vec<UsageExample>> {
+    let mut out: BTreeMap<String, Vec<UsageExample>> = BTreeMap::new();
+    for usage in usages {
+        let row = out.entry(usage.matched_name.clone()).or_default();
+        if row.len() < max_per_name {
+            row.push(UsageExample {
+                path: usage.path.clone(),
+                line: usage.line,
+                column: usage.column,
+                byte_start: usage.byte_start,
+                byte_end: usage.byte_end,
+                context: usage.context.clone(),
+                is_test_site: usage.is_test_site,
+                usage_kind: usage.usage_kind.clone(),
+                matched_name: usage.matched_name.clone(),
+            });
+        }
+    }
+    out
 }
 
 fn collect_usages_in_file(
@@ -826,6 +925,69 @@ mod tests {
             invocations[0].contains("repoDao.save()"),
             "filtered usage must be repoDao call: {invocations:?}"
         );
+    }
+
+    #[test]
+    fn g10_output_path_writes_report_returns_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("A.java"),
+            "package com.example;\n\
+             class Symbol {}\n\
+             class A { Symbol s; }\n",
+        )
+        .unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _lock = crate::util::test_env_lock();
+        unsafe { std::env::set_var("BLACKBOX_STATE_DIR", state_dir.path()) };
+        let mut params = make_params(dir.path(), &["Symbol"]);
+        params.output_path = Some("find-usages.json".to_string());
+        let response = plan_find_java_usages(&params).unwrap();
+        unsafe { std::env::remove_var("BLACKBOX_STATE_DIR") };
+
+        let v = parse_response(&response);
+        assert!(v.get("usages").is_none(), "output-path response should be digest only");
+        assert_eq!(v["total_usages"].as_u64().unwrap(), 1);
+        assert_eq!(v["usage_summary_by_name"]["Symbol"].as_u64().unwrap(), 1);
+        let plan_path = std::path::Path::new(v["plan_path"].as_str().unwrap());
+        assert!(plan_path.starts_with(state_dir.path()));
+        let on_disk = parse_response(&fs::read_to_string(plan_path).unwrap());
+        assert!(on_disk.get("usages").is_some(), "full report should be written to slot");
+        assert_eq!(on_disk["usage_count"].as_u64().unwrap(), 1);
+        assert_eq!(on_disk["total_usages"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn g10_summary_only_returns_per_name_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("A.java"),
+            "package com.example;\n\
+             class Symbol {}\n\
+             class A {\n\
+            \x20   Symbol s1;\n\
+            \x20   Symbol s2;\n\
+            \x20   Symbol s3;\n\
+            \x20   Symbol s4;\n\
+            \x20   Symbol s5;\n\
+            \x20   Symbol s6;\n\
+             }\n",
+        )
+        .unwrap();
+        let mut params = make_params(dir.path(), &["Symbol"]);
+        params.summary_only = Some(true);
+        let response = plan_find_java_usages(&params).unwrap();
+        let v = parse_response(&response);
+        assert!(v.get("usages").is_none(), "summary_only should suppress full enumeration");
+        assert_eq!(v["total_usages"].as_u64().unwrap(), 6);
+        assert_eq!(v["unique_call_files"].as_u64().unwrap(), 1);
+        let examples = v["usage_examples_by_name"]["Symbol"].as_array().unwrap();
+        assert_eq!(examples.len(), 5);
+        assert_eq!(v["usage_summary_by_name"]["Symbol"].as_u64().unwrap(), 6);
     }
 
     // Gate: refuses when project_dir is missing.

@@ -1018,7 +1018,11 @@ pub fn plan(p: &RefactorPlanParams) -> Result<String> {
 
 pub fn plan_with_ctx(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
     let plan_json = plan_dispatch(p, ctx)?;
-    if let Some(output_path) = p.output_path.as_deref() {
+    // `find_java_usages` owns custom output-path behavior (compact digest + full
+    // report write). Let that plan manage persistence itself to avoid generic
+    // post-processing overwriting the expected on-disk payload.
+    if p.kind != "find_java_usages" && p.output_path.as_deref().is_some() {
+        let output_path = p.output_path.as_deref().unwrap();
         let resolved = plan_slot::resolve_plan_write_path(output_path)?;
         if let Some(parent) = resolved.parent() {
             if !parent.as_os_str().is_empty() {
