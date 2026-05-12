@@ -192,6 +192,60 @@ Wanted: test-focused compound plan:
 
 This would avoid turning one god file into one giant `tests.rs` dumping ground.
 
+### G8: Re-Export Repair After Child-Module Extraction
+
+Current state: `extract_rust_items_to_submodule` can move helper items into a
+new child module and add a local `use child::{...};` for names still referenced
+by the parent file. That is not enough when existing sibling modules rely on
+`use super::*`; the moved names disappear from the parent's glob-exported
+surface and sibling modules fail to compile.
+
+Encountered while extracting import/type-index helpers from
+`src/refactor/java.rs` into `src/refactor/java/imports.rs`. The plan parsed and
+applied cleanly, but `cargo test --bin blackboxd` failed until the parent module
+changed the local import into a re-export:
+
+```rust
+pub(super) use imports::*;
+```
+
+Wanted: a planner option or compile-fix proposal that detects sibling-module
+uses of moved items and chooses one of:
+
+- generate `pub(super) use child::{Needed, Names};`
+- generate explicit imports in each affected sibling module
+- leave the parent-local import when no sibling references exist
+
+This should be driven by project reference analysis or rustc diagnostics, not
+by blanket `pub(super) use child::*` unless the operator asks for that broad
+compatibility mode.
+
+### G9: Path Rebase and Visibility Repair for Impl-Method Extraction
+
+Current state: `extract_rust_impl_methods` moves method bodies into a child
+module, but keeps relative paths and method visibility unchanged.
+
+Encountered while moving `WorkflowRunner` fanout methods from
+`src/workflow/engine.rs` into `src/workflow/engine/fanout.rs`:
+
+- `super::schema::NodeSpec` was valid in `engine.rs` but invalid one module
+  deeper; it needed `crate::workflow::schema` or `super::super::schema`.
+- `super::compile(...)` was valid in `engine.rs` but invalid in the child
+  module; it needed an import of `crate::workflow::compile`.
+- `run_dynamic_fanout_node` stayed private to `engine::fanout`, but the parent
+  `engine` module still calls it from `run_activity_node`; it needed
+  `pub(super)`.
+
+Wanted: `extract_rust_impl_methods` or the compile-fix round should detect
+these common post-move diagnostics and propose:
+
+- relative path rebases for `super::...` references
+- imports for moved code whose original lexical parent changed
+- `pub(super)` visibility on moved impl methods still called by the parent
+
+This is the practical blocker behind broad `WorkflowRunner` partitioning unless
+G2's compound split owns the full cargo-check repair loop.
+
 ## Suggested Priority
 
 1. Use current tooling on low-risk bulk: inline tests and obvious top-level
