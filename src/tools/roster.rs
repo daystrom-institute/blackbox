@@ -203,7 +203,9 @@ impl BlackboxServer {
                     effort: p.effort.clone(),
                     filters,
                 };
-                brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref());
+                if let Err(e) = brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref()) {
+                    return Self::err_text(&format!("brofile save failed: {e}"));
+                }
                 Self::ok_json(&json!({"created": name, "scope": scope, "brofile": bf}))
             }
             "list" => {

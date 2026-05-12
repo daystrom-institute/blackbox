@@ -967,7 +967,26 @@ pub(crate) async fn install_artifact_value(
         }
         artifacts::ArtifactKind::Brofile => {
             let brofile: orchestration::brofile::Brofile = serde_json::from_value(value.clone())?;
-            orchestration::brofile::save_brofile(&brofile, "global", &state.store_dir, None);
+            let written = orchestration::brofile::save_brofile(
+                &brofile,
+                "global",
+                &state.store_dir,
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("brofile registry write failed: {e}"))?;
+            // Post-install verification — the artifact catalog reports
+            // "active" only when the runtime registry can actually see
+            // the brofile. Prevents silent G11-style desync where the
+            // catalog says installed but bro_brofile list returns
+            // empty.
+            if orchestration::brofile::resolve_brofile(&brofile.name, &state.store_dir, None)
+                .is_none()
+            {
+                anyhow::bail!(
+                    "brofile written to {} but resolve_brofile returned None — runtime registry desync",
+                    written.display()
+                );
+            }
         }
         artifacts::ArtifactKind::Team => {
             // Teams are stored as artifacts but have no additional validation at install time.
@@ -1828,7 +1847,13 @@ pub(crate) async fn admin_brofile_upsert(
         effort: req.effort,
         filters: None,
     };
-    orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None);
+    if let Err(e) = orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"status": "error", "name": req.name, "error": e.to_string()})),
+        )
+            .into_response();
+    }
     axum::Json(json!({"status": "upserted", "name": req.name})).into_response()
 }
 

@@ -68,22 +68,27 @@ fn project_brofiles_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".bro").join("brofiles")
 }
 
-pub fn save_brofile(bf: &Brofile, scope: &str, store_dir: &Path, project_dir: Option<&str>) {
+pub fn save_brofile(
+    bf: &Brofile,
+    scope: &str,
+    store_dir: &Path,
+    project_dir: Option<&str>,
+) -> std::io::Result<PathBuf> {
     let dir = if scope == "project" {
         project_brofiles_dir(Path::new(project_dir.unwrap_or(".")))
     } else {
         brofiles_dir(store_dir)
     };
-    let _ = fs::create_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
     let file = dir.join(format!("{}.json", bf.name));
     let tmp = dir.join(format!("{}.json.tmp", bf.name));
-    if let Ok(data) = serde_json::to_string_pretty(bf) {
-        if let Ok(mut f) = fs::File::create(&tmp) {
-            let _ = f.write_all(data.as_bytes());
-            let _ = f.sync_all();
-            let _ = fs::rename(&tmp, &file);
-        }
-    }
+    let data = serde_json::to_string_pretty(bf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(data.as_bytes())?;
+    f.sync_all()?;
+    fs::rename(&tmp, &file)?;
+    Ok(file)
 }
 
 pub fn load_brofile(name: &str, dir: &Path) -> Option<Brofile> {
@@ -422,13 +427,38 @@ mod tests {
             effort: None,
             filters: None,
         };
-        save_brofile(&bf, "global", dir.path(), None);
+        save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("reviewer", dir.path(), None);
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.name, "reviewer");
         assert_eq!(loaded.provider, Provider::Claude);
         assert_eq!(loaded.lens.as_deref(), Some("You are a code reviewer"));
+    }
+
+    #[test]
+    fn g11_save_brofile_returns_written_path_resolves_immediately() {
+        // G11: artifact_install for kind=brofile silently desynced from
+        // the runtime registry. Verify save_brofile now returns the on-disk
+        // path AND that resolve_brofile sees the entry immediately, so
+        // post-install verification at the install boundary cannot pass
+        // while the runtime registry is still empty.
+        let dir = temp_store();
+        let bf = Brofile {
+            name: "post-install-verification".into(),
+            provider: Provider::Codex,
+            account: None,
+            lens: Some("test".into()),
+            model: Some("gpt-5.5".into()),
+            effort: Some("medium".into()),
+            filters: None,
+        };
+        let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
+        assert!(written.exists(), "save_brofile must report the on-disk path");
+        assert!(
+            resolve_brofile("post-install-verification", dir.path(), None).is_some(),
+            "saved brofile must resolve immediately — G11 desync regression"
+        );
     }
 
     #[test]
@@ -445,7 +475,7 @@ mod tests {
             effort: None,
             filters: None,
         };
-        save_brofile(&global_bf, "global", store.path(), None);
+        save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
 
         let project_bf = Brofile {
             name: "worker".into(),
@@ -461,7 +491,8 @@ mod tests {
             "project",
             store.path(),
             Some(project.path().to_str().unwrap()),
-        );
+        )
+        .expect("brofile save");
 
         let resolved = resolve_brofile(
             "worker",
@@ -485,7 +516,7 @@ mod tests {
                 effort: None,
                 filters: None,
             };
-            save_brofile(&bf, "global", dir.path(), None);
+            save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         }
         let list = list_brofiles("global", dir.path(), None);
         assert_eq!(list.len(), 3);
@@ -505,7 +536,7 @@ mod tests {
             effort: None,
             filters: None,
         };
-        save_brofile(&bf, "global", dir.path(), None);
+        save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
         assert!(delete_brofile("to_delete", "global", dir.path(), None));
         assert!(resolve_brofile("to_delete", dir.path(), None).is_none());
@@ -550,7 +581,7 @@ mod tests {
                 disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(*)".into()],
             }),
         };
-        save_brofile(&bf, "global", dir.path(), None);
+        save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("auditor", dir.path(), None).unwrap();
         let f = loaded.filters.expect("filters round-trip");
         assert_eq!(f.disallow.len(), 2);
@@ -726,7 +757,7 @@ mod tests {
             effort: Some("low".into()),
             filters: None,
         };
-        save_brofile(&bf, "global", dir.path(), None);
+        save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
         assert_eq!(loaded.model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(loaded.effort.as_deref(), Some("low"));
