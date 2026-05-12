@@ -1,4 +1,6 @@
 use super::*;
+use crate::projects::ProjectRecord;
+use std::collections::BTreeSet;
 use std::fs;
 use tempfile::TempDir;
 
@@ -9,6 +11,27 @@ fn setup_test_file(dir: &TempDir, name: &str, content: &str) -> String {
     }
     fs::write(&path, content).unwrap();
     path.to_string_lossy().into_owned()
+}
+
+/// Build a synthetic `ProjectRecord` for a TempDir so the
+/// registered-project gate accepts the dir during code_symbols tests.
+/// The canonical_path matches what the gate will canonicalise the tempdir
+/// to, so descendant checks pass.
+fn registered_for(dir: &TempDir) -> Vec<ProjectRecord> {
+    let canonical_path = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    vec![ProjectRecord {
+        project_id: "test-project".to_string(),
+        repo_id: None,
+        canonical_path,
+        registered_at: "2026-01-01T00:00:00Z".to_string(),
+        is_git_repo: false,
+        languages: BTreeSet::new(),
+    }]
 }
 
 #[test]
@@ -154,7 +177,7 @@ fn test_code_symbols_finds_java_method_line_ranges_without_rg() {
         file_limit: None,
         include_attributes: Some(false),
     };
-    let response_json = code_symbols(&params).unwrap();
+    let response_json = code_symbols(&params, &registered_for(&dir)).unwrap();
     let response: CodeSymbolSearchResponse = serde_json::from_str(&response_json).unwrap();
     assert_eq!(response.scanned_files, 1);
     assert_eq!(response.matching_items, 1);
@@ -362,16 +385,19 @@ fn test_code_nav_tools_always_label_semantic_status_syntax_only() {
     assert_eq!(describe_response.semantic_status, "syntax_only");
 
     let _ = java_file;
-    let symbols_response_json = code_symbols(&CodeSymbolSearchParams {
-        project_dir: dir.path().to_string_lossy().into_owned(),
-        query: Some("run".to_string()),
-        languages: Some(vec!["java".to_string()]),
-        item_kinds: None,
-        path_contains: None,
-        limit: None,
-        file_limit: None,
-        include_attributes: Some(false),
-    })
+    let symbols_response_json = code_symbols(
+        &CodeSymbolSearchParams {
+            project_dir: dir.path().to_string_lossy().into_owned(),
+            query: Some("run".to_string()),
+            languages: Some(vec!["java".to_string()]),
+            item_kinds: None,
+            path_contains: None,
+            limit: None,
+            file_limit: None,
+            include_attributes: Some(false),
+        },
+        &registered_for(&dir),
+    )
     .unwrap();
     let symbols_response: CodeSymbolSearchResponse =
         serde_json::from_str(&symbols_response_json).unwrap();
@@ -380,4 +406,107 @@ fn test_code_nav_tools_always_label_semantic_status_syntax_only() {
         SEMANTIC_STATUS_SYNTAX_ONLY
     );
     assert_eq!(symbols_response.semantic_status, "syntax_only");
+}
+
+/// `bbox_code_symbols` must refuse a `project_dir` that is neither a
+/// registered project root nor a descendant of one. The error response
+/// must be a typed JSON object (not an anyhow bail) so the agent can
+/// recover programmatically.
+#[test]
+fn test_code_symbols_rejects_unregistered_project_dir() {
+    let dir = TempDir::new().unwrap();
+    setup_test_file(&dir, "src/main/java/Test.java", "class Test { void run() {} }\n");
+    let params = CodeSymbolSearchParams {
+        project_dir: dir.path().to_string_lossy().into_owned(),
+        query: None,
+        languages: None,
+        item_kinds: None,
+        path_contains: None,
+        limit: None,
+        file_limit: None,
+        include_attributes: None,
+    };
+    // Empty registry — dir is not registered nor a descendant.
+    let response_json = code_symbols(&params, &[]).unwrap();
+    let response: CodeNavErrorResponse = serde_json::from_str(&response_json).unwrap();
+    assert_eq!(response.status, "error");
+    assert_eq!(response.code, "project_not_registered");
+    assert_eq!(response.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
+    assert!(response.project_dir.is_some());
+    assert!(response.suggestion.contains("bbox_project_register"));
+}
+
+/// A descendant of a registered project root is accepted (worktrees,
+/// subdirectories, etc.). The walker still runs and returns results.
+#[test]
+fn test_code_symbols_accepts_descendant_of_registered_root() {
+    let dir = TempDir::new().unwrap();
+    setup_test_file(&dir, "src/main/java/Test.java", "class Test { void run() {} }\n");
+    let params = CodeSymbolSearchParams {
+        project_dir: dir
+            .path()
+            .join("src")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        query: None,
+        languages: Some(vec!["java".to_string()]),
+        item_kinds: None,
+        path_contains: None,
+        limit: None,
+        file_limit: None,
+        include_attributes: None,
+    };
+    let response_json = code_symbols(&params, &registered_for(&dir)).unwrap();
+    let response: CodeSymbolSearchResponse = serde_json::from_str(&response_json).unwrap();
+    assert_eq!(response.status, "ok");
+    assert!(response.matching_items >= 1);
+}
+
+/// Files larger than MAX_CODE_NAV_FILE_BYTES must be rejected by every
+/// single-file code-nav tool with a typed JSON error that names the
+/// observed size and the cap. The agent should see the same shape from
+/// `bbox_code_query` and `bbox_code_node_describe`.
+#[test]
+fn test_code_nav_single_file_tools_reject_oversize() {
+    let dir = TempDir::new().unwrap();
+    // Build a file just over the cap with valid Rust so the gate
+    // (not the parser) is what rejects.
+    let mut oversize = String::with_capacity(MAX_CODE_NAV_FILE_BYTES as usize + 1024);
+    oversize.push_str("fn main() {}\n");
+    while (oversize.len() as u64) <= MAX_CODE_NAV_FILE_BYTES {
+        oversize.push_str("// padding line to exceed the code-nav file-size cap\n");
+    }
+    let file = setup_test_file(&dir, "huge.rs", &oversize);
+
+    let query_response_json = code_query(&CodeQueryParams {
+        file: file.clone(),
+        query: "(function_item) @f".to_string(),
+        project_dir: None,
+        language: None,
+        limit: None,
+        include_text: None,
+    })
+    .unwrap();
+    let query_error: CodeNavErrorResponse = serde_json::from_str(&query_response_json).unwrap();
+    assert_eq!(query_error.status, "error");
+    assert_eq!(query_error.code, "file_too_large_for_code_nav");
+    assert!(query_error.file_bytes.unwrap() > MAX_CODE_NAV_FILE_BYTES);
+    assert_eq!(query_error.max_bytes, Some(MAX_CODE_NAV_FILE_BYTES));
+
+    let describe_response_json = code_node_describe(&CodeNodeDescribeParams {
+        file,
+        line: 1,
+        column: 4,
+        project_dir: None,
+        include_siblings: None,
+        include_text: None,
+    })
+    .unwrap();
+    let describe_error: CodeNavErrorResponse =
+        serde_json::from_str(&describe_response_json).unwrap();
+    assert_eq!(describe_error.status, "error");
+    assert_eq!(describe_error.code, "file_too_large_for_code_nav");
+    assert_eq!(describe_error.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
 }

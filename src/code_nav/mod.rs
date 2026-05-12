@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::chunker::code::{language_for_path, parser_for_language, ts_language_for_name};
+use crate::projects::ProjectRecord;
 use crate::refactor::{
     parse_report, resolve_path, ParseReport, RefactorStatus, RefactorStatusParams, SyntaxItem,
 };
@@ -23,6 +24,161 @@ mod tests;
 /// any tool that returns syntactic references must label them as
 /// syntax-derived so agents do not mistake them for semantic facts.
 pub const SEMANTIC_STATUS_SYNTAX_ONLY: &str = "syntax_only";
+
+/// Maximum source-file size accepted by any code-nav tool.
+/// Larger files are rejected with a typed `file_too_large_for_code_nav`
+/// error so the agent can chunk the request or pick a smaller target.
+pub const MAX_CODE_NAV_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Maximum source files scanned in one `bbox_code_symbols` walk.
+/// The scan stops at this many files and reports `truncated=true` so
+/// the caller can narrow with `path_contains`, `languages`, or a tighter
+/// `project_dir` and re-run.
+pub const MAX_CODE_NAV_SCANNED_FILES: usize = 5000;
+
+/// Typed error response shared by every code-nav tool. Recoverable
+/// failure modes (file too large, project not registered, file not
+/// under any registered project) return this shape as JSON instead of
+/// bailing — the agent reads `code`, `suggestion`, and any populated
+/// recovery fields and re-issues the call.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CodeNavErrorResponse {
+    /// Always `"error"`. Pair with `code` for typed dispatch; pair with
+    /// `message` for human display.
+    pub status: String,
+    /// Stable machine-readable code. One of:
+    /// `file_too_large_for_code_nav`, `project_not_registered`,
+    /// `file_outside_registered_projects`.
+    pub code: String,
+    /// One-line human-readable summary.
+    pub message: String,
+    /// Concrete next call the agent should make to recover.
+    pub suggestion: String,
+    /// Echoed file path when the error is file-scoped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Actual file size in bytes (only for `file_too_large_*`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_bytes: Option<u64>,
+    /// Cap in bytes (only for `file_too_large_*`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Echoed project_dir when the error is project-scoped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<String>,
+    /// Registered project roots, so the agent can pick the right one
+    /// or call `bbox_project_register` for a new one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registered_projects: Vec<CodeNavProjectHint>,
+    /// Always `"syntax_only"` — error responses honour the same labeling
+    /// invariant as success responses, so agents never have to special-case.
+    pub semantic_status: String,
+}
+
+/// Compact project descriptor surfaced in error recovery hints. Only
+/// the canonical_path + project_id are emitted — full ProjectRecord is
+/// available via `bbox_project_list`.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CodeNavProjectHint {
+    pub canonical_path: String,
+    pub project_id: String,
+}
+
+impl CodeNavProjectHint {
+    fn from_record(record: &ProjectRecord) -> Self {
+        Self {
+            canonical_path: record.canonical_path.clone(),
+            project_id: record.project_id.clone(),
+        }
+    }
+}
+
+/// Build the JSON for a `file_too_large_for_code_nav` error response.
+/// Centralised so every code-nav tool reports the cap the same way.
+fn err_file_too_large(file: &Path, bytes: u64) -> Result<String> {
+    let response = CodeNavErrorResponse {
+        status: "error".to_string(),
+        code: "file_too_large_for_code_nav".to_string(),
+        message: format!(
+            "{} is {} bytes; code-nav tools cap at {} bytes",
+            file.display(),
+            bytes,
+            MAX_CODE_NAV_FILE_BYTES
+        ),
+        suggestion: format!(
+            "Narrow the request: target a smaller file, or use bbox_refactor_status with item_kinds to locate a specific symbol without reparsing the whole file."
+        ),
+        file: Some(file.to_string_lossy().into_owned()),
+        file_bytes: Some(bytes),
+        max_bytes: Some(MAX_CODE_NAV_FILE_BYTES),
+        project_dir: None,
+        registered_projects: Vec::new(),
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
+    };
+    Ok(serde_json::to_string_pretty(&response)?)
+}
+
+/// Build the JSON for a `project_not_registered` error response.
+fn err_project_not_registered(project_dir: &str, registered: &[ProjectRecord]) -> Result<String> {
+    let response = CodeNavErrorResponse {
+        status: "error".to_string(),
+        code: "project_not_registered".to_string(),
+        message: format!(
+            "{project_dir} is not a registered project root or a descendant of one"
+        ),
+        suggestion: format!(
+            "Either pass a project_dir at or under one of `registered_projects[*].canonical_path`, \
+             or call `bbox_project_register(path=\"{project_dir}\")` to register this directory first."
+        ),
+        file: None,
+        file_bytes: None,
+        max_bytes: None,
+        project_dir: Some(project_dir.to_string()),
+        registered_projects: registered.iter().map(CodeNavProjectHint::from_record).collect(),
+        semantic_status: SEMANTIC_STATUS_SYNTAX_ONLY.to_string(),
+    };
+    Ok(serde_json::to_string_pretty(&response)?)
+}
+
+/// File-size gate. Returns `Ok(Some(error_json))` if the file is too
+/// large for code-nav to parse (caller should return the JSON
+/// verbatim); `Ok(None)` if the file is within the cap and parsing
+/// should proceed; `Err(_)` for I/O errors (e.g. stat failure).
+fn check_code_nav_file_size(path: &Path) -> Result<Option<String>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to stat {} for size check", path.display()))?;
+    let bytes = metadata.len();
+    if bytes > MAX_CODE_NAV_FILE_BYTES {
+        Ok(Some(err_file_too_large(path, bytes)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Registered-project gate for project-scoped code-nav tools.
+/// `project_dir` must equal a registered `canonical_path` or be a
+/// strict descendant of one. Returns `Ok(Some(error_json))` if the
+/// directory is unregistered; `Ok(None)` if accepted. Comparison is
+/// done on canonicalised paths so symlink aliases collapse.
+fn check_project_dir_registered(
+    canonical_project_dir: &Path,
+    registered: &[ProjectRecord],
+) -> Result<Option<String>> {
+    for record in registered {
+        let root = PathBuf::from(&record.canonical_path);
+        // Canonicalise the registered root too — handles symlink aliases.
+        let canonical_root = root.canonicalize().unwrap_or(root);
+        if canonical_project_dir == canonical_root
+            || canonical_project_dir.starts_with(&canonical_root)
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(err_project_not_registered(
+        canonical_project_dir.to_string_lossy().as_ref(),
+        registered,
+    )?))
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CodeQueryParams {
@@ -548,12 +704,15 @@ fn parse_code_nav_source(
     })
 }
 
-pub fn code_symbols(p: &CodeSymbolSearchParams) -> Result<String> {
+pub fn code_symbols(p: &CodeSymbolSearchParams, registered: &[ProjectRecord]) -> Result<String> {
     let project_dir = PathBuf::from(&p.project_dir)
         .canonicalize()
         .with_context(|| format!("failed to resolve project_dir {}", p.project_dir))?;
     if !project_dir.is_dir() {
         return Err(anyhow!("project_dir must be a directory"));
+    }
+    if let Some(err_json) = check_project_dir_registered(&project_dir, registered)? {
+        return Ok(err_json);
     }
 
     let language_filter = p
@@ -563,7 +722,10 @@ pub fn code_symbols(p: &CodeSymbolSearchParams) -> Result<String> {
         .map(|languages| languages.iter().map(String::as_str).collect::<Vec<_>>());
     let kind_filter = p.item_kinds.clone().filter(|kinds| !kinds.is_empty());
     let limit = p.limit.unwrap_or(100).min(1000);
-    let file_limit = p.file_limit.unwrap_or(5000).min(5000);
+    let file_limit = p
+        .file_limit
+        .unwrap_or(MAX_CODE_NAV_SCANNED_FILES)
+        .min(MAX_CODE_NAV_SCANNED_FILES);
     let project_dir_arg = project_dir.to_string_lossy().into_owned();
 
     let mut scanned_files = 0usize;
@@ -671,6 +833,9 @@ pub fn code_symbols(p: &CodeSymbolSearchParams) -> Result<String> {
 
 pub fn code_query(p: &CodeQueryParams) -> Result<String> {
     let path = resolve_path(p.project_dir.as_deref(), &p.file)?;
+    if let Some(err_json) = check_code_nav_file_size(&path)? {
+        return Ok(err_json);
+    }
     let parsed = parse_code_nav_source(&path, p.language.as_deref())?;
     let ts_lang = ts_language_for_name(&parsed.language)?;
 
@@ -748,6 +913,9 @@ pub fn code_query(p: &CodeQueryParams) -> Result<String> {
 
 pub fn code_node_describe(p: &CodeNodeDescribeParams) -> Result<String> {
     let path = resolve_path(p.project_dir.as_deref(), &p.file)?;
+    if let Some(err_json) = check_code_nav_file_size(&path)? {
+        return Ok(err_json);
+    }
     let parsed = parse_code_nav_source(&path, None)?;
 
     let row = p.line.saturating_sub(1);

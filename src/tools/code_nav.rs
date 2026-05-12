@@ -30,7 +30,10 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<CodeSymbolSearchParams>,
     ) -> CallToolResult {
-        Self::run("bbox_code_symbols", || code_symbols(&p))
+        Self::run("bbox_code_symbols", || {
+            let projects = self.state.projects.read().list();
+            code_symbols(&p, &projects)
+        })
     }
 
     #[tool(
