@@ -4271,3 +4271,7 @@ mod find_usages;
 pub(crate) use find_usages::plan_find_java_usages;
 mod rename_symbol;
 pub(crate) use rename_symbol::plan_rename_java_symbol;
+mod class_dependency;
+pub(crate) use class_dependency::plan_java_class_dependency_analysis;
+mod public_api_guard;
+pub(crate) use public_api_guard::plan_java_public_api_guard;
