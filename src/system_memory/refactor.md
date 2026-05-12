@@ -237,3 +237,37 @@ small files only; status defaults to at most 200 returned items and reports
 7. Dispatched agents normally cannot see `bbox_refactor_*` because those tools
    are in the default recursion guard. The orchestrator must deliberately use
    `allow_recursion=true` when delegating a refactor task that needs these tools.
+
+## Refactor-atom personas (RA-B1 / RA-B2)
+
+The atomic refactor agent layer (`design/refactor-agents.md`) ships JSON
+manifests installed via `bbox_artifact_install(kind="agent", …)`. Every
+refactor atom binds to a **narrow persona brofile** whose allow list is
+restricted to the refactor + grounding tool surface. The narrow-allow
+constraint is load-bearing: `MergedFilters::merge` is additive with
+deny-wins, so an atom's `filter_overlay` can only ADD denies on top of
+the brofile — it cannot narrow a permissive allow list. A refactor
+atom layered on top of a general persona has no mechanical surface
+restriction.
+
+Two personas ship as reference artifacts:
+
+- **`rust-refactor-persona`** at `examples/brofiles/rust-refactor-persona.json`.
+  Allows only `bbox_code_*`, `bbox_refactor_*` (status / project_refs /
+  plan / apply / run), `bbox_note`, `bbox_thread`, `bbox_pin`,
+  `bbox_inspect_entity`, `bbox_hybrid_search`, `Read`, `Grep`, `Glob`.
+  Disallows `Bash`, `Write`, `Edit`, `bbox_learn` / `bbox_remember` /
+  `bbox_decide` / `bbox_forget` / `bbox_render`, and `bro_*`. Cargo
+  validation runs through `bbox_refactor_run` command steps, never via
+  `Bash`. The brofile spec is verified by
+  `rust_refactor_persona_matches_design_spec` in
+  `src/orchestration/brofile.rs`; allow/disallow drift fails the test.
+
+- **`java-refactor-persona`** — same shape, Java-flavored lens. Ships
+  only when Java atoms (RA-X1) are introduced.
+
+Refactor-atom manifests under `examples/agents/refactor/*.json` MUST
+bind to one of these personas via `brofile_ref`. Authoring an atom that
+binds to a different brofile (e.g., `code-reviewer-persona`) means the
+atom's tool surface is not actually narrowed; the manifest lint pass
+(RA-S1) rejects such manifests on install.

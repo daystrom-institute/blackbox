@@ -559,6 +559,65 @@ mod tests {
     }
 
     #[test]
+    fn rust_refactor_persona_matches_design_spec() {
+        let src = include_str!("../../examples/brofiles/rust-refactor-persona.json");
+        let bf: Brofile = serde_json::from_str(src).expect("rust-refactor-persona parses");
+        assert_eq!(bf.name, "rust-refactor-persona");
+        assert_eq!(bf.provider, Provider::Claude);
+        assert!(bf.lens.as_deref().unwrap_or("").contains("bbox refactor primitives"));
+
+        let f = bf.filters.expect("filters present");
+
+        let expected_allow: Vec<&str> = vec![
+            "mcp__blackbox__bbox_code_symbols",
+            "mcp__blackbox__bbox_code_node_describe",
+            "mcp__blackbox__bbox_code_query",
+            "mcp__blackbox__bbox_refactor_status",
+            "mcp__blackbox__bbox_refactor_project_refs",
+            "mcp__blackbox__bbox_refactor_plan",
+            "mcp__blackbox__bbox_refactor_apply",
+            "mcp__blackbox__bbox_refactor_run",
+            "mcp__blackbox__bbox_note",
+            "mcp__blackbox__bbox_thread",
+            "mcp__blackbox__bbox_pin",
+            "mcp__blackbox__bbox_inspect_entity",
+            "mcp__blackbox__bbox_hybrid_search",
+            "Read",
+            "Grep",
+            "Glob",
+        ];
+        let expected_disallow: Vec<&str> = vec![
+            "mcp__blackbox__bbox_forget",
+            "mcp__blackbox__bbox_decide",
+            "mcp__blackbox__bbox_learn",
+            "mcp__blackbox__bbox_remember",
+            "mcp__blackbox__bbox_render",
+            "mcp__blackbox__bro_*",
+            "Bash",
+            "Write",
+            "Edit",
+        ];
+
+        let allow_set: std::collections::BTreeSet<&str> =
+            f.allow.iter().map(String::as_str).collect();
+        let expected_allow_set: std::collections::BTreeSet<&str> =
+            expected_allow.iter().copied().collect();
+        assert_eq!(
+            allow_set, expected_allow_set,
+            "rust-refactor-persona allow list drifted from design spec"
+        );
+
+        let disallow_set: std::collections::BTreeSet<&str> =
+            f.disallow.iter().map(String::as_str).collect();
+        let expected_disallow_set: std::collections::BTreeSet<&str> =
+            expected_disallow.iter().copied().collect();
+        assert_eq!(
+            disallow_set, expected_disallow_set,
+            "rust-refactor-persona disallow list drifted from design spec"
+        );
+    }
+
+    #[test]
     fn test_brofile_with_model_effort() {
         let dir = temp_store();
         let bf = Brofile {
