@@ -2577,9 +2577,18 @@ async fn badgey_agent_dispatch_routes_through_wrapper_adapter() {
     assert_eq!(body["session"]["provider"], "codex");
     assert_eq!(body["session"]["session_id"], "codex-session-test");
     assert_eq!(body["resolved_brofile"], "badgey-persona");
-    assert_eq!(
-        body["merged_filters"]["disallow"][0],
-        "mcp__blackbox__bro_*"
+    let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
+    assert!(
+        disallow
+            .iter()
+            .any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
+        "recursive dispatch should remain denied: {disallow:?}"
+    );
+    assert!(
+        !disallow
+            .iter()
+            .any(|p| p.as_str() == Some("mcp__blackbox__bro_report")),
+        "bro_report should remain available for telemetry: {disallow:?}"
     );
     assert_eq!(server.state.badgey_registry.list().len(), 1);
 
@@ -5223,6 +5232,96 @@ fn bro_dashboard_emits_agent_label() {
     assert_eq!(agent_metrics["dispatch_count"].as_u64(), Some(1));
     assert_eq!(agent_metrics["success_count"].as_u64(), Some(0));
     assert_eq!(agent_metrics["failure_count"].as_u64(), Some(0));
+}
+
+#[test]
+fn bro_report_surfaces_latest_task_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let cat = &server.state.artifacts.read();
+    cat.install_value(
+        artifacts::ArtifactKind::Agent,
+        "report-agent.json".into(),
+        &serde_json::json!({
+            "kind": "agent",
+            "name": "report-agent",
+            "version": 1,
+            "manifest": {
+                "description": "Agent for report test.",
+                "brofile_inline": {"provider": "claude"},
+            },
+        }),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+        agent: "report-agent".into(),
+        args: serde_json::Value::Null,
+        project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+        bro: None,
+        ambient: None,
+        caller_provider: None,
+        caller_session_id: None,
+    })));
+    assert_ne!(result.is_error, Some(true));
+    let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    let task_id = body["task_id"].as_str().unwrap().to_string();
+
+    let report = server.bro_report(Parameters(ReportParams {
+        task_id: task_id.clone(),
+        message: "writing focused tests".into(),
+        needs: Some("review API naming".into()),
+        data: Some(serde_json::json!({"phase": "test"})),
+    }));
+    assert_ne!(report.is_error, Some(true));
+    let report_body: serde_json::Value = serde_json::from_str(&extract_text(&report)).unwrap();
+    assert_eq!(
+        report_body["report"]["message"].as_str(),
+        Some("writing focused tests")
+    );
+    assert_eq!(
+        report_body["report"]["needs"].as_str(),
+        Some("review API naming")
+    );
+    assert_eq!(report_body["report"]["data"]["phase"].as_str(), Some("test"));
+    assert!(report_body["report"]["reportedAt"].as_u64().is_some());
+    assert!(report_body["report"]["reportedAgo"].as_str().is_some());
+
+    let dash = server.bro_dashboard(Parameters(DashboardParams {
+        limit: Some(20),
+        provider: None,
+        status: None,
+        team: None,
+    }));
+    let dash_body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+    let entry = dash_body["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["taskId"].as_str() == Some(task_id.as_str()))
+        .expect("task should appear in dashboard");
+    assert_eq!(
+        entry["report"]["message"].as_str(),
+        Some("writing focused tests")
+    );
+    assert_eq!(
+        entry["report"]["needs"].as_str(),
+        Some("review API naming")
+    );
+
+    let status = server.bro_status(Parameters(StatusParams {
+        task_id: task_id.clone(),
+        tail: None,
+    }));
+    let status_body: serde_json::Value = serde_json::from_str(&extract_text(&status)).unwrap();
+    assert_eq!(
+        status_body["report"]["message"].as_str(),
+        Some("writing focused tests")
+    );
 }
 
 // ── Phase 2a: surface handler override tests ───────────────────────

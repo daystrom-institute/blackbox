@@ -107,6 +107,9 @@ impl BlackboxServer {
                 if let Some(ref label) = inner.agent_label {
                     entry["agentLabel"] = Value::String(label.clone());
                 }
+                if let Some(ref report) = inner.report {
+                    entry["report"] = report.to_json();
+                }
                 (inner.started_at, entry)
             })
             .collect();
@@ -134,6 +137,47 @@ impl BlackboxServer {
             .collect();
 
         Self::ok_json(&json!({"count": entries.len(), "tasks": entries, "agents": agents}))
+    }
+
+    #[tool(
+        name = "bro_report",
+        description = "Attach the latest progress report to a task."
+    )]
+    pub(crate) fn bro_report(&self, Parameters(p): Parameters<ReportParams>) -> CallToolResult {
+        let message = p.message.trim();
+        if message.is_empty() {
+            return Self::err_text("message is required");
+        }
+
+        let task = match self.state.task_store.read().get(&p.task_id) {
+            Some(task) => task,
+            None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
+        };
+
+        let report = orch::BroReport {
+            message: message.to_string(),
+            needs: p.needs.and_then(|needs| {
+                let trimmed = needs.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }),
+            data: p.data,
+            reported_at: orch::now_ms(),
+        };
+
+        {
+            let mut inner = task.inner.lock();
+            inner.report = Some(report.clone());
+        }
+        self.state.task_store.read().persist(&self.state.store_dir);
+
+        Self::ok_json(&json!({
+            "taskId": p.task_id,
+            "report": report.to_json(),
+        }))
     }
 
     #[tool(

@@ -238,6 +238,20 @@ pub(crate) struct StatusParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReportParams {
+    /// Task ID to attach the report to.
+    pub(crate) task_id: String,
+    /// Short human-readable progress report.
+    pub(crate) message: String,
+    /// Optional blocker, handoff need, or requested input.
+    #[serde(default)]
+    pub(crate) needs: Option<String>,
+    /// Optional structured payload for workflow hooks or richer agent state.
+    #[serde(default)]
+    pub(crate) data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DashboardParams {
     #[serde(default)]
     pub(crate) provider: Option<String>,

@@ -15,9 +15,10 @@
 //! effective set per-invocation as well for determinism.
 //!
 //! The recursion guard is mechanical: the default filter set disallows
-//! the current blackbox MCP prefix's `bro_*` orchestration tools so
-//! dispatched agents cannot spawn further sub-bros unless
-//! `allow_recursion=true`.
+//! the current blackbox MCP prefix's dispatch-capable `bro_*`
+//! orchestration tools so dispatched agents cannot spawn further
+//! sub-bros unless `allow_recursion=true`. `bro_report` is excluded so
+//! agents can publish progress telemetry.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -252,7 +253,7 @@ impl std::str::FromStr for McpToolRef {
 /// translated at dispatch time.
 ///
 /// Patterns support simple glob: `*` matches any suffix, e.g.
-/// `mcp__<blackbox-name>__bro_*` matches every bro_* orchestration tool.
+/// `mcp__<blackbox-name>__bro_*` matches every bro_* tool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct McpFilters {
     /// Disallow rules — tools matching these patterns are filtered out.
@@ -339,13 +340,13 @@ impl McpFilters {
         self.allow = intersection.into_iter().map(|s| (*s).clone()).collect();
     }
 
-    /// Default filter set: the mechanical recursion guard. Blocks every
-    /// `bro_*` orchestration tool so dispatched agents can't spawn
-    /// sub-bros unless recursion is explicitly allowed. Callers that
-    /// pass allow_recursion=true skip this layer.
+    /// Default filter set: the mechanical recursion guard. Blocks
+    /// dispatch-capable `bro_*` orchestration tools so dispatched
+    /// agents can't spawn sub-bros unless recursion is explicitly
+    /// allowed. Telemetry tools like `bro_report` stay visible.
     pub fn default_recursion_guard() -> Self {
         Self {
-            disallow: vec![format!("{}bro_*", crate::tool_docs::blackbox_mcp_prefix())],
+            disallow: crate::tool_docs::recursion_guard_tool_names_prefixed(),
             allow: Vec::new(),
         }
     }
@@ -1745,10 +1746,18 @@ mod tests {
     fn default_guard_blocks_bro_only() {
         let global = McpStore::new();
         let eff = resolve_effective(&global, None, true);
-        assert_eq!(
-            eff.filters.disallow,
-            vec!["mcp__blackbox__bro_*".to_string()]
-        );
+        assert!(eff
+            .filters
+            .disallow
+            .contains(&"mcp__blackbox__bro_exec".to_string()));
+        assert!(eff
+            .filters
+            .disallow
+            .contains(&"mcp__blackbox__bro_resume".to_string()));
+        assert!(!eff
+            .filters
+            .disallow
+            .contains(&"mcp__blackbox__bro_report".to_string()));
     }
 
     #[test]

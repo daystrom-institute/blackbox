@@ -60,6 +60,34 @@ impl TaskStatus {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroReport {
+    pub message: String,
+    #[serde(default)]
+    pub needs: Option<String>,
+    #[serde(default)]
+    pub data: Option<Value>,
+    #[serde(rename = "reportedAt")]
+    pub reported_at: u64,
+}
+
+impl BroReport {
+    pub fn to_json(&self) -> Value {
+        let mut obj = serde_json::json!({
+            "message": self.message,
+            "reportedAt": self.reported_at,
+            "reportedAgo": format_elapsed(self.reported_at, None),
+        });
+        if let Some(ref needs) = self.needs {
+            obj["needs"] = Value::String(needs.clone());
+        }
+        if let Some(ref data) = self.data {
+            obj["data"] = data.clone();
+        }
+        obj
+    }
+}
+
 /// Shared inner state of a task, updated by background readers.
 pub struct TaskInner {
     pub id: String,
@@ -91,6 +119,9 @@ pub struct TaskInner {
     /// overwrites bro_label for team routing. Surfaced in bro_status /
     /// bro_dashboard as agentLabel alongside broLabel.
     pub agent_label: Option<String>,
+    /// Latest agent-authored progress report, set through `bro_report`
+    /// and surfaced in `bro_status` / `bro_dashboard`.
+    pub report: Option<BroReport>,
     /// True when this task's terminal state is "the daemon killed it
     /// because the process restarted, but the underlying provider
     /// session_id is still valid on disk (rollout / session jsonl
@@ -236,6 +267,8 @@ struct PersistedTask {
     bro_label: Option<String>,
     #[serde(default)]
     agent_label: Option<String>,
+    #[serde(default)]
+    report: Option<BroReport>,
     /// True when the previous daemon instance was running this task
     /// at restart and the underlying provider session_id is still
     /// recoverable on disk. Set during `TaskStore::load` when it
@@ -277,6 +310,7 @@ impl TaskStore {
                     cwd: inner.cwd.clone(),
                     bro_label: inner.bro_label.clone(),
                     agent_label: inner.agent_label.clone(),
+                    report: inner.report.clone(),
                     recoverable: inner.recoverable,
                 }
             })
@@ -337,6 +371,7 @@ impl TaskStore {
                     cwd: rec.cwd,
                     bro_label: rec.bro_label,
                     agent_label: rec.agent_label,
+                    report: rec.report,
                     recoverable: rec.recoverable,
                 }),
                 notify: Arc::new(Notify::new()),
@@ -703,6 +738,7 @@ fn failed_duplicate_task(
             cwd,
             bro_label,
             agent_label,
+            report: None,
             recoverable: false,
         }),
         notify: Arc::new(Notify::new()),
@@ -759,6 +795,7 @@ pub fn spawn_in_process_task(
             cwd,
             bro_label,
             agent_label,
+            report: None,
             recoverable: false,
         }),
         notify: Arc::new(Notify::new()),
@@ -977,6 +1014,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
                     cwd,
                     bro_label: bro_label.clone(),
                     agent_label: agent_label.clone(),
+                    report: None,
                     recoverable: false,
                 }),
                 notify: Arc::new(Notify::new()),
@@ -1008,6 +1046,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             cwd: cwd.clone(),
             bro_label,
             agent_label,
+            report: None,
             recoverable: false,
         }),
         notify: Arc::new(Notify::new()),
@@ -1534,6 +1573,9 @@ pub fn task_result_json(task: &Task) -> Value {
     if let Some(ref label) = inner.agent_label {
         obj["agentLabel"] = Value::String(label.clone());
     }
+    if let Some(ref report) = inner.report {
+        obj["report"] = report.to_json();
+    }
     if inner.status == TaskStatus::Failed {
         if let Some(code) = inner.exit_code {
             obj["exitCode"] = Value::from(code);
@@ -1644,6 +1686,7 @@ mod tests {
                 cwd: None,
                 bro_label: None,
                 agent_label: None,
+                report: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -1667,6 +1710,7 @@ mod tests {
                 cwd: None,
                 bro_label: None,
                 agent_label: None,
+                report: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -1706,6 +1750,7 @@ mod tests {
                 cwd: None,
                 bro_label: None,
                 agent_label: None,
+                report: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -1993,6 +2038,7 @@ mod tests {
                 cwd: None,
                 bro_label: None,
                 agent_label: None,
+                report: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -2026,6 +2072,7 @@ mod tests {
                 cwd: None,
                 bro_label: None,
                 agent_label: None,
+                report: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -2062,6 +2109,7 @@ mod tests {
             cwd: None,
             bro_label: None,
             agent_label: None,
+            report: None,
             recoverable: false,
         };
 
@@ -2106,6 +2154,7 @@ mod tests {
             cwd: None,
             bro_label: None,
             agent_label: None,
+            report: None,
             recoverable: false,
         };
 
@@ -2164,6 +2213,7 @@ mod async_tests {
                 cwd: None,
                 bro_label: None,
                 agent_label: None,
+                report: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -2194,6 +2244,7 @@ mod async_tests {
                 cwd: None,
                 bro_label: None,
                 agent_label: None,
+                report: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),
@@ -2237,6 +2288,7 @@ mod async_tests {
                 cwd: None,
                 bro_label: None,
                 agent_label: None,
+                report: None,
                 recoverable: false,
             }),
             notify: Arc::new(Notify::new()),

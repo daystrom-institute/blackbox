@@ -746,6 +746,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: None,
     },
     ToolDoc {
+        name: "bro_report",
+        category: ToolCategory::Orchestration,
+        summary: "Attach the latest progress report to a task.",
+        when_to_use: "Agents and workflow hooks call this at major milestones so bro_dashboard and bro_status show what the task last reported, what it needs, and when it last checked in.",
+        example: Some(r#"bro_report(task_id="...", message="writing tests", needs="review API naming")"#),
+    },
+    ToolDoc {
         name: "bro_cancel",
         category: ToolCategory::Orchestration,
         summary: "Cancel a running task (SIGTERM).",
@@ -1196,6 +1203,9 @@ won't drift. The daemon owns the state machine; the LLM is a turn. \
 See `sm-workflow-orchestration` via `bbox_knowledge`.
 - `bbox_learn` is for user-stated rules; `bbox_note(kind=learned)` is for \
 agent-discovered facts.
+- For long-running bro work, instruct dispatched agents and workflow hook nodes \
+to call `bro_report` at major milestones. `bro_dashboard` should show the last \
+thing each bro reported, what it needs, and how long ago it checked in.
 ";
 
 fn system_memory_hint(doc: &ToolDoc) -> Option<String> {
@@ -1228,6 +1238,19 @@ pub fn all_tool_names_prefixed() -> Vec<String> {
     let prefix = blackbox_mcp_prefix();
     TOOL_DOCS
         .iter()
+        .map(|d| format!("{}{}", prefix, d.name))
+        .collect()
+}
+
+/// Prefixed bro_* tools blocked by the default recursion guard.
+/// `bro_report` is intentionally excluded: it is telemetry, not
+/// recursive dispatch, and dispatched agents should be able to report
+/// their own progress.
+pub fn recursion_guard_tool_names_prefixed() -> Vec<String> {
+    let prefix = blackbox_mcp_prefix();
+    TOOL_DOCS
+        .iter()
+        .filter(|d| d.name.starts_with("bro_") && d.name != "bro_report")
         .map(|d| format!("{}{}", prefix, d.name))
         .collect()
 }
