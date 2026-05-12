@@ -7555,3 +7555,49 @@ class Example {\n\
             "delegate field must use @Inject: {rewritten}"
         );
     }
+
+    // G7-FU: target class in guice_field_inject mode gets @Inject on its
+    // constructor plus the javax.inject.Inject import when the target needs
+    // ctor params (field capture forces ctor generation).
+    #[test]
+    fn g7_fu_target_class_has_inject_ctor_and_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/a");
+        fs::create_dir_all(&pkg).unwrap();
+        let source = pkg.join("Admin.java");
+        let target = pkg.join("Service.java");
+        fs::write(
+            &source,
+            "package a;\n\
+             import javax.inject.Inject;\n\
+             public class Admin {\n\
+             \x20   @Inject private Helper helper;\n\
+             \x20   public Long save() { return helper.compute(); }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Service".to_string());
+        params.delegate_field = Some("service".to_string());
+        params.item_names = Some(vec!["save".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+        params.wiring_mode = Some("guice_field_inject".to_string());
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        let target_text = target_replacement(&plan);
+        assert!(
+            target_text.contains("import javax.inject.Inject;"),
+            "target must carry javax.inject.Inject import: {target_text}"
+        );
+        let has_inject_ctor = target_text.contains("@Inject\n    public Service(")
+            || target_text.contains("@Inject\n  public Service(")
+            || target_text.contains("@Inject\npublic Service(")
+            || target_text.contains("@Inject\n     public Service(");
+        assert!(
+            has_inject_ctor,
+            "@Inject must appear immediately above the target ctor: {target_text}"
+        );
+    }
