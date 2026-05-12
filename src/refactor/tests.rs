@@ -2556,6 +2556,81 @@ mod tests {
         assert_eq!(fs::read_to_string(&source).unwrap(), "pub mod packets;\n");
     }
 
+    // Gap 1: validate_rewritten_files surfaces line+excerpt for the first few
+    // ERROR / MISSING nodes so the operator can debug `validation_failed`
+    // without re-running the plan.
+    #[test]
+    fn validate_rewritten_files_emits_error_excerpts_for_broken_java() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Broken.java");
+        let source = "package x;\n\
+                      public class Broken {\n\
+                          public void m() {\n\
+                              foo bar baz quux ;;;\n\
+                          }\n\
+                      }\n";
+        let results = validate_rewritten_files(&[(path.clone(), source.as_bytes().to_vec())])
+            .expect("validation pass should succeed even when source has parse errors");
+        assert_eq!(results.len(), 1, "one input file → one validation result");
+        let result = &results[0];
+        assert!(result.has_error, "deliberately broken source must flag has_error");
+        assert!(
+            !result.error_excerpts.is_empty(),
+            "broken source must surface at least one excerpt"
+        );
+        let first = &result.error_excerpts[0];
+        assert!(
+            first.kind == "error" || first.kind == "missing",
+            "excerpt kind = {}",
+            first.kind
+        );
+        assert!(first.line >= 1, "1-based line numbering");
+        assert!(first.column >= 1, "1-based column numbering");
+        assert!(first.byte_end >= first.byte_start);
+        assert!(
+            first.snippet.contains(" | "),
+            "snippet should include line-number gutter: {}",
+            first.snippet
+        );
+    }
+
+    // Gap 1: clean files keep error_excerpts empty so the field skip-if-empty
+    // serde attribute keeps responses tidy.
+    #[test]
+    fn validate_rewritten_files_excerpts_empty_when_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Clean.java");
+        let source = "package x;\npublic class Clean {}\n";
+        let results = validate_rewritten_files(&[(path, source.as_bytes().to_vec())]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].has_error);
+        assert!(results[0].error_excerpts.is_empty());
+    }
+
+    // Gap 1: tree-sitter can surface many ERROR nodes for one syntactic
+    // injury; we cap excerpts so the response payload stays bounded.
+    #[test]
+    fn validate_rewritten_files_caps_error_excerpts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Many.java");
+        // A pile of stray tokens at top level — tree-sitter-java produces an
+        // ERROR node per stray construct.
+        let mut source = String::from("package x;\n");
+        for _ in 0..20 {
+            source.push_str("@@@\n");
+        }
+        source.push_str("public class Many {}\n");
+        let results = validate_rewritten_files(&[(path, source.into_bytes())]).unwrap();
+        let result = &results[0];
+        assert!(result.has_error);
+        assert!(
+            result.error_excerpts.len() <= PARSE_ERROR_EXCERPT_LIMIT,
+            "error_excerpts.len() = {} should be capped at {}",
+            result.error_excerpts.len(),
+            PARSE_ERROR_EXCERPT_LIMIT
+        );
+    }
+
     #[test]
     fn ensure_toml_table_adds_lib_table() {
         let dir = tempfile::tempdir().unwrap();

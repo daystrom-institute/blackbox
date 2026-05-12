@@ -11,7 +11,27 @@ hand-rolled boilerplate (POJO DOJO).
 
 - Inspect: supported with `bbox_refactor_status`.
 - Plan/apply: method extraction, composite class extraction, nested class extraction, field moves/adds, constructor creation, delegate-field wiring, caller delegation, interface extraction, visibility rewriting, implements clause injection, type-use migration, import organization, and `lombokify_java_class` (POJO boilerplate → Lombok annotations).
-- Semantic rename: not supported natively by blackbox yet; use JDT, IntelliJ, Eclipse, or another Java language-server/refactoring workflow.
+- Find usages: supported with `bbox_refactor_plan(kind="find_java_usages")`.
+  Walks every `.java` file under `project_dir` and reports
+  AST-grounded references (type position, method invocation, field
+  access, method reference, import) for the supplied simple name(s).
+  Analysis-only; no FileEdits. Foundation for the semantic-rename
+  primitive below.
+- Semantic rename: supported with `bbox_refactor_plan(kind="rename_java_symbol")`.
+  Project-wide rename of a class / interface / record / enum / method
+  / field / parameter / type-parameter by simple name. Rewrites
+  declaration sites AND every reference (type position, method
+  invocation, field access, method reference, import). When the
+  renamed symbol is a top-level class declared in a file matching the
+  old name, the response surfaces a `file_rename_advisory` listing
+  the suggested `OldName.java` → `NewName.java` rename — the operator
+  follows up with `move_file` or `git mv`. Optional `item_kinds`
+  narrows which categories of declaration get touched (e.g. only
+  `class_declaration` + `type_reference` to leave a same-named local
+  variable alone). For semantic-grade accuracy on disambiguation
+  (e.g. method overloads that share a name), JDTLS-backed rename is
+  the right escape hatch — but the standalone primitive lands every
+  reference its tree-sitter walker can see.
 - Import/package repair: `java_lsp_organize_imports` prefers a warm
   per-project JDTLS session (lazy-spawned, reused across calls, idle-evicted
   by the daemon) and falls back to tree-sitter plus project type scanning
@@ -128,6 +148,43 @@ real; if your concern is on the list, the planner already handles it.
   as needed. Two-plus-arg methods refuse with
   `error.bad_input(code=callback_arity_unsupported)` — wrap them or
   extract a real callback interface.
+- **Method-reference field qualifiers are captured.** A reference like
+  `csvExtractors::extractC4Composition` inside an extracted method body
+  where `csvExtractors` is an instance field of the source class now
+  threads `csvExtractors` through the target's constructor. Pre-fix the
+  qualifier was silently dropped from capture analysis, producing
+  `error: cannot find symbol` at every `::` site after apply.
+- **Cross-file static caller rewrite.** When the move is cross-package
+  and the moved item is `static` (method or `static final` constant),
+  the planner walks every `.java` file under `project_dir`, finds
+  `OldOwnerClass.<symbol>` references — method invocations,
+  `OldOwnerClass.CONST` field accesses, `OldOwnerClass::method`
+  references — and rewrites the qualifier to `NewOwnerClass`. Cross-
+  package callers also get `import <target-pkg>.<NewOwnerClass>;`
+  injected. Each touched file shows up in `plan.edits` and is
+  individually parse-validated. Build dirs (`target/`, `build/`,
+  `.gradle/`, `node_modules/`, `.git/`) are skipped. Instance method
+  callers are NOT rewritten — the source-side delegate field is
+  private and unreachable from other files; operator handles those.
+- **Stacked-extract ctor wiring ordering conflict diagnosed.** When the
+  accessor-rewriter rewrites an existing `this.X = new ...(field)`
+  line to read `binder.getField()` AND the new `this.binder = new ...`
+  wiring lands at a later byte position in the same ctor (because
+  field-only captures pushed it down), the planner emits a
+  `tracing::warn` with `code=ctor_wiring_ordering_conflict`, the
+  delegate field name, and both line numbers. Apply still produces a
+  file — but operator sees the warning in the daemon log and must swap
+  the two statements manually. There's no safe auto-fix: pulling the
+  wiring back past its field-only-capture lower bound would silently
+  null-capture those fields. Future work may relocate the field-only
+  assignments above the conflicting accessor rewrite.
+- **`validation_failed` returns excerpt windows.** When the planned
+  post-edit source has a parse error, the `validations` array now
+  carries an `error_excerpts` field with `{line, column, byte_start,
+  byte_end, snippet}` for the first 5 ERROR / MISSING nodes. The
+  snippet is a 3-line window with a line-number gutter. Operators no
+  longer need to re-run the plan, pipe to a file, or pivot to a
+  different class just to locate where the rewrite broke parse.
 
 ## `promote_java_inner_class` — for clusters with capture-aware inner classes
 
@@ -178,6 +235,57 @@ Refusal codes (the planner returns these instead of emitting broken Java):
 Workflow after promotion: run `extract_java_class` on the outer cluster
 as a separate call. The moved methods will reference the promoted class
 via the source's new import.
+
+## `extract_java_nested_classes` — for static inner classes
+
+When a cluster you want to extract includes one or more **static** inner
+classes (no outer captures), use `extract_java_nested_classes`. This is
+a syntactic move — no capture analysis, no delegate wiring.
+
+```text
+bbox_refactor_plan(
+  kind="extract_java_nested_classes",
+  source="src/main/java/com/example/Outer.java",
+  target="src/main/java/com/example/queries/Readings.java",
+  item_names=["Readings"],
+  project_dir="/repo/x"
+)
+```
+
+What it does (post-Gap-10):
+
+- **Filesystem-derived `package` declaration** on the target, same
+  rules as `extract_java_class`. Operator can override with explicit
+  `target_prelude`.
+- **Copies imports from the source** so the extracted body's type
+  references resolve. The full import block is duplicated; unused
+  imports get cleaned up by a subsequent `java_lsp_organize_imports`
+  call if desired.
+- **Strips `private` and `static` modifiers** on the moved class
+  becoming top-level. A top-level Java class can be neither
+  `private` nor (meaningfully) `static`; javac rejects both. `final`,
+  `abstract`, `sealed`, `non-sealed`, and annotations pass through
+  untouched.
+- **Cross-package extracts inject `public`** before the existing
+  modifiers (or before the `class`/`interface`/`record`/`enum`
+  keyword if no modifiers), so the source's qualified references
+  still resolve from the new package. Same-package extracts keep
+  package-default visibility — operator widens afterwards if needed.
+- **Tree-sitter validation steps cover both source and target**. The
+  previous `validations: vec![]` left a hole wide enough to drive a
+  truck through; v2 wires them up so regressions surface at plan time.
+
+Use this kind when:
+
+- The inner class is `static` and has no outer-state captures.
+  (Non-static inners need `promote_java_inner_class` first — see above.)
+- You want a clean file-per-class layout for things like sibling
+  `queries/` packages.
+
+`extract_java_class` itself refuses inner-class names in `item_names`
+with `error.bad_input(code=nested_class_in_item_names)` — that's
+correct; use this plan kind instead for the inner-class move, then run
+`extract_java_class` on the outer cluster.
 - **`bbox_refactor_plan` always returns `dry_run: true`.** The response
   field indicates "this call did not write any files" — read it as the
   inverse of `wrote_files`. The plan is staged on disk under

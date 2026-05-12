@@ -9,8 +9,8 @@ pub(crate) struct RustImplMethod {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RustStructField {
-    name_byte_start: usize,
-    item: SyntaxItem,
+    pub(crate) name_byte_start: usize,
+    pub(crate) item: SyntaxItem,
 }
 
 #[derive(Debug, Clone, Copy)]

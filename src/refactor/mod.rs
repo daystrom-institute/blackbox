@@ -31,6 +31,9 @@ pub(crate) mod rust_ra_move_item;
 pub(crate) mod rust_ra_classify_callbacks;
 pub(crate) mod rust_compile_fix;
 pub(crate) mod rust_warning_markers;
+pub(crate) mod rust_inline_mod;
+pub(crate) mod rust_extract_to_submodule;
+pub(crate) mod rust_move_with_callers;
 
 #[cfg(test)]
 mod tests;
@@ -805,6 +808,29 @@ pub struct ParseValidationResult {
     pub has_error: bool,
     pub error_nodes: usize,
     pub missing_nodes: usize,
+    /// First few error / missing node locations with a short surrounding
+    /// excerpt, populated only when parsing produced errors. Capped to
+    /// the first 5 nodes by tree-sitter walk order so the response stays
+    /// debuggable without exploding when a rewrite ruptures the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub error_excerpts: Vec<ParseErrorExcerpt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ParseErrorExcerpt {
+    /// "error" for a tree-sitter ERROR node, "missing" for a tree-sitter
+    /// MISSING node.
+    pub kind: String,
+    /// 1-based line of the node's start byte in the rewritten source.
+    pub line: usize,
+    /// 1-based column of the node's start byte.
+    pub column: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    /// ~3-line window of source around the start byte with leading line
+    /// numbers, e.g. `"  41 | foo;\n  42 | bar baz\n  43 | }"`. Trailing
+    /// whitespace is trimmed.
+    pub snippet: String,
 }
 
 struct ParsedSource {
@@ -975,6 +1001,15 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "rewrite_rust_field_visibility" => plan_rewrite_rust_field_visibility(p),
         "rust_lsp_rename" => plan_rust_lsp_rename(p, ctx),
         "rust_organize_imports" => plan_rust_organize_imports(p, ctx),
+        "inline_mod_to_file_submodule" => {
+            rust_inline_mod::plan_inline_mod_to_file_submodule(p)
+        }
+        "extract_rust_items_to_submodule" => {
+            rust_extract_to_submodule::plan_extract_rust_items_to_submodule(p)
+        }
+        "move_rust_items_with_callers" => {
+            rust_move_with_callers::plan_move_rust_items_with_callers(p)
+        }
         "extract_java_methods" => plan_extract_java_methods(p),
         "extract_java_class" => plan_extract_java_class(p),
         "extract_java_nested_classes" => plan_extract_java_nested_classes(p),
@@ -990,6 +1025,10 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "add_java_implements" => plan_add_java_implements(p),
         "extract_java_interface" => plan_extract_java_interface(p),
         "migrate_java_type_usages" => plan_migrate_java_type_usages(p),
+        "find_java_usages" => plan_find_java_usages(p),
+        "rename_java_symbol" => plan_rename_java_symbol(p),
+        "java_class_dependency_analysis" => plan_java_class_dependency_analysis(p),
+        "java_public_api_guard" => plan_java_public_api_guard(p),
         "lombokify_java_class" => plan_lombokify_java_class(p),
         "rewrite_rust_error_type" => rust_error_migrate::plan_rewrite_error_type(p),
         "migrate_rust_type_usages" => rust_migrate_types::plan_migrate_type_usages(p),
@@ -1007,7 +1046,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, lombokify_java_class, rewrite_rust_error_type, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_public_api_guard, rust_compile_fix_round, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, java_public_api_guard, lombokify_java_class, rewrite_rust_error_type, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_public_api_guard, rust_compile_fix_round, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
@@ -3153,38 +3192,124 @@ fn validate_rewritten_files(files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<ParseVal
             let source = std::str::from_utf8(bytes)
                 .with_context(|| format!("{} is not valid utf-8", path.display()))?;
             let tree = parse_source(language, source)?;
-            let report = parse_report(tree.root_node());
+            let (report, error_locations) = parse_report_with_locations(tree.root_node());
+            let error_excerpts = if report.has_error || report.error_nodes > 0 || report.missing_nodes > 0 {
+                build_parse_error_excerpts(source, &error_locations)
+            } else {
+                Vec::new()
+            };
             Ok(ParseValidationResult {
                 path: path_string(path),
                 has_error: report.has_error,
                 error_nodes: report.error_nodes,
                 missing_nodes: report.missing_nodes,
+                error_excerpts,
             })
         })
         .collect()
 }
 
 pub(crate) fn parse_report(root: Node<'_>) -> ParseReport {
+    parse_report_with_locations(root).0
+}
+
+/// Cap on how many error/missing node locations we surface per file.
+const PARSE_ERROR_EXCERPT_LIMIT: usize = 5;
+
+#[derive(Clone, Copy)]
+struct ParseErrorLocation {
+    byte_start: usize,
+    byte_end: usize,
+    is_missing: bool,
+}
+
+fn parse_report_with_locations(
+    root: Node<'_>,
+) -> (ParseReport, Vec<ParseErrorLocation>) {
     let mut report = ParseReport {
         has_error: root.has_error(),
         error_nodes: 0,
         missing_nodes: 0,
     };
-    collect_parse_report(root, &mut report);
-    report
+    let mut locations = Vec::new();
+    collect_parse_report(root, &mut report, &mut locations);
+    (report, locations)
 }
 
-fn collect_parse_report(node: Node<'_>, report: &mut ParseReport) {
-    if node.is_error() {
+fn collect_parse_report(
+    node: Node<'_>,
+    report: &mut ParseReport,
+    locations: &mut Vec<ParseErrorLocation>,
+) {
+    let is_err = node.is_error();
+    let is_missing = node.is_missing();
+    if is_err {
         report.error_nodes += 1;
     }
-    if node.is_missing() {
+    if is_missing {
         report.missing_nodes += 1;
+    }
+    if (is_err || is_missing) && locations.len() < PARSE_ERROR_EXCERPT_LIMIT {
+        locations.push(ParseErrorLocation {
+            byte_start: node.start_byte(),
+            byte_end: node.end_byte(),
+            is_missing,
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_parse_report(child, report);
+        collect_parse_report(child, report, locations);
     }
+}
+
+fn build_parse_error_excerpts(
+    source: &str,
+    locations: &[ParseErrorLocation],
+) -> Vec<ParseErrorExcerpt> {
+    locations
+        .iter()
+        .map(|loc| {
+            let (line, column) = line_col_1based(source, loc.byte_start);
+            let snippet = render_snippet_window(source, line, 1);
+            ParseErrorExcerpt {
+                kind: if loc.is_missing { "missing" } else { "error" }.to_string(),
+                line,
+                column,
+                byte_start: loc.byte_start,
+                byte_end: loc.byte_end,
+                snippet,
+            }
+        })
+        .collect()
+}
+
+fn line_col_1based(source: &str, byte_offset: usize) -> (usize, usize) {
+    let clamped = byte_offset.min(source.len());
+    let prefix = &source[..clamped];
+    let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
+    let last_newline = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = source[last_newline..clamped].chars().count() + 1;
+    (line, column)
+}
+
+/// Render a `context`-line window above and below `line` (1-based) with a
+/// `NNN | ` line-number gutter. Trims trailing whitespace.
+fn render_snippet_window(source: &str, line: usize, context: usize) -> String {
+    let start = line.saturating_sub(context).max(1);
+    let lines: Vec<&str> = source.split('\n').collect();
+    let end = (line + context).min(lines.len());
+    if start > lines.len() {
+        return String::new();
+    }
+    let width = end.to_string().len();
+    let mut out = String::new();
+    for (idx, ln) in lines.iter().enumerate().skip(start - 1).take(end - start + 1) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("{:>width$} | {}", idx + 1, ln.trim_end(), width = width));
+    }
+    out
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
