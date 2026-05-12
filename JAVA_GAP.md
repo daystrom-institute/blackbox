@@ -224,36 +224,53 @@ Realistically a couple-hundred-line extraction.
 
 ---
 
-## What ships without closing the gaps
+## Java atom catalog status (post-gap-closure)
 
-The Java atom catalog still has four useful atoms even with both gaps
-open:
+Both gaps landed on main (efb1042 + supporting commits). The full Java
+atom catalog is now shipped on `worktree-refactor-agents`:
 
 1. `java-extract-cohesive-class` (RA-X1) — wraps `extract_java_class`.
 2. `java-promote-inner-class` (RA-X2) — wraps `promote_java_inner_class`.
-3. `java-extract-interface` (RA-X3) — wraps `extract_java_interface` +
-   optional `migrate_java_type_usages`. Operator-authority on
-   `acknowledge_public_api_change` is **prompt-discipline only** until
-   Gap 1 closes — the atom can't run a structured preflight, only ask
-   the operator to confirm.
+3. `java-extract-interface` (RA-X3 v2) — wraps `extract_java_interface`
+   + `migrate_java_type_usages` with a STRUCTURED public-API guard
+   preflight (`java_public_api_guard`). v2 supersedes v1; the
+   `acknowledge_public_api_change` operator-authority gate is now
+   enforced by the guard's advisory_severity instead of by
+   prompt-discipline alone.
 4. `java-lombokify` (RA-X4) — wraps `lombokify_java_class`.
+5. **NEW** `java-public-api-guard` (RA-X5) — wraps the now-shipped
+   `java_public_api_guard` plan kind. Closes Gap 1.
+6. **NEW** `java-class-dependency-graph` (RA-X6) — wraps the now-shipped
+   `java_class_dependency_analysis` plan kind. Closes Gap 2.
 
-Plus the prerequisite `java-refactor-persona` brofile (RA-B2) and three
-composition workflows (`promote-inner-then-extract`,
-`extract-interface-and-migrate`, `pojo-modernize`).
+Plus the `java-refactor-persona` brofile (RA-B2) and three composition
+workflows (`promote-inner-then-extract`, `extract-interface-and-migrate`,
+`pojo-modernize`).
 
-## Recommended landing order for the gaps
+## Bonus capabilities main also shipped (not yet atom-wrapped)
 
-```
-1. java_public_api_guard plan kind
-   └── unblocks structured preflight for java-extract-interface
-   └── unblocks java-public-api-guard atom (standalone audit)
+The gap-closure tranche additionally landed two plan kinds that aren't
+yet wrapped as atoms but would each support a reasonable single-purpose
+atom:
 
-2. java_class_dependency_analysis plan kind
-   └── unblocks java-class-dependency-graph atom (analysis-only preflight)
-   └── unblocks operator-review composition (graph → extract)
-```
+- `find_java_usages` — analysis-only project-wide reference walk for a
+  simple name. Reports type-position / method-invocation / field-access
+  / method-reference / import sites. Natural atom: `java-find-usages`
+  (cost_class: cheap, parallel_safe: true). Composes well as a
+  follow-up to `java-public-api-guard` when severity is `caution` and
+  the operator wants the de-facto-cross-package call list before
+  acknowledging.
+- `rename_java_symbol` — project-wide semantic rename of a class /
+  interface / record / enum / method / field / parameter / type-param
+  by simple name. Rewrites declaration + every reference. Surfaces a
+  `file_rename_advisory` when the renamed top-level class would imply
+  a file rename. Natural atom: `java-rename-symbol` (cost_class:
+  normal); operator-authority `acknowledge_file_rename` (no default;
+  blocks unless explicit when the advisory fires) and
+  `acknowledge_public_api_change` for cross-module rewrites (preflight
+  via `java-public-api-guard`, mirroring `java-extract-interface` v2).
 
-Both gaps are pure additions — no existing plan-kind behavior changes,
-no migrations needed. Each closes one Codex-round-1-style "the atom
-can't honestly enforce its contract without this" hole.
+These are follow-up tracks, not in this branch. The infrastructure
+built for the Rust+Java catalog (RA-S1 lint, RA-T1 template, RA-D1
+catalog completeness, RA-E1 eval coverage) absorbs them with zero new
+code once the manifests land.

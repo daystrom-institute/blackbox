@@ -12,9 +12,11 @@ note.
 
 | Atom | Pattern |
 |---|---|
+| `java-class-dependency-graph` | Class inventory — methods + fields + inner types + annotations — for partition review (analysis-only) |
+| `java-public-api-guard` | Public-API delta advisory; preflight for mutating atoms (analysis-only) |
 | `java-extract-cohesive-class` | Composite cluster extraction — methods + field moves + delegate + caller rewrites + cross-package widening |
 | `java-promote-inner-class` | Promote non-static inner with captures into a top-level class with final ctor params |
-| `java-extract-interface` | Extract interface from class + optional caller type migration |
+| `java-extract-interface` | Extract interface from class + optional caller type migration; v2 runs a structured public-API guard preflight |
 | `java-lombokify` | Convert hand-rolled POJO boilerplate into Lombok annotations; single-file or bulk-dir |
 
 Discover via `bro_agent_search(<intent phrase>)`; install via
@@ -22,12 +24,6 @@ Discover via `bro_agent_search(<intent phrase>)`; install via
 dispatch via `bro_agent_dispatch(agent="<name>", args={...})`. Full
 catalog (with cost class, plan-kind dependencies, and operator-authority
 fields) lives in `sm-refactor` under "Refactor atom catalog".
-
-Two analysis-shaped atoms are not yet shipped because the underlying
-plan kinds don't exist (`JAVA_GAP.md` Gap 1: `java_public_api_guard`,
-Gap 2: `java_class_dependency_analysis`). Until those land,
-`java-extract-interface`'s `acknowledge_public_api_change` is prompt-
-discipline-only rather than enforced via a structured preflight.
 
 When an atom doesn't fit the operator's exact shape, the manual plan-kind
 sequence below is still the canonical path.

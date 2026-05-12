@@ -69,6 +69,18 @@
       "query": "modernize java pojo boilerplate with lombok annotations",
       "expected_agents": ["java-lombokify"],
       "forbidden_agents": []
+    },
+    {
+      "id": "find-java-public-api-guard",
+      "query": "report public api delta of a proposed java refactor",
+      "expected_agents": ["java-public-api-guard"],
+      "forbidden_agents": []
+    },
+    {
+      "id": "find-java-class-dependency-graph",
+      "query": "produce a class shaped inventory for a java class with methods fields inner types",
+      "expected_agents": ["java-class-dependency-graph"],
+      "forbidden_agents": []
     }
   ],
   "anti_pattern_queries": [
@@ -107,6 +119,18 @@
       "id": "anti-lombokify-without-classpath",
       "query": "convert pojo to lombok when lombok is not on the classpath",
       "agent": "java-lombokify",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-guard-as-java-permission",
+      "query": "approve a java public api change",
+      "agent": "java-public-api-guard",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-dep-graph-as-clusterer",
+      "query": "decide partition for a java class",
+      "agent": "java-class-dependency-graph",
       "expect_matched_anti_pattern": true
     }
   ]

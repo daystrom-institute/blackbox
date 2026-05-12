@@ -140,6 +140,32 @@
         "apply": false
       },
       "expect_response_fields": ["status", "files_lombokified", "annotation_distribution"]
+    },
+    {
+      "id": "dispatch-java-public-api-guard-planonly",
+      "agent": "java-public-api-guard",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example",
+        "proposed_changes": [
+          {
+            "file": "src/main/java/com/example/ServiceImpl.java",
+            "item_name": "ServiceImpl",
+            "change_kind": "modify"
+          }
+        ]
+      },
+      "expect_response_fields": ["status", "advisory_severity", "public_items_touched"]
+    },
+    {
+      "id": "dispatch-java-class-dependency-graph-planonly",
+      "agent": "java-class-dependency-graph",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "module_name": "DashboardView"
+      },
+      "expect_response_fields": ["status", "class", "methods", "fields", "inner_types", "annotations_class_level"]
     }
   ]
 }

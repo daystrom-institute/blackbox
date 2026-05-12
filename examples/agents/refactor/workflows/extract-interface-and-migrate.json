@@ -18,7 +18,7 @@
   },
   "nodes": {
     "ExtractInterface": {
-      "prompt": "Dispatch java-extract-interface with migrate_call_sites=true and migrate_callers_in pre-populated by the workflow caller. The atom handles the structured prompt-discipline gate for acknowledge_public_api_change — when callers in migrate_callers_in cross Maven/Gradle module boundaries and the operator hasn't acknowledged, the atom blocks before any bbox_refactor_run(confirm=true) starts. Once JAVA_GAP.md Gap 1 (java_public_api_guard) ships, this gate becomes structurally enforced via a separate preflight plan.",
+      "prompt": "Dispatch java-extract-interface (v2) with migrate_call_sites=true and migrate_callers_in pre-populated by the workflow caller. The atom runs java_public_api_guard as a structured preflight BEFORE the mutating bbox_refactor_run. When advisory_severity=breaking and the operator hasn't passed acknowledge_public_api_change=true, the atom blocks before any mutation starts — structurally enforced via the guard plan, not by prompt-discipline alone.",
       "on_enter": [
         {
           "op": "mcp_call",

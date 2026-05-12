@@ -167,6 +167,26 @@
         "expected_block_reason_substring": "Lombok"
       },
       "done_note_required": true
+    },
+    {
+      "agent": "java-public-api-guard",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_public_api_guard",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "agent": "java-class-dependency-graph",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }
