@@ -1888,9 +1888,6 @@ fn java_method_signature_text(method_node: Node<'_>, source: &str) -> (String, b
 /// For every method on the source class, return a map from method name to
 /// (signature, partial). Constructors are intentionally excluded — they're
 /// resolved via `new`, not method invocation.
-<<<<<<< HEAD
-pub(crate) fn java_source_class_method_signatures(
-=======
 /// G8: per-source-method metadata for ExternalCall classification.
 #[derive(Debug, Clone)]
 pub(crate) struct JavaSourceMethodInfo {
@@ -1900,8 +1897,7 @@ pub(crate) struct JavaSourceMethodInfo {
     pub is_static: bool,
 }
 
-fn java_source_class_method_signatures(
->>>>>>> d17e2dc (feat(java/extract_class): G19+G14 auto-qualify + G8 visibility hints)
+pub(crate) fn java_source_class_method_signatures(
     parsed: &ParsedSource,
     class_node: Node<'_>,
 ) -> BTreeMap<String, JavaSourceMethodInfo> {
