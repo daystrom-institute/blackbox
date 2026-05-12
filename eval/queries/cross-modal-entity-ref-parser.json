@@ -7,7 +7,7 @@
     {
       "description": "The entity-ref grammar in the agentic-corpus design.",
       "entity_type_hint": "project_file",
-      "path_hint": "design/agentic-corpus.md"
+      "path_hint": "design/archive/agentic-corpus.md"
     },
     {
       "description": "The F1 Rust EntityRef parser implementation.",

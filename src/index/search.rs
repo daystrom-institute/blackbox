@@ -1634,7 +1634,7 @@ mod agentic_project_file_tests {
                 exclude_self: None,
             })
             .unwrap();
-        assert!(design_hits.contains("design/agentic-corpus.md"));
+        assert!(design_hits.contains("design/archive/agentic-corpus.md"));
 
         let trait_hits = index
             .search(&SearchParams {
@@ -1648,7 +1648,7 @@ mod agentic_project_file_tests {
                 exclude_self: None,
             })
             .unwrap();
-        assert!(trait_hits.contains("design/agentic-corpus.md"));
+        assert!(trait_hits.contains("design/archive/agentic-corpus.md"));
         let chunker_source = format!("{}/src/chunker/mod.rs", env!("CARGO_MANIFEST_DIR"));
         assert!(trait_hits.contains(&format!("File: {chunker_source}")));
 

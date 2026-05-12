@@ -6,12 +6,12 @@
     {
       "description": "The design constraint saying no bbox-side LLM appears in the synchronous search path.",
       "entity_type_hint": "project_file",
-      "path_hint": "design/agentic-corpus.md"
+      "path_hint": "design/archive/agentic-corpus.md"
     }
   ],
   "expected_entity_refs": [
-    "project_file:af6f7145:3b317e2b:8d98bac6109b7ccd871be0aba8edc76188d04e29f22f451f00c1190bbbd4d5c2:2",
-    "project_file:af6f7145:3b317e2b:846d7a7534d297e1d6e625f77205f411a78d8c108745182deeea21e2f2e7017a:4"
+    "project_file:af6f7145:4593ef20:8d98bac6109b7ccd871be0aba8edc76188d04e29f22f451f00c1190bbbd4d5c2:2",
+    "project_file:af6f7145:4593ef20:846d7a7534d297e1d6e625f77205f411a78d8c108745182deeea21e2f2e7017a:4"
   ],
   "required_evidence": {
     "kind": "edge_family",

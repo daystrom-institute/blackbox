@@ -1253,13 +1253,27 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     });
     // G7: guice_field_inject mode needs the @Inject import on the source.
     if wiring_mode == "guice_field_inject" {
-        // Prefer javax.inject.Inject as the more portable choice; if the
-        // source already imports com.google.inject.Inject, the existing
-        // import is unchanged and the new edit is idempotent.
-        if let Some(edit) =
-            java_source_import_edit(&parsed.source, "javax.inject.Inject")
-        {
-            source_edits.push(edit);
+        // G7-FU-v2: any non-static wildcard import in the source blocks the
+        // explicit `javax.inject.Inject` add. The wildcard could plausibly
+        // already supply an `Inject` binding (Guice's `com.google.inject.*`
+        // is the canonical case); adding an explicit single-type import
+        // would silently flip which `Inject` resolves bare. We can't probe
+        // the classpath, so any wildcard => conservative skip.
+        let source_has_wildcard_import = parsed.source.lines().any(|line| {
+            let t = line.trim();
+            t.starts_with("import ")
+                && !t.starts_with("import static ")
+                && t.trim_end_matches(';').trim_end().ends_with(".*")
+        });
+        if !source_has_wildcard_import {
+            // Prefer javax.inject.Inject as the more portable choice; if the
+            // source already imports com.google.inject.Inject, the existing
+            // import is unchanged and the new edit is idempotent.
+            if let Some(edit) =
+                java_source_import_edit(&parsed.source, "javax.inject.Inject")
+            {
+                source_edits.push(edit);
+            }
         }
     }
     // Gap 5: when the target type lands in a different package than the source,

@@ -6,17 +6,17 @@
     {
       "description": "The EdgeIndex design section distinguishing projected edges from authored KnowledgeEntry.links and sidecar edges.",
       "entity_type_hint": "project_file",
-      "path_hint": "design/agentic-corpus.md"
+      "path_hint": "design/archive/agentic-corpus.md"
     }
   ],
   "expected_entity_refs": [
-    "project_file:af6f7145:3b317e2b:9e962df35fb0d350805331d9fd58dd98af72a31399cc7c97e320bf1bced3d29f:5",
-    "project_file:af6f7145:3b317e2b:c992fe6ac0b47ee2a1a55edfaa6e76dcf0593a73e3184991f6f9d5d465d3b5f4:9"
+    "project_file:af6f7145:4593ef20:9e962df35fb0d350805331d9fd58dd98af72a31399cc7c97e320bf1bced3d29f:5",
+    "project_file:af6f7145:4593ef20:c992fe6ac0b47ee2a1a55edfaa6e76dcf0593a73e3184991f6f9d5d465d3b5f4:9"
   ],
   "required_evidence": {
     "kind": "path",
     "value": {
-      "from": "design/agentic-corpus.md",
+      "from": "design/archive/agentic-corpus.md",
       "to": "KnowledgeEntry.links",
       "edge_types": [
         "REFERENCES"

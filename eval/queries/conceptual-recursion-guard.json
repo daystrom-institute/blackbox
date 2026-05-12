@@ -16,7 +16,7 @@
   ],
   "expected_entity_refs": [
     "project_file:af6f7145:a54ff182:27d6dd72cfbc502d8378c0f2972645f56e3f54dbde99481de3b2d04e624b7f60:5",
-    "project_file:af6f7145:3f15b6df:e4485bb6fbfdfb2487582f777433fa10210e1904ff333676303b6561129a79b0:112"
+    "project_file:af6f7145:3f15b6df:e871e9b8511d5436016fa80df2cbea8d89fa4568ece5fb3825060e6377afe542:46"
   ],
   "required_evidence": {
     "kind": "path",
