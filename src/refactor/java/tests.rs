@@ -7438,3 +7438,38 @@
             "no surviving private ctor modifier: {target_text}"
         );
     }
+
+    // G19-FU: java_qualify_unqualified_calls uses AST-based parsing and
+    // naturally skips string literals and line comments — they never produce
+    // method_invocation nodes. Only real unqualified call sites get the
+    // class qualifier prepended.
+    #[test]
+    fn g19_fu_qualify_skips_strings_and_comments() {
+        let input = "\
+class Example {\n\
+    void run() {\n\
+        String msg = \"doWork()\";\n\
+        // doWork() is important\n\
+        doWork();\n\
+    }\n\
+    void doWork() {}\n\
+}\n";
+        let result = java_qualify_unqualified_calls(input, "doWork", "Example");
+        assert!(
+            result.contains("\"doWork()\""),
+            "string literal must be preserved verbatim: {result}"
+        );
+        assert!(
+            result.contains("// doWork()"),
+            "comment must be preserved verbatim: {result}"
+        );
+        assert!(
+            result.contains("Example.doWork()"),
+            "real call must be qualified: {result}"
+        );
+        assert_eq!(
+            result.matches("Example.doWork").count(),
+            1,
+            "exactly one qualified occurrence, no spurious rewrites: {result}"
+        );
+    }
