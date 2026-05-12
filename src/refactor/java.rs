@@ -6260,12 +6260,26 @@ fn resolve_field_access<'a>(node: Node<'a>) -> Option<Node<'a>> {
             // Otherwise (object position, etc.) it's a field/variable read.
         }
         "method_reference" => {
-            // `Foo::bar` — `Foo` could be a class type (skip) or an instance
-            // field; tree-sitter labels both as identifiers. Instance field
-            // followed by `::method` is rare for a moved field; skip to avoid
-            // false positives. The method-name part (after ::) is not an
-            // identifier in the field-name sense either.
-            return None;
+            // `Qualifier::name` — tree-sitter-java labels both qualifier-type
+            // (`Foo`) and qualifier-field (`csvExtractors`) as identifiers.
+            // Gap 3: when the qualifier is an instance field of the source
+            // class, the capture analysis must see it so the field flows
+            // through the target's constructor.
+            //
+            // Only the qualifier slot (first named child) is a candidate —
+            // the method-name slot after `::` is never a field reference.
+            // The caller does the field-name lookup against the
+            // source-class field map plus shadowing, so type qualifiers
+            // (uppercase identifiers) naturally fall out at lookup time
+            // (they don't appear in the instance-field map).
+            let mut cursor = parent.walk();
+            let qualifier = parent.named_children(&mut cursor).next();
+            if qualifier.map(|q| q.id()) != Some(node.id()) {
+                return None;
+            }
+            // Fall through to `Some(node)` — let the caller apply the
+            // field-map + shadowing checks. The pre-Gap-3 unconditional
+            // return None here was the documented capture miss.
         }
         "field_access" => {
             // If this identifier is the `field` part of a field_access, then
@@ -13827,6 +13841,76 @@ mod tests {
         assert!(
             replacement.contains("import b.EnumConverter;"),
             "method-reference qualifier import must be retained: {replacement}"
+        );
+    }
+
+    // Gap 3: when a method-reference qualifier is an INSTANCE FIELD of the
+    // source class (e.g. `csvExtractors::extractC4Composition` where
+    // `csvExtractors` is `private final CompositionCsvExtractors`), the
+    // capture analysis must thread `csvExtractors` through the target's
+    // constructor. Pre-fix, `resolve_field_access` short-circuited on every
+    // method-reference qualifier, so the target's ctor was missing the
+    // capture and the apply produced `error: cannot find symbol` at every
+    // call site of the moved method.
+    #[test]
+    fn extract_java_class_captures_method_reference_field_qualifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Composition.java");
+        let target = dir.path().join("Importer.java");
+        fs::write(
+            &source,
+            "package com.example;\n\
+             import java.util.function.Function;\n\
+             class Composition {\n\
+            \x20   private final CsvExtractors csvExtractors = new CsvExtractors();\n\
+            \x20   void importFile() {\n\
+            \x20       Function<String,Integer> fn = csvExtractors::extractC4Composition;\n\
+            \x20       fn.apply(\"x\");\n\
+            \x20   }\n\
+            \x20   static class CsvExtractors {\n\
+            \x20       public Integer extractC4Composition(String s) { return 0; }\n\
+            \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut params = java_plan_params("extract_java_class", &source);
+        params.target = Some(path_string(&target));
+        params.module_name = Some("Importer".to_string());
+        params.delegate_field = Some("importer".to_string());
+        params.item_names = Some(vec!["importFile".to_string()]);
+        params.project_dir = Some(path_string(dir.path()));
+
+        let plan: RefactorPlan =
+            serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
+        // Capture analysis MUST list csvExtractors so the target's ctor
+        // takes it as a parameter and the source-side `new Importer(...)`
+        // wiring passes it through.
+        assert!(
+            plan.captured_variables
+                .iter()
+                .any(|c| c.name == "csvExtractors"),
+            "captured_variables must include `csvExtractors` after Gap 3 fix: {:?}",
+            plan.captured_variables.iter().map(|c| &c.name).collect::<Vec<_>>(),
+        );
+        let rewritten = apply_source_edits(&plan, &source);
+        // Source-side wiring threads csvExtractors into the target's ctor.
+        assert!(
+            rewritten.contains("this.importer = new Importer(csvExtractors)"),
+            "source wiring must pass csvExtractors through: {rewritten}"
+        );
+        // Target text has a `csvExtractors` ctor param + private field.
+        // Gap 7's inner-class qualification rewrites `CsvExtractors` to
+        // `Composition.CsvExtractors` on the target — accept either shape.
+        let target_edit = &plan.edits[1];
+        let target_text = target_edit.edits[0].replacement.as_str();
+        assert!(
+            target_text.contains("CsvExtractors csvExtractors"),
+            "target ctor must take csvExtractors: {target_text}"
+        );
+        assert!(
+            target_text.contains("this.csvExtractors = csvExtractors"),
+            "target ctor must assign csvExtractors to its field: {target_text}"
         );
     }
 
