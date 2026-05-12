@@ -1,0 +1,109 @@
+{
+  "kind": "agent",
+  "name": "rust-test-island-extract",
+  "version": 1,
+  "_contract": "refactor-atom/v1",
+  "manifest": {
+    "description": "Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files declared via mod tests; in the source's parent module.",
+    "when_to_use": [
+      "a Rust source file's inline test block exceeds 200 lines and pollutes the source",
+      "a monolithic test island (e.g. src/tests.rs) wants per-source-file decomposition",
+      "preparing a file for further refactoring where the test block obscures the code"
+    ],
+    "anti_patterns": [
+      "do not use when the test block references items via super::super::* — the sibling move would break those refs",
+      "do not use for crate-level integration tests (those belong in tests/, not src/tests/*.rs)",
+      "do not use on non-Rust files"
+    ],
+    "brofile_ref": "rust-refactor-persona",
+    "filter_overlay": {
+      "allow": [],
+      "disallow": []
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source_file_or_dir"],
+        "properties": {
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the Rust project root."
+          },
+          "source_file_or_dir": {
+            "type": "string",
+            "description": "File or directory whose inline #[cfg(test)] blocks should be extracted, relative to project_dir."
+          },
+          "target_dir": {
+            "type": "string",
+            "description": "Target directory for extracted test files (sibling modules, NOT crate-level tests/). Defaults to src/tests."
+          },
+          "apply": {
+            "type": "boolean",
+            "description": "When true, run the transaction; when false, return plan-only."
+          },
+          "validation_bin": {
+            "type": "string",
+            "description": "cargo test --bin target. Defaults to blackboxd."
+          }
+        }
+      },
+      "prompt_template": "You are rust-test-island-extract. Charter: Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"\",\n                     languages=[\"rust\"], item_kinds=[\"mod_item\"])\n   bbox_refactor_status(file=\"{{source_file_or_dir}}\", project_dir=\"{{project_dir}}\")\n   Identify mod_items annotated #[cfg(test)] (typically `mod tests`). Copy\n   exact `name`/`kind`/byte_range values. If the test block references items\n   via super::super::* or otherwise outside its parent module's scope, RECORD\n   THE REFS — those don't survive a sibling move.\n\n2. Plan with deep_analysis=true (extract_rust_items moves the cfg(test) mod item):\n   bbox_refactor_plan(kind=\"extract_rust_items\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file_or_dir}}\",\n                      target=\"{{target_dir}}/<basename>.rs\",\n                      item_names=[\"<cfg-test-mod-name>\"])\n   Then plan add_rust_mod_decl for `#[cfg(test)] mod tests;` in the source.\n\n3. Decide:\n   - If grounding step 1 found super::super::* or sibling-incompatible refs,\n     save the plan via output_path, emit bbox_note(kind=\"blocked\",\n     body=<concrete diagnostic naming the offending refs + plan_path>) and\n     return status=\"blocked\".\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(confirm=true, steps=[\n     <extract_rust_items step>,\n     <add_rust_mod_decl step>,\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true}\n   ])\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: extracted_test_files count,\n     refs_preserved, cargo result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside your filter_overlay.\n- Never extract into crate-level tests/ — that breaks private-item access.\n- Never proceed when grounding found super::super::* refs.\n- Never apply when status=blocked.\n\nInputs:\n{{project_dir}} {{source_file_or_dir}} {{target_dir}} {{apply}} {{validation_bin}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": { "type": "integer", "minimum": 0 },
+              "warning": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "extracted_test_files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "source": { "type": "string" },
+                "target": { "type": "string" },
+                "test_count": { "type": "integer", "minimum": 0 },
+                "refs_preserved": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "composition": {
+      "chainable_after": [],
+      "parallel_safe": false
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-11T00:00:00Z"
+    }
+  }
+}

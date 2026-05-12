@@ -1948,15 +1948,12 @@ mod tests {
         assert!(joined.contains("bbox_note(kind="));
     }
 
+    /// Walks every JSON manifest under `examples/agents/refactor/` (excluding
+    /// shared `_*` reference files) and asserts each one passes the
+    /// refactor-atom lint and validates against the agent schema. New atoms
+    /// landing under that path are picked up automatically.
     #[test]
-    fn shipped_rust_impl_partition_graph_passes_lint() {
-        let src = include_str!("../../../examples/agents/refactor/rust-impl-partition-graph.json");
-        let v: serde_json::Value =
-            serde_json::from_str(src).expect("rust-impl-partition-graph.json parses");
-        assert!(is_refactor_atom_artifact(&v, None));
-        validate_refactor_atom_install(&v, None)
-            .expect("shipped rust-impl-partition-graph atom passes lint");
-
+    fn every_shipped_refactor_atom_passes_lint_and_schema() {
         let schema_raw = include_str!("../../../schema/agent.schema.json");
         let schema: serde_json::Value =
             serde_json::from_str(schema_raw).expect("agent schema valid JSON");
@@ -1964,56 +1961,54 @@ mod tests {
             .with_draft(jsonschema::Draft::Draft202012)
             .compile(&schema)
             .expect("agent schema compiles");
-        assert!(
-            compiled.is_valid(&v),
-            "rust-impl-partition-graph rejected by agent schema: {:?}",
-            compiled
-                .validate(&v)
-                .err()
-                .map(|errs| errs.map(|e| e.to_string()).collect::<Vec<_>>())
-        );
 
-        let warnings = refactor_atom_install_warnings(&v, None);
-        for w in &warnings {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_root.join("examples/agents/refactor");
+        let entries = std::fs::read_dir(&dir).expect("refactor agents dir exists");
+        let mut found = 0usize;
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name.starts_with('_') {
+                continue;
+            }
+            found += 1;
+            let src = std::fs::read_to_string(&path).expect("read manifest");
+            let v: serde_json::Value = serde_json::from_str(&src)
+                .unwrap_or_else(|e| panic!("{name} did not parse: {e}"));
             assert!(
-                w.contains("bbox_refactor_run"),
-                "unexpected refactor_atom warning on analysis-only atom: {w}"
+                is_refactor_atom_artifact(&v, None),
+                "{name} missing _contract marker"
             );
-        }
-    }
-
-    #[test]
-    fn shipped_rust_public_api_guard_passes_lint() {
-        let src = include_str!("../../../examples/agents/refactor/rust-public-api-guard.json");
-        let v: serde_json::Value =
-            serde_json::from_str(src).expect("rust-public-api-guard.json parses");
-        assert!(is_refactor_atom_artifact(&v, None));
-        validate_refactor_atom_install(&v, None)
-            .expect("shipped rust-public-api-guard atom passes lint");
-
-        let schema_raw = include_str!("../../../schema/agent.schema.json");
-        let schema: serde_json::Value =
-            serde_json::from_str(schema_raw).expect("agent schema valid JSON");
-        let compiled = jsonschema::JSONSchema::options()
-            .with_draft(jsonschema::Draft::Draft202012)
-            .compile(&schema)
-            .expect("agent schema compiles");
-        assert!(
-            compiled.is_valid(&v),
-            "rust-public-api-guard rejected by agent schema: {:?}",
-            compiled
-                .validate(&v)
-                .err()
-                .map(|errs| errs.map(|e| e.to_string()).collect::<Vec<_>>())
-        );
-
-        let warnings = refactor_atom_install_warnings(&v, None);
-        for w in &warnings {
+            validate_refactor_atom_install(&v, None)
+                .unwrap_or_else(|e| panic!("{name} failed refactor-atom lint: {e}"));
             assert!(
-                w.contains("bbox_refactor_run"),
-                "unexpected refactor_atom warning on analysis-only atom: {w}"
+                compiled.is_valid(&v),
+                "{name} rejected by agent schema: {:?}",
+                compiled
+                    .validate(&v)
+                    .err()
+                    .map(|errs| errs.map(|e| e.to_string()).collect::<Vec<_>>())
             );
+            // Analysis-only atoms legitimately drop bbox_refactor_run; any other
+            // warnings (filter_overlay.allow, missing base fields, missing other
+            // markers) are unexpected drift and fail loudly.
+            let warnings = refactor_atom_install_warnings(&v, None);
+            for w in &warnings {
+                assert!(
+                    w.contains("bbox_refactor_run"),
+                    "{name}: unexpected refactor_atom warning: {w}"
+                );
+            }
         }
+        assert!(
+            found >= 1,
+            "expected at least one shipped refactor atom under examples/agents/refactor/"
+        );
     }
 
     #[test]
