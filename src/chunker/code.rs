@@ -214,9 +214,23 @@ fn chunks_from_symbols(
             );
             chunk.symbol = Some(spec.qualified_name);
             chunk.symbol_exact = Some(spec.bare_name);
+            chunk.symbol_kind = Some(spec.kind);
+            chunk.parent_kind = spec.parent_kind;
+            chunk.line_start = Some(byte_to_line_1based(source, spec.byte_start));
+            chunk.line_end = Some(byte_to_line_1based(source, spec.byte_end));
             chunk
         })
         .collect()
+}
+
+/// Convert a byte offset in `source` to a 1-based line number.
+/// `byte` is clamped to `source.len()`. Used by `chunks_from_symbols`
+/// so indexed records can return line ranges without re-opening the
+/// source file at read time.
+fn byte_to_line_1based(source: &str, byte: usize) -> u32 {
+    let clamped = byte.min(source.len());
+    let lines_before = source[..clamped].bytes().filter(|b| *b == b'\n').count();
+    (lines_before as u32) + 1
 }
 
 fn chunk_from_language_pack(
@@ -545,6 +559,49 @@ fn is_ident_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CN-D2 contract: chunks built from a SymbolSpec must carry the
+    /// new symbol_kind / parent_kind / line_start / line_end fields.
+    /// This is what unblocks the indexed code_symbols lane in CN-T2 —
+    /// without these on the Chunk record, CN-D3 has nothing to project
+    /// into tantivy.
+    #[test]
+    fn rust_impl_method_chunks_carry_kind_and_line_metadata() {
+        let source = b"struct S;\nimpl S {\n    fn run(&self) {}\n}\n";
+        let (chunks, _) = CodeChunker.chunk(Path::new("t.rs"), source).unwrap();
+
+        let struct_chunk = chunks
+            .iter()
+            .find(|c| c.symbol_exact.as_deref() == Some("S") && c.symbol_kind.as_deref() == Some("struct_item"))
+            .expect("struct chunk present with symbol_kind=struct_item");
+        assert_eq!(struct_chunk.parent_kind, None);
+        assert_eq!(struct_chunk.line_start, Some(1));
+        assert_eq!(struct_chunk.line_end, Some(1));
+
+        let method_chunk = chunks
+            .iter()
+            .find(|c| c.symbol_exact.as_deref() == Some("run"))
+            .expect("method chunk present");
+        assert_eq!(method_chunk.symbol_kind.as_deref(), Some("function_item"));
+        assert_eq!(method_chunk.parent_kind.as_deref(), Some("impl_item"));
+        assert_eq!(method_chunk.line_start, Some(3));
+        assert_eq!(method_chunk.line_end, Some(3));
+    }
+
+    /// byte_to_line_1based is the helper CN-D3 reads to populate
+    /// tantivy line fields without re-opening the source file. Lock
+    /// its behaviour explicitly: byte 0 -> line 1, byte after a
+    /// newline -> next line.
+    #[test]
+    fn byte_to_line_handles_multiline_source() {
+        let source = "alpha\nbeta\ngamma";
+        assert_eq!(byte_to_line_1based(source, 0), 1); // alpha
+        assert_eq!(byte_to_line_1based(source, 5), 1); // last byte of line 1
+        assert_eq!(byte_to_line_1based(source, 6), 2); // beta
+        assert_eq!(byte_to_line_1based(source, 11), 3); // gamma
+        // Past EOF clamps to line 3.
+        assert_eq!(byte_to_line_1based(source, 999), 3);
+    }
 
     #[test]
     fn rust_impl_display_chunks_with_symbol_metadata() {
