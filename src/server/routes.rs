@@ -1250,6 +1250,13 @@ pub(crate) fn rebuild_edge_index_from_shared(
     let threads = state.threads.read();
     let notes = state.notes.read();
     let task_store = state.task_store.read();
+    let registered_project_ids = state
+        .projects
+        .read()
+        .list()
+        .into_iter()
+        .map(|project| project.project_id)
+        .collect();
     let rebuilt = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
         index: &idx,
         knowledge: &kb,
@@ -1258,6 +1265,7 @@ pub(crate) fn rebuild_edge_index_from_shared(
         task_store: &task_store,
         roadmap: &state.roadmap.read(),
         edges_dir,
+        registered_project_ids: Some(registered_project_ids),
         include_tantivy_projection,
     });
     *state.edge_index.write() = rebuilt;

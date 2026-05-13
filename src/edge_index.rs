@@ -44,6 +44,7 @@ pub struct EdgeStoreRefs<'a> {
     pub task_store: &'a TaskStore,
     pub roadmap: &'a Roadmap,
     pub edges_dir: PathBuf,
+    pub registered_project_ids: Option<HashSet<String>>,
     pub include_tantivy_projection: bool,
 }
 
@@ -65,7 +66,11 @@ impl EdgeIndex {
         } else {
             tracing::debug!("rebuilt EdgeIndex without Tantivy stored-doc projection");
         }
-        index.project_sidecar_edges(&stores.edges_dir, &mut seen);
+        index.project_sidecar_edges(
+            &stores.edges_dir,
+            stores.registered_project_ids.as_ref(),
+            &mut seen,
+        );
 
         tracing::info!(
             edges = index.edge_count(),
@@ -115,6 +120,19 @@ impl EdgeIndex {
         let mut refs = refs.into_iter().collect::<Vec<_>>();
         refs.sort_by_key(|r| r.to_string());
         refs
+    }
+
+    pub fn entity_type_counts(&self) -> BTreeMap<String, usize> {
+        let mut seen = HashSet::new();
+        let mut counts = BTreeMap::new();
+        for r in self.forward.keys().chain(self.reverse.keys()) {
+            if seen.insert(r) {
+                *counts
+                    .entry(r.entity_type().as_str().to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+        counts
     }
 
     pub(crate) fn all_edges(&self) -> impl Iterator<Item = &Edge> {
@@ -474,9 +492,14 @@ impl EdgeIndex {
         }
     }
 
-    fn project_sidecar_edges(&mut self, edges_dir: &Path, seen: &mut HashSet<Edge>) {
+    fn project_sidecar_edges(
+        &mut self,
+        edges_dir: &Path,
+        registered_project_ids: Option<&HashSet<String>>,
+        seen: &mut HashSet<Edge>,
+    ) {
         let managed_derived_dir = managed_derived_edges_dir(edges_dir);
-        self.project_sidecar_edges_in_dir(edges_dir, seen);
+        self.project_sidecar_edges_in_dir(edges_dir, registered_project_ids, seen);
         let Ok(entries) = fs::read_dir(&managed_derived_dir) else {
             return;
         };
@@ -485,11 +508,16 @@ impl EdgeIndex {
             if !path.is_dir() {
                 continue;
             }
-            self.project_sidecar_edges_in_dir(&path, seen);
+            self.project_sidecar_edges_in_dir(&path, registered_project_ids, seen);
         }
     }
 
-    fn project_sidecar_edges_in_dir(&mut self, edges_dir: &Path, seen: &mut HashSet<Edge>) {
+    fn project_sidecar_edges_in_dir(
+        &mut self,
+        edges_dir: &Path,
+        registered_project_ids: Option<&HashSet<String>>,
+        seen: &mut HashSet<Edge>,
+    ) {
         let Ok(entries) = fs::read_dir(edges_dir) else {
             return;
         };
@@ -497,6 +525,10 @@ impl EdgeIndex {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 tracing::debug!(path = %path.display(), "skipping non-jsonl edge sidecar file");
+                continue;
+            }
+            if !sidecar_project_is_registered(&path, registered_project_ids) {
+                tracing::info!(path = %path.display(), "skipping unregistered project edge sidecar");
                 continue;
             }
             self.project_sidecar_edges_file(&path, seen);
@@ -548,6 +580,19 @@ pub(crate) fn edges_dir_from_projects_path(projects_path: &Path) -> PathBuf {
 
 fn managed_derived_edges_dir(edges_dir: &Path) -> PathBuf {
     edges_dir.join("derived")
+}
+
+fn sidecar_project_is_registered(
+    path: &Path,
+    registered_project_ids: Option<&HashSet<String>>,
+) -> bool {
+    let Some(registered_project_ids) = registered_project_ids else {
+        return true;
+    };
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    registered_project_ids.contains(stem)
 }
 
 pub(crate) fn append_project_edges(
@@ -1056,10 +1101,179 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen);
 
         assert_eq!(index.forward_edges(&source).len(), 1);
         assert_eq!(index.reverse_edges(&target).len(), 1);
+    }
+
+    #[test]
+    fn entity_type_counts_dedupe_refs_without_sorting() {
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        let file = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let symbol = EntityRef::Symbol {
+            project_id: "proj1234".into(),
+            qualified_name: "pkg.Type".into(),
+            defn_hash: "b".repeat(64),
+        };
+        index.insert(
+            Edge {
+                source: file.clone(),
+                kind: "CONTAINS_SYMBOL".into(),
+                target: symbol.clone(),
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+            },
+            &mut seen,
+        );
+        index.insert(
+            Edge {
+                source: symbol,
+                kind: "DEFINED_IN".into(),
+                target: file,
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+            },
+            &mut seen,
+        );
+
+        let counts = index.entity_type_counts();
+        assert_eq!(counts.get("project_file"), Some(&1));
+        assert_eq!(counts.get("symbol"), Some(&1));
+    }
+
+    #[test]
+    fn sidecar_loader_skips_unregistered_project_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let registered_source = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let registered_target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "b".repeat(64),
+            occurrence_idx: 1,
+        };
+        let orphan_source = EntityRef::ProjectFile {
+            project_id: "orphan12".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "c".repeat(64),
+            occurrence_idx: 0,
+        };
+        let orphan_target = EntityRef::ProjectFile {
+            project_id: "orphan12".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "d".repeat(64),
+            occurrence_idx: 1,
+        };
+        append_project_edges(
+            dir.path(),
+            "proj1234",
+            &[crate::chunker::Edge {
+                source: registered_source.clone(),
+                kind: "NEXT_SECTION".into(),
+                target: registered_target,
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+            }],
+        )
+        .unwrap();
+        append_project_edges(
+            dir.path(),
+            "orphan12",
+            &[crate::chunker::Edge {
+                source: orphan_source.clone(),
+                kind: "NEXT_SECTION".into(),
+                target: orphan_target,
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+            }],
+        )
+        .unwrap();
+
+        let mut registered = HashSet::new();
+        registered.insert("proj1234".to_string());
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen);
+
+        assert_eq!(index.forward_edges(&registered_source).len(), 1);
+        assert!(index.forward_edges(&orphan_source).is_empty());
+    }
+
+    #[test]
+    fn sidecar_loader_filters_managed_derived_project_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let registered_source = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let registered_target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "b".repeat(64),
+            occurrence_idx: 1,
+        };
+        let orphan_source = EntityRef::ProjectFile {
+            project_id: "orphan12".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "c".repeat(64),
+            occurrence_idx: 0,
+        };
+        let orphan_target = EntityRef::ProjectFile {
+            project_id: "orphan12".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "d".repeat(64),
+            occurrence_idx: 1,
+        };
+        replace_project_edges(
+            dir.path(),
+            "project",
+            "proj1234",
+            &[crate::chunker::Edge {
+                source: registered_source.clone(),
+                kind: "NEXT_SECTION".into(),
+                target: registered_target,
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+            }],
+        )
+        .unwrap();
+        replace_project_edges(
+            dir.path(),
+            "project",
+            "orphan12",
+            &[crate::chunker::Edge {
+                source: orphan_source.clone(),
+                kind: "NEXT_SECTION".into(),
+                target: orphan_target,
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+            }],
+        )
+        .unwrap();
+
+        let mut registered = HashSet::new();
+        registered.insert("proj1234".to_string());
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen);
+
+        assert_eq!(index.forward_edges(&registered_source).len(), 1);
+        assert!(index.forward_edges(&orphan_source).is_empty());
     }
 
     #[test]
@@ -1112,7 +1326,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen);
 
         assert!(
             index
@@ -1168,7 +1382,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen);
 
         assert!(
             index
@@ -1264,7 +1478,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen);
 
         assert!(
             index

@@ -1081,6 +1081,7 @@ async fn write_semantic_edge_projects_describes_sidecar() {
         task_store: &server.state.task_store.read(),
         roadmap: &server.state.roadmap.read(),
         edges_dir,
+        registered_project_ids: None,
         include_tantivy_projection: true,
     });
     let source_ref = entity_ref::EntityRef::parse(source).unwrap();

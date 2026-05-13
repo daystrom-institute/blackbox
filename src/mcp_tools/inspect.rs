@@ -397,16 +397,6 @@ fn labeled_ref(entity_ref: &str, label: Option<&str>) -> String {
     }
 }
 
-pub fn entity_type_count(refs: &[EntityRef]) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    for r in refs {
-        *counts
-            .entry(r.entity_type().as_str().to_string())
-            .or_insert(0) += 1;
-    }
-    counts
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,17 +418,5 @@ mod tests {
         assert_eq!(value["status"], "error.not_found");
         assert_eq!(value["error"]["code"], "error.not_found");
         assert_eq!(value["error"]["similar_refs"][0], "knowledge:nearby");
-    }
-
-    #[test]
-    fn entity_type_count_groups_refs_by_provider_type() {
-        let refs = vec![
-            EntityRef::parse("knowledge:a").unwrap(),
-            EntityRef::parse("knowledge:b").unwrap(),
-            EntityRef::parse("commit:repo:abcdef").unwrap(),
-        ];
-        let counts = entity_type_count(&refs);
-        assert_eq!(counts.get("knowledge"), Some(&2));
-        assert_eq!(counts.get("commit"), Some(&1));
     }
 }

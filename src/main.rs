@@ -179,14 +179,13 @@ impl BlackboxServer {
     }
 
     fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
-        let mut counts =
-            mcp_tools::inspect::entity_type_count(&self.state.edge_index.read().known_refs());
+        let mut counts = self.state.edge_index.read().entity_type_counts();
         counts.insert("knowledge".into(), self.state.kb.read().all_entries().len());
         counts.insert("thread".into(), self.state.threads.read().all().len());
         counts.insert("note".into(), self.state.notes.read().all().len());
         counts.insert("whiteboard".into(), self.state.whiteboards.list_ids().len());
         // Brofile and agent vertices live in the artifact catalog. They
-        // don't naturally appear in the EdgeIndex's known_refs until a
+        // don't naturally appear in EdgeIndex entity counts until a
         // DERIVED_FROM / SUPERSEDES edge points at them; until that
         // wire-up matures (design/agent-system.md §8.1), seed the
         // counts directly from the catalog so describe_schema reflects
@@ -1660,6 +1659,13 @@ async fn main() -> anyhow::Result<()> {
             task_store: &task_store,
             roadmap: &roadmap_store,
             edges_dir: edge_index::edges_dir_from_bro_store(&store_dir),
+            registered_project_ids: Some(
+                projects_store
+                    .list()
+                    .into_iter()
+                    .map(|project| project.project_id)
+                    .collect(),
+            ),
             include_tantivy_projection: false,
         })
     } else {

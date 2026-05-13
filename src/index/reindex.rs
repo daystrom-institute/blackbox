@@ -20,7 +20,10 @@ use crate::transcripts::adapters::{
 use crate::transcripts::projection::{normalized_to_doc, normalized_to_tool_call_doc};
 use crate::transcripts::types::TranscriptLocation;
 
-const DEFAULT_BACKGROUND_FULL_REINDEX_EVERY_TICKS: u64 = 0;
+// At the default 120s interval this is one full refresh per day. Full
+// project refreshes rewrite managed derived sidecars and trigger legacy
+// sidecar compaction, preventing append-only graph edges from growing forever.
+const DEFAULT_BACKGROUND_FULL_REINDEX_EVERY_TICKS: u64 = 720;
 
 fn background_startup_delay(interval: Duration) -> Duration {
     std::env::var("BLACKBOX_REINDEX_STARTUP_DELAY_SECS")

@@ -322,6 +322,28 @@ fn index_project(
         ctx.stats.indexed_files += 1;
     }
     ctx.stats.emitted_edges += git_stats.emitted_edges;
+    if ctx.force_git_full {
+        match crate::edge_index::compact_legacy_sidecar(ctx.edges_dir, &project.project_id, true) {
+            Ok(stats) if stats.applied => {
+                tracing::info!(
+                    project_id = %project.project_id,
+                    removed = stats.derived_edges_removed,
+                    retained = stats.retained_lines,
+                    bytes_before = stats.bytes_before,
+                    bytes_after = stats.bytes_after,
+                    "compacted legacy edge sidecar after full project refresh"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    project_id = %project.project_id,
+                    error = %err,
+                    "failed to compact legacy edge sidecar after full project refresh"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
