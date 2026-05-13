@@ -1033,6 +1033,7 @@ mod tests {
     fn backup_file_detection_patterns() {
         assert!(is_backup_file("proj1234.jsonl.bak-1715600000"));
         assert!(is_backup_file("abc.jsonl.bak-123"));
+        assert!(is_backup_file("p1.jsonl.bak-migrated-1715600000"));
         assert!(!is_backup_file("proj1234.jsonl"));
         assert!(!is_backup_file("proj1234.jsonl.tmp"));
         assert!(!is_backup_file("proj1234.jsonl.compact-123-45.tmp"));

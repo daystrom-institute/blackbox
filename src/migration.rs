@@ -212,6 +212,40 @@ pub fn has_managed_replacement(edges_dir: &Path, project_id: &str) -> bool {
             .is_some()
 }
 
+struct MigrationLock {
+    lock_path: PathBuf,
+}
+
+impl MigrationLock {
+    fn release(&self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn acquire_migration_lock(edges_dir: &Path, project_id: &str) -> Result<MigrationLock> {
+    let lock_dir = migrations_dir(edges_dir).join("locks");
+    fs::create_dir_all(&lock_dir)?;
+    let lock_path = lock_dir.join(format!("{project_id}.lock"));
+    fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "migration already in progress for project {} (lock file: {})",
+                project_id,
+                lock_path.display()
+            )
+        })?;
+    Ok(MigrationLock { lock_path })
+}
+
 pub fn apply_migration(edges_dir: &Path, project_id: &str) -> Result<MigrationManifest> {
     let legacy_path = edges_dir.join(format!("{project_id}.jsonl"));
     if !legacy_path.exists() {
@@ -224,6 +258,8 @@ pub fn apply_migration(edges_dir: &Path, project_id: &str) -> Result<MigrationMa
             project_id
         );
     }
+
+    let _lock = acquire_migration_lock(edges_dir, project_id)?;
 
     let source_hash = compute_source_hash(edges_dir, project_id)?;
     if let Some(existing) = find_committed_migration(edges_dir, project_id)? {
@@ -305,7 +341,7 @@ pub fn apply_migration(edges_dir: &Path, project_id: &str) -> Result<MigrationMa
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let backup_path = edges_dir.join(format!("{project_id}.jsonl.migrated-{ts}"));
+    let backup_path = edges_dir.join(format!("{project_id}.jsonl.bak-migrated-{ts}"));
     fs::rename(&legacy_path, &backup_path)?;
 
     let committed = MigrationManifest {
@@ -829,7 +865,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap()
-                .starts_with("p1.jsonl.migrated-"),
+                .starts_with("p1.jsonl.bak-migrated-"),
             "backup must have migrated prefix"
         );
     }
@@ -928,5 +964,54 @@ mod tests {
             MigrationStatus::Pending,
             "must not confirm migration with missing lanes"
         );
+    }
+
+    #[test]
+    fn migrated_backup_uses_bak_prefix_for_gc_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let exp = serde_json::to_string(&explicit_edge("k1", "DESCRIBES", "k2")).unwrap();
+        write_legacy(edges_dir, "p1", &[&exp]);
+        write_managed_replacement(edges_dir, "p1");
+
+        let manifest = apply_migration(edges_dir, "p1").unwrap();
+        let backup_name = PathBuf::from(manifest.backup_path.unwrap())
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            backup_name.contains(".bak-"),
+            "backup name must contain .bak- for GC compatibility: {backup_name}"
+        );
+        assert!(
+            backup_name.contains("migrated"),
+            "backup name must contain 'migrated': {backup_name}"
+        );
+    }
+
+    #[test]
+    fn migration_lock_prevents_concurrent_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let _lock1 = acquire_migration_lock(edges_dir, "p1").unwrap();
+        let lock2 = acquire_migration_lock(edges_dir, "p1");
+        assert!(lock2.is_err(), "second lock acquisition must fail");
+    }
+
+    #[test]
+    fn migration_lock_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        {
+            let _lock = acquire_migration_lock(edges_dir, "p1").unwrap();
+        }
+        let lock2 = acquire_migration_lock(edges_dir, "p1");
+        assert!(lock2.is_ok(), "lock must be released on drop");
     }
 }

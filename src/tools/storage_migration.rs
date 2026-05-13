@@ -84,6 +84,10 @@ impl BlackboxServer {
                     }
                 }
             };
+            let recovery = crate::migration::recover_pending_migrations(&edges_dir)?;
+            if !recovery.is_empty() {
+                tracing::info!(?recovery, "recovered pending migrations before apply");
+            }
             let manifest = crate::migration::apply_migration(&edges_dir, &project_id)?;
 
             Ok(serde_json::to_string_pretty(&serde_json::json!({
