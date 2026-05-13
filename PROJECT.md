@@ -101,9 +101,11 @@ Upgrades: build, install both daemon names plus `bro`, then restart whichever
 service you actually changed. The `install` is atomic (unlink + write) so the
 running process keeps the old inode until systemd restarts it.
 
-Client config (all point to the same daemon):
-- Claude Code: `mcpServers.blackbox = { type: "http", url: "http://127.0.0.1:7264/mcp" }` in each `~/.claude*/.claude.json`
-- Codex: `[mcp_servers.blackbox] url = "http://127.0.0.1:7264/mcp"` in `~/.codex/config.toml`
+Client config (all point to the same daemon): keep one canonical `blackbox`
+entry for normal human/operator use and point it at
+`http://127.0.0.1:7264/mcp?surface=ops`. Do not register both `blackbox` and
+`blackbox-ops` by default; add extra aliases only for intentionally restricted
+surfaces such as `readonly`.
 
 ## Render Pipeline
 

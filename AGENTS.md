@@ -167,9 +167,11 @@ Upgrades: build, install both daemon names plus `bro`, then restart whichever
 service you actually changed. The `install` is atomic (unlink + write) so the
 running process keeps the old inode until systemd restarts it.
 
-Client config (all point to the same daemon):
-- Claude Code: `mcpServers.blackbox = { type: "http", url: "http://127.0.0.1:7264/mcp" }` in each `~/.claude*/.claude.json`
-- Codex: `[mcp_servers.blackbox] url = "http://127.0.0.1:7264/mcp"` in `~/.codex/config.toml`
+Client config (all point to the same daemon): keep one canonical `blackbox`
+entry for normal human/operator use and point it at
+`http://127.0.0.1:7264/mcp?surface=ops`. Do not register both `blackbox` and
+`blackbox-ops` by default; add extra aliases only for intentionally restricted
+surfaces such as `readonly`.
 
 ## Render Pipeline
 
@@ -198,7 +200,7 @@ A surface is a caller-selected view of the daemon's MCP tool catalog, evaluated 
 
 The shipped default packet at `examples/mcp-surfaces/routing.json` defines four named surfaces:
 
-- `default` — external clients (Claude Code, Codex CLI) doing day-to-day work; hides setup tools, workflow-internal coordination, admin lifecycle, and destructive refactor.
+- `default` — constrained day-to-day clients; hides setup tools, workflow-internal coordination, and admin lifecycle while keeping normal code-editing tools such as `bbox_refactor_apply`.
 - `readonly` — reviewers/evaluators/observer agents; explicit allow list, no writes/dispatch/admin.
 - `agent-internal` — dispatched bros inside a workflow; whiteboards, councils, when_all/any, signals, and broadcast are visible (workflow coordination); `bro_exec`/`resume`/`cancel` denied as a backstop to the mechanical recursion guard.
 - `ops` — operator/admin sessions; full daemon access including setup tools, lifecycle management, and destructive operations.

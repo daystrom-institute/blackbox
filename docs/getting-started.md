@@ -55,6 +55,10 @@ systemctl --user enable --now blackbox-dev.service
 
 ## 3. Connect each provider CLI to the daemon
 
+For normal human/operator use, keep one canonical `blackbox` MCP entry and point
+it at the `ops` surface. Add extra aliases only when you intentionally want a
+restricted surface such as `readonly`.
+
 **Claude Code** - add to each `~/.claude*/.claude.json`:
 
 ```json
@@ -62,7 +66,7 @@ systemctl --user enable --now blackbox-dev.service
   "mcpServers": {
     "blackbox": {
       "type": "http",
-      "url": "http://127.0.0.1:7264/mcp"
+      "url": "http://127.0.0.1:7264/mcp?surface=ops"
     }
   }
 }
@@ -72,12 +76,26 @@ systemctl --user enable --now blackbox-dev.service
 
 ```toml
 [mcp_servers.blackbox]
-url = "http://127.0.0.1:7264/mcp"
+url = "http://127.0.0.1:7264/mcp?surface=ops"
 ```
 
-**Gemini CLI** - `gemini mcp add blackbox http://127.0.0.1:7264/mcp`
+**OpenCode** - add to `~/.config/opencode/opencode.json`:
 
-**Copilot** - `copilot mcp add blackbox http://127.0.0.1:7264/mcp`
+```json
+{
+  "mcp": {
+    "blackbox": {
+      "type": "remote",
+      "url": "http://127.0.0.1:7264/mcp?surface=ops",
+      "enabled": true
+    }
+  }
+}
+```
+
+**Gemini CLI** - `gemini mcp add blackbox http://127.0.0.1:7264/mcp?surface=ops`
+
+**Copilot** - `copilot mcp add blackbox http://127.0.0.1:7264/mcp?surface=ops`
 
 ## 4. Bootstrap a project
 

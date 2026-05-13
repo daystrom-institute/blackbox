@@ -13,7 +13,7 @@ bbox_compile path=system-defaults/mcp-surfaces/routing.json scope=global
 
 | Surface | Audience | What's visible |
 |---|---|---|
-| `default` | external clients (Claude Code, Codex CLI) doing day-to-day work | transcripts, agentic graph, knowledge r/w, threads, notes, inbox, code-nav, atom discovery/invoke/status/resume/delegate, refactor (plan/run/status — not apply), bro core dispatch (exec/resume/status/cancel/dashboard/team/brofile/agents), `bbox_mcp_surface` |
+| `default` | constrained day-to-day clients | transcripts, agentic graph, knowledge r/w, threads, notes, inbox, code-nav, atom discovery/invoke/status/resume/delegate, refactor plan/run/status/apply, bro core dispatch (exec/resume/status/cancel/dashboard/team/brofile/agents), `bbox_mcp_surface` |
 | `readonly` | reviewers, evaluators, observer agents | search/cite/inspect/find_paths/bundle, knowledge read, thread/note/inbox read, code-nav read, atom discovery, council observation, bro status/dashboard. **No writes, no dispatch, no admin.** |
 | `agent-internal` | dispatched bros inside a workflow or arc | superset of `default` plus whiteboards, councils, when_all/any, signals, broadcast, arc_*. `bro_exec`/`resume`/`cancel` denied as a backstop to the mechanical recursion guard; atom invocation remains policy-gated by atom composition/effect limits. |
 | `ops` | operator/admin sessions | full daemon access — setup tools (slack/webhook/poller/cron), workflow authoring, lifecycle (render/absorb/bootstrap/lint/review), index/embedding admin, artifact management, provenance, destructive refactor. |
@@ -30,18 +30,28 @@ http://127.0.0.1:7264/mcp?surface=anything-else    # → init fails: deny catcha
 
 ## Provider config
 
-Register one alias per surface in your provider's MCP config:
+For normal human/operator use, register a single canonical `blackbox` MCP entry
+and point it at the `ops` surface. Add separate aliases only for intentionally
+restricted contexts such as read-only reviewers or workflow actors.
 
 ```jsonc
 // ~/.claude/.claude.json
 {
   "mcpServers": {
-    "blackbox":          { "type": "http", "url": "http://127.0.0.1:7264/mcp" },
-    "blackbox-readonly": { "type": "http", "url": "http://127.0.0.1:7264/mcp?surface=readonly" },
-    "blackbox-ops":      { "type": "http", "url": "http://127.0.0.1:7264/mcp?surface=ops" }
+    "blackbox": { "type": "http", "url": "http://127.0.0.1:7264/mcp?surface=ops" }
   }
 }
 ```
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.blackbox]
+url = "http://127.0.0.1:7264/mcp?surface=ops"
+```
+
+Do not register both `blackbox` and `blackbox-ops` by default. The duplicate
+catalog adds context noise, and dispatch-time recursion filters are anchored on
+the canonical `blackbox` server name.
 
 Or use `bro_mcp action=add` with the `surface` field — the daemon appends the
 query string for you and fans the registration out to every installed provider:
@@ -70,8 +80,11 @@ bbox_mcp_surface action=list
   allow list and a long disallow list — same passthrough-with-exclusions
   pattern as `default`, plus whiteboards/councils stay visible by *not* being
   listed in either column.
-- **`ops` keeps `refactor_apply`.** Operator sessions are explicitly in
-  destructive territory; lower-privilege surfaces hide it.
+- **`default` keeps `refactor_apply`.** Applying a reviewed refactor plan is a
+  day-to-day code-editing operation, not an ops-only daemon administration
+  surface. `ops` remains the full passthrough surface for setup, lifecycle,
+  indexing, provenance, artifact administration, workflow internals, and other
+  operator-only tools.
 - **Recursion guard is mechanical and orthogonal.** Even if a bro got an
   `agent-internal` surface that allowed `bro_exec`, the dispatch-time recursion
   guard at the provider argv layer would still strip it. The surface filter
