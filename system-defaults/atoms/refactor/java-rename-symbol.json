@@ -1,0 +1,197 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-rename-symbol",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Project-wide Java simple-symbol rename with usage inventory, public-API preflight, optional file-rename handling, and validation.",
+    "when_to_use": [
+      "renaming a Java class, interface, record, enum, method, field, parameter, or type parameter across a project",
+      "renaming a top-level Java type where the matching .java filename may also need to move",
+      "replacing manual grep/edit rename sequences with the guarded rename_java_symbol plan kind"
+    ],
+    "anti_patterns": [
+      "do not use for overloaded methods when simple-name matching would be too broad and the operator has not narrowed item_kinds/source",
+      "do not use for non-Java config files, XML, YAML, properties, or generated source trees",
+      "do not silently apply a public/protected rename without acknowledge_public_api_change when the guard reports breaking"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "old_name",
+          "new_name"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the Java project root."
+          },
+          "source": {
+            "type": "string",
+            "description": "Optional declaration file, relative to project_dir. When provided, the plan validates that old_name exists there."
+          },
+          "old_name": {
+            "type": "string",
+            "description": "Old simple Java identifier."
+          },
+          "new_name": {
+            "type": "string",
+            "description": "New simple Java identifier."
+          },
+          "item_kinds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional declaration/reference kinds to narrow the rename, such as class_declaration, method_declaration, field_declaration, or type_reference."
+          },
+          "acknowledge_public_api_change": {
+            "type": "boolean",
+            "description": "Operator-authority opt-out when java_public_api_guard reports breaking. Must be explicit; no default."
+          },
+          "apply": {
+            "type": "boolean"
+          },
+          "apply_file_rename": {
+            "type": "boolean",
+            "description": "When true, include a move_file step for each file_rename_advisory returned by rename_java_symbol. When false, surface the advisory in the done note."
+          },
+          "validation_cmd": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Validation command + args. Defaults to [\"mvn\", \"compile\"]."
+          }
+        }
+      },
+      "prompt_template": "You are java-rename-symbol. Charter: Rename one Java simple symbol across a project using the guarded rename_java_symbol plan kind.\n\nProtocol:\n\n1. Ground the symbol structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{old_name}}\",\n                     languages=[\"java\"], item_kinds={{item_kinds}})\n   If source is provided, also run:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm {{old_name}} exists and {{new_name}} is a valid Java identifier.\n\n2. Inventory usages and preflight public API impact:\n   bbox_refactor_plan(kind=\"find_java_usages\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      item_names=[\"{{old_name}}\"], summary_only=true)\n   Build proposed_changes from the grounded declaration file(s), using\n   change_kind=\"modify\" for the renamed item, then run:\n   bbox_refactor_plan(kind=\"java_public_api_guard\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{project_dir}}\",\n                      toml_entries={\"proposed_changes\": proposed_changes})\n\n3. Plan the rename:\n   bbox_refactor_plan(kind=\"rename_java_symbol\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      item_names=[\"{{old_name}}\"], new_text=\"{{new_name}}\",\n                      item_kinds={{item_kinds}})\n   Inspect file_rename_advisory. If it is non-empty and apply_file_rename is\n   false, keep status=planned and surface the advisory. If apply_file_rename is\n   true, add one move_file plan per advisory before validation.\n\n4. Decide:\n   - If java_public_api_guard returns advisory_severity=\"breaking\" and\n     acknowledge_public_api_change is not true, emit bbox_note(kind=\"blocked\",\n     body=<guard summary + usage counts + plan_path>) and return status=\"blocked\".\n   - If usage inventory reports a broad common-name match and item_kinds/source\n     did not narrow it, block with a concrete diagnostic instead of applying.\n   - Otherwise proceed.\n\n5. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(confirm=true, steps=[\n     <rename_java_symbol step>,\n     /* optional move_file steps from file_rename_advisory when apply_file_rename=true */\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n6. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: old_name, new_name,\n     usage count, files touched, guard severity, file rename advisory/applied,\n     validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never rename more than one symbol per invocation.\n- Never default acknowledge_public_api_change.\n- Never apply when status=blocked.\n- Never hide file_rename_advisory; apply it only when apply_file_rename=true.\n\nInputs:\n{{project_dir}} {{source}} {{old_name}} {{new_name}} {{item_kinds}} {{acknowledge_public_api_change}} {{apply}} {{apply_file_rename}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "old_name": {
+            "type": "string"
+          },
+          "new_name": {
+            "type": "string"
+          },
+          "total_usages": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "guard_severity": {
+            "enum": [
+              "info",
+              "caution",
+              "breaking"
+            ]
+          },
+          "file_rename_advisory": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "file_renames_applied": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:java-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-13T00:00:00Z"
+    }
+  }
+}

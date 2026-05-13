@@ -236,6 +236,7 @@ general install order and supersession; this section focuses on refactor choices
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/java-refactor-persona.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-refactor-persona.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-extract-cohesive-class.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-rename-symbol.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-split-god-impl.json")
 ```
 
@@ -251,10 +252,14 @@ agent follows.
 | `atom:java-class-dependency-graph@v2` | Inventory a Java class before deciding what can be extracted. |
 | `atom:java-extract-cohesive-class@v3` | Extract methods plus field moves, delegate wiring, caller rewrites, and visibility fixes. |
 | `atom:java-extract-interface@v2` | Extract an interface and optionally migrate callers to the interface type. |
+| `atom:java-extract-methods-light@v1` | Move selected methods to a target class without delegate wiring or caller rewrites. |
+| `atom:java-extract-static-nested-class@v1` | Move static or implicitly-static nested types to top-level Java files. |
 | `atom:java-find-usages@v1` | Walk references for one or more Java names. |
 | `atom:java-lombokify@v1` | Convert hand-written POJO boilerplate to Lombok where semantics are safe. |
+| `atom:java-organize-imports@v1` | Organize Java imports through JDTLS with the structural fallback. |
 | `atom:java-promote-inner-class@v1` | Promote a non-static inner class with outer captures to a top-level class. |
 | `atom:java-public-api-guard@v1` | Report public API impact before a Java refactor. |
+| `atom:java-rename-symbol@v1` | Project-wide Java symbol rename with usage inventory, public-API preflight, optional file rename handling, and validation. |
 
 ### Rust Refactor Atoms
 

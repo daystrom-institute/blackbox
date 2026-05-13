@@ -115,6 +115,38 @@
         "java-find-usages"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-rename-symbol",
+      "query": "rename a java class method or field across the whole project",
+      "expected_atoms": [
+        "java-rename-symbol"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-extract-static-nested-class",
+      "query": "move a static java nested class to a top level file",
+      "expected_atoms": [
+        "java-extract-static-nested-class"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-organize-imports",
+      "query": "organize imports in a java file using jdtls fallback",
+      "expected_atoms": [
+        "java-organize-imports"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-extract-methods-light",
+      "query": "move selected java methods to another class without delegate wiring",
+      "expected_atoms": [
+        "java-extract-methods-light"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [
@@ -165,6 +197,30 @@
       "id": "anti-dep-graph-as-clusterer",
       "query": "decide partition for a java class",
       "atom": "java-class-dependency-graph",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-rename-overloaded-broad",
+      "query": "rename overloaded java methods without narrowing the source or item kinds",
+      "atom": "java-rename-symbol",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-static-nested-for-captures",
+      "query": "move non static java inner class with outer captures as a static nested class",
+      "atom": "java-extract-static-nested-class",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-organize-imports-as-type-repair",
+      "query": "fix missing java dependency symbols by organizing imports",
+      "atom": "java-organize-imports",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-methods-light-needs-delegate",
+      "query": "extract java methods and rewrite callers through a delegate field",
+      "atom": "java-extract-methods-light",
       "expect_matched_anti_pattern": true
     }
   ]

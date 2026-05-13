@@ -261,6 +261,80 @@
         "production_sites",
         "test_sites"
       ]
+    },
+    {
+      "id": "dispatch-java-rename-symbol-planonly",
+      "atom": "java-rename-symbol",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ServiceImpl.java",
+        "old_name": "process",
+        "new_name": "processRequest",
+        "item_kinds": [
+          "method_declaration"
+        ],
+        "apply": false,
+        "apply_file_rename": false
+      },
+      "expect_response_fields": [
+        "status",
+        "old_name",
+        "new_name",
+        "guard_severity",
+        "file_rename_advisory"
+      ]
+    },
+    {
+      "id": "dispatch-java-extract-static-nested-class-planonly",
+      "atom": "java-extract-static-nested-class",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/Outer.java",
+        "target": "src/main/java/com/example/Helper.java",
+        "item_names": [
+          "Helper"
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "nested_types_moved",
+        "target_file"
+      ]
+    },
+    {
+      "id": "dispatch-java-organize-imports-planonly",
+      "atom": "java-organize-imports",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "semantic_status",
+        "import_edits"
+      ]
+    },
+    {
+      "id": "dispatch-java-extract-methods-light-planonly",
+      "atom": "java-extract-methods-light",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "target": "src/main/java/com/example/UtilityTarget.java",
+        "module_name": "UtilityTarget",
+        "item_names": [
+          "normalize"
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "methods_moved",
+        "target_file",
+        "dependency_warnings"
+      ]
     }
   ]
 }

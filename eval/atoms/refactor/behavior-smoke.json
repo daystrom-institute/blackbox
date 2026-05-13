@@ -196,6 +196,63 @@
         "bbox_note:done"
       ],
       "done_note_required": true
+    },
+    {
+      "atom": "java-rename-symbol",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:find_java_usages",
+        "bbox_refactor_plan:java_public_api_guard",
+        "bbox_refactor_plan:rename_java_symbol",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "public-method-rename-without-acknowledge",
+        "expected_block_reason_substring": "breaking"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "java-extract-static-nested-class",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_nested_classes",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "non-static-inner-with-captures",
+        "expected_block_reason_substring": "java-promote-inner-class"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "java-organize-imports",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_lsp_organize_imports",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-extract-methods-light",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_methods",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "source-field-capture-without-acknowledge",
+        "expected_block_reason_substring": "external"
+      },
+      "done_note_required": true
     }
   ]
 }
