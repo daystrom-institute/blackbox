@@ -11,10 +11,10 @@
       
       
       
-        <link rel="prev" href="../getting-started/">
+        <link rel="prev" href="../graph-retrieval-internals/">
       
       
-        <link rel="next" href="../internals/">
+        <link rel="next" href="../operations/">
       
       
         
@@ -25,7 +25,7 @@
     
     
       
-        <title>Operating Guide - blackbox</title>
+        <title>Index And Embedding Internals - blackbox</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#operating-blackbox-day-2-runbook" class="md-skip">
+        <a href="#index-and-embedding-internals" class="md-skip">
           Skip to content
         </a>
       
@@ -112,7 +112,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Operating Guide
+              Index And Embedding Internals
             
           </span>
         </div>
@@ -369,37 +369,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Operating Guide
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
         
   
   
@@ -415,153 +388,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#what-healthy-looks-like" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        What healthy looks like
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#after-every-daemon-update" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        After every daemon update
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#reindexing" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Reindexing
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#project-registration-and-code-freshness" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Project registration and code freshness
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#embeddings-and-re-embedding" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Embeddings and re-embedding
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#compaction" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Compaction
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Compaction">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#vector-compaction" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Vector compaction
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#edge-sidecar-compaction" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Edge sidecar compaction
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#backup-and-restore-boundary" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Backup and restore boundary
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#troubleshooting-quick-map" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Troubleshooting quick map
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#key-paths" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Key paths
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -627,10 +453,37 @@
                 
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../index-embedding-internals/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Index And Embedding Internals
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -646,6 +499,125 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#rebuildable-vs-durable" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rebuildable vs durable
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tantivy-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tantivy index
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#schema-versioning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Schema versioning
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#project-file-indexing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Project file indexing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#embedding-router" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Embedding router
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#embedding-queue" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Embedding queue
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#vector-storage-and-compaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vector storage and compaction
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#edgeindex-and-sidecar-compaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        EdgeIndex and sidecar compaction
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#failure-boundaries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure boundaries
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -1466,10 +1438,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#what-healthy-looks-like" class="md-nav__link">
+  <a href="#rebuildable-vs-durable" class="md-nav__link">
     <span class="md-ellipsis">
       
-        What healthy looks like
+        Rebuildable vs durable
       
     </span>
   </a>
@@ -1477,10 +1449,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#after-every-daemon-update" class="md-nav__link">
+  <a href="#tantivy-index" class="md-nav__link">
     <span class="md-ellipsis">
       
-        After every daemon update
+        Tantivy index
       
     </span>
   </a>
@@ -1488,10 +1460,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#reindexing" class="md-nav__link">
+  <a href="#schema-versioning" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Reindexing
+        Schema versioning
       
     </span>
   </a>
@@ -1499,10 +1471,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#project-registration-and-code-freshness" class="md-nav__link">
+  <a href="#project-file-indexing" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Project registration and code freshness
+        Project file indexing
       
     </span>
   </a>
@@ -1510,10 +1482,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#embeddings-and-re-embedding" class="md-nav__link">
+  <a href="#embedding-router" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Embeddings and re-embedding
+        Embedding router
       
     </span>
   </a>
@@ -1521,49 +1493,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#compaction" class="md-nav__link">
+  <a href="#embedding-queue" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Compaction
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Compaction">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#vector-compaction" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Vector compaction
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#edge-sidecar-compaction" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Edge sidecar compaction
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#backup-and-restore-boundary" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Backup and restore boundary
+        Embedding queue
       
     </span>
   </a>
@@ -1571,10 +1504,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#troubleshooting-quick-map" class="md-nav__link">
+  <a href="#vector-storage-and-compaction" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Troubleshooting quick map
+        Vector storage and compaction
       
     </span>
   </a>
@@ -1582,10 +1515,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#key-paths" class="md-nav__link">
+  <a href="#edgeindex-and-sidecar-compaction" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Key paths
+        EdgeIndex and sidecar compaction
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#failure-boundaries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure boundaries
       
     </span>
   </a>
@@ -1612,217 +1556,164 @@
   
 
 
-<h1 id="operating-blackbox-day-2-runbook">Operating blackbox - day 2 runbook<a class="headerlink" href="#operating-blackbox-day-2-runbook" title="Permanent link">&para;</a></h1>
-<p>This is the page for keeping a running daemon healthy. It is deliberately
-not the design tour. For graph and retrieval mechanics, see
-<a href="../graph-retrieval-internals/">Graph And Retrieval Internals</a>. For index,
-embedding, and compaction implementation details, see
-<a href="../index-embedding-internals/">Index And Embedding Internals</a>.</p>
-<h2 id="what-healthy-looks-like">What healthy looks like<a class="headerlink" href="#what-healthy-looks-like" title="Permanent link">&para;</a></h2>
-<p>Run these from any MCP client connected to the daemon:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>bbox_stats()
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>bbox_embed_status()
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>bbox_project_list()
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>bbox_describe_schema()
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>bbox_hybrid_search(query=&quot;blackbox daemon&quot;, limit=5)
-</code></pre></div>
-<p>Healthy output usually means:</p>
+<h1 id="index-and-embedding-internals">Index and embedding internals<a class="headerlink" href="#index-and-embedding-internals" title="Permanent link">&para;</a></h1>
+<p>This page covers the rebuildable storage projections: Tantivy index,
+embedding partitions, EdgeIndex sidecars, schema migration, and
+compaction. For the operational runbook, see
+<a href="../operating-blackbox/">Operating blackbox</a>.</p>
+<h2 id="rebuildable-vs-durable">Rebuildable vs durable<a class="headerlink" href="#rebuildable-vs-durable" title="Permanent link">&para;</a></h2>
+<p>The index and vector stores are projections. They can be recreated from
+transcripts, registered projects, git history, and durable JSON stores.</p>
 <table>
 <thead>
 <tr>
-<th>Check</th>
-<th>Healthy signal</th>
-<th>If not</th>
+<th>Path</th>
+<th>Role</th>
+<th>Durable?</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>bbox_stats</code></td>
-<td>Non-zero documents, recent sessions visible, index size plausible</td>
-<td>Run <code>bbox_reindex(full=false)</code> first</td>
+<td><code>~/.local/share/blackbox/index/</code></td>
+<td>Tantivy index and schema marker</td>
+<td>No</td>
 </tr>
 <tr>
-<td><code>bbox_embed_status</code></td>
-<td><code>available: true</code>, <code>last_error: null</code>; queue drains after churn</td>
-<td>Fix provider/API key, then <code>bbox_reembed(route="...")</code> if needed</td>
+<td><code>~/.local/state/blackbox/vectors/</code></td>
+<td>HNSW partitions and WALs</td>
+<td>No</td>
 </tr>
 <tr>
-<td><code>bbox_project_list</code></td>
-<td>Expected repos registered with stable <code>project_id</code>s</td>
-<td>Register missing repos before blaming search</td>
+<td><code>~/.local/state/blackbox/edges/</code></td>
+<td>Project edge sidecars</td>
+<td>No</td>
 </tr>
 <tr>
-<td><code>bbox_describe_schema</code></td>
-<td>Entity populations are non-zero for transcripts/project files/knowledge</td>
-<td>Reindex and watch EdgeIndex rebuild logs</td>
+<td><code>~/.local/state/blackbox/git_meta/</code></td>
+<td>Git indexing fingerprints</td>
+<td>No</td>
 </tr>
 <tr>
-<td><code>bbox_hybrid_search</code></td>
-<td>Results include useful refs and sources; project filter works</td>
-<td>Check index freshness, embedding status, and project registration</td>
+<td><code>~/.local/state/blackbox/projects.json</code></td>
+<td>Registered project roots and IDs</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>~/.local/state/blackbox/blackbox-*.json</code></td>
+<td>Knowledge, notes, threads, pins, roadmap</td>
+<td>Yes</td>
 </tr>
 </tbody>
 </table>
-<p>Useful shell checks:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>systemctl<span class="w"> </span>--user<span class="w"> </span>status<span class="w"> </span>blackbox.service
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>journalctl<span class="w"> </span>--user<span class="w"> </span>-u<span class="w"> </span>blackbox.service<span class="w"> </span>-n<span class="w"> </span><span class="m">100</span><span class="w"> </span>--no-pager
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>journalctl<span class="w"> </span>--user<span class="w"> </span>-u<span class="w"> </span>blackbox.service<span class="w"> </span>-f
-</code></pre></div>
-<h2 id="after-every-daemon-update">After every daemon update<a class="headerlink" href="#after-every-daemon-update" title="Permanent link">&para;</a></h2>
-<p>Build and install the binaries you changed:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>cargo<span class="w"> </span>build<span class="w"> </span>--release
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>install<span class="w"> </span>-m<span class="w"> </span><span class="m">755</span><span class="w"> </span>target/release/blackboxd<span class="w"> </span>~/.local/bin/blackboxd
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>install<span class="w"> </span>-m<span class="w"> </span><span class="m">755</span><span class="w"> </span>target/release/blackboxd<span class="w"> </span>~/.local/bin/blackboxd-dev
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>install<span class="w"> </span>-m<span class="w"> </span><span class="m">755</span><span class="w"> </span>target/release/bro<span class="w"> </span>~/.local/bin/bro
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>systemctl<span class="w"> </span>--user<span class="w"> </span>restart<span class="w"> </span>blackbox.service
-</code></pre></div>
-<p>Restart <code>blackbox-dev.service</code> only if you updated the dev daemon too.
-Prod and dev intentionally use different installed binary paths.</p>
-<p>Then watch the journal:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>journalctl<span class="w"> </span>--user<span class="w"> </span>-u<span class="w"> </span>blackbox.service<span class="w"> </span>-f
-</code></pre></div>
-<p>Expected after a normal restart:</p>
+<h2 id="tantivy-index">Tantivy index<a class="headerlink" href="#tantivy-index" title="Permanent link">&para;</a></h2>
+<p>Blackbox indexes one document per content block. That gives role-aware
+search and precise excerpts instead of one large opaque document per
+session.</p>
+<p>Indexed sources include:</p>
 <ul>
-<li>Existing index opens.</li>
-<li>Background reindex starts after its startup delay.</li>
-<li>Embedding queues may receive new/changed docs.</li>
-<li>EdgeIndex rebuilds if the indexed corpus grew.</li>
+<li>transcript blocks from supported providers;</li>
+<li>project source and docs from registered repos;</li>
+<li>git commit messages;</li>
+<li>knowledge entries;</li>
+<li>notes and threads;</li>
+<li>selected tool-call records.</li>
 </ul>
-<p>Expected after a schema change:</p>
-<ul>
-<li>Log contains <code>dropping transcript index for schema migration</code>.</li>
-<li>Reindex takes minutes on a large corpus.</li>
-<li>EdgeIndex rebuild follows after the document count changes.</li>
-</ul>
-<p>Smoke the daemon after the journal quiets:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>bbox_stats()
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>bbox_embed_status()
-<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>bbox_describe_schema()
-<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>bbox_hybrid_search(query=&quot;recent changes&quot;, project=&quot;/abs/path/to/repo&quot;, limit=5)
+<p>The background reindex thread runs on an interval controlled by
+<code>BLACKBOX_REINDEX_INTERVAL_SECS</code> (default <code>120</code>). Interactive search can
+also trigger initial index creation when the index is empty.</p>
+<p>Manual tools:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>bbox_reindex(full=false)
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>bbox_reindex(full=true)
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>bbox_stats()
 </code></pre></div>
-<h2 id="reindexing">Reindexing<a class="headerlink" href="#reindexing" title="Permanent link">&para;</a></h2>
-<p>The daemon keeps a Tantivy index for transcripts, project files, git
-messages, knowledge entries, notes, threads, and tool-call records. The
-background reindexer runs periodically, controlled by
-<code>BLACKBOX_REINDEX_INTERVAL_SECS</code> (default <code>120</code>).</p>
-<p>Manual reindexing is for operator intervention, not normal file edits.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>bbox_reindex(full=false)
+<p>Incremental reindex uses file metadata and source-specific fingerprints
+to avoid rewriting unchanged content. Full reindex rebuilds the corpus
+projection from scratch.</p>
+<h2 id="schema-versioning">Schema versioning<a class="headerlink" href="#schema-versioning" title="Permanent link">&para;</a></h2>
+<p><code>INDEX_SCHEMA_VERSION</code> in <code>src/index/mod.rs</code> gates index compatibility.
+On daemon startup, the stored marker is compared with the binary's
+version. A mismatch drops the old index directory and rebuilds it.</p>
+<p>Marker path:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>~/.local/share/blackbox/index/schema_version.txt
 </code></pre></div>
-<p>Use incremental reindex when:</p>
-<ul>
-<li>search looks stale after recent transcript or source changes;</li>
-<li>you restored protected JSON stores and want the index to catch up;</li>
-<li>you registered a project and want to start indexing immediately;</li>
-<li>a background reindex failed after a transient filesystem or lock issue.</li>
-</ul>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>bbox_reindex(full=true)
+<p>Expected migration log:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>dropping transcript index for schema migration
 </code></pre></div>
-<p>Use full reindex when:</p>
-<ul>
-<li><code>INDEX_SCHEMA_VERSION</code> changed;</li>
-<li>chunking/tokenization changed;</li>
-<li>the index was created by an older incompatible binary;</li>
-<li><code>bbox_stats</code> looks impossible, or searches return stale/deleted paths;</li>
-<li>you suspect index corruption.</li>
-</ul>
-<p>Watch for:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>auto-reindex: indexed N files (M docs)
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>edge-index watcher: corpus grew, EdgeIndex rebuilt
-</code></pre></div>
-<p>The rebuildable index lives at:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>~/.local/share/blackbox/index/
-</code></pre></div>
-<p>Do not back it up as durable state. Rebuild it from transcripts,
-registered projects, and protected JSON stores.</p>
-<h2 id="project-registration-and-code-freshness">Project registration and code freshness<a class="headerlink" href="#project-registration-and-code-freshness" title="Permanent link">&para;</a></h2>
-<p>Project file indexing only covers registered repos. Check before adding:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>bbox_project_list()
-</code></pre></div>
-<p>Register with an absolute path:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>bbox_project_register(path=&quot;/abs/path/to/repo&quot;)
-</code></pre></div>
-<p>Registration records the root in <code>~/.local/state/blackbox/projects.json</code>,
-starts an incremental reindex, and triggers graph projection work. Large
-repos can take 10+ minutes on first index.</p>
-<p>If source navigation or refactor tools cannot see a repo, verify in this
-order:</p>
-<ol>
-<li><code>bbox_project_list()</code> includes the repo.</li>
-<li><code>bbox_stats()</code> shows project-file growth after reindex.</li>
-<li><code>bbox_hybrid_search(query="known symbol", project="/abs/path/to/repo")</code>
-   returns project-file refs.</li>
-<li><code>bbox_embed_status()</code> shows the <code>code</code> route available if you need vector search.</li>
-</ol>
-<p>For more code-specific tooling, see
-<a href="../projects-code-indexing/">Projects And Code Indexing</a>.</p>
-<h2 id="embeddings-and-re-embedding">Embeddings and re-embedding<a class="headerlink" href="#embeddings-and-re-embedding" title="Permanent link">&para;</a></h2>
-<p>Embeddings are a second lane beside Tantivy. Reindexing creates source
-documents; embedding workers turn those source docs into vector
-partitions under:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>~/.local/state/blackbox/vectors/
-</code></pre></div>
-<p>Check route health:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>bbox_embed_status()
-</code></pre></div>
-<p>Important fields:</p>
+<p>Recent schema tags:</p>
 <table>
 <thead>
 <tr>
-<th>Field</th>
-<th>Meaning</th>
+<th>Tag</th>
+<th>Change</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>available</code></td>
-<td>Provider/model can currently serve that route</td>
+<td><code>agentic-corpus-g1</code></td>
+<td>Initial graph-aware schema</td>
 </tr>
 <tr>
-<td><code>provider</code>, <code>model</code>, <code>dim</code></td>
-<td>Active embedding backend and vector shape</td>
+<td><code>agentic-corpus-g2-path-tokens</code></td>
+<td>Tokenized path field</td>
 </tr>
 <tr>
-<td><code>indexed_count</code></td>
-<td>Number of vectors stored for that route</td>
+<td><code>agentic-corpus-g3-commit-subject-tokens</code></td>
+<td>Commit subjects contribute path-style tokens</td>
 </tr>
 <tr>
-<td><code>queue_depth</code></td>
-<td>Pending docs waiting to embed</td>
+<td><code>agentic-corpus-g4-elixir-symbols</code></td>
+<td>Elixir symbol extraction</td>
 </tr>
 <tr>
-<td><code>retried_count</code></td>
-<td>Retry pressure; should not climb forever</td>
-</tr>
-<tr>
-<td><code>last_error</code></td>
-<td>First place to look for auth, dimension, or provider failures</td>
+<td><code>agentic-corpus-g5-symbol-tokenized</code></td>
+<td>Symbol field uses code tokenizer</td>
 </tr>
 </tbody>
 </table>
-<p>Routes normally include:</p>
+<h2 id="project-file-indexing">Project file indexing<a class="headerlink" href="#project-file-indexing" title="Permanent link">&para;</a></h2>
+<p>Registered projects are read from <code>projects.json</code>. Project chunks feed:</p>
+<ul>
+<li>project-file search;</li>
+<li>symbol extraction;</li>
+<li>graph sidecars;</li>
+<li>code/doc embedding routes;</li>
+<li>git commit document indexing.</li>
+</ul>
+<p>Per-project edge sidecars live under:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>~/.local/state/blackbox/edges/&lt;project_id&gt;.jsonl
+</code></pre></div>
+<p>Git fingerprints live under:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>~/.local/state/blackbox/git_meta/&lt;project_id&gt;.json
+</code></pre></div>
+<p>The git metadata is rebuildable. It exists so incremental indexing does
+not repeatedly scan the same commit history.</p>
+<h2 id="embedding-router">Embedding router<a class="headerlink" href="#embedding-router" title="Permanent link">&para;</a></h2>
+<p>Embeddings feed the vector lane in hybrid search. Routes are independent
+so one provider/model change does not invalidate every vector.</p>
+<p>Common routes:</p>
 <table>
 <thead>
 <tr>
 <th>Route</th>
-<th>Typical contents</th>
+<th>Source docs</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>code</code></td>
-<td>Source code chunks</td>
+<td>Source-code chunks</td>
 </tr>
 <tr>
 <td><code>docs</code></td>
-<td>Markdown and doc chunks</td>
+<td>Markdown/doc chunks</td>
 </tr>
 <tr>
 <td><code>git_message</code></td>
-<td>Commit subjects/bodies</td>
+<td>Commit subjects and bodies</td>
 </tr>
 <tr>
 <td><code>knowledge</code></td>
-<td>Knowledge-store entries</td>
+<td>Knowledge entries</td>
 </tr>
 <tr>
 <td><code>notes</code></td>
@@ -1834,220 +1725,129 @@ partitions under:</p>
 </tr>
 </tbody>
 </table>
-<p>Re-embed a route when:</p>
-<ul>
-<li>provider/model/dimension changed in <code>~/.config/blackbox/embed.toml</code>;</li>
-<li>Voyage/Ollama was down and a route accumulated failures;</li>
-<li>vectors were deleted during restore;</li>
-<li>vector search misses content that BM25 finds after reindexing.</li>
-</ul>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>bbox_reembed(route=&quot;code&quot;)
-<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>bbox_reembed(route=&quot;docs&quot;)
-<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>bbox_reembed(route=&quot;transcripts&quot;)
+<p>Each route is keyed by provider, model, and dimension. A dimension
+mismatch is a hard error because old vectors cannot be mixed with new
+vectors safely.</p>
+<p>Operator tools:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>bbox_embed_status()
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>bbox_reembed(route=&quot;&lt;route&gt;&quot;)
 </code></pre></div>
-<p>Then watch:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>bbox_embed_status()
+<p>Provider config lives in:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>~/.config/blackbox/embed.toml
 </code></pre></div>
-<p><code>queue_depth</code> should trend down. A non-zero queue is normal during a
-large reindex; a queue that never drains is an operations issue.</p>
-<p>Voyage needs <code>DAYSTROM_VOYAGE_API_KEY</code> or <code>VOYAGE_API_KEY</code> in the
-systemd environment:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="c1"># ~/.config/systemd/user/blackbox.service.d/secrets.conf</span>
-<a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="k">[Service]</span>
-<a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="na">Environment</span><span class="o">=</span><span class="s">DAYSTROM_VOYAGE_API_KEY=pa-...</span>
+<p>Voyage uses <code>voyage-code-3</code> by default. Ollama can be used for local
+routes such as <code>nomic-embed-text</code>.</p>
+<h2 id="embedding-queue">Embedding queue<a class="headerlink" href="#embedding-queue" title="Permanent link">&para;</a></h2>
+<p>The daemon runs route-specific workers. Reindexing enqueues source docs;
+workers batch, send, retry, and persist vectors.</p>
+<p>Voyage batch cap:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>64 documents or 80KB total per request
 </code></pre></div>
-<p>Apply changes with:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>systemctl<span class="w"> </span>--user<span class="w"> </span>daemon-reload
-<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>systemctl<span class="w"> </span>--user<span class="w"> </span>restart<span class="w"> </span>blackbox.service
-</code></pre></div>
-<h2 id="compaction">Compaction<a class="headerlink" href="#compaction" title="Permanent link">&para;</a></h2>
-<p>There are three different things people mean by compaction. They do not
-share the same fix.</p>
+<p>The cap is intentionally below provider limits so a large restart does
+not create one oversized request, retry it repeatedly, and drop the
+whole batch.</p>
+<p><code>bbox_embed_status</code> exposes the operational shape:</p>
 <table>
 <thead>
 <tr>
-<th>Area</th>
-<th>What grows</th>
-<th>Normal action</th>
+<th>Field</th>
+<th>Meaning</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Vector partitions</td>
-<td>WAL records under <code>~/.local/state/blackbox/vectors/</code></td>
-<td>Automatic background compactor</td>
+<td><code>available</code></td>
+<td>Provider is usable for the route</td>
 </tr>
 <tr>
-<td>Edge sidecars</td>
-<td>JSONL graph sidecars under <code>~/.local/state/blackbox/edges/</code></td>
-<td><code>bbox_edge_compact</code> when sidecars grow from repeated full reindex replay</td>
+<td><code>provider</code>, <code>model</code>, <code>dim</code></td>
+<td>Active vector partition identity</td>
 </tr>
 <tr>
-<td>Workflow context</td>
-<td>Rolling <code>ANCHOR</code> notes on workflow threads</td>
-<td>Read via <code>bro orchestrate status</code> or <code>bbox_notes</code>; no storage cleanup needed</td>
+<td><code>indexed_count</code></td>
+<td>Stored vector count</td>
+</tr>
+<tr>
+<td><code>queue_depth</code></td>
+<td>Pending source docs</td>
+</tr>
+<tr>
+<td><code>retried_count</code></td>
+<td>Retry pressure</td>
+</tr>
+<tr>
+<td><code>last_error</code></td>
+<td>Last route-level failure</td>
 </tr>
 </tbody>
 </table>
-<h3 id="vector-compaction">Vector compaction<a class="headerlink" href="#vector-compaction" title="Permanent link">&para;</a></h3>
-<p>Vector WAL compaction is automatic. You should not normally run a tool
-for it. Watch the journal for <code>vector partition compacted</code> if disk churn
-or vector files look suspicious.</p>
-<p>If vectors are bad because the provider changed, the operational fix is
-not "compact harder"; it is:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a>bbox_reembed(route=&quot;&lt;route&gt;&quot;)
-</code></pre></div>
-<h3 id="edge-sidecar-compaction">Edge sidecar compaction<a class="headerlink" href="#edge-sidecar-compaction" title="Permanent link">&para;</a></h3>
-<p>Project graph sidecars can grow when old derived edges are appended by
-repeated full refreshes. Compact one project at a time.</p>
-<p>First dry-run:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a>bbox_edge_compact(project_id=&quot;d723917f&quot;, apply=false)
-</code></pre></div>
-<p>Review removed/retained counts. If the scope is expected, apply:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a>bbox_edge_compact(project_id=&quot;d723917f&quot;, apply=true, rebuild=false)
-</code></pre></div>
-<p>When compacting several projects, leave <code>rebuild=false</code> until the last
-one. On the final project:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a>bbox_edge_compact(project_id=&quot;d723917f&quot;, apply=true, rebuild=true)
-</code></pre></div>
-<p>The tool keeps explicit/provenance/malformed lines and removes legacy
-derived edges. It writes a backup before replacing the sidecar.</p>
-<h2 id="backup-and-restore-boundary">Backup and restore boundary<a class="headerlink" href="#backup-and-restore-boundary" title="Permanent link">&para;</a></h2>
-<p>Protect durable JSON stores and installed operator artifacts. Rebuild
-indexes, vectors, edge projections, and git metadata.</p>
-<p>Protect:</p>
+<h2 id="vector-storage-and-compaction">Vector storage and compaction<a class="headerlink" href="#vector-storage-and-compaction" title="Permanent link">&para;</a></h2>
+<p>Vector partitions are WAL-backed. Writes append records; a background
+compactor periodically rewrites active entries into a smaller WAL and
+removes deleted/stale ordinals.</p>
+<p>Important behavior:</p>
 <ul>
-<li><code>~/.local/state/blackbox/blackbox-knowledge.json</code></li>
-<li><code>~/.local/state/blackbox/blackbox-notes.json</code></li>
-<li><code>~/.local/state/blackbox/blackbox-threads.json</code></li>
-<li><code>~/.local/state/blackbox/blackbox-pins.json</code></li>
-<li><code>~/.local/state/blackbox/blackbox-roadmap.json</code></li>
-<li><code>~/.local/state/blackbox/projects.json</code></li>
-<li><code>~/.local/state/blackbox/packets/</code></li>
-<li><code>~/.local/state/blackbox/artifacts/</code></li>
-<li><code>~/.local/state/blackbox/bro/</code></li>
-<li>customized <code>~/.config/blackbox/embed.toml</code></li>
-<li>systemd drop-ins containing API keys</li>
+<li>Compaction is automatic.</li>
+<li>Compaction is per partition.</li>
+<li>The compactor streams active entries instead of holding several full
+  copies in memory.</li>
+<li>If vectors are semantically wrong after a provider/model change,
+  <code>bbox_reembed(route="...")</code> is the fix, not manual compaction.</li>
 </ul>
-<p>Rebuild:</p>
+<p>Watch the journal for:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>vector partition compacted
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>vector partition compaction failed; will retry
+</code></pre></div>
+<h2 id="edgeindex-and-sidecar-compaction">EdgeIndex and sidecar compaction<a class="headerlink" href="#edgeindex-and-sidecar-compaction" title="Permanent link">&para;</a></h2>
+<p>EdgeIndex combines:</p>
 <ul>
-<li><code>~/.local/share/blackbox/index/</code> with <code>bbox_reindex(full=true)</code></li>
-<li><code>~/.local/state/blackbox/vectors/</code> with <code>bbox_reembed(route="...")</code></li>
-<li><code>~/.local/state/blackbox/edges/</code> via reindex/EdgeIndex rebuild</li>
-<li><code>~/.local/state/blackbox/git_meta/</code> via the next reindex</li>
+<li>per-project sidecars from project indexing;</li>
+<li>live edges from knowledge, thread, and note stores;</li>
+<li>virtual edges for tasks and tool calls.</li>
 </ul>
-<p>The longer backup checklist lives in <a href="../operations/">Operations</a>.</p>
-<h2 id="troubleshooting-quick-map">Troubleshooting quick map<a class="headerlink" href="#troubleshooting-quick-map" title="Permanent link">&para;</a></h2>
+<p>The watcher rebuilds EdgeIndex when Tantivy's document count grows.</p>
+<p>Legacy sidecars can accumulate derived edges after repeated full project
+refreshes. <code>bbox_edge_compact</code> removes old derived lines while retaining
+explicit/provenance/malformed lines.</p>
+<p>Safe sequence:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>bbox_edge_compact(project_id=&quot;d723917f&quot;, apply=false)
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>bbox_edge_compact(project_id=&quot;d723917f&quot;, apply=true, rebuild=false)
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>bbox_edge_compact(project_id=&quot;d723917f&quot;, apply=true, rebuild=true)
+</code></pre></div>
+<p>Use <code>rebuild=false</code> while compacting several projects, then <code>rebuild=true</code>
+on the final one.</p>
+<h2 id="failure-boundaries">Failure boundaries<a class="headerlink" href="#failure-boundaries" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
-<th>Symptom</th>
-<th>First checks</th>
-<th>Likely action</th>
+<th>Failure</th>
+<th>Rebuild path</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Search misses recent transcripts</td>
-<td><code>bbox_stats</code>, journal reindex lines</td>
-<td><code>bbox_reindex(full=false)</code></td>
-</tr>
-<tr>
-<td>Search returns deleted files</td>
-<td>project registration, index age</td>
+<td>Tantivy index missing/corrupt</td>
 <td><code>bbox_reindex(full=true)</code></td>
 </tr>
 <tr>
-<td>Hybrid search is lexical only</td>
-<td><code>bbox_embed_status</code></td>
-<td>Fix route/provider, then <code>bbox_reembed(route="...")</code></td>
+<td>Embedding vectors missing</td>
+<td><code>bbox_reembed(route="...")</code> per route</td>
 </tr>
 <tr>
-<td>Code nav cannot see repo</td>
-<td><code>bbox_project_list</code></td>
-<td><code>bbox_project_register(path="/abs/path")</code></td>
+<td>Edge sidecars missing</td>
+<td>Full or incremental project reindex</td>
 </tr>
 <tr>
-<td>Graph paths look sparse</td>
-<td><code>bbox_describe_schema</code>, EdgeIndex log lines</td>
-<td>Reindex, then wait for EdgeIndex rebuild</td>
+<td>Git metadata missing</td>
+<td>Next reindex repopulates it</td>
 </tr>
 <tr>
-<td>Disk grows under <code>vectors/</code></td>
-<td>journal compaction lines</td>
-<td>Usually wait; re-embed only after provider/data issues</td>
-</tr>
-<tr>
-<td>Disk grows under <code>edges/</code></td>
-<td>sidecar size, project id</td>
-<td>Dry-run <code>bbox_edge_compact</code></td>
-</tr>
-<tr>
-<td>Provider markdown stale</td>
-<td><code>bbox_lint</code>, rendered files</td>
-<td><code>bbox_render(scope="global")</code></td>
+<td>Project registry missing</td>
+<td>Restore <code>projects.json</code>; otherwise project IDs change</td>
 </tr>
 </tbody>
 </table>
-<h2 id="key-paths">Key paths<a class="headerlink" href="#key-paths" title="Permanent link">&para;</a></h2>
-<table>
-<thead>
-<tr>
-<th>Path</th>
-<th>Contents</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>~/.local/bin/blackboxd</code></td>
-<td>Production daemon binary</td>
-</tr>
-<tr>
-<td><code>~/.local/bin/blackboxd-dev</code></td>
-<td>Dev daemon binary</td>
-</tr>
-<tr>
-<td><code>~/.local/bin/bro</code></td>
-<td>Terminal TUI client</td>
-</tr>
-<tr>
-<td><code>~/.config/systemd/user/blackbox.service</code></td>
-<td>Prod systemd unit</td>
-</tr>
-<tr>
-<td><code>~/.config/systemd/user/blackbox.service.d/*.conf</code></td>
-<td>Drop-in env and secrets</td>
-</tr>
-<tr>
-<td><code>~/.local/share/blackbox/index/</code></td>
-<td>Rebuildable Tantivy index</td>
-</tr>
-<tr>
-<td><code>~/.local/state/blackbox/vectors/</code></td>
-<td>Rebuildable vector partitions</td>
-</tr>
-<tr>
-<td><code>~/.local/state/blackbox/edges/</code></td>
-<td>Rebuildable graph sidecars</td>
-</tr>
-<tr>
-<td><code>~/.local/state/blackbox/git_meta/</code></td>
-<td>Rebuildable git fingerprints</td>
-</tr>
-<tr>
-<td><code>~/.local/state/blackbox/</code></td>
-<td>Durable JSON stores plus rebuildable projections</td>
-</tr>
-<tr>
-<td><code>~/.bro/mcp.json</code></td>
-<td>Global MCP server config</td>
-</tr>
-<tr>
-<td><code>&lt;project&gt;/.bro/mcp.json</code></td>
-<td>Project MCP overlay</td>
-</tr>
-</tbody>
-</table>
+<p>The protected-state list is in <a href="../operations/">Operations</a>.</p>
 
 
 
