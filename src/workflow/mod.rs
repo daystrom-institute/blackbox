@@ -1666,6 +1666,10 @@ mod tests {
                 include_str!("../../examples/workflows/e2e-combo.json"),
             ),
             (
+                "e2e-atom-binding",
+                include_str!("../../examples/workflows/e2e-atom-binding.json"),
+            ),
+            (
                 "optimistic",
                 include_str!("../../examples/workflows/optimistic.json"),
             ),
@@ -1688,23 +1692,27 @@ mod tests {
             ),
             (
                 "agent-chain",
-                include_str!("../../examples/agents/workflows/chain.json"),
+                include_str!("../../system-defaults/agents/workflows/chain.json"),
             ),
             (
                 "agent-fan-out",
-                include_str!("../../examples/agents/workflows/fan-out.json"),
+                include_str!("../../system-defaults/agents/workflows/fan-out.json"),
             ),
             (
                 "agent-escalation",
-                include_str!("../../examples/agents/workflows/escalation.json"),
+                include_str!("../../system-defaults/agents/workflows/escalation.json"),
             ),
             (
                 "agent-eval-arc",
-                include_str!("../../examples/agents/workflows/agent-eval-arc.json"),
+                include_str!("../../system-defaults/agents/workflows/agent-eval-arc.json"),
             ),
             (
                 "agent-cuing-eval-arc",
-                include_str!("../../examples/agents/workflows/agent-cuing-eval-arc.json"),
+                include_str!("../../system-defaults/agents/workflows/agent-cuing-eval-arc.json"),
+            ),
+            (
+                "atom-echo-review",
+                include_str!("../../system-defaults/workflows/atoms/echo-review.json"),
             ),
         ];
 
@@ -1771,6 +1779,10 @@ mod tests {
                 include_str!("../../examples/workflows/e2e-combo.json"),
             ),
             (
+                "e2e-atom-binding",
+                include_str!("../../examples/workflows/e2e-atom-binding.json"),
+            ),
+            (
                 "optimistic",
                 include_str!("../../examples/workflows/optimistic.json"),
             ),
@@ -1793,23 +1805,27 @@ mod tests {
             ),
             (
                 "agent-chain",
-                include_str!("../../examples/agents/workflows/chain.json"),
+                include_str!("../../system-defaults/agents/workflows/chain.json"),
             ),
             (
                 "agent-fan-out",
-                include_str!("../../examples/agents/workflows/fan-out.json"),
+                include_str!("../../system-defaults/agents/workflows/fan-out.json"),
             ),
             (
                 "agent-escalation",
-                include_str!("../../examples/agents/workflows/escalation.json"),
+                include_str!("../../system-defaults/agents/workflows/escalation.json"),
             ),
             (
                 "agent-eval-arc",
-                include_str!("../../examples/agents/workflows/agent-eval-arc.json"),
+                include_str!("../../system-defaults/agents/workflows/agent-eval-arc.json"),
             ),
             (
                 "agent-cuing-eval-arc",
-                include_str!("../../examples/agents/workflows/agent-cuing-eval-arc.json"),
+                include_str!("../../system-defaults/agents/workflows/agent-cuing-eval-arc.json"),
+            ),
+            (
+                "atom-echo-review",
+                include_str!("../../system-defaults/workflows/atoms/echo-review.json"),
             ),
         ];
         for (name, src) in cases {
@@ -1838,29 +1854,33 @@ mod tests {
     }
 
     #[test]
-    fn agent_workflows_install_via_artifact_catalog() {
+    fn system_default_workflows_install_via_artifact_catalog() {
         let tmp = tempfile::tempdir().unwrap();
         let catalog = crate::artifacts::ArtifactCatalog::open(tmp.path().to_path_buf()).unwrap();
         let cases: &[(&str, &str)] = &[
             (
                 "agent-chain",
-                include_str!("../../examples/agents/workflows/chain.json"),
+                include_str!("../../system-defaults/agents/workflows/chain.json"),
             ),
             (
                 "agent-fan-out",
-                include_str!("../../examples/agents/workflows/fan-out.json"),
+                include_str!("../../system-defaults/agents/workflows/fan-out.json"),
             ),
             (
                 "agent-escalation",
-                include_str!("../../examples/agents/workflows/escalation.json"),
+                include_str!("../../system-defaults/agents/workflows/escalation.json"),
             ),
             (
                 "agent-eval-arc",
-                include_str!("../../examples/agents/workflows/agent-eval-arc.json"),
+                include_str!("../../system-defaults/agents/workflows/agent-eval-arc.json"),
             ),
             (
                 "agent-cuing-eval-arc",
-                include_str!("../../examples/agents/workflows/agent-cuing-eval-arc.json"),
+                include_str!("../../system-defaults/agents/workflows/agent-cuing-eval-arc.json"),
+            ),
+            (
+                "atom-echo-review",
+                include_str!("../../system-defaults/workflows/atoms/echo-review.json"),
             ),
         ];
         for (name, src) in cases {
@@ -1909,23 +1929,27 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             (
                 "agent-chain",
-                include_str!("../../examples/agents/workflows/chain.json"),
+                include_str!("../../system-defaults/agents/workflows/chain.json"),
             ),
             (
                 "agent-fan-out",
-                include_str!("../../examples/agents/workflows/fan-out.json"),
+                include_str!("../../system-defaults/agents/workflows/fan-out.json"),
             ),
             (
                 "agent-escalation",
-                include_str!("../../examples/agents/workflows/escalation.json"),
+                include_str!("../../system-defaults/agents/workflows/escalation.json"),
             ),
             (
                 "agent-eval-arc",
-                include_str!("../../examples/agents/workflows/agent-eval-arc.json"),
+                include_str!("../../system-defaults/agents/workflows/agent-eval-arc.json"),
             ),
             (
                 "agent-cuing-eval-arc",
-                include_str!("../../examples/agents/workflows/agent-cuing-eval-arc.json"),
+                include_str!("../../system-defaults/agents/workflows/agent-cuing-eval-arc.json"),
+            ),
+            (
+                "atom-echo-review",
+                include_str!("../../system-defaults/workflows/atoms/echo-review.json"),
             ),
         ];
         for (name, src) in cases {
@@ -1941,7 +1965,7 @@ mod tests {
 
     #[test]
     fn agent_chain_uses_dispatch_wait_pattern() {
-        let src = include_str!("../../examples/agents/workflows/chain.json");
+        let src = include_str!("../../system-defaults/agents/workflows/chain.json");
         let spec = load_workflow(src).unwrap();
         let node = spec.nodes.get("RunFirst").expect("RunFirst node");
         let ops = &node.on_enter;
@@ -2037,7 +2061,7 @@ mod tests {
 
     #[test]
     fn agent_fan_out_uses_sequential_dispatch_wait_aggregate() {
-        let src = include_str!("../../examples/agents/workflows/fan-out.json");
+        let src = include_str!("../../system-defaults/agents/workflows/fan-out.json");
         let spec = load_workflow(src).unwrap();
         let dispatch_both = spec.nodes.get("DispatchBoth").expect("DispatchBoth node");
         assert_eq!(
@@ -2096,7 +2120,7 @@ mod tests {
 
     #[test]
     fn agent_escalation_uses_gate_branch() {
-        let src = include_str!("../../examples/agents/workflows/escalation.json");
+        let src = include_str!("../../system-defaults/agents/workflows/escalation.json");
         let spec = load_workflow(src).unwrap();
         let cheap = spec.nodes.get("CheapAttempt").expect("CheapAttempt node");
         assert!(
@@ -2176,8 +2200,8 @@ mod tests {
 
     #[test]
     fn agent_escalation_gate_packet_matches_workflow_domain() {
-        let workflow_src = include_str!("../../examples/agents/workflows/escalation.json");
-        let packet_src = include_str!("../../examples/agents/packets/escalation-judge.json");
+        let workflow_src = include_str!("../../system-defaults/agents/workflows/escalation.json");
+        let packet_src = include_str!("../../system-defaults/agents/packets/escalation-judge.json");
         let spec = load_workflow(workflow_src).unwrap();
         let cheap = spec.nodes.get("CheapAttempt").expect("CheapAttempt node");
         assert_eq!(

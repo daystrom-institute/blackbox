@@ -432,6 +432,18 @@ Dispatch agent tasks to Claude, GLM, DeepSeek, Inception, Codex, Copilot, Vibe, 
 | `bro_brofile` | Manage brofile templates and named accounts. |
 | `bro_team` | Manage team templates and live teams. |
 
+### Atoms (`atom_*`)
+
+| Tool | Description |
+|---|---|
+| `atom_list` / `atom_search` | Browse installed first-class capability artifacts by subcontract, cost, provenance, or semantic query. |
+| `atom_get` / `atom_describe` | Inspect an atom contract, implementation kind, effects, composition policy, and trace policy. |
+| `atom_invoke` | Invoke an atom through its implementation path (`profile`, `workflow`, `deterministic`, or `adapter`). Returns an owned invocation handle. |
+| `atom_status` | Read the normalized trace envelope for an invocation. Ownership-gated. |
+| `atom_resume` / `atom_delegate` | Resume profile-backed invocations or grant ownership to another caller. |
+
+Full reference in [`docs/atoms.md`](docs/atoms.md).
+
 ### Workflow engine (`bro_*`)
 
 | Tool | Description |
@@ -576,6 +588,7 @@ Then `systemctl --user daemon-reload && systemctl --user restart blackbox`.
 - **MCP over streamable HTTP** — `rmcp` crate as transport, axum for auxiliary `/tail` and `/roster` endpoints. Progress notifications echo the caller's `progressToken` per spec.
 - **Knowledge render pipeline** — three-layer composition (steerage → shared memory → per-project PROJECT.md) into provider-specific markdown, with atomic-replace safety and external-edit absorption.
 - **Multi-provider orchestration** — spawns provider CLIs as child processes, streams JSON events, manages task lifecycle, team coordination, and SSE broadcast to `/tail` subscribers.
+- **Atom registry and invocation** — installable `atom:*@vN` capability artifacts with input/output contracts, effect limits, composition policy, and profile/workflow/deterministic/adapter implementations.
 - **Two-layer transcript model** — `parser::TranscriptEvent` (rich, tool-call structured, system-signal aware) for the `bro tail` TUI; projected to `ParsedEvent` for the flat tantivy doc shape.
 - **No LLM calls** — pure local indexing and retrieval. `bbox_topics` uses term frequency, not embeddings.
 
@@ -591,13 +604,23 @@ Source layout (`src/`):
 
 ---
 
+## System defaults
+
+Installable blackbox-owned artifacts live in [`system-defaults/`](system-defaults/README.md).
+This includes atoms, Badgey artifacts, refactor personas, agentic-corpus
+producer machinery, and the default MCP surface packet. The daemon does not
+auto-install them; seed only the catalog entries you want with
+`bbox_artifact_install` or the per-kind installer.
+
+---
+
 ## Examples
 
 Drop-in configs for wiring blackbox into agent CLIs live in [`examples/`](examples/README.md):
 
 - **Agents** — [`session-searcher`](examples/agents/session-searcher.md): read-only subagent that keeps transcript digging off your main context window.
 - **Skills / slash commands** — [`crucible`](examples/skills/crucible.md) (orchestrator + durable implementer + continuous red-team ensemble, coordinated through a `bbox_thread(kind="work_item")` and structured `bbox_note` signals), [`takeover`](examples/skills/takeover.md) (pick up a stalled or handed-off agent session without losing scope), and [`overmind`](examples/skills/overmind.md) (meta-orchestration — strategic Advisor above crucible, with a durable spine doc that survives orchestrator compaction; demonstrates the legitimate `allow_recursion=true` pattern).
-- **Workflow shape catalog** — [`examples/workflows/`](examples/workflows/) — runnable single-file specs covering linear, gated, ensemble, fork-join, blind-convergence, optimistic-review, self-audit patterns.
+- **Workflow shape catalog** — [`examples/workflows/`](examples/workflows/) — runnable single-file specs covering linear, gated, ensemble, fork-join, atom-binding, blind-convergence, optimistic-review, self-audit patterns.
 - **Keystone end-to-end** — [`examples/keystone/`](examples/keystone/README.md) — Forgejo issue → arc → implementer subworkflow → wait → reviewer ensemble → wait-loop until merged → cleanup hooks. Real LLM dispatch. Adaptation guide in the example's README.
 
 ---

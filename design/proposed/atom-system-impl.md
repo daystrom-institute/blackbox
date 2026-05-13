@@ -1,8 +1,14 @@
 # Atom System — Implementation Plan
 
 Date: 2026-05-13
-Status: implementation proposal
+Status: implemented core runtime; implementation plan retained for audit trail
 Companion to: [Atom System](atom-system.md)
+
+Implementation note: phases covering `ArtifactKind::Atom`, atom registry/read
+tools, invocation handles, profile/workflow/deterministic/adapter execution,
+ownership/delegation, output-shape validation, effect-limit enforcement, and
+workflow `atom_bindings` have landed. Remaining work is catalog conversion and
+deprecation cleanup for legacy `bro_agent_*` defaults, not the atom runtime.
 
 Related:
 - [Agent System](../archive/agent-system.md) - predecessor implementation shape.
@@ -36,7 +42,8 @@ ArtifactKind::Atom
 The existing `src/orchestration/agents/*` code is donor material: registry
 projection, manifest validation, brofile resolution, embeddings, selection
 cuing, and dispatch logic. Reuse pieces when useful, but do not preserve
-`kind="agent"`, `bro_agent_*`, or `refactor-atom/v1` as public concepts.
+`kind="agent"`, `bro_agent_*`, or legacy agent-shaped refactor contracts as
+public concepts.
 
 Workflow JSON should stay pure workflow. Workflow-backed atoms are standalone
 atom artifacts whose `implementation.kind="workflow"` points at a workflow ref.
@@ -122,9 +129,9 @@ or be replaced:
 - `src/workflow/engine.rs`
 - `src/orchestration/mcp.rs`
 - `src/tool_docs.rs`
-- `examples/mcp-surfaces/*`
+- `system-defaults/mcp-surfaces/*`
 - `schema/workflow.schema.json`
-- `examples/atoms/refactor/*.json` (canonical atom path; `examples/agents/refactor/` is the legacy agent-only path)
+- `system-defaults/atoms/refactor/*.json` (canonical refactor atom path)
 - `src/system_memory/refactor*.md`
 
 0.2 **Current behavior snapshot.** Use `bbox_code_symbols` and

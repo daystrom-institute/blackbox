@@ -58,12 +58,12 @@ A workflow is one JSON file:
 }
 ```
 
-The metadata declares `actors`, `nodes`, `vars_schema`, `policy_packet`,
-and arc-level hooks. Control flow lives on each node as a typed `next`
-clause (`goto` / `branch` / `fork` / `terminal`); top-level `start`
-names the entry node. The daemon validates every transition target,
-every actor reference, every late_inject source, and every node's
-reachability from `start` before any dispatch fires. The canonical
+The metadata declares `actors`, optional `atom_bindings`, `nodes`,
+`vars_schema`, `policy_packet`, and arc-level hooks. Control flow lives
+on each node as a typed `next` clause (`goto` / `branch` / `fork` /
+`terminal`); top-level `start` names the entry node. The daemon validates
+every transition target, actor reference, atom binding, late_inject source,
+and node reachability from `start` before any dispatch fires. The canonical
 JSON Schema is at `schema/workflow.schema.json`.
 
 ## ArcContext — the universal state container
@@ -198,6 +198,40 @@ Per-actor fields:
   swap-out doesn't lose strategic memory.
 - `requires: [Capability, ...]` — see Capability tags below.
 
+## Atom Bindings
+
+Workflow-local `atom_bindings` let a node invoke a standalone atom by a
+short binding name:
+
+```jsonc
+"atom_bindings": {
+  "echo": {
+    "atom_ref": "atom:echo@v1",
+    "limits": { "dispatches_runs": 0 }
+  }
+},
+"nodes": {
+  "Echo": {
+    "atom": "echo",
+    "atom_args": { "message": "hello" },
+    "next": { "type": "terminal" }
+  }
+}
+```
+
+Use this when the workflow wants a reusable capability boundary instead
+of directly naming a brofile or embedding a private subworkflow. Bindings
+can tighten the atom contract for this workflow with `limits`, but cannot
+loosen the atom's own effect declarations. The engine resolves the atom
+at compile/capability-validation time, invokes it through `atom_invoke`,
+records the resulting invocation handle, and stores the normalized
+`atom_status` trace envelope as the node output.
+
+Atom nodes are mutually exclusive with `actor`, `subworkflow*`, `wait`,
+`foreach`, and `matrix`. A durable binding reuses/resumes a profile-backed
+atom handle when possible; deterministic, adapter, and workflow handles are
+re-invoked if resume is not supported.
+
 ## Capability tags
 
 Mirrors daystrom's `CapabilityTag` shape. Hard-fail at compile rather
@@ -236,6 +270,8 @@ A node declares the unit of work. Fields:
 | Field             | Meaning                                                 |
 |-------------------|---------------------------------------------------------|
 | `actor`           | Which actor runs this node (mutually exclusive with `subworkflow*` and `wait`). |
+| `atom`            | Which workflow-local atom binding runs this node (mutually exclusive with `actor`, `subworkflow*`, `wait`, `foreach`, and `matrix`). |
+| `atom_args`       | Structured atom input arguments, resolved through ArcContext templating before `atom_invoke`. |
 | `prompt`          | Template (rendered against ArcContext).                 |
 | `gate`            | Packet id; verdict drives next-node selection at choice nodes. |
 | `gate_mode`       | `first` (one verdict, default) or `all` (multi-finding aggregate). |

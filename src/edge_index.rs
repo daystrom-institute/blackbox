@@ -592,6 +592,9 @@ fn sidecar_project_is_registered(
     let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return false;
     };
+    if matches!(stem, "agents") {
+        return true;
+    }
     registered_project_ids.contains(stem)
 }
 
@@ -1210,6 +1213,39 @@ mod tests {
 
         assert_eq!(index.forward_edges(&registered_source).len(), 1);
         assert!(index.forward_edges(&orphan_source).is_empty());
+    }
+
+    #[test]
+    fn sidecar_loader_keeps_global_agent_edges_with_project_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = EntityRef::Agent {
+            name: "distilled-reviewer".into(),
+            version: 1,
+        };
+        let target = EntityRef::Session {
+            provider: "claude".into(),
+            session_id: "sess-1".into(),
+        };
+        append_edges_dedup(
+            dir.path(),
+            "agents",
+            &[Edge {
+                source: source.clone(),
+                kind: "DERIVED_FROM".into(),
+                target,
+                provenance: EdgeProvenance::Explicit,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+            }],
+        )
+        .unwrap();
+
+        let registered = HashSet::new();
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen);
+
+        assert_eq!(index.forward_edges(&source).len(), 1);
     }
 
     #[test]

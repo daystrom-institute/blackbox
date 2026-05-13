@@ -3,7 +3,7 @@
 Use this memory before moving, extracting, renaming, or splitting Rust code with
 blackbox refactor tools.
 
-## Agent layer over these plan kinds
+## Atom layer over these plan kinds
 
 For common Rust refactor patterns, prefer a refactor atom over re-deriving
 the discipline by hand. Each atom encodes the grounding sequence, plans
@@ -21,9 +21,9 @@ cargo-test sequence, and emits the done note.
 | `rust-error-migrate` | Rewrite a module error type with public-API preflight |
 | `rust-split-god-impl` | Carve multi-domain impl block into per-domain modules |
 
-Discover via `bro_agent_search(<intent phrase>)`; install via
-`bbox_artifact_install(kind="agent", source="examples/agents/refactor/<name>.json")`;
-dispatch via `bro_agent_dispatch(agent="<name>", args={...})`. Full
+Discover via `atom_search(<intent phrase>)`; install via
+`bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/<name>.json")`;
+invoke via `atom_invoke(atom="atom:<name>@v<N>", args={...})`. Full
 catalog (with cost class, plan-kind dependencies, and operator-authority
 fields) lives in `sm-refactor` under "Refactor atom catalog".
 

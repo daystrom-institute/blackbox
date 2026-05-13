@@ -1,0 +1,217 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-public-api-guard",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Report the public-API delta a proposed Java refactor would produce, as an advisory severity (info / caution / breaking). Mirrors rust-public-api-guard.",
+    "when_to_use": [
+      "about to run a refactor that may touch public Java surfaces (visibility rewrites, type-use migration, error-type changes on pub methods)",
+      "preflight before java-extract-interface when callers may live in other Maven/Gradle modules",
+      "auditing a proposed change set for cross-module impact"
+    ],
+    "anti_patterns": [
+      "do not use as a permission grant — this atom reports the delta, it does not decide whether the change is safe",
+      "do not use on non-Java files",
+      "do not chain inside a mutating bbox_refactor_run — keep the guard as a separate preflight"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the Java project root."
+          },
+          "source": {
+            "type": "string",
+            "description": "File or directory to analyze, relative to project_dir. Directory walks recursively, skipping target/, build/, .gradle/, node_modules/, .git/."
+          },
+          "proposed_changes": {
+            "type": "array",
+            "description": "Optional list of proposed-change refs (file + item_name + change_kind=modify|remove|add). When provided, the guard scopes its report to these items. When omitted, the guard reports zero changes — useful for module-boundary-only audits once Maven/Gradle awareness lands.",
+            "items": {
+              "type": "object",
+              "required": [
+                "file",
+                "item_name",
+                "change_kind"
+              ],
+              "properties": {
+                "file": {
+                  "type": "string"
+                },
+                "item_name": {
+                  "type": "string"
+                },
+                "change_kind": {
+                  "enum": [
+                    "modify",
+                    "remove",
+                    "add"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "prompt_template": "You are java-public-api-guard. Charter: Report the public-API delta of a proposed Java refactor as an advisory severity.\n\nProtocol (analysis-only — steps 3 and 4 are skipped):\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"\",\n                     languages=[\"java\"], item_kinds=[\"class_declaration\", \"method_declaration\", \"field_declaration\"])\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm the path resolves and tree-sitter parses cleanly. For each\n   entry in {{proposed_changes}}, confirm `file` and `item_name` resolve\n   in the inventory.\n\n2. Plan with deep_analysis=true:\n   bbox_refactor_plan(kind=\"java_public_api_guard\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source}}\",\n                      toml_entries={\"proposed_changes\": {{proposed_changes}}})\n   The response carries advisory_severity (info|caution|breaking),\n   public_items_touched, public_api_delta_summary (added_public,\n   removed_public, modified_signatures), and module_boundaries_affected.\n   Do not invoke bbox_refactor_run — analysis only.\n\n   Severity rules (mirrored from the current plan kind):\n   - breaking — public/protected item removed or signature-modified.\n   - caution — package-private (default-visibility) item removed or\n     modified. Operator should chain `java-find-usages` (wraps the\n     `find_java_usages` plan kind) to enumerate cross-package callers;\n     prefer `declaring_class=<class>` when the touched name isn't\n     globally unique.\n   - info — only private items touched, OR every change is an addition.\n   `module_boundaries_affected` is present but empty in current v1; Maven /\n   Gradle multi-module and module-info.java export awareness are future\n   extensions, not current blocking criteria.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: severity, touched\n     count, public_api_delta_summary counts, source>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never use this atom's output as a permission grant — it advises;\n  the caller (or chained mutating atom) decides whether the change\n  is acceptable.\n- Never invent symbol names from the user prompt.\n\nInputs:\n{{project_dir}} {{source}} {{proposed_changes}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "advisory_severity": {
+            "enum": [
+              "info",
+              "caution",
+              "breaking"
+            ]
+          },
+          "public_items_touched": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "fqcn": {
+                  "type": "string"
+                },
+                "modifiers": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "file": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "public_api_delta_summary": {
+            "type": "object",
+            "properties": {
+              "added_public": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "removed_public": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "modified_signatures": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "module_boundaries_affected": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Empty in v1 — Maven/Gradle multi-module + module-info.java awareness lands in v2 of the plan kind."
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:java-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-11T00:00:00Z"
+    }
+  }
+}

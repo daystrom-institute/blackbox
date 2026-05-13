@@ -315,22 +315,21 @@ small files only; status defaults to at most 200 returned items and reports
 
 ## Refactor-atom personas (RA-B1 / RA-B2)
 
-The atomic refactor agent layer (`design/refactor-agents.md`) ships JSON
-manifests installed via `bbox_artifact_install(kind="agent", …)`. Every
-refactor atom binds to a **narrow persona brofile** whose allow list is
-restricted to the refactor + grounding tool surface. The narrow-allow
-constraint is load-bearing: `MergedFilters::merge` is additive with
-deny-wins, so an atom's `filter_overlay` can only ADD denies on top of
-the brofile — it cannot narrow a permissive allow list. A refactor
-atom layered on top of a general persona has no mechanical surface
-restriction.
+The refactor atom layer ships JSON manifests installed via
+`bbox_artifact_install(kind="atom", …)`. Every refactor atom uses
+`subcontract: "refactor/v1"` and binds to a **narrow persona brofile** through
+`manifest.implementation.brofile_ref`. The persona's allow list is the
+mechanical boundary: profile-backed atom execution dispatches through that
+brofile, so the atom inherits the refactor + grounding tool surface rather
+than a general-purpose operator surface.
 
 Two personas ship as reference artifacts:
 
-- **`rust-refactor-persona`** at `examples/brofiles/rust-refactor-persona.json`.
-  Allows only `bbox_code_*`, `bbox_refactor_*` (status / project_refs /
-  plan / apply / run), `bbox_note`, `bbox_thread`, `bbox_pin`,
-  `bbox_inspect_entity`, `bbox_hybrid_search`, `Read`, `Grep`, `Glob`.
+- **`rust-refactor-persona`** at `system-defaults/brofiles/refactor/rust-refactor-persona.json`.
+  Allows only `bbox_code_*` (symbols / node_describe / query / refs),
+  `bbox_refactor_*` (status / project_refs / plan / apply / run),
+  `bbox_note`, `bbox_thread`, `bbox_pin`, `bbox_inspect_entity`,
+  `bbox_hybrid_search`, `Read`, `Grep`, `Glob`.
   Disallows `Bash`, `Write`, `Edit`, `bbox_learn` / `bbox_remember` /
   `bbox_decide` / `bbox_forget` / `bbox_render`, and `bro_*`. Cargo
   validation runs through `bbox_refactor_run` command steps, never via
@@ -338,7 +337,7 @@ Two personas ship as reference artifacts:
   `rust_refactor_persona_matches_design_spec` in
   `src/orchestration/brofile.rs`; allow/disallow drift fails the test.
 
-- **`java-refactor-persona`** at `examples/brofiles/java-refactor-persona.json`.
+- **`java-refactor-persona`** at `system-defaults/brofiles/refactor/java-refactor-persona.json`.
   Same allow/disallow shape as the Rust persona — the refactor + grounding
   tool surface is language-agnostic at the MCP layer; only the lens prose
   differs. Java lens calls out `mvn` / `gradle` validation and the
@@ -347,225 +346,48 @@ Two personas ship as reference artifacts:
   symmetry verified by `rust_and_java_refactor_personas_share_tool_surface`
   in `src/orchestration/brofile.rs`.
 
-Refactor-atom manifests under `examples/agents/refactor/*.json` MUST
-bind to one of these personas via `brofile_ref`. Authoring an atom that
-binds to a different brofile (e.g., `code-reviewer-persona`) means the
-atom's tool surface is not actually narrowed; the manifest lint pass
-(RA-S1) rejects such manifests on install.
+Refactor-atom manifests under `system-defaults/atoms/refactor/*.json` MUST
+bind to one of these personas via a typed ref such as
+`brofile:rust-refactor-persona@v1`. Authoring an atom that binds to a
+different brofile (e.g., `code-reviewer-persona`) means the atom's tool
+surface is not actually narrowed; the `refactor/v1` atom subcontract rejects
+such manifests on install.
 
-## Refactor atom catalog
+## Refactor atom discovery
 
-Shipped refactor atoms (RA-A* / RA-X*) — discover via
-`bro_agent_search(<intent phrase>)`, install via
-`bbox_artifact_install(kind="agent", source="examples/agents/refactor/<name>.json")`,
-dispatch via `bro_agent_dispatch(agent="<name>", args={...})`.
+System memory is not the atom catalog. Do not mirror shipped atom names,
+versions, status, costs, eval fixtures, or release lineage here. The active
+catalog lives in installable manifests and the artifact tools:
 
-| Atom | Status | Cost | Plan kind(s) | Purpose |
-|---|---|---|---|---|
-| `rust-impl-partition-graph` | shipped (v1, RA-A1) | cheap | `rust_impl_partition_analysis` (RX-G1) | Produce method/field/call graph for a Rust impl block; analysis-only |
-| `rust-public-api-guard` | shipped (v1, RA-A2) | normal | `rust_public_api_guard` (RX-G2) | Report public-API delta of a proposed refactor as advisory severity; preflight for mutating atoms |
-| `rust-test-island-extract` | shipped (v1, RA-A3) | normal | `extract_rust_items`, `add_rust_mod_decl`, `rust_compile_fix_round` | Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files |
-| `rust-state-extract` | shipped (v1, RA-A4) | normal | `extract_rust_items`, `move_rust_struct_fields`, `add_rust_delegate_field`, `update_rust_callers`, `rust_compile_fix_round` | Pull a self.<field> cluster into a separate struct + delegate; operator-authority `acknowledge_repr` for #[repr(C)] / #[repr(packed)] |
-| `rust-trait-from-impl` | shipped (v1, RA-A5) | normal | `extract_rust_trait`, `migrate_rust_type_usages`, `rust_compile_fix_round` | Lift method subset into trait + impl Trait for Struct; HARD REFUSES migrate_call_sites=true when dyn_compatible=false |
-| `rust-error-migrate` | shipped (v1, RA-A6) | normal | `rewrite_rust_error_type` (RX-E1), `rust_public_api_guard` (preflight, RX-G2), `rust_compile_fix_round` (RX-C1) | Rewrite a module's error type; `rust_public_api_guard` runs as PREFLIGHT (outside the mutating run); operator-authority `acknowledge_public_api_change` |
-| `rust-split-god-impl` | shipped (v1, RA-A7, headline) | expensive | `extract_rust_impl_methods`, `rust_ra_classify_callbacks` (RX-R2, REQUIRED), `add_rust_router_to_sum`, `add_rust_mod_decl`, `rewrite_rust_item_visibility`, `rust_organize_imports`, `rust_compile_fix_round` | Carve multi-domain impl block into per-domain modules; mandatory RA-backed cross-partition call classification; fail-closed on lsp_unavailable (RX-V3) |
-| `java-extract-cohesive-class` | shipped (v1, RA-X1, Java headline) | normal | `extract_java_class` (composite) | Extract cohesive cluster (methods + field moves + delegate + caller delegation + accessor rewrites + cross-package widening) in one composite plan; auto-qualifies public-static cross-class calls and inner-type method references; rewrites record-component bare access through the accessor on BOTH method parameters and local-variable receivers; propagates `@Slf4j` to the target when moved bodies reference `log`; import-injection paths dedupe only against same-package wildcards (foreign `import x.y.*;` no longer blocks unrelated imports); preserves `throws` on optional source delegate wrappers; optional `wiring_mode` (`constructor_args` | `guice_field_inject` | `manual`) with refusal-on-`@Inject`-detection so DI-managed sources don't capture null silently; mutable_capture FIXMEs suppressed under `wiring_mode=guice_field_inject` since the target also `@Inject`-constructs; hard refusals on mutable_capture_with_write / nested_class_in_item_names / method_overload_ambiguous / guice_field_injection_detected |
-| `java-promote-inner-class` | shipped (v1, RA-X2) | normal | `promote_java_inner_class` | Promote a non-static inner class with outer captures into a top-level class with final ctor params; hard refusals on static_inner / writes_outer_field / calls_outer_method / multiple_ctors / this_chain_ctor / referenced_as_type |
-| `java-extract-interface` | shipped (v2, RA-X3, supersedes v1) | normal | `extract_java_interface` + `java_public_api_guard` (preflight) + optional `migrate_java_type_usages` | Extract interface from class (signatures + implements + visibility widening) with optional caller migration; v2 runs the public-API guard as a structured preflight (closes JAVA_GAP.md Gap 1); operator-authority `acknowledge_public_api_change` gates apply on `advisory_severity=breaking` |
-| `java-lombokify` | shipped (v1, RA-X4) | expensive | `lombokify_java_class` (single-file or bulk-dir) + optional `java_lsp_organize_imports` | Convert hand-rolled POJO boilerplate (getters/setters/equals/hashCode/toString/canonical ctors/SLF4J) into Lombok annotations; operator-authority `boolean_getter_strategy` (skip / bridge / rename); cost_class=expensive to match bulk-dir worst case |
-| `java-public-api-guard` | shipped (v1, RA-X5) | normal | `java_public_api_guard` | Report public-API delta of a proposed Java refactor as advisory severity; preflight for `java-extract-interface` and standalone audit; closes JAVA_GAP.md Gap 1 |
-| `java-class-dependency-graph` | shipped (v1, RA-X6) | cheap | `java_class_dependency_analysis` | Class-shaped inventory — methods + fields + inner types + class-level annotations + edges (method_to_method / method_to_field read-write split / method_to_inherited) — for operator review before partition decisions; records carry `is_implicitly_static` per JLS; analysis-only preflight to `java-extract-cohesive-class` |
-| `java-find-usages` | shipped (v1) | cheap | `find_java_usages` | Project-wide reference walk for one or more simple Java names with optional `declaring_class` filter; production_sites/test_sites tally; optional `output_path` + `summary_only` for large reports; analysis-only sibling to `java-public-api-guard` |
-
-Per-atom manifests live at `examples/agents/refactor/<atom>.json`. The
-shared prompt template and base outputs schema (RA-T1) under the same
-directory are reference files — manifest installers inline the
-filled-in form. `sm_refactor_catalog_lists_every_shipped_atom` (RA-D1)
-asserts every `examples/agents/refactor/<name>.json` has a row in
-this table; new atoms that land without a catalog entry fail the
-build. The mechanical alternative to a manually maintained table —
-auto-regeneration from the manifest set — is a `tools/refactor-atom-
-catalog-gen` follow-up.
-
-## Refactor-atom eval coverage (RA-E1)
-
-Per-atom eval artifacts live under `eval/agents/refactor/`:
-
-- `discovery-queries.json` — per-atom queries matching `when_to_use`,
-  plus anti-pattern queries with `expect_matched_anti_pattern: true`.
-  Runs in **keyword-only mode** in CI (`include_vectors=false`) to
-  stay deterministic. Vector-ready mode is gated on every shipped
-  atom showing `embedding_pending=false` and tolerates ranking
-  fluctuation.
-- `dispatch-scenarios.json` — per-atom install + dispatch round trip
-  with a fixture input and an `expect_response_fields` shape
-  assertion. The fixture paths use `${FIXTURE_RUST_PROJECT}` for the
-  Rust project root; future eval-runner integration resolves them.
-- `behavior-smoke.json` — per-atom `expected_plan_sequence` listing
-  the bbox_refactor_* tool calls the atom's prompt template
-  encodes, plus an optional `block_reachability` fixture and the
-  expected block_reason substring. NOT exhaustive semantic
-  testing (that's RX-per-plan-kind territory).
-
-`refactor_atom_eval_suites_cover_every_shipped_atom` (RA-E1) asserts
-every atom under `examples/agents/refactor/<name>.json` appears in all
-three eval suites; eval drift fails the build.
-
-The **recording AgentDispatchAdapter** that interprets behavior-smoke
-entries against the prompt template (registering a fake adapter per
-the impl doc's Codex round-2/3 design, parsing the template's
-bbox_refactor_* markers in order and asserting the simulated tool-call
-sequence matches `expected_plan_sequence`) is tracked as a follow-up.
-v1 ships the deterministic artifact alignment; live LLM dispatch is a
-secondary integration check (marked slow/live) that requires the
-adapter implementation.
-
-## Refactor-atom supersession (RA-Z1)
-
-Atom version bumps use the standard artifact-supersede mechanism:
-
-```
-bbox_artifact_supersede(kind="agent", name="<atom>", superseded_by="<atom>")
+```text
+atom_search(query="<intent phrase>")
+atom_describe(atom="atom:<name>@latest")
+bbox_artifact_list(kind="atom", name="<optional name>")
 ```
 
-Concretely, installing a new version with `"supersedes": "<atom>"` in
-the artifact body marks the prior version superseded automatically
-(`install_value_locked_scoped` handles the supersedes chain).
+Mention atoms in system memory only as contextual signposts: when a documented
+tool sequence has a reusable atom boundary, say "for this pattern, consider the
+matching refactor atom via `atom_search(...)`" and keep the primitive sequence
+as the canonical fallback. The manifest is the source of truth for an atom's
+version, cost class, input schema, prompt, implementation brofile, and
+operator-authority flags.
 
-Behavior pinned by `supersession_hides_old_versions_from_search_and_list`:
+Workflow composition is also a catalog concern. Use workflow artifacts when a
+refactor needs multiple atom boundaries with gates or operator review between
+them; do not paste a workflow inventory into resident memory.
 
-- `bro_agent_search` excludes superseded versions. Default-search
-  surfaces only the active version.
-- `bro_agent_list` without `include_superseded=true` excludes
-  superseded versions; both surface when `include_superseded=true`.
-- `bro_agent_get(name="<atom>@v<N>")` and `bro_agent_describe(...)`
-  resolve superseded versions (read paths permit `include_superseded
-  =true`).
-- `bro_agent_dispatch(agent="<atom>@v<N>")` REJECTS superseded
-  versions with `agent '...' is not active (superseded or
-  deactivated)` (`src/tools/agents.rs:522`). v1 does NOT add an
-  `allow_superseded` flag to dispatch — the active version is
-  canonical. Operators who need to dispatch an older version must
-  explicitly un-supersede it through the existing
-  `bbox_artifact_supersede` mechanics, or pin to a still-active
-  version.
+## Refactor-atom install validation
 
-Every new atom version bump triggers an embedding refresh in the
-`agent_manifest` bucket (existing agent-system behavior; called out
-here so operators understand the cost per version bump).
+A manifest is treated as a refactor atom when it declares
+`subcontract: "refactor/v1"`. The atom install validator hard-rejects:
 
-Removal/cleanup of ancient superseded versions is a separate decision;
-v1 keeps history indefinitely.
+- `manifest.implementation.kind` other than `profile`.
+- `manifest.implementation.brofile_ref` not in
+  `brofile:rust-refactor-persona@vN` or `brofile:java-refactor-persona@vN`.
+- `inputs.schema` declaring any `acknowledge_*` field with a `default` value.
+  Operator-authority opt-outs must be operator-explicit.
 
-## Refactor-atom distillation path (RA-V2)
-
-The v1 catalog is `provenance: hand_authored` end-to-end. The schema
-already carries `AgentProvenance::Distilled` (`src/orchestration/agents/
-types.rs:170`) — distilled atoms enter the catalog by the same path
-as hand-authored atoms (`bbox_artifact_install(kind="agent",
-source=…)`) but declare:
-
-- `provenance.kind = "distilled"`
-- `provenance.distilled_by` — agent or pipeline name that produced
-  the manifest
-- `provenance.evidence_session_ids` — session refs the distiller
-  mined for the pattern
-- `provenance.created_from_threads` — thread refs the distiller
-  walked
-
-The install path materializes agentic-corpus edges from distilled
-manifests back to source sessions/threads automatically
-(`src/server/routes.rs::persist_agent_provenance_edges`).
-
-The distiller itself is **out of scope for this skeleton**. A
-badgey-flavor pipeline that mines the corpus for recurring refactor
-task shapes and proposes new atoms is acknowledged in
-`design/refactor-agents.md` "Provenance — distillation path" and
-tracked separately from RA-* phases. When the distiller lands, the
-RA-S1 refactor-atom lint applies to distilled manifests
-unchanged — the `_contract: "refactor-atom/v1"` marker and the
-recognized-personas list bind identically regardless of provenance.
-
-## Refactor-atom composition (RA-V1)
-
-v1 atom composition is hand-wired through workflows. The
-`composition.chainable_after`, `parallel_safe`, and `fan_out_aggregator`
-fields on each manifest are signals to workflow authors and to the
-agent-search ranker — the manifest fields do not autoload at runtime
-per `design/agent-system-impl.md` §608. There is no `bro_agent_compose`
-consumer in v1; atom-to-atom dispatch is a v2 path.
-
-Three canonical composition shapes ship as reference workflow JSONs
-under `examples/agents/refactor/workflows/`:
-
-- **`state-extract-then-split.json`** — `rust-state-extract` →
-  `rust-split-god-impl`. State extraction lands first so the
-  partitioned impl references a clean state struct via the
-  delegate field.
-- **`error-migrate-with-guard.json`** — `rust-public-api-guard` →
-  `rust-error-migrate`. The workflow-level guard call gives the
-  operator a separate audit trail; the migrate atom additionally
-  runs its OWN preflight internally and blocks on
-  acknowledge_public_api_change unless operator-explicit.
-- **`partition-graph-then-split.json`** — `rust-impl-partition-graph` →
-  operator review → `rust-split-god-impl`. The graph atom produces
-  structural facts; the operator-supplied partition variable drives
-  the splitter.
-
-Reference workflows install through `bbox_artifact_install(kind=
-"workflow", source="examples/agents/refactor/workflows/<name>.json")`
-and dispatch via `bro_orchestrate_run(workflow="refactor-<name>",
-vars={...})`. The test
-`refactor_atom_reference_workflows_parse_and_compile` asserts each
-one parses as a `Workflow` and compiles cleanly; drift fails the
-test.
-
-Fan-out across languages is supported through the workflow engine's
-existing `Fork` / `Wait` primitives — `parallel_safe: false` on
-individual atoms doesn't prevent fan-out, because parallel dispatches
-run against DIFFERENT files / projects, not against each other.
-Future v2 composition (`bro_agent_compose`) is acknowledged in
-`design/agent-system-impl.md` §608 but is not required by v1.
-
-## Refactor-atom install lint (RA-S1)
-
-A manifest is treated as a refactor atom — and subject to the refactor-atom
-lint — when one of:
-
-- Top-level `"_contract": "refactor-atom/v1"` field is present (authoring
-  convention; refactor atom templates include this).
-- Artifact source path contains `examples/agents/refactor/`.
-
-There is no opt-out flag in v1: an operator who wants different semantics
-either drops the contract marker or hosts the manifest outside the refactor
-path. `schema/agent.schema.json` has `additionalProperties: false` at the
-manifest level, so adding a top-level escape-hatch field would itself be
-rejected by the generic schema.
-
-**Hard rejects** (install fails with
-`error.bad_input(code=refactor_atom_lint_failed)`):
-
-- `brofile_ref` is not one of `rust-refactor-persona` /
-  `java-refactor-persona`. Refactor atoms layered on a permissive persona
-  have no mechanical tool-surface restriction — `filter_overlay` can only
-  ADD denies.
-- `inputs.schema` declares an `acknowledge_*` field with a `default` value
-  (any default). Operator-authority opt-outs must be operator-explicit per
-  RX-V1.
-
-**Warnings** (install succeeds, surfaced via `install_warnings`):
-
-- `filter_overlay.allow` non-empty — refactor atoms narrow via additional
-  denies only.
-- `outputs.schema` drops one or more RA-T1 base fields (status, plan_path,
-  files_touched, fixme_count, deep_analysis_summary, cargo_result,
-  block_reason, done_note_id).
-- `inputs.prompt_template` is missing one or more protocol markers
-  (`bbox_refactor_plan`, `bbox_refactor_run`, `bbox_note(kind=`).
-  Analysis-only atoms legitimately skip `bbox_refactor_run`; the warning
-  is informational in that case.
-
-## Shared atom contract (RA-T1)
+## Shared atom contract
 
 Every refactor atom embeds the same five-step protocol
 (ground → plan with `deep_analysis=true` → decide → apply-or-block →
@@ -573,16 +395,11 @@ done-note) and the same base outputs.schema (status / plan_path /
 files_touched / fixme_count / deep_analysis_summary / cargo_result /
 block_reason / done_note_id). Reference files:
 
-- `examples/agents/refactor/_template.prompt.md` — the prompt template
+- `system-defaults/atoms/refactor/_template.prompt.md` — the prompt template
   with `{{...}}` placeholders. Atom manifests inline the filled-in form
-  under `inputs.prompt_template`. The artifact installer does not yet
-  support shared-template includes; the `tools/refactor-atom-fill`
-  helper (follow-up) keeps manifests in sync mechanically.
-- `examples/agents/refactor/_base.outputs.schema.json` — the base
-  outputs.schema every atom unions with atom-specific fields. Advisory
-  in v1: dispatch does not validate the agent's emission against the
-  schema; the RA-S1 lint warns when a manifest's `outputs.schema`
-  drops one or more of the base fields.
+  under `inputs.prompt_template`.
+- `system-defaults/atoms/refactor/_base.outputs.schema.json` — the base
+  outputs.schema every atom unions with atom-specific fields.
 
 `fixme_count` is split into `plan_only` (FIXMEs the plan emitted with
 no associated edit) and `warning` (FIXMEs emitted alongside an applied

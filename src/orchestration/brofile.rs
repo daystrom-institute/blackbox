@@ -610,7 +610,8 @@ mod tests {
 
     #[test]
     fn rust_refactor_persona_matches_design_spec() {
-        let src = include_str!("../../examples/brofiles/rust-refactor-persona.json");
+        let src =
+            include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
         let bf: Brofile = serde_json::from_str(src).expect("rust-refactor-persona parses");
         assert_eq!(bf.name, "rust-refactor-persona");
         assert_eq!(bf.provider, Provider::Claude);
@@ -627,6 +628,7 @@ mod tests {
             "mcp__blackbox__bbox_code_symbols",
             "mcp__blackbox__bbox_code_node_describe",
             "mcp__blackbox__bbox_code_query",
+            "mcp__blackbox__bbox_code_refs",
             "mcp__blackbox__bbox_refactor_status",
             "mcp__blackbox__bbox_refactor_project_refs",
             "mcp__blackbox__bbox_refactor_plan",
@@ -674,7 +676,8 @@ mod tests {
 
     #[test]
     fn java_refactor_persona_matches_design_spec() {
-        let src = include_str!("../../examples/brofiles/java-refactor-persona.json");
+        let src =
+            include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json");
         let bf: Brofile = serde_json::from_str(src).expect("java-refactor-persona parses");
         assert_eq!(bf.name, "java-refactor-persona");
         assert_eq!(bf.provider, Provider::Codex);
@@ -693,6 +696,7 @@ mod tests {
             "mcp__blackbox__bbox_code_symbols",
             "mcp__blackbox__bbox_code_node_describe",
             "mcp__blackbox__bbox_code_query",
+            "mcp__blackbox__bbox_code_refs",
             "mcp__blackbox__bbox_refactor_status",
             "mcp__blackbox__bbox_refactor_project_refs",
             "mcp__blackbox__bbox_refactor_plan",
@@ -744,8 +748,10 @@ mod tests {
     /// is load-bearing for refactor-atom interchange between brofiles.
     #[test]
     fn rust_and_java_refactor_personas_share_tool_surface() {
-        let rust_src = include_str!("../../examples/brofiles/rust-refactor-persona.json");
-        let java_src = include_str!("../../examples/brofiles/java-refactor-persona.json");
+        let rust_src =
+            include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
+        let java_src =
+            include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json");
         let rust: Brofile = serde_json::from_str(rust_src).unwrap();
         let java: Brofile = serde_json::from_str(java_src).unwrap();
 

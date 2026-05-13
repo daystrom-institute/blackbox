@@ -1,0 +1,209 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "rust-split-god-impl",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Carve a multi-domain Rust impl block into per-domain modules with router wiring, visibility widening for cross-partition callees, and import organization.",
+    "when_to_use": [
+      "a single impl block holds 20+ methods that cleanly partition by domain",
+      "BlackboxServer-shaped god-impl ready for per-domain extraction",
+      "operator has partitions in hand (chain rust-impl-partition-graph first if not)"
+    ],
+    "anti_patterns": [
+      "do not use to decide partitions — chain rust-impl-partition-graph first",
+      "do not use when partitions share mutable state on self — chain rust-state-extract first",
+      "do not use on non-Rust files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source_file",
+          "impl_name",
+          "partition"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string"
+          },
+          "source_file": {
+            "type": "string"
+          },
+          "impl_name": {
+            "type": "string"
+          },
+          "partition": {
+            "type": "object",
+            "description": "Map of domain name to method-name list. Each method must appear in exactly one domain.",
+            "additionalProperties": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "allow_cross_partition_delegation": {
+            "type": "boolean",
+            "description": "When false (default in spirit), any cross-partition call resolved by rust_ra_classify_callbacks blocks the run. When true, the atom widens visibility on cross-partition callees to pub(crate) and proceeds."
+          },
+          "apply": {
+            "type": "boolean"
+          },
+          "validation_bin": {
+            "type": "string"
+          }
+        }
+      },
+      "prompt_template": "You are rust-split-god-impl. Charter: Carve a multi-domain Rust impl block into per-domain modules.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{impl_name}}\",\n                     languages=[\"rust\"], item_kinds=[\"impl_item\", \"function_item\"])\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Confirm every method in every partition's list resolves on {{impl_name}}.\n\n2. Plan with deep_analysis=true — per partition:\n   For each <domain, method-names> in {{partition}}:\n     bbox_refactor_plan(kind=\"extract_rust_impl_methods\", deep_analysis=true,\n                        project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                        target=\"src/<domain>.rs\",\n                        impl_name=\"{{impl_name}}\",\n                        item_names=<methods in this partition>)\n   Inspect captured_self_fields, remaining_source_accessors,\n   unresolved_callbacks per partition.\n\n   THEN chain rust_ra_classify_callbacks (MANDATORY — RA-A7 dep on RX-R2):\n     bbox_refactor_plan(kind=\"rust_ra_classify_callbacks\", deep_analysis=true,\n                        project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                        impl_name=\"{{impl_name}}\")\n   If rust-analyzer is unavailable, the plan returns error.lsp_unavailable\n   (RX-V3 fail-closed). Emit bbox_note(kind=\"blocked\", body=<reason>) and\n   return status=\"blocked\". NO RA-backed fallback in v1.\n\n3. Decide using resolved_callbacks:\n   - Compute cross-partition calls: any resolved call whose target method\n     is in a DIFFERENT partition's set than the caller.\n   - If cross-partition calls exist AND {{allow_cross_partition_delegation}}\n     != true: emit bbox_note(kind=\"blocked\", body=<concrete list of\n     cross-partition calls from resolved_callbacks + plan_path>) and\n     return status=\"blocked\".\n   - Otherwise proceed; record cross-partition callees for visibility\n     widening in step 4.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(confirm=true, steps=[\n     <per-partition extract_rust_impl_methods steps>,\n     <add_rust_router_to_sum + add_rust_mod_decl per partition>,\n     <rewrite_rust_item_visibility widening cross-partition callees to pub(crate) when allow_cross_partition_delegation=true>,\n     <rust_organize_imports>,\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true}\n   ])\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: partition count,\n     methods moved per partition, cross-partition callees widened,\n     fixme_count, cargo result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never skip rust_ra_classify_callbacks — RX-R2 is REQUIRED to safely\n  classify cross-partition method calls. An unresolved callback in the\n  wrong partition is exactly the silent-miscompile case this atom must\n  refuse.\n- Never apply when status=blocked.\n- Never proceed past cargo check failure (runner rolls back per RX-F2b).\n- Never invent partition assignments from the user prompt — rely on\n  bbox_code_symbols to confirm method residency.\n\nInputs:\n{{project_dir}} {{source_file}} {{impl_name}} {{partition}} {{allow_cross_partition_delegation}} {{apply}} {{validation_bin}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "domain": {
+                  "type": "string"
+                },
+                "target_file": {
+                  "type": "string"
+                },
+                "moved_methods": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "captured_self_fields": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "unresolved_callbacks": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "resolved_callbacks": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "fixme_count": {
+                  "type": "object",
+                  "properties": {
+                    "plan_only": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "warning": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  }
+                },
+                "repair_steps_applied": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "expensive",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-11T00:00:00Z"
+    }
+  }
+}

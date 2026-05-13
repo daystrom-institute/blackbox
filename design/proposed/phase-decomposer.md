@@ -428,7 +428,7 @@ debates. The council decides.
 | Policy packet (arc-level gate) | `schema.rs:34`, `engine.rs:1098-1165` | implemented |
 | Compaction anchor (rolling summary) | `engine.rs:1173-1189` | implemented |
 | Durable actor sessions | `schema.rs:64`, `engine.rs:2064-2068` | implemented |
-| Agent manifests (typed install artifacts) | `examples/agents/code-reviewer.json` | implemented |
+| Agent manifests (typed install artifacts) | `system-defaults/agents/code-reviewer.json` | implemented |
 | Advisor checkpoint/packet/resume pipeline | `src/tools/roster.rs:607-1099` | implemented (team-scoped) |
 | Mechanical anomaly counters | — | **aspirational** |
 | Oracle agent manifest | — | **aspirational** |

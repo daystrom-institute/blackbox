@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blackbox.local/schema/agent.schema.json",
   "title": "Blackbox Agent Artifact",
+  "description": "Legacy registered-agent artifact schema. New reusable capabilities should use atom.schema.json with kind=atom and _contract=atom/v1.",
   "type": "object",
   "additionalProperties": false,
   "required": ["kind", "name", "version", "manifest"],

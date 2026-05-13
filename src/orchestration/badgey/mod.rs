@@ -53,8 +53,8 @@ mod artifact_tests {
     #[test]
     fn badgey_brofile_artifacts_parse_and_deny_bro_tools() {
         for raw in [
-            include_str!("../../../examples/badgey/brofiles/badgey-persona.json"),
-            include_str!("../../../examples/badgey/brofiles/badgey-scout-persona.json"),
+            include_str!("../../../system-defaults/badgey/brofiles/badgey-persona.json"),
+            include_str!("../../../system-defaults/badgey/brofiles/badgey-scout-persona.json"),
         ] {
             let brofile: Brofile = serde_json::from_str(raw).unwrap();
             assert!(brofile.filters.as_ref().is_some_and(|filters| {
@@ -68,9 +68,10 @@ mod artifact_tests {
 
     #[test]
     fn badgey_agent_artifacts_parse_and_reference_brofiles() {
-        let badgey: AgentArtifact =
-            serde_json::from_str(include_str!("../../../examples/badgey/agents/badgey.json"))
-                .unwrap();
+        let badgey: AgentArtifact = serde_json::from_str(include_str!(
+            "../../../system-defaults/badgey/agents/badgey.json"
+        ))
+        .unwrap();
         assert_eq!(badgey.kind, "agent");
         assert_eq!(badgey.name, "badgey");
         assert_eq!(
@@ -80,7 +81,7 @@ mod artifact_tests {
         assert_eq!(badgey.manifest.dispatch_adapter.as_deref(), Some("badgey"));
 
         let scout: AgentArtifact = serde_json::from_str(include_str!(
-            "../../../examples/badgey/agents/badgey-scout.json"
+            "../../../system-defaults/badgey/agents/badgey-scout.json"
         ))
         .unwrap();
         assert_eq!(scout.name, "badgey-scout");
@@ -93,9 +94,10 @@ mod artifact_tests {
 
     #[test]
     fn badgey_agent_install_validation_is_adapter_gated() {
-        let value: Value =
-            serde_json::from_str(include_str!("../../../examples/badgey/agents/badgey.json"))
-                .unwrap();
+        let value: Value = serde_json::from_str(include_str!(
+            "../../../system-defaults/badgey/agents/badgey.json"
+        ))
+        .unwrap();
         let empty_registry = AgentAdapterRegistry::new();
         let ctx = InstallCtx {
             adapter_registry: &empty_registry,
@@ -118,7 +120,7 @@ mod artifact_tests {
     #[test]
     fn badgey_scout_agent_install_validation_does_not_need_adapter() {
         let value: Value = serde_json::from_str(include_str!(
-            "../../../examples/badgey/agents/badgey-scout.json"
+            "../../../system-defaults/badgey/agents/badgey-scout.json"
         ))
         .unwrap();
         let registry = AgentAdapterRegistry::new();
@@ -133,8 +135,8 @@ mod artifact_tests {
     #[test]
     fn badgey_iac_examples_parse() {
         for raw in [
-            include_str!("../../../examples/badgey/crons/badgey-triage-daily.json"),
-            include_str!("../../../examples/badgey/crons/badgey-close-loops-weekly.json"),
+            include_str!("../../../system-defaults/badgey/crons/badgey-triage-daily.json"),
+            include_str!("../../../system-defaults/badgey/crons/badgey-close-loops-weekly.json"),
         ] {
             let cron: crate::crons::CronSpec = serde_json::from_str(raw).unwrap();
             assert!(cron.name.starts_with("badgey-"));
@@ -142,8 +144,8 @@ mod artifact_tests {
         }
 
         for raw in [
-            include_str!("../../../examples/badgey/workflows/badgey-eval-arc.json"),
-            include_str!("../../../examples/badgey/workflows/badgey-graduation-eval.json"),
+            include_str!("../../../system-defaults/badgey/workflows/badgey-eval-arc.json"),
+            include_str!("../../../system-defaults/badgey/workflows/badgey-graduation-eval.json"),
         ] {
             let workflow: crate::workflow::Workflow = serde_json::from_str(raw).unwrap();
             assert!(workflow.name.starts_with("badgey-"));
@@ -151,12 +153,12 @@ mod artifact_tests {
         }
 
         let packet: crate::packets::CompileParams = serde_json::from_str(include_str!(
-            "../../../examples/badgey/packets/badgey-self-eval.json"
+            "../../../system-defaults/badgey/packets/badgey-self-eval.json"
         ))
         .unwrap();
         assert_eq!(packet.domain, "badgey/self-eval");
         let routing_packet: crate::packets::CompileParams = serde_json::from_str(include_str!(
-            "../../../examples/badgey/packets/badgey-cron-routing.json"
+            "../../../system-defaults/badgey/packets/badgey-cron-routing.json"
         ))
         .unwrap();
         assert_eq!(routing_packet.domain, "badgey/cron-routing");

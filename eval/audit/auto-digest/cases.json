@@ -326,7 +326,7 @@
       "category": "workflow",
       "scope": "project",
       "source_session": "sess-q",
-      "source_files": ["examples/agentic-corpus/workflows/auto-digest-arc.json"],
+      "source_files": ["system-defaults/agentic-corpus/workflows/auto-digest-arc.json"],
       "source_query": "workflow rendered",
       "justification": "Rendered workflow notes need review.",
       "suggested_approval": "hold_for_review",

@@ -535,200 +535,6 @@ fn lint_filter_overlay(overlay: &Option<AgentFilterOverlay>) -> Result<(), Valid
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Refactor-atom lint (RA-S1)
-// ---------------------------------------------------------------------------
-//
-// Layered on top of the generic agent install validation. Recognizes refactor
-// atoms by a top-level `_contract: "refactor-atom/v1"` marker or by source
-// path under `examples/agents/refactor/`. Hard rejects bind atoms to a
-// recognized refactor persona and forbid `default` on operator-authority
-// opt-out fields (`acknowledge_*`). Warnings flag overlays that try to widen
-// the allow set, drop base outputs fields, or omit protocol markers.
-
-/// `_contract` marker that opts a manifest into the refactor-atom lint.
-pub const REFACTOR_ATOM_CONTRACT_MARKER: &str = "refactor-atom/v1";
-
-/// Path substring trigger for the refactor-atom lint when the artifact ships
-/// under the reference catalog.
-pub const REFACTOR_ATOM_PATH_TRIGGER: &str = "examples/agents/refactor/";
-
-/// Brofiles a refactor atom may bind to via `brofile_ref`. Grows as new
-/// language personas land (e.g. RA-B2 adds `java-refactor-persona`).
-pub const RECOGNIZED_REFACTOR_PERSONAS: &[&str] =
-    &["rust-refactor-persona", "java-refactor-persona"];
-
-/// Outputs.schema fields every refactor atom embeds (RA-T1 base schema).
-pub const REFACTOR_ATOM_BASE_OUTPUT_FIELDS: &[&str] = &[
-    "status",
-    "plan_path",
-    "files_touched",
-    "fixme_count",
-    "deep_analysis_summary",
-    "cargo_result",
-    "block_reason",
-    "done_note_id",
-];
-
-/// Prompt-template substrings that signal the five-step protocol. A manifest
-/// missing one or more gets a warning, not a reject — analysis-only atoms
-/// legitimately skip `bbox_refactor_run`.
-pub const REFACTOR_ATOM_PROTOCOL_MARKERS: &[&str] =
-    &["bbox_refactor_plan", "bbox_refactor_run", "bbox_note(kind="];
-
-/// Returns true when the artifact should be subject to the refactor-atom
-/// lint, either because it carries the `_contract` marker or because it
-/// ships from the reference path under `examples/agents/refactor/`.
-pub fn is_refactor_atom_artifact(value: &serde_json::Value, source_path: Option<&str>) -> bool {
-    if value
-        .get("_contract")
-        .and_then(|v| v.as_str())
-        .map(|s| s == REFACTOR_ATOM_CONTRACT_MARKER)
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    source_path
-        .map(|p| p.contains(REFACTOR_ATOM_PATH_TRIGGER))
-        .unwrap_or(false)
-}
-
-/// Hard-reject portion of the refactor-atom lint. Returns `Ok(())` when the
-/// artifact is not a refactor atom or when all hard invariants hold. The
-/// `step` on error is always `refactor_atom_lint`; the message starts with
-/// `refactor_atom_lint_failed:` so the install path can map to
-/// `error.bad_input(code=refactor_atom_lint_failed)`.
-pub fn validate_refactor_atom_install(
-    value: &serde_json::Value,
-    source_path: Option<&str>,
-) -> Result<(), ValidationError> {
-    if !is_refactor_atom_artifact(value, source_path) {
-        return Ok(());
-    }
-    let manifest = value
-        .get("manifest")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| ValidationError {
-            step: "refactor_atom_lint",
-            message: "refactor_atom_lint_failed: manifest object is missing".into(),
-        })?;
-
-    let brofile_ref = manifest.get("brofile_ref").and_then(|v| v.as_str());
-    let bound_persona_ok = brofile_ref
-        .map(|r| RECOGNIZED_REFACTOR_PERSONAS.contains(&r))
-        .unwrap_or(false);
-    if !bound_persona_ok {
-        return Err(ValidationError {
-            step: "refactor_atom_lint",
-            message: format!(
-                "refactor_atom_lint_failed: brofile_ref must be one of {:?}; got {:?}. \
-                 Refactor atoms layered on a permissive persona have no mechanical \
-                 tool-surface restriction — filter_overlay can only ADD denies.",
-                RECOGNIZED_REFACTOR_PERSONAS, brofile_ref
-            ),
-        });
-    }
-
-    if let Some(props) = manifest
-        .get("inputs")
-        .and_then(|i| i.get("schema"))
-        .and_then(|s| s.get("properties"))
-        .and_then(|p| p.as_object())
-    {
-        for (name, prop_schema) in props {
-            if name.starts_with("acknowledge_") && prop_schema.get("default").is_some() {
-                return Err(ValidationError {
-                    step: "refactor_atom_lint",
-                    message: format!(
-                        "refactor_atom_lint_failed: inputs.schema.properties.{name} declares \
-                         a `default`; operator-authority opt-outs must be operator-explicit \
-                         per the RX-V1 invariant — drop the default."
-                    ),
-                });
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Returns warnings the refactor-atom lint emits when soft invariants are
-/// violated. Empty when the artifact is not a refactor atom or when no soft
-/// issues apply. The install path appends these to `install_warnings` on the
-/// artifact metadata.
-pub fn refactor_atom_install_warnings(
-    value: &serde_json::Value,
-    source_path: Option<&str>,
-) -> Vec<String> {
-    if !is_refactor_atom_artifact(value, source_path) {
-        return Vec::new();
-    }
-    let Some(manifest) = value.get("manifest").and_then(|v| v.as_object()) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-
-    if let Some(allow) = manifest
-        .get("filter_overlay")
-        .and_then(|o| o.get("allow"))
-        .and_then(|v| v.as_array())
-    {
-        if !allow.is_empty() {
-            out.push(
-                "refactor_atom_lint: filter_overlay.allow is non-empty; refactor atoms should \
-                 narrow via additional denies only — the merge can ADD allow patterns but \
-                 cannot remove patterns the persona already permits."
-                    .into(),
-            );
-        }
-    }
-
-    match manifest
-        .get("outputs")
-        .and_then(|o| o.get("schema"))
-        .and_then(|s| s.get("properties"))
-        .and_then(|p| p.as_object())
-    {
-        Some(props) => {
-            let missing: Vec<&str> = REFACTOR_ATOM_BASE_OUTPUT_FIELDS
-                .iter()
-                .filter(|f| !props.contains_key(**f))
-                .copied()
-                .collect();
-            if !missing.is_empty() {
-                out.push(format!(
-                    "refactor_atom_lint: outputs.schema missing RA-T1 base fields: {}",
-                    missing.join(", ")
-                ));
-            }
-        }
-        None => out.push(
-            "refactor_atom_lint: outputs.schema missing or has no properties block; \
-             refactor atoms embed the RA-T1 base outputs shape."
-                .into(),
-        ),
-    }
-
-    let template = manifest
-        .get("inputs")
-        .and_then(|i| i.get("prompt_template"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    let missing_markers: Vec<&str> = REFACTOR_ATOM_PROTOCOL_MARKERS
-        .iter()
-        .filter(|m| !template.contains(**m))
-        .copied()
-        .collect();
-    if !missing_markers.is_empty() {
-        out.push(format!(
-            "refactor_atom_lint: prompt_template missing protocol markers: {}",
-            missing_markers.join(", ")
-        ));
-    }
-
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,15 +634,15 @@ mod tests {
         for (name, raw) in [
             (
                 "code-reviewer",
-                include_str!("../../../examples/agents/code-reviewer.json"),
+                include_str!("../../../system-defaults/agents/code-reviewer.json"),
             ),
             (
                 "diff-narrator",
-                include_str!("../../../examples/agents/diff-narrator.json"),
+                include_str!("../../../system-defaults/agents/diff-narrator.json"),
             ),
             (
                 "badgey",
-                include_str!("../../../examples/agents/badgey.json"),
+                include_str!("../../../system-defaults/agents/badgey.json"),
             ),
         ] {
             let value: serde_json::Value =
@@ -1438,7 +1244,7 @@ mod tests {
     fn reference_agent_diff_narrator_installs_cleanly() {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx(&registry);
-        let src = include_str!("../../../examples/agents/diff-narrator.json");
+        let src = include_str!("../../../system-defaults/agents/diff-narrator.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("diff-narrator.json parses");
         validate_agent_install(&v, &ctx).expect("diff-narrator validates cleanly");
     }
@@ -1451,7 +1257,7 @@ mod tests {
             brofile_exists: |name: &str| name == "code-reviewer-persona",
             agent_exists: |name: &str| name == "diff-narrator",
         };
-        let src = include_str!("../../../examples/agents/code-reviewer.json");
+        let src = include_str!("../../../system-defaults/agents/code-reviewer.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("code-reviewer.json parses");
         validate_agent_install(&v, &ctx).expect("code-reviewer validates cleanly");
     }
@@ -1460,7 +1266,7 @@ mod tests {
     fn reference_agent_code_reviewer_fails_without_brofile() {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx_brofile_missing(&registry);
-        let src = include_str!("../../../examples/agents/code-reviewer.json");
+        let src = include_str!("../../../system-defaults/agents/code-reviewer.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("code-reviewer.json parses");
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "brofile_resolution");
@@ -1475,7 +1281,7 @@ mod tests {
             brofile_exists: |_name: &str| true,
             agent_exists: |_name: &str| true,
         };
-        let src = include_str!("../../../examples/agents/badgey.json");
+        let src = include_str!("../../../system-defaults/agents/badgey.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
         validate_agent_install(&v, &ctx).expect("badgey validates cleanly");
     }
@@ -1484,7 +1290,7 @@ mod tests {
     fn reference_agent_badgey_fails_without_adapter() {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx(&registry);
-        let src = include_str!("../../../examples/agents/badgey.json");
+        let src = include_str!("../../../system-defaults/agents/badgey.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_dispatch_adapter");
@@ -1495,7 +1301,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let catalog = crate::artifacts::ArtifactCatalog::open(tmp.path()).unwrap();
 
-        let persona_src = include_str!("../../../examples/agents/code-reviewer-persona.json");
+        let persona_src =
+            include_str!("../../../system-defaults/brofiles/code-reviewer-persona.json");
         let persona_v: serde_json::Value =
             serde_json::from_str(persona_src).expect("persona parses");
         catalog
@@ -1540,9 +1347,9 @@ mod tests {
         registry.register(Arc::new(TestBadgeyAdapter));
 
         let agents: &[&str] = &[
-            include_str!("../../../examples/agents/code-reviewer.json"),
-            include_str!("../../../examples/agents/diff-narrator.json"),
-            include_str!("../../../examples/agents/badgey.json"),
+            include_str!("../../../system-defaults/agents/code-reviewer.json"),
+            include_str!("../../../system-defaults/agents/diff-narrator.json"),
+            include_str!("../../../system-defaults/agents/badgey.json"),
         ];
         for src in agents {
             let v: serde_json::Value = serde_json::from_str(src).expect("agent JSON parses");
@@ -1629,7 +1436,7 @@ mod tests {
         }
         registry.register(Arc::new(TestBadgeyAdapter));
 
-        let src = include_str!("../../../examples/agents/badgey.json");
+        let src = include_str!("../../../system-defaults/agents/badgey.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
         let ctx = make_ctx(&registry);
         validate_agent_install(&v, &ctx).expect("badgey with registered adapter should validate");
@@ -1702,11 +1509,11 @@ mod tests {
         for (agent_name, agent_src) in [
             (
                 "code-reviewer",
-                include_str!("../../../examples/agents/code-reviewer.json"),
+                include_str!("../../../system-defaults/agents/code-reviewer.json"),
             ),
             (
                 "diff-narrator",
-                include_str!("../../../examples/agents/diff-narrator.json"),
+                include_str!("../../../system-defaults/agents/diff-narrator.json"),
             ),
         ] {
             let v: serde_json::Value = serde_json::from_str(agent_src).expect("agent parses");
@@ -1741,447 +1548,5 @@ mod tests {
                 "{agent_name}: should not be degraded for small args"
             );
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // RA-S1 — refactor-atom lint
-    // -----------------------------------------------------------------------
-
-    fn make_refactor_atom(overrides: serde_json::Value) -> serde_json::Value {
-        let mut base = serde_json::json!({
-            "kind": "agent",
-            "name": "rust-test-atom",
-            "version": 1,
-            "_contract": REFACTOR_ATOM_CONTRACT_MARKER,
-            "manifest": {
-                "description": "Test refactor atom for lint coverage.",
-                "when_to_use": ["only in unit tests"],
-                "brofile_ref": "rust-refactor-persona",
-                "inputs": {
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "project_dir": { "type": "string" }
-                        },
-                        "required": ["project_dir"]
-                    },
-                    "prompt_template": "ground via bbox_refactor_plan, run via bbox_refactor_run, emit bbox_note(kind=\"done\")."
-                },
-                "outputs": {
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "status": { "type": "string" },
-                            "plan_path": { "type": "string" },
-                            "files_touched": { "type": "array" },
-                            "fixme_count": { "type": "object" },
-                            "deep_analysis_summary": { "type": "object" },
-                            "cargo_result": { "type": "object" },
-                            "block_reason": { "type": "string" },
-                            "done_note_id": { "type": "string" }
-                        }
-                    }
-                }
-            }
-        });
-        let serde_json::Value::Object(over_map) = overrides else {
-            return base;
-        };
-        // shallow patch: top-level keys replace verbatim; manifest sub-keys replace verbatim
-        let base_map = base.as_object_mut().unwrap();
-        for (k, v) in over_map {
-            if k == "manifest" {
-                if let (Some(base_manifest), serde_json::Value::Object(over_manifest)) =
-                    (base_map.get_mut(&k).and_then(|x| x.as_object_mut()), v)
-                {
-                    for (mk, mv) in over_manifest {
-                        base_manifest.insert(mk, mv);
-                    }
-                }
-            } else {
-                base_map.insert(k, v);
-            }
-        }
-        base
-    }
-
-    #[test]
-    fn refactor_atom_lint_triggers_on_contract_marker() {
-        let v = make_refactor_atom(serde_json::json!({}));
-        assert!(is_refactor_atom_artifact(&v, None));
-        validate_refactor_atom_install(&v, None).expect("known-good atom passes");
-        assert!(refactor_atom_install_warnings(&v, None).is_empty());
-    }
-
-    #[test]
-    fn refactor_atom_lint_triggers_on_path() {
-        let mut v = make_refactor_atom(serde_json::json!({}));
-        v.as_object_mut().unwrap().remove("_contract");
-        assert!(!is_refactor_atom_artifact(&v, None));
-        let src = Some("examples/agents/refactor/rust-test-atom.json");
-        assert!(is_refactor_atom_artifact(&v, src));
-        validate_refactor_atom_install(&v, src).expect("path-triggered atom passes");
-    }
-
-    #[test]
-    fn refactor_atom_lint_skips_non_refactor_artifact() {
-        let v = serde_json::json!({
-            "kind": "agent",
-            "name": "code-reviewer",
-            "version": 1,
-            "manifest": {
-                "description": "general reviewer",
-                "when_to_use": ["after diffs"],
-                "brofile_ref": "code-reviewer-persona"
-            }
-        });
-        assert!(!is_refactor_atom_artifact(&v, None));
-        validate_refactor_atom_install(&v, None).expect("non-refactor artifact untouched");
-        assert!(refactor_atom_install_warnings(&v, None).is_empty());
-    }
-
-    #[test]
-    fn refactor_atom_lint_rejects_unrecognized_brofile() {
-        let v = make_refactor_atom(serde_json::json!({
-            "manifest": { "brofile_ref": "code-reviewer-persona" }
-        }));
-        let err = validate_refactor_atom_install(&v, None).unwrap_err();
-        assert_eq!(err.step, "refactor_atom_lint");
-        assert!(
-            err.message.contains("refactor_atom_lint_failed"),
-            "message lacks failure code: {}",
-            err.message
-        );
-        assert!(err.message.contains("brofile_ref"));
-    }
-
-    #[test]
-    fn refactor_atom_lint_rejects_missing_brofile_ref() {
-        let mut v = make_refactor_atom(serde_json::json!({}));
-        // Strip brofile_ref entirely.
-        v["manifest"].as_object_mut().unwrap().remove("brofile_ref");
-        let err = validate_refactor_atom_install(&v, None).unwrap_err();
-        assert_eq!(err.step, "refactor_atom_lint");
-        assert!(err.message.contains("brofile_ref"));
-    }
-
-    #[test]
-    fn refactor_atom_lint_rejects_acknowledge_default() {
-        let v = make_refactor_atom(serde_json::json!({
-            "manifest": {
-                "inputs": {
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "project_dir": { "type": "string" },
-                            "acknowledge_repr": { "type": "boolean", "default": false }
-                        }
-                    },
-                    "prompt_template": "bbox_refactor_plan / bbox_refactor_run / bbox_note(kind=\"done\")"
-                }
-            }
-        }));
-        let err = validate_refactor_atom_install(&v, None).unwrap_err();
-        assert_eq!(err.step, "refactor_atom_lint");
-        assert!(
-            err.message.contains("acknowledge_repr"),
-            "message should name the offending field: {}",
-            err.message
-        );
-        assert!(err.message.contains("operator-authority"));
-    }
-
-    #[test]
-    fn refactor_atom_warning_filter_overlay_allow_nonempty() {
-        let v = make_refactor_atom(serde_json::json!({
-            "manifest": {
-                "filter_overlay": {
-                    "allow": ["mcp__blackbox__bbox_blame"],
-                    "disallow": []
-                }
-            }
-        }));
-        let warnings = refactor_atom_install_warnings(&v, None);
-        assert!(
-            warnings.iter().any(|w| w.contains("filter_overlay.allow")),
-            "expected allow warning; got {:?}",
-            warnings
-        );
-    }
-
-    #[test]
-    fn refactor_atom_warning_missing_base_output_fields() {
-        let v = make_refactor_atom(serde_json::json!({
-            "manifest": {
-                "outputs": {
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "status": { "type": "string" }
-                        }
-                    }
-                }
-            }
-        }));
-        let warnings = refactor_atom_install_warnings(&v, None);
-        let joined = warnings.join(" | ");
-        assert!(joined.contains("base fields"), "got {:?}", warnings);
-        assert!(joined.contains("plan_path"));
-        assert!(joined.contains("done_note_id"));
-    }
-
-    #[test]
-    fn refactor_atom_warning_missing_protocol_markers() {
-        let v = make_refactor_atom(serde_json::json!({
-            "manifest": {
-                "inputs": {
-                    "schema": { "type": "object", "properties": { "project_dir": { "type": "string" } } },
-                    "prompt_template": "just analyze and report"
-                }
-            }
-        }));
-        let warnings = refactor_atom_install_warnings(&v, None);
-        let joined = warnings.join(" | ");
-        assert!(joined.contains("protocol markers"), "got {:?}", warnings);
-        assert!(joined.contains("bbox_refactor_plan"));
-        assert!(joined.contains("bbox_refactor_run"));
-        assert!(joined.contains("bbox_note(kind="));
-    }
-
-    /// Walks every JSON manifest under `examples/agents/refactor/` (excluding
-    /// shared `_*` reference files) and asserts each one passes the
-    /// refactor-atom lint and validates against the agent schema. New atoms
-    /// landing under that path are picked up automatically.
-    /// RA-E1: the eval/agents/refactor/ suites parse cleanly AND every
-    /// shipped atom has at least one discovery query and one behavior-smoke
-    /// entry. The recording AgentDispatchAdapter that interprets the
-    /// behavior-smoke entries against the manifest's prompt template is a
-    /// follow-up; this gate covers the artifact alignment so eval drift
-    /// surfaces at build time.
-    #[test]
-    fn refactor_atom_eval_suites_cover_every_shipped_atom() {
-        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let dir = crate_root.join("examples/agents/refactor");
-        let mut atom_names: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&dir).expect("refactor agents dir exists") {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let filename = path.file_name().unwrap().to_string_lossy().to_string();
-            if filename.starts_with('_') {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).expect("read manifest");
-            let v: serde_json::Value = serde_json::from_str(&src).expect("manifest parses");
-            atom_names.push(v["name"].as_str().expect("manifest name").to_string());
-        }
-
-        let eval_dir = crate_root.join("eval/agents/refactor");
-        let discovery: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(eval_dir.join("discovery-queries.json"))
-                .expect("read discovery-queries.json"),
-        )
-        .expect("discovery-queries.json parses");
-        let dispatch: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(eval_dir.join("dispatch-scenarios.json"))
-                .expect("read dispatch-scenarios.json"),
-        )
-        .expect("dispatch-scenarios.json parses");
-        let behavior: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(eval_dir.join("behavior-smoke.json"))
-                .expect("read behavior-smoke.json"),
-        )
-        .expect("behavior-smoke.json parses");
-
-        let discovery_agents: std::collections::HashSet<String> = discovery["queries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|q| q["expected_agents"].as_array().unwrap().iter())
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        let dispatch_agents: std::collections::HashSet<String> = dispatch["scenarios"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s["agent"].as_str().unwrap().to_string())
-            .collect();
-        let behavior_agents: std::collections::HashSet<String> = behavior["atoms"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| a["agent"].as_str().unwrap().to_string())
-            .collect();
-
-        for name in &atom_names {
-            assert!(
-                discovery_agents.contains(name),
-                "eval/agents/refactor/discovery-queries.json missing {name}"
-            );
-            assert!(
-                dispatch_agents.contains(name),
-                "eval/agents/refactor/dispatch-scenarios.json missing {name}"
-            );
-            assert!(
-                behavior_agents.contains(name),
-                "eval/agents/refactor/behavior-smoke.json missing {name}"
-            );
-        }
-    }
-
-    /// RA-D1: the sm-refactor catalog must list every shipped atom under
-    /// `examples/agents/refactor/<name>.json` exactly once. A new atom that
-    /// lands without a catalog row fails this test — the failure message
-    /// names the missing atoms so the author knows which row to add.
-    #[test]
-    fn sm_refactor_catalog_lists_every_shipped_atom() {
-        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let dir = crate_root.join("examples/agents/refactor");
-
-        let mut atom_names: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&dir).expect("refactor agents dir exists") {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let filename = path.file_name().unwrap().to_string_lossy().to_string();
-            if filename.starts_with('_') {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).expect("read manifest");
-            let v: serde_json::Value = serde_json::from_str(&src).expect("manifest parses");
-            let name = v
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or_else(|| panic!("{filename}: missing top-level name"))
-                .to_string();
-            atom_names.push(name);
-        }
-        atom_names.sort();
-
-        let catalog = std::fs::read_to_string(crate_root.join("src/system_memory/refactor.md"))
-            .expect("read sm-refactor");
-
-        let mut missing: Vec<&str> = Vec::new();
-        for name in &atom_names {
-            let needle = format!("`{name}`");
-            if !catalog.contains(&needle) {
-                missing.push(name);
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "sm-refactor catalog is missing rows for shipped atoms: {:?}. \
-             Add a row to the \"Refactor atom catalog\" table in \
-             src/system_memory/refactor.md.",
-            missing
-        );
-    }
-
-    /// RA-V1: every reference workflow under
-    /// examples/agents/refactor/workflows/ parses as a Workflow and compiles
-    /// cleanly. The workflows are operator-runnable artifacts; if the engine
-    /// can't compile them, the docs are wrong.
-    #[test]
-    fn refactor_atom_reference_workflows_parse_and_compile() {
-        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let dir = crate_root.join("examples/agents/refactor/workflows");
-        let entries = std::fs::read_dir(&dir).expect("refactor workflows dir exists");
-        let mut found = 0usize;
-        for entry in entries {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            found += 1;
-            let src = std::fs::read_to_string(&path).expect("read workflow");
-            let spec: crate::workflow::Workflow = serde_json::from_str(&src)
-                .unwrap_or_else(|e| panic!("{name} did not parse as Workflow: {e}"));
-            crate::workflow::compile(spec)
-                .unwrap_or_else(|e| panic!("{name} failed to compile: {e}"));
-        }
-        assert!(
-            found >= 1,
-            "expected at least one reference workflow under examples/agents/refactor/workflows/"
-        );
-    }
-
-    #[test]
-    fn every_shipped_refactor_atom_passes_lint_and_schema() {
-        let schema_raw = include_str!("../../../schema/agent.schema.json");
-        let schema: serde_json::Value =
-            serde_json::from_str(schema_raw).expect("agent schema valid JSON");
-        let compiled = jsonschema::JSONSchema::options()
-            .with_draft(jsonschema::Draft::Draft202012)
-            .compile(&schema)
-            .expect("agent schema compiles");
-
-        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let dir = crate_root.join("examples/agents/refactor");
-        let entries = std::fs::read_dir(&dir).expect("refactor agents dir exists");
-        let mut found = 0usize;
-        for entry in entries {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if name.starts_with('_') {
-                continue;
-            }
-            found += 1;
-            let src = std::fs::read_to_string(&path).expect("read manifest");
-            let v: serde_json::Value =
-                serde_json::from_str(&src).unwrap_or_else(|e| panic!("{name} did not parse: {e}"));
-            assert!(
-                is_refactor_atom_artifact(&v, None),
-                "{name} missing _contract marker"
-            );
-            validate_refactor_atom_install(&v, None)
-                .unwrap_or_else(|e| panic!("{name} failed refactor-atom lint: {e}"));
-            assert!(
-                compiled.is_valid(&v),
-                "{name} rejected by agent schema: {:?}",
-                compiled
-                    .validate(&v)
-                    .err()
-                    .map(|errs| errs.map(|e| e.to_string()).collect::<Vec<_>>())
-            );
-            // Analysis-only atoms legitimately drop bbox_refactor_run; any other
-            // warnings (filter_overlay.allow, missing base fields, missing other
-            // markers) are unexpected drift and fail loudly.
-            let warnings = refactor_atom_install_warnings(&v, None);
-            for w in &warnings {
-                assert!(
-                    w.contains("bbox_refactor_run"),
-                    "{name}: unexpected refactor_atom warning: {w}"
-                );
-            }
-        }
-        assert!(
-            found >= 1,
-            "expected at least one shipped refactor atom under examples/agents/refactor/"
-        );
-    }
-
-    #[test]
-    fn refactor_atom_warning_skipped_when_not_refactor() {
-        let v = serde_json::json!({
-            "kind": "agent",
-            "name": "non-refactor",
-            "version": 1,
-            "manifest": {
-                "description": "x",
-                "when_to_use": ["x"],
-                "filter_overlay": { "allow": ["mcp__blackbox__bbox_blame"], "disallow": [] }
-            }
-        });
-        assert!(refactor_atom_install_warnings(&v, None).is_empty());
     }
 }

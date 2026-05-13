@@ -71,11 +71,11 @@ bytes: 2140}, {ref: ..., bytes: 895}]}`.
 
 2.1 **Corpus-pathfinder as JSON agent.** Lift the existing
    `.claude/agents/corpus-pathfinder.md` (Claude-frontmatter agent) to
-   an installed JSON manifest in `examples/agents/corpus-pathfinder.json`.
-   Follows the `code-reviewer.json` schema (`examples/agents/`).
+   an installed JSON manifest in `system-defaults/agents/corpus-pathfinder.json`.
+   Follows the `code-reviewer.json` schema (`system-defaults/agents/`).
 
    Fields (matching `code-reviewer.json` schema,
-   `examples/agents/code-reviewer.json`):
+   `system-defaults/agents/code-reviewer.json`):
    - `description`: "Scout for codebase exploration..."
    - `when_to_use`: ["when dispatching discovery scouts over a phase doc",
      "when grounding a proposal in code before implementing"]
@@ -394,7 +394,7 @@ configuration artifacts on top of the existing workflow engine.
 | Node gate + gate_mode | 3, 5, 7 | `schema.rs:120-127` |
 | Whiteboard (MCP tool surface) | 5, 7 | `src/whiteboards.rs` (store), `whiteboard_*` MCP tools |
 | Durable actor sessions | 3, 5, 7 | `schema.rs:64` |
-| Agent manifests | 2, 5, 7 | `examples/agents/code-reviewer.json` |
+| Agent manifests | 2, 5, 7 | `system-defaults/agents/code-reviewer.json` |
 | bro_agent_dispatch | 2, 3 | `src/tools/agents.rs` |
 | bro_workflow_install | 3, 4 | `src/tools/orchestrate.rs` |
 | bbox_compile / bbox_audit | 3, 5, 7 | `src/tools/packets.rs` |

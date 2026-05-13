@@ -1,0 +1,193 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "rust-trait-from-impl",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Lift a method subset from a struct's inherent impl into a trait + impl Trait for Struct, optionally migrating call sites to depend on the trait.",
+    "when_to_use": [
+      "a struct exposes a public method surface callers should depend on by trait, not concretion",
+      "operator wants mockability for a subset of methods",
+      "preparing for dyn-dispatch or generic-parameter binding at call sites"
+    ],
+    "anti_patterns": [
+      "do not use when methods take Self by value or return Self — trait cannot be used as dyn Trait (atom HARD-REFUSES when migrate_call_sites=true and dyn_compatible=false)",
+      "do not use when methods call other inherent (non-lifted) methods on self — atom refuses cleanly",
+      "do not use on non-Rust files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source_file",
+          "source_struct",
+          "trait_name",
+          "target_file",
+          "method_names"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string"
+          },
+          "source_file": {
+            "type": "string"
+          },
+          "source_struct": {
+            "type": "string"
+          },
+          "trait_name": {
+            "type": "string"
+          },
+          "target_file": {
+            "type": "string"
+          },
+          "method_names": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "migrate_call_sites": {
+            "type": "boolean"
+          },
+          "call_site_replacement": {
+            "type": "string",
+            "description": "Replacement type used at call sites when migrate_call_sites=true (e.g. \"Arc<dyn MyTrait>\" or \"impl MyTrait\")."
+          },
+          "apply": {
+            "type": "boolean"
+          },
+          "validation_bin": {
+            "type": "string"
+          }
+        }
+      },
+      "prompt_template": "You are rust-trait-from-impl. Charter: Lift a method subset into a trait + impl Trait for Struct.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{source_struct}}\",\n                     languages=[\"rust\"], item_kinds=[\"impl_item\", \"function_item\"])\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Copy exact method names from the impl block. Confirm every name in\n   {{method_names}} resolves on {{source_struct}}.\n\n2. Plan with deep_analysis=true:\n   bbox_refactor_plan(kind=\"extract_rust_trait\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      source_struct=\"{{source_struct}}\",\n                      trait_name=\"{{trait_name}}\",\n                      target=\"{{target_file}}\",\n                      item_names={{method_names}})\n   Inspect the response's object_safety_report and call_site_warnings.\n\n3. Decide:\n   - HARD REFUSE: if {{migrate_call_sites}} == true AND\n     object_safety_report.dyn_compatible == false:\n     emit bbox_note(kind=\"blocked\", body=<concrete diagnostic: cannot\n     migrate to dyn Trait when trait is not object-safe; method takes\n     Self by value or returns Self / has generic methods / etc. +\n     plan_path>) and return status=\"blocked\". NO plan-time fix exists.\n   - SOFT REFUSE: if any method in {{method_names}} calls other inherent\n     (non-lifted) methods on self — block with reason naming the call.\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(confirm=true, steps=[\n     <extract_rust_trait step>,\n     /* migrate_call_sites=true path also includes\n        migrate_rust_type_usages to swap concretion for replacement */\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true}\n   ])\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: trait_file,\n     methods_lifted count, object_safe, call_sites_migrated count,\n     migration_skipped count, cargo result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never attempt migrate_call_sites=true when dyn_compatible=false.\n- Never apply when status=blocked.\n- Never invent method names from the user prompt.\n\nInputs:\n{{project_dir}} {{source_file}} {{source_struct}} {{trait_name}} {{target_file}} {{method_names}} {{migrate_call_sites}} {{call_site_replacement}} {{apply}} {{validation_bin}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "trait_file": {
+            "type": "string"
+          },
+          "methods_lifted": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "object_safe": {
+            "type": "boolean"
+          },
+          "call_site_warnings": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "migration_skipped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "call_sites_migrated": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-11T00:00:00Z"
+    }
+  }
+}

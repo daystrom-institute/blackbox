@@ -1,0 +1,192 @@
+{
+  "name": "refactor-promote-inner-then-extract",
+  "version": 1,
+  "actors": {},
+  "start": "PromoteInner",
+  "vars_schema": {
+    "project_dir": {
+      "kind": "string",
+      "required": true
+    },
+    "source": {
+      "kind": "string",
+      "required": true
+    },
+    "inner_target": {
+      "kind": "string",
+      "required": true
+    },
+    "inner_module_name": {
+      "kind": "string",
+      "required": true
+    },
+    "outer_target": {
+      "kind": "string",
+      "required": true
+    },
+    "outer_module_name": {
+      "kind": "string",
+      "required": true
+    },
+    "outer_item_names": {
+      "kind": "any",
+      "required": true
+    },
+    "move_fields": {
+      "kind": "any"
+    },
+    "delegate_field": {
+      "kind": "string",
+      "required": true
+    },
+    "callback_externals": {
+      "kind": "any"
+    },
+    "validation_cmd": {
+      "kind": "any"
+    },
+    "promote_handle": {
+      "kind": "any"
+    },
+    "promote_output": {
+      "kind": "any"
+    },
+    "extract_handle": {
+      "kind": "any"
+    },
+    "extract_output": {
+      "kind": "any"
+    },
+    "promote_wait": {
+      "kind": "any"
+    },
+    "extract_wait": {
+      "kind": "any"
+    }
+  },
+  "nodes": {
+    "PromoteInner": {
+      "prompt": "Phase 1: invoke java-promote-inner-class to lift the non-static inner class with outer captures into a top-level class. The atom rewrites every `new <Inner>(args)` site on the source to pass capture arguments; the source gains an import for the promoted class.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_invoke",
+            "arguments": {
+              "atom": "atom:java-promote-inner-class@v1",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source": "${vars.source}",
+                "target": "${vars.inner_target}",
+                "module_name": "${vars.inner_module_name}",
+                "apply": true,
+                "validation_cmd": "${vars.validation_cmd}"
+              },
+              "project_dir": "${vars.project_dir}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 600
+          },
+          "into_var": "promote_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.promote_handle.task_id}",
+              "timeout_seconds": 600
+            },
+            "timeout_secs": 620
+          },
+          "into_var": "promote_wait",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_status",
+            "arguments": {
+              "invocation_id": "${vars.promote_handle.invocation_id}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "promote_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "goto",
+        "to": "ExtractOuter"
+      }
+    },
+    "ExtractOuter": {
+      "prompt": "Phase 2: with the inner class promoted, invoke java-extract-cohesive-class on the outer cluster. The outer methods can now reference the promoted class via the source's auto-added import. The composite plan handles the rest (field moves + delegate wiring + caller delegation + accessor rewrites + cross-package widening).",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_invoke",
+            "arguments": {
+              "atom": "atom:java-extract-cohesive-class@v3",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source": "${vars.source}",
+                "target": "${vars.outer_target}",
+                "module_name": "${vars.outer_module_name}",
+                "item_names": "${vars.outer_item_names}",
+                "move_fields": "${vars.move_fields}",
+                "delegate_field": "${vars.delegate_field}",
+                "callback_externals": "${vars.callback_externals}",
+                "apply": true,
+                "validation_cmd": "${vars.validation_cmd}"
+              },
+              "project_dir": "${vars.project_dir}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 900
+          },
+          "into_var": "extract_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.extract_handle.task_id}",
+              "timeout_seconds": 900
+            },
+            "timeout_secs": 920
+          },
+          "into_var": "extract_wait",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_status",
+            "arguments": {
+              "invocation_id": "${vars.extract_handle.invocation_id}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "extract_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "terminal"
+      }
+    }
+  }
+}

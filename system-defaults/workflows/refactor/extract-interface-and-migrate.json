@@ -1,0 +1,115 @@
+{
+  "name": "refactor-extract-interface-and-migrate",
+  "version": 1,
+  "actors": {},
+  "start": "ExtractInterface",
+  "vars_schema": {
+    "project_dir": {
+      "kind": "string",
+      "required": true
+    },
+    "source": {
+      "kind": "string",
+      "required": true
+    },
+    "target": {
+      "kind": "string",
+      "required": true
+    },
+    "module_name": {
+      "kind": "string",
+      "required": true
+    },
+    "impl_name": {
+      "kind": "any"
+    },
+    "item_names": {
+      "kind": "any"
+    },
+    "migrate_callers_in": {
+      "kind": "any",
+      "required": true
+    },
+    "acknowledge_public_api_change": {
+      "kind": "any"
+    },
+    "validation_cmd": {
+      "kind": "any"
+    },
+    "extract_handle": {
+      "kind": "any"
+    },
+    "extract_output": {
+      "kind": "any"
+    },
+    "extract_wait": {
+      "kind": "any"
+    }
+  },
+  "nodes": {
+    "ExtractInterface": {
+      "prompt": "Invoke java-extract-interface (v2) with migrate_call_sites=true and migrate_callers_in pre-populated by the workflow caller. The atom runs java_public_api_guard as a structured preflight BEFORE the mutating bbox_refactor_run. When advisory_severity=breaking and the operator hasn't passed acknowledge_public_api_change=true, the atom blocks before any mutation starts — structurally enforced via the guard plan, not by prompt-discipline alone.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_invoke",
+            "arguments": {
+              "atom": "atom:java-extract-interface@v2",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source": "${vars.source}",
+                "target": "${vars.target}",
+                "module_name": "${vars.module_name}",
+                "impl_name": "${vars.impl_name}",
+                "item_names": "${vars.item_names}",
+                "migrate_call_sites": true,
+                "migrate_callers_in": "${vars.migrate_callers_in}",
+                "acknowledge_public_api_change": "${vars.acknowledge_public_api_change}",
+                "apply": true,
+                "validation_cmd": "${vars.validation_cmd}"
+              },
+              "project_dir": "${vars.project_dir}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 900
+          },
+          "into_var": "extract_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.extract_handle.task_id}",
+              "timeout_seconds": 900
+            },
+            "timeout_secs": 920
+          },
+          "into_var": "extract_wait",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_status",
+            "arguments": {
+              "invocation_id": "${vars.extract_handle.invocation_id}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "extract_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "terminal"
+      }
+    }
+  }
+}

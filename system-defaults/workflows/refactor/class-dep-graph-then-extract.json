@@ -1,0 +1,185 @@
+{
+  "name": "refactor-class-dep-graph-then-extract",
+  "version": 1,
+  "actors": {},
+  "start": "DepGraph",
+  "vars_schema": {
+    "project_dir": {
+      "kind": "string",
+      "required": true
+    },
+    "source": {
+      "kind": "string",
+      "required": true
+    },
+    "class_name": {
+      "kind": "string",
+      "required": true
+    },
+    "target": {
+      "kind": "string",
+      "required": true
+    },
+    "extract_module_name": {
+      "kind": "string",
+      "required": true
+    },
+    "extract_item_names": {
+      "kind": "any",
+      "required": true
+    },
+    "move_fields": {
+      "kind": "any"
+    },
+    "delegate_field": {
+      "kind": "string",
+      "required": true
+    },
+    "callback_externals": {
+      "kind": "any"
+    },
+    "validation_cmd": {
+      "kind": "any"
+    },
+    "graph_handle": {
+      "kind": "any"
+    },
+    "graph_output": {
+      "kind": "any"
+    },
+    "extract_handle": {
+      "kind": "any"
+    },
+    "extract_output": {
+      "kind": "any"
+    },
+    "graph_wait": {
+      "kind": "any"
+    },
+    "extract_wait": {
+      "kind": "any"
+    }
+  },
+  "nodes": {
+    "DepGraph": {
+      "prompt": "Phase 1 (analysis): invoke java-class-dependency-graph to enumerate methods, fields, inner types, and class-level annotations on the target class. Operator review of the inventory drives the partition decision (workflow's extract_item_names + move_fields vars). cost_class=cheap, parallel_safe; safe to fan out across multiple candidate classes. Annotations_class_level matters — @Slf4j generates a `log` field invisible to extraction dep analysis; @Data generates accessors; the operator needs to know which auto-members travel with which methods.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_invoke",
+            "arguments": {
+              "atom": "atom:java-class-dependency-graph@v2",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source": "${vars.source}",
+                "module_name": "${vars.class_name}"
+              },
+              "project_dir": "${vars.project_dir}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 180
+          },
+          "into_var": "graph_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.graph_handle.task_id}",
+              "timeout_seconds": 180
+            },
+            "timeout_secs": 200
+          },
+          "into_var": "graph_wait",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_status",
+            "arguments": {
+              "invocation_id": "${vars.graph_handle.invocation_id}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "graph_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "goto",
+        "to": "ExtractCohesiveCluster"
+      }
+    },
+    "ExtractCohesiveCluster": {
+      "prompt": "Phase 2: with the inventory available for operator review, invoke java-extract-cohesive-class against the operator-decided partition. The composite plan handles delegate wiring + caller delegation + accessor rewrites + cross-package widening + FIXME scaffolding in one bbox_refactor_run.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_invoke",
+            "arguments": {
+              "atom": "atom:java-extract-cohesive-class@v3",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source": "${vars.source}",
+                "target": "${vars.target}",
+                "module_name": "${vars.extract_module_name}",
+                "item_names": "${vars.extract_item_names}",
+                "move_fields": "${vars.move_fields}",
+                "delegate_field": "${vars.delegate_field}",
+                "callback_externals": "${vars.callback_externals}",
+                "apply": true,
+                "validation_cmd": "${vars.validation_cmd}"
+              },
+              "project_dir": "${vars.project_dir}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 900
+          },
+          "into_var": "extract_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.extract_handle.task_id}",
+              "timeout_seconds": 900
+            },
+            "timeout_secs": 920
+          },
+          "into_var": "extract_wait",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_status",
+            "arguments": {
+              "invocation_id": "${vars.extract_handle.invocation_id}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "extract_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "terminal"
+      }
+    }
+  }
+}

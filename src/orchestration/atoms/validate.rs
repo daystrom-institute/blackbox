@@ -1222,14 +1222,194 @@ mod tests {
         validate_atom_install(&v, &noop_ctx()).unwrap();
     }
 
-    #[test]
-    fn every_shipped_atom_artifact_passes_validation() {
+    fn shipped_refactor_atom_names() -> Vec<String> {
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let dir = crate_root.join("examples/atoms/refactor");
-        let entries = std::fs::read_dir(&dir).expect("examples/atoms/refactor dir exists");
+        let dir = crate_root.join("system-defaults/atoms/refactor");
+        let mut atom_names: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("refactor atoms dir exists") {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let filename = path.file_name().unwrap().to_string_lossy().to_string();
+            if filename.starts_with('_') {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read manifest");
+            let v: serde_json::Value = serde_json::from_str(&src).expect("manifest parses");
+            let name = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_else(|| panic!("{filename}: missing top-level name"))
+                .to_string();
+            atom_names.push(name);
+        }
+        atom_names.sort();
+        atom_names
+    }
+
+    #[test]
+    fn every_shipped_refactor_atom_passes_atom_validation() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_root.join("system-defaults/atoms/refactor");
+        let entries = std::fs::read_dir(&dir).expect("refactor atoms dir exists");
         let mut found = 0usize;
         for entry in entries {
             let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name.starts_with('_') {
+                continue;
+            }
+            found += 1;
+            let src = std::fs::read_to_string(&path).expect("read manifest");
+            let v: serde_json::Value =
+                serde_json::from_str(&src).unwrap_or_else(|e| panic!("{name} did not parse: {e}"));
+            assert_eq!(
+                v.get("_contract").and_then(|v| v.as_str()),
+                Some("atom/v1"),
+                "{name} must use atom/v1 contract"
+            );
+            assert_eq!(
+                v.get("kind").and_then(|v| v.as_str()),
+                Some("atom"),
+                "{name} must be kind=atom"
+            );
+            assert_eq!(
+                v.get("subcontract").and_then(|v| v.as_str()),
+                Some(REFACTOR_SUBCONTRACT),
+                "{name} must opt into refactor/v1 subcontract"
+            );
+            validate_atom_install(&v, &noop_ctx())
+                .unwrap_or_else(|e| panic!("{name} failed atom validation: {e}"));
+        }
+        assert!(
+            found >= 1,
+            "expected at least one shipped refactor atom under system-defaults/atoms/refactor/"
+        );
+    }
+
+    #[test]
+    fn sm_refactor_catalog_lists_every_shipped_atom() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let atom_names = shipped_refactor_atom_names();
+        let catalog = std::fs::read_to_string(crate_root.join("src/system_memory/refactor.md"))
+            .expect("read sm-refactor");
+
+        let mut missing: Vec<&str> = Vec::new();
+        for name in &atom_names {
+            let needle = format!("`{name}`");
+            if !catalog.contains(&needle) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "sm-refactor catalog is missing rows for shipped atoms: {:?}. \
+             Add a row to the \"Refactor atom catalog\" table in \
+             src/system_memory/refactor.md.",
+            missing
+        );
+    }
+
+    #[test]
+    fn refactor_atom_eval_suites_cover_every_shipped_atom() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let atom_names = shipped_refactor_atom_names();
+
+        let eval_dir = crate_root.join("eval/atoms/refactor");
+        let discovery: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(eval_dir.join("discovery-queries.json"))
+                .expect("read discovery-queries.json"),
+        )
+        .expect("discovery-queries.json parses");
+        let dispatch: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(eval_dir.join("dispatch-scenarios.json"))
+                .expect("read dispatch-scenarios.json"),
+        )
+        .expect("dispatch-scenarios.json parses");
+        let behavior: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(eval_dir.join("behavior-smoke.json"))
+                .expect("read behavior-smoke.json"),
+        )
+        .expect("behavior-smoke.json parses");
+
+        let discovery_atoms: std::collections::HashSet<String> = discovery["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|q| q["expected_atoms"].as_array().unwrap().iter())
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let dispatch_atoms: std::collections::HashSet<String> = dispatch["scenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["atom"].as_str().unwrap().to_string())
+            .collect();
+        let behavior_atoms: std::collections::HashSet<String> = behavior["atoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["atom"].as_str().unwrap().to_string())
+            .collect();
+
+        for name in &atom_names {
+            assert!(
+                discovery_atoms.contains(name),
+                "eval/atoms/refactor/discovery-queries.json missing {name}"
+            );
+            assert!(
+                dispatch_atoms.contains(name),
+                "eval/atoms/refactor/dispatch-scenarios.json missing {name}"
+            );
+            assert!(
+                behavior_atoms.contains(name),
+                "eval/atoms/refactor/behavior-smoke.json missing {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn refactor_atom_reference_workflows_parse_and_compile() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_root.join("system-defaults/workflows/refactor");
+        let entries = std::fs::read_dir(&dir).expect("refactor workflows dir exists");
+        let mut found = 0usize;
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            found += 1;
+            let src = std::fs::read_to_string(&path).expect("read workflow");
+            let spec: crate::workflow::Workflow = serde_json::from_str(&src)
+                .unwrap_or_else(|e| panic!("{name} did not parse as Workflow: {e}"));
+            crate::workflow::compile(spec)
+                .unwrap_or_else(|e| panic!("{name} failed to compile: {e}"));
+        }
+        assert!(
+            found >= 1,
+            "expected at least one reference workflow under system-defaults/workflows/refactor/"
+        );
+    }
+
+    #[test]
+    fn every_shipped_atom_artifact_passes_validation() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_root.join("system-defaults/atoms");
+        let entries = walkdir::WalkDir::new(&dir);
+        let mut found = 0usize;
+        for entry in entries.into_iter().filter_map(|entry| entry.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
@@ -1243,7 +1423,7 @@ mod tests {
                 serde_json::from_str(&src).unwrap_or_else(|e| panic!("{name} did not parse: {e}"));
             assert!(
                 v.get("kind").and_then(|v| v.as_str()) == Some("atom"),
-                "{name} under examples/atoms/ must have kind=\"atom\""
+                "{name} under system-defaults/atoms/ must have kind=\"atom\""
             );
             found += 1;
             validate_atom_install(&v, &noop_ctx())
@@ -1251,7 +1431,7 @@ mod tests {
         }
         assert!(
             found >= 1,
-            "expected at least one shipped atom artifact under examples/atoms/refactor/"
+            "expected at least one shipped atom artifact under system-defaults/atoms/"
         );
     }
 }

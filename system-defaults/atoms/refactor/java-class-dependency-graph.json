@@ -1,0 +1,181 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-class-dependency-graph",
+  "version": 2,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Produce a class-shaped dependency report for a Java class — methods, fields, inner types, class-level annotations — to support partitioning decisions before extraction. Mirrors rust-impl-partition-graph.",
+    "when_to_use": [
+      "about to run java-extract-cohesive-class and want a structural inventory before committing to a partition",
+      "operator wants to see method clusters + inner-type captures + class-level annotations (e.g. @Slf4j → generated `log` field) before deciding what travels with the cluster",
+      "auditing a god-class for cohesion"
+    ],
+    "anti_patterns": [
+      "do not use as a clustering algorithm — this atom returns the inventory, not partitions",
+      "do not use to decide whether to split — chain operator review or a future clustering atom",
+      "do not use on non-Java files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "File containing the target class, relative to project_dir."
+          },
+          "module_name": {
+            "type": "string",
+            "description": "Class name to analyze. Defaults to the first top-level class in the file."
+          },
+          "impl_name": {
+            "type": "string",
+            "description": "Alternate way to name the class — the plan kind accepts either module_name or impl_name."
+          }
+        }
+      },
+      "prompt_template": "You are java-class-dependency-graph. Charter: Produce a class-shaped dependency report — methods, fields, inner types, class-level annotations — for operator review before a partition decision.\n\nProtocol (analysis-only — steps 3 and 4 are skipped):\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}}\",\n                     languages=[\"java\"], item_kinds=[\"class_declaration\"])\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm the target class exists in the file.\n\n2. Plan with deep_analysis=true (currently a no-op on the plan kind\n   but consistent with the atomic contract):\n   bbox_refactor_plan(kind=\"java_class_dependency_analysis\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      module_name=\"{{module_name}}\",\n                      impl_name=\"{{impl_name}}\")\n   The response carries: class {name, package, source_path},\n   annotations_class_level (e.g. @Slf4j, @Route — annotation-processor\n   generated members are invisible to dependency analysis; surface these\n   so the operator knows which auto-members the partition decision\n   needs to account for), methods (name + signature + visibility +\n   is_static + line_range), fields (name + type + visibility + final +\n   is_static + line_range), inner_types (name + kind + is_static +\n   is_implicitly_static + line_range — the implicitly_static flag is\n   true for `record_declaration` nodes regardless of explicit modifier,\n   per JLS records cannot capture outer state), and edges:\n   method_to_method (intra-class calls with context=\"direct\"|\"lambda\",\n   self-edges excluded), method_to_field (read|write split on bare and\n   `this.`-qualified field accesses), and method_to_inherited (calls\n   that resolve to a superclass or interface method via the project\n   type index — gated on `project_dir`).\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: class name, method\n     count, field count, inner-type count, class-level annotations>).\n   Method count MUST equal the length of the methods array returned by\n   the plan. Any narrative number (pre-table, post-table, done-note)\n   reads from that single source — never report \"24 methods + 1 inner\n   record\" while the Methods table has 26 entries. When the class has\n   name-collision overloads, render \"<N> methods (<U> unique names)\"\n   once; do not silently collapse to U or expand to N elsewhere.\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never invent class names from the user prompt — re-derive from\n  bbox_code_symbols.\n- Never attempt apply on this atom — analysis-only.\n- Surface annotations_class_level in the done-note when non-empty:\n  Lombok @Slf4j generates a `log` field invisible to dep analysis;\n  @Data / @Getter / @Setter generate accessors; an operator deciding\n  partitions needs to know.\n\nInputs:\n{{project_dir}} {{source}} {{module_name}} {{impl_name}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "class": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "package": {
+                "type": "string"
+              },
+              "source_path": {
+                "type": "string"
+              }
+            }
+          },
+          "annotations_class_level": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "inner_types": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:java-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-11T00:00:00Z"
+    }
+  }
+}

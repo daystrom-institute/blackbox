@@ -1,7 +1,13 @@
 # Atom System
 
 Date: 2026-05-13
-Status: proposal
+Status: implemented core runtime; design remains the conceptual reference
+
+Implementation note: the atom artifact kind, registry/read tools,
+`atom_invoke`/`atom_status`/`atom_resume`/`atom_delegate`, deterministic and
+adapter runners, workflow-backed atoms, and workflow `atom_bindings` are
+implemented. Legacy `bro_agent_*` remains as a compatibility surface while new
+public capability work moves to atoms.
 
 Related:
 - [Agent System](../archive/agent-system.md) - predecessor design for

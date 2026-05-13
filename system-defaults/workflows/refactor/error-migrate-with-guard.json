@@ -1,0 +1,172 @@
+{
+  "name": "refactor-error-migrate-with-guard",
+  "version": 1,
+  "actors": {},
+  "start": "GuardPreflight",
+  "vars_schema": {
+    "project_dir": {
+      "kind": "string",
+      "required": true
+    },
+    "source_file_or_module": {
+      "kind": "string",
+      "required": true
+    },
+    "from_type": {
+      "kind": "string",
+      "required": true
+    },
+    "to_type": {
+      "kind": "string",
+      "required": true
+    },
+    "error_mapping": {
+      "kind": "any",
+      "required": true
+    },
+    "acknowledge_public_api_change": {
+      "kind": "any"
+    },
+    "validation_bin": {
+      "kind": "any"
+    },
+    "guard_handle": {
+      "kind": "any"
+    },
+    "guard_output": {
+      "kind": "any"
+    },
+    "migrate_handle": {
+      "kind": "any"
+    },
+    "migrate_output": {
+      "kind": "any"
+    },
+    "guard_wait": {
+      "kind": "any"
+    },
+    "migrate_wait": {
+      "kind": "any"
+    }
+  },
+  "nodes": {
+    "GuardPreflight": {
+      "prompt": "Phase 1 (preflight): invoke rust-public-api-guard against the error type's surface to surface advisory_severity. The migrate atom internally re-runs the guard plan, but the workflow-level call gives the operator a separate audit trail.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_invoke",
+            "arguments": {
+              "atom": "atom:rust-public-api-guard@v1",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source": "${vars.source_file_or_module}",
+                "proposed_changes": []
+              },
+              "project_dir": "${vars.project_dir}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 300
+          },
+          "into_var": "guard_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.guard_handle.task_id}",
+              "timeout_seconds": 300
+            },
+            "timeout_secs": 320
+          },
+          "into_var": "guard_wait",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_status",
+            "arguments": {
+              "invocation_id": "${vars.guard_handle.invocation_id}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "guard_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "goto",
+        "to": "Migrate"
+      }
+    },
+    "Migrate": {
+      "prompt": "Phase 2: invoke rust-error-migrate. The atom runs its OWN public-API guard preflight internally; this invoke is the actual mutation. acknowledge_public_api_change must be explicit when the guard surfaces a breaking delta — the atom never defaults it.",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_invoke",
+            "arguments": {
+              "atom": "atom:rust-error-migrate@v1",
+              "args": {
+                "project_dir": "${vars.project_dir}",
+                "source_file_or_module": "${vars.source_file_or_module}",
+                "from_type": "${vars.from_type}",
+                "to_type": "${vars.to_type}",
+                "error_mapping": "${vars.error_mapping}",
+                "acknowledge_public_api_change": "${vars.acknowledge_public_api_change}",
+                "apply": true,
+                "validation_bin": "${vars.validation_bin}"
+              },
+              "project_dir": "${vars.project_dir}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 600
+          },
+          "into_var": "migrate_handle",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bro_wait",
+            "arguments": {
+              "task_id": "${vars.migrate_handle.task_id}",
+              "timeout_seconds": 600
+            },
+            "timeout_secs": 620
+          },
+          "into_var": "migrate_wait",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "atom_status",
+            "arguments": {
+              "invocation_id": "${vars.migrate_handle.invocation_id}",
+              "owner": "workflow:${meta.arc_id}"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "migrate_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "terminal"
+      }
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "echo-review-workflow",
+  "version": 1,
+  "subcontract": "utility/v1",
+  "manifest": {
+    "description": "Workflow-backed atom that invokes the deterministic echo atom through a workflow atom binding.",
+    "when_to_use": [
+      "testing workflow-backed atom invocation",
+      "checking parent-child atom invocation tracking",
+      "using a minimal example of atoms composing atoms through a workflow"
+    ],
+    "anti_patterns": [
+      "do not use when a direct deterministic echo invocation is enough",
+      "do not use as a production review workflow"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["message"],
+        "properties": {
+          "message": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 1,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "allowed",
+        "atoms": ["atom:echo@v1"]
+      }
+    },
+    "implementation": {
+      "kind": "workflow",
+      "workflow_ref": "workflow:atom-echo-review@v1"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_request"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-system-defaults",
+      "created_at": "2026-05-13T00:00:00Z"
+    }
+  }
+}

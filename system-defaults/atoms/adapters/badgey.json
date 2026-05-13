@@ -1,0 +1,61 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "badgey-adapter-smoke",
+  "version": 1,
+  "subcontract": "consultant/v1",
+  "manifest": {
+    "description": "Exercise the registered Badgey adapter runner and return an accepted adapter envelope.",
+    "when_to_use": [
+      "checking that adapter-backed atom invocation is wired",
+      "testing the atom adapter implementation path without provider dispatch",
+      "smoke-testing adapter output trace envelopes"
+    ],
+    "anti_patterns": [
+      "do not use as the full Badgey consultant workflow",
+      "do not use when the caller needs corpus evidence or proposal lifecycle management"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["adapter", "accepted", "input"],
+        "properties": {
+          "adapter": { "const": "badgey" },
+          "accepted": { "type": "boolean" },
+          "input": {}
+        },
+        "additionalProperties": false
+      },
+      "evidence_density": "low"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 0,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": { "kind": "none" }
+    },
+    "implementation": {
+      "kind": "adapter",
+      "adapter_name": "badgey"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_request"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-system-defaults",
+      "created_at": "2026-05-13T00:00:00Z"
+    }
+  }
+}

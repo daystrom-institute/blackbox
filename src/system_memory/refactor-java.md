@@ -2,7 +2,7 @@
 
 Use this memory before operating on Java files with blackbox refactor tools.
 
-## Agent layer over these plan kinds
+## Atom layer over these plan kinds
 
 For common Java refactor patterns, prefer a refactor atom over re-deriving
 the discipline by hand. Each atom encodes the grounding sequence, plans
@@ -20,9 +20,9 @@ note.
 | `java-extract-interface` | Extract interface from class + optional caller type migration; v2 runs a structured public-API guard preflight |
 | `java-lombokify` | Convert hand-rolled POJO boilerplate into Lombok annotations; single-file or bulk-dir |
 
-Discover via `bro_agent_search(<intent phrase>)`; install via
-`bbox_artifact_install(kind="agent", source="examples/agents/refactor/<name>.json")`;
-dispatch via `bro_agent_dispatch(agent="<name>", args={...})`. Full
+Discover via `atom_search(<intent phrase>)`; install via
+`bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/<name>.json")`;
+invoke via `atom_invoke(atom="atom:<name>@v<N>", args={...})`. Full
 catalog (with cost class, plan-kind dependencies, and operator-authority
 fields) lives in `sm-refactor` under "Refactor atom catalog".
 
@@ -36,7 +36,9 @@ field/constructor wiring, caller delegation, interface extraction, visibility
 rewriting, type migration, import organization, and Lombok-ification of
 hand-rolled boilerplate (POJO DOJO).
 
-- Inspect: supported with `bbox_refactor_status`.
+- Inspect: supported with `bbox_refactor_status`; syntax grounding also uses
+  `bbox_code_symbols`, `bbox_code_node_describe`, `bbox_code_query`, and
+  `bbox_code_refs` from the shared `sm-refactor` toolkit.
 - Plan/apply: method extraction, composite class extraction, nested class extraction, field moves/adds, constructor creation, delegate-field wiring, caller delegation, interface extraction, visibility rewriting, implements clause injection, type-use migration, import organization, and `lombokify_java_class` (POJO boilerplate → Lombok annotations).
 - Find usages: supported with `bbox_refactor_plan(kind="find_java_usages")`.
   Walks every `.java` file under `project_dir` and reports
@@ -87,6 +89,9 @@ Tree-sitter language: `java`.
 
 ## Child memories — when to pull alongside this one
 
+- `sm-refactor` — parent catalog: shared code-nav semantics, supported plan
+  kinds by language, refactor persona tool surface, atom install/invoke
+  contract, and the authoritative shipped atom version table.
 - `sm-refactor-java-extract-class` — `extract_java_class` capability
   checklist, parameter reference (`wiring_mode`, `source_delegate_wrappers`,
   `propagate_class_annotations`, `callback_externals`, etc.), capture-analysis
@@ -96,10 +101,33 @@ Tree-sitter language: `java`.
   table, collapse rules, conservative refusals, `boolean_getter_strategy`,
   bulk mode, plan-to-file, classpath prerequisites, curated-batch composition.
 
-Both children are reachable via `bbox_knowledge(query=...)` with their own
+This parent also keeps concise sections for `promote_java_inner_class`,
+`extract_java_nested_classes`, `find_java_usages`, `rename_java_symbol`,
+`extract_java_interface`, `migrate_java_type_usages`, and
+`java_lsp_organize_imports`. Split those into dedicated child memories when the
+detail grows beyond quick routing/signpost prose.
+
+All child memories are reachable via `bbox_knowledge(query=...)` with their own
 tag set. Pull the relevant child for parameter detail; this parent stays a
 language-level map of plan kinds, the tool sequence, safety rules, and the
 refactor-atom catalog.
+
+## Atom gaps to crystallize next
+
+These plan kinds/workflows are real enough to deserve atoms if they recur:
+
+- `java-rename-symbol` over `rename_java_symbol`: project-wide syntax rename
+  with `java-find-usages`/public-API preflight, `file_rename_advisory` handling
+  for top-level type renames, and compile validation.
+- `java-extract-static-nested-class` over `extract_java_nested_classes`: the
+  static-inner counterpart to `java-promote-inner-class`, useful before
+  cohesive-class extraction when the cluster owns helper inner types.
+- `java-organize-imports` over `java_lsp_organize_imports`: cheap cleanup atom
+  for JDTLS/fallback import repair after manual edits, Lombok conversion, or
+  generated target files.
+- `java-extract-methods-light` over `extract_java_methods`: method-only move to
+  a new/existing class when the composite `extract_java_class` delegate/field
+  machinery is intentionally too heavy.
 
 ## `promote_java_inner_class` — for clusters with capture-aware inner classes
 

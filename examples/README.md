@@ -1,8 +1,13 @@
 # Examples
 
-Reference configurations that demonstrate how to wire blackbox (`bbox_*` / `bro_*` MCP tools)
-into the CLIs it orchestrates. Copy / adapt into your own project or agent directories — the
-daemon doesn't read these files, they're just starting points.
+Tutorial configs and integration demos that demonstrate how to wire blackbox
+(`bbox_*`, `bro_*`, and `atom_*` MCP tools) into the CLIs it orchestrates.
+Copy or adapt these into your own project or agent directories.
+
+Blackbox-owned installable defaults now live in
+[`../system-defaults/`](../system-defaults/README.md). That tree contains atoms,
+Badgey artifacts, refactor personas, agentic-corpus machinery, legacy registered
+agents, and MCP surface packets.
 
 ## Workflows
 
@@ -17,6 +22,7 @@ JSON specs consumed by `bro orchestrate run`. Each one declares actors and nodes
 | [`workflows/e2e-policy.json`](workflows/e2e-policy.json) | Workflow-level policy packet — rule-packet applied to the arc's own state at every boundary. Halts, escalates, or warns based on the packet's verdict. "Advisor as packet" without any LLM in the decision loop. |
 | [`workflows/e2e-ensemble-vote.json`](workflows/e2e-ensemble-vote.json) | Ensemble actor — concurrent team dispatch via `bro_broadcast`, member outputs aggregated into a labeled block, downstream synthesizer consumes the merged panel response. |
 | [`workflows/e2e-self-audit.json`](workflows/e2e-self-audit.json) | Durable-session multi-phase critique arc with gate + choice + back-edge. The live-validation workflow that surfaced the subworkflow depth-threading bug. |
+| [`workflows/e2e-atom-binding.json`](workflows/e2e-atom-binding.json) | Workflow-local atom binding. Invokes `atom:echo@v1` through the workflow engine; install `system-defaults/atoms/basic/echo.json` first. |
 | [`workflows/optimistic.json`](workflows/optimistic.json) | Ensemble version of the async-review pattern — needs an ensemble team on the daemon. |
 | [`workflows/blind.json`](workflows/blind.json) | Blind converge-then-execute pattern — needs an ensemble team on the daemon. |
 
@@ -79,6 +85,6 @@ If you adapt this pattern to your own skill, keep `allow_recursion=true` narrowl
 ## Adding your own
 
 PRs welcome. Keep examples self-contained — no references to private / project-specific
-tooling, no references to corpora blackbox doesn't actually index. Agents should declare
-their tool scope explicitly (`disallowedTools` or equivalent) and state up front which
-`bbox_*` / `bro_*` surface they depend on.
+tooling, no references to corpora blackbox doesn't actually index. User-facing
+examples belong here; daemon-owned installable artifacts belong under
+`system-defaults/`.

@@ -1,0 +1,27 @@
+{
+  "name": "e2e-atom-binding",
+  "version": 1,
+  "actors": {},
+  "vars_schema": {
+    "message": { "kind": "string" }
+  },
+  "atom_bindings": {
+    "echo": {
+      "atom_ref": "atom:echo@v1",
+      "limits": {
+        "writes_files": false,
+        "dispatches_runs": 0,
+        "max_depth": 0,
+        "uses_network": false
+      }
+    }
+  },
+  "nodes": {
+    "Echo": {
+      "atom": "echo",
+      "atom_args": { "message": "hello from atom binding" },
+      "next": { "type": "terminal" }
+    }
+  },
+  "start": "Echo"
+}

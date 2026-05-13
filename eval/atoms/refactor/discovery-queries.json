@@ -1,0 +1,171 @@
+{
+  "suite": "refactor-atom-discovery",
+  "version": 1,
+  "search_mode": "keyword",
+  "notes": "Keyword-only mode (include_vectors=false) keeps discovery deterministic in CI. Vector-ready mode (include_vectors=true) is an opt-in gate that requires embedding_pending=false on every shipped atom before running.",
+  "queries": [
+    {
+      "id": "find-impl-partition-graph",
+      "query": "produce method field call graph for a rust impl block",
+      "expected_atoms": [
+        "rust-impl-partition-graph"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-public-api-guard",
+      "query": "report public api delta of a proposed rust refactor",
+      "expected_atoms": [
+        "rust-public-api-guard"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-test-island-extract",
+      "query": "peel cfg test mod tests blocks into sibling files",
+      "expected_atoms": [
+        "rust-test-island-extract"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-state-extract",
+      "query": "pull a self field cluster into a separate struct with delegate",
+      "expected_atoms": [
+        "rust-state-extract"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-trait-from-impl",
+      "query": "lift a method subset into a trait and impl trait for struct",
+      "expected_atoms": [
+        "rust-trait-from-impl"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-error-migrate",
+      "query": "rewrite a rust module error type with public api preflight",
+      "expected_atoms": [
+        "rust-error-migrate"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-split-god-impl",
+      "query": "carve a multi domain rust impl block into per domain modules",
+      "expected_atoms": [
+        "rust-split-god-impl"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-extract-cohesive-class",
+      "query": "extract a cohesive java cluster with methods fields delegate wiring",
+      "expected_atoms": [
+        "java-extract-cohesive-class"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-promote-inner-class",
+      "query": "promote a non static java inner class with outer captures",
+      "expected_atoms": [
+        "java-promote-inner-class"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-extract-interface",
+      "query": "extract a java interface from a class and migrate callers",
+      "expected_atoms": [
+        "java-extract-interface"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-lombokify",
+      "query": "modernize java pojo boilerplate with lombok annotations",
+      "expected_atoms": [
+        "java-lombokify"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-public-api-guard",
+      "query": "report public api delta of a proposed java refactor",
+      "expected_atoms": [
+        "java-public-api-guard"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-class-dependency-graph",
+      "query": "produce a class shaped inventory for a java class with methods fields inner types",
+      "expected_atoms": [
+        "java-class-dependency-graph"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-find-usages",
+      "query": "find every project wide caller of a java method or field",
+      "expected_atoms": [
+        "java-find-usages"
+      ],
+      "forbidden_atoms": []
+    }
+  ],
+  "anti_pattern_queries": [
+    {
+      "id": "anti-graph-as-clusterer",
+      "query": "decide partition for rust impl",
+      "atom": "rust-impl-partition-graph",
+      "expect_matched_anti_pattern": true,
+      "notes": "anti-pattern query — should match anti_pattern field when exclude_anti_pattern_matches=false; should NOT return when exclude_anti_pattern_matches=true."
+    },
+    {
+      "id": "anti-guard-as-permission",
+      "query": "approve this public api change",
+      "atom": "rust-public-api-guard",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-trait-dyn-incompatible",
+      "query": "make struct mockable when methods take self by value",
+      "atom": "rust-trait-from-impl",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-java-extract-on-inner-class-name",
+      "query": "extract a java inner class using extract_java_class item_names",
+      "atom": "java-extract-cohesive-class",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-promote-static-inner",
+      "query": "promote a static java inner class",
+      "atom": "java-promote-inner-class",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-lombokify-without-classpath",
+      "query": "convert pojo to lombok when lombok is not on the classpath",
+      "atom": "java-lombokify",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-guard-as-java-permission",
+      "query": "approve a java public api change",
+      "atom": "java-public-api-guard",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-dep-graph-as-clusterer",
+      "query": "decide partition for a java class",
+      "atom": "java-class-dependency-graph",
+      "expect_matched_anti_pattern": true
+    }
+  ]
+}

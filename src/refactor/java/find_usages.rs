@@ -57,10 +57,9 @@
 //! - Skipped dirs: `target/`, `build/`, `.gradle/`, `node_modules/`,
 //!   `.git/`.
 //!
-//! Designed as the foundation for semantic rename. The data this
-//! returns is sufficient to drive an `OldName` → `NewName` rewrite
-//! across the project; a future `rename_java_symbol` plan kind will
-//! consume it.
+//! Designed as the analysis sibling for semantic rename. The
+//! `rename_java_symbol` plan kind uses the same reference categories
+//! when rewriting `OldName` → `NewName` across the project.
 
 use super::*;
 use std::collections::{BTreeMap, HashSet};

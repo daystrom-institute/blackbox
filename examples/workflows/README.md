@@ -1,6 +1,11 @@
 # Workflow examples
 
-Workflow specs for `bro orchestrate run`. Each file is a JSON document declaring `actors` and `nodes`; each node carries a typed `next` clause (`goto` / `branch` / `fork` / `terminal`) that drives control flow. The daemon validates every transition target, actor reference, and reachability before any dispatch. JSON Schema at [`../../schema/workflow.schema.json`](../../schema/workflow.schema.json).
+Workflow specs for `bro orchestrate run`. Each file is a JSON document declaring
+`actors`, optional `atom_bindings`, and `nodes`; each node carries a typed `next`
+clause (`goto` / `branch` / `fork` / `terminal`) that drives control flow. The
+daemon validates every transition target, actor reference, atom binding, and
+reachability before any dispatch. JSON Schema at
+[`../../schema/workflow.schema.json`](../../schema/workflow.schema.json).
 
 Run any of these:
 
@@ -107,6 +112,31 @@ Preamble → goto:SubGreet (subworkflow=…) → goto:Closing → terminal
 
 `SubGreet` is the composition point — its own actors + nodes + start live inside it. Recursion is depth-limited (5 by default). This is how reusable templates (crucible, ensemble-consensus, etc.) become library-callable rather than pasted-prose.
 
+### `e2e-atom-binding.json` — atom binding as a node
+
+A workflow-local binding maps a short name to a standalone atom ref, then a node
+invokes the binding with structured `atom_args`.
+
+```
+start: Echo
+Echo (atom=echo, atom_ref=atom:echo@v1) → terminal
+```
+
+Install the echo atom first:
+
+```
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/basic/echo.json")
+```
+
+Then run it:
+
+```
+bro orchestrate run examples/workflows/e2e-atom-binding.json
+```
+
+Bindings are workflow-local caps: `limits` can tighten the atom contract for
+this workflow, but cannot loosen the atom's own effect limits.
+
 ### `e2e-policy.json` — workflow-level policy packet (advisor-as-packet)
 
 Attaches a `policy_packet` to the workflow itself. At every node boundary, the engine builds an arc-state entity (step, completed, in-flight, last verdict, visit counts) and applies the packet. The classification drives an arc-level action:
@@ -194,7 +224,7 @@ Ensemble_Blind_Final → terminal
 ## Authoring a new workflow
 
 1. **Pick a pattern.** Start from one of the catalog specs that matches the interaction shape you want.
-2. **Name your actors.** Each actor declares a kind (`executor`, `ensemble`, `advisor`, `user`), a brofile or team, and whether it's durable. Durable actors reuse the same session across nodes — the second dispatch becomes a `bro_resume`. For pure hook-host / routing nodes, leave `actor` empty (`""`).
+2. **Name your actors or atoms.** Actors declare a dispatch kind (`executor` or `ensemble`), a brofile or team, and whether they're durable. Atom nodes instead reference `atom_bindings` by name and pass `atom_args`. For pure hook-host / routing nodes, leave `actor` empty (`""`).
 3. **Set `start`.** Top-level `start` names the entry node.
 4. **Write the node metadata.** Every node needs a `next` clause. Activity nodes also need an actor + prompt; `${NodeName.output}` substitutes a prior node's text output. Gates, retry ceilings, late-inject, and `wait_for` declarations are optional.
 5. **Compile any gate packets** you referenced. Packet classifications SHOULD match the consuming branch's `cases` keys (e.g., lattice `["yes", "no"]` → cases `{"yes": ..., "no": ...}`). Use `default` on the branch for unmatched-verdict fallthrough.
@@ -205,6 +235,7 @@ Ensemble_Blind_Final → terminal
 
 - **Gate verdict lattice should match branch case keys.** If your packet's lattice is `["approved", "revise"]`, your branch's `cases` keys should be `approved` and `revise`. The engine halts at runtime on an unmatched verdict and lists the available cases (or routes to `default` if set).
 - **Durable actors persist across nodes *within one arc*, not across arc invocations.** A fresh `bro orchestrate run` starts a fresh set of sessions even if the same actor names appear.
+- **Atom bindings require installed atoms.** `bro_orchestrate_run(..., dry_run=true)` performs capability validation before the dry-run summary, so missing atom refs fail early.
 - **Fork branches are always fire-and-forget.** The main walk advances to `continue_to` immediately after dispatch. To wait for branches before a downstream node, use that node's `wait_for` field.
 - **`late_inject` joins at node entry, with a timeout.** The source node keeps running in the daemon; the target node's dispatch blocks until the source completes (with a 15-minute timeout). If you want zero-wait optimistic, interpose other sync work between the fork and the late-inject target so the source has time to complete.
 - **Cycles are just `goto` back-edges.** No special syntax. Retry budgets stay on the node-level `retry` field; `retry.max_generations: 3` means a node can be visited at most 3 times.

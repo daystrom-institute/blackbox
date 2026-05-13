@@ -1,0 +1,163 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "rust-impl-partition-graph",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Produce a method/field/call graph for a Rust impl block to support partitioning decisions; analysis-only, no apply path.",
+    "when_to_use": [
+      "about to split a god-impl and want to inspect method-field-call structure",
+      "operator wants to see method clusters before committing to a partition",
+      "auditing an impl block for cross-method coupling"
+    ],
+    "anti_patterns": [
+      "do not use as a clustering algorithm — this atom returns the graph, not partitions",
+      "do not use to decide whether to split — chain a clustering step or operator review",
+      "do not use on non-Rust files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source_file",
+          "impl_name"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the Rust project root."
+          },
+          "source_file": {
+            "type": "string",
+            "description": "File containing the target impl block, relative to project_dir."
+          },
+          "impl_name": {
+            "type": "string",
+            "description": "Exact impl name as reported by bbox_code_symbols (e.g. `impl BlackboxServer`)."
+          }
+        }
+      },
+      "prompt_template": "You are rust-impl-partition-graph. Charter: Produce the partition graph for a Rust impl block. Do not propose partitions; the operator decides.\n\nProtocol (analysis-only — steps 3 and 4 are skipped):\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{impl_name}}\",\n                     languages=[\"rust\"], item_kinds=[\"impl_item\"])\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Copy exact `name` and `kind` values from the response. Do not name-match\n   from the user's prompt — re-derive from the structural inventory.\n\n2. Plan with deep_analysis=true:\n   bbox_refactor_plan(kind=\"rust_impl_partition_analysis\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      impl_name=\"{{impl_name}}\")\n   The response carries methods, fields, and edges (method→method calls,\n   method→field reads/writes). Do not invoke bbox_refactor_run — analysis\n   only.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: method count, field count,\n     edge count, file>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never invent impl names from the user prompt — re-derive from\n  bbox_code_symbols / bbox_refactor_status.\n- Never attempt apply on this atom — bbox_refactor_run is not part of\n  the analysis-only path.\n\nInputs:\n{{project_dir}} {{source_file}} {{impl_name}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Subset of the rust_impl_partition_analysis report — at minimum: method_count, field_count, edge_count."
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Methods on the impl with name, line range, and field-access summary."
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Struct fields the impl reads or writes."
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Typed edges — method→method calls, method→field reads/writes."
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-11T00:00:00Z"
+    }
+  }
+}

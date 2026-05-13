@@ -223,11 +223,11 @@ async fn artifact_install_wires_f3_workflow_and_packet() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
     let workflow_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/workflows/schema-migration-arc.json"
+        "../system-defaults/agentic-corpus/workflows/schema-migration-arc.json"
     ))
     .unwrap();
     let packet_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/packets/workflow-policy/arc-budget.json"
+        "../system-defaults/agentic-corpus/packets/workflow-policy/arc-budget.json"
     ))
     .unwrap();
 
@@ -235,7 +235,7 @@ async fn artifact_install_wires_f3_workflow_and_packet() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Workflow,
-            source: "examples/agentic-corpus/workflows/schema-migration-arc.json".into(),
+            source: "system-defaults/agentic-corpus/workflows/schema-migration-arc.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -248,7 +248,7 @@ async fn artifact_install_wires_f3_workflow_and_packet() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Packet,
-            source: "examples/agentic-corpus/packets/workflow-policy/arc-budget.json".into(),
+            source: "system-defaults/agentic-corpus/packets/workflow-policy/arc-budget.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -405,7 +405,7 @@ async fn artifact_install_wires_project_bootstrap_arc() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
     let workflow_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/workflows/project-bootstrap-arc.json"
+        "../system-defaults/agentic-corpus/workflows/project-bootstrap-arc.json"
     ))
     .unwrap();
 
@@ -413,7 +413,7 @@ async fn artifact_install_wires_project_bootstrap_arc() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Workflow,
-            source: "examples/agentic-corpus/workflows/project-bootstrap-arc.json".into(),
+            source: "system-defaults/agentic-corpus/workflows/project-bootstrap-arc.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -490,15 +490,15 @@ async fn artifact_install_wires_m2_compaction_arc_and_packets() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
     let workflow_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/workflows/embed-compaction-arc.json"
+        "../system-defaults/agentic-corpus/workflows/embed-compaction-arc.json"
     ))
     .unwrap();
     let policy_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/packets/embed/compaction-policy.json"
+        "../system-defaults/agentic-corpus/packets/embed/compaction-policy.json"
     ))
     .unwrap();
     let cron_routing_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/packets/cron-routing/embed-compaction.json"
+        "../system-defaults/agentic-corpus/packets/cron-routing/embed-compaction.json"
     ))
     .unwrap();
 
@@ -506,7 +506,7 @@ async fn artifact_install_wires_m2_compaction_arc_and_packets() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Workflow,
-            source: "examples/agentic-corpus/workflows/embed-compaction-arc.json".into(),
+            source: "system-defaults/agentic-corpus/workflows/embed-compaction-arc.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -519,7 +519,7 @@ async fn artifact_install_wires_m2_compaction_arc_and_packets() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Packet,
-            source: "examples/agentic-corpus/packets/embed/compaction-policy.json".into(),
+            source: "system-defaults/agentic-corpus/packets/embed/compaction-policy.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -532,7 +532,8 @@ async fn artifact_install_wires_m2_compaction_arc_and_packets() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Packet,
-            source: "examples/agentic-corpus/packets/cron-routing/embed-compaction.json".into(),
+            source: "system-defaults/agentic-corpus/packets/cron-routing/embed-compaction.json"
+                .into(),
             name: None,
             version: None,
             supersedes: None,
@@ -596,14 +597,14 @@ async fn embed_compaction_arc_gates_against_vector_status_vars() {
 
     let server = test_server(&tmp);
     let packet_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/packets/embed/compaction-policy.json"
+        "../system-defaults/agentic-corpus/packets/embed/compaction-policy.json"
     ))
     .unwrap();
     install_artifact_value(
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Packet,
-            source: "examples/agentic-corpus/packets/embed/compaction-policy.json".into(),
+            source: "system-defaults/agentic-corpus/packets/embed/compaction-policy.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -614,7 +615,7 @@ async fn embed_compaction_arc_gates_against_vector_status_vars() {
     .unwrap();
 
     let workflow_spec: workflow::Workflow = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/workflows/embed-compaction-arc.json"
+        "../system-defaults/agentic-corpus/workflows/embed-compaction-arc.json"
     ))
     .unwrap();
     let compiled = workflow::compile(workflow_spec).unwrap();
@@ -648,7 +649,7 @@ async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
     let brofile_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/brofiles/digest-extractor.json"
+        "../system-defaults/agentic-corpus/brofiles/digest-extractor.json"
     ))
     .unwrap();
     assert_eq!(
@@ -656,19 +657,19 @@ async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
         serde_json::json!(["Edit", "Write", "Bash"])
     );
     let trust_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/packets/bro-trust/per-brofile.json"
+        "../system-defaults/agentic-corpus/packets/bro-trust/per-brofile.json"
     ))
     .unwrap();
     let quality_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/packets/auto-digest/entry-quality.json"
+        "../system-defaults/agentic-corpus/packets/auto-digest/entry-quality.json"
     ))
     .unwrap();
     let routing_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/packets/auto-digest/task-completed-routing.json"
+        "../system-defaults/agentic-corpus/packets/auto-digest/task-completed-routing.json"
     ))
     .unwrap();
     let workflow_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/workflows/auto-digest-arc.json"
+        "../system-defaults/agentic-corpus/workflows/auto-digest-arc.json"
     ))
     .unwrap();
 
@@ -676,7 +677,7 @@ async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Brofile,
-            source: "examples/agentic-corpus/brofiles/digest-extractor.json".into(),
+            source: "system-defaults/agentic-corpus/brofiles/digest-extractor.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -689,7 +690,7 @@ async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Packet,
-            source: "examples/agentic-corpus/packets/bro-trust/per-brofile.json".into(),
+            source: "system-defaults/agentic-corpus/packets/bro-trust/per-brofile.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -702,7 +703,7 @@ async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Packet,
-            source: "examples/agentic-corpus/packets/auto-digest/entry-quality.json".into(),
+            source: "system-defaults/agentic-corpus/packets/auto-digest/entry-quality.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -715,8 +716,9 @@ async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Packet,
-            source: "examples/agentic-corpus/packets/auto-digest/task-completed-routing.json"
-                .into(),
+            source:
+                "system-defaults/agentic-corpus/packets/auto-digest/task-completed-routing.json"
+                    .into(),
             name: None,
             version: None,
             supersedes: None,
@@ -729,7 +731,7 @@ async fn artifact_install_wires_m3_auto_digest_artifacts_and_audit() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Workflow,
-            source: "examples/agentic-corpus/workflows/auto-digest-arc.json".into(),
+            source: "system-defaults/agentic-corpus/workflows/auto-digest-arc.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -800,39 +802,39 @@ async fn artifact_install_wires_m4_contradiction_review_artifacts() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
     let workflow_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/workflows/contradiction-review-arc.json"
+        "../system-defaults/agentic-corpus/workflows/contradiction-review-arc.json"
     ))
     .unwrap();
     let packet_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/packets/contradiction/review-synthesis.json"
+        "../system-defaults/agentic-corpus/packets/contradiction/review-synthesis.json"
     ))
     .unwrap();
     let brofiles: [(&str, Value); 4] = [
         (
             "contradiction-provenance",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/contradiction-provenance.json"
+                "../system-defaults/agentic-corpus/brofiles/contradiction-provenance.json"
             ))
             .unwrap(),
         ),
         (
             "contradiction-lifecycle",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/contradiction-lifecycle.json"
+                "../system-defaults/agentic-corpus/brofiles/contradiction-lifecycle.json"
             ))
             .unwrap(),
         ),
         (
             "contradiction-coherence",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/contradiction-coherence.json"
+                "../system-defaults/agentic-corpus/brofiles/contradiction-coherence.json"
             ))
             .unwrap(),
         ),
         (
             "contradiction-facilitator",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/contradiction-facilitator.json"
+                "../system-defaults/agentic-corpus/brofiles/contradiction-facilitator.json"
             ))
             .unwrap(),
         ),
@@ -842,7 +844,8 @@ async fn artifact_install_wires_m4_contradiction_review_artifacts() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Packet,
-            source: "examples/agentic-corpus/packets/contradiction/review-synthesis.json".into(),
+            source: "system-defaults/agentic-corpus/packets/contradiction/review-synthesis.json"
+                .into(),
             name: None,
             version: None,
             supersedes: None,
@@ -856,7 +859,7 @@ async fn artifact_install_wires_m4_contradiction_review_artifacts() {
             &server.state,
             ArtifactInstallParams {
                 kind: artifacts::ArtifactKind::Brofile,
-                source: format!("examples/agentic-corpus/brofiles/{name}.json"),
+                source: format!("system-defaults/agentic-corpus/brofiles/{name}.json"),
                 name: None,
                 version: None,
                 supersedes: None,
@@ -870,7 +873,7 @@ async fn artifact_install_wires_m4_contradiction_review_artifacts() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Workflow,
-            source: "examples/agentic-corpus/workflows/contradiction-review-arc.json".into(),
+            source: "system-defaults/agentic-corpus/workflows/contradiction-review-arc.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -913,53 +916,53 @@ async fn artifact_install_wires_m5_auto_edge_artifacts_and_audit() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
     let packet_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/packets/auto-edge/vote-aggregate.json"
+        "../system-defaults/agentic-corpus/packets/auto-edge/vote-aggregate.json"
     ))
     .unwrap();
     let workflow_value: Value = serde_json::from_str(include_str!(
-        "../examples/agentic-corpus/workflows/auto-edge-arc.json"
+        "../system-defaults/agentic-corpus/workflows/auto-edge-arc.json"
     ))
     .unwrap();
     let brofiles: [(&str, Value); 6] = [
         (
             "describe-prose-signal",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/describe-prose-signal.json"
+                "../system-defaults/agentic-corpus/brofiles/describe-prose-signal.json"
             ))
             .unwrap(),
         ),
         (
             "describe-symbol-fit",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/describe-symbol-fit.json"
+                "../system-defaults/agentic-corpus/brofiles/describe-symbol-fit.json"
             ))
             .unwrap(),
         ),
         (
             "describe-narrative-cohesion",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/describe-narrative-cohesion.json"
+                "../system-defaults/agentic-corpus/brofiles/describe-narrative-cohesion.json"
             ))
             .unwrap(),
         ),
         (
             "reference-citation-precision",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/reference-citation-precision.json"
+                "../system-defaults/agentic-corpus/brofiles/reference-citation-precision.json"
             ))
             .unwrap(),
         ),
         (
             "reference-target-existence",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/reference-target-existence.json"
+                "../system-defaults/agentic-corpus/brofiles/reference-target-existence.json"
             ))
             .unwrap(),
         ),
         (
             "reference-context-fit",
             serde_json::from_str(include_str!(
-                "../examples/agentic-corpus/brofiles/reference-context-fit.json"
+                "../system-defaults/agentic-corpus/brofiles/reference-context-fit.json"
             ))
             .unwrap(),
         ),
@@ -969,7 +972,7 @@ async fn artifact_install_wires_m5_auto_edge_artifacts_and_audit() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Packet,
-            source: "examples/agentic-corpus/packets/auto-edge/vote-aggregate.json".into(),
+            source: "system-defaults/agentic-corpus/packets/auto-edge/vote-aggregate.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -983,7 +986,7 @@ async fn artifact_install_wires_m5_auto_edge_artifacts_and_audit() {
             &server.state,
             ArtifactInstallParams {
                 kind: artifacts::ArtifactKind::Brofile,
-                source: format!("examples/agentic-corpus/brofiles/{name}.json"),
+                source: format!("system-defaults/agentic-corpus/brofiles/{name}.json"),
                 name: None,
                 version: None,
                 supersedes: None,
@@ -1000,7 +1003,7 @@ async fn artifact_install_wires_m5_auto_edge_artifacts_and_audit() {
         &server.state,
         ArtifactInstallParams {
             kind: artifacts::ArtifactKind::Workflow,
-            source: "examples/agentic-corpus/workflows/auto-edge-arc.json".into(),
+            source: "system-defaults/agentic-corpus/workflows/auto-edge-arc.json".into(),
             name: None,
             version: None,
             supersedes: None,
@@ -1100,15 +1103,15 @@ async fn shipped_packet_audit_examples_pass() {
     let server = test_server(&tmp);
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let packets = [
-        "examples/agentic-corpus/packets/workflow-policy/arc-budget.json",
-        "examples/agentic-corpus/packets/embed/compaction-policy.json",
-        "examples/agentic-corpus/packets/cron-routing/embed-compaction.json",
-        "examples/agentic-corpus/packets/bro-trust/per-brofile.json",
-        "examples/agentic-corpus/packets/auto-digest/task-completed-routing.json",
-        "examples/agentic-corpus/packets/auto-digest/entry-quality.json",
-        "examples/agentic-corpus/packets/contradiction/review-synthesis.json",
-        "examples/agentic-corpus/packets/auto-edge/vote-aggregate.json",
-        "examples/agentic-corpus/packets/eval/drift-policy.json",
+        "system-defaults/agentic-corpus/packets/workflow-policy/arc-budget.json",
+        "system-defaults/agentic-corpus/packets/embed/compaction-policy.json",
+        "system-defaults/agentic-corpus/packets/cron-routing/embed-compaction.json",
+        "system-defaults/agentic-corpus/packets/bro-trust/per-brofile.json",
+        "system-defaults/agentic-corpus/packets/auto-digest/task-completed-routing.json",
+        "system-defaults/agentic-corpus/packets/auto-digest/entry-quality.json",
+        "system-defaults/agentic-corpus/packets/contradiction/review-synthesis.json",
+        "system-defaults/agentic-corpus/packets/auto-edge/vote-aggregate.json",
+        "system-defaults/agentic-corpus/packets/eval/drift-policy.json",
     ];
     for rel in packets {
         let path = root.join(rel);
@@ -1129,15 +1132,15 @@ async fn shipped_packet_audit_examples_pass() {
     }
 
     let audits = [
-        "examples/agentic-corpus/packets/workflow-policy/arc-budget.audit_examples.json",
-        "examples/agentic-corpus/packets/embed/compaction-policy.audit_examples.json",
-        "examples/agentic-corpus/packets/cron-routing/embed-compaction.audit_examples.json",
-        "examples/agentic-corpus/packets/bro-trust/per-brofile.audit_examples.json",
-        "examples/agentic-corpus/packets/auto-digest/task-completed-routing.audit_examples.json",
-        "examples/agentic-corpus/packets/auto-digest/entry-quality.audit_examples.json",
-        "examples/agentic-corpus/packets/contradiction/review-synthesis.audit_examples.json",
-        "examples/agentic-corpus/packets/auto-edge/vote-aggregate.audit_examples.json",
-        "examples/agentic-corpus/packets/eval/drift-policy.audit_examples.json",
+        "system-defaults/agentic-corpus/packets/workflow-policy/arc-budget.audit_examples.json",
+        "system-defaults/agentic-corpus/packets/embed/compaction-policy.audit_examples.json",
+        "system-defaults/agentic-corpus/packets/cron-routing/embed-compaction.audit_examples.json",
+        "system-defaults/agentic-corpus/packets/bro-trust/per-brofile.audit_examples.json",
+        "system-defaults/agentic-corpus/packets/auto-digest/task-completed-routing.audit_examples.json",
+        "system-defaults/agentic-corpus/packets/auto-digest/entry-quality.audit_examples.json",
+        "system-defaults/agentic-corpus/packets/contradiction/review-synthesis.audit_examples.json",
+        "system-defaults/agentic-corpus/packets/auto-edge/vote-aggregate.audit_examples.json",
+        "system-defaults/agentic-corpus/packets/eval/drift-policy.audit_examples.json",
     ];
     let packet_store = server.state.packets.read();
     for rel in audits {
@@ -1607,6 +1610,51 @@ async fn atom_invoke_adapter_runner_returns_terminal_trace() {
     assert_eq!(body["data"]["adapter"], "badgey");
     assert_eq!(body["data"]["accepted"], true);
     assert_eq!(body["output_shape"]["valid"], true);
+}
+
+#[tokio::test]
+async fn shipped_refactor_atom_installs_after_persona_brofile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let brofile: serde_json::Value = serde_json::from_str(include_str!(
+        "../system-defaults/brofiles/refactor/rust-refactor-persona.json"
+    ))
+    .unwrap();
+    let atom: serde_json::Value = serde_json::from_str(include_str!(
+        "../system-defaults/atoms/refactor/rust-test-island-extract.json"
+    ))
+    .unwrap();
+
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Brofile,
+            source: "system-defaults/brofiles/refactor/rust-refactor-persona.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        brofile,
+    )
+    .await
+    .unwrap();
+    let meta = install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Atom,
+            source: "system-defaults/atoms/refactor/rust-test-island-extract.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        atom,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(meta.kind, artifacts::ArtifactKind::Atom);
+    assert_eq!(meta.name, "rust-test-island-extract");
+    assert!(meta.active);
 }
 
 #[tokio::test]
@@ -5003,7 +5051,7 @@ async fn bro_agent_dispatch_handle_shape_reference_agent_noop_adapter() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
     let mut diff_narrator: serde_json::Value =
-        serde_json::from_str(include_str!("../examples/agents/diff-narrator.json")).unwrap();
+        serde_json::from_str(include_str!("../system-defaults/agents/diff-narrator.json")).unwrap();
     diff_narrator["manifest"]["dispatch_adapter"] = serde_json::json!("noop-ref");
     let cat = &server.state.artifacts.read();
     cat.install_value(
@@ -6129,8 +6177,8 @@ fn bro_mcp_add_without_surface_preserves_url() {
 
 #[test]
 fn example_surface_packet_parses_and_compiles() {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/mcp-surfaces/routing.json");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("system-defaults/mcp-surfaces/routing.json");
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("example packet not found at {:?}: {e}", path));
     let value: serde_json::Value = serde_json::from_str(&raw).expect("example packet JSON parse");
