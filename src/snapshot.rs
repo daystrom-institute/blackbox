@@ -982,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn active_loader_reads_overlay_over_snapshot() {
+    fn active_loader_overlay_suppresses_clean_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
 
@@ -1024,10 +1024,85 @@ mod tests {
                 .unwrap_or_default()
                 .contains("snapshots/head-sha_aaaa")
         });
+        let snap_edge_in_paths = paths.iter().any(|p| {
+            fs::read_to_string(p)
+                .unwrap_or_default()
+                .contains("k_snap_only")
+        });
         assert!(has_overlay, "active loader must include dirty overlay");
         assert!(
+            !has_snap,
+            "whole-workspace dirty overlay must suppress clean snapshot paths"
+        );
+        assert!(
+            !snap_edge_in_paths,
+            "clean-snapshot-only edge must not appear in active paths"
+        );
+    }
+
+    #[test]
+    fn clean_checkout_restores_clean_snapshot_in_active_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let snap_edges = vec![derived_edge("k_snap_only", "DESCRIBES", "k2")];
+        switch_to_clean_snapshot(
+            edges_dir,
+            "p1",
+            "repo1",
+            Some("main"),
+            "sha_aaaa",
+            snap_edges,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let dirty_edges = vec![derived_edge("k_dirty", "DESCRIBES", "k2")];
+        switch_to_dirty_overlay(
+            edges_dir,
+            "p1",
+            "repo1",
+            Some("main"),
+            "sha_aaaa",
+            "fp-dirty",
+            dirty_edges,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let clean_edges = vec![derived_edge("k_snap_only", "DESCRIBES", "k2")];
+        switch_to_clean_snapshot(
+            edges_dir,
+            "p1",
+            "repo1",
+            Some("main"),
+            "sha_aaaa",
+            clean_edges,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let idx = ManifestIndex::load(edges_dir).unwrap();
+        let paths = idx.active_materialized_paths(edges_dir);
+
+        let has_overlay = paths
+            .iter()
+            .any(|p| p.to_str().unwrap_or_default().contains("dirty-current"));
+        let has_snap = paths.iter().any(|p| {
+            p.to_str()
+                .unwrap_or_default()
+                .contains("snapshots/head-sha_aaaa")
+        });
+        assert!(
+            !has_overlay,
+            "clean checkout must remove dirty overlay from active paths"
+        );
+        assert!(
             has_snap,
-            "active loader must still reference clean snapshot"
+            "clean checkout must restore clean snapshot in active paths"
         );
     }
 

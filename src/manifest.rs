@@ -179,25 +179,29 @@ impl ManifestIndex {
     pub fn active_materialized_paths(&self, edges_dir: &Path) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for (project_id, entry) in &self.workspaces {
-            if let Some(ref snapshot) = entry.active_snapshot {
+            let has_overlay = entry.dirty_overlay.is_some()
+                && materialized_dir(edges_dir)
+                    .join(entry.dirty_overlay.as_ref().unwrap())
+                    .is_dir();
+
+            if has_overlay {
+                let overlay_dir =
+                    materialized_dir(edges_dir).join(entry.dirty_overlay.as_ref().unwrap());
+                append_jsonl_files(&overlay_dir, &mut paths);
+            } else if let Some(ref snapshot) = entry.active_snapshot {
                 let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
                 if snapshot_dir.is_dir() {
                     append_jsonl_files(&snapshot_dir, &mut paths);
                 }
             }
-            if let Some(ref overlay) = entry.dirty_overlay {
-                let overlay_dir = materialized_dir(edges_dir).join(overlay);
-                if overlay_dir.is_dir() {
-                    append_jsonl_files(&overlay_dir, &mut paths);
-                }
-            }
+
             if let Some(ref repo_mat) = entry.repo_materialization {
                 let repo_dir = materialized_dir(edges_dir).join(repo_mat);
                 if repo_dir.is_dir() {
                     append_jsonl_files(&repo_dir, &mut paths);
                 }
             }
-            if entry.active_snapshot.is_none() {
+            if entry.active_snapshot.is_none() && !has_overlay {
                 let managed_dir = edges_dir
                     .join("derived")
                     .join("project")
