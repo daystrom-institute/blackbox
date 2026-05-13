@@ -1917,6 +1917,19 @@ fn bbox_project_list_round_trips_through_tool_serialization() {
         path: project.to_string_lossy().into_owned(),
     }));
     assert_ne!(register.is_error, Some(true));
+    let register_text = serde_json::to_value(&register).unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let register_response: serde_json::Value = serde_json::from_str(&register_text).unwrap();
+    assert_eq!(
+        register_response["indexing"]["status"].as_str(),
+        Some("scheduled")
+    );
+    assert_eq!(
+        register_response["indexing"]["mode"].as_str(),
+        Some("background")
+    );
 
     let listed = server.bbox_project_list();
     assert_ne!(listed.is_error, Some(true));

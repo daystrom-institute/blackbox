@@ -122,7 +122,7 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
 impl BlackboxServer {
     #[tool(
         name = "bbox_project_register",
-        description = "Register a project directory for agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. Triggers the project-bootstrap-arc which walks the project, chunks files, writes to the index, and emits structural edges. project_id is derived from the canonicalized realpath and is per-machine; not portable across hosts. repo_id is null for non-git projects; for git projects it derives from the first-commit SHA (with remote-URL fallback for shallow clones), so it survives clones. Use bbox_project_list to inspect registered projects."
+        description = "Register a project directory and schedule background agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. project_id is derived from canonicalized realpath and is per-machine; repo_id derives from first commit SHA with remote fallback. Use bbox_project_list to inspect registered projects."
     )]
     pub(crate) fn bbox_project_register(
         &self,
@@ -186,19 +186,14 @@ impl BlackboxServer {
                 }
             }
             trigger_project_bootstrap_arc(self.state.clone(), record.clone());
-            self.state
-                .idx
-                .write()
-                .reindex(&ReindexParams { full: Some(false) })?;
-            // Rebuild EdgeIndex AFTER reindex so freshly-derived edges from the
-            // new project's chunks (IN_FILE, CONTAINS_SYMBOL, NEXT_CHUNK, etc.)
-            // are projected into the in-memory index. Doing this before reindex
-            // (the prior order) left the new project's edges invisible until
-            // the next unrelated rebuild trigger.
-            self.rebuild_edge_index_from_stores();
             let response = json!({
                 "record": record,
                 "project_config_loaded": project_config_loaded,
+                "indexing": {
+                    "status": "scheduled",
+                    "mode": "background",
+                    "detail": "project registration is durable; project-file indexing and edge projection are picked up by the background reindexer after this response"
+                },
             });
             Ok(serde_json::to_string_pretty(&response)?)
         })
