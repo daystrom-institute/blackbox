@@ -536,12 +536,26 @@ fn validate_implementation<B: Fn(&str) -> bool, A: Fn(&str) -> bool>(
                     message: "implementation.runner must not be empty".into(),
                 });
             }
+            let registry = super::runners::default_registry();
+            if !registry.has_deterministic(runner) {
+                return Err(ValidationError {
+                    step: "lint_implementation",
+                    message: format!("unknown deterministic atom runner `{runner}`"),
+                });
+            }
         }
         super::types::AtomImplementation::Adapter { adapter_name } => {
             if adapter_name.trim().is_empty() {
                 return Err(ValidationError {
                     step: "lint_implementation",
                     message: "implementation.adapter_name must not be empty".into(),
+                });
+            }
+            let registry = super::runners::default_registry();
+            if !registry.has_adapter(adapter_name) {
+                return Err(ValidationError {
+                    step: "lint_implementation",
+                    message: format!("unknown atom adapter `{adapter_name}`"),
                 });
             }
         }

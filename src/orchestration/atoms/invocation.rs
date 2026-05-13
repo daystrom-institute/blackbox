@@ -58,6 +58,35 @@ pub struct InvocationCost {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputShapeStatus {
+    pub valid: Option<bool>,
+    pub schema_ref: String,
+    pub errors: Vec<String>,
+}
+
+impl Default for OutputShapeStatus {
+    fn default() -> Self {
+        Self {
+            valid: None,
+            schema_ref: "outputs.schema".to_string(),
+            errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InvocationLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writes_files: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatches_runs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses_network: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomInvocation {
     pub invocation_id: String,
     pub atom_ref: String,
@@ -69,6 +98,10 @@ pub struct AtomInvocation {
     pub ended_at: Option<String>,
     pub input_digest: Option<String>,
     pub output_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_shape: Option<OutputShapeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_limits: Option<InvocationLimits>,
     pub summary: Option<String>,
     pub effects_observed: EffectsObserved,
     pub cost: InvocationCost,
@@ -106,6 +139,51 @@ impl AtomInvocation {
             ended_at: None,
             input_digest: None,
             output_digest: None,
+            output_shape: None,
+            effective_limits: None,
+            summary: None,
+            effects_observed: EffectsObserved {
+                dispatches_runs: Some(1),
+                ..EffectsObserved::default()
+            },
+            cost: InvocationCost {
+                dispatched_runs: Some(1),
+                ..InvocationCost::default()
+            },
+            children: Vec::new(),
+            errors: Vec::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    pub fn new_workflow(
+        invocation_id: String,
+        atom_ref: String,
+        parent_invocation_id: Option<String>,
+        owner: String,
+        workflow_ref: String,
+        arc_id: Option<String>,
+        root_task_id: Option<String>,
+    ) -> Self {
+        let mut owners = HashSet::new();
+        owners.insert(owner);
+        Self {
+            invocation_id,
+            atom_ref,
+            parent_invocation_id,
+            owners,
+            handle: AtomHandle::Workflow {
+                workflow_ref,
+                arc_id,
+                root_task_id,
+            },
+            status: InvocationStatus::Running,
+            started_at: now_iso(),
+            ended_at: None,
+            input_digest: None,
+            output_digest: None,
+            output_shape: None,
+            effective_limits: None,
             summary: None,
             effects_observed: EffectsObserved {
                 dispatches_runs: Some(1),
@@ -166,14 +244,11 @@ impl AtomInvocation {
             "ended_at": self.ended_at,
             "input_digest": self.input_digest,
             "output_digest": self.output_digest,
-            "output_shape": {
-                "valid": serde_json::Value::Null,
-                "schema_ref": "outputs.schema",
-                "errors": [],
-            },
+            "output_shape": self.output_shape.clone().unwrap_or_default(),
             "summary": self.summary,
             "decision_points": [],
             "children": self.children,
+            "effective_limits": self.effective_limits,
             "effects_observed": self.effects_observed,
             "cost": self.cost,
             "artifacts": self.artifacts,

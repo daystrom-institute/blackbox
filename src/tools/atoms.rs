@@ -5,6 +5,11 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::atoms_tools()
 }
 
+enum RunnerInvocationKind {
+    Deterministic(String),
+    Adapter(String),
+}
+
 #[tool_router(router = atoms_tools)]
 impl BlackboxServer {
     #[tool(
@@ -332,12 +337,14 @@ impl BlackboxServer {
         manifest: &orchestration::atoms::types::AtomManifest,
         p: &AtomInvokeParams,
         owner: &str,
-    ) -> Result<u64, String> {
+        dispatch_cost: u64,
+        binding_limits: Option<&workflow::AtomBindingLimits>,
+    ) -> Result<(u64, orchestration::atoms::invocation::InvocationLimits), String> {
         use orchestration::atoms::types::{AtomImplementation, MayInvokeAtoms};
 
-        let dispatch_cost = atom_dispatch_cost(&manifest.implementation);
-        if let Some(effects) = &manifest.effects
-            && let Some(limit) = bounded_effect_u64(effects.dispatches_runs.as_ref())?
+        let effective_limits =
+            effective_invocation_limits(manifest.effects.as_ref(), binding_limits)?;
+        if let Some(limit) = effective_limits.dispatches_runs
             && dispatch_cost > limit
         {
             return Err(format!(
@@ -346,7 +353,7 @@ impl BlackboxServer {
         }
 
         let Some(parent_id) = p.parent_invocation_id.as_deref() else {
-            return Ok(dispatch_cost);
+            return Ok((dispatch_cost, effective_limits));
         };
 
         let ancestors = self.atom_invocation_ancestors(parent_id)?;
@@ -378,27 +385,29 @@ impl BlackboxServer {
         }
 
         for (depth_from_ancestor, ancestor) in ancestors.iter().enumerate() {
-            let (_, _, ancestor_manifest) =
-                self.resolve_active_atom_manifest(&ancestor.atom_ref)?;
-            if let Some(effects) = &ancestor_manifest.effects {
-                if let Some(max_depth) = bounded_effect_u64(effects.max_depth.as_ref())? {
-                    let requested_depth = (depth_from_ancestor + 1) as u64;
-                    if requested_depth > max_depth {
-                        return Err(format!(
-                            "error.policy(code=depth_exhausted): ancestor {} allows max_depth={max_depth}, requested depth={requested_depth}",
-                            ancestor.invocation_id
-                        ));
-                    }
+            let limits = if let Some(limits) = &ancestor.effective_limits {
+                limits.clone()
+            } else {
+                let (_, _, ancestor_manifest) =
+                    self.resolve_active_atom_manifest(&ancestor.atom_ref)?;
+                effective_invocation_limits(ancestor_manifest.effects.as_ref(), None)?
+            };
+            if let Some(max_depth) = limits.max_depth {
+                let requested_depth = (depth_from_ancestor + 1) as u64;
+                if requested_depth > max_depth {
+                    return Err(format!(
+                        "error.policy(code=depth_exhausted): ancestor {} allows max_depth={max_depth}, requested depth={requested_depth}",
+                        ancestor.invocation_id
+                    ));
                 }
-                if let Some(dispatch_limit) = bounded_effect_u64(effects.dispatches_runs.as_ref())?
-                {
-                    let observed = ancestor.effects_observed.dispatches_runs.unwrap_or(0);
-                    if observed.saturating_add(dispatch_cost) > dispatch_limit {
-                        return Err(format!(
-                            "error.policy(code=budget_exhausted): ancestor {} allows dispatches_runs={dispatch_limit}, observed={observed}, requested={dispatch_cost}",
-                            ancestor.invocation_id
-                        ));
-                    }
+            }
+            if let Some(dispatch_limit) = limits.dispatches_runs {
+                let observed = ancestor.effects_observed.dispatches_runs.unwrap_or(0);
+                if observed.saturating_add(dispatch_cost) > dispatch_limit {
+                    return Err(format!(
+                        "error.policy(code=budget_exhausted): ancestor {} allows dispatches_runs={dispatch_limit}, observed={observed}, requested={dispatch_cost}",
+                        ancestor.invocation_id
+                    ));
                 }
             }
         }
@@ -410,7 +419,127 @@ impl BlackboxServer {
             // Deterministic/adapter invocations may still be children; this
             // branch exists to make the zero-dispatch case explicit.
         }
-        Ok(dispatch_cost)
+        Ok((dispatch_cost, effective_limits))
+    }
+
+    fn atom_dispatch_cost_for_manifest(
+        &self,
+        manifest: &orchestration::atoms::types::AtomManifest,
+    ) -> Result<u64, String> {
+        match &manifest.implementation {
+            orchestration::atoms::types::AtomImplementation::Profile { .. } => Ok(1),
+            orchestration::atoms::types::AtomImplementation::Workflow { workflow_ref } => {
+                let (workflow_name, _workflow_version) =
+                    orchestration::atoms::validate::parse_typed_ref(workflow_ref, "workflow:")
+                        .map_err(|e| format!("invalid workflow_ref: {e}"))?;
+                let workflow = self
+                    .resolve_workflow_by_id(&workflow_name)
+                    .or_else(|| self.resolve_workflow_by_id(workflow_ref))
+                    .ok_or_else(|| {
+                        format!(
+                            "workflow '{}' not found for atom dispatch budget",
+                            workflow_ref
+                        )
+                    })?;
+                self.workflow_static_dispatch_upper_bound(&workflow, 0)
+            }
+            orchestration::atoms::types::AtomImplementation::Deterministic { .. }
+            | orchestration::atoms::types::AtomImplementation::Adapter { .. } => Ok(0),
+        }
+    }
+
+    fn workflow_static_dispatch_upper_bound(
+        &self,
+        workflow: &workflow::Workflow,
+        depth: u32,
+    ) -> Result<u64, String> {
+        if depth > workflow::engine::MAX_COMPOSITION_DEPTH {
+            return Err(format!(
+                "workflow '{}' exceeds static dispatch budget depth guard",
+                workflow.name
+            ));
+        }
+        let mut cost = 1u64;
+        for (node_id, node) in &workflow.nodes {
+            if !node.actor.is_empty() {
+                cost = cost.saturating_add(1);
+            }
+            if let Some(sub) = &node.subworkflow {
+                cost =
+                    cost.saturating_add(self.workflow_static_dispatch_upper_bound(sub, depth + 1)?);
+            }
+            if let Some(sub_ref) = &node.subworkflow_ref {
+                let sub = self.resolve_workflow_by_id(sub_ref).ok_or_else(|| {
+                    format!(
+                        "workflow '{}' node '{node_id}' references unknown subworkflow '{sub_ref}' while computing atom dispatch budget",
+                        workflow.name
+                    )
+                })?;
+                cost = cost
+                    .saturating_add(self.workflow_static_dispatch_upper_bound(&sub, depth + 1)?);
+            }
+            if let Some(foreach) = &node.foreach {
+                let Some(items) = foreach.items.as_array() else {
+                    return Err(format!(
+                        "workflow '{}' node '{node_id}' uses dynamic foreach items; atom dispatch budget must be statically bounded in v1",
+                        workflow.name
+                    ));
+                };
+                let child = self.fanout_child_dispatch_upper_bound(
+                    &workflow.name,
+                    node_id,
+                    foreach.subworkflow.as_deref(),
+                    foreach.subworkflow_ref.as_deref(),
+                    depth + 1,
+                )?;
+                cost = cost.saturating_add(child.saturating_mul(items.len() as u64));
+            }
+            if let Some(matrix) = &node.matrix {
+                let mut product = 1u64;
+                for axis in &matrix.axes {
+                    let Some(values) = axis.values.as_array() else {
+                        return Err(format!(
+                            "workflow '{}' node '{node_id}' uses dynamic matrix axis '{}'; atom dispatch budget must be statically bounded in v1",
+                            workflow.name, axis.name
+                        ));
+                    };
+                    product = product.saturating_mul(values.len() as u64);
+                }
+                let child = self.fanout_child_dispatch_upper_bound(
+                    &workflow.name,
+                    node_id,
+                    matrix.subworkflow.as_deref(),
+                    matrix.subworkflow_ref.as_deref(),
+                    depth + 1,
+                )?;
+                cost = cost.saturating_add(child.saturating_mul(product));
+            }
+        }
+        Ok(cost)
+    }
+
+    fn fanout_child_dispatch_upper_bound(
+        &self,
+        workflow_name: &str,
+        node_id: &str,
+        inline: Option<&workflow::Workflow>,
+        referenced: Option<&str>,
+        depth: u32,
+    ) -> Result<u64, String> {
+        if let Some(inline) = inline {
+            return self.workflow_static_dispatch_upper_bound(inline, depth);
+        }
+        let Some(sub_ref) = referenced else {
+            return Err(format!(
+                "workflow '{workflow_name}' node '{node_id}' fanout has no child workflow"
+            ));
+        };
+        let sub = self.resolve_workflow_by_id(sub_ref).ok_or_else(|| {
+            format!(
+                "workflow '{workflow_name}' node '{node_id}' references unknown fanout subworkflow '{sub_ref}' while computing atom dispatch budget"
+            )
+        })?;
+        self.workflow_static_dispatch_upper_bound(&sub, depth)
     }
 
     fn atom_invocation_ancestors(
@@ -472,33 +601,34 @@ impl BlackboxServer {
         let _ = store.persist();
     }
 
-    #[tool(
-        name = "atom_invoke",
-        description = "Invoke an installed atom. Resolves the atom manifest, validates policy gates (effects, composition, depth), and dispatches via the appropriate implementation path (profile, workflow, deterministic, adapter). Returns an owned invocation handle with invocation_id and underlying task/session ids."
-    )]
-    pub(crate) async fn atom_invoke(
+    pub(crate) async fn atom_invoke_value(
         &self,
-        Parameters(p): Parameters<AtomInvokeParams>,
-    ) -> CallToolResult {
+        p: AtomInvokeParams,
+        binding_limits: Option<&workflow::AtomBindingLimits>,
+    ) -> Result<serde_json::Value, String> {
         use orchestration::atoms::types::AtomImplementation;
 
         let (atom_name, atom_version, manifest) = match self.resolve_active_atom_manifest(&p.atom) {
             Ok(found) => found,
-            Err(e) => return Self::err_text(&e),
+            Err(e) => return Err(e),
         };
         let atom_ref = format!("atom:{atom_name}@v{atom_version}");
         let args_to_validate = match Self::validate_atom_args(&manifest, &p.args) {
             Ok(args) => args,
-            Err(e) => return Self::err_text(&e),
+            Err(e) => return Err(e),
         };
 
         let invocation_id = uuid::Uuid::new_v4().to_string();
         let owner = p.owner.clone().unwrap_or_else(default_atom_owner);
-        let dispatch_cost = match self.validate_atom_invoke_policy(&atom_ref, &manifest, &p, &owner)
-        {
-            Ok(cost) => cost,
-            Err(e) => return Self::err_text(&e),
-        };
+        let dispatch_cost = self.atom_dispatch_cost_for_manifest(&manifest)?;
+        let (dispatch_cost, effective_limits) = self.validate_atom_invoke_policy(
+            &atom_ref,
+            &manifest,
+            &p,
+            &owner,
+            dispatch_cost,
+            binding_limits,
+        )?;
         let input_digest = Some(sha256_json_value(&args_to_validate));
 
         match &manifest.implementation {
@@ -509,21 +639,66 @@ impl BlackboxServer {
                     &manifest,
                     brofile_ref,
                     &p,
+                    &args_to_validate,
                     &owner,
                     input_digest,
                     dispatch_cost,
+                    effective_limits,
                 )
                 .await
             }
-            AtomImplementation::Workflow { .. } => Self::err_text(
-                "error.not_implemented(code=workflow_atom): workflow-backed atoms are not yet supported",
+            AtomImplementation::Workflow { workflow_ref } => {
+                self.atom_invoke_workflow(
+                    &invocation_id,
+                    &atom_ref,
+                    workflow_ref,
+                    &p,
+                    &args_to_validate,
+                    &owner,
+                    input_digest,
+                    dispatch_cost,
+                    effective_limits,
+                )
+                .await
+            }
+            AtomImplementation::Deterministic { runner } => self.atom_invoke_runner(
+                &invocation_id,
+                &atom_ref,
+                &manifest,
+                RunnerInvocationKind::Deterministic(runner.clone()),
+                &p,
+                &args_to_validate,
+                &owner,
+                input_digest,
+                dispatch_cost,
+                effective_limits,
             ),
-            AtomImplementation::Deterministic { .. } => Self::err_text(
-                "error.not_implemented(code=deterministic_atom): deterministic atoms are not yet supported",
+            AtomImplementation::Adapter { adapter_name } => self.atom_invoke_runner(
+                &invocation_id,
+                &atom_ref,
+                &manifest,
+                RunnerInvocationKind::Adapter(adapter_name.clone()),
+                &p,
+                &args_to_validate,
+                &owner,
+                input_digest,
+                dispatch_cost,
+                effective_limits,
             ),
-            AtomImplementation::Adapter { .. } => Self::err_text(
-                "error.not_implemented(code=adapter_atom): adapter atoms are not yet supported",
-            ),
+        }
+    }
+
+    #[tool(
+        name = "atom_invoke",
+        description = "Invoke an installed atom. Resolves the atom manifest, validates policy gates (effects, composition, depth), and dispatches via the appropriate implementation path (profile, workflow, deterministic, adapter). Returns an owned invocation handle with invocation_id and underlying task/session ids."
+    )]
+    pub(crate) async fn atom_invoke(
+        &self,
+        Parameters(p): Parameters<AtomInvokeParams>,
+    ) -> CallToolResult {
+        match self.atom_invoke_value(p, None).await {
+            Ok(value) => Self::ok_json(&value),
+            Err(e) => Self::err_text(&e),
         }
     }
 
@@ -534,17 +709,19 @@ impl BlackboxServer {
         manifest: &orchestration::atoms::types::AtomManifest,
         brofile_ref: &str,
         p: &AtomInvokeParams,
+        args_to_validate: &serde_json::Value,
         owner: &str,
         input_digest: Option<String>,
         dispatch_cost: u64,
-    ) -> CallToolResult {
+        effective_limits: orchestration::atoms::invocation::InvocationLimits,
+    ) -> Result<serde_json::Value, String> {
         use orchestration::atoms::invocation::AtomInvocation;
         use orchestration::providers::ExecOpts;
 
         let typed_name =
             match orchestration::atoms::validate::parse_typed_ref(brofile_ref, "brofile:") {
                 Ok((name, _ver)) => name,
-                Err(e) => return Self::err_text(&format!("invalid brofile_ref: {e}")),
+                Err(e) => return Err(format!("invalid brofile_ref: {e}")),
             };
 
         let bf = match orchestration::brofile::resolve_brofile(
@@ -553,7 +730,7 @@ impl BlackboxServer {
             p.project_dir.as_deref(),
         ) {
             Some(b) => b,
-            None => return Self::err_text(&format!("brofile '{}' not found", typed_name)),
+            None => return Err(format!("brofile '{}' not found", typed_name)),
         };
 
         let (base_allow, base_disallow) = match &bf.filters {
@@ -575,15 +752,15 @@ impl BlackboxServer {
             None
         };
 
-        let prompt = match (&manifest.inputs, &p.args) {
+        let prompt = match (&manifest.inputs, args_to_validate) {
             (Some(spec), _) if spec.prompt_template.is_some() => {
-                Self::expand_template(spec.prompt_template.as_ref().unwrap(), &p.args)
+                Self::expand_template(spec.prompt_template.as_ref().unwrap(), args_to_validate)
             }
             _ => {
-                if p.args.is_null() {
+                if args_to_validate.is_null() {
                     String::new()
                 } else {
-                    serde_json::to_string_pretty(&p.args).unwrap_or_default()
+                    serde_json::to_string_pretty(args_to_validate).unwrap_or_default()
                 }
             }
         };
@@ -642,7 +819,7 @@ impl BlackboxServer {
             &self.state.packets.read(),
         ) {
             Ok(df) => df,
-            Err(e) => return Self::err_text(&format!("dispatch filter resolution failed: {e}")),
+            Err(e) => return Err(format!("dispatch filter resolution failed: {e}")),
         };
         args.extend(dispatch_filters.args);
 
@@ -676,6 +853,7 @@ impl BlackboxServer {
             task_id.clone(),
         );
         inv.input_digest = input_digest;
+        inv.effective_limits = Some(effective_limits);
         inv.effects_observed.dispatches_runs = Some(dispatch_cost);
         inv.cost.dispatched_runs = Some(dispatch_cost);
         self.state.atom_invocation_store.write().insert(inv);
@@ -685,12 +863,199 @@ impl BlackboxServer {
             dispatch_cost,
         );
 
-        Self::ok_json(&serde_json::json!({
+        Ok(serde_json::json!({
             "invocation_id": invocation_id,
             "atom_ref": atom_ref,
             "task_id": task_id,
             "session_id": session_id,
             "status": "running",
+        }))
+    }
+
+    async fn atom_invoke_workflow(
+        &self,
+        invocation_id: &str,
+        atom_ref: &str,
+        workflow_ref: &str,
+        p: &AtomInvokeParams,
+        args_to_validate: &serde_json::Value,
+        owner: &str,
+        input_digest: Option<String>,
+        dispatch_cost: u64,
+        effective_limits: orchestration::atoms::invocation::InvocationLimits,
+    ) -> Result<serde_json::Value, String> {
+        use orchestration::atoms::invocation::AtomInvocation;
+
+        let (workflow_name, workflow_version) =
+            match orchestration::atoms::validate::parse_typed_ref(workflow_ref, "workflow:") {
+                Ok(parsed) => parsed,
+                Err(e) => return Err(format!("invalid workflow_ref: {e}")),
+            };
+        let workflow = self
+            .resolve_workflow_by_id(&workflow_name)
+            .or_else(|| self.resolve_workflow_by_id(workflow_ref))
+            .ok_or_else(|| {
+                format!(
+                    "workflow '{}' not found for atom {}",
+                    workflow_ref, atom_ref
+                )
+            })?;
+        if let Some(pinned) = workflow_version.strip_prefix('v') {
+            let expected = pinned.parse::<u32>().map_err(|_| {
+                format!("invalid workflow_ref version in '{workflow_ref}': {workflow_version}")
+            })?;
+            if workflow.version != expected {
+                return Err(format!(
+                    "workflow_ref {workflow_ref} resolved to workflow version {}, expected {expected}",
+                    workflow.version
+                ));
+            }
+        }
+
+        let compiled = workflow::compile(workflow)
+            .map_err(|e| format!("workflow-backed atom compile failed: {e}"))?;
+        validate_workflow_capabilities(&compiled, &self.state)
+            .map_err(|e| format!("workflow-backed atom capability validation failed: {e}"))?;
+
+        let mut initial_vars = match args_to_validate {
+            serde_json::Value::Object(map) => map.clone(),
+            other => serde_json::Map::from_iter([("input".to_string(), other.clone())]),
+        };
+        initial_vars.insert(
+            "_atom_parent_invocation_id".to_string(),
+            serde_json::Value::String(invocation_id.to_string()),
+        );
+        initial_vars.insert(
+            "_atom_owner".to_string(),
+            serde_json::Value::String(owner.to_string()),
+        );
+
+        let (task, arc_id) =
+            self.spawn_workflow_task(compiled, p.project_dir.clone(), None, initial_vars);
+        let task_id = task.inner.lock().id.clone();
+        let mut inv = AtomInvocation::new_workflow(
+            invocation_id.to_string(),
+            atom_ref.to_string(),
+            p.parent_invocation_id.clone(),
+            owner.to_string(),
+            workflow_ref.to_string(),
+            Some(arc_id.clone()),
+            Some(task_id.clone()),
+        );
+        inv.input_digest = input_digest;
+        inv.effective_limits = Some(effective_limits);
+        inv.effects_observed.dispatches_runs = Some(dispatch_cost);
+        inv.cost.dispatched_runs = Some(dispatch_cost);
+        self.state.atom_invocation_store.write().insert(inv);
+        self.record_child_invocation(
+            p.parent_invocation_id.as_deref(),
+            invocation_id,
+            dispatch_cost,
+        );
+
+        Ok(serde_json::json!({
+            "invocation_id": invocation_id,
+            "atom_ref": atom_ref,
+            "task_id": task_id,
+            "arc_id": arc_id,
+            "status": "running",
+        }))
+    }
+
+    fn atom_invoke_runner(
+        &self,
+        invocation_id: &str,
+        atom_ref: &str,
+        manifest: &orchestration::atoms::types::AtomManifest,
+        kind: RunnerInvocationKind,
+        p: &AtomInvokeParams,
+        args_to_validate: &serde_json::Value,
+        owner: &str,
+        input_digest: Option<String>,
+        dispatch_cost: u64,
+        effective_limits: orchestration::atoms::invocation::InvocationLimits,
+    ) -> Result<serde_json::Value, String> {
+        use orchestration::atoms::invocation::{
+            AtomHandle, AtomInvocation, EffectsObserved, InvocationCost, InvocationStatus,
+        };
+        use orchestration::atoms::runners::{RunnerStatus, default_registry};
+
+        let registry = default_registry();
+        let (handle, result) = match kind {
+            RunnerInvocationKind::Deterministic(runner) => {
+                let result = registry.execute_deterministic(&runner, args_to_validate);
+                (AtomHandle::Deterministic { runner }, result)
+            }
+            RunnerInvocationKind::Adapter(adapter_name) => {
+                let result = registry.execute_adapter(&adapter_name, args_to_validate);
+                let adapter_handle = result
+                    .data
+                    .get("handle")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                (
+                    AtomHandle::Adapter {
+                        adapter_name,
+                        adapter_handle,
+                    },
+                    result,
+                )
+            }
+        };
+
+        let status = match result.status {
+            RunnerStatus::Succeeded => InvocationStatus::Succeeded,
+            RunnerStatus::Failed => InvocationStatus::Failed,
+        };
+        let output_shape = validate_atom_output(manifest, &result.data);
+        let output_text = serde_json::to_string(&result.data).unwrap_or_default();
+        let mut owners = std::collections::HashSet::new();
+        owners.insert(owner.to_string());
+        let inv = AtomInvocation {
+            invocation_id: invocation_id.to_string(),
+            atom_ref: atom_ref.to_string(),
+            parent_invocation_id: p.parent_invocation_id.clone(),
+            owners,
+            handle,
+            status: status.clone(),
+            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ended_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            input_digest,
+            output_digest: Some(sha256_json_value(&result.data)),
+            output_shape: Some(output_shape.clone()),
+            effective_limits: Some(effective_limits),
+            summary: Some(output_text.chars().take(500).collect()),
+            effects_observed: EffectsObserved {
+                dispatches_runs: Some(dispatch_cost),
+                ..EffectsObserved::default()
+            },
+            cost: InvocationCost {
+                dispatched_runs: Some(dispatch_cost),
+                wall_time_ms: Some(result.wall_time_ms),
+                ..InvocationCost::default()
+            },
+            children: Vec::new(),
+            errors: result.errors.clone(),
+            artifacts: Vec::new(),
+        };
+        self.state.atom_invocation_store.write().insert(inv);
+        self.record_child_invocation(
+            p.parent_invocation_id.as_deref(),
+            invocation_id,
+            dispatch_cost,
+        );
+
+        Ok(serde_json::json!({
+            "invocation_id": invocation_id,
+            "atom_ref": atom_ref,
+            "status": match status {
+                InvocationStatus::Succeeded => "succeeded",
+                InvocationStatus::Failed => "failed",
+                _ => "running",
+            },
+            "data": result.data,
+            "output_shape": output_shape,
+            "errors": result.errors,
         }))
     }
 
@@ -702,17 +1067,21 @@ impl BlackboxServer {
     ) {
         use orchestration::atoms::invocation::{AtomHandle, InvocationStatus};
 
-        let AtomHandle::Profile {
-            task_id,
-            session_id,
-            ..
-        } = &mut inv.handle
-        else {
-            return;
+        let (task_id, session_id_slot) = match &mut inv.handle {
+            AtomHandle::Profile {
+                task_id,
+                session_id,
+                ..
+            } => (task_id.clone(), Some(session_id)),
+            AtomHandle::Workflow {
+                root_task_id: Some(task_id),
+                ..
+            } => (task_id.clone(), None),
+            _ => return,
         };
 
         let task_store = self.state.task_store.read();
-        let Some(task) = task_store.get(task_id) else {
+        let Some(task) = task_store.get(&task_id) else {
             return;
         };
         let inner = task.inner.lock();
@@ -722,7 +1091,10 @@ impl BlackboxServer {
             orchestration::TaskStatus::Running => InvocationStatus::Running,
             orchestration::TaskStatus::Cancelled => InvocationStatus::Cancelled,
         };
-        if *session_id == "pending" && inner.session_id != "pending" {
+        if let Some(session_id) = session_id_slot
+            && *session_id == "pending"
+            && inner.session_id != "pending"
+        {
             *session_id = inner.session_id.clone();
         }
         if let Some(usage) = &inner.usage {
@@ -752,19 +1124,29 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<AtomStatusParams>,
     ) -> CallToolResult {
+        match self.atom_status_value(p) {
+            Ok(value) => Self::ok_json(&value),
+            Err(e) => Self::err_text(&e),
+        }
+    }
+
+    pub(crate) fn atom_status_value(
+        &self,
+        p: AtomStatusParams,
+    ) -> Result<serde_json::Value, String> {
         let mut inv = {
             let inv_store = self.state.atom_invocation_store.read();
             match inv_store.get(&p.invocation_id).cloned() {
                 Some(i) => i,
                 None => {
-                    return Self::err_text(&format!("invocation not found: {}", p.invocation_id));
+                    return Err(format!("invocation not found: {}", p.invocation_id));
                 }
             }
         };
         let owner = p.owner.clone().unwrap_or_else(default_atom_owner);
         let caller = owner.as_str();
         if !inv.is_owner(caller) {
-            return Self::err_text("error.forbidden: caller is not an owner of this invocation");
+            return Err("error.forbidden: caller is not an owner of this invocation".into());
         }
 
         {
@@ -772,7 +1154,7 @@ impl BlackboxServer {
             self.state.atom_invocation_store.write().update(inv.clone());
         }
 
-        Self::ok_json(&inv.to_trace_envelope())
+        Ok(inv.to_trace_envelope())
     }
 
     // ── atom_resume ─────────────────────────────────────────────
@@ -785,6 +1167,16 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<AtomResumeParams>,
     ) -> CallToolResult {
+        match self.atom_resume_value(p).await {
+            Ok(value) => Self::ok_json(&value),
+            Err(e) => Self::err_text(&e),
+        }
+    }
+
+    pub(crate) async fn atom_resume_value(
+        &self,
+        p: AtomResumeParams,
+    ) -> Result<serde_json::Value, String> {
         use orchestration::atoms::invocation::{AtomHandle, InvocationStatus};
         use orchestration::providers::ExecOpts;
 
@@ -795,17 +1187,18 @@ impl BlackboxServer {
             match inv_store.get(&p.invocation_id).cloned() {
                 Some(i) => i,
                 None => {
-                    return Self::err_text(&format!("invocation not found: {}", p.invocation_id));
+                    return Err(format!("invocation not found: {}", p.invocation_id));
                 }
             }
         };
         if !inv.is_owner(caller) {
-            return Self::err_text("error.forbidden: caller is not an owner of this invocation");
+            return Err("error.forbidden: caller is not an owner of this invocation".into());
         }
         self.refresh_atom_invocation_from_task(&mut inv);
         if !inv.is_resumable() {
-            return Self::err_text(
-                "error.not_resumable: this invocation handle does not support resume (deterministic/adapter/workflow handles are not resumable, or invocation is in a terminal non-runnable state)",
+            return Err(
+                "error.not_resumable: this invocation handle does not support resume (deterministic/adapter/workflow handles are not resumable, or invocation is in a terminal non-runnable state)"
+                    .into(),
             );
         }
 
@@ -819,18 +1212,19 @@ impl BlackboxServer {
             _ => unreachable!("is_resumable checked above"),
         };
         if session_id == "pending" {
-            return Self::err_text(
-                "error.not_ready(code=session_pending): provider has not emitted a resumable session id yet; call atom_status again later",
+            return Err(
+                "error.not_ready(code=session_pending): provider has not emitted a resumable session id yet; call atom_status again later"
+                    .into(),
             );
         }
 
         let provider = match provider_str.parse::<orchestration::providers::Provider>() {
             Ok(p) => p,
-            Err(_) => return Self::err_text(&format!("invalid provider: {provider_str}")),
+            Err(_) => return Err(format!("invalid provider: {provider_str}")),
         };
 
         if !provider.supports_resume() {
-            return Self::err_text(&format!(
+            return Err(format!(
                 "provider '{}' does not support resume",
                 provider.as_str()
             ));
@@ -838,20 +1232,21 @@ impl BlackboxServer {
 
         let (_, _, manifest) = match self.resolve_active_atom_manifest(&inv.atom_ref) {
             Ok(found) => found,
-            Err(e) => return Self::err_text(&e),
+            Err(e) => return Err(e),
         };
         let brofile_ref = match &manifest.implementation {
             orchestration::atoms::types::AtomImplementation::Profile { brofile_ref } => brofile_ref,
             _ => {
-                return Self::err_text(
-                    "error.not_resumable: only profile-backed atom handles can resume through a provider session",
+                return Err(
+                    "error.not_resumable: only profile-backed atom handles can resume through a provider session"
+                        .into(),
                 );
             }
         };
         let brofile_name =
             match orchestration::atoms::validate::parse_typed_ref(brofile_ref, "brofile:") {
                 Ok((name, _ver)) => name,
-                Err(e) => return Self::err_text(&format!("invalid brofile_ref: {e}")),
+                Err(e) => return Err(format!("invalid brofile_ref: {e}")),
             };
         let bf = match orchestration::brofile::resolve_brofile(
             &brofile_name,
@@ -859,10 +1254,10 @@ impl BlackboxServer {
             cwd.as_deref(),
         ) {
             Some(b) => b,
-            None => return Self::err_text(&format!("brofile '{}' not found", brofile_name)),
+            None => return Err(format!("brofile '{}' not found", brofile_name)),
         };
         if bf.provider != provider {
-            return Self::err_text(&format!(
+            return Err(format!(
                 "error.not_resumable(code=provider_changed): atom brofile now resolves to provider {}, but handle was created with {}",
                 bf.provider.as_str(),
                 provider.as_str()
@@ -895,7 +1290,7 @@ impl BlackboxServer {
             &session_id,
         ) {
             Ok(lease) => lease,
-            Err(e) => return Self::err_text(&e),
+            Err(e) => return Err(e),
         };
 
         let ambient_ctx = orchestration::AmbientContext {
@@ -931,7 +1326,7 @@ impl BlackboxServer {
             &self.state.packets.read(),
         ) {
             Ok(df) => df,
-            Err(e) => return Self::err_text(&format!("dispatch filter resolution failed: {e}")),
+            Err(e) => return Err(format!("dispatch filter resolution failed: {e}")),
         };
         args.extend(dispatch_filters.args);
 
@@ -976,7 +1371,7 @@ impl BlackboxServer {
             let _ = inv_store.persist();
         }
 
-        Self::ok_json(&serde_json::json!({
+        Ok(serde_json::json!({
             "invocation_id": p.invocation_id,
             "task_id": task_id_new,
             "session_id": session_id,
@@ -1026,15 +1421,6 @@ fn default_atom_owner() -> String {
     "operator:local".to_string()
 }
 
-fn atom_dispatch_cost(implementation: &orchestration::atoms::types::AtomImplementation) -> u64 {
-    match implementation {
-        orchestration::atoms::types::AtomImplementation::Profile { .. }
-        | orchestration::atoms::types::AtomImplementation::Workflow { .. } => 1,
-        orchestration::atoms::types::AtomImplementation::Deterministic { .. }
-        | orchestration::atoms::types::AtomImplementation::Adapter { .. } => 0,
-    }
-}
-
 fn bounded_effect_u64(value: Option<&serde_json::Value>) -> Result<Option<u64>, String> {
     match value {
         None => Ok(None),
@@ -1046,6 +1432,116 @@ fn bounded_effect_u64(value: Option<&serde_json::Value>) -> Result<Option<u64>, 
         Some(other) => Err(format!(
             "invalid bounded effect value (expected integer or \"unbounded\"): {other}"
         )),
+    }
+}
+
+fn bounded_effect_bool(value: Option<&serde_json::Value>) -> Result<Option<bool>, String> {
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::String(s)) if s == "unbounded" => Ok(None),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(*b)),
+        Some(other) => Err(format!(
+            "invalid boolean effect value (expected boolean or \"unbounded\"): {other}"
+        )),
+    }
+}
+
+fn min_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(l), Some(r)) => Some(l.min(r)),
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
+    }
+}
+
+fn tighten_optional_bool(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(l), Some(r)) => Some(l && r),
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
+    }
+}
+
+fn effective_invocation_limits(
+    effects: Option<&orchestration::atoms::types::AtomEffects>,
+    binding_limits: Option<&workflow::AtomBindingLimits>,
+) -> Result<orchestration::atoms::invocation::InvocationLimits, String> {
+    let effect_writes = effects
+        .map(|e| bounded_effect_bool(e.writes_files.as_ref()))
+        .transpose()?
+        .flatten();
+    let effect_dispatches = effects
+        .map(|e| bounded_effect_u64(e.dispatches_runs.as_ref()))
+        .transpose()?
+        .flatten();
+    let effect_depth = effects
+        .map(|e| bounded_effect_u64(e.max_depth.as_ref()))
+        .transpose()?
+        .flatten();
+    let effect_network = effects
+        .map(|e| bounded_effect_bool(e.uses_network.as_ref()))
+        .transpose()?
+        .flatten();
+
+    let binding_writes = binding_limits
+        .map(|l| bounded_effect_bool(l.writes_files.as_ref()))
+        .transpose()?
+        .flatten();
+    let binding_dispatches = binding_limits
+        .map(|l| bounded_effect_u64(l.dispatches_runs.as_ref()))
+        .transpose()?
+        .flatten();
+    let binding_depth = binding_limits
+        .map(|l| bounded_effect_u64(l.max_depth.as_ref()))
+        .transpose()?
+        .flatten();
+    let binding_network = binding_limits
+        .map(|l| bounded_effect_bool(l.uses_network.as_ref()))
+        .transpose()?
+        .flatten();
+
+    Ok(orchestration::atoms::invocation::InvocationLimits {
+        writes_files: tighten_optional_bool(effect_writes, binding_writes),
+        dispatches_runs: min_optional_u64(effect_dispatches, binding_dispatches),
+        max_depth: min_optional_u64(effect_depth, binding_depth),
+        uses_network: tighten_optional_bool(effect_network, binding_network),
+    })
+}
+
+fn validate_atom_output(
+    manifest: &orchestration::atoms::types::AtomManifest,
+    data: &serde_json::Value,
+) -> orchestration::atoms::invocation::OutputShapeStatus {
+    let Some(outputs) = &manifest.outputs else {
+        return orchestration::atoms::invocation::OutputShapeStatus::default();
+    };
+    let Some(schema) = &outputs.schema else {
+        return orchestration::atoms::invocation::OutputShapeStatus::default();
+    };
+    let compiled = match jsonschema::JSONSchema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .compile(schema)
+    {
+        Ok(compiled) => compiled,
+        Err(e) => {
+            return orchestration::atoms::invocation::OutputShapeStatus {
+                valid: Some(false),
+                schema_ref: "outputs.schema".to_string(),
+                errors: vec![format!("output schema failed to compile: {e}")],
+            };
+        }
+    };
+    match compiled.validate(data) {
+        Ok(()) => orchestration::atoms::invocation::OutputShapeStatus {
+            valid: Some(true),
+            schema_ref: "outputs.schema".to_string(),
+            errors: Vec::new(),
+        },
+        Err(errors) => orchestration::atoms::invocation::OutputShapeStatus {
+            valid: Some(false),
+            schema_ref: "outputs.schema".to_string(),
+            errors: errors.map(|e| e.to_string()).collect(),
+        },
     }
 }
 

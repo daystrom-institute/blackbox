@@ -17,6 +17,11 @@ pub struct Workflow {
     pub name: String,
     pub version: u32,
     pub actors: HashMap<String, ActorSpec>,
+    /// Workflow-local bindings to reusable atoms. Nodes reference
+    /// these by id through `NodeSpec.atom`; the standalone atom
+    /// manifest remains the reusable contract.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub atom_bindings: HashMap<String, AtomBinding>,
     pub nodes: HashMap<String, NodeSpec>,
     /// Entry node id — the first node executed when the arc starts.
     /// Must reference a key in `nodes`.
@@ -76,6 +81,46 @@ pub struct ActorSpec {
     pub requires: Vec<Capability>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AtomBinding {
+    /// Optional self-identifying id. The map key remains canonical; if
+    /// present, compile validation requires it to match the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub atom_ref: String,
+    /// When true, repeated visits to this binding resume the prior
+    /// resumable atom invocation instead of starting a fresh one.
+    #[serde(default)]
+    pub durable: bool,
+    #[serde(default)]
+    pub compaction_anchor: bool,
+    /// Provider capability requirements retained from ActorSpec donor
+    /// shape. Effects such as filesystem/network live on atom policy,
+    /// not here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Capability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<AtomBindingLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision_override: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_override: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AtomBindingLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writes_files: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatches_runs: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses_network: Option<serde_json::Value>,
+}
+
 /// Engine-level actor kinds. Two values: `executor` for single-bro
 /// dispatch, `ensemble` for team broadcast. Persona / role / contract
 /// (advisor, planner, triager, facilitator, specialist, reviewer, …)
@@ -110,6 +155,16 @@ pub struct NodeSpec {
     /// Optional only when `subworkflow` or `wait` is set.
     #[serde(default)]
     pub actor: String,
+    /// Name of an atom binding to invoke (must exist in
+    /// `Workflow.atom_bindings`). Mutually exclusive with `actor`,
+    /// `subworkflow`, `wait`, `foreach`, and `matrix`.
+    #[serde(default)]
+    pub atom: String,
+    /// Structured atom input arguments. Values are resolved through
+    /// `workflow::context::resolve_arg_value` so whole-string
+    /// `${vars.x}` templates preserve JSON type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atom_args: Option<Value>,
     /// Prompt template. Supports full ArcContext templating:
     /// `${vars.x}`, `${outputs.NodeName.field}`, `${meta.x}`,
     /// `${last_signal.payload.x}`, plus legacy `${NodeName.output}`.

@@ -23,8 +23,8 @@ pub use engine::{
 #[cfg(test)]
 pub use schema::load_workflow;
 pub use schema::{
-    ActorFailureMode, ActorKind, ActorSpec, ForeachSpec, GateMode, ItemFailurePolicy, MatrixSpec,
-    NodeMode, NodeTransition, Workflow,
+    ActorFailureMode, ActorKind, ActorSpec, AtomBinding, AtomBindingLimits, ForeachSpec, GateMode,
+    ItemFailurePolicy, MatrixSpec, NodeMode, NodeSpec, NodeTransition, Workflow,
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -57,6 +57,22 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
         );
     }
 
+    for (binding_id, binding) in &spec.atom_bindings {
+        if let Some(declared_id) = &binding.id
+            && declared_id != binding_id
+        {
+            bail!(
+                "atom binding '{binding_id}' declares id='{declared_id}' — binding id must match the map key"
+            );
+        }
+        if crate::orchestration::atoms::types::AtomRef::parse(&binding.atom_ref).is_none() {
+            bail!(
+                "atom binding '{binding_id}' has invalid atom_ref '{}' (expected atom:name@vN or atom:name@latest)",
+                binding.atom_ref
+            );
+        }
+    }
+
     // Every node's `next` targets must reference declared nodes; gate
     // packet, actor, late_inject, subworkflow, wait_for cross-checks.
     for (node_id, node) in &spec.nodes {
@@ -71,6 +87,32 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
                 compile((**sub).clone()).map_err(|e| {
                     anyhow!("subworkflow on node '{node_id}' failed to compile: {e}")
                 })?;
+            }
+        }
+
+        if !node.actor.is_empty() && !node.atom.is_empty() {
+            bail!(
+                "node '{node_id}' declares both actor '{}' and atom binding '{}' — pick one",
+                node.actor,
+                node.atom
+            );
+        }
+
+        if !node.atom.is_empty() {
+            if !spec.atom_bindings.contains_key(&node.atom) {
+                bail!(
+                    "node '{node_id}' references undeclared atom binding '{}'",
+                    node.atom
+                );
+            }
+            if node.subworkflow.is_some() || node.subworkflow_ref.is_some() {
+                bail!("node '{node_id}' cannot combine atom binding with subworkflow");
+            }
+            if node.wait.is_some() {
+                bail!("node '{node_id}' cannot combine atom binding with wait");
+            }
+            if node.foreach.is_some() || node.matrix.is_some() {
+                bail!("node '{node_id}' cannot combine atom binding with foreach/matrix");
             }
         }
 
@@ -150,6 +192,12 @@ fn validate_dynamic_fanout(
         bail!(
             "node '{node_id}' foreach/matrix cannot also declare actor '{}'",
             node.actor
+        );
+    }
+    if !node.atom.is_empty() {
+        bail!(
+            "node '{node_id}' foreach/matrix cannot also declare atom binding '{}'",
+            node.atom
         );
     }
     if node.subworkflow.is_some() || node.subworkflow_ref.is_some() {
@@ -607,6 +655,79 @@ mod tests {
     fn compile_err(spec_json: &str) -> String {
         let spec = load_workflow(spec_json).unwrap();
         compile(spec).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn atom_binding_workflow_loads_and_validates() {
+        let json = r#"{
+            "name": "atom-binding-smoke",
+            "version": 1,
+            "actors": {},
+            "atom_bindings": {
+                "echoer": {
+                    "atom_ref": "atom:echo@v1",
+                    "durable": true,
+                    "limits": {"dispatches_runs": 0}
+                }
+            },
+            "nodes": {
+                "Echo": {
+                    "atom": "echoer",
+                    "atom_args": {"message": "${vars.message}"},
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Echo"
+        }"#;
+        let spec = load_workflow(json).expect("parse atom-binding workflow");
+        let compiled = compile(spec).expect("compile atom-binding workflow");
+        assert_eq!(
+            compiled.spec.atom_bindings["echoer"].atom_ref,
+            "atom:echo@v1"
+        );
+        assert_eq!(compiled.spec.nodes["Echo"].atom, "echoer");
+    }
+
+    #[test]
+    fn atom_binding_rejects_bare_atom_ref() {
+        let err = compile_err(
+            r#"{
+                "name": "bad-binding",
+                "version": 1,
+                "actors": {},
+                "atom_bindings": {
+                    "echoer": {"atom_ref": "echo"}
+                },
+                "nodes": {
+                    "Echo": {"atom": "echoer", "next": {"type": "terminal"}}
+                },
+                "start": "Echo"
+            }"#,
+        );
+        assert!(err.contains("invalid atom_ref"), "{err}");
+    }
+
+    #[test]
+    fn node_cannot_reference_actor_and_atom_binding() {
+        let err = compile_err(
+            r#"{
+                "name": "bad-node",
+                "version": 1,
+                "actors": {"worker": {"kind": "executor", "brofile": "worker"}},
+                "atom_bindings": {
+                    "echoer": {"atom_ref": "atom:echo@v1"}
+                },
+                "nodes": {
+                    "Echo": {
+                        "actor": "worker",
+                        "atom": "echoer",
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Echo"
+            }"#,
+        );
+        assert!(err.contains("declares both actor"), "{err}");
     }
 
     #[test]

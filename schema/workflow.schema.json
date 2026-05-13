@@ -13,6 +13,11 @@
       "type": "object",
       "additionalProperties": { "$ref": "#/definitions/ActorSpec" }
     },
+    "atom_bindings": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/AtomBinding" },
+      "description": "Workflow-local bindings from node ids to standalone atom refs."
+    },
     "nodes": {
       "type": "object",
       "additionalProperties": { "$ref": "#/definitions/NodeSpec" }
@@ -60,6 +65,60 @@
       "enum": ["executor", "ensemble", "advisor", "user"]
     },
 
+    "AtomBinding": {
+      "type": "object",
+      "required": ["atom_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "id":                { "type": ["string", "null"], "minLength": 1 },
+        "atom_ref":          {
+          "type": "string",
+          "pattern": "^atom:[^@]+@(v[1-9][0-9]*|latest)$"
+        },
+        "durable":           { "type": "boolean", "default": false },
+        "compaction_anchor": { "type": "boolean", "default": false },
+        "requires": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/Capability" }
+        },
+        "limits":            { "$ref": "#/definitions/AtomBindingLimits" },
+        "supervision_override": {},
+        "trace_override": {},
+        "portal": {}
+      }
+    },
+
+    "AtomBindingLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "writes_files": {
+          "oneOf": [
+            { "type": "boolean" },
+            { "const": "unbounded" }
+          ]
+        },
+        "dispatches_runs": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "const": "unbounded" }
+          ]
+        },
+        "max_depth": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "const": "unbounded" }
+          ]
+        },
+        "uses_network": {
+          "oneOf": [
+            { "type": "boolean" },
+            { "const": "unbounded" }
+          ]
+        }
+      }
+    },
+
     "Capability": {
       "description": "Provider capability requirement. Validated against the actor's brofile/team → provider/model catalog at compile time.",
       "type": "string"
@@ -74,6 +133,15 @@
           "type": "string",
           "default": "",
           "description": "Name of the actor to invoke. Empty string = hook-only / pure-routing node (no actor dispatch)."
+        },
+        "atom": {
+          "type": "string",
+          "default": "",
+          "description": "Name of an atom binding to invoke."
+        },
+        "atom_args": {
+          "description": "Structured atom input arguments, resolved through ArcContext templating at dispatch.",
+          "type": ["array", "object", "string", "number", "integer", "boolean", "null"]
         },
         "prompt":           { "type": ["string", "null"] },
         "gate":             { "type": ["string", "null"] },

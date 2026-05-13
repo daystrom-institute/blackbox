@@ -25,8 +25,8 @@ use super::context::{ArcContext, ArcMeta, SignalRef, resolve_arg_value};
 use super::ops::{HookOp, OnFailure, OpEffect, execute_op};
 use super::wait::{PendingWait, ProviderEventWait, WaitSpec, canonicalize_correlation};
 use super::{
-    ActorFailureMode, ActorKind, ActorSpec, CompiledWorkflow, ForeachSpec, GateMode,
-    ItemFailurePolicy, MatrixSpec, NodeMode, NodeTransition, Workflow,
+    ActorFailureMode, ActorKind, ActorSpec, AtomBinding, CompiledWorkflow, ForeachSpec, GateMode,
+    ItemFailurePolicy, MatrixSpec, NodeMode, NodeSpec, NodeTransition, Workflow,
 };
 use crate::BlackboxServer;
 use crate::orchestration as orch;
@@ -576,6 +576,7 @@ struct WorkflowRunner<'a> {
     ctx: ArcContext,
     actor_sessions: HashMap<String, String>,
     actor_tasks: HashMap<String, String>,
+    atom_invocations: HashMap<String, String>,
     /// Per-ensemble member session continuity: key is
     /// `<actor_name>::<member_name>`. Populated when the ensemble
     /// actor is durable.
@@ -702,6 +703,7 @@ impl<'a> WorkflowRunner<'a> {
             ctx,
             actor_sessions: HashMap::new(),
             actor_tasks: HashMap::new(),
+            atom_invocations: HashMap::new(),
             ensemble_sessions: HashMap::new(),
             in_flight: HashMap::new(),
             visit_counts: HashMap::new(),
@@ -719,6 +721,14 @@ impl<'a> WorkflowRunner<'a> {
     fn record_output(&mut self, node_id: &str, text: String) {
         self.ctx.set_output(node_id, Value::String(text.clone()));
         self.node_outputs.insert(node_id.to_string(), text);
+    }
+
+    fn effective_project_dir(&self) -> Option<String> {
+        self.ctx
+            .meta
+            .worktree
+            .clone()
+            .or_else(|| self.project_dir.clone())
     }
 
     /// Apply a single OpEffect to the runner state. Used by hook
@@ -1319,6 +1329,51 @@ impl<'a> WorkflowRunner<'a> {
             return Ok(());
         }
 
+        if !spec.atom.is_empty() {
+            if matches!(spec.mode, NodeMode::FireAndForget) {
+                bail!(
+                    "node '{node_id}' uses atom binding '{}' with mode=fire_and_forget; atom workflow bindings require synchronous execution in v1",
+                    spec.atom
+                );
+            }
+            self.join_late_inject(node_id).await?;
+
+            let visit_count = {
+                let c = self.visit_counts.entry(node_id.to_string()).or_insert(0);
+                *c += 1;
+                *c
+            };
+            if let Some(retry) = &spec.retry {
+                if visit_count > retry.max_generations {
+                    bail!(
+                        "node '{node_id}' exceeded retry ceiling ({} generations; visited {visit_count} times)",
+                        retry.max_generations
+                    );
+                }
+            }
+
+            let binding = self
+                .compiled
+                .spec
+                .atom_bindings
+                .get(&spec.atom)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "node '{node_id}' references undeclared atom binding '{}'",
+                        spec.atom
+                    )
+                })?
+                .clone();
+            self.run_atom_node(node_id, &binding, &spec, visit_count)
+                .await?;
+            if matches!(spec.next, NodeTransition::Fork { .. }) {
+                self.run_fork_dispatch(node_id).await?;
+            }
+            self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
+            self.apply_node_gate(node_id, &spec).await;
+            return Ok(());
+        }
+
         let actor_name = spec.actor.clone();
 
         // Hook-only / pure-routing node: no actor declared. The
@@ -1637,6 +1692,148 @@ impl<'a> WorkflowRunner<'a> {
             }),
         );
         self.arc_note("done", &format!("node '{node_id}' → {output_preview}"));
+        Ok(())
+    }
+
+    async fn run_atom_node(
+        &mut self,
+        node_id: &str,
+        binding: &AtomBinding,
+        spec: &NodeSpec,
+        visit_count: u32,
+    ) -> Result<()> {
+        let owner = format!("workflow:{}", self.ctx.meta.arc_id);
+        let rendered_prompt = spec.prompt.as_deref().map(|p| self.render_prompt(p));
+        let args = if let Some(raw_args) = &spec.atom_args {
+            resolve_arg_value(&self.ctx, raw_args)
+                .map_err(|e| anyhow!("node '{node_id}' atom_args resolution failed: {e}"))?
+        } else if let Some(prompt) = rendered_prompt.as_ref().filter(|p| !p.is_empty()) {
+            json!({ "prompt": prompt })
+        } else {
+            json!({})
+        };
+
+        let parent_invocation_id = self
+            .ctx
+            .vars
+            .get("_atom_parent_invocation_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let existing_invocation_id = if binding.durable {
+            self.atom_invocations.get(&spec.atom).cloned()
+        } else {
+            None
+        };
+
+        self.log_event(
+            "node_atom_dispatch",
+            json!({
+                "node": node_id,
+                "binding": spec.atom,
+                "atom_ref": binding.atom_ref,
+                "mode": if existing_invocation_id.is_some() { "resume" } else { "invoke" },
+                "visit": visit_count,
+            }),
+        );
+
+        let value = if let Some(invocation_id) = existing_invocation_id {
+            let resume_prompt = rendered_prompt
+                .clone()
+                .unwrap_or_else(|| serde_json::to_string_pretty(&args).unwrap_or_default());
+            match self
+                .server
+                .atom_resume_value(crate::AtomResumeParams {
+                    invocation_id: invocation_id.clone(),
+                    prompt: resume_prompt,
+                    owner: Some(owner.clone()),
+                })
+                .await
+            {
+                Ok(value) => value,
+                Err(e) if e.contains("error.not_resumable") => {
+                    self.log_event(
+                        "node_atom_reinvoke",
+                        json!({
+                            "node": node_id,
+                            "binding": spec.atom,
+                            "prior_invocation_id": invocation_id,
+                            "reason": e,
+                        }),
+                    );
+                    self.server
+                        .atom_invoke_value(
+                            crate::AtomInvokeParams {
+                                atom: binding.atom_ref.clone(),
+                                args: args.clone(),
+                                project_dir: self.effective_project_dir(),
+                                owner: Some(owner.clone()),
+                                parent_invocation_id,
+                            },
+                            binding.limits.as_ref(),
+                        )
+                        .await
+                        .map_err(|e| anyhow!("atom invoke for node '{node_id}': {e}"))?
+                }
+                Err(e) => return Err(anyhow!("atom resume for node '{node_id}': {e}")),
+            }
+        } else {
+            self.server
+                .atom_invoke_value(
+                    crate::AtomInvokeParams {
+                        atom: binding.atom_ref.clone(),
+                        args,
+                        project_dir: self.effective_project_dir(),
+                        owner: Some(owner.clone()),
+                        parent_invocation_id,
+                    },
+                    binding.limits.as_ref(),
+                )
+                .await
+                .map_err(|e| anyhow!("atom invoke for node '{node_id}': {e}"))?
+        };
+
+        let invocation_id = value
+            .get("invocation_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("atom node '{node_id}' returned no invocation_id"))?
+            .to_string();
+        if binding.durable {
+            self.atom_invocations
+                .insert(spec.atom.clone(), invocation_id.clone());
+        }
+
+        let status_value = self
+            .server
+            .atom_status_value(crate::AtomStatusParams {
+                invocation_id: invocation_id.clone(),
+                owner: Some(owner),
+            })
+            .map_err(|e| anyhow!("atom status for node '{node_id}': {e}"))?;
+        self.ctx.record_actor_result(node_id, status_value.clone());
+        let output = serde_json::to_string(&status_value).unwrap_or_default();
+        self.record_output(node_id, output.clone());
+
+        let state = status_value
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let output_preview: String = output.chars().take(160).collect();
+        self.log_event(
+            "node_atom_complete",
+            json!({
+                "node": node_id,
+                "binding": spec.atom,
+                "atom_ref": binding.atom_ref,
+                "invocation_id": invocation_id,
+                "state": state,
+                "output_bytes": output.len(),
+                "output_preview": output_preview.clone(),
+            }),
+        );
+        self.arc_note(
+            "done",
+            &format!("atom node '{node_id}' ({}) → {state}", binding.atom_ref),
+        );
         Ok(())
     }
 
