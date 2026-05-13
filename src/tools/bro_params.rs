@@ -710,6 +710,7 @@ pub(crate) struct AtomSearchParams {
 pub(crate) struct AtomInvokeParams {
     pub(crate) atom: String,
     #[serde(default)]
+    #[schemars(with = "std::collections::BTreeMap<String, serde_json::Value>")]
     pub(crate) args: serde_json::Value,
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
@@ -740,4 +741,19 @@ pub(crate) struct AtomDelegateParams {
     pub(crate) grant_to: String,
     #[serde(default)]
     pub(crate) owner: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atom_invoke_args_schema_is_object() {
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(AtomInvokeParams)).unwrap();
+        let args_schema = &schema["properties"]["args"];
+        assert_eq!(
+            args_schema["type"], "object",
+            "atom_invoke.args must be advertised as an object, not a string"
+        );
+    }
 }
