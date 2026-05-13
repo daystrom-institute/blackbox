@@ -5,6 +5,7 @@ pub mod http_fetch;
 pub mod mcp;
 pub mod providers;
 pub mod resume_lease;
+pub mod supervision;
 pub mod tail;
 pub mod team;
 
@@ -21,6 +22,7 @@ use tokio::sync::Notify;
 use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{TranscriptCursor, TranscriptLocation};
 use providers::{EventSink, Provider, Usage};
+use supervision::SupervisionState;
 
 const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
     "BBOX_PORT",
@@ -134,6 +136,7 @@ pub struct TaskInner {
     pub recoverable: bool,
     pub transcript_location: Option<TranscriptLocation>,
     pub transcript_cursor: Option<TranscriptCursor>,
+    pub supervision: SupervisionState,
 }
 
 pub struct Task {
@@ -285,6 +288,8 @@ struct PersistedTask {
     transcript_location: Option<TranscriptLocation>,
     #[serde(default)]
     transcript_cursor: Option<TranscriptCursor>,
+    #[serde(default)]
+    supervision: SupervisionState,
 }
 
 impl TaskStore {
@@ -322,6 +327,7 @@ impl TaskStore {
                     recoverable: inner.recoverable,
                     transcript_location: inner.transcript_location.clone(),
                     transcript_cursor: inner.transcript_cursor.clone(),
+                    supervision: inner.supervision.clone(),
                 }
             })
             .collect();
@@ -385,6 +391,7 @@ impl TaskStore {
                     recoverable: rec.recoverable,
                     transcript_location: rec.transcript_location,
                     transcript_cursor: rec.transcript_cursor,
+                    supervision: rec.supervision,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -759,6 +766,7 @@ fn failed_duplicate_task(
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            supervision: SupervisionState::default(),
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -818,6 +826,7 @@ pub fn spawn_in_process_task(
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            supervision: SupervisionState::default(),
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -1039,6 +1048,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
                     recoverable: false,
                     transcript_location: None,
                     transcript_cursor: None,
+                    supervision: SupervisionState::default(),
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -1073,6 +1083,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            supervision: SupervisionState::default(),
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(pid),
@@ -1192,6 +1203,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
                             }
                         }
                         if accepted {
+                            inner.supervision.observe_event(&evt, &sink, now_ms());
                             apply_sink_updates(&mut inner, sink);
                         }
                         accepted
@@ -1251,13 +1263,16 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
                 if let Some(sid) = sink.session_id.clone() {
                     if inner.session_id == "pending" {
                         inner.session_id = sid;
+                        inner.supervision.observe_bulk_sink(&sink, now_ms());
                         apply_sink_updates(&mut inner, sink);
                     } else if inner.session_id != sid {
                         reject_forked_session(&mut inner, &sid);
                     } else {
+                        inner.supervision.observe_bulk_sink(&sink, now_ms());
                         apply_sink_updates(&mut inner, sink);
                     }
                 } else {
+                    inner.supervision.observe_bulk_sink(&sink, now_ms());
                     apply_sink_updates(&mut inner, sink);
                 }
             }
@@ -1325,6 +1340,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
                 .await
                 {
                     let mut inner = task_ref_wait.inner.lock();
+                    inner.supervision.observe_bulk_sink(&sink, now_ms());
                     apply_sink_updates(&mut inner, sink);
                 }
             }
@@ -1567,7 +1583,7 @@ pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
 
 pub fn task_result_json(task: &Task) -> Value {
     populate_transcript_handle(task);
-    let inner = task.inner.lock();
+    let mut inner = task.inner.lock();
     let mut obj = serde_json::json!({
         "taskId": inner.id,
         "provider": inner.provider,
@@ -1608,6 +1624,9 @@ pub fn task_result_json(task: &Task) -> Value {
     if let Some(ref cursor) = inner.transcript_cursor {
         obj["transcriptCursor"] = serde_json::to_value(cursor).unwrap_or(Value::Null);
     }
+    let supervision_now = inner.completed_at.unwrap_or_else(now_ms);
+    inner.supervision.observe_stall(supervision_now);
+    obj["supervision"] = inner.supervision.snapshot(supervision_now);
     if inner.status == TaskStatus::Failed {
         if let Some(code) = inner.exit_code {
             obj["exitCode"] = Value::from(code);
@@ -1670,7 +1689,7 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
 }
 
 pub fn timeout_snapshot_json(task: &Task) -> Value {
-    let inner = task.inner.lock();
+    let mut inner = task.inner.lock();
     let elapsed = format_elapsed(inner.started_at, None);
     let event_count = inner.events.len();
     let last_activity = inner.last_assistant_message.as_deref().map(|msg| {
@@ -1690,6 +1709,7 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
         "check_status"
     };
 
+    inner.supervision.observe_stall(now_ms());
     serde_json::json!({
         "taskId": inner.id,
         "provider": inner.provider,
@@ -1700,6 +1720,7 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
         "eventCount": event_count,
         "keep_going": keep_going,
         "lastAssistantSnippet": last_activity,
+        "supervision": inner.supervision.snapshot(now_ms()),
     })
 }
 
@@ -1744,6 +1765,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                supervision: SupervisionState::default(),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1770,6 +1792,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                supervision: SupervisionState::default(),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1812,6 +1835,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                supervision: SupervisionState::default(),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -2104,6 +2128,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                supervision: SupervisionState::default(),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -2114,6 +2139,7 @@ mod tests {
         assert_eq!(json["result"], "Done!");
         assert_eq!(json["costUsd"], 0.05);
         assert_eq!(json["usage"]["input_tokens"], 100);
+        assert!(json["supervision"].is_object());
     }
 
     #[test]
@@ -2140,6 +2166,7 @@ mod tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                supervision: SupervisionState::default(),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -2181,6 +2208,7 @@ mod tests {
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            supervision: SupervisionState::default(),
         };
 
         reject_forked_session(&mut inner, "forked-session");
@@ -2228,6 +2256,7 @@ mod tests {
             recoverable: false,
             transcript_location: None,
             transcript_cursor: None,
+            supervision: SupervisionState::default(),
         };
 
         let sink = EventSink {
@@ -2289,6 +2318,7 @@ mod async_tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                supervision: SupervisionState::default(),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -2322,6 +2352,7 @@ mod async_tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                supervision: SupervisionState::default(),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -2368,6 +2399,7 @@ mod async_tests {
                 recoverable: false,
                 transcript_location: None,
                 transcript_cursor: None,
+                supervision: SupervisionState::default(),
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
