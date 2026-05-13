@@ -39,6 +39,7 @@ mod lsp;
 mod manifest;
 mod mcp_client;
 mod mcp_tools;
+mod migration;
 mod notes;
 mod orchestration;
 mod packets;
@@ -161,6 +162,7 @@ impl BlackboxServer {
                 + tools::mcp_surface::router()
                 + tools::storage_health::router()
                 + tools::storage_gc::router()
+                + tools::storage_migration::router()
                 + tools::workspace::router(),
             surface: std::sync::OnceLock::new(),
         }

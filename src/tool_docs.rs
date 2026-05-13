@@ -1363,6 +1363,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Sidecar cleanup.",
         example: None,
     },
+    ToolDoc {
+        name: "bbox_storage_migrate_legacy_edges",
+        category: ToolCategory::StorageHealth,
+        summary: "Dry-run or apply legacy edge sidecar migration into lifecycle-owned explicit/observed lanes. Drops derived only when managed replacement exists; quarantines malformed lines.",
+        when_to_use: "Migrating pre-Phase-2 legacy sidecars into lane-split storage.",
+        example: None,
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\

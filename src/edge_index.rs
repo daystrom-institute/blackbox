@@ -535,15 +535,32 @@ impl EdgeIndex {
             seen,
             &projects_with_managed,
         );
-        let Ok(entries) = fs::read_dir(&managed_derived_dir) else {
-            return;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if !path.is_dir() {
+        for sub in &["derived", "explicit", "observed"] {
+            let sub_dir = edges_dir.join(sub);
+            if !sub_dir.is_dir() {
                 continue;
             }
-            self.project_sidecar_edges_in_dir(&path, registered_project_ids, seen, &HashSet::new());
+            let Ok(entries) = fs::read_dir(&sub_dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                self.project_sidecar_edges_in_dir(
+                    &path,
+                    registered_project_ids,
+                    seen,
+                    &HashSet::new(),
+                );
+            }
+            self.project_sidecar_edges_in_dir(
+                &sub_dir,
+                registered_project_ids,
+                seen,
+                &HashSet::new(),
+            );
         }
     }
 
@@ -622,6 +639,36 @@ impl EdgeIndex {
         registered_project_ids: Option<&HashSet<String>>,
         seen: &mut HashSet<Edge>,
     ) {
+        let explicit_dir = edges_dir.join("explicit");
+        let observed_dir = edges_dir.join("observed");
+        let explicit_lane_projects = scan_lane_project_ids(&explicit_dir);
+        let observed_lane_projects = scan_lane_project_ids(&observed_dir);
+        let mut migrated_projects: HashSet<String> = HashSet::new();
+        for pid in &explicit_lane_projects {
+            migrated_projects.insert(pid.clone());
+        }
+        for pid in &observed_lane_projects {
+            migrated_projects.insert(pid.clone());
+        }
+
+        for project_id in &migrated_projects {
+            if !sidecar_project_id_is_registered(project_id, registered_project_ids) {
+                continue;
+            }
+            if explicit_lane_projects.contains(project_id) {
+                let path = explicit_dir.join(format!("{project_id}.jsonl"));
+                if path.exists() {
+                    self.project_sidecar_edges_file(&path, seen, false);
+                }
+            }
+            if observed_lane_projects.contains(project_id) {
+                let path = observed_dir.join(format!("{project_id}.jsonl"));
+                if path.exists() {
+                    self.project_sidecar_edges_file(&path, seen, false);
+                }
+            }
+        }
+
         let managed_derived_dir = managed_derived_edges_dir(edges_dir);
         let projects_with_managed = scan_managed_derived_project_ids(&managed_derived_dir);
         let Ok(entries) = fs::read_dir(edges_dir) else {
@@ -635,11 +682,43 @@ impl EdgeIndex {
             if !sidecar_project_is_registered(&path, registered_project_ids) {
                 continue;
             }
+            if let Some(stem) = sidecar_file_stem(&path) {
+                if migrated_projects.contains(stem) {
+                    continue;
+                }
+            }
             let skip_derived =
                 sidecar_file_stem(&path).is_some_and(|stem| projects_with_managed.contains(stem));
             self.project_sidecar_edges_file(&path, seen, skip_derived);
         }
     }
+}
+
+fn scan_lane_project_ids(lane_dir: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(entries) = fs::read_dir(lane_dir) else {
+        return ids;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(stem) = sidecar_file_stem(&path) {
+            ids.insert(stem.to_string());
+        }
+    }
+    ids
+}
+
+fn sidecar_project_id_is_registered(
+    project_id: &str,
+    registered: Option<&HashSet<String>>,
+) -> bool {
+    let Some(registered) = registered else {
+        return true;
+    };
+    registered.contains(project_id)
 }
 
 pub(crate) fn edges_dir_from_bro_store(store_dir: &Path) -> PathBuf {

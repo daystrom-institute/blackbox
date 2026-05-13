@@ -25,6 +25,7 @@ pub mod roster;
 pub mod sessions;
 pub mod storage_gc;
 pub mod storage_health;
+pub mod storage_migration;
 pub mod threads;
 pub mod transcripts;
 pub mod whiteboards;
