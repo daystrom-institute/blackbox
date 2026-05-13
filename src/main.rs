@@ -158,6 +158,7 @@ impl BlackboxServer {
                 + tools::dispatch::router()
                 + tools::mcp_surface::router()
                 + tools::storage_health::router()
+                + tools::storage_gc::router()
                 + tools::workspace::router(),
             surface: std::sync::OnceLock::new(),
         }

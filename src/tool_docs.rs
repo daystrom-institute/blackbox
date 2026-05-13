@@ -1356,6 +1356,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Sidecar disk usage.",
         example: None,
     },
+    ToolDoc {
+        name: "bbox_storage_gc",
+        category: ToolCategory::StorageHealth,
+        summary: "Dry-run or apply edge sidecar garbage collection. Reports exact candidates with path, bytes, and rule.",
+        when_to_use: "Sidecar cleanup.",
+        example: None,
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -422,6 +423,218 @@ pub(crate) fn find_edges_dir(store_dir: &Path, projects_path: Option<&Path>) -> 
     from_store
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcCandidate {
+    pub path: String,
+    pub kind: FileKind,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcResult {
+    pub applied: bool,
+    pub candidates: Vec<GcCandidate>,
+    pub total_candidates: usize,
+    pub total_candidate_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_errors: Option<Vec<String>>,
+}
+
+pub struct GcParams {
+    pub dry_run: bool,
+    pub project_filter: Option<String>,
+    pub prune_backups: bool,
+    pub prune_orphans: bool,
+    pub prune_temps: bool,
+    pub max_backup_age_days: Option<u64>,
+    pub keep_newest_backup_per_source: u64,
+}
+
+const TEMP_GRACE_SECS: u64 = 24 * 3600;
+
+pub fn plan_gc(
+    edges_dir: &Path,
+    registered_project_ids: &HashSet<String>,
+    params: &GcParams,
+) -> Result<Vec<GcCandidate>> {
+    let report = scan_storage_health(
+        edges_dir,
+        registered_project_ids,
+        params.project_filter.as_deref(),
+        true,
+    )?;
+
+    let mut candidates: Vec<GcCandidate> = Vec::new();
+
+    if params.prune_temps {
+        for f in &report.files {
+            if f.kind != FileKind::Temp {
+                continue;
+            }
+            let path = Path::new(&f.path);
+            let age_secs = file_age_secs(path).unwrap_or(0);
+            if age_secs < TEMP_GRACE_SECS {
+                candidates.push(GcCandidate {
+                    path: f.path.clone(),
+                    kind: f.kind,
+                    bytes: f.bytes,
+                    project_id: f.project_id.clone(),
+                    reason: format!(
+                        "temp file within 24h grace (age={}s, need={}s)",
+                        age_secs, TEMP_GRACE_SECS
+                    ),
+                });
+                continue;
+            }
+            candidates.push(GcCandidate {
+                path: f.path.clone(),
+                kind: f.kind,
+                bytes: f.bytes,
+                project_id: f.project_id.clone(),
+                reason: "temp file older than 24h grace period".to_string(),
+            });
+        }
+    }
+
+    if params.prune_backups {
+        let mut backups_by_source: std::collections::HashMap<String, Vec<&StorageFileInfo>> =
+            std::collections::HashMap::new();
+        for f in &report.files {
+            if f.kind != FileKind::Backup {
+                continue;
+            }
+            let source_key = f
+                .project_id
+                .clone()
+                .unwrap_or_else(|| path_source_key(&f.path));
+            backups_by_source.entry(source_key).or_default().push(f);
+        }
+
+        for (source, mut backups) in backups_by_source {
+            backups.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+            let newest_count = params.keep_newest_backup_per_source as usize;
+            for (i, f) in backups.iter().enumerate() {
+                let is_newest = i < newest_count;
+
+                let age_violated = if let Some(max_days) = params.max_backup_age_days {
+                    let age_secs = file_age_secs(Path::new(&f.path)).unwrap_or(0);
+                    age_secs > max_days * 86400
+                } else {
+                    false
+                };
+
+                if is_newest && !age_violated {
+                    candidates.push(GcCandidate {
+                        path: f.path.clone(),
+                        kind: f.kind,
+                        bytes: f.bytes,
+                        project_id: f.project_id.clone(),
+                        reason: format!("newest backup retained (#{}, source={})", i + 1, source),
+                    });
+                    continue;
+                }
+
+                let reason = if !is_newest && age_violated {
+                    format!(
+                        "older-than-newest backup and exceeds max_backup_age_days (#{}, source={})",
+                        i + 1,
+                        source
+                    )
+                } else if !is_newest {
+                    format!(
+                        "older-than-newest backup (#{}, keep={}, source={})",
+                        i + 1,
+                        newest_count,
+                        source
+                    )
+                } else {
+                    format!(
+                        "newest backup but exceeds max_backup_age_days (#{}, source={})",
+                        i + 1,
+                        source
+                    )
+                };
+                candidates.push(GcCandidate {
+                    path: f.path.clone(),
+                    kind: f.kind,
+                    bytes: f.bytes,
+                    project_id: f.project_id.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+
+    if params.prune_orphans {
+        let mut orphan_supported = false;
+        for f in &report.files {
+            if f.kind == FileKind::Orphan {
+                orphan_supported = true;
+                candidates.push(GcCandidate {
+                    path: f.path.clone(),
+                    kind: f.kind,
+                    bytes: f.bytes,
+                    project_id: f.project_id.clone(),
+                    reason: "orphan/unregistered sidecar reported; Phase 1 does not auto-prune"
+                        .to_string(),
+                });
+            }
+        }
+        if !orphan_supported {
+            candidates.push(GcCandidate {
+                path: String::new(),
+                kind: FileKind::Orphan,
+                bytes: 0,
+                project_id: None,
+                reason: "prune_orphans=true but no orphan sidecars found".to_string(),
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| a.reason.cmp(&b.reason).then(a.path.cmp(&b.path)));
+    Ok(candidates)
+}
+
+pub fn apply_gc(candidates: &[GcCandidate]) -> (Vec<String>, Vec<String>) {
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    for c in candidates {
+        if c.path.is_empty() {
+            continue;
+        }
+        if c.reason.contains("retained")
+            || c.reason.contains("Phase 1 does not")
+            || c.reason.contains("within 24h grace")
+        {
+            continue;
+        }
+        match fs::remove_file(&c.path) {
+            Ok(()) => deleted.push(c.path.clone()),
+            Err(e) => errors.push(format!("{}: {}", c.path, e)),
+        }
+    }
+    (deleted, errors)
+}
+
+fn path_source_key(path: &str) -> String {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    extract_project_id_from_backup(file_name).unwrap_or_else(|| file_name.to_string())
+}
+
+fn file_age_secs(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let now = SystemTime::now();
+    now.duration_since(modified).ok().map(|d| d.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +929,220 @@ mod tests {
             Some("proj1234".to_string())
         );
         assert_eq!(extract_project_id_from_base(".jsonl"), None);
+    }
+
+    #[test]
+    fn gc_dry_run_reports_candidates_without_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+        write_file(&edges_dir, "proj1234.jsonl.bak-1000", b"old backup\n");
+        write_file(&edges_dir, "proj1234.jsonl.bak-2000", b"newer backup\n");
+
+        let mut registered = HashSet::new();
+        registered.insert("proj1234".to_string());
+
+        let candidates = plan_gc(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: true,
+                prune_orphans: false,
+                prune_temps: false,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+        )
+        .unwrap();
+
+        let deletable: Vec<&GcCandidate> = candidates
+            .iter()
+            .filter(|c| !c.reason.contains("retained"))
+            .collect();
+        assert!(
+            !deletable.is_empty(),
+            "should have at least one deletable backup"
+        );
+        assert!(
+            edges_dir.join("proj1234.jsonl.bak-1000").exists(),
+            "dry_run must not delete files"
+        );
+        assert!(
+            edges_dir.join("proj1234.jsonl.bak-2000").exists(),
+            "dry_run must not delete files"
+        );
+    }
+
+    #[test]
+    fn gc_apply_deletes_only_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+        write_file(&edges_dir, "proj1234.jsonl", b"active\n");
+        write_file(&edges_dir, "proj1234.jsonl.bak-1000", b"old backup\n");
+        write_file(&edges_dir, "proj1234.jsonl.bak-2000", b"newer backup\n");
+
+        let mut registered = HashSet::new();
+        registered.insert("proj1234".to_string());
+
+        let candidates = plan_gc(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: false,
+                project_filter: None,
+                prune_backups: true,
+                prune_orphans: false,
+                prune_temps: false,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+        )
+        .unwrap();
+
+        let (deleted, errors) = apply_gc(&candidates);
+        assert!(errors.is_empty(), "no delete errors expected");
+        assert!(
+            !edges_dir.join("proj1234.jsonl").exists() || edges_dir.join("proj1234.jsonl").exists(),
+        );
+        assert!(
+            edges_dir.join("proj1234.jsonl").exists(),
+            "active sidecar must never be deleted in Phase 1"
+        );
+        assert!(
+            !deleted
+                .iter()
+                .any(|p| p.contains("proj1234.jsonl") && !p.contains(".bak-")),
+            "active sidecar must not appear in deleted list"
+        );
+    }
+
+    #[test]
+    fn gc_retains_newest_backup_per_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+        write_file(&edges_dir, "proj1234.jsonl.bak-1000", b"old\n");
+        write_file(&edges_dir, "proj1234.jsonl.bak-2000", b"mid\n");
+        write_file(&edges_dir, "proj1234.jsonl.bak-3000", b"newest\n");
+
+        let mut registered = HashSet::new();
+        registered.insert("proj1234".to_string());
+
+        let candidates = plan_gc(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: true,
+                prune_orphans: false,
+                prune_temps: false,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+        )
+        .unwrap();
+
+        let retained: Vec<&GcCandidate> = candidates
+            .iter()
+            .filter(|c| c.reason.contains("retained"))
+            .collect();
+        assert_eq!(retained.len(), 1, "exactly 1 newest backup retained");
+    }
+
+    #[test]
+    fn gc_respects_temp_grace_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+        let recent_path = edges_dir.join("proj1234.jsonl.compact-123-45.tmp");
+        fs::write(&recent_path, b"recent tmp\n").unwrap();
+
+        let mut registered = HashSet::new();
+        registered.insert("proj1234".to_string());
+
+        let candidates = plan_gc(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: false,
+                prune_temps: true,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+        )
+        .unwrap();
+
+        let grace_candidates: Vec<&GcCandidate> = candidates
+            .iter()
+            .filter(|c| c.reason.contains("grace"))
+            .collect();
+        assert!(
+            !grace_candidates.is_empty(),
+            "recent temp file must appear in candidates (within grace or prunable)"
+        );
+    }
+
+    #[test]
+    fn gc_orphans_reported_not_deleted_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+        write_file(&edges_dir, "orphan99.jsonl", b"orphan data\n");
+
+        let registered = HashSet::new();
+
+        let candidates_default = plan_gc(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: false,
+                prune_temps: false,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            candidates_default.is_empty(),
+            "orphans not candidates when prune_orphans=false"
+        );
+
+        let candidates_report = plan_gc(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: true,
+                prune_temps: false,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            candidates_report
+                .iter()
+                .any(|c| c.reason.contains("Phase 1 does not")),
+            "orphans must be reported with Phase 1 limitation"
+        );
+
+        let (deleted, _) = apply_gc(&candidates_report);
+        assert!(deleted.is_empty(), "Phase 1 must not delete orphans");
+        assert!(
+            edges_dir.join("orphan99.jsonl").exists(),
+            "orphan file must survive apply"
+        );
     }
 }
