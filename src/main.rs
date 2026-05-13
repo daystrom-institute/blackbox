@@ -58,6 +58,7 @@ mod server;
 mod slack_channel_bindings;
 mod slack_proposal_links;
 mod slack_thread_store;
+mod snapshot;
 mod storage_health;
 mod system_memory;
 mod template;
