@@ -67,34 +67,11 @@ impl EdgeIndex {
             tracing::debug!("rebuilt EdgeIndex without Tantivy stored-doc projection");
         }
 
-        match crate::manifest::try_load_manifest_index(&stores.edges_dir) {
-            Ok(manifest_index) => {
-                let active_paths = manifest_index.active_materialized_paths(&stores.edges_dir);
-                index.load_manifest_active_paths(&active_paths, &mut seen);
-                index.load_legacy_explicit_edges(
-                    &stores.edges_dir,
-                    stores.registered_project_ids.as_ref(),
-                    &mut seen,
-                );
-                tracing::info!(
-                    active_paths = active_paths.len(),
-                    "loaded edges via manifest-index"
-                );
-            }
-            Err(reason) => {
-                if !matches!(
-                    reason,
-                    crate::manifest::ManifestFallbackReason::MissingNotMigrated
-                ) {
-                    tracing::warn!(?reason, "manifest-index fallback to legacy sidecar loading");
-                }
-                index.project_sidecar_edges(
-                    &stores.edges_dir,
-                    stores.registered_project_ids.as_ref(),
-                    &mut seen,
-                );
-            }
-        }
+        index.load_sidecar_edges(
+            &stores.edges_dir,
+            stores.registered_project_ids.as_ref(),
+            &mut seen,
+        );
 
         tracing::info!(
             edges = index.edge_count(),
@@ -118,8 +95,18 @@ impl EdgeIndex {
                 let active_paths = manifest_index.active_materialized_paths(edges_dir);
                 self.load_manifest_active_paths(&active_paths, seen);
                 self.load_legacy_explicit_edges(edges_dir, registered_project_ids, seen);
+                tracing::info!(
+                    active_paths = active_paths.len(),
+                    "loaded edges via manifest-index"
+                );
             }
-            Err(_) => {
+            Err(reason) => {
+                if !matches!(
+                    reason,
+                    crate::manifest::ManifestFallbackReason::MissingNotMigrated
+                ) {
+                    tracing::warn!(?reason, "manifest-index fallback to legacy sidecar loading");
+                }
                 self.project_sidecar_edges(edges_dir, registered_project_ids, seen);
             }
         }
@@ -2859,9 +2846,7 @@ mod tests {
             crate::manifest::WorkspaceIndexEntry {
                 manifest: "workspace/p1/manifest.json".into(),
                 active_snapshot: None,
-                dirty_overlay: Some(
-                    "workspace/p1/dirty-overlay/does-not-exist".into(),
-                ),
+                dirty_overlay: Some("workspace/p1/dirty-overlay/does-not-exist".into()),
                 repo_materialization: None,
             },
         );
