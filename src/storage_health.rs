@@ -99,6 +99,17 @@ pub struct StorageHealthReport {
     pub top_offenders: Vec<StorageFileInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<StorageFileInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_status: Option<ManifestStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestStatus {
+    pub index_exists: bool,
+    pub workspace_count: usize,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 pub fn scan_storage_health(
@@ -135,11 +146,49 @@ pub fn scan_storage_health(
 
     let files_out = if include_files { files } else { Vec::new() };
 
+    let manifest_status = scan_manifest_status(edges_dir);
+
     Ok(StorageHealthReport {
         totals,
         top_offenders,
         files: files_out,
+        manifest_status,
     })
+}
+
+fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
+    match crate::manifest::try_load_manifest_index(edges_dir) {
+        Ok(idx) => {
+            let workspace_count = idx.workspaces.len();
+            Some(ManifestStatus {
+                index_exists: true,
+                workspace_count,
+                status: "valid".to_string(),
+                fallback_reason: None,
+            })
+        }
+        Err(reason) => match reason {
+            crate::manifest::ManifestFallbackReason::MissingNotMigrated => None,
+            crate::manifest::ManifestFallbackReason::Corrupt { error } => Some(ManifestStatus {
+                index_exists: true,
+                workspace_count: 0,
+                status: "corrupt".to_string(),
+                fallback_reason: Some(error),
+            }),
+            crate::manifest::ManifestFallbackReason::Stale {
+                missing_manifests,
+                missing_snapshots,
+            } => Some(ManifestStatus {
+                index_exists: true,
+                workspace_count: 0,
+                status: "stale".to_string(),
+                fallback_reason: Some(format!(
+                    "missing manifests: {:?}, missing snapshots: {:?}",
+                    missing_manifests, missing_snapshots
+                )),
+            }),
+        },
+    }
 }
 
 fn project_filter_matches(project_id: Option<&str>, project_filter: Option<&str>) -> bool {

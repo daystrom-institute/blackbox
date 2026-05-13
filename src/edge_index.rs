@@ -66,11 +66,35 @@ impl EdgeIndex {
         } else {
             tracing::debug!("rebuilt EdgeIndex without Tantivy stored-doc projection");
         }
-        index.project_sidecar_edges(
-            &stores.edges_dir,
-            stores.registered_project_ids.as_ref(),
-            &mut seen,
-        );
+
+        match crate::manifest::try_load_manifest_index(&stores.edges_dir) {
+            Ok(manifest_index) => {
+                let active_paths = manifest_index.active_materialized_paths(&stores.edges_dir);
+                index.load_manifest_active_paths(&active_paths, &mut seen);
+                index.load_legacy_explicit_edges(
+                    &stores.edges_dir,
+                    stores.registered_project_ids.as_ref(),
+                    &mut seen,
+                );
+                tracing::info!(
+                    active_paths = active_paths.len(),
+                    "loaded edges via manifest-index"
+                );
+            }
+            Err(reason) => {
+                if !matches!(
+                    reason,
+                    crate::manifest::ManifestFallbackReason::MissingNotMigrated
+                ) {
+                    tracing::warn!(?reason, "manifest-index fallback to legacy sidecar loading");
+                }
+                index.project_sidecar_edges(
+                    &stores.edges_dir,
+                    stores.registered_project_ids.as_ref(),
+                    &mut seen,
+                );
+            }
+        }
 
         tracing::info!(
             edges = index.edge_count(),
@@ -578,6 +602,56 @@ impl EdgeIndex {
         self.insert(edge, seen);
         if let Some(edge) = derived {
             self.insert(edge, seen);
+        }
+    }
+
+    fn load_manifest_active_paths(&mut self, paths: &[PathBuf], seen: &mut HashSet<Edge>) {
+        for path in paths {
+            self.project_sidecar_edges_file(path, seen, false);
+        }
+    }
+
+    fn load_legacy_explicit_edges(
+        &mut self,
+        edges_dir: &Path,
+        registered_project_ids: Option<&HashSet<String>>,
+        seen: &mut HashSet<Edge>,
+    ) {
+        let managed_derived_dir = managed_derived_edges_dir(edges_dir);
+        let projects_with_managed = scan_managed_derived_project_ids(&managed_derived_dir);
+        let Ok(entries) = fs::read_dir(edges_dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if !sidecar_project_is_registered(&path, registered_project_ids) {
+                continue;
+            }
+            let skip_derived =
+                sidecar_file_stem(&path).is_some_and(|stem| projects_with_managed.contains(stem));
+            self.project_sidecar_edges_file(&path, seen, skip_derived);
+        }
+        for namespace_dir in fs::read_dir(&managed_derived_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_dir())
+        {
+            let ns_path = namespace_dir.path();
+            let ns_name = ns_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if ns_name == "project" {
+                continue;
+            }
+            self.project_sidecar_edges_in_dir(
+                &ns_path,
+                registered_project_ids,
+                seen,
+                &HashSet::new(),
+            );
         }
     }
 }

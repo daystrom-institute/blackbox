@@ -36,6 +36,7 @@ mod index;
 mod json_store;
 mod knowledge;
 mod lsp;
+mod manifest;
 mod mcp_client;
 mod mcp_tools;
 mod notes;
