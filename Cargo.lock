@@ -336,6 +336,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "figment",
+ "filetime",
  "fs2",
  "futures",
  "futures-util",

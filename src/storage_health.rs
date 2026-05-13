@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -519,7 +520,7 @@ pub fn plan_gc(
         }
 
         for (source, mut backups) in backups_by_source {
-            backups.sort_by(|a, b| backup_recency_key(b).cmp(&backup_recency_key(a)));
+            backups.sort_by(|a, b| backup_recency_key(a).cmp(&backup_recency_key(b)));
             let keep = params.keep_newest_backup_per_source as usize;
             for (i, f) in backups.iter().enumerate() {
                 let is_retained = i < keep;
@@ -619,10 +620,10 @@ fn path_source_key(path: &str) -> String {
     extract_project_id_from_backup(file_name).unwrap_or_else(|| file_name.to_string())
 }
 
-fn backup_recency_key(f: &StorageFileInfo) -> (u64, u64) {
+fn backup_recency_key(f: &StorageFileInfo) -> (Reverse<u64>, Reverse<u64>) {
     let mtime = file_age_secs(Path::new(&f.path)).unwrap_or(u64::MAX);
     let suffix_ts = extract_bak_timestamp(&f.path).unwrap_or(0);
-    (mtime, suffix_ts)
+    (Reverse(mtime), Reverse(suffix_ts))
 }
 
 fn extract_bak_timestamp(path: &str) -> Option<u64> {
@@ -1051,6 +1052,63 @@ mod tests {
         assert!(
             retained[0].rule.contains("retained"),
             "retained backup rule must say retained"
+        );
+        assert!(
+            retained[0].path.contains("bak-3000"),
+            "highest suffix (newest by timestamp) must be retained, got {:?}",
+            retained[0].path
+        );
+    }
+
+    #[test]
+    fn gc_mtime_overrides_suffix_for_recency() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        let newer_path = edges_dir.join("projAB.jsonl.bak-100");
+        let older_path = edges_dir.join("projAB.jsonl.bak-9999");
+        fs::write(&newer_path, b"x\n").unwrap();
+        fs::write(&older_path, b"x\n").unwrap();
+
+        filetime::set_file_mtime(
+            &newer_path,
+            filetime::FileTime::from_unix_time(2000000000, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &older_path,
+            filetime::FileTime::from_unix_time(1000000000, 0),
+        )
+        .unwrap();
+
+        let mut registered = HashSet::new();
+        registered.insert("projAB".to_string());
+
+        let candidates = plan_gc(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: true,
+                prune_orphans: false,
+                prune_temps: false,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+        )
+        .unwrap();
+
+        let retained: Vec<&GcCandidate> = candidates
+            .iter()
+            .filter(|c| !c.deletable && c.kind == FileKind::Backup)
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert!(
+            retained[0].path.contains("bak-100"),
+            "newer mtime must win over higher suffix, got {:?}",
+            retained[0].path
         );
     }
 
