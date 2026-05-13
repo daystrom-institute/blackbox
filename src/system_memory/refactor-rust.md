@@ -42,7 +42,8 @@ with rollback across primitive-plan file writes if a later required step fails.
 Plan kinds, grouped by intent:
 
 - Syntactic moves / deletes: `extract_rust_items`, `extract_rust_impl_methods`,
-  `lift_rust_inherent_to_free`, `extract_rust_trait`, `move_rust_struct_fields`,
+  `extract_rust_function_region`, `lift_rust_inherent_to_free`,
+  `extract_rust_trait`, `move_rust_struct_fields`,
   `delete_rust_items`, `move_file`,
   `inline_mod_to_file_submodule` (inline `mod foo { ... }` → `foo.rs` + `mod foo;`),
   `extract_rust_items_to_submodule` (compound: scaffold + mod_decl + visibility
@@ -51,8 +52,10 @@ Plan kinds, grouped by intent:
   `move_rust_items_with_callers` (extract_rust_items + cross-file caller-prefix
   rewrite).
 - Caller / accessor rewrites: `update_rust_callers`, `migrate_rust_type_usages`,
-  `add_rust_delegate_field`, `add_rust_router_to_sum`.
-- Module wiring: `add_rust_mod_decl`, `add_rust_use_decl`, `copy_rust_mod_decls`.
+  `migrate_rust_string_field_to_enum`, `add_rust_delegate_field`,
+  `add_rust_router_to_sum`.
+- Module wiring: `add_rust_mod_decl`, `add_rust_use_decl`, `copy_rust_mod_decls`,
+  `rust_minimize_imports` (conservative wildcard-import replacement).
 - Visibility: `rewrite_rust_mod_visibility`, `rewrite_rust_item_visibility`,
   `rewrite_rust_field_visibility`.
 - LSP-backed (rust-analyzer): `rust_lsp_rename` (semantic rename),
@@ -71,7 +74,9 @@ Plan kinds, grouped by intent:
 - Run-loop integration: `rust_compile_fix_round` (classify a `capture=rustc_json`
   step's diagnostics into use-decl / visibility / replace proposals),
   `split_rust_impl_methods_to_submodule` (a `bbox_refactor_run` plan-step macro
-  that expands to method extraction + wiring + cargo-check repair).
+  that expands to method extraction + wiring + cargo-check repair),
+  `migrate_rust_mods_to_lib` (a `bbox_refactor_run` macro for moving selected
+  binary-root `mod` declarations into `src/lib.rs` and validating all bins).
 - Generic primitives (language-agnostic, useful in compound runs):
   `replace_text`, `write_file`, `ensure_toml_table`.
 
@@ -90,6 +95,14 @@ Writable plan kinds:
   `super::...` references one module deeper (`super::super::...`). If the
   parent file still references a moved method after deletion and `visibility`
   was not supplied, the moved method is widened to `pub(super)`.
+- `extract_rust_function_region`: conservative intra-function extraction.
+  Requires exact `old_text`, helper name via `item_names[0]` or `module_name`,
+  and explicit `toml_entries.parameters=["x: Type"]` /
+  `toml_entries.arguments=["x"]`. Optional `toml_entries.return_type="Type"`
+  controls whether the default replacement is expression-like; `new_text`
+  can override the replacement call. Rejects regions containing `return`,
+  `break`, `continue`, or `?` rather than trying to infer complex control
+  flow or borrow behavior.
 - `split_rust_impl_methods_to_submodule`: use inside `bbox_refactor_run`, not
   `bbox_refactor_plan`. Expands to `add_rust_mod_decl` (idempotent via optional
   skip), `extract_rust_impl_methods`, optional `rust_organize_imports` on the
@@ -99,6 +112,22 @@ Writable plan kinds:
   target file stem, `target_prelude` defaults to `use super::*;`, and
   `item_kinds` defaults to `["impl_method"]`. `toml_entries` supports
   `skip_organize_imports=true` and `targeted_tests=["test_name", ...]`.
+- `migrate_rust_mods_to_lib`: use inside `bbox_refactor_run`, not
+  `bbox_refactor_plan`. Inputs: `source` is the binary root (for example
+  `src/main.rs`), `item_names` are module declarations to move, `target`
+  defaults to `src/lib.rs`, and `visibility` defaults to `pub` because binary
+  crates import the package library as an external crate. The expansion copies
+  selected `mod` declarations to the lib target, deletes those declarations
+  from the binary root, rewrites simple bin-root `crate::<module>` references
+  to `<package_crate>::<module>`, checks every Cargo `[[bin]]` target with
+  rustc JSON capture, runs `rust_compile_fix_round`, then runs final
+  `cargo check --bins`. `toml_entries.bin_sources=["src/other.rs"]` adds
+  extra bin roots to the path-rewrite pass.
+- `rewrite_rust_bin_crate_paths`: primitive used by
+  `migrate_rust_mods_to_lib`; rewrites simple `crate::<module>` references and
+  grouped `use crate::{module_a, module_b};` imports when every grouped entry
+  is in `item_names`. Mixed grouped imports are reported in `leftovers` for
+  manual split.
 - `delete_rust_items`: delete named top-level Rust items or named impl methods
   in place. `item_names` is required; use `item_kinds` only to narrow matches.
   Use `item_kinds=["impl_method"]` plus `impl_name` when method names are
@@ -248,6 +277,15 @@ Writable plan kinds:
   the source struct, optional `target` + `delegate_type` so the rewriter can
   consult the delegate struct for Copy-whitelist behavior. Sites it refuses
   to rewrite surface as `unrewriteable` / `overlapping` / `borrow_promotions`.
+- `migrate_rust_string_field_to_enum`: conservative G6 helper for one struct
+  field at a time. `toml_entries.field_name` names the `String` field,
+  `toml_entries.enum_name` or `module_name` names the generated enum, and
+  `toml_entries.variants=[{"name":"Variant","rename":"wire", "aliases":[...]}]`
+  defines serde-compatible variants. The generated enum derives
+  `Serialize`, `Deserialize`, and `schemars::JsonSchema`, includes serde
+  `rename`/`alias` attributes, and provides `as_str()` so existing
+  `field.as_str()` matches keep compiling while follow-up match-arm rewrites
+  are staged.
 - `move_file`: rename one file to another with hash protection. No content
   rewrite, no caller updates — purely a file-system move guarded by the
   refactor envelope (sha256 check, atomic rename, rollback).
@@ -261,6 +299,15 @@ Writable plan kinds:
   crate-wide textual external reference hints, suggested connected clusters,
   and macro-heavy warnings. Use before choosing `item_names` for
   `extract_rust_items_to_submodule`.
+- `rust_minimize_imports`: replace resolvable wildcard imports such as
+  `use super::*;` or `use super::helpers::*;` with explicit local names that
+  are directly referenced by the file. The planner resolves local `self`,
+  `super`, and `crate` module paths, intersects exported top-level names with
+  identifier references, and leaves ambiguous cases in `leftovers` instead of
+  guessing. `toml_entries.allow_wildcards=["crate::prelude::*"]` preserves
+  intentional preludes; `remove_unused_wildcards=true` permits deleting a
+  wildcard where no direct name references were found. Chain
+  `rust_organize_imports` after apply when rust-analyzer is available.
 - `rust_public_api_guard` (analysis-only): score a proposed set of changes
   against the file's public API surface and report severity / touched-item
   delta. `toml_entries={"proposed_changes": [...]}` carries the change set.

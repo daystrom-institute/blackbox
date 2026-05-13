@@ -144,10 +144,8 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
         let re_export_names: Vec<String> = match explicit_use_decl_items {
             Some(names) => {
                 // Validate every requested name is in the move set.
-                let move_set: HashSet<&str> = selected
-                    .iter()
-                    .filter_map(|i| i.name.as_deref())
-                    .collect();
+                let move_set: HashSet<&str> =
+                    selected.iter().filter_map(|i| i.name.as_deref()).collect();
                 for n in &names {
                     if !move_set.contains(n.as_str()) {
                         bail!(

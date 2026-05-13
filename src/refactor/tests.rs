@@ -1271,12 +1271,160 @@ mod tests {
         assert!(kinds.contains(&"add_rust_mod_decl"));
         assert!(kinds.contains(&"extract_rust_impl_methods"));
         assert!(kinds.contains(&"rust_compile_fix_round"));
-        assert!(run_response.steps.iter().any(|step| {
-            step.title.as_deref() == Some("cargo check --message-format=json")
-        }));
-        assert!(run_response.steps.iter().any(|step| {
-            step.title.as_deref() == Some("cargo test run_fanout")
-        }));
+        assert!(
+            run_response
+                .steps
+                .iter()
+                .any(|step| { step.title.as_deref() == Some("cargo check --message-format=json") })
+        );
+        assert!(
+            run_response
+                .steps
+                .iter()
+                .any(|step| { step.title.as_deref() == Some("cargo test run_fanout") })
+        );
+    }
+
+    #[test]
+    fn refactor_run_expands_rust_minimize_imports_with_organize_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(src_dir.join("parent")).unwrap();
+        fs::write(&src_dir.join("parent.rs"), "pub(crate) struct Thing;\n").unwrap();
+        fs::write(
+            src_dir.join("parent").join("child.rs"),
+            "use super::*;\n\nfn run(_thing: Thing) {}\n",
+        )
+        .unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "minimize imports".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "rust_minimize_imports".into(),
+                        source: "src/parent/child.rs".into(),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(run_response.status, "planned");
+        let kinds = run_response
+            .steps
+            .iter()
+            .filter_map(|step| step.kind.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds[0], "rust_minimize_imports");
+        assert!(kinds.contains(&"rust_organize_imports"));
+    }
+
+    #[test]
+    fn rewrite_rust_bin_crate_paths_rewrites_simple_and_grouped_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let main = src_dir.join("main.rs");
+        fs::write(
+            &main,
+            "use crate::{alpha, beta};\nfn run() { crate::alpha::go(); crate::beta::go(); }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_bin_crate_paths".into(),
+            source: path_string(&main),
+            item_names: Some(vec!["alpha".into(), "beta".into()]),
+            project_dir: Some(path_string(dir.path())),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+
+        assert_eq!(plan.kind, "rewrite_rust_bin_crate_paths");
+        let replacements = plan
+            .edits
+            .first()
+            .unwrap()
+            .edits
+            .iter()
+            .map(|edit| edit.replacement.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replacements,
+            vec!["demo_app", "demo_app::alpha", "demo_app::beta"]
+        );
+    }
+
+    #[test]
+    fn refactor_run_expands_migrate_rust_mods_to_lib() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[[bin]]\nname = \"demo\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            src_dir.join("main.rs"),
+            "mod alpha;\nfn run() { crate::alpha::go(); }\n",
+        )
+        .unwrap();
+        fs::write(src_dir.join("lib.rs"), "").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "migrate alpha".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "migrate_rust_mods_to_lib".into(),
+                        source: "src/main.rs".into(),
+                        item_names: Some(vec!["alpha".into()]),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(run_response.status, "planned");
+        let kinds = run_response
+            .steps
+            .iter()
+            .filter_map(|step| step.kind.as_deref())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"copy_rust_mod_decls"));
+        assert!(kinds.contains(&"delete_rust_items"));
+        assert!(kinds.contains(&"rewrite_rust_bin_crate_paths"));
+        assert!(kinds.contains(&"rust_compile_fix_round"));
+        assert!(
+            run_response
+                .steps
+                .iter()
+                .any(|step| { step.title.as_deref() == Some("cargo check --bins") })
+        );
     }
 
     #[test]
@@ -2463,6 +2611,256 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("is inline"));
+    }
+
+    #[test]
+    fn rust_minimize_imports_replaces_super_wildcard_with_used_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(src_dir.join("parent")).unwrap();
+        let parent = src_dir.join("parent.rs");
+        let child = src_dir.join("parent").join("child.rs");
+        fs::write(
+            &parent,
+            "pub(crate) struct Thing;\npub(crate) fn helper() {}\npub(crate) fn unused() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            "use super::*;\n\nfn run() {\n    let _thing = Thing;\n    helper();\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rust_minimize_imports".into(),
+            source: path_string(&child),
+            project_dir: Some(path_string(dir.path())),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+
+        assert_eq!(plan.kind, "rust_minimize_imports");
+        assert_eq!(plan.edits[0].edits.len(), 1);
+        assert_eq!(
+            plan.edits[0].edits[0].replacement,
+            "use super::{Thing, helper};"
+        );
+        assert!(plan.leftovers.is_empty());
+    }
+
+    #[test]
+    fn rust_minimize_imports_resolves_sibling_module_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(src_dir.join("parent")).unwrap();
+        fs::write(&src_dir.join("parent.rs"), "mod helpers;\nmod child;\n").unwrap();
+        fs::write(
+            src_dir.join("parent").join("helpers.rs"),
+            "pub(super) enum Mode { Fast }\npub(super) fn unused() {}\n",
+        )
+        .unwrap();
+        let child = src_dir.join("parent").join("child.rs");
+        fs::write(
+            &child,
+            "use super::helpers::*;\n\nfn run(mode: Mode) {\n    match mode { Mode::Fast => {} }\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rust_minimize_imports".into(),
+            source: path_string(&child),
+            project_dir: Some(path_string(dir.path())),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+
+        assert_eq!(
+            plan.edits[0].edits[0].replacement,
+            "use super::helpers::{Mode};"
+        );
+    }
+
+    #[test]
+    fn rust_minimize_imports_preserves_unproven_unused_wildcard_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(src_dir.join("parent")).unwrap();
+        fs::write(
+            &src_dir.join("parent.rs"),
+            "pub(crate) trait Extension {}\n",
+        )
+        .unwrap();
+        let child = src_dir.join("parent").join("child.rs");
+        fs::write(&child, "use super::*;\n\nfn run() {}\n").unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "rust_minimize_imports".into(),
+            source: path_string(&child),
+            project_dir: Some(path_string(dir.path())),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("no wildcard imports could be minimized")
+        );
+        assert!(
+            err.to_string()
+                .contains("no directly referenced names found")
+        );
+    }
+
+    #[test]
+    fn extract_rust_function_region_inserts_helper_and_replaces_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let selected = "let value = input + 1;\n    println!(\"{value}\");";
+        fs::write(
+            &source,
+            "fn run(input: i32) {\n    let value = input + 1;\n    println!(\"{value}\");\n}\n",
+        )
+        .unwrap();
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "parameters".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("input: i32".to_string())]),
+        );
+        entries.insert(
+            "arguments".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("input".to_string())]),
+        );
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_function_region".into(),
+            source: path_string(&source),
+            old_text: Some(selected.into()),
+            item_names: Some(vec!["print_value".into()]),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+
+        assert_eq!(plan.kind, "extract_rust_function_region");
+        assert_eq!(plan.edits[0].edits[0].replacement, "print_value(input);");
+        assert!(
+            plan.edits[0].edits[1]
+                .replacement
+                .contains("fn print_value(input: i32)")
+        );
+    }
+
+    #[test]
+    fn extract_rust_function_region_rejects_early_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        fs::write(
+            &source,
+            "fn run(input: i32) -> i32 {\n    if input < 0 { return 0; }\n    input\n}\n",
+        )
+        .unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "extract_rust_function_region".into(),
+            source: path_string(&source),
+            old_text: Some("if input < 0 { return 0; }".into()),
+            item_names: Some(vec!["guard".into()]),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("rejects regions containing `return`")
+        );
+    }
+
+    #[test]
+    fn extract_rust_function_region_uses_self_call_inside_impl() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        fs::write(
+            &source,
+            "struct Runner;\nimpl Runner {\n    fn run(&self, input: i32) {\n        println!(\"{}\", input + 1);\n    }\n}\n",
+        )
+        .unwrap();
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "parameters".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("input: i32".to_string())]),
+        );
+        entries.insert(
+            "arguments".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("input".to_string())]),
+        );
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_function_region".into(),
+            source: path_string(&source),
+            old_text: Some("println!(\"{}\", input + 1);".into()),
+            item_names: Some(vec!["print_value".into()]),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+
+        assert_eq!(
+            plan.edits[0].edits[0].replacement,
+            "Self::print_value(input);"
+        );
+    }
+
+    #[test]
+    fn migrate_rust_string_field_to_enum_generates_serde_enum() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("params.rs");
+        fs::write(
+            &source,
+            "use serde::{Deserialize, Serialize};\n\n#[derive(Debug, Deserialize)]\npub struct Params {\n    pub kind: String,\n}\n",
+        )
+        .unwrap();
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "field_name".into(),
+            serde_json::Value::String("kind".into()),
+        );
+        entries.insert(
+            "enum_name".into(),
+            serde_json::Value::String("PlanKind".into()),
+        );
+        entries.insert(
+            "variants".into(),
+            serde_json::json!([
+                {"name": "ExtractRustItems", "rename": "extract_rust_items"},
+                {"name": "DeleteRustItems", "rename": "delete_rust_items", "aliases": ["delete_items"]}
+            ]),
+        );
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "migrate_rust_string_field_to_enum".into(),
+            source: path_string(&source),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
+
+        assert_eq!(plan.kind, "migrate_rust_string_field_to_enum");
+        assert!(
+            plan.edits[0].edits[0]
+                .replacement
+                .contains("pub enum PlanKind")
+        );
+        assert!(
+            plan.edits[0].edits[0]
+                .replacement
+                .contains("alias = \"delete_items\"")
+        );
+        assert_eq!(plan.edits[0].edits[1].replacement, "pub kind: PlanKind,");
     }
 
     #[test]
@@ -4836,7 +5234,11 @@ impl Cache {
     fn rust_top_level_dependency_analysis_warns_on_macro_invocations() {
         let dir = tempfile::tempdir().unwrap();
         let lib = dir.path().join("lib.rs");
-        fs::write(&lib, "fn macro_user() {\n    println!(\"opaque {}\", 1);\n}\n").unwrap();
+        fs::write(
+            &lib,
+            "fn macro_user() {\n    println!(\"opaque {}\", 1);\n}\n",
+        )
+        .unwrap();
 
         let plan_text = plan(&RefactorPlanParams {
             kind: "rust_top_level_dependency_analysis".into(),
@@ -4849,8 +5251,10 @@ impl Cache {
         let warnings = value["top_level_dependency_graph"]["warnings"]
             .as_array()
             .unwrap();
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.as_str().unwrap_or_default().contains("macro_user")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.as_str().unwrap_or_default().contains("macro_user"))
+        );
     }
 }

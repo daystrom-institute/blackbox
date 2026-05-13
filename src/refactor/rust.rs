@@ -1558,11 +1558,14 @@ fn rust_text_contains_identifier(text: &str, needle: &str) -> bool {
     if needle.is_empty() || needle.len() > bytes.len() {
         return false;
     }
-    bytes.windows(needle.len()).enumerate().any(|(idx, window)| {
-        window == needle
-            && rust_identifier_boundary(bytes.get(idx.wrapping_sub(1)).copied())
-            && rust_identifier_boundary(bytes.get(idx + needle.len()).copied())
-    })
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .any(|(idx, window)| {
+            window == needle
+                && rust_identifier_boundary(bytes.get(idx.wrapping_sub(1)).copied())
+                && rust_identifier_boundary(bytes.get(idx + needle.len()).copied())
+        })
 }
 
 fn rust_identifier_boundary(ch: Option<u8>) -> bool {

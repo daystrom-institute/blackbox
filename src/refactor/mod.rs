@@ -17,22 +17,25 @@ mod java;
 use java::*;
 pub(crate) mod plan_slot;
 pub(crate) mod rust_compile_fix;
-pub(crate) mod rust_top_level_deps;
 pub(crate) mod rust_deep;
 pub(crate) mod rust_delegate_field;
 pub(crate) mod rust_error_migrate;
+pub(crate) mod rust_extract_region;
 pub(crate) mod rust_extract_to_submodule;
 pub(crate) mod rust_extract_trait;
 pub(crate) mod rust_inline_mod;
 pub(crate) mod rust_lift_free;
 pub(crate) mod rust_match_strategy;
 pub(crate) mod rust_migrate_types;
+pub(crate) mod rust_minimize_imports;
 pub(crate) mod rust_move_fields;
 pub(crate) mod rust_move_with_callers;
 pub(crate) mod rust_partition;
 pub(crate) mod rust_public_api;
 pub(crate) mod rust_ra_classify_callbacks;
 pub(crate) mod rust_ra_move_item;
+pub(crate) mod rust_string_enum;
+pub(crate) mod rust_top_level_deps;
 pub(crate) mod rust_update_callers;
 pub(crate) mod rust_warning_markers;
 
@@ -1108,6 +1111,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
     match p.kind.as_str() {
         "extract_rust_items" => plan_extract_rust_items(p),
         "extract_rust_impl_methods" => plan_extract_rust_impl_methods(p),
+        "extract_rust_function_region" => rust_extract_region::plan_extract_function_region(p),
         "lift_rust_inherent_to_free" => rust_lift_free::plan_lift_to_free(p),
         "delete_rust_items" => plan_delete_rust_items(p),
         "add_rust_router_to_sum" => plan_add_rust_router_to_sum(p),
@@ -1147,6 +1151,9 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "java_public_api_guard" => plan_java_public_api_guard(p),
         "lombokify_java_class" => plan_lombokify_java_class(p),
         "rewrite_rust_error_type" => rust_error_migrate::plan_rewrite_error_type(p),
+        "migrate_rust_string_field_to_enum" => {
+            rust_string_enum::plan_migrate_string_field_to_enum(p)
+        }
         "migrate_rust_type_usages" => rust_migrate_types::plan_migrate_type_usages(p),
         "extract_rust_trait" => rust_extract_trait::plan_extract_trait(p),
         "rust_match_arm_to_strategy" => rust_match_strategy::plan_match_to_strategy(p),
@@ -1158,14 +1165,99 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "rust_impl_partition_analysis" => plan_rust_impl_partition_analysis(p),
         "rust_top_level_dependency_analysis" => plan_rust_top_level_dependency_analysis(p),
         "rust_public_api_guard" => plan_rust_public_api_guard(p),
+        "rust_minimize_imports" => rust_minimize_imports::plan_minimize_imports(p),
+        "rewrite_rust_bin_crate_paths" => plan_rewrite_rust_bin_crate_paths(p),
         "move_file" => plan_move_file(p),
         "replace_text" => plan_replace_text(p),
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, java_public_api_guard, lombokify_java_class, rewrite_rust_error_type, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_compile_fix_round, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, java_public_api_guard, lombokify_java_class, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
+}
+
+/// G5 support: rewrite simple bin-root `crate::<module>` paths after selected
+/// modules move from a binary crate root to the package library crate.
+fn plan_rewrite_rust_bin_crate_paths(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let source = fs::read_to_string(&source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
+    let module_names = p
+        .item_names
+        .as_deref()
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| anyhow!("item_names is required for rewrite_rust_bin_crate_paths"))?;
+    for name in module_names {
+        validate_rust_identifier(name, "item_names")?;
+    }
+    let crate_name = p
+        .module_name
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| cargo_package_crate_name(p.project_dir.as_deref(), &source_path))?;
+    validate_rust_use_path(&crate_name)?;
+
+    let mut edits = Vec::new();
+    let mut leftovers = Vec::new();
+    for module_name in module_names {
+        let old = format!("crate::{module_name}");
+        let new = format!("{crate_name}::{module_name}");
+        edits.extend(replace_identifier_path_edits(&source, &old, &new));
+    }
+    edits.extend(rewrite_grouped_crate_use_edits(
+        &source,
+        &crate_name,
+        module_names,
+        &mut leftovers,
+    ));
+    edits.sort_by_key(|edit| edit.byte_start);
+    ensure_non_overlapping(&edits).with_context(|| {
+        format!(
+            "overlapping rewrite_rust_bin_crate_paths edits in {}",
+            source_path.display()
+        )
+    })?;
+
+    if edits.is_empty() {
+        bail!(
+            "no crate::<module> references to rewrite in {}",
+            source_path.display()
+        );
+    }
+
+    let plan = RefactorPlan {
+        title: format!(
+            "rewrite bin crate paths in {} to {crate_name}::...",
+            path_string(&source_path)
+        ),
+        kind: "rewrite_rust_bin_crate_paths".to_string(),
+        semantic_status: SemanticStatus::SyntaxOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(source.as_bytes()),
+            edits,
+            new_text: None,
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: Vec::new(),
+        leftovers,
+        captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
+    };
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
 }
 
 /// G1: top-level Rust dependency-cluster analysis.
@@ -2178,12 +2270,179 @@ fn expand_refactor_run_steps(
             RefactorRunStep::Plan { params, optional }
                 if params.kind == "split_rust_impl_methods_to_submodule" =>
             {
-                expanded.extend(expand_split_rust_impl_methods_step(params, *optional, project_dir)?);
+                expanded.extend(expand_split_rust_impl_methods_step(
+                    params,
+                    *optional,
+                    project_dir,
+                )?);
+            }
+            RefactorRunStep::Plan { params, optional }
+                if params.kind == "rust_minimize_imports" =>
+            {
+                expanded.extend(expand_rust_minimize_imports_step(
+                    params,
+                    *optional,
+                    project_dir,
+                )?);
+            }
+            RefactorRunStep::Plan { params, optional }
+                if params.kind == "migrate_rust_mods_to_lib" =>
+            {
+                expanded.extend(expand_migrate_rust_mods_to_lib_step(
+                    params,
+                    *optional,
+                    project_dir,
+                )?);
             }
             _ => expanded.push(step.clone()),
         }
     }
     Ok(expanded)
+}
+
+fn expand_migrate_rust_mods_to_lib_step(
+    params: &RefactorPlanParams,
+    optional: bool,
+    project_dir: &Path,
+) -> Result<Vec<RefactorRunStep>> {
+    let module_names = params
+        .item_names
+        .clone()
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| anyhow!("item_names is required for migrate_rust_mods_to_lib"))?;
+    for name in &module_names {
+        validate_rust_identifier(name, "item_names")?;
+    }
+    let project_dir_arg = path_string(project_dir);
+    let target = params
+        .target
+        .clone()
+        .unwrap_or_else(|| "src/lib.rs".to_string());
+    let visibility = params
+        .visibility
+        .clone()
+        .or_else(|| Some("pub".to_string()));
+    let crate_name =
+        cargo_package_crate_name(Some(&project_dir_arg), &project_dir.join(&params.source))?;
+    let mut compile_fix_entries = BTreeMap::new();
+    compile_fix_entries.insert(
+        "diagnostics_ref".to_string(),
+        serde_json::Value::String("last".to_string()),
+    );
+
+    let mut steps = vec![
+        RefactorRunStep::Plan {
+            params: RefactorPlanParams {
+                kind: "copy_rust_mod_decls".to_string(),
+                source: params.source.clone(),
+                target: Some(target),
+                item_names: Some(module_names.clone()),
+                visibility,
+                project_dir: Some(project_dir_arg.clone()),
+                ..Default::default()
+            },
+            optional,
+        },
+        RefactorRunStep::Plan {
+            params: RefactorPlanParams {
+                kind: "delete_rust_items".to_string(),
+                source: params.source.clone(),
+                item_names: Some(module_names.clone()),
+                item_kinds: Some(vec!["mod_item".to_string()]),
+                project_dir: Some(project_dir_arg.clone()),
+                ..Default::default()
+            },
+            optional,
+        },
+    ];
+
+    let mut bin_sources = cargo_bin_sources(project_dir)?;
+    for extra in toml_str_array(&params.toml_entries, "bin_sources") {
+        if !bin_sources.contains(&extra) {
+            bin_sources.push(extra);
+        }
+    }
+    if !bin_sources.contains(&params.source) {
+        bin_sources.push(params.source.clone());
+    }
+    bin_sources.sort();
+    bin_sources.dedup();
+    for bin_source in bin_sources {
+        steps.push(RefactorRunStep::Plan {
+            params: RefactorPlanParams {
+                kind: "rewrite_rust_bin_crate_paths".to_string(),
+                source: bin_source,
+                item_names: Some(module_names.clone()),
+                module_name: Some(crate_name.clone()),
+                project_dir: Some(project_dir_arg.clone()),
+                ..Default::default()
+            },
+            optional: true,
+        });
+    }
+
+    steps.extend([
+        RefactorRunStep::Command {
+            command: "cargo".to_string(),
+            args: vec![
+                "check".to_string(),
+                "--bins".to_string(),
+                "--message-format=json".to_string(),
+            ],
+            cwd: None,
+            touches: Vec::new(),
+            required: None,
+            capture: Some(CaptureSpec::RustcJson),
+            on_failure: Some(OnFailure::ContinueForRepair),
+        },
+        RefactorRunStep::Plan {
+            params: RefactorPlanParams {
+                kind: "rust_compile_fix_round".to_string(),
+                source: String::new(),
+                project_dir: Some(project_dir_arg),
+                toml_entries: Some(compile_fix_entries),
+                ..Default::default()
+            },
+            optional: true,
+        },
+        RefactorRunStep::Command {
+            command: "cargo".to_string(),
+            args: vec!["check".to_string(), "--bins".to_string()],
+            cwd: None,
+            touches: Vec::new(),
+            required: Some(true),
+            capture: None,
+            on_failure: None,
+        },
+    ]);
+    Ok(steps)
+}
+
+fn expand_rust_minimize_imports_step(
+    params: &RefactorPlanParams,
+    optional: bool,
+    project_dir: &Path,
+) -> Result<Vec<RefactorRunStep>> {
+    let project_dir_arg = path_string(project_dir);
+    let mut minimize = params.clone();
+    minimize.project_dir = Some(project_dir_arg.clone());
+
+    let mut steps = vec![RefactorRunStep::Plan {
+        params: minimize,
+        optional,
+    }];
+    if !toml_bool(&params.toml_entries, "skip_organize_imports") {
+        steps.push(RefactorRunStep::Plan {
+            params: RefactorPlanParams {
+                kind: "rust_organize_imports".to_string(),
+                source: params.source.clone(),
+                project_dir: Some(project_dir_arg),
+                ..Default::default()
+            },
+            optional: true,
+        });
+    }
+    Ok(steps)
 }
 
 fn expand_split_rust_impl_methods_step(
@@ -2221,7 +2480,9 @@ fn expand_split_rust_impl_methods_step(
         project_dir: Some(project_dir_arg.clone()),
         ..Default::default()
     };
-    if params.visibility.as_deref() == Some("pub") || params.visibility.as_deref() == Some("pub(crate)") {
+    if params.visibility.as_deref() == Some("pub")
+        || params.visibility.as_deref() == Some("pub(crate)")
+    {
         add_mod.visibility = params.visibility.clone();
     }
 
@@ -2231,7 +2492,11 @@ fn expand_split_rust_impl_methods_step(
     if extract.item_kinds.as_ref().is_none_or(Vec::is_empty) {
         extract.item_kinds = Some(vec!["impl_method".to_string()]);
     }
-    if extract.target_prelude.as_ref().is_none_or(|text| text.trim().is_empty()) {
+    if extract
+        .target_prelude
+        .as_ref()
+        .is_none_or(|text| text.trim().is_empty())
+    {
         extract.target_prelude = Some("use super::*;".to_string());
     }
 
@@ -2317,10 +2582,7 @@ fn toml_bool(entries: &Option<BTreeMap<String, serde_json::Value>>, key: &str) -
         .unwrap_or(false)
 }
 
-fn toml_str_array(
-    entries: &Option<BTreeMap<String, serde_json::Value>>,
-    key: &str,
-) -> Vec<String> {
+fn toml_str_array(entries: &Option<BTreeMap<String, serde_json::Value>>, key: &str) -> Vec<String> {
     entries
         .as_ref()
         .and_then(|entries| entries.get(key))
@@ -2332,6 +2594,127 @@ fn toml_str_array(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn cargo_package_crate_name(project_dir: Option<&str>, source_path: &Path) -> Result<String> {
+    let project_dir = project_dir
+        .map(PathBuf::from)
+        .or_else(|| find_project_dir_from_source(source_path))
+        .ok_or_else(|| anyhow!("project_dir is required to resolve Cargo package name"))?;
+    let cargo_toml = project_dir.join("Cargo.toml");
+    let text = fs::read_to_string(&cargo_toml)
+        .with_context(|| format!("reading {}", cargo_toml.display()))?;
+    let value: toml::Value = text
+        .parse()
+        .with_context(|| format!("parsing {}", cargo_toml.display()))?;
+    let package_name = value
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(|name| name.as_str())
+        .ok_or_else(|| anyhow!("Cargo.toml is missing package.name"))?;
+    Ok(package_name.replace('-', "_"))
+}
+
+fn cargo_bin_sources(project_dir: &Path) -> Result<Vec<String>> {
+    let cargo_toml = project_dir.join("Cargo.toml");
+    let text = fs::read_to_string(&cargo_toml)
+        .with_context(|| format!("reading {}", cargo_toml.display()))?;
+    let value: toml::Value = text
+        .parse()
+        .with_context(|| format!("parsing {}", cargo_toml.display()))?;
+    let mut sources = Vec::new();
+    if let Some(bins) = value.get("bin").and_then(|bins| bins.as_array()) {
+        for bin in bins {
+            if let Some(path) = bin.get("path").and_then(|path| path.as_str()) {
+                sources.push(path.to_string());
+            }
+        }
+    }
+    if sources.is_empty() && project_dir.join("src/main.rs").exists() {
+        sources.push("src/main.rs".to_string());
+    }
+    Ok(sources)
+}
+
+fn find_project_dir_from_source(source_path: &Path) -> Option<PathBuf> {
+    let mut dir = source_path.parent()?;
+    loop {
+        if dir.file_name().and_then(|name| name.to_str()) == Some("src") {
+            return dir.parent().map(Path::to_path_buf);
+        }
+        dir = dir.parent()?;
+    }
+}
+
+fn replace_identifier_path_edits(source: &str, old: &str, new: &str) -> Vec<TextEdit> {
+    let mut edits = Vec::new();
+    let mut start = 0;
+    while let Some(relative) = source[start..].find(old) {
+        let byte_start = start + relative;
+        let byte_end = byte_start + old.len();
+        if rust_path_boundary(source.as_bytes().get(byte_start.wrapping_sub(1)).copied())
+            && rust_path_boundary(source.as_bytes().get(byte_end).copied())
+        {
+            edits.push(TextEdit {
+                byte_start,
+                byte_end,
+                replacement: new.to_string(),
+            });
+        }
+        start = byte_end;
+    }
+    edits
+}
+
+fn rewrite_grouped_crate_use_edits(
+    source: &str,
+    crate_name: &str,
+    module_names: &[String],
+    leftovers: &mut Vec<String>,
+) -> Vec<TextEdit> {
+    let module_set = module_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut edits = Vec::new();
+    for line_start in source.match_indices("use crate::{").map(|(idx, _)| idx) {
+        let Some(line_end_rel) = source[line_start..].find(';') else {
+            continue;
+        };
+        let line_end = line_start + line_end_rel + 1;
+        let line = &source[line_start..line_end];
+        let Some(open) = line.find('{') else {
+            continue;
+        };
+        let Some(close) = line.rfind('}') else {
+            continue;
+        };
+        let entries = line[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .collect::<Vec<_>>();
+        if entries.is_empty() || !entries.iter().any(|entry| module_set.contains(*entry)) {
+            continue;
+        }
+        if entries.iter().all(|entry| module_set.contains(*entry)) {
+            edits.push(TextEdit {
+                byte_start: line_start + "use ".len(),
+                byte_end: line_start + "use crate".len(),
+                replacement: crate_name.to_string(),
+            });
+        } else {
+            leftovers.push(format!(
+                "left mixed grouped import `{}` unchanged",
+                line.trim()
+            ));
+        }
+    }
+    edits
+}
+
+fn rust_path_boundary(ch: Option<u8>) -> bool {
+    !matches!(ch, Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'))
 }
 
 fn append_report(

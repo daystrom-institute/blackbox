@@ -14,6 +14,7 @@
 //! Explicit `target` overrides the derivation.
 
 use super::*;
+use regex::Regex;
 use std::path::PathBuf;
 
 pub(crate) fn plan_inline_mod_to_file_submodule(p: &RefactorPlanParams) -> Result<String> {
@@ -72,13 +73,8 @@ pub(crate) fn plan_inline_mod_to_file_submodule(p: &RefactorPlanParams) -> Resul
         .get(block_start + 1..block_end - 1)
         .ok_or_else(|| anyhow!("invalid body range for mod `{mod_name}`"))?;
     let de_indented = de_indent_body(body_text);
-    let target_content = if de_indented.ends_with('\n') {
-        de_indented
-    } else {
-        format!("{de_indented}\n")
-    };
 
-    // Decide target path. Refuse to overwrite a non-empty file.
+    // Decide target path early so we can compute depth for fixture repair.
     let target_path = match p.target.as_deref() {
         Some(t) => resolve_path(p.project_dir.as_deref(), t)?,
         None => derive_submodule_target_path(&source_path, mod_name)?,
@@ -86,6 +82,26 @@ pub(crate) fn plan_inline_mod_to_file_submodule(p: &RefactorPlanParams) -> Resul
     if source_path == target_path {
         bail!("source and target must be different files");
     }
+
+    // When extracting a #[cfg(test)] module to a deeper path, repair
+    // relative fixture paths in include_str!/include_bytes!/include!.
+    let de_indented = {
+        let is_test_mod = has_cfg_test_attr(mod_node, &parsed.source);
+        let extra_depth = compute_depth_increase(&source_path, &target_path);
+        if is_test_mod && extra_depth > 0 {
+            repair_include_paths(&de_indented, extra_depth)?
+        } else {
+            de_indented
+        }
+    };
+
+    let target_content = if de_indented.ends_with('\n') {
+        de_indented
+    } else {
+        format!("{de_indented}\n")
+    };
+
+    // Refuse to overwrite a non-empty file.
     let target_source = if target_path.exists() {
         let existing = fs::read_to_string(&target_path)
             .with_context(|| format!("failed to read {}", target_path.display()))?;
@@ -235,6 +251,82 @@ fn trim_trailing_ws_end(bytes: &[u8], end: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+fn has_cfg_test_attr(mod_node: Node, source: &str) -> bool {
+    let mut node = mod_node;
+    loop {
+        match node.prev_named_sibling() {
+            Some(prev) if prev.kind() == "attribute_item" => {
+                let text = &source[prev.start_byte()..prev.end_byte()];
+                if is_cfg_test_attr(text) {
+                    return true;
+                }
+                node = prev;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn is_cfg_test_attr(text: &str) -> bool {
+    let re = Regex::new(r#"cfg\s*\([^)]*\btest\b"#).unwrap();
+    re.is_match(text)
+}
+
+fn compute_depth_increase(source_path: &Path, target_path: &Path) -> usize {
+    let source_dir = match source_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => return 0,
+    };
+    let target_dir = match target_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => return 0,
+    };
+    let source_str = source_dir.to_string_lossy();
+    let target_str = target_dir.to_string_lossy();
+    if target_str == source_str || !target_str.starts_with(source_str.as_ref()) {
+        return 0;
+    }
+    let rest = &target_str[source_str.len()..];
+    rest.trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .count()
+}
+
+fn repair_include_paths(body: &str, extra_depth: usize) -> Result<String> {
+    if extra_depth == 0 {
+        return Ok(body.to_string());
+    }
+    let prefix = "../".repeat(extra_depth);
+    let simple_re =
+        Regex::new(r#"((?:include_str|include_bytes|include)!)\s*\(\s*"([^"]*)"\s*\)"#)?;
+    let any_re = Regex::new(r#"(?:include_str|include_bytes|include)!\s*\(\s*[^"]*"#)?;
+    let simple_count = simple_re.find_iter(body).count();
+    let any_count = any_re.find_iter(body).count();
+    if any_count > simple_count {
+        bail!(
+            "found include_str!/include_bytes!/include! with non-string-literal arguments; \
+             cannot safely repair fixture paths when moving module deeper"
+        );
+    }
+    if simple_count == 0 {
+        return Ok(body.to_string());
+    }
+    let result = simple_re.replace_all(body, |caps: &regex::Captures| {
+        let path = caps.get(2).unwrap().as_str();
+        if path.is_empty() || path.starts_with('/') || path.starts_with('\\') {
+            return caps.get(0).unwrap().as_str().to_string();
+        }
+        let new_path = format!("{prefix}{path}");
+        let full = caps.get(0).unwrap();
+        let path_group = caps.get(2).unwrap();
+        let before = &body[full.start()..path_group.start()];
+        let after = &body[path_group.end()..full.end()];
+        format!("{before}{new_path}{after}")
+    });
+    Ok(result.into_owned())
 }
 
 #[cfg(test)]
@@ -459,6 +551,165 @@ mod tests {
         assert!(
             err.contains("not found"),
             "expected not-found error, got: {err}"
+        );
+    }
+
+    // G7: include_str! paths are rebased when a #[cfg(test)] mod moves deeper.
+    #[test]
+    fn repairs_include_str_when_test_mod_moves_deeper() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src/module");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("engine.rs");
+        fs::write(
+            &src,
+            "pub fn run() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn it_works() {\n        let data = include_str!(\"../fixtures/test_data.json\");\n    }\n}\n",
+        )
+        .unwrap();
+
+        let plan_json = plan_inline_mod_to_file_submodule(&make_params(&src, "tests", None))
+            .expect("plan should succeed");
+        let target_after = apply_to(&plan_json, 1);
+        assert!(
+            target_after.contains("include_str!(\"../../fixtures/test_data.json\")"),
+            "fixture path should gain one ../ when moving one level deeper:\n{target_after}"
+        );
+    }
+
+    // G7: include_bytes! and include! are also repaired.
+    #[test]
+    fn repairs_include_bytes_and_include() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src/module");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("engine.rs");
+        fs::write(
+            &src,
+            "#[cfg(test)]\nmod tests {\n    let a = include_bytes!(\"data.bin\");\n    let b = include!(\"helpers.rs\");\n}\n",
+        )
+        .unwrap();
+
+        let plan_json = plan_inline_mod_to_file_submodule(&make_params(&src, "tests", None))
+            .expect("plan should succeed");
+        let target_after = apply_to(&plan_json, 1);
+        assert!(
+            target_after.contains("include_bytes!(\"../data.bin\")"),
+            "include_bytes path should gain ../:\n{target_after}"
+        );
+        assert!(
+            target_after.contains("include!(\"../helpers.rs\")"),
+            "include path should gain ../:\n{target_after}"
+        );
+    }
+
+    // G7: no path repair when mod.rs / lib.rs (same-level target).
+    #[test]
+    fn no_path_repair_at_same_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("mod.rs");
+        fs::write(
+            &src,
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() {\n        let data = include_str!(\"fixtures/test_data.json\");\n    }\n}\n",
+        )
+        .unwrap();
+
+        let plan_json = plan_inline_mod_to_file_submodule(&make_params(&src, "tests", None))
+            .expect("plan should succeed");
+        let target_after = apply_to(&plan_json, 1);
+        assert!(
+            target_after.contains("include_str!(\"fixtures/test_data.json\")"),
+            "fixture path should NOT change at same level:\n{target_after}"
+        );
+    }
+
+    // G7: reject when include macro has non-string-literal argument.
+    #[test]
+    fn rejects_non_literal_include_when_deeper() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src/module");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("engine.rs");
+        fs::write(
+            &src,
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() {\n        let data = include_str!(concat!(env!(\"OUT_DIR\"), \"/test.json\"));\n    }\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_inline_mod_to_file_submodule(&make_params(&src, "tests", None))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-string-literal"),
+            "expected rejection for non-literal include, got: {err}"
+        );
+    }
+
+    // G7: non-test modules are not path-repaired even when moving deeper.
+    #[test]
+    fn no_repair_for_non_test_mod() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src/module");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("engine.rs");
+        fs::write(
+            &src,
+            "mod inner {\n    const DATA: &str = include_str!(\"../data.txt\");\n}\n",
+        )
+        .unwrap();
+
+        let plan_json = plan_inline_mod_to_file_submodule(&make_params(&src, "inner", None))
+            .expect("plan should succeed");
+        let target_after = apply_to(&plan_json, 1);
+        assert!(
+            target_after.contains("include_str!(\"../data.txt\")"),
+            "non-test mod paths should NOT be repaired:\n{target_after}"
+        );
+    }
+
+    // G7: absolute paths in include_str! are left alone.
+    #[test]
+    fn absolute_paths_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src/module");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("engine.rs");
+        fs::write(
+            &src,
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() {\n        let data = include_str!(\"/absolute/path.json\");\n    }\n}\n",
+        )
+        .unwrap();
+
+        let plan_json = plan_inline_mod_to_file_submodule(&make_params(&src, "tests", None))
+            .expect("plan should succeed");
+        let target_after = apply_to(&plan_json, 1);
+        assert!(
+            target_after.contains("include_str!(\"/absolute/path.json\")"),
+            "absolute paths should NOT be rebased:\n{target_after}"
+        );
+    }
+
+    // G7: depth_increase unit tests.
+    #[test]
+    fn depth_increase_computation() {
+        assert_eq!(
+            compute_depth_increase(Path::new("/src/foo.rs"), Path::new("/src/tests.rs")),
+            0,
+            "same level → 0"
+        );
+        assert_eq!(
+            compute_depth_increase(Path::new("/src/foo.rs"), Path::new("/src/foo/tests.rs")),
+            1,
+            "one level deeper → 1"
+        );
+        assert_eq!(
+            compute_depth_increase(Path::new("/src/foo.rs"), Path::new("/src/foo/bar/tests.rs")),
+            2,
+            "two levels deeper → 2"
+        );
+        assert_eq!(
+            compute_depth_increase(Path::new("/src/a/b.rs"), Path::new("/src/tests.rs")),
+            0,
+            "shallower → 0"
         );
     }
 }
