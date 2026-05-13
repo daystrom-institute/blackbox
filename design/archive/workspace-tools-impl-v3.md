@@ -1,7 +1,7 @@
 # Workspace Tools - Implementation Plan
 
 Date: 2026-05-12
-Companion to: `design/partial/workspace-tools.md`.
+Companion to: `design/archive/workspace-tools-v3.md`.
 Namespace: all new workspace tools use the `work_*` prefix, not `bbox_*`.
 
 The work splits into three tracks:

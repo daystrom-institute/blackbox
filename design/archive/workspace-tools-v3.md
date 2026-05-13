@@ -1,8 +1,8 @@
 # Workspace Tools - enriched MCP tools, instrumentation, opt-in coercion
 
 Date: 2026-05-12
-Status: partial implementation - v3, reconciled with the current MCP registry and filter stack.
-Companion implementation plan: `design/partial/workspace-tools-impl.md`.
+Status: fully implemented — archived from design/partial/.
+Companion implementation plan: `design/archive/workspace-tools-impl-v3.md`.
 Predecessor archived at `design/archive/workspace-tools.md`.
 
 ## 1. Problem
