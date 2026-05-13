@@ -499,7 +499,13 @@ impl EdgeIndex {
         seen: &mut HashSet<Edge>,
     ) {
         let managed_derived_dir = managed_derived_edges_dir(edges_dir);
-        self.project_sidecar_edges_in_dir(edges_dir, registered_project_ids, seen);
+        let projects_with_managed = scan_managed_derived_project_ids(&managed_derived_dir);
+        self.project_sidecar_edges_in_dir(
+            edges_dir,
+            registered_project_ids,
+            seen,
+            &projects_with_managed,
+        );
         let Ok(entries) = fs::read_dir(&managed_derived_dir) else {
             return;
         };
@@ -508,7 +514,7 @@ impl EdgeIndex {
             if !path.is_dir() {
                 continue;
             }
-            self.project_sidecar_edges_in_dir(&path, registered_project_ids, seen);
+            self.project_sidecar_edges_in_dir(&path, registered_project_ids, seen, &HashSet::new());
         }
     }
 
@@ -517,6 +523,7 @@ impl EdgeIndex {
         edges_dir: &Path,
         registered_project_ids: Option<&HashSet<String>>,
         seen: &mut HashSet<Edge>,
+        skip_derived_for: &HashSet<String>,
     ) {
         let Ok(entries) = fs::read_dir(edges_dir) else {
             return;
@@ -531,11 +538,18 @@ impl EdgeIndex {
                 tracing::info!(path = %path.display(), "skipping unregistered project edge sidecar");
                 continue;
             }
-            self.project_sidecar_edges_file(&path, seen);
+            let skip_derived =
+                sidecar_file_stem(&path).is_some_and(|stem| skip_derived_for.contains(stem));
+            self.project_sidecar_edges_file(&path, seen, skip_derived);
         }
     }
 
-    fn project_sidecar_edges_file(&mut self, path: &Path, seen: &mut HashSet<Edge>) {
+    fn project_sidecar_edges_file(
+        &mut self,
+        path: &Path,
+        seen: &mut HashSet<Edge>,
+        skip_derived: bool,
+    ) {
         let Ok(file) = fs::File::open(path) else {
             return;
         };
@@ -545,6 +559,9 @@ impl EdgeIndex {
                 continue;
             }
             match serde_json::from_str::<Edge>(&line) {
+                Ok(edge) if skip_derived && edge.provenance == EdgeProvenance::Derived => {
+                    continue;
+                }
                 Ok(edge) => {
                     self.insert_sidecar_edge(edge, seen);
                 }
@@ -580,6 +597,36 @@ pub(crate) fn edges_dir_from_projects_path(projects_path: &Path) -> PathBuf {
 
 fn managed_derived_edges_dir(edges_dir: &Path) -> PathBuf {
     edges_dir.join("derived")
+}
+
+fn sidecar_file_stem(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|s| s.to_str())
+}
+
+fn scan_managed_derived_project_ids(managed_dir: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(namespace_entries) = fs::read_dir(managed_dir) else {
+        return ids;
+    };
+    for ns_entry in namespace_entries.filter_map(Result::ok) {
+        let ns_path = ns_entry.path();
+        if !ns_path.is_dir() {
+            continue;
+        }
+        let Ok(project_entries) = fs::read_dir(&ns_path) else {
+            continue;
+        };
+        for proj_entry in project_entries.filter_map(Result::ok) {
+            let proj_path = proj_entry.path();
+            if proj_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(stem) = sidecar_file_stem(&proj_path) {
+                ids.insert(stem.to_string());
+            }
+        }
+    }
+    ids
 }
 
 fn sidecar_project_is_registered(
@@ -1379,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_project_edges_do_not_hide_legacy_until_compaction() {
+    fn managed_derived_sidecar_overrides_legacy_derived_edges() {
         let dir = tempfile::tempdir().unwrap();
         let source = EntityRef::ProjectFile {
             project_id: "proj1234".into(),
@@ -1424,13 +1471,163 @@ mod tests {
             index
                 .forward_edges(&source)
                 .iter()
-                .any(|edge| edge.target == managed_target)
+                .any(|edge| edge.target == managed_target),
+            "managed derived edge should be loaded"
         );
+        assert!(
+            !index
+                .forward_edges(&source)
+                .iter()
+                .any(|edge| edge.target == legacy_target),
+            "legacy derived edge should be skipped when managed derived sidecar exists"
+        );
+    }
+
+    #[test]
+    fn legacy_explicit_edges_preserved_when_managed_derived_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = EntityRef::Knowledge { id: "k-abc".into() };
+        let explicit_target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "b".repeat(64),
+            occurrence_idx: 0,
+        };
+        let derived_target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "c".repeat(64),
+            occurrence_idx: 1,
+        };
+        let legacy_explicit = Edge {
+            source: source.clone(),
+            kind: "DESCRIBES".into(),
+            target: explicit_target.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: Default::default(),
+        };
+        let legacy_derived = crate::chunker::Edge {
+            source: EntityRef::ProjectFile {
+                project_id: "proj1234".into(),
+                rel_path_hash: "pathhash".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            kind: "NEXT_SECTION".into(),
+            target: derived_target,
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        append_edges(dir.path(), "proj1234", &[legacy_explicit]).unwrap();
+        append_project_edges(dir.path(), "proj1234", &[legacy_derived]).unwrap();
+
+        let managed = crate::chunker::Edge {
+            source: EntityRef::ProjectFile {
+                project_id: "proj1234".into(),
+                rel_path_hash: "pathhash".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            kind: "NEXT_SECTION".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "proj1234".into(),
+                rel_path_hash: "other".into(),
+                chunk_hash: "d".repeat(64),
+                occurrence_idx: 2,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        replace_project_edges(dir.path(), "project", "proj1234", &[managed]).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), None, &mut seen);
+
         assert!(
             index
                 .forward_edges(&source)
                 .iter()
-                .any(|edge| edge.target == legacy_target)
+                .any(|e| e.target == explicit_target),
+            "explicit edge from legacy sidecar must be preserved"
+        );
+        assert_eq!(
+            index
+                .forward_edges(&EntityRef::ProjectFile {
+                    project_id: "proj1234".into(),
+                    rel_path_hash: "pathhash".into(),
+                    chunk_hash: "a".repeat(64),
+                    occurrence_idx: 0,
+                })
+                .len(),
+            1,
+            "only managed derived edge should load, not legacy derived"
+        );
+    }
+
+    #[test]
+    fn legacy_derived_edges_loaded_when_no_managed_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let target = EntityRef::ProjectFile {
+            project_id: "proj1234".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "b".repeat(64),
+            occurrence_idx: 1,
+        };
+        let derived = crate::chunker::Edge {
+            source: source.clone(),
+            kind: "NEXT_SECTION".into(),
+            target: target.clone(),
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        append_project_edges(dir.path(), "proj1234", &[derived]).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), None, &mut seen);
+
+        assert!(
+            index
+                .forward_edges(&source)
+                .iter()
+                .any(|e| e.target == target),
+            "legacy derived edge must load when no managed sidecar exists"
+        );
+    }
+
+    #[test]
+    fn backup_and_temp_files_not_loaded_by_sidecar_loader() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        let backup_path = edges_dir.join("proj1234.jsonl.bak-20260513");
+        let temp_path = edges_dir.join("proj1234.jsonl.compact-12345");
+        let mut f = fs::File::create(&backup_path).unwrap();
+        writeln!(f, "not a real edge but should not be read").unwrap();
+        drop(f);
+        let mut f = fs::File::create(&temp_path).unwrap();
+        writeln!(f, "not a real edge but should not be read").unwrap();
+        drop(f);
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges_in_dir(&edges_dir, None, &mut seen, &HashSet::new());
+
+        assert_eq!(
+            index.edge_count(),
+            0,
+            "backup and temp files must not be loaded"
         );
     }
 
