@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
@@ -161,17 +161,13 @@ impl SupervisionState {
                 self.recent_hashes.pop_front();
             }
 
-            let count = self
-                .recent_hashes
-                .iter()
-                .filter(|obs| obs.hash == hashed)
-                .count() as u64;
+            let count = self.trailing_loop_count(&hashed);
 
             if count == config().loop_amber_count {
                 self.push_alert(
                     AlertKind::Loop,
                     AlertSeverity::Amber,
-                    format!("same tool/input hash observed {count} times in the recent window",),
+                    format!("same tool/input hash observed {count} times consecutively",),
                     Some(count as f64),
                     Some(hashed.clone()),
                     Some(tool_name.clone()),
@@ -183,7 +179,7 @@ impl SupervisionState {
                 self.push_alert(
                     AlertKind::Loop,
                     AlertSeverity::Red,
-                    format!("same tool/input hash observed {count} times in the recent window",),
+                    format!("same tool/input hash observed {count} times consecutively",),
                     Some(count as f64),
                     Some(hashed),
                     Some(tool_name),
@@ -370,33 +366,55 @@ impl SupervisionState {
     }
 
     fn max_loop_count(&self) -> u64 {
-        let mut by_hash: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut max = 0_u64;
+        let mut current_hash: Option<&str> = None;
+        let mut current_count = 0_u64;
+
         for obs in &self.recent_hashes {
-            let count = by_hash.entry(&obs.hash).or_insert(0);
-            *count = count.saturating_add(1);
+            let hash = obs.hash.as_str();
+            if current_hash == Some(hash) {
+                current_count = current_count.saturating_add(1);
+            } else {
+                current_hash = Some(hash);
+                current_count = 1;
+            }
+            max = max.max(current_count);
         }
-        by_hash.values().copied().max().unwrap_or(0)
+
+        max
     }
 
     fn loop_hash_max_tool(&self) -> Option<String> {
-        let mut by_hash: BTreeMap<&str, u64> = BTreeMap::new();
-        let mut hash_to_tool: BTreeMap<&str, String> = BTreeMap::new();
+        let mut best_tool = None;
+        let mut best_count = 0_u64;
+        let mut current_hash: Option<&str> = None;
+        let mut current_tool: Option<String> = None;
+        let mut current_count = 0_u64;
+
         for obs in &self.recent_hashes {
-            let count = by_hash.entry(&obs.hash).or_insert(0);
-            *count = count.saturating_add(1);
-            if let Some(tool) = &obs.tool_name {
-                hash_to_tool.insert(&obs.hash, tool.clone());
+            let hash = obs.hash.as_str();
+            if current_hash == Some(hash) {
+                current_count = current_count.saturating_add(1);
+            } else {
+                current_hash = Some(hash);
+                current_tool = obs.tool_name.clone();
+                current_count = 1;
+            }
+            if current_count > best_count {
+                best_count = current_count;
+                best_tool = current_tool.clone();
             }
         }
 
-        let mut best: Option<(&str, u64)> = None;
-        for (k, v) in by_hash {
-            if best.is_none_or(|(_, c)| v > c) {
-                best = Some((k, v));
-            }
-        }
+        best_tool
+    }
 
-        best.and_then(|(hash, _)| hash_to_tool.get(hash).cloned())
+    fn trailing_loop_count(&self, hash: &str) -> u64 {
+        self.recent_hashes
+            .iter()
+            .rev()
+            .take_while(|obs| obs.hash == hash)
+            .count() as u64
     }
 
     fn compactions_within_window(&self, now_ms: u64) -> u64 {
@@ -619,7 +637,10 @@ fn extract_tool_calls(event: &Value) -> Vec<(String, String)> {
         }
     }
 
-    out
+    let mut seen = BTreeSet::new();
+    out.into_iter()
+        .filter(|call| seen.insert(call.clone()))
+        .collect()
 }
 
 fn has_compaction_marker(event: &Value) -> bool {
@@ -729,6 +750,58 @@ mod tests {
         assert_eq!(amber, 1);
         assert_eq!(red, 1);
         assert_eq!(state.max_loop_count(), 6);
+    }
+
+    #[test]
+    fn interleaved_repeated_tool_events_do_not_emit_loop_alerts() {
+        let mut state = SupervisionState::default();
+        let edit = tool_call_event();
+        let read = serde_json::json!({
+            "tool_use": {
+                "name": "Read",
+                "input": {
+                    "file": "a.rs"
+                }
+            }
+        });
+
+        for idx in 0..6 {
+            state.observe_event(&edit, &sink_without_usage(), 1_000 + idx * 20);
+            state.observe_event(&read, &sink_without_usage(), 1_010 + idx * 20);
+        }
+
+        assert!(
+            state
+                .alerts
+                .iter()
+                .all(|alert| !matches!(alert.kind, AlertKind::Loop)),
+            "interleaved repeated calls should not be treated as a loop: {:?}",
+            state.alerts
+        );
+        assert_eq!(state.max_loop_count(), 1);
+    }
+
+    #[test]
+    fn duplicate_tool_shape_in_one_event_counts_once() {
+        let mut state = SupervisionState::default();
+        let event = serde_json::json!({
+            "type": "tool_use",
+            "name": "Edit",
+            "input": {
+                "file": "a.rs"
+            },
+            "tool_use": {
+                "name": "Edit",
+                "input": {
+                    "file": "a.rs"
+                }
+            }
+        });
+
+        state.observe_event(&event, &sink_without_usage(), 1_000);
+
+        assert_eq!(state.recent_hashes.len(), 1);
+        assert_eq!(state.max_loop_count(), 1);
     }
 
     #[test]
