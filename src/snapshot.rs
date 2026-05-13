@@ -58,8 +58,11 @@ pub fn write_snapshot_files(
     files: &[(&str, &[Edge])],
 ) -> Result<()> {
     let snap_dir = snapshot_dir(edges_dir, project_id, snapshot_id);
-    let tmp_dir = snap_dir.with_extension("tmp");
+    let tmp_dir = snap_dir.with_extension("write-tmp");
 
+    if tmp_dir.is_dir() {
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
     fs::create_dir_all(&tmp_dir)?;
     for (filename, edges) in files {
         let path = tmp_dir.join(*filename);
@@ -77,22 +80,34 @@ pub fn write_snapshot_files(
     Ok(())
 }
 
-pub fn write_dirty_overlay(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
-    for e in edges {
-        if e.provenance != EdgeProvenance::Derived {
-            anyhow::bail!(
-                "dirty overlay rejected non-Derived edge: kind={} provenance={:?} source={:?}",
-                e.kind,
-                e.provenance,
-                e.source,
-            );
+pub fn write_dirty_overlay(
+    edges_dir: &Path,
+    project_id: &str,
+    files: &[(&str, &[Edge])],
+) -> Result<()> {
+    for (filename, edges) in files {
+        for e in *edges {
+            if e.provenance != EdgeProvenance::Derived {
+                anyhow::bail!(
+                    "dirty overlay rejected non-Derived edge in {}: kind={} provenance={:?} source={:?}",
+                    filename,
+                    e.kind,
+                    e.provenance,
+                    e.source,
+                );
+            }
         }
     }
 
     let overlay_dir = dirty_overlay_dir(edges_dir, project_id);
-    let tmp_dir = overlay_dir.with_extension("tmp");
+    let tmp_dir = overlay_dir.with_extension("write-tmp");
 
-    if edges.is_empty() {
+    if tmp_dir.is_dir() {
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    let all_empty = files.iter().all(|(_, edges)| edges.is_empty());
+    if all_empty {
         if overlay_dir.is_dir() {
             for entry in fs::read_dir(&overlay_dir)? {
                 let entry = entry?;
@@ -105,14 +120,19 @@ pub fn write_dirty_overlay(edges_dir: &Path, project_id: &str, edges: &[Edge]) -
     }
 
     fs::create_dir_all(&tmp_dir)?;
-    let path = tmp_dir.join("project.jsonl");
-    let mut file = fs::File::create(&path)?;
-    for edge in edges {
-        serde_json::to_writer(&mut file, edge)?;
-        file.write_all(b"\n")?;
+    for (filename, edges) in files {
+        if edges.is_empty() {
+            continue;
+        }
+        let path = tmp_dir.join(*filename);
+        let mut file = fs::File::create(&path)?;
+        for edge in *edges {
+            serde_json::to_writer(&mut file, edge)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
     }
-    file.sync_all()?;
-    drop(file);
+    drop(files);
 
     if overlay_dir.is_dir() {
         let _ = fs::remove_dir_all(&overlay_dir);
@@ -264,8 +284,8 @@ pub fn switch_to_dirty_overlay(
     head_sha: &str,
     dirty_fingerprint: &str,
     project_edges: Vec<Edge>,
-    _symbol_edges: Vec<Edge>,
-    _git_current_edges: Vec<Edge>,
+    symbol_edges: Vec<Edge>,
+    git_current_edges: Vec<Edge>,
 ) -> Result<()> {
     let snap_id = clean_snapshot_id(repo_id, project_id, head_sha);
     let snap_path = snapshot_dir(edges_dir, project_id, &snap_id);
@@ -276,7 +296,12 @@ pub fn switch_to_dirty_overlay(
         write_snapshot_files(edges_dir, project_id, &snap_id, &files)?;
     }
 
-    write_dirty_overlay(edges_dir, project_id, &project_edges)?;
+    let overlay_files: Vec<(&str, &[Edge])> = vec![
+        ("project.jsonl", &project_edges),
+        ("symbols.jsonl", &symbol_edges),
+        ("git-current.jsonl", &git_current_edges),
+    ];
+    write_dirty_overlay(edges_dir, project_id, &overlay_files)?;
 
     update_manifest_for_snapshot(
         edges_dir,
@@ -475,7 +500,7 @@ mod tests {
         let edges_dir = dir.path();
 
         let edges = vec![derived_edge("k_dirty", "DESCRIBES", "k_target")];
-        write_dirty_overlay(edges_dir, "p1", &edges).unwrap();
+        write_dirty_overlay(edges_dir, "p1", &[("project.jsonl", &edges)]).unwrap();
 
         let overlay = dirty_overlay_dir(edges_dir, "p1");
         assert!(overlay.is_dir());
@@ -489,7 +514,7 @@ mod tests {
         let edges_dir = dir.path();
 
         let edges = vec![explicit_edge("k_exp", "DESCRIBES", "k_target")];
-        let result = write_dirty_overlay(edges_dir, "p1", &edges);
+        let result = write_dirty_overlay(edges_dir, "p1", &[("project.jsonl", &edges)]);
         assert!(result.is_err(), "must reject explicit edges");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -504,10 +529,10 @@ mod tests {
         let edges_dir = dir.path();
 
         let edges_v1 = vec![derived_edge("k_v1", "DESCRIBES", "k_target")];
-        write_dirty_overlay(edges_dir, "p1", &edges_v1).unwrap();
+        write_dirty_overlay(edges_dir, "p1", &[("project.jsonl", &edges_v1)]).unwrap();
 
         let edges_v2 = vec![derived_edge("k_v2", "DESCRIBES", "k_target")];
-        write_dirty_overlay(edges_dir, "p1", &edges_v2).unwrap();
+        write_dirty_overlay(edges_dir, "p1", &[("project.jsonl", &edges_v2)]).unwrap();
 
         let content =
             fs::read_to_string(dirty_overlay_dir(edges_dir, "p1").join("project.jsonl")).unwrap();
@@ -524,7 +549,7 @@ mod tests {
         let edges_dir = dir.path();
 
         let edges = vec![derived_edge("k1", "DESCRIBES", "k2")];
-        write_dirty_overlay(edges_dir, "p1", &edges).unwrap();
+        write_dirty_overlay(edges_dir, "p1", &[("project.jsonl", &edges)]).unwrap();
 
         let cleared = clear_dirty_overlay(edges_dir, "p1").unwrap();
         assert!(cleared, "should report overlay was cleared");
@@ -856,7 +881,7 @@ mod tests {
         let edges_dir = dir.path();
 
         let edges = vec![derived_edge("k1", "DESCRIBES", "k2")];
-        write_dirty_overlay(edges_dir, "p1", &edges).unwrap();
+        write_dirty_overlay(edges_dir, "p1", &[("project.jsonl", &edges)]).unwrap();
         assert!(dirty_overlay_dir(edges_dir, "p1").is_dir());
 
         write_dirty_overlay(edges_dir, "p1", &[]).unwrap();
@@ -868,5 +893,197 @@ mod tests {
                 .any(|e| e.path().extension().and_then(|e| e.to_str()) == Some("jsonl"));
             assert!(!has_jsonl, "empty overlay write must remove jsonl files");
         }
+    }
+
+    #[test]
+    fn stale_temp_dir_does_not_leak_into_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let snap_dir = snapshot_dir(edges_dir, "p1", "snap-stale");
+        let tmp_dir = snap_dir.with_extension("write-tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        fs::write(tmp_dir.join("stale.jsonl"), "should not persist").unwrap();
+
+        let edges = vec![derived_edge("k_clean", "DESCRIBES", "k2")];
+        write_snapshot_files(edges_dir, "p1", "snap-stale", &[("project.jsonl", &edges)]).unwrap();
+
+        assert!(
+            !snap_dir.join("stale.jsonl").exists(),
+            "stale temp file must not leak into snapshot"
+        );
+        assert!(
+            snap_dir.join("project.jsonl").exists(),
+            "new snapshot files must exist"
+        );
+    }
+
+    #[test]
+    fn dirty_overlay_writes_multiple_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let proj = vec![derived_edge("k_proj", "DESCRIBES", "k2")];
+        let sym = vec![derived_edge("k_sym", "HAS_SYMBOL", "k2")];
+        let git = vec![derived_edge("k_git", "EDITED_FILE", "k2")];
+
+        write_dirty_overlay(
+            edges_dir,
+            "p1",
+            &[
+                ("project.jsonl", &proj),
+                ("symbols.jsonl", &sym),
+                ("git-current.jsonl", &git),
+            ],
+        )
+        .unwrap();
+
+        let overlay = dirty_overlay_dir(edges_dir, "p1");
+        let proj_content = fs::read_to_string(overlay.join("project.jsonl")).unwrap();
+        let sym_content = fs::read_to_string(overlay.join("symbols.jsonl")).unwrap();
+        let git_content = fs::read_to_string(overlay.join("git-current.jsonl")).unwrap();
+
+        assert!(proj_content.contains("k_proj"));
+        assert!(sym_content.contains("k_sym"));
+        assert!(git_content.contains("k_git"));
+    }
+
+    #[test]
+    fn switch_to_dirty_writes_all_lanes_to_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let proj = vec![derived_edge("k_proj", "DESCRIBES", "k2")];
+        let sym = vec![derived_edge("k_sym", "HAS_SYMBOL", "k2")];
+        let git = vec![derived_edge("k_git", "EDITED_FILE", "k2")];
+
+        switch_to_dirty_overlay(
+            edges_dir,
+            "p1",
+            "repo1",
+            Some("main"),
+            "abc123def456",
+            "fp-dirty",
+            proj,
+            sym,
+            git,
+        )
+        .unwrap();
+
+        let overlay = dirty_overlay_dir(edges_dir, "p1");
+        assert!(overlay.join("project.jsonl").exists());
+        assert!(overlay.join("symbols.jsonl").exists());
+        assert!(overlay.join("git-current.jsonl").exists());
+
+        let proj_content = fs::read_to_string(overlay.join("project.jsonl")).unwrap();
+        assert!(proj_content.contains("k_proj"));
+        let sym_content = fs::read_to_string(overlay.join("symbols.jsonl")).unwrap();
+        assert!(sym_content.contains("k_sym"));
+    }
+
+    #[test]
+    fn active_loader_reads_overlay_over_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let snap_edges = vec![derived_edge("k_snap_only", "DESCRIBES", "k2")];
+        switch_to_clean_snapshot(
+            edges_dir,
+            "p1",
+            "repo1",
+            Some("main"),
+            "sha_aaaa",
+            snap_edges,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let dirty_edges = vec![derived_edge("k_dirty", "DESCRIBES", "k2")];
+        switch_to_dirty_overlay(
+            edges_dir,
+            "p1",
+            "repo1",
+            Some("main"),
+            "sha_aaaa",
+            "fp-dirty",
+            dirty_edges,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let idx = ManifestIndex::load(edges_dir).unwrap();
+        let paths = idx.active_materialized_paths(edges_dir);
+
+        let has_overlay = paths
+            .iter()
+            .any(|p| p.to_str().unwrap_or_default().contains("dirty-current"));
+        let has_snap = paths.iter().any(|p| {
+            p.to_str()
+                .unwrap_or_default()
+                .contains("snapshots/head-sha_aaaa")
+        });
+        assert!(has_overlay, "active loader must include dirty overlay");
+        assert!(
+            has_snap,
+            "active loader must still reference clean snapshot"
+        );
+    }
+
+    #[test]
+    fn branch_switch_changes_active_graph_via_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let edges_a = vec![derived_edge("k_branch_a", "DESCRIBES", "k2")];
+        switch_to_clean_snapshot(
+            edges_dir,
+            "p1",
+            "repo1",
+            Some("branch-a"),
+            "sha_aaaa",
+            edges_a,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let idx_a = ManifestIndex::load(edges_dir).unwrap();
+        let paths_a = idx_a.active_materialized_paths(edges_dir);
+        let has_a = paths_a.iter().any(|p| {
+            let content = fs::read_to_string(p).unwrap_or_default();
+            content.contains("k_branch_a")
+        });
+        assert!(has_a, "branch-a active graph must have branch-a edges");
+
+        let edges_b = vec![derived_edge("k_branch_b", "DESCRIBES", "k2")];
+        switch_to_clean_snapshot(
+            edges_dir,
+            "p1",
+            "repo1",
+            Some("branch-b"),
+            "sha_bbbb",
+            edges_b,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let idx_b = ManifestIndex::load(edges_dir).unwrap();
+        let paths_b = idx_b.active_materialized_paths(edges_dir);
+        let has_b = paths_b.iter().any(|p| {
+            let content = fs::read_to_string(p).unwrap_or_default();
+            content.contains("k_branch_b")
+        });
+        let has_a_in_b = paths_b.iter().any(|p| {
+            let content = fs::read_to_string(p).unwrap_or_default();
+            content.contains("k_branch_a")
+        });
+        assert!(has_b, "branch-b active graph must have branch-b edges");
+        assert!(
+            !has_a_in_b,
+            "branch-b active graph must NOT have branch-a edges"
+        );
     }
 }

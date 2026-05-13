@@ -336,6 +336,7 @@ fn index_project(
             }
         }
     }
+    snapshot_after_reindex(project, root, ctx.edges_dir)?;
     Ok(())
 }
 
@@ -724,6 +725,71 @@ fn short_hash(bytes: &[u8]) -> String {
     hasher.update(bytes);
     let digest = hasher.finalize();
     hex::encode(&digest[..4])
+}
+
+fn snapshot_after_reindex(project: &ProjectRecord, root: &Path, edges_dir: &Path) -> Result<()> {
+    let Some(repo_id) = project.repo_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(head_sha) = crate::git::current_head(root) else {
+        return Ok(());
+    };
+    let branch = crate::git::current_branch(root);
+
+    let project_edges =
+        crate::edge_index::read_managed_derived_edges(edges_dir, "project", &project.project_id)?;
+    let git_edges =
+        crate::edge_index::read_managed_derived_edges(edges_dir, "git", &project.project_id)?;
+
+    let snapshot_edges: Vec<crate::edge_index::Edge> = project_edges
+        .iter()
+        .map(|e| crate::edge_index::Edge {
+            source: e.source.clone(),
+            kind: e.kind.clone(),
+            target: e.target.clone(),
+            provenance: e.provenance,
+            confidence: e.confidence,
+            metadata: Default::default(),
+        })
+        .collect();
+    let git_snapshot_edges: Vec<crate::edge_index::Edge> = git_edges
+        .iter()
+        .map(|e| crate::edge_index::Edge {
+            source: e.source.clone(),
+            kind: e.kind.clone(),
+            target: e.target.clone(),
+            provenance: e.provenance,
+            confidence: e.confidence,
+            metadata: Default::default(),
+        })
+        .collect();
+
+    if crate::git::is_worktree_dirty(root) {
+        let fp = crate::git::dirty_fingerprint(root).unwrap_or_default();
+        crate::snapshot::switch_to_dirty_overlay(
+            edges_dir,
+            &project.project_id,
+            repo_id,
+            branch.as_deref(),
+            &head_sha,
+            &fp,
+            snapshot_edges,
+            vec![],
+            git_snapshot_edges,
+        )?;
+    } else {
+        crate::snapshot::switch_to_clean_snapshot(
+            edges_dir,
+            &project.project_id,
+            repo_id,
+            branch.as_deref(),
+            &head_sha,
+            snapshot_edges,
+            vec![],
+            git_snapshot_edges,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

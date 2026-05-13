@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitCommit {
@@ -93,6 +94,24 @@ pub(crate) fn current_head(root: &Path) -> Option<String> {
         None
     } else {
         Some(sha.to_string())
+    }
+}
+
+pub(crate) fn current_branch(root: &Path) -> Option<String> {
+    let output = git_output(
+        root,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        "deriving current branch",
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let branch = branch.trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        None
+    } else {
+        Some(branch)
     }
 }
 
@@ -338,6 +357,36 @@ pub(crate) fn head_fingerprint(root: &Path) -> Option<u64> {
         }
         u64::from_be_bytes(bytes)
     })
+}
+
+pub(crate) fn is_worktree_dirty(root: &Path) -> bool {
+    let output = match git_output(
+        root,
+        &["status", "--porcelain"],
+        "checking worktree dirty state",
+    ) {
+        Some(o) if o.status.success() => o,
+        _ => return false,
+    };
+    !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
+pub(crate) fn dirty_fingerprint(root: &Path) -> Option<String> {
+    let output = git_output(
+        root,
+        &["status", "--porcelain", "--no-renames", "-z"],
+        "computing dirty fingerprint",
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(stdout.as_bytes());
+    Some(hex::encode(hasher.finalize()))
 }
 
 pub(crate) fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
