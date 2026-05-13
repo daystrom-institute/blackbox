@@ -975,21 +975,24 @@ fn line_provenance_is_derived(line: &str) -> bool {
 //   global        = non-project graph support (Explicit)
 //
 // append_project_edges callers (legacy append path):
-//   project_files.rs  → materialized  [Phase 2: moved to replace_materialized_edges]
-//   git_history.rs    → materialized  [Phase 2: moved to replace_materialized_edges]
+//   (none — all production callers moved to lifecycle APIs)
 //
 // append_edges callers (full Edge with metadata):
-//   tool_edges.rs:emit_file_tool_edge  → observed
-//   tool_edges.rs:emit_bash_tool_edge  → observed
+//   (none — all production callers moved to lifecycle APIs)
 //
 // append_edges_dedup callers:
-//   provenance.rs:import_provenance  → explicit
-//   routes.rs:persist_agent_edges    → global (agents.jsonl)
-//   workflow/ops.rs:write_semantic   → explicit
+//   (none — all production callers moved to lifecycle APIs)
 //
 // replace_project_edges callers (managed derived replacement):
-//   project_files.rs  → materialized, namespace "project"
-//   git_history.rs    → materialized, namespace "git"
+//   (none directly — wrapped by lifecycle APIs below)
+//
+// Lifecycle API routing:
+//   project_files.rs  → replace_materialized_edges_incremental ("project")
+//   git_history.rs    → replace_materialized_edges (full) or merge_materialized_edges (incremental) ("git")
+//   tool_edges.rs     → append_observed_edges
+//   provenance.rs     → append_explicit_edges
+//   routes.rs         → append_explicit_edges (global agents.jsonl)
+//   workflow/ops.rs   → append_explicit_edges
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,6 +1131,51 @@ pub(crate) fn replace_materialized_edges_incremental(
         .collect();
     let mut merged = preserved;
     merged.extend_from_slice(new_edges);
+    replace_project_edges(edges_dir, namespace, project_id, &merged)
+}
+
+pub(crate) fn merge_materialized_edges(
+    edges_dir: &Path,
+    namespace: &str,
+    project_id: &str,
+    new_edges: &[crate::chunker::Edge],
+) -> Result<()> {
+    for e in new_edges {
+        debug_assert!(
+            e.provenance == EdgeProvenance::Derived,
+            "merge_materialized_edges: rejected non-Derived edge kind={} provenance={:?}",
+            e.kind,
+            e.provenance,
+        );
+    }
+    if new_edges.is_empty() {
+        return Ok(());
+    }
+    let existing = read_managed_derived_edges(edges_dir, namespace, project_id)?;
+    let mut seen: HashSet<String> = existing.iter().map(edge_import_key).collect();
+    let mut merged: Vec<crate::chunker::Edge> = existing
+        .into_iter()
+        .map(|e| crate::chunker::Edge {
+            source: e.source,
+            kind: e.kind,
+            target: e.target,
+            provenance: e.provenance,
+            confidence: e.confidence,
+        })
+        .collect();
+    for e in new_edges {
+        let key = edge_import_key(&Edge {
+            source: e.source.clone(),
+            kind: e.kind.clone(),
+            target: e.target.clone(),
+            provenance: e.provenance,
+            confidence: e.confidence,
+            metadata: BTreeMap::new(),
+        });
+        if seen.insert(key) {
+            merged.push(e.clone());
+        }
+    }
     replace_project_edges(edges_dir, namespace, project_id, &merged)
 }
 
@@ -2478,5 +2526,86 @@ mod tests {
             1,
             "re-incremental with same edges must not duplicate"
         );
+    }
+
+    #[test]
+    fn merge_materialized_git_preserves_old_commits_and_appends_new() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let old_commit_edge = crate::chunker::Edge {
+            source: EntityRef::Commit {
+                repo_id: "repo1".into(),
+                sha: "aaaaaa".into(),
+            },
+            kind: "COMMIT_EDITED_FILE".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "fff".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        let new_commit_edge = crate::chunker::Edge {
+            source: EntityRef::Commit {
+                repo_id: "repo1".into(),
+                sha: "bbbbbb".into(),
+            },
+            kind: "COMMIT_EDITED_FILE".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "fff".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+
+        replace_materialized_edges(dir.path(), "git", "p1", &[old_commit_edge.clone()]).unwrap();
+        let after_full = read_managed_derived_edges(dir.path(), "git", "p1").unwrap();
+        assert_eq!(after_full.len(), 1);
+
+        merge_materialized_edges(dir.path(), "git", "p1", &[new_commit_edge.clone()]).unwrap();
+        let after_merge = read_managed_derived_edges(dir.path(), "git", "p1").unwrap();
+        assert_eq!(after_merge.len(), 2, "old + new commit edges");
+
+        let has_old = after_merge.iter().any(|e| match &e.source {
+            EntityRef::Commit { sha, .. } => sha == "aaaaaa",
+            _ => false,
+        });
+        let has_new = after_merge.iter().any(|e| match &e.source {
+            EntityRef::Commit { sha, .. } => sha == "bbbbbb",
+            _ => false,
+        });
+        assert!(has_old, "old commit edge must be preserved");
+        assert!(has_new, "new commit edge must be appended");
+    }
+
+    #[test]
+    fn merge_materialized_git_no_duplicates_on_repeated_ingest() {
+        let dir = tempfile::tempdir().unwrap();
+        let edge = crate::chunker::Edge {
+            source: EntityRef::Commit {
+                repo_id: "repo1".into(),
+                sha: "cccccc".into(),
+            },
+            kind: "COMMIT_EDITED_FILE".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "hhh".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+
+        merge_materialized_edges(dir.path(), "git", "p1", &[edge.clone()]).unwrap();
+        merge_materialized_edges(dir.path(), "git", "p1", &[edge]).unwrap();
+
+        let after = read_managed_derived_edges(dir.path(), "git", "p1").unwrap();
+        assert_eq!(after.len(), 1, "re-merge with same edge must not duplicate");
     }
 }
