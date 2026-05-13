@@ -430,15 +430,16 @@ pub struct GcCandidate {
     pub bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
-    pub reason: String,
+    pub rule: String,
+    pub deletable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcResult {
     pub applied: bool,
     pub candidates: Vec<GcCandidate>,
-    pub total_candidates: usize,
-    pub total_candidate_bytes: u64,
+    pub deletable_count: usize,
+    pub deletable_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -484,10 +485,11 @@ pub fn plan_gc(
                     kind: f.kind,
                     bytes: f.bytes,
                     project_id: f.project_id.clone(),
-                    reason: format!(
-                        "temp file within 24h grace (age={}s, need={}s)",
+                    rule: format!(
+                        "temp_within_grace(age={}s,need={}s)",
                         age_secs, TEMP_GRACE_SECS
                     ),
+                    deletable: false,
                 });
                 continue;
             }
@@ -496,7 +498,8 @@ pub fn plan_gc(
                 kind: f.kind,
                 bytes: f.bytes,
                 project_id: f.project_id.clone(),
-                reason: "temp file older than 24h grace period".to_string(),
+                rule: "temp_past_grace".to_string(),
+                deletable: true,
             });
         }
     }
@@ -516,87 +519,80 @@ pub fn plan_gc(
         }
 
         for (source, mut backups) in backups_by_source {
-            backups.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-            let newest_count = params.keep_newest_backup_per_source as usize;
+            backups.sort_by(|a, b| backup_recency_key(b).cmp(&backup_recency_key(a)));
+            let keep = params.keep_newest_backup_per_source as usize;
             for (i, f) in backups.iter().enumerate() {
-                let is_newest = i < newest_count;
+                let is_retained = i < keep;
 
-                let age_violated = if let Some(max_days) = params.max_backup_age_days {
-                    let age_secs = file_age_secs(Path::new(&f.path)).unwrap_or(0);
-                    age_secs > max_days * 86400
-                } else {
-                    false
-                };
-
-                if is_newest && !age_violated {
+                if is_retained {
                     candidates.push(GcCandidate {
                         path: f.path.clone(),
                         kind: f.kind,
                         bytes: f.bytes,
                         project_id: f.project_id.clone(),
-                        reason: format!("newest backup retained (#{}, source={})", i + 1, source),
+                        rule: format!("backup_retained(#{},source={})", i + 1, source),
+                        deletable: false,
                     });
                     continue;
                 }
 
-                let reason = if !is_newest && age_violated {
-                    format!(
-                        "older-than-newest backup and exceeds max_backup_age_days (#{}, source={})",
-                        i + 1,
-                        source
-                    )
-                } else if !is_newest {
-                    format!(
-                        "older-than-newest backup (#{}, keep={}, source={})",
-                        i + 1,
-                        newest_count,
-                        source
-                    )
+                let age_note = if let Some(max_days) = params.max_backup_age_days {
+                    let age_secs = file_age_secs(Path::new(&f.path)).unwrap_or(0);
+                    if age_secs > max_days * 86400 {
+                        format!("+past_max_age({}d)", max_days)
+                    } else {
+                        String::new()
+                    }
                 } else {
-                    format!(
-                        "newest backup but exceeds max_backup_age_days (#{}, source={})",
-                        i + 1,
-                        source
-                    )
+                    String::new()
                 };
+
                 candidates.push(GcCandidate {
                     path: f.path.clone(),
                     kind: f.kind,
                     bytes: f.bytes,
                     project_id: f.project_id.clone(),
-                    reason,
+                    rule: format!(
+                        "backup_prunable(#{},keep={},source={}{})",
+                        i + 1,
+                        keep,
+                        source,
+                        age_note
+                    ),
+                    deletable: true,
                 });
             }
         }
     }
 
     if params.prune_orphans {
-        let mut orphan_supported = false;
+        let mut found = false;
         for f in &report.files {
             if f.kind == FileKind::Orphan {
-                orphan_supported = true;
+                found = true;
                 candidates.push(GcCandidate {
                     path: f.path.clone(),
                     kind: f.kind,
                     bytes: f.bytes,
                     project_id: f.project_id.clone(),
-                    reason: "orphan/unregistered sidecar reported; Phase 1 does not auto-prune"
-                        .to_string(),
+                    rule: "orphan_phase1_report_only".to_string(),
+                    deletable: false,
                 });
             }
         }
-        if !orphan_supported {
+        if !found {
             candidates.push(GcCandidate {
                 path: String::new(),
                 kind: FileKind::Orphan,
                 bytes: 0,
                 project_id: None,
-                reason: "prune_orphans=true but no orphan sidecars found".to_string(),
+                rule: "orphan_none_found".to_string(),
+                deletable: false,
             });
         }
     }
 
-    candidates.sort_by(|a, b| a.reason.cmp(&b.reason).then(a.path.cmp(&b.path)));
+    candidates.sort_by(|a, b| a.rule.cmp(&b.rule).then(a.path.cmp(&b.path)));
     Ok(candidates)
 }
 
@@ -604,13 +600,7 @@ pub fn apply_gc(candidates: &[GcCandidate]) -> (Vec<String>, Vec<String>) {
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
     for c in candidates {
-        if c.path.is_empty() {
-            continue;
-        }
-        if c.reason.contains("retained")
-            || c.reason.contains("Phase 1 does not")
-            || c.reason.contains("within 24h grace")
-        {
+        if !c.deletable || c.path.is_empty() {
             continue;
         }
         match fs::remove_file(&c.path) {
@@ -627,6 +617,19 @@ fn path_source_key(path: &str) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("");
     extract_project_id_from_backup(file_name).unwrap_or_else(|| file_name.to_string())
+}
+
+fn backup_recency_key(f: &StorageFileInfo) -> (u64, u64) {
+    let mtime = file_age_secs(Path::new(&f.path)).unwrap_or(u64::MAX);
+    let suffix_ts = extract_bak_timestamp(&f.path).unwrap_or(0);
+    (mtime, suffix_ts)
+}
+
+fn extract_bak_timestamp(path: &str) -> Option<u64> {
+    let file_name = Path::new(path).file_name().and_then(|n| n.to_str())?;
+    let idx = file_name.find(".bak-")?;
+    let ts_str = &file_name[idx + 5..];
+    ts_str.parse().ok()
 }
 
 fn file_age_secs(path: &Path) -> Option<u64> {
@@ -957,10 +960,7 @@ mod tests {
         )
         .unwrap();
 
-        let deletable: Vec<&GcCandidate> = candidates
-            .iter()
-            .filter(|c| !c.reason.contains("retained"))
-            .collect();
+        let deletable: Vec<&GcCandidate> = candidates.iter().filter(|c| c.deletable).collect();
         assert!(
             !deletable.is_empty(),
             "should have at least one deletable backup"
@@ -1005,11 +1005,8 @@ mod tests {
         let (deleted, errors) = apply_gc(&candidates);
         assert!(errors.is_empty(), "no delete errors expected");
         assert!(
-            !edges_dir.join("proj1234.jsonl").exists() || edges_dir.join("proj1234.jsonl").exists(),
-        );
-        assert!(
             edges_dir.join("proj1234.jsonl").exists(),
-            "active sidecar must never be deleted in Phase 1"
+            "active sidecar must never be deleted"
         );
         assert!(
             !deleted
@@ -1048,9 +1045,13 @@ mod tests {
 
         let retained: Vec<&GcCandidate> = candidates
             .iter()
-            .filter(|c| c.reason.contains("retained"))
+            .filter(|c| !c.deletable && c.kind == FileKind::Backup)
             .collect();
         assert_eq!(retained.len(), 1, "exactly 1 newest backup retained");
+        assert!(
+            retained[0].rule.contains("retained"),
+            "retained backup rule must say retained"
+        );
     }
 
     #[test]
@@ -1081,7 +1082,7 @@ mod tests {
 
         let grace_candidates: Vec<&GcCandidate> = candidates
             .iter()
-            .filter(|c| c.reason.contains("grace"))
+            .filter(|c| c.rule.contains("grace"))
             .collect();
         assert!(
             !grace_candidates.is_empty(),
@@ -1132,9 +1133,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            candidates_report
-                .iter()
-                .any(|c| c.reason.contains("Phase 1 does not")),
+            candidates_report.iter().any(|c| c.rule.contains("phase1")),
             "orphans must be reported with Phase 1 limitation"
         );
 

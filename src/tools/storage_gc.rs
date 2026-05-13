@@ -80,25 +80,12 @@ impl BlackboxServer {
 
             let candidates = crate::storage_health::plan_gc(&edges_dir, &registered, &gc_params)?;
 
-            let total_candidates = candidates
+            let deletable: Vec<&crate::storage_health::GcCandidate> = candidates
                 .iter()
-                .filter(|c| {
-                    !c.reason.contains("retained")
-                        && !c.reason.contains("Phase 1 does not")
-                        && !c.reason.contains("within 24h grace")
-                        && !c.path.is_empty()
-                })
-                .count();
-            let total_candidate_bytes = candidates
-                .iter()
-                .filter(|c| {
-                    !c.reason.contains("retained")
-                        && !c.reason.contains("Phase 1 does not")
-                        && !c.reason.contains("within 24h grace")
-                        && !c.path.is_empty()
-                })
-                .map(|c| c.bytes)
-                .sum::<u64>();
+                .filter(|c| c.deletable && !c.path.is_empty())
+                .collect();
+            let deletable_count = deletable.len();
+            let deletable_bytes = deletable.iter().map(|c| c.bytes).sum::<u64>();
 
             let (deleted, delete_errors) = if p.dry_run {
                 (None, None)
@@ -110,8 +97,8 @@ impl BlackboxServer {
             let result = crate::storage_health::GcResult {
                 applied: !p.dry_run,
                 candidates,
-                total_candidates,
-                total_candidate_bytes,
+                deletable_count,
+                deletable_bytes,
                 deleted,
                 delete_errors,
             };
