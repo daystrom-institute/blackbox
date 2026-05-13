@@ -951,7 +951,16 @@ fn thread_edge_kind_name(kind: &EdgeKind) -> &'static str {
 }
 
 fn line_provenance_is_derived(line: &str) -> bool {
-    line.contains("\"provenance\":\"derived\"") || line.contains("\"provenance\": \"derived\"")
+    let Some(pos) = line.find("\"provenance\"") else {
+        return false;
+    };
+    let rest = &line[pos + "\"provenance\"".len()..];
+    let rest = rest.trim_start();
+    if !rest.starts_with(':') {
+        return false;
+    }
+    let after_colon = rest[1..].trim_start();
+    after_colon.starts_with("\"derived\"")
 }
 
 #[cfg(test)]
@@ -1670,16 +1679,20 @@ mod tests {
             !line_provenance_is_derived("{\"provenance\":\"derivedly_wrong\"}"),
             "substring that is not exact value must not match"
         );
+        assert!(
+            !line_provenance_is_derived(
+                "{\"source\":\"k:abc\",\"kind\":\"DESCRIBES\",\"target\":\"k:def\",\"provenance\":\"explicit\",\"confidence\":\"exact\",\"metadata\":{\"nested\":\"provenance\\\":\\\"derived\\\"\"}"
+            ),
+            "explicit top-level with derived-like substring in metadata must not false-skip"
+        );
+        assert!(
+            !line_provenance_is_derived("no provenance field at all"),
+            "line without provenance key must not match"
+        );
     }
 
     #[test]
-    fn legacy_derived_lines_skip_deserialization_when_managed_sidecar_exists() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static DESERIALIZE_COUNT: std::sync::LazyLock<Arc<AtomicUsize>> =
-            std::sync::LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
-
+    fn managed_derived_sidecar_supersedes_legacy_derived_while_preserving_explicit() {
         let dir = tempfile::tempdir().unwrap();
         let source = EntityRef::ProjectFile {
             project_id: "proj9999".into(),
