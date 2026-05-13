@@ -126,9 +126,11 @@ pub(crate) fn import_provenance_to_edges_dir(
                     continue;
                 };
                 let edges = edges_from_note(project, root, &note)?;
-                edges_imported +=
-                    crate::edge_index::append_edges_dedup(edges_dir, &project.project_id, &edges)?
-                        as u64;
+                edges_imported += crate::edge_index::append_explicit_edges(
+                    edges_dir,
+                    &project.project_id,
+                    &edges,
+                )? as u64;
             }
         }
     }

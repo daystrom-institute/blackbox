@@ -466,7 +466,8 @@ async fn exec_write_semantic_edge(
                 .and_then(Value::as_str)
                 .map(PathBuf::from)
                 .unwrap_or_else(default_edges_dir);
-            let written = crate::edge_index::append_edges_dedup(&edges_dir, &project_id, &[edge])?;
+            let written =
+                crate::edge_index::append_explicit_edges(&edges_dir, &project_id, &[edge])?;
             Ok(OpEffect::SetVar {
                 key: into_var.unwrap_or("semantic_edge").to_string(),
                 value: json!({

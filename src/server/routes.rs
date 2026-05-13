@@ -1172,7 +1172,7 @@ pub(crate) fn persist_agent_provenance_edges(
         edges.push(agent_derived_from_edge(source.clone(), target));
     }
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
-    let written = edge_index::append_edges_dedup(&edges_dir, "agents", &edges)?;
+    let written = edge_index::append_explicit_edges(&edges_dir, "agents", &edges)?;
     if written > 0 {
         rebuild_edge_index_from_shared(state, false);
     }

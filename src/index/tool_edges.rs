@@ -118,7 +118,7 @@ impl ToolEdgeContext {
                 &bytes,
             ),
         };
-        crate::edge_index::append_edges(&self.edges_dir, &project.project_id, &[edge])?;
+        crate::edge_index::append_observed_edges(&self.edges_dir, &project.project_id, &[edge])?;
         Ok(1)
     }
 
@@ -154,7 +154,7 @@ impl ToolEdgeContext {
             confidence: EdgeConfidence::Exact,
             metadata: bash_metadata(event, tool_call, project, line_offset),
         };
-        crate::edge_index::append_edges(&self.edges_dir, &project.project_id, &[edge])?;
+        crate::edge_index::append_observed_edges(&self.edges_dir, &project.project_id, &[edge])?;
         Ok(1)
     }
 

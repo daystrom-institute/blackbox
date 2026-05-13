@@ -963,6 +963,167 @@ fn line_provenance_is_derived(line: &str) -> bool {
     after_colon.starts_with("\"derived\"")
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2: Lifecycle-specific write APIs
+// ---------------------------------------------------------------------------
+//
+// Caller audit (recorded here so it does not rot):
+//
+//   materialized  = computed current workspace/repo view (Derived provenance)
+//   observed      = event/provenance history, usually Tool provenance (Explicit)
+//   explicit      = user/agent-authored durable fact (Explicit)
+//   global        = non-project graph support (Explicit)
+//
+// append_project_edges callers (legacy append path):
+//   project_files.rs  → materialized  [Phase 2: moved to replace_materialized_edges]
+//   git_history.rs    → materialized  [Phase 2: moved to replace_materialized_edges]
+//
+// append_edges callers (full Edge with metadata):
+//   tool_edges.rs:emit_file_tool_edge  → observed
+//   tool_edges.rs:emit_bash_tool_edge  → observed
+//
+// append_edges_dedup callers:
+//   provenance.rs:import_provenance  → explicit
+//   routes.rs:persist_agent_edges    → global (agents.jsonl)
+//   workflow/ops.rs:write_semantic   → explicit
+//
+// replace_project_edges callers (managed derived replacement):
+//   project_files.rs  → materialized, namespace "project"
+//   git_history.rs    → materialized, namespace "git"
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeLane {
+    Explicit,
+    Observed,
+}
+
+pub(crate) fn append_explicit_edges(
+    edges_dir: &Path,
+    project_id: &str,
+    edges: &[Edge],
+) -> Result<usize> {
+    for e in edges {
+        debug_assert!(
+            e.provenance != EdgeProvenance::Derived,
+            "append_explicit_edges: rejected Derived edge kind={} source={:?}",
+            e.kind,
+            e.source,
+        );
+    }
+    append_edges_dedup(edges_dir, project_id, edges)
+}
+
+pub(crate) fn append_observed_edges(
+    edges_dir: &Path,
+    project_id: &str,
+    edges: &[Edge],
+) -> Result<()> {
+    for e in edges {
+        debug_assert!(
+            e.provenance != EdgeProvenance::Derived,
+            "append_observed_edges: rejected Derived edge kind={} source={:?}",
+            e.kind,
+            e.source,
+        );
+    }
+    append_edges(edges_dir, project_id, edges)
+}
+
+pub(crate) fn replace_materialized_edges(
+    edges_dir: &Path,
+    namespace: &str,
+    project_id: &str,
+    edges: &[crate::chunker::Edge],
+) -> Result<()> {
+    for e in edges {
+        debug_assert!(
+            e.provenance == EdgeProvenance::Derived,
+            "replace_materialized_edges: rejected non-Derived edge kind={} provenance={:?}",
+            e.kind,
+            e.provenance,
+        );
+    }
+    replace_project_edges(edges_dir, namespace, project_id, edges)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Legacy edge extraction dry-run
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LegacyExtractionPlan {
+    pub project_id: String,
+    pub legacy_path: String,
+    pub total_lines: u64,
+    pub derived_lines: u64,
+    pub tool_lines: u64,
+    pub explicit_lines: u64,
+    pub malformed_lines: u64,
+    pub blank_lines: u64,
+    pub managed_replacement_exists: bool,
+    pub extractable: bool,
+}
+
+pub fn plan_legacy_edge_extraction(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<LegacyExtractionPlan> {
+    let legacy_path = edges_dir.join(format!("{project_id}.jsonl"));
+    let mut plan = LegacyExtractionPlan {
+        project_id: project_id.to_string(),
+        legacy_path: legacy_path.display().to_string(),
+        ..Default::default()
+    };
+
+    let managed = managed_derived_edges_dir(edges_dir);
+    plan.managed_replacement_exists = managed
+        .join("project")
+        .join(format!("{project_id}.jsonl"))
+        .exists()
+        || managed
+            .join("git")
+            .join(format!("{project_id}.jsonl"))
+            .exists();
+
+    let file = match fs::File::open(&legacy_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plan),
+        Err(e) => return Err(e.into()),
+    };
+
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        plan.total_lines += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            plan.blank_lines += 1;
+            continue;
+        }
+        match serde_json::from_str::<Edge>(trimmed) {
+            Ok(edge) => match edge.provenance {
+                EdgeProvenance::Derived => plan.derived_lines += 1,
+                EdgeProvenance::Explicit => {
+                    let is_tool = edge.kind == "READ_FILE"
+                        || edge.kind == "EDITED_FILE"
+                        || edge.kind == "RAN_BASH";
+                    if is_tool {
+                        plan.tool_lines += 1;
+                    } else {
+                        plan.explicit_lines += 1;
+                    }
+                }
+                EdgeProvenance::Implicit => plan.explicit_lines += 1,
+            },
+            Err(_) => plan.malformed_lines += 1,
+        }
+    }
+
+    plan.extractable = plan.managed_replacement_exists && plan.derived_lines > 0;
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1882,5 +2043,228 @@ mod tests {
         );
         let sidecar = fs::read_to_string(dir.path().join("proj1234.jsonl")).unwrap();
         assert_eq!(sidecar.lines().count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 tests
+    // -----------------------------------------------------------------------
+
+    fn derived_chunker_edge(kind: &str) -> crate::chunker::Edge {
+        crate::chunker::Edge {
+            source: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "h1".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            kind: kind.into(),
+            target: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "h2".into(),
+                chunk_hash: "b".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        }
+    }
+
+    fn explicit_edge(kind: &str) -> Edge {
+        Edge {
+            source: EntityRef::Knowledge { id: "k1".into() },
+            kind: kind.into(),
+            target: EntityRef::Knowledge { id: "k2".into() },
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn observed_tool_edge(kind: &str) -> Edge {
+        Edge {
+            source: EntityRef::Transcript {
+                provider: "claude".into(),
+                session_id: "sess-1".into(),
+                line_offset: 10,
+                event_idx: 0,
+            },
+            kind: kind.into(),
+            target: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "h1".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn replace_materialized_replaces_not_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = derived_chunker_edge("CALLS");
+        let second = derived_chunker_edge("USES_TYPE");
+
+        replace_materialized_edges(dir.path(), "project", "p1", &[first]).unwrap();
+        let sidecar_path = dir.path().join("derived").join("project").join("p1.jsonl");
+        let content1 = fs::read_to_string(&sidecar_path).unwrap();
+        assert_eq!(content1.lines().count(), 1);
+
+        replace_materialized_edges(dir.path(), "project", "p1", &[second.clone(), second]).unwrap();
+        let content2 = fs::read_to_string(&sidecar_path).unwrap();
+        assert_eq!(content2.lines().count(), 2, "replacement must not append");
+    }
+
+    #[test]
+    #[should_panic(expected = "rejected non-Derived edge")]
+    fn replace_materialized_rejects_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = derived_chunker_edge("CALLS");
+        e.provenance = EdgeProvenance::Explicit;
+        let _ = replace_materialized_edges(dir.path(), "project", "p1", &[e]);
+    }
+
+    #[test]
+    #[should_panic(expected = "rejected Derived edge")]
+    fn append_explicit_rejects_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Edge {
+            source: EntityRef::Knowledge { id: "k1".into() },
+            kind: "CALLS".into(),
+            target: EntityRef::Knowledge { id: "k2".into() },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+        };
+        let _ = append_explicit_edges(dir.path(), "p1", &[e]);
+    }
+
+    #[test]
+    #[should_panic(expected = "rejected Derived edge")]
+    fn append_observed_rejects_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Edge {
+            source: EntityRef::Knowledge { id: "k1".into() },
+            kind: "READ_FILE".into(),
+            target: EntityRef::Knowledge { id: "k2".into() },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+        };
+        let _ = append_observed_edges(dir.path(), "p1", &[e]);
+    }
+
+    #[test]
+    fn append_explicit_dedups_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = explicit_edge("DESCRIBES");
+        let n = append_explicit_edges(dir.path(), "p1", &[e.clone()]).unwrap();
+        assert_eq!(n, 1);
+        let n2 = append_explicit_edges(dir.path(), "p1", &[e]).unwrap();
+        assert_eq!(n2, 0, "dedup must skip reimport");
+    }
+
+    #[test]
+    fn append_observed_writes_tool_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = observed_tool_edge("READ_FILE");
+        append_observed_edges(dir.path(), "p1", &[e]).unwrap();
+        let sidecar = fs::read_to_string(dir.path().join("p1.jsonl")).unwrap();
+        assert_eq!(sidecar.lines().count(), 1);
+    }
+
+    #[test]
+    fn plan_legacy_extraction_classifies_lines() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let derived = derived_chunker_edge("NEXT_SECTION");
+        let tool = observed_tool_edge("READ_FILE");
+        let explicit = explicit_edge("SUPERSEDES");
+
+        append_project_edges(dir.path(), "p1", &[derived]).unwrap();
+        append_edges(dir.path(), "p1", &[tool]).unwrap();
+        append_edges(dir.path(), "p1", &[explicit]).unwrap();
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join("p1.jsonl"))
+                .unwrap();
+            f.write_all(b"\n").unwrap();
+            f.write_all(b"not json\n").unwrap();
+        }
+
+        let plan = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
+        assert_eq!(plan.total_lines, 5);
+        assert_eq!(plan.derived_lines, 1);
+        assert_eq!(plan.tool_lines, 1);
+        assert_eq!(plan.explicit_lines, 1);
+        assert_eq!(plan.blank_lines, 1);
+        assert_eq!(plan.malformed_lines, 1);
+        assert!(!plan.managed_replacement_exists);
+        assert!(!plan.extractable);
+    }
+
+    #[test]
+    fn plan_legacy_extraction_detects_managed_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let derived = derived_chunker_edge("NEXT_SECTION");
+        append_project_edges(dir.path(), "p1", &[derived.clone()]).unwrap();
+
+        let plan_before = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
+        assert!(!plan_before.managed_replacement_exists);
+
+        replace_materialized_edges(dir.path(), "project", "p1", &[derived]).unwrap();
+
+        let plan_after = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
+        assert!(plan_after.managed_replacement_exists);
+        assert!(plan_after.extractable);
+    }
+
+    #[test]
+    fn repeated_materialized_replace_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let edge = derived_chunker_edge("CALLS");
+
+        for _ in 0..5 {
+            replace_materialized_edges(dir.path(), "project", "p1", &[edge.clone()]).unwrap();
+        }
+
+        let sidecar_path = dir.path().join("derived").join("project").join("p1.jsonl");
+        let content = fs::read_to_string(&sidecar_path).unwrap();
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "repeated replacement must not grow line count"
+        );
+    }
+
+    #[test]
+    fn legacy_sidecar_still_loads_for_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let derived = derived_chunker_edge("NEXT_SECTION");
+        let explicit = explicit_edge("DESCRIBES");
+        append_project_edges(dir.path(), "p1", &[derived]).unwrap();
+        append_edges(dir.path(), "p1", &[explicit]).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        let skip = HashSet::new();
+        index.project_sidecar_edges_in_dir(dir.path(), None, &mut seen, &skip);
+
+        let source = EntityRef::ProjectFile {
+            project_id: "p1".into(),
+            rel_path_hash: "h1".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        assert!(
+            index
+                .forward_edges_filtered(&source, &["NEXT_SECTION"])
+                .len()
+                == 1,
+            "legacy derived edge must still load"
+        );
     }
 }

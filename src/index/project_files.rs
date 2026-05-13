@@ -288,20 +288,12 @@ fn index_project(
         );
         ctx.stats.indexed_files += 1;
     }
-    if ctx.force_git_full {
-        crate::edge_index::replace_project_edges(
-            ctx.edges_dir,
-            "project",
-            &project.project_id,
-            &project_edges,
-        )?;
-    } else {
-        crate::edge_index::append_project_edges(
-            ctx.edges_dir,
-            &project.project_id,
-            &project_edges,
-        )?;
-    }
+    crate::edge_index::replace_materialized_edges(
+        ctx.edges_dir,
+        "project",
+        &project.project_id,
+        &project_edges,
+    )?;
     let mut git_ctx = super::git_history::GitIndexContext {
         f: ctx.f,
         writer: ctx.writer,
