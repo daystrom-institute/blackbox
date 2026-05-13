@@ -3243,11 +3243,18 @@ mod tests {
             .unwrap();
 
             let overlay_path = format!("workspace/{}/dirty-overlay", project_id);
+            let active_snap_id = clean_snapshot_id(repo_id, project_id, head_sha);
+            let snap_path = format!("workspace/{}/snapshots/{}", project_id, active_snap_id);
 
             for candidate in &candidates {
                 assert!(
                     !candidate.path.contains(&overlay_path),
                     "dirty overlay must not be a GC candidate: {}",
+                    candidate.path
+                );
+                assert!(
+                    !candidate.path.contains(&snap_path),
+                    "active snapshot must not be a GC candidate even when overlay wins: {}",
                     candidate.path
                 );
             }
@@ -3257,8 +3264,8 @@ mod tests {
                 .filter(|c| c.rule == "inactive_snapshot")
                 .collect();
             assert!(
-                !inactive_candidates.is_empty(),
-                "clean snapshot must be reported as inactive when dirty overlay is active"
+                inactive_candidates.is_empty(),
+                "active snapshot + dirty overlay must both be protected, no inactive_snapshot candidates"
             );
         }
 

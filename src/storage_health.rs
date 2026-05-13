@@ -172,12 +172,12 @@ fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
     let mut inactive_bytes: u64 = 0;
     let mut inactive_files: u64 = 0;
     if mat_dir.is_dir() {
-        let active_jsonl_prefixes = collect_active_jsonl_prefixes(edges_dir);
+        let protected_jsonl_prefixes = collect_protected_jsonl_prefixes(edges_dir);
         if let Ok(entries) = fs::read_dir(&mat_dir) {
             for entry in entries.filter_map(Result::ok) {
                 count_materialized_tree(
                     &entry.path(),
-                    &active_jsonl_prefixes,
+                    &protected_jsonl_prefixes,
                     &mut inactive_bytes,
                     &mut inactive_files,
                 );
@@ -237,6 +237,17 @@ fn collect_active_jsonl_prefixes(edges_dir: &Path) -> Vec<String> {
     match crate::manifest::try_load_manifest_index(edges_dir) {
         Ok(idx) => idx
             .active_materialized_paths(edges_dir)
+            .into_iter()
+            .filter_map(|p| p.to_str().map(String::from))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn collect_protected_jsonl_prefixes(edges_dir: &Path) -> Vec<String> {
+    match crate::manifest::try_load_manifest_index(edges_dir) {
+        Ok(idx) => idx
+            .protected_materialized_paths(edges_dir)
             .into_iter()
             .filter_map(|p| p.to_str().map(String::from))
             .collect(),
@@ -523,7 +534,7 @@ fn scan_inactive_snapshots(
     totals: &mut StorageHealthTotals,
     files: &mut Vec<StorageFileInfo>,
 ) {
-    let active_prefixes = collect_active_jsonl_prefixes(edges_dir);
+    let active_prefixes = collect_protected_jsonl_prefixes(edges_dir);
     let mat_dir = crate::manifest::materialized_dir(edges_dir);
     if !mat_dir.is_dir() {
         return;

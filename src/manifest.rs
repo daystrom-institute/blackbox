@@ -214,6 +214,46 @@ impl ManifestIndex {
         paths
     }
 
+    pub fn protected_materialized_paths(&self, edges_dir: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for (project_id, entry) in &self.workspaces {
+            let has_overlay = entry.dirty_overlay.is_some()
+                && materialized_dir(edges_dir)
+                    .join(entry.dirty_overlay.as_ref().unwrap())
+                    .is_dir();
+
+            if has_overlay {
+                let overlay_dir =
+                    materialized_dir(edges_dir).join(entry.dirty_overlay.as_ref().unwrap());
+                append_jsonl_files(&overlay_dir, &mut paths);
+            }
+
+            if let Some(ref snapshot) = entry.active_snapshot {
+                let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
+                if snapshot_dir.is_dir() {
+                    append_jsonl_files(&snapshot_dir, &mut paths);
+                }
+            }
+
+            if let Some(ref repo_mat) = entry.repo_materialization {
+                let repo_dir = materialized_dir(edges_dir).join(repo_mat);
+                if repo_dir.is_dir() {
+                    append_jsonl_files(&repo_dir, &mut paths);
+                }
+            }
+            if entry.active_snapshot.is_none() && !has_overlay {
+                let managed_dir = edges_dir
+                    .join("derived")
+                    .join("project")
+                    .join(format!("{}.jsonl", project_id));
+                if managed_dir.exists() {
+                    paths.push(managed_dir);
+                }
+            }
+        }
+        paths
+    }
+
     pub fn validate(&self, edges_dir: &Path) -> ManifestValidation {
         let mut missing_manifests = Vec::new();
         let mut missing_paths = Vec::new();

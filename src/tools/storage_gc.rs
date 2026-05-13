@@ -24,8 +24,10 @@ pub(crate) struct StorageGcParams {
     /// Prune compact temp files older than 24h. Default true.
     #[serde(default = "default_true")]
     pub prune_temps: bool,
-    /// Prune inactive snapshot dirs not referenced by any manifest. Default true.
-    #[serde(default = "default_true")]
+    /// Prune inactive snapshot dirs not referenced by any manifest. Default
+    /// false; inactive snapshots are reported but not pruned unless explicitly
+    /// enabled. Retention policy (keep_recent/grace) not yet implemented.
+    #[serde(default)]
     pub prune_inactive_snapshots: bool,
     /// Maximum age in days for backup files. If set, backups older than this
     /// are candidates even if they are the newest retained.
