@@ -31,6 +31,13 @@ pub struct Brofile {
     /// inherits without touching global/project config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<McpFilters>,
+    /// When true, inject the workspace-tools appendix into every dispatch
+    /// using this brofile. The appendix teaches the agent to prefer
+    /// workspace-scoped tools (work_smart_read, work_bash, work_git_*)
+    /// over raw filesystem access, falling back to bbox_note(kind=learned)
+    /// when workspace tools are unavailable. Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coerce_workspace: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +435,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            coerce_workspace: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("reviewer", dir.path(), None);
@@ -454,6 +462,7 @@ mod tests {
             model: Some("gpt-5.5".into()),
             effort: Some("medium".into()),
             filters: None,
+            coerce_workspace: None,
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(
@@ -479,6 +488,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            coerce_workspace: None,
         };
         save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
 
@@ -490,6 +500,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            coerce_workspace: None,
         };
         save_brofile(
             &project_bf,
@@ -520,6 +531,7 @@ mod tests {
                 model: None,
                 effort: None,
                 filters: None,
+                coerce_workspace: None,
             };
             save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         }
@@ -540,6 +552,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            coerce_workspace: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
@@ -585,6 +598,7 @@ mod tests {
                 allow: vec![],
                 disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(*)".into()],
             }),
+            coerce_workspace: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("auditor", dir.path(), None).unwrap();
@@ -766,11 +780,56 @@ mod tests {
             model: Some("gpt-5.4-mini".into()),
             effort: Some("low".into()),
             filters: None,
+            coerce_workspace: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
         assert_eq!(loaded.model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(loaded.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn test_brofile_coerce_workspace_round_trip() {
+        let dir = temp_store();
+        let bf = Brofile {
+            name: "ws-worker".into(),
+            provider: Provider::Claude,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: None,
+            coerce_workspace: Some(true),
+        };
+        save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
+        let loaded = resolve_brofile("ws-worker", dir.path(), None).unwrap();
+        assert_eq!(loaded.coerce_workspace, Some(true));
+
+        let bf_off = Brofile {
+            name: "ws-off".into(),
+            provider: Provider::Claude,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: None,
+            coerce_workspace: None,
+        };
+        save_brofile(&bf_off, "global", dir.path(), None).expect("brofile save");
+        let loaded_off = resolve_brofile("ws-off", dir.path(), None).unwrap();
+        assert_eq!(loaded_off.coerce_workspace, None);
+    }
+
+    #[test]
+    fn test_brofile_coerce_workspace_deserializes_from_json() {
+        let json = r#"{
+            "name": "ws-json",
+            "provider": "claude",
+            "coerce_workspace": true
+        }"#;
+        let bf: Brofile = serde_json::from_str(json).unwrap();
+        assert_eq!(bf.name, "ws-json");
+        assert_eq!(bf.coerce_workspace, Some(true));
     }
 
     #[test]

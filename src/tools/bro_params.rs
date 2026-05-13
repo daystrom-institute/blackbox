@@ -39,6 +39,11 @@ pub(crate) struct ExecParams {
     /// agent's tool catalog accordingly.
     #[serde(default)]
     pub(crate) surface: Option<String>,
+    /// Override the brofile's `coerce_workspace` setting for this dispatch.
+    /// When true, injects the workspace-tools appendix into the ambient
+    /// prefix. When false or absent, defers to the brofile setting.
+    #[serde(default)]
+    pub(crate) coerce_workspace: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -72,6 +77,11 @@ pub(crate) struct ResumeParams {
     /// is restricted according to the named surface's routing packet.
     #[serde(default)]
     pub(crate) surface: Option<String>,
+    /// Override the brofile's `coerce_workspace` setting for this resume.
+    /// When true, injects the workspace-tools appendix into the ambient
+    /// prefix. When false or absent, defers to the brofile setting.
+    #[serde(default)]
+    pub(crate) coerce_workspace: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -406,6 +416,10 @@ pub(crate) struct BrofileParams {
     pub(crate) allow_tools: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) disallow_tools: Option<Vec<String>>,
+    /// When true, inject the workspace-tools appendix into every dispatch
+    /// using this brofile. Default off (absent / false).
+    #[serde(default)]
+    pub(crate) coerce_workspace: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

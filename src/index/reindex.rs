@@ -17,7 +17,7 @@ use crate::orchestration::providers::Provider;
 use crate::transcripts::adapters::{
     TranscriptAdapterRegistry, TranscriptReadAdapter, TranscriptScanTarget,
 };
-use crate::transcripts::projection::normalized_to_doc;
+use crate::transcripts::projection::{normalized_to_doc, normalized_to_tool_call_doc};
 use crate::transcripts::types::TranscriptLocation;
 
 const DEFAULT_BACKGROUND_FULL_REINDEX_EVERY_TICKS: u64 = 0;
@@ -577,6 +577,17 @@ fn index_adapter_location(
         };
         writer.add_document(doc)?;
         *indexed_docs += 1;
+        if let Some(tool_doc) = normalized_to_tool_call_doc(
+            event,
+            account,
+            &path_str,
+            location.is_subagent,
+            project_fallback,
+            fields,
+        ) {
+            writer.add_document(tool_doc)?;
+            *indexed_docs += 1;
+        }
     }
 
     meta.insert(path_str, FileMeta { mtime, size });

@@ -15,12 +15,19 @@ impl BlackboxServer {
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let store_dir = self.state.store_dir.clone();
 
-        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) = match self
-            .resolve_exec_target(
-                p.bro.as_deref(),
-                p.provider.as_deref(),
-                p.project_dir.as_deref(),
-            ) {
+        let (
+            provider,
+            lens,
+            exec_opts,
+            env_overrides,
+            cwd,
+            brofile_filters,
+            brofile_coerce_workspace,
+        ) = match self.resolve_exec_target(
+            p.bro.as_deref(),
+            p.provider.as_deref(),
+            p.project_dir.as_deref(),
+        ) {
             Ok(r) => r,
             Err(e) => return Self::err_text(&e),
         };
@@ -35,6 +42,7 @@ impl BlackboxServer {
         } else {
             "pending".to_string()
         };
+        let coerce_workspace = p.coerce_workspace.unwrap_or(brofile_coerce_workspace);
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
@@ -56,6 +64,7 @@ impl BlackboxServer {
             },
             allow_recursion,
             provider: Some(provider),
+            coerce_workspace,
         };
         let final_prompt = orch::apply_brofile_lens(
             &orch::apply_ambient(&p.prompt, &ambient_ctx),
@@ -124,16 +133,24 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let store_dir = self.state.store_dir.clone();
 
-        let (provider, session_id, _lens, exec_opts, env_overrides, cwd, brofile_filters) =
-            match self.resolve_resume_target(
-                p.bro.as_deref(),
-                p.session_id.as_deref(),
-                p.provider.as_deref(),
-                p.project_dir.as_deref(),
-            ) {
-                Ok(r) => r,
-                Err(e) => return Self::err_text(&e),
-            };
+        let (
+            provider,
+            session_id,
+            _lens,
+            exec_opts,
+            env_overrides,
+            cwd,
+            brofile_filters,
+            brofile_coerce_workspace,
+        ) = match self.resolve_resume_target(
+            p.bro.as_deref(),
+            p.session_id.as_deref(),
+            p.provider.as_deref(),
+            p.project_dir.as_deref(),
+        ) {
+            Ok(r) => r,
+            Err(e) => return Self::err_text(&e),
+        };
 
         if !provider.supports_resume() {
             return Self::err_text(&format!("{provider} does not support resume"));
@@ -173,6 +190,7 @@ impl BlackboxServer {
         // contract need to ride with every follow-up (memory-file
         // reinforcement decays at depth). The brofile lens was injected on
         // exec and lives in the transcript — not re-prepended here.
+        let coerce_workspace = p.coerce_workspace.unwrap_or(brofile_coerce_workspace);
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
@@ -194,6 +212,7 @@ impl BlackboxServer {
             },
             allow_recursion,
             provider: Some(provider),
+            coerce_workspace,
         };
         let wrapped_prompt = orch::apply_ambient(&p.prompt, &ambient_ctx);
 
@@ -490,6 +509,7 @@ impl BlackboxServer {
                 }
             };
 
+            let member_coerce_workspace = brofile.coerce_workspace.unwrap_or(false);
             let env_overrides = orchestration::brofile::resolve_provider_env(
                 brofile.provider,
                 brofile.account.as_deref(),
@@ -534,6 +554,7 @@ impl BlackboxServer {
                     },
                     allow_recursion,
                     provider: Some(brofile.provider),
+                    coerce_workspace: member_coerce_workspace,
                 };
                 orch::apply_brofile_lens(
                     &orch::apply_ambient(&p.prompt, &ctx),
@@ -812,6 +833,7 @@ impl BlackboxServer {
             Option<std::collections::HashMap<String, String>>,
             Option<String>,
             Option<orchestration::mcp::McpFilters>,
+            bool,
         ),
         String,
     > {
@@ -845,7 +867,15 @@ impl BlackboxServer {
                     let cwd = project_dir
                         .map(String::from)
                         .or(bro_match.team.project_dir.clone());
-                    return Ok((bf.provider, bf.lens, opts, env, cwd, bf.filters));
+                    return Ok((
+                        bf.provider,
+                        bf.lens,
+                        opts,
+                        env,
+                        cwd,
+                        bf.filters,
+                        bf.coerce_workspace.unwrap_or(false),
+                    ));
                 }
                 None => {
                     // Standalone brofile fallback
@@ -874,6 +904,7 @@ impl BlackboxServer {
                 env,
                 project_dir.map(String::from),
                 bf.filters,
+                bf.coerce_workspace.unwrap_or(false),
             ));
         }
 
@@ -889,6 +920,7 @@ impl BlackboxServer {
                 env,
                 project_dir.map(String::from),
                 None,
+                false,
             ));
         }
 
@@ -911,6 +943,7 @@ impl BlackboxServer {
             Option<std::collections::HashMap<String, String>>,
             Option<String>,
             Option<orchestration::mcp::McpFilters>,
+            bool,
         ),
         String,
     > {
@@ -969,6 +1002,7 @@ impl BlackboxServer {
                 env,
                 cwd,
                 bf.filters,
+                bf.coerce_workspace.unwrap_or(false),
             ));
         }
 
@@ -985,6 +1019,7 @@ impl BlackboxServer {
                 env,
                 project_dir.map(String::from),
                 None,
+                false,
             ));
         }
 

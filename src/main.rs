@@ -154,7 +154,8 @@ impl BlackboxServer {
                 + tools::roster::router()
                 + tools::config::router()
                 + tools::dispatch::router()
-                + tools::mcp_surface::router(),
+                + tools::mcp_surface::router()
+                + tools::workspace::router(),
             surface: std::sync::OnceLock::new(),
         }
     }
@@ -274,7 +275,7 @@ impl BlackboxServer {
 
         // Always use exec-target resolution. The workflow engine owns
         // the project_dir; resume just swaps the provider args call.
-        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters, _coerce_workspace) =
             self.resolve_exec_target(Some(brofile), None, project_dir)?;
 
         if is_resume && !provider.supports_resume() {
@@ -318,6 +319,7 @@ impl BlackboxServer {
             completion_contract: None,
             allow_recursion: false,
             provider: Some(provider),
+            coerce_workspace: false,
         };
         let ambient_prompt = orch::apply_ambient(prompt, &ambient_ctx);
         let mut args = if is_resume {

@@ -544,6 +544,26 @@ other value (not project path, not prose, not \"pending\") into this field>\n\
 The task_id is the primary correlation key and the orchestrator uses it \
 to find your notes.";
 
+/// Workspace-tools appendix injected when `AmbientContext::coerce_workspace`
+/// is true. Teaches agents to prefer workspace-scoped tool surfaces over
+/// raw filesystem access. References the implemented workspace tool surface
+/// (`work_smart_read`, `work_bash`, `work_git_*`) and the safe fallback
+/// (`bbox_note(kind=learned)`) when those tools are not available in a
+/// narrowed tool catalog.
+pub const WORKSPACE_TOOLS_APPENDIX: &str = "\
+[workspace-tools mode]\n\
+You are in workspace-tools mode. Prefer workspace-scoped tool surfaces over \
+raw filesystem access:\n\
+  - Prefer `work_smart_read` over `Read` for file inspection.\n\
+  - Prefer `work_bash` over `Bash` for shell commands.\n\
+  - Prefer `work_git_status` / `work_git_diff` / `work_git_log` over \
+bare `Bash(\"git …\")` invocations.\n\
+When a workspace tool is not available in the current session, fall back to \
+the standard tool and emit `bbox_note(kind=learned, body=\"work_* unavailable, \
+used <standard_tool> as fallback\")` so the orchestrator can track coverage.\n\
+Do NOT implement `work_*` handlers yourself; they are provided by the host.\n\
+Do NOT add new workspace tool names under the `bbox_*` namespace.";
+
 /// Pre-bound context the daemon has at dispatch time but the executor
 /// would otherwise have to infer by reaching back through the prompt.
 /// Emitting these into the prefix lets notes, thread links, and work-
@@ -573,6 +593,12 @@ pub struct AmbientContext {
     #[allow(dead_code)]
     // reserved hook for defense-in-depth text guards; see comment above apply_ambient
     pub provider: Option<providers::Provider>,
+    /// Inject workspace-tools appendix. When true, `apply_ambient` appends
+    /// the WORKSPACE_TOOLS_APPENDIX after the completion contract, teaching
+    /// the agent to prefer work_smart_read / work_bash / work_git_* over
+    /// raw filesystem access. Sourced from brofile `coerce_workspace` or
+    /// per-dispatch ExecParams/ResumeParams override. Default off.
+    pub coerce_workspace: bool,
 }
 
 impl AmbientContext {
@@ -672,6 +698,11 @@ pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
     if let Some(contract) = &ctx.completion_contract {
         prefix.push_str("[completion contract]\n");
         prefix.push_str(contract.trim_end());
+        prefix.push_str("\n\n");
+    }
+
+    if ctx.coerce_workspace {
+        prefix.push_str(WORKSPACE_TOOLS_APPENDIX);
         prefix.push_str("\n\n");
     }
 
@@ -2073,6 +2104,92 @@ mod tests {
         };
         let out = apply_ambient("work", &ctx);
         assert!(!out.contains("[orchestrator]"));
+    }
+
+    #[test]
+    fn coerce_workspace_false_omits_appendix() {
+        let ctx = AmbientContext {
+            coerce_workspace: false,
+            ..Default::default()
+        };
+        let out = apply_ambient("work", &ctx);
+        assert!(
+            !out.contains("[workspace-tools mode]"),
+            "appendix must not appear when coerce_workspace is false"
+        );
+    }
+
+    #[test]
+    fn coerce_workspace_true_injects_workspace_tools_appendix() {
+        let ctx = AmbientContext {
+            coerce_workspace: true,
+            ..Default::default()
+        };
+        let out = apply_ambient("work", &ctx);
+        assert!(
+            out.contains("[workspace-tools mode]"),
+            "appendix header must appear when coerce_workspace is true"
+        );
+        assert!(
+            out.contains("work_smart_read"),
+            "appendix must reference work_smart_read"
+        );
+        assert!(
+            out.contains("work_bash"),
+            "appendix must reference work_bash"
+        );
+        assert!(
+            out.contains("work_git_status"),
+            "appendix must reference work_git_status"
+        );
+        assert!(
+            out.contains("work_git_diff"),
+            "appendix must reference work_git_diff"
+        );
+        assert!(
+            out.contains("work_git_log"),
+            "appendix must reference work_git_log"
+        );
+        assert!(
+            out.contains("bbox_note(kind=learned"),
+            "appendix must reference bbox_note fallback"
+        );
+    }
+
+    #[test]
+    fn workspace_tools_appendix_placed_after_completion_contract() {
+        let ctx = AmbientContext {
+            coerce_workspace: true,
+            completion_contract: Some("do the thing".into()),
+            ..Default::default()
+        };
+        let out = apply_ambient("work", &ctx);
+        let contract_idx = out.find("[completion contract]").unwrap();
+        let ws_idx = out.find("[workspace-tools mode]").unwrap();
+        assert!(
+            contract_idx < ws_idx,
+            "workspace-tools appendix must follow completion contract"
+        );
+    }
+
+    #[test]
+    fn coerce_workspace_true_composes_with_other_ambient_sections() {
+        let ctx = AmbientContext {
+            task_id: Some("task-123".into()),
+            coerce_workspace: true,
+            allow_recursion: true,
+            completion_contract: Some("emit done".into()),
+            provider: Some(providers::Provider::Claude),
+            ..Default::default()
+        };
+        let out = apply_ambient("work", &ctx);
+        assert!(out.contains("[scope]"));
+        assert!(out.contains("[recall before acting]"));
+        assert!(out.contains("[task shape]"));
+        assert!(out.contains("[orchestrator]"));
+        assert!(out.contains("[completion contract]"));
+        assert!(out.contains("[workspace-tools mode]"));
+        assert!(out.contains("work"));
     }
 
     #[test]

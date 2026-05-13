@@ -12,7 +12,7 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g6-symbol-kind-and-ranges";
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g7-transcript-tool-calls";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -99,6 +99,13 @@ pub struct FieldHandles {
     pub commit_author_name: Field,
     #[allow(dead_code)]
     pub commit_author_email: Field,
+    pub tool_server: Field,
+    pub tool_name: Field,
+    pub tool_kind: Field,
+    pub tool_target: Field,
+    pub tool_outcome: Field,
+    pub task_id: Field,
+    pub tool_use_id: Field,
 }
 
 /// Config needed by the background reindex thread.
@@ -538,6 +545,13 @@ impl TranscriptIndex {
             ("commit_sha", self.fields.commit_sha),
             ("commit_author_name", self.fields.commit_author_name),
             ("commit_author_email", self.fields.commit_author_email),
+            ("tool_server", self.fields.tool_server),
+            ("tool_name", self.fields.tool_name),
+            ("tool_kind", self.fields.tool_kind),
+            ("tool_target", self.fields.tool_target),
+            ("tool_outcome", self.fields.tool_outcome),
+            ("task_id", self.fields.task_id),
+            ("tool_use_id", self.fields.tool_use_id),
             ("role", self.fields.role),
         ] {
             if let Some(value) = optional_text(doc, field).filter(|value| !value.is_empty()) {
@@ -627,6 +641,13 @@ pub(crate) fn build_schema() -> (Schema, FieldHandles) {
         repo_id: builder.add_text_field("repo_id", STRING | STORED),
         commit_author_name: builder.add_text_field("commit_author_name", TEXT | STORED),
         commit_author_email: builder.add_text_field("commit_author_email", STRING | STORED),
+        tool_server: builder.add_text_field("tool_server", STRING | STORED),
+        tool_name: builder.add_text_field("tool_name", STRING | STORED),
+        tool_kind: builder.add_text_field("tool_kind", STRING | STORED),
+        tool_target: builder.add_text_field("tool_target", STRING | STORED),
+        tool_outcome: builder.add_text_field("tool_outcome", STRING | STORED),
+        task_id: builder.add_text_field("task_id", STRING | STORED),
+        tool_use_id: builder.add_text_field("tool_use_id", STRING | STORED),
     };
     (builder.build(), fields)
 }

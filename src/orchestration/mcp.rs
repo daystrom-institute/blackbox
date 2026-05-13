@@ -1757,18 +1757,21 @@ mod tests {
     fn default_guard_blocks_bro_only() {
         let global = McpStore::new();
         let eff = resolve_effective(&global, None, true);
-        assert!(eff
-            .filters
-            .disallow
-            .contains(&"mcp__blackbox__bro_exec".to_string()));
-        assert!(eff
-            .filters
-            .disallow
-            .contains(&"mcp__blackbox__bro_resume".to_string()));
-        assert!(!eff
-            .filters
-            .disallow
-            .contains(&"mcp__blackbox__bro_report".to_string()));
+        assert!(
+            eff.filters
+                .disallow
+                .contains(&"mcp__blackbox__bro_exec".to_string())
+        );
+        assert!(
+            eff.filters
+                .disallow
+                .contains(&"mcp__blackbox__bro_resume".to_string())
+        );
+        assert!(
+            !eff.filters
+                .disallow
+                .contains(&"mcp__blackbox__bro_report".to_string())
+        );
     }
 
     #[test]

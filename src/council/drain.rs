@@ -544,6 +544,7 @@ fn build_dispatch(
         completion_contract: None,
         allow_recursion: false,
         provider: Some(bf.provider),
+        coerce_workspace: bf.coerce_workspace.unwrap_or(false),
     };
     let with_ambient = orch::apply_ambient(&body_with_council, &ambient_ctx);
     // Brofile lens (persona) is anchored at turn 1 — `apply_brofile_lens`

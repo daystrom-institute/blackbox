@@ -36,6 +36,7 @@ pub enum ToolCategory {
     Whiteboards,
     Councils,
     Roadmap,
+    Workspace,
 }
 
 impl ToolCategory {
@@ -56,6 +57,7 @@ impl ToolCategory {
             Self::Whiteboards => "Whiteboards",
             Self::Councils => "Councils",
             Self::Roadmap => "Roadmap",
+            Self::Workspace => "Workspace tools",
         }
     }
 
@@ -101,6 +103,9 @@ impl ToolCategory {
             }
             Self::Roadmap => {
                 "Prospective work tracker: designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Inbox is reactive; threads are active work; knowledge is atemporal. The roadmap tracks the future band. Link items to design docs (ROADMAP_DESIGNED_IN) and threads (ROADMAP_SPAWNS). Use `action=\"next\"` to rank accepted items by priority/staleness/blockers, and `action=\"promote\"` to spin a roadmap item into a work thread."
+            }
+            Self::Workspace => {
+                "Instrumented file read, shell execution, and git operations for registered projects. Prefer these over raw Read/Bash/git when working inside a bbox-registered project — every call is indexed as a tool-call record and enriched with bbox context where relevant."
             }
         }
     }
@@ -780,7 +785,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Orchestration,
         summary: "Attach the latest progress report to a task.",
         when_to_use: "Agents and workflow hooks call this at major milestones so bro_dashboard and bro_status show what the task last reported, what it needs, and when it last checked in.",
-        example: Some(r#"bro_report(task_id="...", message="writing tests", needs="review API naming")"#),
+        example: Some(
+            r#"bro_report(task_id="...", message="writing tests", needs="review API naming")"#,
+        ),
     },
     ToolDoc {
         name: "bro_cancel",
@@ -1177,6 +1184,69 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use to follow a council incrementally — call with the last seen sequence to fetch only new posts. Cheaper than `bro_council_open` for long-running observation.",
         example: Some(r#"bro_council_posts(id="council-7f01324e", since_seq=42, limit=50)"#),
     },
+    // ── Workspace tools ──────────────────────────────────────────────
+    ToolDoc {
+        name: "work_tool_calls",
+        category: ToolCategory::Workspace,
+        summary: "Query indexed workspace tool-call records by server, tool_name, glob_pattern, tool_kind, target, project, and time. Rows preserve (server, tool_name) identity.",
+        when_to_use: "Use to answer recent tool-use questions. Filter by server + tool_name for one tool, or glob_pattern for families like `work_git_*`.",
+        example: Some(
+            r#"work_tool_calls(server="blackbox", tool_kind="bash", project="/repo/x", limit=20)"#,
+        ),
+    },
+    ToolDoc {
+        name: "work_smart_read",
+        category: ToolCategory::Workspace,
+        summary: "Read a file with stable line numbers and optional bounded bbox overlays. Use offset/limit to window large files; set enrich=false for plain reads.",
+        when_to_use: "Use instead of raw Read on registered-project files when line citations or related notes may matter.",
+        example: Some(r#"work_smart_read(file_path="/repo/x/src/main.rs", offset=0, limit=100)"#),
+    },
+    ToolDoc {
+        name: "work_bash",
+        category: ToolCategory::Workspace,
+        summary: "Run a shell command in an explicit cwd with 32KB output caps and a timeout. Returns exit_code, stdout, stderr, and outcome.",
+        when_to_use: "Use instead of raw Bash inside a registered project. `cwd` is required; `task_id` correlates the call to a dispatch task.",
+        example: Some(
+            r#"work_bash(command="cargo test --bin blackboxd", cwd="/repo/x", timeout_secs=120)"#,
+        ),
+    },
+    ToolDoc {
+        name: "work_git_status",
+        category: ToolCategory::Workspace,
+        summary: "Structured git status for a repository: branch, staged/unstaged/untracked files, and clean flag.",
+        when_to_use: "Use before committing or dispatching a writer; the clean flag is easy to gate on.",
+        example: Some(r#"work_git_status(repo="/repo/x")"#),
+    },
+    ToolDoc {
+        name: "work_git_log",
+        category: ToolCategory::Workspace,
+        summary: "Structured git commit log with sha, parents, author, date, and subject. Default limit is 20, max 200.",
+        when_to_use: "Use for branch orientation before edits; JSON output is easier to parse than raw git log.",
+        example: Some(r#"work_git_log(repo="/repo/x", limit=10)"#),
+    },
+    ToolDoc {
+        name: "work_git_diff",
+        category: ToolCategory::Workspace,
+        summary: "Structured git diff for working tree or staged changes, optionally path-restricted, with 32KB output cap.",
+        when_to_use: "Use to review changes before committing or verify that an edit produced the expected delta.",
+        example: Some(r#"work_git_diff(repo="/repo/x", staged=true)"#),
+    },
+    ToolDoc {
+        name: "work_git_show",
+        category: ToolCategory::Workspace,
+        summary: "Show one commit by hex SHA with metadata and diff, capped at 32KB.",
+        when_to_use: "Use to inspect a specific commit returned by `work_git_log`. SHA is validated as hex-only before use to prevent injection.",
+        example: Some(r#"work_git_show(repo="/repo/x", sha="abc123def456")"#),
+    },
+    ToolDoc {
+        name: "work_git_commit",
+        category: ToolCategory::Workspace,
+        summary: "Stage and commit files, rejecting sensitive paths before staging. Omitting files stages tracked modifications only; never pushes.",
+        when_to_use: "Use when an executor needs to commit. Supply `task_id` for a done note; prefer explicit files for scoped changes.",
+        example: Some(
+            r#"work_git_commit(repo="/repo/x", message="fix: correct off-by-one in parser", files=["src/parser.rs"], task_id="task-abc")"#,
+        ),
+    },
     // ── Roadmap ─────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_roadmap",
@@ -1365,6 +1435,7 @@ pub fn render_markdown() -> String {
         ToolCategory::Whiteboards,
         ToolCategory::Councils,
         ToolCategory::Roadmap,
+        ToolCategory::Workspace,
     ];
 
     for cat in categories {
@@ -1652,6 +1723,7 @@ mod tests {
                     || n.starts_with("bro_")
                     || n.starts_with("badgey_")
                     || n.starts_with("whiteboard_")
+                    || n.starts_with("work_")
                 {
                     out.push((n, d));
                 }

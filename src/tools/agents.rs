@@ -728,6 +728,7 @@ impl BlackboxServer {
             completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
             allow_recursion: false,
             provider: Some(provider),
+            coerce_workspace: false,
         };
         let final_prompt =
             orch::apply_brofile_lens(&orch::apply_ambient(&prompt, &ambient_ctx), lens.as_deref());

@@ -25,3 +25,4 @@ pub mod sessions;
 pub mod threads;
 pub mod transcripts;
 pub mod whiteboards;
+pub mod workspace;

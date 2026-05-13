@@ -246,6 +246,7 @@ impl BlackboxServer {
                     model: p.model.clone(),
                     effort: p.effort.clone(),
                     filters,
+                    coerce_workspace: p.coerce_workspace,
                 };
                 if let Err(e) =
                     brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref())
@@ -780,6 +781,7 @@ Next step: <one concrete steering suggestion>\n",
                     completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
                     allow_recursion: false,
                     provider: Some(provider),
+                    coerce_workspace: brofile.coerce_workspace.unwrap_or(false),
                 };
                 let wrapped_prompt = orch::apply_ambient(&prompt, &ambient_ctx);
                 let mut args =
@@ -837,6 +839,7 @@ Next step: <one concrete steering suggestion>\n",
                     completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
                     allow_recursion: false,
                     provider: Some(provider),
+                    coerce_workspace: brofile.coerce_workspace.unwrap_or(false),
                 };
                 let wrapped_prompt = orch::apply_brofile_lens(
                     &orch::apply_ambient(&prompt, &ambient_ctx),

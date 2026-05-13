@@ -89,6 +89,7 @@ fn save_test_brofile(tmp: &tempfile::TempDir, name: &str) {
             model: None,
             effort: None,
             filters: None,
+            coerce_workspace: None,
         },
         "global",
         &tmp.path().join("bro"),
@@ -109,6 +110,7 @@ fn save_badgey_test_brofile(tmp: &tempfile::TempDir) {
                 allow: Vec::new(),
                 disallow: vec!["mcp__blackbox__bro_*".to_string()],
             }),
+            coerce_workspace: None,
         },
         "global",
         &tmp.path().join("bro"),
@@ -1688,7 +1690,7 @@ fn resolve_resume_target_accepts_scoped_team_bro_selector() {
         );
     }
 
-    let (provider, session_id, _lens, _opts, _env, cwd, _filters) = server
+    let (provider, session_id, _lens, _opts, _env, cwd, _filters, _coerce_ws) = server
         .resolve_resume_target(Some("blue::reviewer"), None, None, None)
         .unwrap();
     assert_eq!(provider, Provider::Gemini);
@@ -3777,6 +3779,7 @@ fn bro_agent_describe_brofile_ref_resolved() {
             ],
             disallow: vec!["mcp__blackbox__bro_exec".into()],
         }),
+        coerce_workspace: None,
     };
     orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
     let manifest = serde_json::json!({
@@ -5341,7 +5344,10 @@ fn bro_report_surfaces_latest_task_report() {
         report_body["report"]["needs"].as_str(),
         Some("review API naming")
     );
-    assert_eq!(report_body["report"]["data"]["phase"].as_str(), Some("test"));
+    assert_eq!(
+        report_body["report"]["data"]["phase"].as_str(),
+        Some("test")
+    );
     assert!(report_body["report"]["reportedAt"].as_u64().is_some());
     assert!(report_body["report"]["reportedAgo"].as_str().is_some());
 
@@ -5362,10 +5368,7 @@ fn bro_report_surfaces_latest_task_report() {
         entry["report"]["message"].as_str(),
         Some("writing focused tests")
     );
-    assert_eq!(
-        entry["report"]["needs"].as_str(),
-        Some("review API naming")
-    );
+    assert_eq!(entry["report"]["needs"].as_str(), Some("review API naming"));
 
     let status = server.bro_status(Parameters(StatusParams {
         task_id: task_id.clone(),

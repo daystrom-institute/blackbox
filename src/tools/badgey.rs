@@ -126,7 +126,7 @@ impl BlackboxServer {
         String,
     > {
         let store_dir = self.state.store_dir.clone();
-        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters, _coerce_workspace) =
             self.resolve_exec_target(Some("badgey-persona"), None, Some(&scope.project_id))?;
 
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -153,6 +153,7 @@ impl BlackboxServer {
             completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
             allow_recursion: false,
             provider: Some(provider),
+            coerce_workspace: false,
         };
         let final_prompt =
             orch::apply_brofile_lens(&orch::apply_ambient(&prompt, &ambient_ctx), lens.as_deref());
@@ -508,8 +509,15 @@ impl BlackboxServer {
             .resolve_session_cwd(&instance.provider_session_id)
             .map(|p| p.to_string_lossy().into_owned())
             .or_else(|| Some(instance.scope.project_id.clone()));
-        let (provider, _lens, exec_opts, env_overrides, _resolved_cwd, brofile_filters) =
-            self.resolve_exec_target(Some("badgey-persona"), None, cwd.as_deref())?;
+        let (
+            provider,
+            _lens,
+            exec_opts,
+            env_overrides,
+            _resolved_cwd,
+            brofile_filters,
+            _coerce_workspace,
+        ) = self.resolve_exec_target(Some("badgey-persona"), None, cwd.as_deref())?;
         let scope_bind =
             self.badgey_scope_bind(&id, &instance.thread_of_record_id, &instance.scope);
         let wrapped_user_prompt = format!("{scope_bind}\n{prompt}");
@@ -530,6 +538,7 @@ impl BlackboxServer {
             completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
             allow_recursion: false,
             provider: Some(provider),
+            coerce_workspace: false,
         };
         let final_prompt = orch::apply_ambient(&wrapped_user_prompt, &ambient_ctx);
         let mut args = provider.build_resume_args(
@@ -1234,7 +1243,7 @@ impl BlackboxServer {
         work_item_id: Option<&str>,
         label: Option<String>,
     ) -> Result<Arc<orch::Task>, String> {
-        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters, _coerce_workspace) =
             self.resolve_exec_target(Some(brofile), None, Some(project_dir))?;
         let session_id = "pending".to_string();
         let ambient_ctx = orch::AmbientContext {
@@ -1254,6 +1263,7 @@ impl BlackboxServer {
             completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
             allow_recursion: false,
             provider: Some(provider),
+            coerce_workspace: false,
         };
         let final_prompt =
             orch::apply_brofile_lens(&orch::apply_ambient(prompt, &ambient_ctx), lens.as_deref());
