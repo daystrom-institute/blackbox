@@ -1,7 +1,31 @@
 # Refactor Compound Runs
 
 Date: 2026-05-07
-Status: proposal
+Status: **partially implemented** (updated 2026-05-13)
+
+## Implementation Status
+
+The core compound runner is shipped. Several sections below describe features
+that are implemented differently or not yet built. This status table summarizes
+the gaps; details are inline in each section.
+
+| Feature | Status | Notes |
+|---|---|---|
+| `bbox_refactor_run` tool | **Done** | `src/refactor/mod.rs:1665`, `src/tools/refactor.rs:60` |
+| `RefactorRunStep` enum (Plan + Command) | **Done** | `src/refactor/mod.rs:618`; Command extended beyond design with `capture`, `on_failure`, `touches` |
+| `dry_run` / `confirm` modes | **Done** (single mode) | Single `confirm` flag on input, `dry_run` computed on response. No projected dry-run planning. |
+| Structured diagnostics | **Done** | `RustcDiagnostic`, `CapturedDiagnosticsSummary`, `ParseValidationResult`, `ObligationReport` |
+| `allow_dirty_worktree` / `allow_unregistered_paths` | **Done** | `RefactorRunParams` fields |
+| Transactional rollback (snapshot-based) | **Done** | File-level snapshots before each step, rollback on failure. In-place only, no temp worktree. |
+| LSP rename | **Done** as plan kind | `rust_lsp_rename` plan kind (`src/refactor/rust.rs:1144`), not a dedicated step variant |
+| Import handling | **Done** differently | `rust_organize_imports` (LSP), `rust_minimize_imports` (tree-sitter), `rust_compile_fix_round` (diagnostic-driven repair) — not the dedicated step variants below |
+| Step expansion macros | **Done** (not in design) | `split_rust_impl_methods_to_submodule`, `migrate_rust_mods_to_lib`, `rust_minimize_imports` auto-expanded inside runs |
+| Obligation/repair pipeline | **Done** (not in design) | `ContinueForRepair` on-failure mode opens obligations; later steps consume them. |
+| `SourceProvider` trait / projected filesystem | **Not built** | Critical for accurate multi-step dry-run; currently each step plans against disk |
+| `temp_worktree` execution mode | **Not built** | All runs in-place with snapshot rollback |
+| `bbox_refactor_run_status` / `bbox_refactor_run_resume` | **Not built** | No run persistence; runs synchronous, return inline |
+| Dedicated `LspRename` / `ImportRepair` step variants | **Not built** | Implemented as plan kinds instead. See discussion in Symbolic Rename section. |
+| Run record persistence | **Not built** | No `~/.local/state/blackbox/runs/` |
 
 ## Problem
 
@@ -22,6 +46,10 @@ pull apart a broad patch, integrate the moved pieces, run semantic gates, and
 return a reviewable result without losing rollback discipline.
 
 ## Proposal
+
+> **Implemented.** `bbox_refactor_run` is live with `title`, `project_dir`,
+> `steps[]`, `confirm`, `allow_dirty_worktree`, `allow_unregistered_paths`.
+> The example below is accurate to the shipped API shape.
 
 Add a compound runner over existing primitive refactor plans:
 
@@ -78,9 +106,9 @@ this design.
 
 Initial tools:
 
-- `bbox_refactor_run`: dry-run or confirmed execution
-- `bbox_refactor_run_status`: inspect a saved run record
-- `bbox_refactor_run_resume`: amend a failed run with additional steps
+- `bbox_refactor_run`: dry-run or confirmed execution **[done]**
+- `bbox_refactor_run_status`: inspect a saved run record **[not built]**
+- `bbox_refactor_run_resume`: amend a failed run with additional steps **[not built]**
 
 The runner should not replace primitive plans. It should compose them and
 preserve each step's reviewability. The output is a compound plan with step
@@ -88,6 +116,14 @@ metadata, merged file edits, expected touched files, rollback scope, and a
 diagnostic trail.
 
 ## Execution Model
+
+> **Partially implemented.** The shipped runner has `confirm=true`/`false` but
+> does NOT have a projected filesystem. When `confirm=false`, each step is
+> planned independently against the original disk state — step N does not see
+> the projected output of steps 1..N-1. When `confirm=true`, steps are applied
+> sequentially to disk, so later confirmed steps do see prior writes. The
+> projected filesystem described below remains a key correctness gap for
+> multi-step dry-run.
 
 `bbox_refactor_run` has two modes:
 
@@ -110,6 +146,10 @@ trait SourceProvider {
 }
 ```
 
+> **Not implemented.** All primitive planners read from disk. The `SourceProvider`
+> abstraction is the prerequisite for projected dry-run planning and should be
+> the first piece built if this section is pursued.
+
 The MCP primitive tools can keep reading from disk. The compound runner uses a
 projected provider that layers prior step outputs over disk. This avoids
 teaching every primitive planner about transactions while still making them
@@ -120,6 +160,11 @@ Step N's byte offsets are valid against the projected text produced by steps
 1..N-1. V1 should preserve per-step `FileEdit`s and apply them in order. A
 later optimizer can rebase edits back to original coordinates, but the first
 correct model is sequential application.
+
+> **Implemented differently for confirmed runs.** The shipped runner applies
+> each step's edits to disk immediately after planning, then snapshots for
+> rollback. Sequential composition is implicit via the live filesystem. For
+> dry-run, edits are collected per-step but planned against original disk.
 
 Minimum internal model:
 
@@ -137,7 +182,14 @@ enum RunStep {
     LspRename(RenameParams),
     ImportRepair(ImportRepairParams),
 }
+```
 
+> **Shipped shape differs.** The actual types are:
+> - `RefactorRunParams` (input: `src/refactor/mod.rs:562`) — no `validations` field
+> - `RefactorRunStep` enum (lines 618–660) — two variants: `Plan { params, optional }` and `Command { command, args, cwd, touches, required, capture, on_failure }`. The Command variant is richer than the design: `CaptureSpec` enables `cargo --message-format=json` parsing, `OnFailure` adds `ContinueForRepair` beyond the design's boolean `required`, and `touches` declares files the command may mutate for rollback.
+> - `LspRename` and `ImportRepair` are NOT dedicated variants; they are plan kinds dispatched through `RefactorRunStep::Plan`. See discussion in Symbolic Rename and Import Repair sections.
+
+```rust
 struct RefactorRunPlan {
     title: String,
     semantic_status: SemanticStatus,
@@ -149,11 +201,31 @@ struct RefactorRunPlan {
 }
 ```
 
+> **Shipped as `RefactorRunResponse`** (`src/refactor/mod.rs:877`): combines run-level
+> status with step reports. Fields: `status`, `title`, `dry_run`, `steps`, `files_written`,
+> `rolled_back`, `error`, `rollback_errors`, `obligations`. Step reports are
+> `RefactorRunStepReport` (line 895): `index`, `op`, `status`, `kind`, `title`, `files`,
+> `validations`, `error`, `captured_diagnostics_summary`.
+
 The first implementation can be strict: all primitive plans must be Rust plans,
 and all writes must remain under either registered projects or
 `allow_unregistered_paths=true` practice roots.
 
 ## Transaction Semantics
+
+> **Implemented differently.** The shipped runner uses in-place execution with
+> file-level snapshots for rollback, not the two-phase temp-worktree model
+> described below. Each confirmed step: (1) snapshots files it will touch,
+> (2) plans and applies writes, (3) parse-validates written files. On any
+> required-step failure, all prior snapshots are restored in reverse order.
+>
+> This works but has a narrower safety guarantee: if the rollback itself fails
+> (e.g. a snapshot restore hits a permissions error), the tree can be left in a
+> partial state. The temp-worktree model below would avoid this by never mutating
+> the caller's tree until a fully validated diff exists.
+>
+> The temp-worktree model remains the target for high-confidence autonomous
+> operation, especially when LSP or semantic tool steps are involved.
 
 The compound runner should use a two-phase apply in a temporary worktree by
 default:
@@ -189,10 +261,43 @@ should only know how to compose refactor steps and transaction boundaries. A
 future validation surface can attach command/profile steps with declared
 read/write sets.
 
+> **Command steps are implemented** with richer semantics than the design
+> proposes. The shipped `RefactorRunStep::Command` has:
+> - `capture: Option<CaptureSpec>` — parses `cargo --message-format=json` output into structured `RustcDiagnostic`s, stashed in a `RunCaptureContext` for downstream repair steps
+> - `on_failure: Option<OnFailure>` — three modes: `Required` (rollback), `Optional` (continue), `ContinueForRepair` (open obligation, continue)
+> - `touches: Vec<String>` — declared mutable paths snapshotted for rollback
+>
+> The design's concern about not hardcoding language-specific commands is
+> respected: the runner executes generic shell commands. The `CaptureSpec` enum
+> is the only language-aware piece, and it is open to future variants (clippy
+> JSON, miri, etc.).
+
 Compound runs do not commit. They leave a validated worktree diff for the user
 or orchestrator to commit at an explicit milestone.
 
 ## Symbolic Rename
+
+> **Implemented as plan kind `rust_lsp_rename`**, not as a dedicated
+> `RefactorRunStep` variant. The implementation (`src/refactor/rust.rs:1144`)
+> uses rust-analyzer via LSP `textDocument/rename`, converts `WorkspaceEdit`
+> into `FileEdit`s, and sets `semantic_status: LspVerified`. Tested at
+> `src/refactor/tests.rs:3346`.
+>
+> The agent-facing API uses `item_names`/`old_text`/`new_text` on
+> `RefactorPlanParams` instead of the `position`/`new_name` selectors below.
+> The workspace-edit scoping rules and empty-edit failure semantics described
+> below are partially implemented — the LSP rename does scope edits and rejects
+> out-of-project changes.
+>
+> **Should this become a dedicated step variant?** The current plan-kind
+> approach works but has a latent scheduling constraint that matters if projected
+> filesystem or temp worktree mode lands. Structural tree-sitter plans can
+> operate against in-memory projected text; LSP rename needs a running language
+> server seeing real files (or a temp worktree). A dedicated `LspRename` variant
+> could encode "I need a real filesystem" as a typed scheduling hint, which the
+> generic plan-kind dispatch can't express cleanly. Recommendation: keep the
+> plan-kind approach until projected FS or temp worktree is implemented, then
+> extract into a first-class variant at that point.
 
 Tree-sitter should not own semantic rename. Add an LSP-backed step type:
 
@@ -249,6 +354,30 @@ as a semantic rename.
 
 ## Import Repair and Optimization
 
+> **Implemented differently.** The design's dedicated `rust_import_repair` and
+> `rust_import_prune` step types are not built. Instead, three plan kinds cover
+> the same surface area:
+>
+> - **`rust_organize_imports`** (`src/refactor/rust.rs:1210`): LSP-backed
+>   `source.organizeImports` via rust-analyzer. Covers the "organize/optimize
+>   imports" use case that `rust_import_prune` would have served.
+> - **`rust_minimize_imports`** (`src/refactor/rust_minimize_imports.rs`):
+>   Tree-sitter-based conservative wildcard-import replacement. Auto-expanded
+>   as a follow-up step inside `bbox_refactor_run` when certain extraction plan
+>   kinds are used.
+> - **`rust_compile_fix_round`** (`src/refactor/rust_compile_fix.rs`):
+>   Diagnostic-driven repair: classifies rustc diagnostics from `cargo check
+>   --message-format=json` output into repair plans. This is the closest thing
+>   to `rust_import_repair` — it reads compiler errors including unresolved
+>   imports and proposes fixes. Integrated into the run loop as a repair hook
+>   via the `ContinueForRepair` on-failure mode and obligation pipeline.
+>
+> The same scheduling-constraint argument from Symbolic Rename applies here:
+> these operations need a real filesystem (or temp worktree) for the LSP and
+> compiler to operate correctly. Dedicated step variants would encode that
+> constraint, but the plan-kind approach is adequate until projected FS or temp
+> worktree mode lands.
+
 Import repair should also be semantic-backed. Tree-sitter can remove exact
 syntactic imports, but it cannot know the canonical path for a moved symbol.
 
@@ -278,6 +407,22 @@ validation. If the language backend cannot produce exact ranges, it reports a
 follow-up instead of editing.
 
 ## Diagnostics Loop
+
+> **Largely implemented.** Structured diagnostics are emitted via
+> `RustcDiagnostic` (parsed from `cargo --message-format=json`), per-step
+> `CapturedDiagnosticsSummary`, and `ParseValidationResult`. Full diagnostic
+> bodies are intentionally omitted from MCP responses (size budget) — only
+> aggregate counts surface in summaries.
+>
+> The obligation/repair pipeline (`ContinueForRepair` + `ObligationReport`)
+> provides the autonomous repair bridge the design describes: a soft-failed
+> command step opens a repair obligation, and a later `rust_compile_fix_round`
+> step can consume it. This is richer than the design's "V1 should stop at
+> structured diagnostics" baseline.
+>
+> **Not implemented:** `bbox_refactor_run_resume`. Runs are synchronous with no
+> persistence. The resumability described below — starting from original pre-run
+> state with amended steps — remains unbuilt.
 
 Compound runs should emit structured diagnostics, not only command text:
 
@@ -313,6 +458,11 @@ agent loops.
 
 ## Temporary Worktree Mode
 
+> **Not implemented.** All runs execute in-place with snapshot-based rollback.
+> The two-phase model below remains the target for high-confidence autonomous
+> operation. The `execution_mode` parameter does not exist on
+> `RefactorRunParams`.
+
 For high-confidence autonomy, compound runs should default to:
 
 ```text
@@ -336,6 +486,10 @@ Run records live under the daemon state directory:
 ~/.local/state/blackbox/runs/<run-id>/
 ```
 
+> **Not implemented.** No run records are persisted. The `plan_slot.rs` module
+> references `refactor/runs/` as a future path but the directory and persistence
+> layer do not exist.
+
 A run record stores the input steps, starting git commit, project root, final
 status, structured diagnostics, and the validated diff on success. Temporary
 worktrees can be deleted after success/failure. Run metadata should default to a
@@ -344,16 +498,18 @@ TTL expires.
 
 ## MVP
 
+> **The MVP is shipped.** Items marked with [x] are done; [ ] remain.
+
 The first useful version does not need LSP. It should implement:
 
-- `bbox_refactor_run` with `dry_run`, `confirm`, `allow_dirty_worktree`, and
+- [x] `bbox_refactor_run` with `dry_run`, `confirm`, `allow_dirty_worktree`, and
   `allow_unregistered_paths`
-- primitive-plan steps for existing plan kinds
-- projected filesystem planning
-- sequential per-step edit composition
-- temporary-worktree execution and validated diff replay
-- no resume yet
-- no diagnostic-to-repair suggestions yet
+- [x] primitive-plan steps for existing plan kinds
+- [ ] projected filesystem planning
+- [x] sequential per-step edit composition (via in-place disk writes for confirmed runs)
+- [ ] temporary-worktree execution and validated diff replay
+- [x] no resume yet
+- [x] no diagnostic-to-repair suggestions yet (but the obligation pipeline goes further)
 
 The benchmark fixtures for compound runs should be scenarios, not isolated
 single-op tests. A useful fixture exercises at least two primitive plan steps so
@@ -362,10 +518,10 @@ prove.
 
 Then add:
 
-- generic validation/profile surface with declared read/write sets
-- rust-analyzer-backed `lsp_rename`
-- rust-analyzer-backed import repair
-- language-specific diagnostic parsing into structured diagnostics
+- [ ] generic validation/profile surface with declared read/write sets
+- [x] rust-analyzer-backed `lsp_rename` (as plan kind `rust_lsp_rename`)
+- [x] rust-analyzer-backed import repair (as `rust_organize_imports` + `rust_compile_fix_round` plan kinds)
+- [x] language-specific diagnostic parsing into structured diagnostics
 
 ## Open Questions
 
