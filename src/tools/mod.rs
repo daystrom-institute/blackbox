@@ -23,6 +23,7 @@ pub mod render;
 pub mod roadmap;
 pub mod roster;
 pub mod sessions;
+pub mod storage_health;
 pub mod threads;
 pub mod transcripts;
 pub mod whiteboards;

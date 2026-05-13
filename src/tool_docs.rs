@@ -36,6 +36,7 @@ pub enum ToolCategory {
     Whiteboards,
     Councils,
     Roadmap,
+    StorageHealth,
     Workspace,
 }
 
@@ -57,6 +58,7 @@ impl ToolCategory {
             Self::Whiteboards => "Whiteboards",
             Self::Councils => "Councils",
             Self::Roadmap => "Roadmap",
+            Self::StorageHealth => "Storage health",
             Self::Workspace => "Workspace tools",
         }
     }
@@ -104,6 +106,7 @@ impl ToolCategory {
             Self::Roadmap => {
                 "Prospective work tracker: designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Inbox is reactive; threads are active work; knowledge is atemporal. The roadmap tracks the future band. Link items to design docs (ROADMAP_DESIGNED_IN) and threads (ROADMAP_SPAWNS). Use `action=\"next\"` to rank accepted items by priority/staleness/blockers, and `action=\"promote\"` to spin a roadmap item into a work thread."
             }
+            Self::StorageHealth => "Read-only storage inventory for edge sidecar hygiene.",
             Self::Workspace => {
                 "Instrumented file read, shell execution, and git operations for registered projects. Prefer these over raw Read/Bash/git when working inside a bbox-registered project — every call is indexed as a tool-call record and enriched with bbox context where relevant."
             }
@@ -118,6 +121,7 @@ fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
         ToolCategory::Orchestration => Some("sm-bro-dispatch-patterns"),
         ToolCategory::Workflows => Some("sm-workflow-orchestration"),
         ToolCategory::Whiteboards => Some("sm-whiteboards"),
+        ToolCategory::StorageHealth => Some("sm-storage-health"),
         _ => None,
     }
 }
@@ -1343,6 +1347,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Manage the bbox roadmap — a prospective work tracker for designed-but-not-implemented features, refactors, explorations, tech debt, and risks. Inbox is reactive (surprises, blockages); threads are active work; knowledge is atemporal. The roadmap tracks the *future*: accepted items awaiting promotion, deferred items with provenance, and proposed ideas awaiting review. Items link to design docs via ROADMAP_DESIGNED_IN edges and to threads via ROADMAP_SPAWNS edges. Status lifecycle: proposed → accepted → delivered (shipped) or rejected; accepted → deferred → accepted.",
         when_to_use: "Use when planning future work, reviewing what's been designed but not yet built, or deciding what to work on next. `action=\"next\"` ranks accepted items by priority, staleness, blockers, and design-link health. `action=\"promote\"` opens a bbox_thread with the item's context injected. Link to design docs (designed_in) and threads (spawns / deferred_from). `action=\"render\"` emits a Tera-templated markdown artifact; pass `template` (inline Tera source) or `template_path` to customise layout and which statuses are included — `delivered`/`rejected` are excluded from the default template. `action=\"default_template\"` returns the built-in Tera source as a starting point.",
         example: Some(r#"bbox_roadmap(action="next", n=5)"#),
+    },
+    // ── Storage health ──────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_storage_health",
+        category: ToolCategory::StorageHealth,
+        summary: "Read-only edge sidecar inventory. Totals by kind; include_files=true for rows.",
+        when_to_use: "Sidecar disk usage.",
+        example: None,
     },
 ];
 

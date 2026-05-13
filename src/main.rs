@@ -57,6 +57,7 @@ mod server;
 mod slack_channel_bindings;
 mod slack_proposal_links;
 mod slack_thread_store;
+mod storage_health;
 mod system_memory;
 mod template;
 #[cfg(test)]
@@ -156,6 +157,7 @@ impl BlackboxServer {
                 + tools::config::router()
                 + tools::dispatch::router()
                 + tools::mcp_surface::router()
+                + tools::storage_health::router()
                 + tools::workspace::router(),
             surface: std::sync::OnceLock::new(),
         }
