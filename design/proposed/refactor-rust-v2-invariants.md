@@ -48,16 +48,21 @@ when `agent`, runner enforces the allowlist server-side.
 Pairs with V1 — both gate on dispatch-origin metadata that the
 agents-impl skeleton is the natural producer of.
 
-### RX-C1 multi-round compile-fix loop semantics
+### RX-C1 multi-round compile-fix loop semantics (resolved)
 
 Source: `design/archive/refactor-rust-expansion-impl.md` non-goals.
 
-Open question deferred from the RX-C1 ship: under what termination
-condition does a compile-fix round loop? Current v1 ships single-round
-repair driven by `continue_for_repair` + obligations. Multi-round is
-viable but the termination criterion (fixed-point on rustc diagnostics?
-budget on iterations? operator-acknowledged "give up"?) was left open
-deliberately.
+Resolved: diagnostics-settling fixed-point with a hard iteration cap.
+Each round classifies diagnostics into fixes, applies them, re-runs
+`cargo check`. If the diagnostic set is unchanged between rounds (same
+codes + spans), the loop has settled — stop. A hard cap (e.g. 5 rounds)
+prevents infinite loops on pathological cases. This is deterministic,
+requires no operator input, and naturally stops when the fixer either
+resolves everything or can't make further progress.
+
+Current v1 ships single-round repair driven by `continue_for_repair` +
+obligations. The multi-round loop wrapping that single-round primitive
+is the v2 work.
 
 ### Cargo-semver-checks integration (RX-G2)
 
