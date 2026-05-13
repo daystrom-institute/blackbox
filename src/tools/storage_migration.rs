@@ -13,6 +13,7 @@ pub(crate) struct StorageMigrationParams {
     #[serde(default = "default_true")]
     pub dry_run: bool,
     /// Optional project filter: project_id, canonical_path, or absolute path.
+    /// Required for apply mode (dry_run=false).
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -42,7 +43,7 @@ impl BlackboxServer {
             if p.dry_run {
                 let mut results = Vec::new();
                 let targets =
-                    resolve_migration_targets(&registered, &edges_dir, p.project.as_deref());
+                    resolve_dry_run_targets(&registered, &edges_dir, p.project.as_deref());
                 for project_id in targets {
                     match crate::edge_index::plan_legacy_edge_extraction(&edges_dir, &project_id) {
                         Ok(plan) => {
@@ -62,31 +63,38 @@ impl BlackboxServer {
                 }))?);
             }
 
-            let mut results = Vec::new();
-            let targets = resolve_migration_targets(&registered, &edges_dir, p.project.as_deref());
-            for project_id in targets {
-                match crate::migration::apply_migration(&edges_dir, &project_id) {
-                    Ok(manifest) => {
-                        results.push(serde_json::to_value(&manifest).unwrap_or_default());
+            let Some(ref project) = p.project else {
+                anyhow::bail!("apply mode requires a project parameter");
+            };
+            let project_id = {
+                let guard = self.state.projects.read();
+                match guard.resolve(project) {
+                    Ok(Some(record)) if registered.contains(&record.project_id) => {
+                        record.project_id
                     }
-                    Err(err) => {
-                        let mut obj = serde_json::Map::new();
-                        obj.insert("project_id".into(), serde_json::Value::String(project_id));
-                        obj.insert("error".into(), serde_json::Value::String(err.to_string()));
-                        results.push(serde_json::Value::Object(obj));
+                    _ => {
+                        if registered.contains(project) {
+                            project.clone()
+                        } else {
+                            anyhow::bail!(
+                                "project '{}' is not registered; apply requires a registered project",
+                                project
+                            )
+                        }
                     }
                 }
-            }
+            };
+            let manifest = crate::migration::apply_migration(&edges_dir, &project_id)?;
 
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "mode": "apply",
-                "migrations": results,
+                "migration": manifest,
             }))?)
         })
     }
 }
 
-fn resolve_migration_targets(
+fn resolve_dry_run_targets(
     registered: &std::collections::HashSet<String>,
     edges_dir: &Path,
     project_filter: Option<&str>,
@@ -95,12 +103,7 @@ fn resolve_migration_targets(
         if registered.contains(filter) {
             return vec![filter.to_string()];
         }
-        for pid in registered {
-            if pid.starts_with(&filter[..filter.len().min(8)]) {
-                return vec![pid.clone()];
-            }
-        }
-        return vec![filter.to_string()];
+        return Vec::new();
     }
 
     let mut targets = Vec::new();

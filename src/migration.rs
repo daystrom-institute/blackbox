@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -88,17 +88,7 @@ pub fn extract_legacy_sidecar(edges_dir: &Path, project_id: &str) -> Result<Extr
         return Ok(ExtractionResult::default());
     }
 
-    let managed_project = edges_dir
-        .join("derived")
-        .join("project")
-        .join(format!("{project_id}.jsonl"))
-        .exists();
-    let managed_git = edges_dir
-        .join("derived")
-        .join("git")
-        .join(format!("{project_id}.jsonl"))
-        .exists();
-    let has_replacement = managed_project || managed_git;
+    let has_replacement = has_managed_replacement(edges_dir, project_id);
 
     let mut result = ExtractionResult::default();
     let file = fs::File::open(&legacy_path)?;
@@ -205,10 +195,34 @@ pub fn generate_migration_id(project_id: &str, source_hash: &str) -> String {
     )
 }
 
+pub fn has_managed_replacement(edges_dir: &Path, project_id: &str) -> bool {
+    edges_dir
+        .join("derived")
+        .join("project")
+        .join(format!("{project_id}.jsonl"))
+        .exists()
+        || edges_dir
+            .join("derived")
+            .join("git")
+            .join(format!("{project_id}.jsonl"))
+            .exists()
+        || crate::manifest::try_load_manifest_index(edges_dir)
+            .ok()
+            .and_then(|idx| idx.workspaces.get(project_id).cloned())
+            .is_some()
+}
+
 pub fn apply_migration(edges_dir: &Path, project_id: &str) -> Result<MigrationManifest> {
     let legacy_path = edges_dir.join(format!("{project_id}.jsonl"));
     if !legacy_path.exists() {
         anyhow::bail!("no legacy sidecar for project {}", project_id);
+    }
+
+    if !has_managed_replacement(edges_dir, project_id) {
+        anyhow::bail!(
+            "no managed materialized replacement exists for project {}; run reindex first",
+            project_id
+        );
     }
 
     let source_hash = compute_source_hash(edges_dir, project_id)?;
@@ -306,28 +320,94 @@ pub fn apply_migration(edges_dir: &Path, project_id: &str) -> Result<MigrationMa
 }
 
 fn install_lane_outputs(edges_dir: &Path, project_id: &str, staging_dir: &Path) -> Result<()> {
-    let explicit_src = staging_dir.join("explicit.jsonl");
-    if explicit_src.exists() {
-        let dest = explicit_lane_path(edges_dir, project_id);
-        let tmp = dest.with_extension("jsonl.tmp");
-        fs::rename(&explicit_src, &tmp)?;
-        if dest.exists() {
-            fs::remove_file(&dest)?;
-        }
-        fs::rename(&tmp, &dest)?;
+    merge_staging_into_lane(
+        staging_dir.join("explicit.jsonl"),
+        explicit_lane_path(edges_dir, project_id),
+    )?;
+    merge_staging_into_lane(
+        staging_dir.join("observed.jsonl"),
+        observed_lane_path(edges_dir, project_id),
+    )?;
+    Ok(())
+}
+
+fn merge_staging_into_lane(staging_path: PathBuf, lane_path: PathBuf) -> Result<()> {
+    if !staging_path.exists() {
+        return Ok(());
     }
 
-    let observed_src = staging_dir.join("observed.jsonl");
-    if observed_src.exists() {
-        let dest = observed_lane_path(edges_dir, project_id);
-        let tmp = dest.with_extension("jsonl.tmp");
-        fs::rename(&observed_src, &tmp)?;
-        if dest.exists() {
-            fs::remove_file(&dest)?;
+    let mut existing_keys: HashSet<String> = HashSet::new();
+    let mut merged: Vec<Edge> = Vec::new();
+
+    if lane_path.exists() {
+        let file = fs::File::open(&lane_path)?;
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines().flatten() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(edge) = serde_json::from_str::<Edge>(trimmed) {
+                let key = edge_import_key_no_meta(&edge);
+                existing_keys.insert(key);
+                merged.push(edge);
+            }
         }
-        fs::rename(&tmp, &dest)?;
     }
+
+    let staging_file = fs::File::open(&staging_path)?;
+    let staging_reader = std::io::BufReader::new(staging_file);
+    for line in staging_reader.lines().flatten() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(edge) = serde_json::from_str::<Edge>(trimmed) {
+            let key = edge_import_key_no_meta(&edge);
+            if existing_keys.insert(key) {
+                merged.push(edge);
+            }
+        }
+    }
+
+    if merged.is_empty() {
+        if lane_path.exists() {
+            fs::remove_file(&lane_path)?;
+        }
+        return Ok(());
+    }
+
+    let tmp = lane_path.with_extension("jsonl.tmp");
+    {
+        let mut file = fs::File::create(&tmp)?;
+        for edge in &merged {
+            serde_json::to_writer(&mut file, edge)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+    }
+    if lane_path.exists() {
+        fs::remove_file(&lane_path)?;
+    }
+    fs::rename(&tmp, &lane_path)?;
     Ok(())
+}
+
+fn edge_import_key_no_meta(edge: &Edge) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(
+        serde_json::to_string(&edge.source)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update(edge.kind.as_bytes());
+    hasher.update(
+        serde_json::to_string(&edge.target)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update(format!("{:?}", edge.provenance).as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn write_migration_manifest(dir: &Path, manifest: &MigrationManifest) -> Result<()> {
@@ -382,16 +462,10 @@ pub fn recover_pending_migrations(edges_dir: &Path) -> Result<Vec<String>> {
                 manifest.migration_id
             ));
         } else {
-            let explicit_ok = if !manifest.explicit_count > 0 {
-                true
-            } else {
-                explicit_lane_path(edges_dir, &manifest.project_id).exists()
-            };
-            let observed_ok = if !manifest.observed_count > 0 {
-                true
-            } else {
-                observed_lane_path(edges_dir, &manifest.project_id).exists()
-            };
+            let explicit_ok = manifest.explicit_count == 0
+                || explicit_lane_path(edges_dir, &manifest.project_id).exists();
+            let observed_ok = manifest.observed_count == 0
+                || observed_lane_path(edges_dir, &manifest.project_id).exists();
 
             if explicit_ok && observed_ok {
                 let committed = MigrationManifest {
@@ -757,6 +831,102 @@ mod tests {
                 .unwrap()
                 .starts_with("p1.jsonl.migrated-"),
             "backup must have migrated prefix"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_without_managed_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let exp = serde_json::to_string(&explicit_edge("k1", "DESCRIBES", "k2")).unwrap();
+        write_legacy(edges_dir, "p1", &[&exp]);
+
+        let result = apply_migration(edges_dir, "p1");
+        assert!(result.is_err(), "must refuse without managed replacement");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("managed materialized replacement"),
+            "error must mention replacement requirement: {err}"
+        );
+
+        let legacy = edges_dir.join("p1.jsonl");
+        assert!(legacy.exists(), "legacy must not be touched");
+    }
+
+    #[test]
+    fn lane_install_merges_with_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let existing =
+            serde_json::to_string(&explicit_edge("k_existing", "DESCRIBES", "k2")).unwrap();
+        let lane_dir = edges_dir.join("explicit");
+        fs::create_dir_all(&lane_dir).unwrap();
+        fs::write(lane_dir.join("p1.jsonl"), &existing).unwrap();
+
+        let exp_new = serde_json::to_string(&explicit_edge("k_new", "DESCRIBES", "k3")).unwrap();
+        let exp_dup =
+            serde_json::to_string(&explicit_edge("k_existing", "DESCRIBES", "k2")).unwrap();
+        let der = serde_json::to_string(&derived_edge("k_der", "DESCRIBES", "k_target")).unwrap();
+        write_legacy(edges_dir, "p1", &[&exp_new, &exp_dup, &der]);
+        write_managed_replacement(edges_dir, "p1");
+
+        apply_migration(edges_dir, "p1").unwrap();
+
+        let lane_content = fs::read_to_string(explicit_lane_path(edges_dir, "p1")).unwrap();
+        assert!(
+            lane_content.contains("k_existing"),
+            "existing lane edge must survive"
+        );
+        assert!(lane_content.contains("k_new"), "new edge must be added");
+        assert!(
+            lane_content.matches("k_existing").count() == 1,
+            "duplicate edge must be deduped"
+        );
+    }
+
+    #[test]
+    fn recovery_detects_missing_required_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let migration_id = generate_migration_id("p1", "fakehash");
+        let m_dir = migrations_dir(edges_dir).join(&migration_id);
+        fs::create_dir_all(&m_dir).unwrap();
+
+        let manifest = MigrationManifest {
+            version: 1,
+            migration_id: migration_id.clone(),
+            project_id: "p1".into(),
+            source_path: "test".into(),
+            source_hash: "fakehash".into(),
+            status: MigrationStatus::Pending,
+            explicit_count: 5,
+            observed_count: 0,
+            derived_dropped: 0,
+            quarantined_count: 0,
+            backup_path: None,
+            created_at: None,
+            committed_at: None,
+        };
+        write_migration_manifest(&m_dir, &manifest).unwrap();
+
+        let recovered = recover_pending_migrations(edges_dir).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            recovered[0].contains("WARNING"),
+            "must warn about missing lane outputs: {}",
+            recovered[0]
+        );
+
+        let reloaded: MigrationManifest =
+            serde_json::from_str(&fs::read_to_string(m_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            reloaded.status,
+            MigrationStatus::Pending,
+            "must not confirm migration with missing lanes"
         );
     }
 }
