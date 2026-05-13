@@ -48,6 +48,28 @@ pub struct EdgeStoreRefs<'a> {
     pub include_tantivy_projection: bool,
 }
 
+fn count_materialized_jsonl_files(edges_dir: &Path) -> usize {
+    let mat_dir = crate::manifest::materialized_dir(edges_dir);
+    if !mat_dir.is_dir() {
+        return 0;
+    }
+    fn count_jsonl_recursive(dir: &Path) -> usize {
+        let mut count = 0;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    count += count_jsonl_recursive(&path);
+                } else if path.extension().is_some_and(|e| e == "jsonl") {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+    count_jsonl_recursive(&mat_dir)
+}
+
 impl EdgeIndex {
     pub fn rebuild(stores: &EdgeStoreRefs<'_>) -> Self {
         let started = Instant::now();
@@ -93,10 +115,14 @@ impl EdgeIndex {
         match crate::manifest::try_load_manifest_index(edges_dir) {
             Ok(manifest_index) => {
                 let active_paths = manifest_index.active_materialized_paths(edges_dir);
+                let total_materialized_files = count_materialized_jsonl_files(edges_dir);
+                let skipped_inactive = total_materialized_files.saturating_sub(active_paths.len());
                 self.load_manifest_active_paths(&active_paths, seen);
                 self.load_legacy_explicit_edges(edges_dir, registered_project_ids, seen);
                 tracing::info!(
                     active_paths = active_paths.len(),
+                    skipped_inactive_refs = skipped_inactive,
+                    total_materialized_files,
                     "loaded edges via manifest-index"
                 );
             }
@@ -2943,5 +2969,531 @@ mod tests {
             1,
             "stale manifest (missing dirty_overlay) must fall back to legacy loading"
         );
+    }
+
+    mod cross_phase {
+        use super::*;
+        use crate::manifest::ManifestIndex;
+        use crate::snapshot::{
+            clean_snapshot_id, snapshot_dir, switch_to_clean_snapshot, switch_to_dirty_overlay,
+        };
+        use crate::storage_health::{GcParams, plan_gc, scan_storage_health};
+
+        fn derived_edge(source: &str, kind: &str, target: &str) -> Edge {
+            Edge {
+                source: EntityRef::Knowledge { id: source.into() },
+                kind: kind.into(),
+                target: EntityRef::Knowledge { id: target.into() },
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+            }
+        }
+
+        fn setup_branch_snapshot(
+            edges_dir: &Path,
+            project_id: &str,
+            repo_id: &str,
+            branch: &str,
+            head_sha: &str,
+            edges: Vec<Edge>,
+        ) {
+            let empty: Vec<Edge> = Vec::new();
+            switch_to_clean_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                Some(branch),
+                head_sha,
+                edges,
+                empty.clone(),
+                empty,
+            )
+            .unwrap();
+        }
+
+        fn active_edge_sources(index: &EdgeIndex) -> Vec<String> {
+            let mut sources: Vec<String> = index
+                .forward
+                .keys()
+                .filter_map(|e| match e {
+                    EntityRef::Knowledge { id } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            sources.sort();
+            sources
+        }
+
+        fn load_active(edges_dir: &Path) -> EdgeIndex {
+            let mut index = EdgeIndex::default();
+            let mut seen = HashSet::new();
+            index.load_sidecar_edges(edges_dir, None, &mut seen);
+            index
+        }
+
+        #[test]
+        fn branch_switch_active_graph_reflects_current_branch() {
+            let dir = tempfile::tempdir().unwrap();
+            let edges_dir = dir.path();
+            let project_id = "p1";
+            let repo_id = "repo_abc";
+
+            let branch_a_sha = "aaaa1111bbbb";
+            let branch_b_sha = "bbbb2222cccc";
+
+            let edges_a = vec![derived_edge("sym_branch_a", "DESCRIBES", "target_a")];
+            let edges_b = vec![derived_edge("sym_branch_b", "DESCRIBES", "target_b")];
+
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                branch_a_sha,
+                edges_a,
+            );
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "feature",
+                branch_b_sha,
+                edges_b,
+            );
+
+            let index = load_active(edges_dir);
+            let sources = active_edge_sources(&index);
+            assert!(
+                sources.contains(&"sym_branch_b".to_string()),
+                "active graph must have branch B edges: {sources:?}"
+            );
+            assert!(
+                !sources.contains(&"sym_branch_a".to_string()),
+                "active graph must NOT have branch A edges: {sources:?}"
+            );
+        }
+
+        #[test]
+        fn branch_reactivate_cached_snapshot() {
+            let dir = tempfile::tempdir().unwrap();
+            let edges_dir = dir.path();
+            let project_id = "p1";
+            let repo_id = "repo_abc";
+
+            let branch_a_sha = "aaaa1111bbbb";
+            let branch_b_sha = "bbbb2222cccc";
+
+            let edges_a = vec![derived_edge("sym_branch_a", "DESCRIBES", "target_a")];
+            let edges_b = vec![derived_edge("sym_branch_b", "DESCRIBES", "target_b")];
+
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                branch_a_sha,
+                edges_a,
+            );
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "feature",
+                branch_b_sha,
+                edges_b,
+            );
+
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                branch_a_sha,
+                vec![derived_edge("sym_branch_a", "DESCRIBES", "target_a")],
+            );
+
+            let index = load_active(edges_dir);
+            let sources = active_edge_sources(&index);
+            assert!(
+                sources.contains(&"sym_branch_a".to_string()),
+                "switching back to A must reactivate cached A snapshot: {sources:?}"
+            );
+            assert!(
+                !sources.contains(&"sym_branch_b".to_string()),
+                "switching back to A must deactivate B snapshot: {sources:?}"
+            );
+
+            let snap_a_dir = snapshot_dir(
+                edges_dir,
+                project_id,
+                &clean_snapshot_id(repo_id, project_id, branch_a_sha),
+            );
+            let snap_b_dir = snapshot_dir(
+                edges_dir,
+                project_id,
+                &clean_snapshot_id(repo_id, project_id, branch_b_sha),
+            );
+            assert!(snap_a_dir.is_dir(), "branch A snapshot dir must exist");
+            assert!(
+                snap_b_dir.is_dir(),
+                "branch B snapshot dir must be preserved"
+            );
+        }
+
+        #[test]
+        fn dirty_overlay_wins_over_clean_snapshot() {
+            let dir = tempfile::tempdir().unwrap();
+            let edges_dir = dir.path();
+            let project_id = "p1";
+            let repo_id = "repo_abc";
+            let head_sha = "aaaa1111bbbb";
+
+            let clean_edges = vec![derived_edge("sym_clean", "DESCRIBES", "target_clean")];
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                head_sha,
+                clean_edges,
+            );
+
+            let index = load_active(edges_dir);
+            assert!(
+                active_edge_sources(&index).contains(&"sym_clean".to_string()),
+                "clean snapshot must load initially"
+            );
+
+            let dirty_edges = vec![derived_edge("sym_dirty", "DESCRIBES", "target_dirty")];
+            let empty: Vec<Edge> = Vec::new();
+            switch_to_dirty_overlay(
+                edges_dir,
+                project_id,
+                repo_id,
+                Some("main"),
+                head_sha,
+                "fingerprint1",
+                dirty_edges,
+                empty.clone(),
+                empty,
+            )
+            .unwrap();
+
+            let index = load_active(edges_dir);
+            let sources = active_edge_sources(&index);
+            assert!(
+                sources.contains(&"sym_dirty".to_string()),
+                "dirty overlay must win over clean snapshot: {sources:?}"
+            );
+            assert!(
+                !sources.contains(&"sym_clean".to_string()),
+                "clean snapshot edges must be suppressed when dirty overlay active: {sources:?}"
+            );
+        }
+
+        #[test]
+        fn gc_retains_active_snapshot_and_dirty_overlay() {
+            let dir = tempfile::tempdir().unwrap();
+            let edges_dir = dir.path();
+            let project_id = "p1";
+            let repo_id = "repo_abc";
+            let head_sha = "aaaa1111bbbb";
+
+            let clean_edges = vec![derived_edge("sym_clean", "DESCRIBES", "target_clean")];
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                head_sha,
+                clean_edges,
+            );
+
+            let dirty_edges = vec![derived_edge("sym_dirty", "DESCRIBES", "target_dirty")];
+            let empty: Vec<Edge> = Vec::new();
+            switch_to_dirty_overlay(
+                edges_dir,
+                project_id,
+                repo_id,
+                Some("main"),
+                head_sha,
+                "fingerprint1",
+                dirty_edges,
+                empty.clone(),
+                empty,
+            )
+            .unwrap();
+
+            let registered: HashSet<String> = [project_id.to_string()].into_iter().collect();
+            let candidates = plan_gc(
+                edges_dir,
+                &registered,
+                &GcParams {
+                    dry_run: true,
+                    project_filter: None,
+                    prune_backups: true,
+                    prune_orphans: false,
+                    prune_temps: true,
+                    prune_inactive_snapshots: true,
+                    max_backup_age_days: None,
+                    keep_newest_backup_per_source: 1,
+                },
+            )
+            .unwrap();
+
+            let overlay_path = format!("workspace/{}/dirty-overlay", project_id);
+
+            for candidate in &candidates {
+                assert!(
+                    !candidate.path.contains(&overlay_path),
+                    "dirty overlay must not be a GC candidate: {}",
+                    candidate.path
+                );
+            }
+
+            let inactive_candidates: Vec<_> = candidates
+                .iter()
+                .filter(|c| c.rule == "inactive_snapshot")
+                .collect();
+            assert!(
+                !inactive_candidates.is_empty(),
+                "clean snapshot must be reported as inactive when dirty overlay is active"
+            );
+        }
+
+        #[test]
+        fn gc_prunes_inactive_snapshots_when_enabled() {
+            let dir = tempfile::tempdir().unwrap();
+            let edges_dir = dir.path();
+            let project_id = "p1";
+            let repo_id = "repo_abc";
+
+            let sha_a = "aaaa1111bbbb";
+            let sha_b = "bbbb2222cccc";
+
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                sha_a,
+                vec![derived_edge("sym_a", "DESCRIBES", "t")],
+            );
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "feature",
+                sha_b,
+                vec![derived_edge("sym_b", "DESCRIBES", "t")],
+            );
+
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                sha_a,
+                vec![derived_edge("sym_a", "DESCRIBES", "t")],
+            );
+
+            let registered: HashSet<String> = [project_id.to_string()].into_iter().collect();
+            let candidates = plan_gc(
+                edges_dir,
+                &registered,
+                &GcParams {
+                    dry_run: true,
+                    project_filter: None,
+                    prune_backups: true,
+                    prune_orphans: false,
+                    prune_temps: false,
+                    prune_inactive_snapshots: true,
+                    max_backup_age_days: None,
+                    keep_newest_backup_per_source: 1,
+                },
+            )
+            .unwrap();
+
+            let inactive_snap_id = clean_snapshot_id(repo_id, project_id, sha_b);
+            let inactive_path = format!("workspace/{}/snapshots/{}", project_id, inactive_snap_id);
+
+            let inactive_candidate = candidates
+                .iter()
+                .find(|c| c.path.contains(&inactive_path) && c.rule == "inactive_snapshot");
+            assert!(
+                inactive_candidate.is_some(),
+                "inactive branch B snapshot must be a GC candidate: {:?}",
+                candidates
+                    .iter()
+                    .filter(|c| c.rule == "inactive_snapshot")
+                    .map(|c| &c.path)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn storage_health_reports_active_inactive_post_snapshot() {
+            let dir = tempfile::tempdir().unwrap();
+            let edges_dir = dir.path();
+            let project_id = "p1";
+            let repo_id = "repo_abc";
+
+            let sha_a = "aaaa1111bbbb";
+            let sha_b = "bbbb2222cccc";
+
+            let big_edge = derived_edge("sym_a", "DESCRIBES", "target_a");
+
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                sha_a,
+                vec![big_edge.clone()],
+            );
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "feature",
+                sha_b,
+                vec![derived_edge("sym_b", "DESCRIBES", "target_b")],
+            );
+
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                sha_a,
+                vec![big_edge],
+            );
+
+            let registered: HashSet<String> = [project_id.to_string()].into_iter().collect();
+            let report = scan_storage_health(edges_dir, &registered, None, false).unwrap();
+
+            let ms = report.manifest_status.expect("manifest must exist");
+            assert!(
+                ms.active_materialized_bytes > 0,
+                "active bytes must be nonzero: {}",
+                ms.active_materialized_bytes
+            );
+            assert!(
+                ms.active_materialized_files > 0,
+                "active files must be nonzero: {}",
+                ms.active_materialized_files
+            );
+            assert!(
+                ms.inactive_materialized_bytes > 0,
+                "inactive bytes must be nonzero (branch B snapshot): {}",
+                ms.inactive_materialized_bytes
+            );
+            assert!(
+                ms.inactive_materialized_files > 0,
+                "inactive files must be nonzero (branch B snapshot): {}",
+                ms.inactive_materialized_files
+            );
+        }
+
+        #[test]
+        fn active_loader_does_not_scan_inactive_snapshots() {
+            let dir = tempfile::tempdir().unwrap();
+            let edges_dir = dir.path();
+            let project_id = "p1";
+            let repo_id = "repo_abc";
+            let head_sha = "aaaa1111bbbb";
+
+            setup_branch_snapshot(
+                edges_dir,
+                project_id,
+                repo_id,
+                "main",
+                head_sha,
+                vec![Edge {
+                    source: EntityRef::Knowledge {
+                        id: "sym_active".into(),
+                    },
+                    kind: "DESCRIBES".into(),
+                    target: EntityRef::Knowledge {
+                        id: "target_active".into(),
+                    },
+                    provenance: EdgeProvenance::Derived,
+                    confidence: EdgeConfidence::Exact,
+                    metadata: BTreeMap::new(),
+                }],
+            );
+
+            let inactive_base = crate::manifest::materialized_dir(edges_dir)
+                .join("workspace")
+                .join(project_id)
+                .join("snapshots");
+            for i in 0..20 {
+                let inactive_dir = inactive_base.join(format!("head-inactive-{i}"));
+                let fat_content: Vec<String> = (0..100)
+                    .map(|j| format!("{{\"fake\":\"padding_{i}_{j}\"}}"))
+                    .collect();
+                write_jsonl(
+                    &inactive_dir.join("project.jsonl"),
+                    &fat_content.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                );
+            }
+
+            let mat_dir = crate::manifest::materialized_dir(edges_dir);
+            let total_jsonl = count_materialized_jsonl_files_recursive(&mat_dir);
+            assert!(
+                total_jsonl > 20,
+                "must have many jsonl files (active + inactive): {total_jsonl}"
+            );
+
+            let active_paths = {
+                let idx = ManifestIndex::load(edges_dir).unwrap();
+                idx.active_materialized_paths(edges_dir)
+            };
+            assert!(
+                active_paths.len() <= 3,
+                "active loader must see only the active snapshot files, got {}: {active_paths:?}",
+                active_paths.len()
+            );
+
+            let mut index = EdgeIndex::default();
+            let mut seen = HashSet::new();
+            index.load_sidecar_edges(edges_dir, None, &mut seen);
+
+            let source = EntityRef::Knowledge {
+                id: "sym_active".into(),
+            };
+            assert_eq!(
+                index.forward_edges(&source).len(),
+                1,
+                "active edge must load"
+            );
+
+            for i in 0..20 {
+                let fake_source = EntityRef::Knowledge {
+                    id: format!("fake_padding_{i}").into(),
+                };
+                assert_eq!(
+                    index.forward_edges(&fake_source).len(),
+                    0,
+                    "inactive snapshot content must not be loaded"
+                );
+            }
+        }
+
+        fn count_materialized_jsonl_files_recursive(dir: &Path) -> usize {
+            let mut count = 0;
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.filter_map(Result::ok) {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        count += count_materialized_jsonl_files_recursive(&path);
+                    } else if path.extension().is_some_and(|e| e == "jsonl") {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
     }
 }

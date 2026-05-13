@@ -15,6 +15,7 @@ pub enum FileKind {
     Backup,
     Temp,
     Orphan,
+    InactiveSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +89,10 @@ impl StorageHealthTotals {
                 self.orphan_bytes += bytes;
                 self.orphan_files += 1;
             }
+            FileKind::InactiveSnapshot => {
+                self.orphan_bytes += bytes;
+                self.orphan_files += 1;
+            }
         }
     }
 }
@@ -143,6 +148,8 @@ pub fn scan_storage_health(
             &mut files,
         )?;
     }
+
+    scan_inactive_snapshots(edges_dir, project_filter, &mut totals, &mut files);
 
     files.sort_by(|a, b| b.bytes.cmp(&a.bytes));
 
@@ -510,6 +517,74 @@ fn scan_managed_derived_dir(
     Ok(())
 }
 
+fn scan_inactive_snapshots(
+    edges_dir: &Path,
+    project_filter: Option<&str>,
+    totals: &mut StorageHealthTotals,
+    files: &mut Vec<StorageFileInfo>,
+) {
+    let active_prefixes = collect_active_jsonl_prefixes(edges_dir);
+    let mat_dir = crate::manifest::materialized_dir(edges_dir);
+    if !mat_dir.is_dir() {
+        return;
+    }
+    fn walk_for_inactive(
+        dir: &Path,
+        active_prefixes: &[String],
+        project_filter: Option<&str>,
+        totals: &mut StorageHealthTotals,
+        files: &mut Vec<StorageFileInfo>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_for_inactive(&path, active_prefixes, project_filter, totals, files);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                let path_str = match path.to_str() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if active_prefixes.iter().any(|p| path_str == p) {
+                    continue;
+                }
+                let bytes = match fs::metadata(&path) {
+                    Ok(m) => m.len(),
+                    Err(_) => continue,
+                };
+                let project_id = extract_project_from_workspace_path(&path);
+                if !project_filter_matches(project_id.as_deref(), project_filter) {
+                    continue;
+                }
+                totals.accumulate(FileKind::InactiveSnapshot, bytes);
+                files.push(StorageFileInfo {
+                    path: path_str.to_string(),
+                    kind: FileKind::InactiveSnapshot,
+                    project_id,
+                    bytes,
+                    reason: Some("inactive snapshot not in active manifest paths".into()),
+                });
+            }
+        }
+    }
+    walk_for_inactive(&mat_dir, &active_prefixes, project_filter, totals, files);
+}
+
+fn extract_project_from_workspace_path(path: &Path) -> Option<String> {
+    let mut components = path.components().rev();
+    let _filename = components.next()?;
+    let _snapshots = components.next()?;
+    let project = components.next()?;
+    let workspace = components.next()?;
+    if workspace.as_os_str() == "workspace" {
+        Some(project.as_os_str().to_str()?.to_string())
+    } else {
+        None
+    }
+}
+
 fn is_backup_file(file_name: &str) -> bool {
     if let Some(idx) = file_name.find(".bak-") {
         let rest = &file_name[idx + 5..];
@@ -585,6 +660,7 @@ pub struct GcParams {
     pub prune_backups: bool,
     pub prune_orphans: bool,
     pub prune_temps: bool,
+    pub prune_inactive_snapshots: bool,
     pub max_backup_age_days: Option<u64>,
     pub keep_newest_backup_per_source: u64,
 }
@@ -721,6 +797,22 @@ pub fn plan_gc(
                 project_id: None,
                 rule: "orphan_none_found".to_string(),
                 deletable: false,
+            });
+        }
+    }
+
+    if params.prune_inactive_snapshots {
+        for f in &report.files {
+            if f.kind != FileKind::InactiveSnapshot {
+                continue;
+            }
+            candidates.push(GcCandidate {
+                path: f.path.clone(),
+                kind: f.kind,
+                bytes: f.bytes,
+                project_id: f.project_id.clone(),
+                rule: "inactive_snapshot".to_string(),
+                deletable: true,
             });
         }
     }
@@ -1092,6 +1184,7 @@ mod tests {
                 prune_backups: true,
                 prune_orphans: false,
                 prune_temps: false,
+                prune_inactive_snapshots: false,
                 max_backup_age_days: None,
                 keep_newest_backup_per_source: 1,
             },
@@ -1134,6 +1227,7 @@ mod tests {
                 prune_backups: true,
                 prune_orphans: false,
                 prune_temps: false,
+                prune_inactive_snapshots: false,
                 max_backup_age_days: None,
                 keep_newest_backup_per_source: 1,
             },
@@ -1175,6 +1269,7 @@ mod tests {
                 prune_backups: true,
                 prune_orphans: false,
                 prune_temps: false,
+                prune_inactive_snapshots: false,
                 max_backup_age_days: None,
                 keep_newest_backup_per_source: 1,
             },
@@ -1231,6 +1326,7 @@ mod tests {
                 prune_backups: true,
                 prune_orphans: false,
                 prune_temps: false,
+                prune_inactive_snapshots: false,
                 max_backup_age_days: None,
                 keep_newest_backup_per_source: 1,
             },
@@ -1269,6 +1365,7 @@ mod tests {
                 prune_backups: false,
                 prune_orphans: false,
                 prune_temps: true,
+                prune_inactive_snapshots: false,
                 max_backup_age_days: None,
                 keep_newest_backup_per_source: 1,
             },
@@ -1303,6 +1400,7 @@ mod tests {
                 prune_backups: false,
                 prune_orphans: false,
                 prune_temps: false,
+                prune_inactive_snapshots: false,
                 max_backup_age_days: None,
                 keep_newest_backup_per_source: 1,
             },
@@ -1322,6 +1420,7 @@ mod tests {
                 prune_backups: false,
                 prune_orphans: true,
                 prune_temps: false,
+                prune_inactive_snapshots: false,
                 max_backup_age_days: None,
                 keep_newest_backup_per_source: 1,
             },

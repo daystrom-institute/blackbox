@@ -24,6 +24,9 @@ pub(crate) struct StorageGcParams {
     /// Prune compact temp files older than 24h. Default true.
     #[serde(default = "default_true")]
     pub prune_temps: bool,
+    /// Prune inactive snapshot dirs not referenced by any manifest. Default true.
+    #[serde(default = "default_true")]
+    pub prune_inactive_snapshots: bool,
     /// Maximum age in days for backup files. If set, backups older than this
     /// are candidates even if they are the newest retained.
     #[serde(default)]
@@ -74,6 +77,7 @@ impl BlackboxServer {
                 prune_backups: p.prune_backups,
                 prune_orphans: p.prune_orphans,
                 prune_temps: p.prune_temps,
+                prune_inactive_snapshots: p.prune_inactive_snapshots,
                 max_backup_age_days: p.max_backup_age_days,
                 keep_newest_backup_per_source: p.keep_newest_backup_per_source,
             };
