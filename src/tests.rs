@@ -75,6 +75,11 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             crate::config::load()
                 .unwrap_or_else(|e| panic!("loading config for test SharedState: {e}")),
         )),
+        atom_invocation_store: Arc::new(RwLock::new(
+            orchestration::atoms::invocation::InvocationStore::new(
+                tmp.path().join("atom-invocations.json"),
+            ),
+        )),
     });
     BlackboxServer::new(state)
 }

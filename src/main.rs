@@ -1528,6 +1528,11 @@ async fn main() -> anyhow::Result<()> {
         ),
         lsp_sessions: lsp::LspSessionManager::with_lsp_config(&cfg.lsp),
         config: cfg_arc.clone(),
+        atom_invocation_store: Arc::new(RwLock::new(
+            orchestration::atoms::invocation::InvocationStore::new(
+                store_dir.join("atom-invocations.json"),
+            ),
+        )),
     });
     shared
         .agent_adapter_registry

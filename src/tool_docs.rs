@@ -1106,6 +1106,41 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     },
     // ── Whiteboards ─────────────────────────────────────────────
     ToolDoc {
+        name: "atom_invoke",
+        category: ToolCategory::Orchestration,
+        summary: "Invoke an installed atom. Resolves the atom manifest, validates policy gates (effects, composition, depth), and dispatches via the appropriate implementation path (profile, workflow, deterministic, adapter). Returns an owned invocation handle with invocation_id and underlying task/session ids.",
+        when_to_use: "Invoke an atom after discovery via atom_search. Returns invocation_id — check with atom_status, continue with atom_resume, share with atom_delegate. Profile-backed atoms dispatch through the existing bro execution path.",
+        example: Some(
+            r#"atom_invoke(atom="atom:rust-test-island-extract@v1", args={"project_dir": "/repo/x", "source_file_or_dir": "src/lib.rs"}, project_dir="/repo/x")"#,
+        ),
+    },
+    ToolDoc {
+        name: "atom_status",
+        category: ToolCategory::Orchestration,
+        summary: "Read the status of an atom invocation. Ownership-gated: only owners can read status. Returns a normalized trace envelope with state, timestamps, effects observed, cost, and summary.",
+        when_to_use: "Check on an invocation returned by atom_invoke. Pass the owner identity that was set at invoke time. For profile-backed atoms, refreshes status from the underlying bro task.",
+        example: Some(r#"atom_status(invocation_id="inv-abc123", owner="operator:claude")"#),
+    },
+    ToolDoc {
+        name: "atom_resume",
+        category: ToolCategory::Orchestration,
+        summary: "Resume a profile-backed atom invocation. Ownership-gated and only for resumable handles (profile-backed, in a runnable state). Resumes underlying provider session using existing bro resume internals.",
+        when_to_use: "Continue a profile-backed atom invocation with a follow-up prompt. Deterministic, adapter, and workflow handles return not_resumable. Must be an owner of the invocation.",
+        example: Some(
+            r#"atom_resume(invocation_id="inv-abc123", prompt="now run cargo test", owner="operator:claude")"#,
+        ),
+    },
+    ToolDoc {
+        name: "atom_delegate",
+        category: ToolCategory::Orchestration,
+        summary: "Grant another owner access to an atom invocation. Owner-only. v1 does not support revocation. Delegated owners gain full status/resume/delegate rights.",
+        when_to_use: "Share atom invocation access with another agent or operator. The grant_to identity becomes a co-owner. Use before atom_status or atom_resume from a different identity.",
+        example: Some(
+            r#"atom_delegate(invocation_id="inv-abc123", grant_to="operator:codex", owner="operator:claude")"#,
+        ),
+    },
+    // ── Whiteboards ─────────────────────────────────────────────
+    ToolDoc {
         name: "whiteboard_open",
         category: ToolCategory::Whiteboards,
         summary: "Open a new whiteboard for structured deliberation. The board collects posts (blind phase), annotations (validate/debate phases), and votes (debate phase) from registered agents, advanced through phases by a facilitator-or-operator role. Returns when the board is created and the opener is registered as facilitator. Idempotent re-open against an existing id is rejected — use whiteboard_state to inspect.",

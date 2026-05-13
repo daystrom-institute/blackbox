@@ -93,7 +93,7 @@
     },
     "effects": {
       "writes_files": true,
-      "dispatches_runs": 0,
+      "dispatches_runs": 1,
       "max_depth": 0,
       "uses_network": false
     },

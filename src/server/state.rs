@@ -128,6 +128,7 @@ pub(crate) struct SharedState {
     /// idle-evicts sessions on a background tick.
     pub(crate) lsp_sessions: lsp::LspSessionManager,
     pub(crate) config: std::sync::Arc<parking_lot::RwLock<crate::config::Config>>,
+    pub(crate) atom_invocation_store: orchestration::atoms::invocation::SharedInvocationStore,
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
@@ -310,6 +311,11 @@ impl SharedState {
             config: Arc::new(RwLock::new(
                 crate::config::load()
                     .unwrap_or_else(|e| panic!("loading config for test SharedState: {e}")),
+            )),
+            atom_invocation_store: Arc::new(RwLock::new(
+                orchestration::atoms::invocation::InvocationStore::new(
+                    store_dir.join("atom-invocations.json"),
+                ),
             )),
         }
     }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::types::{
-    AtomCostClass, AtomEffects, AtomManifest, AtomProvenance, validate_description_length,
+    AtomEffects, AtomManifest, AtomProvenance, validate_description_length,
     validate_when_to_use_nonempty,
 };
 
@@ -31,7 +31,10 @@ const REF_PREFIX_BROFILE: &str = "brofile:";
 const REF_PREFIX_WORKFLOW: &str = "workflow:";
 const REF_PREFIX_ATOM: &str = "atom:";
 
-fn parse_typed_ref(raw: &str, expected_prefix: &str) -> Result<(String, String), ValidationError> {
+pub fn parse_typed_ref(
+    raw: &str,
+    expected_prefix: &str,
+) -> Result<(String, String), ValidationError> {
     let step = "lint_refs";
     if !raw.starts_with(expected_prefix) {
         return Err(ValidationError {

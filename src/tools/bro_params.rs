@@ -705,3 +705,39 @@ pub(crate) struct AtomSearchParams {
     #[serde(default)]
     pub(crate) exclude_anti_pattern_matches: Option<bool>,
 }
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct AtomInvokeParams {
+    pub(crate) atom: String,
+    #[serde(default)]
+    pub(crate) args: serde_json::Value,
+    #[serde(default)]
+    pub(crate) project_dir: Option<String>,
+    #[serde(default)]
+    pub(crate) owner: Option<String>,
+    #[serde(default)]
+    pub(crate) parent_invocation_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct AtomStatusParams {
+    pub(crate) invocation_id: String,
+    #[serde(default)]
+    pub(crate) owner: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct AtomResumeParams {
+    pub(crate) invocation_id: String,
+    pub(crate) prompt: String,
+    #[serde(default)]
+    pub(crate) owner: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct AtomDelegateParams {
+    pub(crate) invocation_id: String,
+    pub(crate) grant_to: String,
+    #[serde(default)]
+    pub(crate) owner: Option<String>,
+}
