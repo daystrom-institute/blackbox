@@ -40,7 +40,7 @@ Protocol:
    - Otherwise proceed.
 
 4. Apply (if inputs.apply == true) or return plan-only:
-   bbox_refactor_run(confirm=true, steps=[
+   bbox_refactor_run(dispatch_origin="agent", confirm=true, steps=[
      <plan steps for {{plan_kind}}>,
      {"op":"command","command":"cargo","args":["check","--message-format=json"],
       "capture":"rustc_json","on_failure":"continue_for_repair"},

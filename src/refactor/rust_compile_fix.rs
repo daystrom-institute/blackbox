@@ -967,6 +967,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record_for(dir.path())],
         )
@@ -1022,6 +1023,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record_for(dir.path())],
         )

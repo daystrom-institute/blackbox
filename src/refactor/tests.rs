@@ -1212,6 +1212,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1257,6 +1258,7 @@ mod tests {
                 confirm: Some(false),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1312,6 +1314,7 @@ mod tests {
                 confirm: Some(false),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1403,6 +1406,7 @@ mod tests {
                 confirm: Some(false),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1492,6 +1496,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1545,6 +1550,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1608,6 +1614,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1686,6 +1693,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: None,
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1769,6 +1777,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1829,6 +1838,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1888,6 +1898,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -1926,6 +1937,7 @@ mod tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -3999,6 +4011,190 @@ mod rx_f2b_obligation_tests {
         Guard
     }
 
+    #[test]
+    fn agent_origin_refactor_run_rejects_non_cargo_command() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "agent command allowlist".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Command {
+                    command: "sh".into(),
+                    args: vec!["-c".into(), "true".into()],
+                    cwd: None,
+                    touches: Vec::new(),
+                    required: Some(true),
+                    capture: None,
+                    on_failure: None,
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: Some(DispatchOrigin::Agent),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "step_failed");
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("agent_command_not_allowed"),
+            "got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn agent_origin_refactor_run_requires_touches_for_cargo_fmt() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "agent cargo fmt allowlist".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Command {
+                    command: "cargo".into(),
+                    args: vec!["fmt".into()],
+                    cwd: None,
+                    touches: Vec::new(),
+                    required: Some(true),
+                    capture: None,
+                    on_failure: None,
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: Some(DispatchOrigin::Agent),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "step_failed");
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("agent_command_requires_touches"),
+            "got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn agent_origin_refactor_run_allows_cargo_check_plan() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "agent cargo check allowlist".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Command {
+                    command: "cargo".into(),
+                    args: vec!["check".into(), "--message-format=json".into()],
+                    cwd: None,
+                    touches: Vec::new(),
+                    required: Some(true),
+                    capture: Some(CaptureSpec::RustcJson),
+                    on_failure: Some(OnFailure::ContinueForRepair),
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: Some(DispatchOrigin::Agent),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "planned");
+        assert_eq!(resp.steps[0].status, "planned");
+    }
+
+    #[test]
+    fn agent_origin_refactor_run_allows_cargo_fmt_with_touches_plan() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "agent cargo fmt allowlist with touches".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Command {
+                    command: "cargo".into(),
+                    args: vec!["fmt".into()],
+                    cwd: None,
+                    touches: vec!["src/lib.rs".into()],
+                    required: Some(true),
+                    capture: None,
+                    on_failure: None,
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: Some(DispatchOrigin::Agent),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "planned");
+        assert_eq!(resp.steps[0].status, "planned");
+    }
+
+    #[test]
+    fn agent_origin_allowlist_failure_rolls_back_prior_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "agent allowlist rollback".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Plan {
+                        optional: false,
+                        params: RefactorPlanParams {
+                            kind: "add_rust_mod_decl".into(),
+                            source: "lib.rs".into(),
+                            module_name: Some("newmod".into()),
+                            ..Default::default()
+                        },
+                    },
+                    RefactorRunStep::Command {
+                        command: "sh".into(),
+                        args: vec!["-c".into(), "true".into()],
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                        capture: None,
+                        on_failure: None,
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: Some(DispatchOrigin::Agent),
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "step_failed");
+        assert!(
+            resp.rolled_back,
+            "allowlist failure should roll back: {response}"
+        );
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
+    }
+
     // ── Gate A: legacy required: bool behaves identically when on_failure unset ──
 
     #[test]
@@ -4023,6 +4219,7 @@ mod rx_f2b_obligation_tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -4056,6 +4253,7 @@ mod rx_f2b_obligation_tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -4117,6 +4315,7 @@ mod rx_f2b_obligation_tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -4178,6 +4377,7 @@ mod rx_f2b_obligation_tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -4230,6 +4430,7 @@ mod rx_f2b_obligation_tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -4288,6 +4489,7 @@ mod rx_f2b_obligation_tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -4378,6 +4580,7 @@ mod rx_f2b_obligation_tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -4519,6 +4722,7 @@ mod rx_f2a_capture_tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )
@@ -4569,6 +4773,7 @@ mod rx_f2a_capture_tests {
                 confirm: Some(true),
                 allow_dirty_worktree: None,
                 allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
             },
             &[project_record(dir.path())],
         )

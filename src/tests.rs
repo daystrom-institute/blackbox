@@ -5316,6 +5316,219 @@ fn expand_template_substitutes_args() {
 }
 
 #[test]
+fn bro_agent_dispatch_rejects_undeclared_operator_authority_arg() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let cat = &server.state.artifacts.read();
+    cat.install_value(
+        artifacts::ArtifactKind::Agent,
+        "ack-agent.json".into(),
+        &serde_json::json!({
+            "kind": "agent",
+            "name": "ack-agent",
+            "version": 1,
+            "manifest": {
+                "description": "Agent with undeclared acknowledge arg.",
+                "brofile_inline": {"provider": "claude"},
+                "inputs": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "project_dir": {"type": "string"}
+                        }
+                    },
+                    "prompt_template": "Run on {{project_dir}}"
+                },
+            },
+        }),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+        agent: "ack-agent".into(),
+        args: serde_json::json!({
+            "project_dir": "/tmp/x",
+            "acknowledge_repr": true
+        }),
+        project_dir: None,
+        bro: None,
+        ambient: None,
+        caller_provider: None,
+        caller_session_id: None,
+    })));
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(
+        text.contains("operator_authority_flag_not_declared") && text.contains("acknowledge_repr"),
+        "got: {text}"
+    );
+}
+
+#[test]
+fn bro_agent_dispatch_rejects_hardcoded_operator_authority_template_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let cat = &server.state.artifacts.read();
+    cat.install_value(
+        artifacts::ArtifactKind::Agent,
+        "ack-constant-agent.json".into(),
+        &serde_json::json!({
+            "kind": "agent",
+            "name": "ack-constant-agent",
+            "version": 1,
+            "manifest": {
+                "description": "Agent with hardcoded acknowledge flag.",
+                "brofile_inline": {"provider": "claude"},
+                "inputs": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "project_dir": {"type": "string"},
+                            "acknowledge_public_api_change": {"type": "boolean"}
+                        }
+                    },
+                    "prompt_template": "bbox_refactor_run(confirm=true, steps=[], toml_entries={\"acknowledge_public_api_change\": true})"
+                },
+            },
+        }),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+        agent: "ack-constant-agent".into(),
+        args: serde_json::json!({"project_dir": "/tmp/x"}),
+        project_dir: None,
+        bro: None,
+        ambient: None,
+        caller_provider: None,
+        caller_session_id: None,
+    })));
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(
+        text.contains("operator_authority_flag_constant")
+            && text.contains("acknowledge_public_api_change"),
+        "got: {text}"
+    );
+}
+
+#[test]
+fn bro_agent_dispatch_rejects_compact_hardcoded_operator_authority_template_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let cat = &server.state.artifacts.read();
+    cat.install_value(
+        artifacts::ArtifactKind::Agent,
+        "ack-compact-constant-agent.json".into(),
+        &serde_json::json!({
+            "kind": "agent",
+            "name": "ack-compact-constant-agent",
+            "version": 1,
+            "manifest": {
+                "description": "Agent with compact hardcoded acknowledge flag.",
+                "brofile_inline": {"provider": "claude"},
+                "inputs": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "project_dir": {"type": "string"},
+                            "acknowledge_public_api_change": {"type": "boolean"}
+                        }
+                    },
+                    "prompt_template": "bbox_refactor_run(confirm=true, toml_entries={\"acknowledge_public_api_change\":true})"
+                },
+            },
+        }),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+        agent: "ack-compact-constant-agent".into(),
+        args: serde_json::json!({"project_dir": "/tmp/x"}),
+        project_dir: None,
+        bro: None,
+        ambient: None,
+        caller_provider: None,
+        caller_session_id: None,
+    })));
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(
+        text.contains("operator_authority_flag_constant")
+            && text.contains("acknowledge_public_api_change"),
+        "got: {text}"
+    );
+}
+
+#[test]
+fn bro_agent_dispatch_accepts_declared_operator_authority_arg() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let cat = &server.state.artifacts.read();
+    cat.install_value(
+        artifacts::ArtifactKind::Agent,
+        "ack-declared-agent.json".into(),
+        &serde_json::json!({
+            "kind": "agent",
+            "name": "ack-declared-agent",
+            "version": 1,
+            "manifest": {
+                "description": "Agent with declared acknowledge arg.",
+                "dispatch_adapter": "missing-adapter",
+                "brofile_inline": {"provider": "claude"},
+                "inputs": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "project_dir": {"type": "string"},
+                            "acknowledge_repr": {"type": "boolean"}
+                        }
+                    },
+                    "prompt_template": "Run on {{project_dir}} with {{acknowledge_repr}}"
+                },
+            },
+        }),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+        agent: "ack-declared-agent".into(),
+        args: serde_json::json!({
+            "project_dir": "/tmp/x",
+            "acknowledge_repr": true
+        }),
+        project_dir: None,
+        bro: None,
+        ambient: None,
+        caller_provider: None,
+        caller_session_id: None,
+    })));
+    assert_eq!(result.is_error, Some(true));
+    let text = extract_text(&result);
+    assert!(
+        text.contains("adapter_unavailable")
+            && !text.contains("operator_authority_flag_not_declared"),
+        "got: {text}"
+    );
+}
+
+#[test]
 fn bro_agent_dispatch_invalid_inline_provider_error() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);

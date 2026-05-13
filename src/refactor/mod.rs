@@ -575,6 +575,18 @@ pub struct RefactorRunParams {
     /// Default false. When false, refuses paths outside registered projects.
     #[serde(default)]
     pub allow_unregistered_paths: Option<bool>,
+    /// Provenance for command-policy enforcement. Operator-origin runs keep
+    /// the general command surface; agent-origin runs are limited to the
+    /// refactor atom cargo allowlist.
+    #[serde(default)]
+    pub dispatch_origin: Option<DispatchOrigin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchOrigin {
+    Operator,
+    Agent,
 }
 
 /// Which stdout format to parse for a Command step (RX-F2a).
@@ -1675,6 +1687,7 @@ pub fn run_with_ctx(
         );
     }
     let confirmed = p.confirm == Some(true);
+    let agent_origin = p.dispatch_origin == Some(DispatchOrigin::Agent);
     let mut snapshots: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     let mut snapshot_paths: HashSet<PathBuf> = HashSet::new();
     let mut reports = Vec::new();
@@ -2055,6 +2068,34 @@ pub fn run_with_ctx(
                 capture,
                 on_failure,
             } => {
+                if agent_origin {
+                    if let Err(err) = enforce_agent_command_allowlist(command, args, touches) {
+                        let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                        reports.push(RefactorRunStepReport {
+                            index: idx,
+                            op: "command".to_string(),
+                            status: if confirmed { "failed" } else { "blocked" }.to_string(),
+                            kind: None,
+                            title: Some(command_display(command, args)),
+                            files: touches.clone(),
+                            validations: Vec::new(),
+                            error: Some(err.to_string()),
+                            captured_diagnostics_summary: None,
+                        });
+                        return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                            status: "step_failed".to_string(),
+                            title: p.title.clone(),
+                            dry_run: !confirmed,
+                            steps: reports,
+                            files_written,
+                            rolled_back: rollback_errors.is_empty(),
+                            error: Some(err.to_string()),
+                            rollback_errors,
+                            obligations: capture_ctx.obligation_reports(),
+                        })?);
+                    }
+                }
                 if !confirmed {
                     reports.push(RefactorRunStepReport {
                         index: idx,
@@ -2982,6 +3023,39 @@ fn command_display(command: &str, args: &[String]) -> String {
         .chain(args.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn enforce_agent_command_allowlist(
+    command: &str,
+    args: &[String],
+    touches: &[String],
+) -> Result<()> {
+    if command != "cargo" {
+        bail!(
+            "error.bad_input(code=agent_command_not_allowed): \
+             agent-origin bbox_refactor_run command steps may only invoke cargo; got `{}`",
+            command_display(command, args)
+        );
+    }
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        bail!(
+            "error.bad_input(code=agent_command_not_allowed): \
+             agent-origin cargo command must include one of: check, test, clippy, fmt, build"
+        );
+    };
+    match subcommand {
+        "check" | "test" | "clippy" | "build" => Ok(()),
+        "fmt" if !touches.is_empty() => Ok(()),
+        "fmt" => bail!(
+            "error.bad_input(code=agent_command_requires_touches): \
+             agent-origin cargo fmt command steps must declare touches for rollback"
+        ),
+        other => bail!(
+            "error.bad_input(code=agent_command_not_allowed): \
+             agent-origin cargo subcommand `{other}` is not allowed; \
+             allowed subcommands are check, test, clippy, fmt, build"
+        ),
+    }
 }
 
 fn truncate_for_report(value: &str, max_chars: usize) -> String {

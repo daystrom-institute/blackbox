@@ -163,6 +163,62 @@ impl BlackboxServer {
         result
     }
 
+    fn validate_operator_authority_inputs(
+        manifest: &orchestration::agents::types::AgentManifest,
+        args: &serde_json::Value,
+    ) -> std::result::Result<(), String> {
+        const OPERATOR_AUTHORITY_FLAGS: [&str; 2] =
+            ["acknowledge_repr", "acknowledge_public_api_change"];
+
+        let schema_properties = manifest
+            .inputs
+            .as_ref()
+            .and_then(|inputs| inputs.schema.as_ref())
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|properties| properties.as_object());
+        let prompt_template = manifest
+            .inputs
+            .as_ref()
+            .and_then(|inputs| inputs.prompt_template.as_deref())
+            .unwrap_or_default();
+
+        for flag in OPERATOR_AUTHORITY_FLAGS {
+            let declared_input = schema_properties
+                .map(|properties| properties.contains_key(flag))
+                .unwrap_or(false);
+
+            if args.get(flag).is_some() && !declared_input {
+                return Err(format!(
+                    "error.bad_input(code=operator_authority_flag_not_declared): \
+                     `{flag}` may only be passed through a declared agent input"
+                ));
+            }
+            let placeholder = format!("{{{{{}}}}}", flag);
+            if prompt_template.contains(&placeholder) && !declared_input {
+                return Err(format!(
+                    "error.bad_input(code=operator_authority_flag_not_declared): \
+                     prompt template references `{flag}` but inputs.schema.properties does not declare it"
+                ));
+            }
+            let quoted = format!("\"{flag}\": true");
+            let compact_quoted = format!("\"{flag}\":true");
+            let bare = format!("{flag}: true");
+            let compact_bare = format!("{flag}:true");
+            if prompt_template.contains(&quoted)
+                || prompt_template.contains(&compact_quoted)
+                || prompt_template.contains(&bare)
+                || prompt_template.contains(&compact_bare)
+            {
+                return Err(format!(
+                    "error.bad_input(code=operator_authority_flag_constant): \
+                     prompt template hardcodes `{flag}=true`; operator-authority flags must be supplied by inputs"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn embed_agent_query(query: &str) -> anyhow::Result<Vec<f32>> {
         let router = embed::EmbeddingRouter::load_default()?;
         let route = router.route(embed::Bucket::AgentManifest, None)?;
@@ -533,6 +589,10 @@ impl BlackboxServer {
             let bro_label = format!("agent:{}@v{}", rec.name, rec.version);
             (manifest, agent_ref, bro_label)
         };
+
+        if let Err(err) = Self::validate_operator_authority_inputs(&manifest, &p.args) {
+            return Self::err_text(&err);
+        }
 
         // Adapter path
         if let Some(ref adapter_name) = manifest.dispatch_adapter {
