@@ -5,7 +5,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
@@ -191,6 +191,14 @@ impl NoteStore {
 // ── Gap-note view ─────────────────────────────────────────────────
 
 const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
+const GAP_NOTE_FIELD_TYPE: &str = "type";
+const GAP_NOTE_FIELD_TITLE: &str = "title";
+const GAP_NOTE_FIELD_GAP_KIND: &str = "gap_kind";
+const GAP_NOTE_FIELD_DOMAIN: &str = "domain";
+const GAP_NOTE_FIELD_IMPACT: &str = "impact";
+const GAP_NOTE_FIELD_BLOCKING_LEVEL: &str = "blocking_level";
+const GAP_NOTE_FIELD_DEDUPE_KEY: &str = "dedupe_key";
+const GAP_NOTE_FIELD_WANTED_CAPABILITY: &str = "wanted_capability";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GapImpact {
@@ -240,22 +248,69 @@ impl<'a> GapNoteView<'a> {
 
         let value = serde_json::from_str::<Value>(&note.body).ok()?;
         let object = value.as_object()?;
-        if object.get("type").and_then(Value::as_str) != Some(GAP_NOTE_TYPE) {
+        if object.get(GAP_NOTE_FIELD_TYPE).and_then(Value::as_str) != Some(GAP_NOTE_TYPE) {
             return None;
         }
 
         Some(Self {
             note,
-            title: string_field(object, "title")
+            title: string_field(object, GAP_NOTE_FIELD_TITLE)
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| truncate_chars(&note.body, 120)),
-            gap_kind: string_field(object, "gap_kind"),
-            domain: string_field(object, "domain"),
-            impact: GapImpact::parse(object.get("impact").and_then(Value::as_str)),
-            blocking_level: string_field(object, "blocking_level"),
-            dedupe_key: string_field(object, "dedupe_key"),
-            wanted_capability: string_field(object, "wanted_capability"),
+            gap_kind: string_field(object, GAP_NOTE_FIELD_GAP_KIND),
+            domain: string_field(object, GAP_NOTE_FIELD_DOMAIN),
+            impact: GapImpact::parse(object.get(GAP_NOTE_FIELD_IMPACT).and_then(Value::as_str)),
+            blocking_level: string_field(object, GAP_NOTE_FIELD_BLOCKING_LEVEL),
+            dedupe_key: string_field(object, GAP_NOTE_FIELD_DEDUPE_KEY),
+            wanted_capability: string_field(object, GAP_NOTE_FIELD_WANTED_CAPABILITY),
         })
+    }
+
+    pub fn to_json_value(&self) -> Value {
+        let mut object = Map::new();
+        object.insert(
+            GAP_NOTE_FIELD_TYPE.to_owned(),
+            Value::String(GAP_NOTE_TYPE.to_owned()),
+        );
+        object.insert(
+            GAP_NOTE_FIELD_TITLE.to_owned(),
+            Value::String(self.title.clone()),
+        );
+        if let Some(value) = &self.gap_kind {
+            object.insert(
+                GAP_NOTE_FIELD_GAP_KIND.to_owned(),
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.domain {
+            object.insert(
+                GAP_NOTE_FIELD_DOMAIN.to_owned(),
+                Value::String(value.clone()),
+            );
+        }
+        object.insert(
+            GAP_NOTE_FIELD_IMPACT.to_owned(),
+            Value::String(self.impact.as_str().to_owned()),
+        );
+        if let Some(value) = &self.blocking_level {
+            object.insert(
+                GAP_NOTE_FIELD_BLOCKING_LEVEL.to_owned(),
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.dedupe_key {
+            object.insert(
+                GAP_NOTE_FIELD_DEDUPE_KEY.to_owned(),
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.wanted_capability {
+            object.insert(
+                GAP_NOTE_FIELD_WANTED_CAPABILITY.to_owned(),
+                Value::String(value.clone()),
+            );
+        }
+        Value::Object(object)
     }
 }
 
@@ -684,6 +739,31 @@ mod tests {
             Some("packet_ast/review-policy/regex")
         );
         assert_eq!(view.wanted_capability.as_deref(), Some("regex matching"));
+    }
+
+    #[test]
+    fn gap_note_view_roundtrips_normalized_json_body() {
+        let body = serde_json::json!({
+            "type": "blackbox.gap_note.v1",
+            "title": "Packet AST cannot express regex",
+            "gap_kind": "packet_ast",
+            "domain": "review-policy",
+            "impact": "high",
+            "blocking_level": "workaround_available",
+            "dedupe_key": "packet_ast/review-policy/regex",
+            "wanted_capability": "regex matching"
+        })
+        .to_string();
+        let note = followup_note(&body);
+
+        let view = GapNoteView::parse(&note).unwrap();
+        let regenerated = view.to_json_value();
+        let regenerated_body = serde_json::to_string(&regenerated).unwrap();
+        let reparsed_note = followup_note(&regenerated_body);
+        let reparsed = GapNoteView::parse(&reparsed_note).unwrap();
+
+        assert_eq!(regenerated["type"].as_str(), Some(GAP_NOTE_TYPE));
+        assert_eq!(reparsed.to_json_value(), regenerated);
     }
 
     #[test]
