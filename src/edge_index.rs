@@ -555,13 +555,14 @@ impl EdgeIndex {
         };
         let reader = std::io::BufReader::new(file);
         for line in reader.lines().map_while(Result::ok) {
-            if line.trim().is_empty() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Edge>(&line) {
-                Ok(edge) if skip_derived && edge.provenance == EdgeProvenance::Derived => {
-                    continue;
-                }
+            if skip_derived && line_provenance_is_derived(trimmed) {
+                continue;
+            }
+            match serde_json::from_str::<Edge>(trimmed) {
                 Ok(edge) => {
                     self.insert_sidecar_edge(edge, seen);
                 }
@@ -947,6 +948,10 @@ fn thread_edge_kind_name(kind: &EdgeKind) -> &'static str {
         EdgeKind::RelatesTo => "THREAD_RELATES_TO",
         EdgeKind::Subsumes => "THREAD_SUBSUMES",
     }
+}
+
+fn line_provenance_is_derived(line: &str) -> bool {
+    line.contains("\"provenance\":\"derived\"") || line.contains("\"provenance\": \"derived\"")
 }
 
 #[cfg(test)]
@@ -1628,6 +1633,112 @@ mod tests {
             index.edge_count(),
             0,
             "backup and temp files must not be loaded"
+        );
+    }
+
+    #[test]
+    fn line_provenance_is_derived_matches_exact_serialized_forms() {
+        assert!(
+            line_provenance_is_derived(
+                r#"{"source":"k:abc","kind":"DESCRIBES","target":"k:def","provenance":"derived","confidence":"exact"}"#
+            ),
+            "compact JSON with derived provenance"
+        );
+        assert!(
+            line_provenance_is_derived(
+                r#"{"source":"k:abc", "kind":"DESCRIBES", "target":"k:def", "provenance": "derived", "confidence":"exact"}"#
+            ),
+            "JSON with spaces around colon/value for provenance"
+        );
+        assert!(
+            !line_provenance_is_derived(
+                r#"{"source":"k:abc","kind":"DESCRIBES","target":"k:def","provenance":"explicit","confidence":"exact"}"#
+            ),
+            "explicit provenance must not match"
+        );
+        assert!(
+            !line_provenance_is_derived(
+                r#"{"source":"k:abc","kind":"DESCRIBES","target":"k:def","provenance":"implicit","confidence":"exact"}"#
+            ),
+            "implicit provenance must not match"
+        );
+        assert!(
+            !line_provenance_is_derived("not valid json at all"),
+            "malformed line must not match"
+        );
+        assert!(
+            !line_provenance_is_derived("{\"provenance\":\"derivedly_wrong\"}"),
+            "substring that is not exact value must not match"
+        );
+    }
+
+    #[test]
+    fn legacy_derived_lines_skip_deserialization_when_managed_sidecar_exists() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DESERIALIZE_COUNT: std::sync::LazyLock<Arc<AtomicUsize>> =
+            std::sync::LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = EntityRef::ProjectFile {
+            project_id: "proj9999".into(),
+            rel_path_hash: "pathhash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let legacy_derived = crate::chunker::Edge {
+            source: source.clone(),
+            kind: "NEXT_SECTION".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "proj9999".into(),
+                rel_path_hash: "pathhash".into(),
+                chunk_hash: "b".repeat(64),
+                occurrence_idx: 1,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        let legacy_explicit = Edge {
+            source: EntityRef::Knowledge { id: "k-1".into() },
+            kind: "DESCRIBES".into(),
+            target: source.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: Default::default(),
+        };
+        append_project_edges(dir.path(), "proj9999", &[legacy_derived]).unwrap();
+        append_edges(dir.path(), "proj9999", &[legacy_explicit]).unwrap();
+
+        let managed = crate::chunker::Edge {
+            source: source.clone(),
+            kind: "NEXT_SECTION".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "proj9999".into(),
+                rel_path_hash: "other".into(),
+                chunk_hash: "c".repeat(64),
+                occurrence_idx: 2,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        replace_project_edges(dir.path(), "project", "proj9999", &[managed]).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(dir.path(), None, &mut seen);
+
+        assert_eq!(
+            index.forward_edges(&source).len(),
+            1,
+            "only managed derived edge should appear"
+        );
+        assert!(
+            index
+                .forward_edges(&EntityRef::Knowledge { id: "k-1".into() })
+                .iter()
+                .any(|e| e.kind == "DESCRIBES"),
+            "explicit edge from legacy sidecar must survive"
         );
     }
 
