@@ -620,10 +620,10 @@ fn path_source_key(path: &str) -> String {
     extract_project_id_from_backup(file_name).unwrap_or_else(|| file_name.to_string())
 }
 
-fn backup_recency_key(f: &StorageFileInfo) -> (Reverse<u64>, Reverse<u64>) {
-    let mtime = file_age_secs(Path::new(&f.path)).unwrap_or(u64::MAX);
+fn backup_recency_key(f: &StorageFileInfo) -> (u64, Reverse<u64>) {
+    let mtime = recency_age_secs(Path::new(&f.path));
     let suffix_ts = extract_bak_timestamp(&f.path).unwrap_or(0);
-    (Reverse(mtime), Reverse(suffix_ts))
+    (mtime, Reverse(suffix_ts))
 }
 
 fn extract_bak_timestamp(path: &str) -> Option<u64> {
@@ -637,6 +637,10 @@ fn file_age_secs(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     let now = SystemTime::now();
     now.duration_since(modified).ok().map(|d| d.as_secs())
+}
+
+fn recency_age_secs(path: &Path) -> u64 {
+    file_age_secs(path).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1073,12 +1077,12 @@ mod tests {
 
         filetime::set_file_mtime(
             &newer_path,
-            filetime::FileTime::from_unix_time(2000000000, 0),
+            filetime::FileTime::from_unix_time(1700000000, 0),
         )
         .unwrap();
         filetime::set_file_mtime(
             &older_path,
-            filetime::FileTime::from_unix_time(1000000000, 0),
+            filetime::FileTime::from_unix_time(1600000000, 0),
         )
         .unwrap();
 
