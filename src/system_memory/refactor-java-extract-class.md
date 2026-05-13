@@ -8,7 +8,7 @@ injection, and (under `deep_analysis: true`) a structured preview of
 remaining-source accessors / external calls / inherited dependencies.
 
 Parent runbook: `sm-refactor-java` (general Java tool sequence, capability
-matrix, agent atom catalog, interface/visibility/migration/imports
+matrix, contextual atom signposts, interface/visibility/migration/imports
 primitives). For Lombok conversion, see `sm-refactor-java-lombokify`.
 
 ## Minimal invocation skeleton
@@ -703,4 +703,3 @@ Same-package targets get the `package` floor and resolve the delegate
 type implicitly. An explicit `visibility` parameter on the plan acts as
 an additional floor — the planner widens further if you ask for `public`,
 but never narrows below the cross-package requirement.
-

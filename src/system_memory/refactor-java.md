@@ -2,32 +2,18 @@
 
 Use this memory before operating on Java files with blackbox refactor tools.
 
-## Atom layer over these plan kinds
+## Atom signposts
 
-For common Java refactor patterns, prefer a refactor atom over re-deriving
-the discipline by hand. Each atom encodes the grounding sequence, plans
-with `deep_analysis=true`, composes the right primitives through
-`bbox_refactor_run` with a validation command step, and emits the done
-note.
+For recurring Java refactor patterns, check `atom_search(query="<intent>")`
+before re-deriving the whole tool sequence. Use atoms as contextual shortcuts
+for patterns such as class dependency inventory, public-API preflight,
+project-wide usage enumeration, cohesive-class extraction, inner-class
+promotion, interface extraction, or Lombok conversion. The atom manifest is the
+source of truth for version, inputs, cost, and prompt text; this memory keeps
+the primitive plan-kind map and safety invariants.
 
-| Atom | Pattern |
-|---|---|
-| `java-class-dependency-graph` | Class inventory — methods + fields + inner types + annotations — for partition review (analysis-only) |
-| `java-public-api-guard` | Public-API delta advisory; preflight for mutating atoms (analysis-only) |
-| `java-find-usages` | Project-wide reference walk with optional `declaring_class` filter + test/prod tally (analysis-only) |
-| `java-extract-cohesive-class` | Composite cluster extraction — methods + field moves + delegate + caller rewrites + cross-package widening |
-| `java-promote-inner-class` | Promote non-static inner with captures into a top-level class with final ctor params |
-| `java-extract-interface` | Extract interface from class + optional caller type migration; v2 runs a structured public-API guard preflight |
-| `java-lombokify` | Convert hand-rolled POJO boilerplate into Lombok annotations; single-file or bulk-dir |
-
-Discover via `atom_search(<intent phrase>)`; install via
-`bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/<name>.json")`;
-invoke via `atom_invoke(atom="atom:<name>@v<N>", args={...})`. Full
-catalog (with cost class, plan-kind dependencies, and operator-authority
-fields) lives in `sm-refactor` under "Refactor atom catalog".
-
-When an atom doesn't fit the operator's exact shape, the manual plan-kind
-sequence below is still the canonical path.
+When no atom fits the exact shape, the manual plan-kind sequence below is the
+canonical path.
 
 ## Current Capability
 
@@ -89,9 +75,9 @@ Tree-sitter language: `java`.
 
 ## Child memories — when to pull alongside this one
 
-- `sm-refactor` — parent catalog: shared code-nav semantics, supported plan
-  kinds by language, refactor persona tool surface, atom install/invoke
-  contract, and the authoritative shipped atom version table.
+- `sm-refactor` — parent invariants: shared code-nav semantics, supported plan
+  kinds by language, refactor persona tool surface, and the atom
+  install/invoke contract.
 - `sm-refactor-java-extract-class` — `extract_java_class` capability
   checklist, parameter reference (`wiring_mode`, `source_delegate_wrappers`,
   `propagate_class_annotations`, `callback_externals`, etc.), capture-analysis
@@ -109,8 +95,8 @@ detail grows beyond quick routing/signpost prose.
 
 All child memories are reachable via `bbox_knowledge(query=...)` with their own
 tag set. Pull the relevant child for parameter detail; this parent stays a
-language-level map of plan kinds, the tool sequence, safety rules, and the
-refactor-atom catalog.
+language-level map of plan kinds, the tool sequence, safety rules, and
+contextual atom signposts.
 
 ## Atom gaps to crystallize next
 

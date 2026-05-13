@@ -3,32 +3,18 @@
 Use this memory before moving, extracting, renaming, or splitting Rust code with
 blackbox refactor tools.
 
-## Atom layer over these plan kinds
+## Atom signposts
 
-For common Rust refactor patterns, prefer a refactor atom over re-deriving
-the discipline by hand. Each atom encodes the grounding sequence, plans
-with `deep_analysis=true`, composes the right primitives through
-`bbox_refactor_run` with the canonical cargo-check + compile-fix-round +
-cargo-test sequence, and emits the done note.
+For recurring Rust refactor patterns, check `atom_search(query="<intent>")`
+before re-deriving the whole tool sequence. Use atoms as contextual shortcuts
+for patterns such as impl partition inventory, public-API preflight, test
+island extraction, state extraction, trait extraction, error migration, or
+large impl splitting. The atom manifest is the source of truth for version,
+inputs, cost, and prompt text; this memory keeps the primitive plan-kind map
+and safety invariants.
 
-| Atom | Pattern |
-|---|---|
-| `rust-impl-partition-graph` | Method/field/call graph for an impl block; analysis-only preflight |
-| `rust-public-api-guard` | Public-API delta advisory; preflight for mutating atoms |
-| `rust-test-island-extract` | Peel inline `#[cfg(test)] mod tests` into `src/tests/*.rs` siblings |
-| `rust-state-extract` | Pull a `self.<field>` cluster into a separate struct + delegate |
-| `rust-trait-from-impl` | Lift method subset into a trait + `impl Trait for Struct` |
-| `rust-error-migrate` | Rewrite a module error type with public-API preflight |
-| `rust-split-god-impl` | Carve multi-domain impl block into per-domain modules |
-
-Discover via `atom_search(<intent phrase>)`; install via
-`bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/<name>.json")`;
-invoke via `atom_invoke(atom="atom:<name>@v<N>", args={...})`. Full
-catalog (with cost class, plan-kind dependencies, and operator-authority
-fields) lives in `sm-refactor` under "Refactor atom catalog".
-
-When an atom doesn't fit the operator's exact shape, the manual plan-kind
-sequence below is still the canonical path.
+When no atom fits the exact shape, the manual plan-kind sequence below is the
+canonical path.
 
 ## Current Capability
 

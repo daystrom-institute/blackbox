@@ -313,7 +313,7 @@ small files only; status defaults to at most 200 returned items and reports
    touches are snapshotted before the command and are rolled back with prior
    plan writes on required command failure.
 
-## Refactor-atom personas (RA-B1 / RA-B2)
+## Refactor-atom personas
 
 The refactor atom layer ships JSON manifests installed via
 `bbox_artifact_install(kind="atom", …)`. Every refactor atom uses
@@ -370,7 +370,9 @@ tool sequence has a reusable atom boundary, say "for this pattern, consider the
 matching refactor atom via `atom_search(...)`" and keep the primitive sequence
 as the canonical fallback. The manifest is the source of truth for an atom's
 version, cost class, input schema, prompt, implementation brofile, and
-operator-authority flags.
+operator-authority flags. Pull `sm-atoms` only when you need the deeper atom
+contract: backend kinds, invocation handles, effect limits, child composition,
+workflow bindings, or manifest authoring rules.
 
 Workflow composition is also a catalog concern. Use workflow artifacts when a
 refactor needs multiple atom boundaries with gates or operator review between

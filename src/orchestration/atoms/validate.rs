@@ -1294,25 +1294,23 @@ mod tests {
     }
 
     #[test]
-    fn sm_refactor_catalog_lists_every_shipped_atom() {
+    fn sm_refactor_uses_signposts_not_atom_ledger() {
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let atom_names = shipped_refactor_atom_names();
         let catalog = std::fs::read_to_string(crate_root.join("src/system_memory/refactor.md"))
             .expect("read sm-refactor");
 
-        let mut missing: Vec<&str> = Vec::new();
-        for name in &atom_names {
-            let needle = format!("`{name}`");
-            if !catalog.contains(&needle) {
-                missing.push(name);
-            }
-        }
         assert!(
-            missing.is_empty(),
-            "sm-refactor catalog is missing rows for shipped atoms: {:?}. \
-             Add a row to the \"Refactor atom catalog\" table in \
-             src/system_memory/refactor.md.",
-            missing
+            catalog.contains("atom_search(query=\"<intent phrase>\")")
+                && catalog.contains("System memory is not the atom catalog"),
+            "sm-refactor should signpost atom discovery, not mirror the atom catalog"
+        );
+        assert!(
+            !catalog.contains("| Atom | Status | Cost |")
+                && !catalog.contains("shipped (v")
+                && !catalog.contains("RA-A")
+                && !catalog.contains("RA-X"),
+            "sm-refactor must not become a historical atom ledger; \
+             shipped atom coverage belongs to manifest/eval tests"
         );
     }
 

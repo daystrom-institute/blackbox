@@ -6,7 +6,7 @@ Commons equals/hashCode/toString, canonical constructors, SLF4J logger
 fields) into the corresponding Lombok annotations, optionally collapsing
 the full mutable-POJO set into `@Data` or the all-final-fields set into
 `@Value`. Parent runbook: `sm-refactor-java` (general Java tool
-sequence, capability matrix, agent atom catalog). For class-extraction
+sequence, capability matrix, contextual atom signposts). For class-extraction
 and capture analysis, see `sm-refactor-java-extract-class`.
 
 ## Minimal invocation skeleton
