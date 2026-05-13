@@ -157,7 +157,7 @@ impl SupervisionState {
                 input: Some(input),
             });
 
-            while self.recent_hashes.len() > SupervisionConfig::default().max_recent_hashes {
+            while self.recent_hashes.len() > config().max_recent_hashes {
                 self.recent_hashes.pop_front();
             }
 
@@ -318,10 +318,6 @@ impl SupervisionState {
             }
             if usage.output_tokens > self.total_output_tokens {
                 self.total_output_tokens = usage.output_tokens;
-            }
-            let total_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
-            if self.token_baseline.is_none() && total_tokens > 0 {
-                self.token_baseline = Some(total_tokens);
             }
         }
     }
@@ -863,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn token_burn_ratio_computed_from_usage_totals() {
+    fn token_burn_alert_requires_seeded_baseline() {
         let mut state = SupervisionState::default();
 
         state.observe_event(
@@ -871,6 +867,29 @@ mod tests {
             &sink_with_tokens(100, 25),
             1_000,
         );
+        state.observe_event(
+            &serde_json::json!({"note": "follow"}),
+            &sink_with_tokens(375, 125),
+            2_000,
+        );
+
+        let snapshot = state.snapshot(2_100);
+        assert!(snapshot.get("token_burn_ratio").is_none());
+        assert!(
+            state
+                .alerts
+                .iter()
+                .all(|alert| !matches!(alert.kind, AlertKind::TokenBurn))
+        );
+    }
+
+    #[test]
+    fn token_burn_ratio_computed_from_seeded_baseline() {
+        let mut state = SupervisionState {
+            token_baseline: Some(125),
+            ..Default::default()
+        };
+
         state.observe_event(
             &serde_json::json!({"note": "follow"}),
             &sink_with_tokens(375, 125),
