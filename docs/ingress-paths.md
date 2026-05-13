@@ -1,9 +1,11 @@
 # Ingress Paths
 
-Three trigger sources feed into the same routing pipeline. Each one
-produces an entity, passes it through an extractor, runs a routing
-packet against it, and dispatches the verdict — start an arc, signal a
-waiting arc, cancel, or ignore.
+Ingress is how outside events reach workflow state.
+
+Webhooks, pollers, and crons all do the same thing once they enter the daemon:
+produce an entity, extract the fields the packet cares about, apply a routing
+packet, then dispatch the verdict. The verdict starts an arc, signals a waiting
+arc, cancels an arc, dead-letters the event, or ignores it.
 
 ```
 ┌──────────┐  ┌──────────┐  ┌──────────┐
@@ -19,10 +21,9 @@ waiting arc, cancel, or ignore.
    ignore      dead_letter
 ```
 
-The daemon has no hardcoded integrations — Forgejo, GitHub, Slack, any
-JSON-speaking upstream — they all converge on the same extractor →
-packet → dispatch path. You iterate on routing rules by replaying
-payloads, not by redeploying.
+The daemon has no hardcoded Forgejo/GitHub/Slack path. JSON-speaking upstreams
+all converge on extractor to packet to dispatch. You iterate on routing by
+replaying payloads, not by redeploying code.
 
 ## Webhooks
 
@@ -128,7 +129,7 @@ bro_poller_install(spec = {
 | `every_seconds` | Poll interval (≥ `BBOX_POLLER_MIN_INTERVAL_SECS`, default 5) |
 | `iterate` | JSONPath selector to explode array responses into per-item events |
 | `dedup_id_path` | Stable id for dedup (in-memory recent-seen ring per poller) |
-| `extractor` | Field projections — same shape as webhook extractors |
+| `extractor` | Field projections - same shape as webhook extractors |
 | `routing_packet` | Packet that classifies each extracted entity |
 
 ### Management
@@ -141,7 +142,7 @@ bro_poller_install(spec = { ... })  // same name = replace
 
 ## Crons
 
-Crons are calendar-driven triggers — no fetch, just a scheduled tick that
+Crons are calendar-driven triggers - no fetch, just a scheduled tick that
 produces a synthetic entity and routes it through the packet pipeline.
 
 ### Install a cron
@@ -160,8 +161,8 @@ bro_cron_install(spec = {
 
 At each tick, the daemon merges two synthetic fields into the entity:
 
-- `cron_name` — the cron's name (so routing rules can discriminate)
-- `tick_at` — ISO 8601 timestamp of the tick
+- `cron_name` - the cron's name (so routing rules can discriminate)
+- `tick_at` - ISO 8601 timestamp of the tick
 
 Your routing packet can use `Eq{field: "cron_name", value: "daily-triage"}`
 to route only this cron's ticks.
@@ -204,13 +205,13 @@ bro_cron_list()
 
 The universal debugging pattern across all three ingress types:
 
-1. **Replay** — `bro_webhook_replay()` for webhooks; pollers and crons
+1. **Replay** - `bro_webhook_replay()` for webhooks; pollers and crons
    can be triggered manually by calling their dispatch path
-2. **Inspect deliveries** — `bro_webhook_deliveries()` shows the
+2. **Inspect deliveries** - `bro_webhook_deliveries()` shows the
    classification verdict for every webhook event (and replay)
-3. **Inspect signals** — `bro_signals()` shows whether `signal_arc`
+3. **Inspect signals** - `bro_signals()` shows whether `signal_arc`
    verdicts matched waiting arcs or fell idle
-4. **Check arc state** — `bro_arc_status()` shows whether a
+4. **Check arc state** - `bro_arc_status()` shows whether a
    `start_arc` verdict actually started running
 
 ## When to use which

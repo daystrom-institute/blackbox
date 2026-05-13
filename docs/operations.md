@@ -1,4 +1,4 @@
-# Operations — config, upkeep, and backup
+# Operations - config, upkeep, and backup
 
 Where things live on disk, what needs protecting, what can be rebuilt
 from scratch, and the maintenance tasks that keep the daemon healthy.
@@ -9,7 +9,7 @@ This is the most important section for disaster recovery and multi-machine
 replication. Get this wrong and a disk failure or mistaken `rm -rf` takes
 out months of accumulated knowledge.
 
-### Protect — cannot be reconstructed
+### Protect - cannot be reconstructed
 
 These files are the durable state blackbox accumulates over time. Back
 them up, version them, and replicate them to wherever your next machine
@@ -25,7 +25,7 @@ will run.
 | `~/.local/state/blackbox/projects.json` | Registered project roots and their IDs | small |
 | `~/.local/state/blackbox/packets/` | Compiled rule packets (packet JSON + audit examples) | varies |
 | `~/.local/state/blackbox/artifacts/` | Artifact catalog (installed workflows, agents, brofiles) | varies |
-| `~/.local/state/blackbox/bro/` | **The entire bro directory** — see breakdown below | varies |
+| `~/.local/state/blackbox/bro/` | **The entire bro directory** - see breakdown below | varies |
 | `~/.bro/slack-identities.json` | Slack user identity mappings | small |
 
 The `bro/` subtree in detail:
@@ -46,7 +46,7 @@ The `bro/` subtree in detail:
 | `slack-threads.json` | Slack thread metadata |
 | `tasks.json` | Task lifecycle records for all dispatched bros |
 
-### Rebuild — safe to lose
+### Rebuild - safe to lose
 
 These can be fully reconstructed from the protected files + source
 repos. Don't waste backup space on them.
@@ -60,7 +60,7 @@ repos. Don't waste backup space on them.
 | `~/.local/state/blackbox/backups/` | Pre-render snapshots; the rendered files themselves are the source of truth |
 | `~/.local/state/blackbox/logs/` | Structured event logs; rotated automatically |
 
-### Binaries — reinstall, don't back up
+### Binaries - reinstall, don't back up
 
 ```
 ~/.local/bin/blackboxd
@@ -75,7 +75,7 @@ Built from source: `cargo build --release && install -m 755 target/release/{blac
 ### API keys
 
 Blackbox uses Voyage AI for embeddings. The daemon needs the key in its
-environment — not in a config file, not hardcoded.
+environment - not in a config file, not hardcoded.
 
 ```ini
 # ~/.config/systemd/user/blackbox.service.d/secrets.conf
@@ -132,7 +132,7 @@ model requires re-embedding that route: `bbox_reembed(route="knowledge")`.
 
 Default port: `7264` (HTTP MCP + `/tail` + `/roster`). Override with
 `BBOX_PORT` environment variable. Port `7263` is retired (old `bro.service`)
-— avoid it.
+- avoid it.
 
 ### Daemon variants
 
@@ -221,7 +221,7 @@ install -m 755 target/release/bro ~/.local/bin/bro
 systemctl --user restart blackbox.service blackbox-dev.service
 ```
 
-Watch the journal for `auto-reindex: indexed N files` — if the schema
+Watch the journal for `auto-reindex: indexed N files` - if the schema
 version changed, the index will drop and rebuild (~5–7 min for 1M docs).
 
 ### After a schema version bump
@@ -230,8 +230,8 @@ The daemon drops and rebuilds the index automatically on start. You'll
 see `dropping transcript index for schema migration` in the journal.
 Wait for:
 
-1. `auto-reindex: indexed N files (M docs)` — tantivy rebuild done
-2. `edge-index watcher: corpus grew, EdgeIndex rebuilt` — graph projection done (~6 sec after)
+1. `auto-reindex: indexed N files (M docs)` - tantivy rebuild done
+2. `edge-index watcher: corpus grew, EdgeIndex rebuilt` - graph projection done (~6 sec after)
 3. Smoke: `bbox_describe_schema` should return all entity types with non-zero populations; `bbox_hybrid_search("test", limit=5)` should show both `bm25` and `vector` sources.
 
 ### After changing an embedding route provider
@@ -271,7 +271,7 @@ bbox_render(scope="global")  # re-sync provider markdown files if out of date
 
 ## Backup strategy
 
-Minimal working backup — tar the protect list:
+Minimal working backup - tar the protect list:
 
 ```bash
 tar -czf blackbox-backup-$(date +%F).tar.gz \
@@ -296,7 +296,7 @@ vectors, run `bbox_reembed(route="<route>")` for each configured route.
 1. Restore the protected files to the same paths.
 2. Build and install the daemon binaries.
 3. Copy systemd units and drop-ins (including secrets).
-4. Start the daemon — index rebuilds automatically.
+4. Start the daemon - index rebuilds automatically.
 5. Run `bbox_reembed(route="<route>")` for each embedding route.
 6. Verify: `bbox_describe_schema`, `bbox_embed_status`, `bbox_inbox`.
 

@@ -1,15 +1,15 @@
-# Internals — graph grounding, search, and indexing
+# Internals - graph grounding, search, and indexing
 
 ## The grounding problem
 
 An LLM asked a cold-start question about a codebase it hasn't seen this
-session will answer from training priors — confidently, often wrong.
+session will answer from training priors - confidently, often wrong.
 Even with BM25 transcript search, naive rerank on the top-N results
 achieves around **23% recall** on questions that require tracing
 provenance or following a reasoning chain across multiple entities.
 
 Blackbox's graph layer raises that to around **97%** on the same probe
-set. The improvement doesn't come from a better model — it comes from
+set. The improvement doesn't come from a better model - it comes from
 giving agents a structured traversal surface and a sequence of tool
 calls with interlocking shapes that carry evidence forward rather than
 starting each step from scratch.
@@ -24,17 +24,17 @@ output shape of step N is the required input shape of step N+1.
 ### `bbox_hybrid_search` / `bbox_discover_seed_entities`
 
 **Output shape:** a ranked list of entity refs, each with a
-`notable_edges` preview — the highest-signal outgoing and incoming edges
+`notable_edges` preview - the highest-signal outgoing and incoming edges
 for that entity, prioritized semantic-first.
 
 **Why this shape:** the agent doesn't have to run a second call to know
 what to inspect next. The notable_edges are a pre-vetted traversal menu.
 `bbox_discover_seed_entities` is the same search but with notable_edges
-rendered inline for every result — use it when the next step is
+rendered inline for every result - use it when the next step is
 `bbox_inspect_entity` and you want the hop targets surfaced before you
 commit to one.
 
-The vector lane catches paraphrases — if the user's query wording
+The vector lane catches paraphrases - if the user's query wording
 doesn't match the corpus's wording, cosine similarity finds the
 canonical entity anyway. This is why the top seed is canonical for the
 query even when lexical matching would miss it.
@@ -49,13 +49,13 @@ just structurally reachable nodes)
 
 **Why this shape:** one call returns both properties and edges.
 `recommended_next_hops` means the agent doesn't have to reason about
-which edges to follow — the index pre-ranks them. The `edge_types` and
+which edges to follow - the index pre-ranks them. The `edge_types` and
 `direction` parameters exist so you can narrow from the orientation
 sweep (`direction=both`) to targeted reads (`direction=out,
 edge_types=SUPERSEDES`) as you understand the subgraph.
 
 Critical: entity refs are canonical strings. When a call returns
-`error.bad_input` with a `suggested_fix`, use the suggestion verbatim —
+`error.bad_input` with a `suggested_fix`, use the suggestion verbatim -
 don't guess a corrected ref. The ref format encodes path hashes and
 chunk positions that aren't reconstructible by inspection.
 
@@ -63,11 +63,11 @@ chunk positions that aren't reconstructible by inspection.
 
 **Input:** a `from` entity ref, optional `to` ref or `to_type` target,
 optional `edge_types` filter  
-**Output:** BFS chains with **path_ids** — server-side identifiers for
+**Output:** BFS chains with **path_ids** - server-side identifiers for
 the validated traversal results
 
 **Why this shape:** path_ids are the key. They are opaque handles that
-the server holds — passing them to `bbox_bundle_evidence` lets you cite
+the server holds - passing them to `bbox_bundle_evidence` lets you cite
 a multi-hop reasoning chain without reconstructing the path text from
 memory (which would be subject to hallucination). Direction is
 preserved; do not invert edges from memory.
@@ -96,15 +96,15 @@ conversational history, run this sequence before falling back to
 filesystem search or training-prior answers:
 
 ```
-1. bbox_describe_schema           # orient — entity types + edge families (once per session)
-2. bbox_hybrid_search(q, k=5)     # seed — ranked results with notable_edges
-3. bbox_inspect_entity(ref)       # confirm — properties + edges + recommended_next_hops
-4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS, returns path_ids
-5. bbox_bundle_evidence(...)      # close — package entity refs + path_ids before answering
+1. bbox_describe_schema           # orient - entity types + edge families (once per session)
+2. bbox_hybrid_search(q, k=5)     # seed - ranked results with notable_edges
+3. bbox_inspect_entity(ref)       # confirm - properties + edges + recommended_next_hops
+4. bbox_find_paths(from, to_*)    # traverse - direction-preserving BFS, returns path_ids
+5. bbox_bundle_evidence(...)      # close - package entity refs + path_ids before answering
 ```
 
-Step 1 is one-time per session — cache the schema mentally, don't
-repeat it on every query. Step 4 is conditional — skip it when the
+Step 1 is one-time per session - cache the schema mentally, don't
+repeat it on every query. Step 4 is conditional - skip it when the
 answer is single-hop. Step 5 is the close-the-loop write.
 
 **What makes this work is the data flowing forward:**
@@ -148,7 +148,7 @@ counts for all types.
 | `task` (virtual) | A `bro_exec` dispatch unit | "what produced this artifact?" |
 | `bash_call` (virtual) | One shell invocation in a transcript | "what did this command emit?" |
 
-One Tantivy document is indexed per content block — not per session.
+One Tantivy document is indexed per content block - not per session.
 This enables role-based filtering (`role=user` vs `role=assistant`) and
 precise excerpt generation. Sessions with 50 turns produce 50+ documents,
 each independently searchable.
@@ -158,7 +158,7 @@ each independently searchable.
 Edges are directional and typed. `bbox_find_paths` follows them;
 `bbox_inspect_entity` returns them filtered by `edge_types` and
 `direction`. Use `direction=out` or `direction=in` once you know what
-you're looking for — `direction=both` is for initial orientation only.
+you're looking for - `direction=both` is for initial orientation only.
 
 | Family | Edge kinds |
 |---|---|
@@ -184,7 +184,7 @@ Fusion (RRF), then applies four post-processing passes.
 
 ### The three lists
 
-**BM25 (chunk-level)** — Tantivy BM25 over indexed fields, with boosts:
+**BM25 (chunk-level)** - Tantivy BM25 over indexed fields, with boosts:
 
 | Field | Boost | Notes |
 |---|---|---|
@@ -193,12 +193,12 @@ Fusion (RRF), then applies four post-processing passes.
 | `content` | 1.0× | Full chunk text |
 | `code_content` | 1.0× | Source code |
 
-**BM25-file (file-level aggregation)** — sums per-chunk BM25 scores
+**BM25-file (file-level aggregation)** - sums per-chunk BM25 scores
 across all chunks of a file, weighted by `sum × √chunk_count`. Lifts
 files with many sparse mentions (e.g. a STATUS.md with 21 references to
 a topic) that per-chunk ranking buries.
 
-**Vector** — HNSW approximate nearest neighbor over Voyage embeddings
+**Vector** - HNSW approximate nearest neighbor over Voyage embeddings
 (`voyage-code-3`, 1024d). Default RRF weight: 0.6 vector / 0.4 BM25.
 Override with `vector_weight`: `0.0` for BM25-only, `1.0` for
 vector-only.
@@ -216,22 +216,22 @@ completely dominating results that appear consistently across all three.
 
 Applied in order after fusion:
 
-1. **Project filter** — `project=<path or project_id>` drops
+1. **Project filter** - `project=<path or project_id>` drops
    `project_file` refs from other projects while passing commits,
    knowledge, and transcripts through. Without this, a query for
    "voyage" in the transcript-search repo surfaces `erlang-test/voyage.ex`
    ahead of `transcript-search/src/embed/voyage.rs`.
 
-2. **Per-file collapse** — only the highest-scoring chunk per file
+2. **Per-file collapse** - only the highest-scoring chunk per file
    survives. Ensures result diversity across files rather than returning
    10 chunks from the same large file.
 
-3. **Modal diversification** — guarantees at least one `code_block`,
+3. **Modal diversification** - guarantees at least one `code_block`,
    `doc_section`, and `git_message` in top-N when the fetch set contains
    them. Without this, a query like "triad implementation" can return 10
    doc chunks with the defining `.ex` source file invisible.
 
-4. **Symbol_exact boost** — single-token queries (snake_case, CamelCase,
+4. **Symbol_exact boost** - single-token queries (snake_case, CamelCase,
    dotted paths) add a SHOULD clause on `symbol_exact` with 6× boost,
    lifting the defining chunk above documents that only mention the
    symbol in prose.
@@ -300,7 +300,7 @@ Schema version history:
 | `agentic-corpus-g2-path-tokens` | Tokenized `path_tokens` field |
 | `agentic-corpus-g3-commit-subject-tokens` | `path_tokens` from commit subjects so commits rank alongside project files |
 | `agentic-corpus-g4-elixir-symbols` | Elixir symbol extraction via tree-sitter |
-| `agentic-corpus-g5-symbol-tokenized` | `symbol` switched to code_tokenizer — `Substrate.TriadClosure` now matches both camelCase and snake_case queries |
+| `agentic-corpus-g5-symbol-tokenized` | `symbol` switched to code_tokenizer - `Substrate.TriadClosure` now matches both camelCase and snake_case queries |
 
 ---
 
@@ -323,7 +323,7 @@ items thread.
 
 ## System memories
 
-Code-embedded runbooks pulled on demand — not rendered into provider
+Code-embedded runbooks pulled on demand - not rendered into provider
 files, so they don't bloat every session's context. Fetch with
 `bbox_knowledge(query="sm-<id>")`.
 

@@ -1,12 +1,17 @@
 # Reference Implementations
 
-Three end-to-end examples ship with the daemon. Each one is a complete,
-runnable stack: routing packets, workflow specs, brofiles, install
-scripts, and a Docker environment where needed. Copy and adapt — the
-daemon doesn't read `examples/` automatically; you install what you
-want.
+Blackbox ships two kinds of runnable material:
 
-## Keystone — issue → PR → review → merge
+- `examples/` contains tutorial specs and full integration demos that users copy
+  and adapt.
+- `system-defaults/` contains blackbox-owned installable artifacts: atoms,
+  Badgey artifacts, refactor personas, agentic-corpus producer machinery, legacy
+  registered agents, and MCP surface packets.
+
+The daemon does not read either tree automatically. Install only the artifacts
+you want.
+
+## Keystone - issue → PR → review → merge
 
 `examples/keystone/`
 
@@ -65,16 +70,16 @@ cd examples/keystone
 ```
 examples/keystone/
 ├── docker-compose.yaml
-├── packets/          — routing-forgejo, gate-merge-or-review, gate-loop-or-exit, …
-├── webhooks/         — forgejo.json (hmac_sha256 signature scheme)
-├── pollers/          — forgejo-open-issues.json (opt-in alternative)
-├── workflows/        — issue-to-merged-pr, implementer-arc, reviewer-arc, …
-└── scripts/          — bootstrap.sh, install.sh, run.sh
+├── packets/          - routing-forgejo, gate-merge-or-review, gate-loop-or-exit, …
+├── webhooks/         - forgejo.json (hmac_sha256 signature scheme)
+├── pollers/          - forgejo-open-issues.json (opt-in alternative)
+├── workflows/        - issue-to-merged-pr, implementer-arc, reviewer-arc, …
+└── scripts/          - bootstrap.sh, install.sh, run.sh
 ```
 
 ---
 
-## SASTquatch — cron → SAST → fix → PR → review → merge
+## SASTquatch - cron → SAST → fix → PR → review → merge
 
 `examples/sastquatch/`
 
@@ -84,9 +89,9 @@ MCP calls, a triager picks the highest-value cluster, a fixer applies
 the fix and opens a PR, a reviewer ensemble votes, and the arc
 auto-merges on approval.
 
-SASTquatch inverts three Keystone axes simultaneously — cron vs. webhook
+SASTquatch inverts three Keystone axes simultaneously - cron vs. webhook
 trigger, analyst-discovered vs. operator-supplied input, triager actor
-vs. none — each inversion forcing a new engine primitive.
+vs. none - each inversion forcing a new engine primitive.
 
 ```mermaid
 flowchart TB
@@ -115,7 +120,7 @@ flowchart TB
 |---|---|
 | Cron inlet (calendar-driven, no upstream event) | `crons/sastquatch-daily.json`, `concurrency: 1` (skip ticks while in-flight) |
 | `mcp_call` op (engine-level outbound MCP) | Analyzer fires `sast_run` / `sast_summary` on biofilter (stdio MCP); arc hooks call `bbox_thread` / `bbox_note` on blackbox-self (HTTP MCP) |
-| `triager` actor kind | `PickCluster` — emits structured JSON; `parse_json on_exit` enforces the contract |
+| `triager` actor kind | `PickCluster` - emits structured JSON; `parse_json on_exit` enforces the contract |
 | Work-item thread as typed envelope | Analyzer opens `bbox_thread(kind=work_item)`, threads `thread_id` through every sub-arc |
 | Subworkflow composition (5 specs) | Analyzer, fixer, reviewer, feedback sub-arcs |
 | Hook-only nodes (no LLM dispatch) | Setup, RunSast, OpenWorkItem, FetchDiff, PushAndOpenPr, PostReview, Done |
@@ -141,18 +146,60 @@ cd examples/sastquatch
 ```
 examples/sastquatch/
 ├── docker-compose.yaml
-├── crons/         — sastquatch-daily.json (concurrency=1)
-├── packets/       — routing-cron, routing-webhook, hook-when-has-work-item
-├── webhooks/      — sastquatch.json (PR event extractor)
-├── workflows/     — sastquatch-arc, analyzer-arc, fixer-arc, reviewer-arc, feedback-arc
-└── scripts/       — bootstrap.sh (seeds buggy Rust crate + sast-bridge.json), install.sh, run.sh
+├── crons/         - sastquatch-daily.json (concurrency=1)
+├── packets/       - routing-cron, routing-webhook, hook-when-has-work-item
+├── webhooks/      - sastquatch.json (PR event extractor)
+├── workflows/     - sastquatch-arc, analyzer-arc, fixer-arc, reviewer-arc, feedback-arc
+└── scripts/       - bootstrap.sh (seeds buggy Rust crate + sast-bridge.json), install.sh, run.sh
 ```
 
 ---
 
-## Agentic Corpus — producer machinery
+## System Defaults
 
-`examples/agentic-corpus/`
+Installable blackbox-owned artifacts live under
+`system-defaults/`. These are shipped defaults rather than tutorial
+examples: atoms, Badgey artifacts, refactor personas, agentic-corpus
+producer machinery, legacy registered agents, and MCP surface packets.
+
+For catalog mechanics and install order, see
+[Artifact Catalog And System Defaults](artifact-catalog.md).
+
+Use [Atoms](atoms.md) for the full atom contract and runtime reference.
+
+### Atoms
+
+| Path | Purpose |
+|---|---|
+| `system-defaults/atoms/basic/echo.json` | Deterministic atom smoke test; returns invocation args under `echo`. |
+| `system-defaults/atoms/basic/validate-schema.json` | Deterministic object-shape probe. |
+| `system-defaults/atoms/workflows/echo-review.json` | Workflow-backed atom wrapper around `system-defaults/workflows/atoms/echo-review.json`. |
+| `system-defaults/atoms/refactor/rust-test-island-extract.json` | Profile-backed refactor atom using the Rust refactor persona. |
+
+Install:
+
+```
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/basic/echo.json")
+atom_invoke(atom="atom:echo@v1", args={"message":"hello"})
+```
+
+Workflow-backed atoms also require the referenced workflow artifact:
+
+```
+bbox_artifact_install(kind="workflow", source="system-defaults/workflows/atoms/echo-review.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/workflows/echo-review.json")
+```
+
+Profile-backed refactor atoms also require their language persona brofile:
+
+```
+bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-refactor-persona.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-test-island-extract.json")
+```
+
+### Agentic Corpus - producer machinery
+
+`system-defaults/agentic-corpus/`
 
 Workflows, packets, brofiles, and crons that drive the daemon's own
 knowledge-maintenance arcs: auto-digesting sessions into knowledge
@@ -161,7 +208,7 @@ compacting the embedding index.
 
 These are the artifacts the daemon ships as sane defaults. They are
 functional but several depend on engine primitives still in progress
-(see the `examples/agentic-corpus/README.md` status section).
+(see the `system-defaults/agentic-corpus/README.md` status section).
 
 ### Workflows
 
@@ -172,7 +219,7 @@ functional but several depend on engine primitives still in progress
 | `contradiction-review-arc.json` | Open a whiteboard, dispatch three specialist brofiles, synthesize a verdict |
 | `embed-compaction-arc.json` | Re-embed + WAL compaction sweep |
 | `schema-migration-arc.json` | Drain compaction targets after a schema bump |
-| `project-bootstrap-arc.json` | Stub fired by `bbox_project_register` (stub — chunking wired in the reindex thread) |
+| `project-bootstrap-arc.json` | Stub fired by `bbox_project_register` (stub - chunking wired in the reindex thread) |
 
 ### Brofile panels
 
@@ -186,9 +233,9 @@ functional but several depend on engine primitives still in progress
 The daemon does not auto-install these on startup. Install what you want:
 
 ```
-bbox_artifact_install(kind="workflow", source="examples/agentic-corpus/workflows/auto-digest-arc.json")
-bbox_artifact_install(kind="packet",   source="examples/agentic-corpus/packets/auto-digest/entry-quality.json")
-bro_cron_install(spec=<contents of examples/agentic-corpus/crons/embed-compaction-nightly.json>)
+bbox_artifact_install(kind="workflow", source="system-defaults/agentic-corpus/workflows/auto-digest-arc.json")
+bbox_artifact_install(kind="packet",   source="system-defaults/agentic-corpus/packets/auto-digest/entry-quality.json")
+bro_cron_install(spec=<contents of system-defaults/agentic-corpus/crons/embed-compaction-nightly.json>)
 ```
 
 Use `bbox_artifact_list` to inspect what's installed.
@@ -197,7 +244,7 @@ Use `bbox_artifact_list` to inspect what's installed.
 
 ## Workflow pattern catalog
 
-`examples/workflows/` and `examples/agents/workflows/`
+`examples/workflows/` and `system-defaults/agents/workflows/`
 
 Minimal standalone specs that demonstrate individual engine primitives.
 Use as copy-paste starting points before reaching for a full example
@@ -215,16 +262,17 @@ like Keystone.
 | `e2e-composition.json` | Inline sub-workflow as a node | `subworkflow` field, sub-arc output concatenation |
 | `e2e-policy.json` | Workflow-level policy packet | `policy_packet`, arc-state entity, halt/escalate/warn verdicts |
 | `e2e-self-audit.json` | Multi-phase back-edge critique loop | `retry.max_generations`, durable auditor, `branch` back-edge |
-| `e2e-review-mode.json` | Gate applied to actor output (review mode) | `gate_mode: "all"` — runs ALL packet rules, not just first match |
+| `e2e-review-mode.json` | Gate applied to actor output (review mode) | `gate_mode: "all"` - runs ALL packet rules, not just first match |
 | `e2e-combo.json` | Gated retry loop + inline sub-workflow | Combines `retry`, `branch`, and inline `subworkflow` in one arc |
+| `e2e-atom-binding.json` | Workflow-local atom binding | `atom_bindings`, atom node dispatch, normalized `atom_status` output |
 | `blind.json` | Blind-convergence deliberation | Ensemble critique → converged branch → executor implements → fresh review |
 | `optimistic.json` | Async ensemble steering | `fork` + `fire_and_forget` + `late_inject` with ensemble actor |
 
-### `foreach` — bounded parallel iteration over a list
+### `foreach` - bounded parallel iteration over a list
 
 A `foreach` node fans out a sub-workflow once per item in an array
 variable, runs up to `parallelism` items concurrently, and collects
-results into a `vars` key. No actor declared on the node — iteration
+results into a `vars` key. No actor declared on the node - iteration
 is pure engine machinery.
 
 ```json
@@ -257,11 +305,11 @@ is pure engine machinery.
 `collect.into_var` must be declared `kind: "array"` in `vars_schema`.
 The collected array entries have shape `{item: <input>, result: <sub-arc output>, status: "ok"|"failed"}`.
 
-Live example: `examples/badgey/workflows/badgey-triage-fanout-arc.json`
+Live example: `system-defaults/badgey/workflows/badgey-triage-fanout-arc.json`
 (channel bindings fanout) and `badgey-triage-channel-arc.json` (scout
 fanout at `parallelism: 3`, proposal posting at `parallelism: 1`).
 
-### `matrix` — Cartesian product fanout over multiple axes
+### `matrix` - Cartesian product fanout over multiple axes
 
 A `matrix` node runs a sub-workflow for every combination of values
 across two or more named axes. Axis values can be literal arrays or
@@ -293,16 +341,17 @@ Constraints: `foreach` and `matrix` are mutually exclusive on a node;
 neither can declare an actor, a node-level subworkflow, a wait, or
 `fire_and_forget` mode. Item ceiling is enforced at runtime (default 200).
 
-### Agent dispatch workflows (`examples/agents/workflows/`)
+### Legacy agent dispatch workflows (`system-defaults/agents/workflows/`)
 
-Patterns for composing named installed agents (`bro_agent_dispatch` +
-`bro_wait`) via hook-only nodes and `mcp_call` ops:
+Compatibility patterns for composing named installed agents
+(`bro_agent_dispatch` + `bro_wait`) via hook-only nodes and `mcp_call` ops.
+New reusable capabilities should prefer atoms and workflow `atom_bindings`.
 
 | File | Pattern |
 |---|---|
-| `chain.json` | Serial agent dispatch — diff-narrator feeds code-reviewer |
-| `fan-out.json` | Parallel agent dispatch — both dispatched, `bro_wait` collected separately |
-| `escalation.json` | Cheap-first escalation — gate packet decides whether to invoke the expensive agent |
+| `chain.json` | Serial agent dispatch - diff-narrator feeds code-reviewer |
+| `fan-out.json` | Parallel agent dispatch - both dispatched, `bro_wait` collected separately |
+| `escalation.json` | Cheap-first escalation - gate packet decides whether to invoke the expensive agent |
 | `agent-eval-arc.json` | Nightly evaluation arc over installed agents |
 | `agent-cuing-eval-arc.json` | Cuing evaluation variant |
 

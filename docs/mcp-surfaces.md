@@ -1,9 +1,10 @@
 # MCP Surfaces
 
-A **surface** is a caller-selected view of the daemon's MCP tool catalog. Different callers
-— a read-only reviewer agent, an executor with full write access, an audit-only operator —
-connect to the same daemon but see a different set of tools based on which surface they
-select at connect time.
+A **surface** is a named view of the daemon's MCP tools.
+
+Use surfaces when different callers should connect to the same daemon but see
+different tool catalogs: a read-only reviewer, an executor with write tools, an
+audit-only observer, or an internal workflow actor.
 
 Surfaces are not roles, not permissions, not per-user ACLs. They are named
 configurations that filter the tool list and optionally inject surface-scoped
@@ -56,7 +57,7 @@ returns a verdict from the lattice `["tool_surface", "deny"]`:
 | Verdict | Effect |
 |---|---|
 | `tool_surface` | Session proceeds; surfaces contains `allow`, `disallow`, and `instructions` |
-| `deny` | MCP `initialize` fails with the verdict's `reason` — the client is rejected outright, not given an empty catalog |
+| `deny` | MCP `initialize` fails with the verdict's `reason`. The client is rejected outright, not given an empty catalog. |
 
 ### Verdict shape
 
@@ -70,7 +71,7 @@ returns a verdict from the lattice `["tool_surface", "deny"]`:
 ```
 
 `allow` and `disallow` support glob patterns. An empty `allow` list passes all tools;
-a non-empty `allow` list is an explicit allowlist — only listed tools are visible.
+a non-empty `allow` list is an explicit allowlist - only listed tools are visible.
 `disallow` always takes precedence over `allow`.
 
 ### Example packet
@@ -79,7 +80,7 @@ a non-empty `allow` list is an explicit allowlist — only listed tools are visi
 {
   "id": "surface-readonly",
   "domain": "mcp-surface/routing",
-  "description": "Read-only surface — search and inspect, no writes",
+  "description": "Read-only surface: search and inspect, no writes",
   "rules": [
     {
       "when": { "surface": "readonly" },
@@ -112,11 +113,11 @@ bbox_artifact_install(kind="packet", source=".bbox/packets/surface-readonly.json
 
 Enforcement is layered so filtering can't be bypassed:
 
-- **`list_tools`** — returns only the tools the surface allows. Hidden tools are
+- **`list_tools`** - returns only the tools the surface allows. Hidden tools are
   invisible to the caller.
-- **`call_tool`** — rejects calls to hidden tools with a clear error, even if the
+- **`call_tool`** - rejects calls to hidden tools with a clear error, even if the
   caller somehow knows the tool name. The filter is not advisory.
-- **`deny` verdict** — causes `initialize` to fail immediately. The session is not
+- **`deny` verdict** - causes `initialize` to fail immediately. The session is not
   established; the caller receives the denial reason. Use `deny` for surfaces that
   should never be reachable except from an authorized dispatch path.
 
@@ -130,9 +131,9 @@ bbox_mcp_surface(action="replay", surface="readonly")
 
 Returns the packet evaluation result without establishing a session:
 
-- **entity** — the synthesized `initialize` entity the packet received
-- **verdict** — the raw verdict from the winning rule (or the default pass-through)
-- **visible_tools** — the filtered tool list after applying the verdict
+- **entity** - the synthesized `initialize` entity the packet received
+- **verdict** - the raw verdict from the winning rule (or the default pass-through)
+- **visible_tools** - the filtered tool list after applying the verdict
 
 Use `replay` to validate a surface packet before deploying it, or to diagnose why
 a specific tool is or isn't visible to a given surface.

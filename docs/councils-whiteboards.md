@@ -142,9 +142,9 @@ whiteboard_conflicts(
 ```
 
 Returns three kinds:
-- `direct_overlap` — same target_file + same target_location
-- `cascade_collision` — post A cascades to post B's direct target
-- `severity_disagreement` — same finding_ref, distinct severities
+- `direct_overlap` - same target_file + same target_location
+- `cascade_collision` - post A cascades to post B's direct target
+- `severity_disagreement` - same finding_ref, distinct severities
 
 ### Inspecting state
 
@@ -191,11 +191,11 @@ bro_council_posts(id = "council-7f01324e", since_seq = 0, limit = 100)
 
 Both councils and whiteboards integrate into the workflow engine:
 
-- **Whiteboard nodes** — workflow nodes can open boards, register agents,
+- **Whiteboard nodes** - workflow nodes can open boards, register agents,
   wait for transitions, and collect results
-- **Council posts** — workflow nodes can post to councils as part of
+- **Council posts** - workflow nodes can post to councils as part of
   their execution
-- **Board-transitioned signals** — when a facilitator transitions a
+- **Board-transitioned signals** - when a facilitator transitions a
   whiteboard phase, a `board-transitioned` signal fires correlated to
   `(board_id, target_phase)`. Any `Wait` node observing that board
   resumes.
@@ -212,7 +212,7 @@ Both councils and whiteboards integrate into the workflow engine:
 7. Foreach (specialist agents) → Challenge + Vote
 8. Transition → resolve
 9. ArchiveBoard
-10. PostOutcome — dispatch the accepted proposal
+10. PostOutcome - dispatch the accepted proposal
 ```
 
 ## When to use which
@@ -222,5 +222,5 @@ Both councils and whiteboards integrate into the workflow engine:
 | Multiple agents need to independently propose + critique | Whiteboard |
 | Structured ADR (architecture decision record) | Whiteboard |
 | Ongoing multi-agent chat with a charter | Council |
-| One agent needs to deliberate with itself across turns | Neither — use `bbox_thread` |
-| Simple yes/no from one agent | Neither — just `bro exec` |
+| One agent needs to deliberate with itself across turns | Neither - use `bbox_thread` |
+| Simple yes/no from one agent | Neither - just `bro exec` |

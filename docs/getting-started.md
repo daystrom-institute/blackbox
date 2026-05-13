@@ -1,9 +1,14 @@
 # Getting Started
 
-Five steps. After step 5 every agent CLI on your host is talking to the
-same daemon, your existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`
-content has been absorbed into one store, and the store is rendered back
-out to each provider in a consistent layered form.
+This gets one host into the normal blackbox shape:
+
+- one long-running `blackboxd`
+- every agent CLI pointed at the same MCP endpoint
+- one knowledge store rendered back into provider markdown
+- project source indexed into the agentic corpus
+
+Do this once per machine, then use the same daemon from Claude, Codex, Gemini,
+Copilot, and Vibe.
 
 ## 1. Build and install the binaries
 
@@ -26,11 +31,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now blackbox.service
 ```
 
-One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI on
-the host, so they all share the same tantivy index, knowledge store, and
-orchestration state. Prod and dev should use separate installed daemon
-paths even when they come from the same built artifact — dev restarts
-never mutate the prod service binary in place.
+One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI on the
+host. That is what makes transcript search, knowledge, threads, notes, and bro
+tasks shared instead of provider-local.
+
+Prod and dev should use separate installed daemon paths even when they come from
+the same built artifact. Dev restarts should never mutate the prod service
+binary in place.
 
 Logs live in journald:
 
@@ -48,7 +55,7 @@ systemctl --user enable --now blackbox-dev.service
 
 ## 3. Connect each provider CLI to the daemon
 
-**Claude Code** — add to each `~/.claude*/.claude.json`:
+**Claude Code** - add to each `~/.claude*/.claude.json`:
 
 ```json
 {
@@ -61,16 +68,16 @@ systemctl --user enable --now blackbox-dev.service
 }
 ```
 
-**Codex CLI** — add to `~/.codex/config.toml`:
+**Codex CLI** - add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.blackbox]
 url = "http://127.0.0.1:7264/mcp"
 ```
 
-**Gemini CLI** — `gemini mcp add blackbox http://127.0.0.1:7264/mcp`
+**Gemini CLI** - `gemini mcp add blackbox http://127.0.0.1:7264/mcp`
 
-**Copilot** — `copilot mcp add blackbox http://127.0.0.1:7264/mcp`
+**Copilot** - `copilot mcp add blackbox http://127.0.0.1:7264/mcp`
 
 ## 4. Bootstrap a project
 
@@ -78,9 +85,8 @@ url = "http://127.0.0.1:7264/mcp"
 bbox_bootstrap(project="/absolute/path/to/your/repo")
 ```
 
-This onboards the repo into the knowledge system, registers it with the
-agentic corpus, and emits structural edges (file → function, file →
-class, etc.).
+This onboards the repo into the knowledge system, registers it with the agentic
+corpus, and emits structural edges such as file to function and file to class.
 
 ## 5. Render the knowledge store
 
@@ -91,6 +97,9 @@ bbox_render(scope="both", project="/path/to/repo")
 This writes a unified layered markdown file for each provider:
 `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`,
 and per-project `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`.
+
+Rendering is a projection. The durable source of truth is the blackbox knowledge
+store, not the rendered markdown.
 
 ## Environment Variables
 

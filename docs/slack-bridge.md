@@ -2,7 +2,7 @@
 
 `bro-slack` is a sidecar binary that translates Slack workspace events
 into the blackbox daemon's generic webhook + routing pipeline. The daemon
-itself carries no Slack-specific code — the sidecar owns the socket,
+itself carries no Slack-specific code - the sidecar owns the socket,
 auth, reconnection, and envelope shape, and the daemon receives
 normalized webhook events through the same path as any other ingress
 source.
@@ -22,7 +22,7 @@ Slack Events API ──► bro-slack sidecar ──► POST /webhook/slack ─�
 ```
 
 The same pattern applies to any future chat-platform adapter: Discord,
-Matrix, Mattermost, Zulip — swap the sidecar, keep the daemon unchanged.
+Matrix, Mattermost, Zulip - swap the sidecar, keep the daemon unchanged.
 
 ## Setup
 
@@ -87,15 +87,15 @@ bro_slack_bind(action = "unbind", team_id = "T0123ABCD", channel_id = "C0123XYZ"
 The per-channel triage workflow is the core Slack integration. On a
 schedule (or trigger), it:
 
-1. **EnsureInstance** — get-or-create a Badgey consultant for the channel's
+1. **EnsureInstance** - get-or-create a Badgey consultant for the channel's
    bound project
-2. **Synthesize** — Badgey inspects the inbox (stale threads, unresolved
+2. **Synthesize** - Badgey inspects the inbox (stale threads, unresolved
    notes, open work) and writes proposals
-3. **ForeachPostProposal** — for each new proposal:
-   1. `chat.postMessage` — post the proposal to the Slack channel
-   2. `bro_slack_link_record` — record the Slack message → proposal
+3. **ForeachPostProposal** - for each new proposal:
+   1. `chat.postMessage` - post the proposal to the Slack channel
+   2. `bro_slack_link_record` - record the Slack message → proposal
       mapping so reactions/replies can resolve back
-4. **Apply hooks** — `:white_check_mark:` reactions trigger proposal apply;
+4. **Apply hooks** - `:white_check_mark:` reactions trigger proposal apply;
    thread replies trigger refinement rounds
 
 ## Proposal lifecycle
@@ -143,7 +143,7 @@ Inbound Slack events flow through the daemon's standard webhook routing
 pipeline:
 
 1. Sidecar translates Slack event → normalized JSON entity
-2. `POST /webhook/slack` — signature verification
+2. `POST /webhook/slack` - signature verification
 3. Extractor projects entity fields
 4. Routing packet classifies: `start_arc` (launch a workflow for this
    event), `signal_arc` (resume a waiting workflow node), `cancel_arc`,
@@ -155,7 +155,7 @@ layer.
 
 ## Design notes
 
-For the full design rationale — why a sidecar rather than an embedded
+For the full design rationale - why a sidecar rather than an embedded
 Slack crate, the process-supervision pattern shared with `bro-irc`, and
-known gaps — see [`design/bro-slack.md`](https://github.com/invidious9000/transcript-search/blob/main/design/bro-slack.md) and
+known gaps - see [`design/bro-slack.md`](https://github.com/invidious9000/transcript-search/blob/main/design/bro-slack.md) and
 [`design/bro-slack-next.md`](https://github.com/invidious9000/transcript-search/blob/main/design/bro-slack-next.md).

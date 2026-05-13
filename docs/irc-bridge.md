@@ -2,7 +2,7 @@
 
 `bro-irc` is a LAN IRC bridge that relays IRC commands into the blackbox
 daemon's `bro exec/resume/status` surface. It's designed for couch
-steering — operators on a local IRC server can dispatch bros, check task
+steering - operators on a local IRC server can dispatch bros, check task
 status, and participate in councils via IRC messages.
 
 The bridge runs as a sidecar process (just like `bro-slack`), connecting
@@ -38,7 +38,7 @@ and configure:
 # Arch
 pacman -S ngircd
 
-# Edit /etc/ngircd/ngircd.conf — see deploy/irc/config/ngircd.conf for reference
+# Edit /etc/ngircd/ngircd.conf - see deploy/irc/config/ngircd.conf for reference
 systemctl enable --now ngircd
 ```
 
@@ -65,7 +65,7 @@ All config is via CLI flags (or environment for secrets):
 | `--channel` | `#bros` | Channel to join |
 | `--daemon-url` | `http://127.0.0.1:7264` | blackboxd base URL |
 | `--prefix` | `!` | Command prefix |
-| `--allow-nicks` | (none — permissive) | Comma-separated nick allowlist |
+| `--allow-nicks` | (none - permissive) | Comma-separated nick allowlist |
 | `--announce` | `false` | Print command help on startup |
 
 ## Commands
@@ -86,8 +86,8 @@ All commands are prefixed with `!` (configurable):
 
 ```
 <operator> !exec audit the rule-packets docs for gaps
-<blackbox> [task-3f7a1b2c] dispatched — Claude/Opus 4.7
-<blackbox> [task-3f7a1b2c] completed — found 2 missing AST primitives, logged gaps
+<blackbox> [task-3f7a1b2c] dispatched - Claude/Opus 4.7
+<blackbox> [task-3f7a1b2c] completed - found 2 missing AST primitives, logged gaps
 
 <operator> !st task-3f7a1b2c
 <blackbox> task-3f7a1b2c | completed | claude | 47s | "audit the rule-packets docs for gaps"
@@ -102,7 +102,7 @@ All commands are prefixed with `!` (configurable):
 
 The bridge auto-opens an IRC council when bros are dispatched. The
 council is a structured deliberation board where bro outputs are posted
-and operators can annotate, vote, and advance through phases — all via
+and operators can annotate, vote, and advance through phases - all via
 IRC. See the [Workflow Engine](workflows.md) docs for council mechanics.
 
 ## Security

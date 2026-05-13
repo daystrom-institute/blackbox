@@ -1,5 +1,5 @@
 site_name: blackbox
-site_description: Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration
+site_description: "Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration"
 repo_url: https://github.com/invidious9000/transcript-search
 edit_uri: edit/main/docs/
 
@@ -38,12 +38,19 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - How It Works:
+    - Operating Guide: operating-blackbox.md
     - Internals: internals.md
     - Operations: operations.md
   - Toolbelt:
     - Workflow Engine: workflows.md
+    - Atoms: atoms.md
     - Rule Packets: rule-packets.md
-    - Refactor Tools: refactor.md
+    - Refactor Tools And Atoms: refactor.md
+    - Bro Runtime: bro-runtime.md
+    - Knowledge Store: knowledge-store.md
+    - Transcript Retrieval: transcript-retrieval.md
+    - Projects And Code Indexing: projects-code-indexing.md
+    - Artifact Catalog: artifact-catalog.md
     - Agent System: agent-system.md
     - Badgey: badgey.md
     - Councils & Whiteboards: councils-whiteboards.md

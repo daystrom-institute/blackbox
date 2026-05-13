@@ -1,4 +1,4 @@
-# Operating blackbox — what landed in agentic-corpus, how to keep it healthy
+# Operating blackbox - what landed in agentic-corpus, how to keep it healthy
 
 This doc covers everything the bbox daemon now does beyond what the README
 describes: the agentic graph surface, hybrid retrieval, the embedding
@@ -14,7 +14,7 @@ or jump via the section index. Cross-linked from the [README](index.md).
 - [Schema migrations](#schema-migrations)
 - [Upkeep checklist](#upkeep-checklist)
 - [Key locations on disk](#key-locations-on-disk)
-- [System memories — on-demand runbooks](#system-memories-on-demand-runbooks)
+- [System memories - on-demand runbooks](#system-memories-on-demand-runbooks)
 - [Provider integration matrix](#provider-integration-matrix)
 - [Open follow-ups](#open-follow-ups)
 
@@ -61,19 +61,19 @@ writing the corpus knows:
 
 Edge families (full list via `bbox_describe_schema`):
 
-- **Structural** — IN_FILE, IN_SESSION, NEXT_SECTION, NEXT_CHUNK,
+- **Structural** - IN_FILE, IN_SESSION, NEXT_SECTION, NEXT_CHUNK,
   PREV_CHUNK, THREAD_HAS_SESSION
-- **AST** — DEFINED_IN, CONTAINS_SYMBOL, CALLS, USES_TYPE, HAS_FIELD,
+- **AST** - DEFINED_IN, CONTAINS_SYMBOL, CALLS, USES_TYPE, HAS_FIELD,
   IMPLEMENTS_TRAIT
-- **Knowledge** — SUPERSEDES, DERIVED_FROM, Contradicts,
+- **Knowledge** - SUPERSEDES, DERIVED_FROM, Contradicts,
   KNOWLEDGE_FROM_SESSION, KNOWLEDGE_FROM_BOARD
-- **Provenance** — SESSION_USED_BROFILE, ARC_USED_BROFILE,
+- **Provenance** - SESSION_USED_BROFILE, ARC_USED_BROFILE,
   ARC_OPENED_BOARD, NOTE_FROM_SESSION, NOTE_IN_THREAD, NOTE_FROM_TASK,
   TASK_PRODUCED_NOTE
-- **Git** — COMMIT_PARENT, COMMIT_TOUCHED_FILE, COMMIT_PRODUCED_BY_ARC
-- **Format-specific** — LINKS_TO_FILE, LINKS_TO_SECTION, DESCRIBES,
+- **Git** - COMMIT_PARENT, COMMIT_TOUCHED_FILE, COMMIT_PRODUCED_BY_ARC
+- **Format-specific** - LINKS_TO_FILE, LINKS_TO_SECTION, DESCRIBES,
   ON_PAGE, FIGURE_OF, TABLE_OF
-- **Tool-call** — EDITED_FILE, EDITED_BY_SESSION, READ_FILE, RAN_BASH
+- **Tool-call** - EDITED_FILE, EDITED_BY_SESSION, READ_FILE, RAN_BASH
 
 The 5-step opening sequence is documented in detail in the
 `sm-agentic-opening-sequence` system memory. Pull on demand with
@@ -83,37 +83,37 @@ The 5-step opening sequence is documented in detail in the
 
 `bbox_hybrid_search` fuses three ranked lists via RRF:
 
-1. **bm25** — chunk-level Tantivy BM25 over `content`, `project`,
+1. **bm25** - chunk-level Tantivy BM25 over `content`, `project`,
    `code_content`, `symbol`, `commit_author_name`, `path_tokens` fields.
    Path tokens use the code tokenizer (splits on `/_-.:>` plus
    CamelCase) and carry a 1.5× field boost. Symbol field also 1.5×.
-2. **bm25_file** — sum-of-scores aggregated per `(project_id,
+2. **bm25_file** - sum-of-scores aggregated per `(project_id,
    rel_path_hash)`, then weighted by `sum * sqrt(chunk_count)`. Lifts
    high-coverage files (e.g. STATUS.md with 21 sparse mentions) that
    would otherwise be invisible to per-chunk ranking.
-3. **vector** — per-route HNSW search via Voyage `voyage-code-3` (1024d)
+3. **vector** - per-route HNSW search via Voyage `voyage-code-3` (1024d)
    embeddings. RRF default weight 0.6 (0.4 BM25, 0.6 vector); set
    `vector_weight=0` for BM25-only, `1.0` for vector-only.
 
 After fusion, the result list is post-processed:
 
-- **Project filter** — when `project=<path or project_id>` is passed,
+- **Project filter** - when `project=<path or project_id>` is passed,
   drop project_file refs from other projects. Commits / knowledge /
   transcripts pass through. Cuts cross-repo keyword pollution that
   otherwise dominates ("voyage" returning erlang-test/voyage.ex above
   transcript-search/src/embed/voyage.rs).
-- **Per-file collapse** — only the highest-scoring chunk per file
+- **Per-file collapse** - only the highest-scoring chunk per file
   survives. Mirrors the AgenticTools donor's diversity-by-file pass.
-- **Modal diversification** — guarantees at least one
+- **Modal diversification** - guarantees at least one
   `code_block` / `doc_section` / `git_message` in top-N when the fetch
   set has them. Stops a query like "triad implementation" from being
   10 docs with the defining .ex file invisible.
-- **Symbol_exact boost** — single-token queries (snake_case, CamelCase,
+- **Symbol_exact boost** - single-token queries (snake_case, CamelCase,
   dotted) add a SHOULD clause matching `symbol_exact` with 6× boost so
   the defining chunk lifts above docs that just mention the symbol.
 
 `bbox_discover_seed_entities` is the same call with `notable_edges`
-rendered for each result — useful when the next step is
+rendered for each result - useful when the next step is
 `bbox_inspect_entity` and you want pre-vetted hops.
 
 ## Embedding pipeline
@@ -147,7 +147,7 @@ Environment=DAYSTROM_VOYAGE_API_KEY=pa-...
 
 Then `systemctl --user daemon-reload && systemctl --user restart blackbox.service`.
 
-Falling back to `Ollama` works without an API key — set the route to
+Falling back to `Ollama` works without an API key - set the route to
 `ollama` in `embed.toml` to use a local `nomic-embed-text` (768d)
 endpoint. Mixing Voyage and Ollama is fine; each route persists its own
 HNSW partition keyed on `(provider, model, dimensions)`.
@@ -189,14 +189,14 @@ including the EdgeIndex projection pass (which auto-fires via the
 
 Recent schema bumps in chronological order:
 
-- `agentic-corpus-g1` — initial agentic schema
-- `agentic-corpus-g2-path-tokens` — added tokenized `path_tokens` field
-- `agentic-corpus-g3-commit-subject-tokens` — populates `path_tokens`
+- `agentic-corpus-g1` - initial agentic schema
+- `agentic-corpus-g2-path-tokens` - added tokenized `path_tokens` field
+- `agentic-corpus-g3-commit-subject-tokens` - populates `path_tokens`
   from commit subject too so commits compete on equal footing with
   project_files for ranking
-- `agentic-corpus-g4-elixir-symbols` — elixir symbol extraction (defmodule/
+- `agentic-corpus-g4-elixir-symbols` - elixir symbol extraction (defmodule/
   def/defp/defmacro/etc via tree-sitter `call` node filtering)
-- `agentic-corpus-g5-symbol-tokenized` — `symbol` field switched from
+- `agentic-corpus-g5-symbol-tokenized` - `symbol` field switched from
   default tokenizer to code_tokenizer so `Substrate.TriadClosure`
   indexes as the union of [Substrate, TriadClosure, Triad, Closure]
   and matches both camelCase and snake_case query forms
@@ -206,8 +206,8 @@ Bumping the version triggers a full reindex; old segments are removed.
 ## Upkeep checklist
 
 Daily / on-demand:
-- `bbox_inbox(project="...")` — round-boundary attention sweep
-- `bbox_thread_list(status="open")` — investigation continuity check
+- `bbox_inbox(project="...")` - round-boundary attention sweep
+- `bbox_thread_list(status="open")` - investigation continuity check
 
 Per-release / when changing schema or chunker:
 - Bump `INDEX_SCHEMA_VERSION`
@@ -257,7 +257,7 @@ After registering a new project:
 | `~/.claude-shared/BLACKBOX.md` | Rendered tool reference + CORE RULEs (single source of truth, included by other provider files) |
 | `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` | Per-provider memory files that include BLACKBOX.md by reference |
 
-## System memories — on-demand runbooks
+## System memories - on-demand runbooks
 
 Code-embedded markdown runbooks queryable via `bbox_knowledge(query="sm-...")`.
 Not rendered into provider files (kept cold; pulled when an agent reaches
@@ -288,7 +288,7 @@ question:
 | Provider | Honors AGENTS.md @-imports | Reaches for bbox_* tools | Notes |
 |---|---|---|---|
 | `claude` (claude-opus-4-7) | ✅ | ✅ first-class | Followed full 5-step loop, caught cross-repo collisions naturally. Best cold-start reliability. |
-| `codex` (gpt-5.5) | ✅ | ✅ first-class | Quality high, latency tends 2× of claude — verbose exploratory turns |
+| `codex` (gpt-5.5) | ✅ | ✅ first-class | Quality high, latency tends 2× of claude - verbose exploratory turns |
 | `gemini` (gemini-3.1-pro) | ✅ | Untested in probe series | Renders to GEMINI.md; should mirror claude pattern |
 | `glm` (zai-coding-plan/glm-5.1, via opencode) | ❌ | Falls back to grep/read | Opencode SQLite contention with parallel deepseek runs |
 | `deepseek` (deepseek-v4-pro, via opencode) | ❌ | Falls back to grep/read | Same opencode integration gap |
@@ -302,13 +302,13 @@ thread.
 
 Tracked in bbox threads; surface with `bbox_thread_list(status="open")`.
 
-- `thread-3cfbf9e0` — agentic-corpus impl: deferred items across all phases
-- `thread-f4e4624f` — Agentic-loop tools as composable subagents (scout
+- `thread-3cfbf9e0` - agentic-corpus impl: deferred items across all phases
+- `thread-f4e4624f` - Agentic-loop tools as composable subagents (scout
   brofile + workflow actor type)
-- `thread-cba8bfa1` — workflow engine: foreach/matrix primitive
-- `thread-e8f0371a` — apply_brofile_lens runs every turn — strip from
+- `thread-cba8bfa1` - workflow engine: foreach/matrix primitive
+- `thread-e8f0371a` - apply_brofile_lens runs every turn - strip from
   resume paths
-- `thread-7e2bd735` — workflow engine phase-next: template library + resume
+- `thread-7e2bd735` - workflow engine phase-next: template library + resume
 
 Smaller items still open at session end:
 - file: virtual entity refactor (currently chunk[0] proxies as the file)

@@ -1,6 +1,6 @@
 # Workflows
 
-Canonical reference for the blackbox workflow engine — the durable
+Canonical reference for the blackbox workflow engine - the durable
 execution loop that lets you stitch together rule-packet decisions,
 hook side-effects, sub-arc composition, and external webhook signals
 into a deterministic state machine driven by mermaid graphs.
@@ -15,7 +15,7 @@ into a deterministic state machine driven by mermaid graphs.
 An LLM maintaining workflow state across turns drifts. It forgets
 phases, re-litigates settled decisions, invents new steps to paper
 over mistakes, and dies on context compaction. A daemon-driven loop
-doesn't — it has no context to forget. LLMs become stateless function
+doesn't - it has no context to forget. LLMs become stateless function
 calls dispatched *into* the loop rather than the loop's substrate.
 
 This is the same lesson Temporal, Restate, Sayiir, and Wolverine
@@ -58,15 +58,15 @@ A workflow is one JSON file:
 }
 ```
 
-The metadata declares `actors`, `nodes`, `vars_schema`, `policy_packet`,
-and arc-level hooks. Control flow lives on each node as a typed `next`
-clause (`goto` / `branch` / `fork` / `terminal`); top-level `start`
-names the entry node. The daemon validates every transition target,
-every actor reference, every late_inject source, and every node's
-reachability from `start` before any dispatch fires. The canonical
+The metadata declares `actors`, optional `atom_bindings`, `nodes`,
+`vars_schema`, `policy_packet`, and arc-level hooks. Control flow lives
+on each node as a typed `next` clause (`goto` / `branch` / `fork` /
+`terminal`); top-level `start` names the entry node. The daemon validates
+every transition target, actor reference, atom binding, late_inject source,
+and node reachability from `start` before any dispatch fires. The canonical
 JSON Schema is at `schema/workflow.schema.json`.
 
-## ArcContext — the universal state container
+## ArcContext - the universal state container
 
 Every node, hook, gate, policy packet, and webhook routing decision
 sees the same JSON-shaped state, called the **ArcContext**:
@@ -103,7 +103,7 @@ Whole-string templates resolve as their **typed value** (a `${vars.n}`
 where `vars.n == 42` becomes the integer 42 in a hook arg). Mixed
 strings stringify (`"issue-${vars.n}"` → `"issue-42"`).
 
-Unresolved expressions are left in place verbatim — `${vars.does_not_exist}`
+Unresolved expressions are left in place verbatim - `${vars.does_not_exist}`
 shows up as the literal string in the dispatched prompt rather than
 silently becoming the empty string. Misspellings are loud.
 
@@ -122,11 +122,11 @@ Optional `vars_schema` declares per-key kind and required-ness:
 
 Kinds: `bool` / `int` / `float` / `string` / `array` / `object` /
 `any`. Hook writes (`SetVar`, `IncVar`, `MergeVar`, `ParseJson`,
-`HttpJson` with `into_var`) are kind-validated against the schema —
+`HttpJson` with `into_var`) are kind-validated against the schema -
 mismatches fail at write time, not later. `required: true` keys are
 enforced at arc start (initial vars), at sub-arc start (imports), and
 at terminal state (exports). Unknown keys are accepted (open schema
-by design — explicit `required` fields are how you lock down the
+by design - explicit `required` fields are how you lock down the
 surface).
 
 ### Packet entity flatten
@@ -146,7 +146,7 @@ policy packets, webhook routing), the engine flattens to:
 }
 ```
 
-Predicate paths support dotted resolution — `vars.issue_number`,
+Predicate paths support dotted resolution - `vars.issue_number`,
 `outputs.Plan.branch`, `last_signal.name`. Array elements via numeric
 indices: `vars.labels.0`. Quantified predicates work too:
 `Exists{path:"vars.labels[*]", pred:Eq{field:"$", value:"bug"}}`.
@@ -158,19 +158,19 @@ Two kinds.
 
 | Kind       | What it does                                            |
 |------------|---------------------------------------------------------|
-| `executor` | Single bro dispatched via `bro_exec` / `bro_resume`. Used for every single-bro role the workflow declares — implementer, fixer, triager, planner, facilitator, advisor, aggregator, synthesizer, reviewer, etc. The brofile + prompt carry the persona. |
+| `executor` | Single bro dispatched via `bro_exec` / `bro_resume`. Used for every single-bro role the workflow declares - implementer, fixer, triager, planner, facilitator, advisor, aggregator, synthesizer, reviewer, etc. The brofile + prompt carry the persona. |
 | `ensemble` | Team broadcast: every member runs the same prompt; output is the labeled concatenation. When the node has an associated whiteboard (see §Whiteboards), each member's STRICT-JSON output is also auto-postable via `whiteboard_post` from inside the dispatched turn. |
 
 **Why only two kinds.** Earlier iterations had `advisor`, `planner`,
-`triager`, `user` as marker types. They didn't pull engine weight —
+`triager`, `user` as marker types. They didn't pull engine weight -
 mechanically each was identical to `executor`, and the marker was
 never enforced. Persona / role / contract is a workflow-author concern
 carried by the brofile lens + prompt + on_exit `parse_json`
 validation. Engine vocabulary describes *dispatch shape*, not roles.
 
 **Human-in-the-loop without a `user` actor.** When a workflow needs
-human input — operator approval, external Claude weighing in,
-ntfy-routed acknowledgement — the pattern is: open a whiteboard,
+human input - operator approval, external Claude weighing in,
+ntfy-routed acknowledgement - the pattern is: open a whiteboard,
 register the human as an `operator` role, suspend the arc on a
 `board-transitioned` signal correlated to `(board_id, target_phase)`.
 The human (or their Claude session, or a slack/ntfy adapter) calls
@@ -187,16 +187,70 @@ fire hooks, capture their rendered `prompt` as the node output (so
 
 Per-actor fields:
 
-- `brofile` — single-bro target (executor / advisor)
-- `team` — ensemble target
-- `durable: true` — reuse the same session across every node that
+- `brofile` - single-bro target (executor / advisor)
+- `team` - ensemble target
+- `durable: true` - reuse the same session across every node that
   invokes this actor; the engine threads the session id through
   `bro_resume` automatically. Critical for the implementer that has
   to address feedback after initial PR.
-- `compaction_anchor: true` — the actor contributes a rolling summary
+- `compaction_anchor: true` - the actor contributes a rolling summary
   to the arc's work_item thread at every boundary, so an orchestrator
   swap-out doesn't lose strategic memory.
-- `requires: [Capability, ...]` — see Capability tags below.
+- `requires: [Capability, ...]` - see Capability tags below.
+
+## Atom Bindings
+
+A workflow uses `atom_bindings` when a node should call a reusable capability
+instead of dispatching an actor directly.
+
+The binding name is local. The atom ref is the contract. That split matters:
+workflows can cap a powerful atom for one arc without changing the atom itself.
+
+```jsonc
+"atom_bindings": {
+  "echo": {
+    "atom_ref": "atom:echo@v1",
+    "limits": { "dispatches_runs": 0 }
+  }
+},
+"nodes": {
+  "Echo": {
+    "atom": "echo",
+    "atom_args": { "message": "hello" },
+    "next": { "type": "terminal" }
+  }
+}
+```
+
+Use this when the workflow should say "run the test-island extractor" rather
+than know which brofile, workflow, runner, or adapter currently implements it.
+
+Binding fields:
+
+| Field | Meaning |
+|---|---|
+| `id` | Optional self-identifying id. If present, it must match the map key. |
+| `atom_ref` | Required atom ref: `atom:name@vN` or `atom:name@latest`. |
+| `durable` | Reuse the binding's previous invocation id on repeated visits. Profile-backed atoms resume; non-resumable handles are re-invoked. |
+| `requires` | Provider capabilities required when the atom resolves to a profile-backed brofile. |
+| `limits` | Optional tighter `writes_files`, `dispatches_runs`, `max_depth`, `uses_network` bounds. |
+| `supervision_override` / `trace_override` / `portal` | Reserved policy metadata carried on the binding. |
+
+Validation happens before dispatch. The compiler checks binding shape and node
+references. Capability validation resolves installed atoms, rejects missing or
+inactive refs, verifies binding limits do not exceed the atom's declared effects,
+and checks profile-backed provider capabilities.
+
+At runtime the engine calls `atom_invoke`, records the invocation id, reads
+`atom_status`, and stores that status JSON as the node output. Deterministic and
+adapter atoms usually finish immediately. Profile and workflow atoms may still be
+backed by a running bro task or child arc, so downstream nodes should branch on
+the trace fields they actually require.
+
+Atom nodes are mutually exclusive with `actor`, `subworkflow*`, `wait`,
+`foreach`, and `matrix`, and cannot use `mode: "fire_and_forget"` in v1.
+If `atom_args` is absent and `prompt` is present, the rendered prompt is passed
+as `{ "prompt": "..." }`; otherwise args default to `{}`.
 
 ## Capability tags
 
@@ -235,21 +289,23 @@ A node declares the unit of work. Fields:
 
 | Field             | Meaning                                                 |
 |-------------------|---------------------------------------------------------|
-| `actor`           | Which actor runs this node (mutually exclusive with `subworkflow*` and `wait`). |
+| `actor`           | Which actor runs this node (mutually exclusive with `atom`, `subworkflow*`, and `wait`). |
+| `atom`            | Which workflow-local atom binding runs this node (mutually exclusive with `actor`, `subworkflow*`, `wait`, `foreach`, and `matrix`). |
+| `atom_args`       | Structured atom input arguments, resolved through ArcContext templating before `atom_invoke`. Whole-string templates preserve JSON type. |
 | `prompt`          | Template (rendered against ArcContext).                 |
 | `gate`            | Packet id; verdict drives next-node selection at choice nodes. |
 | `gate_mode`       | `first` (one verdict, default) or `all` (multi-finding aggregate). |
 | `mode`            | `sync` (default) or `fire_and_forget`.                  |
-| `retry`           | `{max_generations: N}` — visit-count ceiling.           |
-| `late_inject`     | `{from: NodeId, policy: "resume_on_return"}` — fold an async source into this node at its entry. |
+| `retry`           | `{max_generations: N}` - visit-count ceiling.           |
+| `late_inject`     | `{from: NodeId, policy: "resume_on_return"}` - fold an async source into this node at its entry. |
 | `subworkflow`     | Inline `Workflow` spec (mutually exclusive with `subworkflow_ref`). |
 | `subworkflow_ref` | Workflow id resolved from the registry at dispatch time. |
 | `imports`         | Vars to copy from parent into the sub's fresh ArcContext (subworkflow nodes only). |
 | `exports`         | Vars to promote back to parent on sub completion (missing exports = runtime error). |
-| `import_renames`  | `{ local_name: "parent.path.expression" }` — Extractor-style projection from parent context into sub. |
+| `import_renames`  | `{ local_name: "parent.path.expression" }` - Extractor-style projection from parent context into sub. |
 | `on_enter`        | Hook ops fired BEFORE actor dispatch / sub descent / Wait registration. |
 | `on_exit`         | Hook ops fired AFTER body returns, BEFORE the gate evaluates. Lets `ParseJson` normalize output the gate sees. |
-| `wait`            | `WaitSpec` — suspend the arc on a signal. Mutually exclusive with `actor` + `subworkflow*`. |
+| `wait`            | `WaitSpec` - suspend the arc on a signal. Mutually exclusive with `actor` + `subworkflow*`. |
 
 ## Hooks and the op catalog
 
@@ -280,7 +336,7 @@ A hook's `when` references a packet. The packet evaluates against the
 flattened ArcContext. The hook fires only if the packet's verdict is in
 the operator-blessed allow set: `allow`, `pass`, `proceed`, `fire`,
 `ok`, `delete`, `keep`, `yes`, `true`. Unknown verdicts (e.g. `flag`,
-`manual`) do NOT permit firing — conservative on purpose.
+`manual`) do NOT permit firing - conservative on purpose.
 
 ### Op catalog (current)
 
@@ -293,29 +349,29 @@ the operator-blessed allow set: `allow`, `pass`, `proceed`, `fire`,
 | `parse_json`          | Parse a string-shaped value into JSON; strips ```` ```json ```` fences. |
 | `shell`               | Sandboxed shell command (gated via packet policy in v-next; today reads `cwd` from `meta.worktree`). |
 | `worktree_create`     | `git worktree add` with smart branch reuse (see below). |
-| `worktree_remove`     | `git worktree remove`; idempotent on missing path. No `rm -rf` fallback — surfaces git's error if the path is not a git-tracked worktree. |
+| `worktree_remove`     | `git worktree remove`; idempotent on missing path. No `rm -rf` fallback - surfaces git's error if the path is not a git-tracked worktree. |
 | `set_meta`            | Update `meta.worktree` directly (only mutable meta field today). |
-| `http_json`           | Generic HTTP request → response into_var. Workflow author composes URL/headers/body using `${env.X}` + `${vars.X}` templates to express any code-host integration without baking platform-specific ops into the engine. `response_kind`: `json` (default — parse, error on non-JSON), `text` (capture body as-is, e.g. for `.diff` URLs), or `auto` (try JSON, fall back to text). `expect_status`: optional override of the default 2xx success window. |
-| `find_first`          | Find the first element of an array variable whose nested fields all equal the targets in `where`, write into_var. Writes `Value::Null` (not Err) when no match — downstream `IsNull` / `IsNonNull` packets branch cleanly. Composable primitive for "find existing PR for this branch" / "find label by name" without baking platform-specific search ops or relying on upstream API filters that may be broken. `where` keys use dotted paths (e.g. `head.ref`). |
-| `mcp_call`            | Outbound MCP tool call — sibling of `http_json` but speaking MCP JSON-RPC. Resolves `args.server` against the existing `bro_mcp` registry (global `~/.bro/mcp.json` + project overlay), opens a transient client (stdio child-process or streamable HTTP), invokes `args.tool` with `args.arguments`, captures the result into `vars[into_var]`. Tool errors (`is_error: true`) become op failures so `on_failure` fires. Result normalization preserves typing when `structured_content` is present, falls back to JSON-parsed text content otherwise. Args: `{server, tool, arguments?, timeout_secs?}` (default 300s). Use for engine-level grounding calls — `sast_run` / `sast_findings` against biofilter, `bbox_thread` / `bbox_note` against blackbox-self — instead of dispatching a bro just to make a tool call. |
+| `http_json`           | Generic HTTP request → response into_var. Workflow author composes URL/headers/body using `${env.X}` + `${vars.X}` templates to express any code-host integration without baking platform-specific ops into the engine. `response_kind`: `json` (default - parse, error on non-JSON), `text` (capture body as-is, e.g. for `.diff` URLs), or `auto` (try JSON, fall back to text). `expect_status`: optional override of the default 2xx success window. |
+| `find_first`          | Find the first element of an array variable whose nested fields all equal the targets in `where`, write into_var. Writes `Value::Null` (not Err) when no match - downstream `IsNull` / `IsNonNull` packets branch cleanly. Composable primitive for "find existing PR for this branch" / "find label by name" without baking platform-specific search ops or relying on upstream API filters that may be broken. `where` keys use dotted paths (e.g. `head.ref`). |
+| `mcp_call`            | Outbound MCP tool call - sibling of `http_json` but speaking MCP JSON-RPC. Resolves `args.server` against the existing `bro_mcp` registry (global `~/.bro/mcp.json` + project overlay), opens a transient client (stdio child-process or streamable HTTP), invokes `args.tool` with `args.arguments`, captures the result into `vars[into_var]`. Tool errors (`is_error: true`) become op failures so `on_failure` fires. Result normalization preserves typing when `structured_content` is present, falls back to JSON-parsed text content otherwise. Args: `{server, tool, arguments?, timeout_secs?}` (default 300s). Use for engine-level grounding calls - `sast_run` / `sast_findings` against biofilter, `bbox_thread` / `bbox_note` against blackbox-self - instead of dispatching a bro just to make a tool call. |
 
 ### `worktree_create` semantics
 
 Three real cases the op handles:
 
 1. **Branch absent** → `git worktree add -b <branch> <path> <base>` (fresh).
-2. **Branch present, no worktree references it** → `git worktree add <path> <branch>` (REUSE — common after a prior arc died with `cleanup-policy=keep-on-fail`).
+2. **Branch present, no worktree references it** → `git worktree add <path> <branch>` (REUSE - common after a prior arc died with `cleanup-policy=keep-on-fail`).
 3. **Branch present AND another worktree has it checked out** → fail loudly with the occupant path. Suggests including `${meta.arc_id}` in the branch name for concurrent-arc-safe naming.
 
 ### Failure semantics
 
 `on_failure` per hook decides what an op error means:
 
-- `halt` (default) — abort the arc with the op's error.
-- `warn` — log + write a `surprise` note on the arc thread, continue.
-- `ignore` — log only, continue.
+- `halt` (default) - abort the arc with the op's error.
+- `warn` - log + write a `surprise` note on the arc thread, continue.
+- `ignore` - log only, continue.
 
-Hooks cannot change which next node runs — that authority stays with
+Hooks cannot change which next node runs - that authority stays with
 the gate packet. Hooks are guarded *side effects*, not control flow.
 If you need conditional branching, that's a node + gate.
 
@@ -357,7 +413,7 @@ When a matching signal arrives:
    into the wait's resolved-slot.
 3. Wakes the arc via the wait's `Notify`.
 4. Sibling waits in the same `any_of` are removed from the store
-   (race-loser cleanup — only the first signal wins).
+   (race-loser cleanup - only the first signal wins).
 
 The arc resumes, populates `ctx.last_signal` + appends to
 `signal_history`, and proceeds to the gate (which can branch on
@@ -372,7 +428,7 @@ If `timeout` fires before any signal:
    `SignalRef { name: "__timeout__", payload: { expired: ["sig1", "sig2"] } }`.
 3. Gate evaluates as normal (route via `Eq{field: "last_signal.name", value: "__timeout__"}`).
 
-`timeout` accepts `30s`, `5m`, `1h`, `7d` — any decimal followed by a
+`timeout` accepts `30s`, `5m`, `1h`, `7d` - any decimal followed by a
 unit suffix. Absent timeout = wait indefinitely (suitable for
 never-firing-but-cancellable arcs).
 
@@ -428,7 +484,7 @@ Right-hand side is an Extractor path (dotted). Evaluated against the
 parent's ArcContext flatten.
 
 `exports` declares which sub vars get promoted back into the parent
-on sub completion. **Missing exports are a runtime error** — if you
+on sub completion. **Missing exports are a runtime error** - if you
 declare `exports: ["pr_number"]` and the sub never sets `vars.pr_number`,
 the parent fails. This is the contract.
 
@@ -462,15 +518,15 @@ rules). The classification becomes the verdict; the same node's
 
 Two modes:
 
-- `gate_mode: "first"` (default) — first-matching rule wins, single verdict.
-- `gate_mode: "all"` — every matching rule fires, aggregate verdict is
+- `gate_mode: "first"` (default) - first-matching rule wins, single verdict.
+- `gate_mode: "all"` - every matching rule fires, aggregate verdict is
   the lattice-highest-priority classification across all findings.
   Findings are surfaced as a `learned` note on the arc thread and
   exposed via `bro orchestrate status`.
 
 Back-edges in the graph become natural retry loops. Each visit bumps
 `visit_counts[node]`; exceeding `retry.max_generations` halts the
-arc. Retried prompts get `[retry — attempt N, prior gate verdict: X]`
+arc. Retried prompts get `[retry - attempt N, prior gate verdict: X]`
 prepended automatically.
 
 ## Workflow-level policy packets
@@ -480,10 +536,10 @@ flattened ArcContext (with arc-shape additions: `step`, `just_ran`,
 `next`, `completed`, `in_flight`, `visit_counts`). Classifications
 are arc-level verdicts:
 
-- `halt` — stop the arc immediately (error exit, reason posted to thread).
-- `escalate` — write a `blocked` note, continue.
-- `warn` — write a `surprise` note, continue.
-- anything else — no-op.
+- `halt` - stop the arc immediately (error exit, reason posted to thread).
+- `escalate` - write a `blocked` note, continue.
+- `warn` - write a `surprise` note, continue.
+- anything else - no-op.
 
 This is the mechanization of the advisor loop: instead of dispatching
 an LLM at every boundary to read the checkpoint and judge, compile
@@ -496,15 +552,15 @@ invariants.
 Anywhere a workflow names a packet (`gate`, `policy_packet`,
 `hook.when`, `webhook.routing_packet`), accept either:
 
-- `packet-XXXXXXXX` — pinned exact compile.
-- `domain:<name>` — resolves to the most-recently-compiled packet
+- `packet-XXXXXXXX` - pinned exact compile.
+- `domain:<name>` - resolves to the most-recently-compiled packet
   matching `<name>`.
 
 Domain refs let workflow + webhook specs survive packet recompiles
 without re-edit. Audit events name the resolved `packet-id` so you
 always know which compile actually fired.
 
-## Inlets — webhook, poller, cron
+## Inlets - webhook, poller, cron
 
 Three inlet primitives, all converging on the same dispatch pipeline:
 
@@ -518,7 +574,7 @@ Three inlet primitives, all converging on the same dispatch pipeline:
 ```
 
 The shared dispatch path is `crate::dispatch_routed_event`. Routing
-rules don't know which inlet fed them — they see a flat entity and a
+rules don't know which inlet fed them - they see a flat entity and a
 routing-packet id, the rest is the engine's problem. Pick the inlet
 that matches your trigger source:
 
@@ -526,7 +582,7 @@ that matches your trigger source:
 |-----------|---------------------------|------------------------------|-------------|
 | Webhook   | External HTTP POST + signature | `webhooks/<name>.json`  | Upstream pushes to you (Forgejo / GitHub / Stripe / generic JSON). Lower latency than polling, but needs ingress. |
 | Poller    | Scheduled HTTP fetch (data rides on the tick) | `pollers/<name>.json` | Upstream is poll-only OR you have no public ingress. Carries an `HttpFetchSpec` + optional `iterate` for array responses + dedup ring. |
-| Cron      | Calendar / clock (no fetch — entity is operator-supplied `payload`) | `crons/<name>.json` | Trigger is time-based, not event-based. Nightly maintenance, hourly sweeps, scheduled SAST squashing. The dispatched arc does its own data acquisition (typically via `mcp_call` hooks). Concurrency cap (default 1) skips ticks while a prior arc is still in flight. |
+| Cron      | Calendar / clock (no fetch - entity is operator-supplied `payload`) | `crons/<name>.json` | Trigger is time-based, not event-based. Nightly maintenance, hourly sweeps, scheduled SAST squashing. The dispatched arc does its own data acquisition (typically via `mcp_call` hooks). Concurrency cap (default 1) skips ticks while a prior arc is still in flight. |
 
 ### Webhook
 
@@ -547,7 +603,7 @@ HTTP POST /webhook/<name>
 ### Extractor
 
 Tiny AST that projects a webhook payload (plus `_headers` map for
-header-driven routing — operator names the header in their extractor;
+header-driven routing - operator names the header in their extractor;
 the engine doesn't know the sender) into a flat entity:
 
 ```jsonc
@@ -569,9 +625,9 @@ the engine doesn't know the sender) into a flat entity:
 Selector kinds: `json_path`, `const`, `default { inner, fallback }`,
 `concat { parts: [...] }`, `coalesce { sources: [...] }` (first
 non-null wins; lets one extractor field cover divergent payload
-shapes — e.g. Forgejo's `pull_request_review` puts the comment text
+shapes - e.g. Forgejo's `pull_request_review` puts the comment text
 at `.review.body` while `pull_request_review_comment` uses
-`.comment.body`). Deliberately small — no transformations (regex,
+`.comment.body`). Deliberately small - no transformations (regex,
 case folding, math). Those belong in packet predicates or downstream
 nodes.
 
@@ -617,7 +673,7 @@ When a webhook resolves to `start_arc`, the engine:
 4. Resolves `project_dir`:
    - `${WEBHOOK_NAME_UPPER}_PROJECT_DIR` env override
    - `WebhookSpec.default_project_dir`
-   - `None` (worktree hooks fail loudly — better than silent fallback to cwd).
+   - `None` (worktree hooks fail loudly - better than silent fallback to cwd).
 5. Spawns the arc in a background task. Webhook returns immediately
    with `{status: "arc_started", workflow: <id>}`.
 
@@ -634,7 +690,7 @@ rules without firing arcs.
 
 ### Poller
 
-Scheduled HTTP-source inlet — operationally "a webhook whose source is
+Scheduled HTTP-source inlet - operationally "a webhook whose source is
 a tokio interval pulling from a URL instead of an inbound POST." Spec
 shape:
 
@@ -656,14 +712,14 @@ shape:
 ```
 
 - `every_seconds` is clamped above `BBOX_POLLER_MIN_INTERVAL_SECS`
-  (default 5s) — operators can't accidentally hammer an upstream.
+  (default 5s) - operators can't accidentally hammer an upstream.
 - `source` is the same `HttpFetchSpec` shape the workflow `http_json`
   op consumes. `${env.X}` is resolved at spec-load time (no per-tick
-  ArcContext to resolve `${vars.X}` against — credentials live in env).
-- `iterate` (optional) — array path; each element becomes its own
+  ArcContext to resolve `${vars.X}` against - credentials live in env).
+- `iterate` (optional) - array path; each element becomes its own
   event (extractor runs per-element). Absent → whole response is one
   event.
-- `dedup_id_path` (optional) — stable id per item; in-memory recent-
+- `dedup_id_path` (optional) - stable id per item; in-memory recent-
   seen ring (1024 cap, per-poller, resets on daemon restart). Repeated
   items are dropped before dispatch.
 
@@ -673,7 +729,7 @@ plain-HTTP `/admin/poller/install` endpoint. Persisted under
 
 ### Cron
 
-Calendar-driven inlet — sibling of webhook + poller. Distinction from
+Calendar-driven inlet - sibling of webhook + poller. Distinction from
 poller: poller fetches HTTP per tick (data rides on the tick), cron
 carries no fetch (entity is operator-supplied `payload` plus synthetic
 `cron_name` + `tick_at` fields). Use cron when the trigger is time-
@@ -696,14 +752,14 @@ based and the dispatched arc itself does the data acquisition.
 - `schedule` uses the `cron` crate's 6- or 7-field form (seconds-first;
   prefix a classic 5-field cron with `0 ` to run-at-second-0). Validated
   at install time. `bro_cron_upcoming` is a pure helper that returns
-  the next N scheduled times for a candidate expression — use to sanity-
+  the next N scheduled times for a candidate expression - use to sanity-
   check before installing.
 - `payload` is operator-supplied entity fields. Synthetic `cron_name`
   and `tick_at` (RFC3339 UTC) are merged in at tick time so routing
   rules can discriminate without operator boilerplate. Operator-supplied
   keys win on collision.
 - `concurrency` caps in-flight arcs spawned by this cron. Default 1
-  (skip ticks while a prior arc is still running — the most common
+  (skip ticks while a prior arc is still running - the most common
   case for daily sweeps). Set 0 to lift the cap. The counter
   decrements when the dispatched arc terminates; failed dispatches
   refund immediately.
@@ -732,7 +788,7 @@ on a board, advanced through phases (blind → read → validate →
 debate → resolve → archived) by a facilitator-or-operator role.
 
 Where webhooks and crons are *inlet* primitives (events arriving
-into the engine), whiteboards are a *deliberation* primitive — a
+into the engine), whiteboards are a *deliberation* primitive - a
 shared structured log that any audience can read and write through
 the same MCP surface:
 
@@ -746,8 +802,8 @@ the same MCP surface:
   Drive phase transitions via `whiteboard_transition`. Phase
   transitions emit a `board-transitioned` signal correlated to
   `(board, target_phase)` through the shared
-  `dispatch_routed_event` pipeline — same machinery webhooks use.
-- **External agents — operator's Claude session, dispatched help,
+  `dispatch_routed_event` pipeline - same machinery webhooks use.
+- **External agents - operator's Claude session, dispatched help,
   eventually humans through slack / ntfy adapters.** Read board
   state via `whiteboard_state`, act via the same write tools. The
   board IS the human-in-the-loop surface; no separate escalation
@@ -755,7 +811,7 @@ the same MCP surface:
 
 ### Spec shape
 
-Whiteboards aren't operator-installed like webhooks/pollers/crons —
+Whiteboards aren't operator-installed like webhooks/pollers/crons -
 they're created on demand by workflows (via `mcp_call → whiteboard_open`)
 or by external clients (via `whiteboard_open` MCP tool directly). The
 board id is the operator's choice; convention is
@@ -784,11 +840,11 @@ board id is the operator's choice; convention is
 | Phase       | Allowed actions                                 |
 |-------------|-------------------------------------------------|
 | `blind`     | post (specialists post without seeing others)   |
-| `read`      | (none — observation phase, advance when ready)  |
+| `read`      | (none - observation phase, advance when ready)  |
 | `validate`  | annotate (validation only, with required result)|
 | `debate`    | annotate (challenge / corroborate / resolve), vote |
-| `resolve`   | (none — frozen, facilitator synthesizes outside)|
-| `archived`  | (terminal — board moved to `archive/` directory)|
+| `resolve`   | (none - frozen, facilitator synthesizes outside)|
+| `archived`  | (terminal - board moved to `archive/` directory)|
 
 Skip rule: `read → debate` is legal (skip validate). All other
 transitions follow the canonical order.
@@ -798,11 +854,11 @@ transitions follow the canonical order.
 `whiteboard_conflicts` evaluates the board state and returns three
 kinds of conflicts:
 
-- **direct_overlap** — two posts target the same `target_file` +
+- **direct_overlap** - two posts target the same `target_file` +
   `target_location`
-- **cascade_collision** — post A's `cascade_targets` includes post
+- **cascade_collision** - post A's `cascade_targets` includes post
   B's direct target
-- **severity_disagreement** — two posts share a `finding_ref` but
+- **severity_disagreement** - two posts share a `finding_ref` but
   disagree on `severity`
 
 This generalizes phaser's domain-specific shapes; the operator's
@@ -812,7 +868,7 @@ setting) the relevant fields.
 ### Resume on phase transition
 
 A workflow can suspend on a board's phase advance using the existing
-`wait` primitive — no new variant needed:
+`wait` primitive - no new variant needed:
 
 ```jsonc
 "AwaitResolve": {
@@ -843,7 +899,7 @@ events.
 Boards are JSON files under `$store_dir/whiteboards/<id>.json`,
 atomically written via tempfile + rename, restored on daemon
 startup. Archived boards move to `$store_dir/whiteboards/archive/`
-and are not loaded back into memory — they exist for audit only.
+and are not loaded back into memory - they exist for audit only.
 
 ### Where to dispatch what
 
@@ -852,7 +908,7 @@ and are not loaded back into memory — they exist for audit only.
 | `whiteboard_open` from `on_enter` hook (mcp_call) | Engine, on Setup | Predictable id, deterministic registration |
 | `whiteboard_register` from `on_enter` hook (mcp_call) | Engine, on Setup | All specialists registered up-front so role checks work |
 | `whiteboard_post` / `whiteboard_annotate` / `whiteboard_vote` from inside dispatched bro | Specialist (LLM) | The structured deliberation IS the agent's output |
-| `whiteboard_transition` from `on_enter` hook (mcp_call) | Engine, on phase-advance node | Deterministic — facilitator's "decide to advance" is part of arc shape, not dispatched |
+| `whiteboard_transition` from `on_enter` hook (mcp_call) | Engine, on phase-advance node | Deterministic - facilitator's "decide to advance" is part of arc shape, not dispatched |
 | `whiteboard_state` / `whiteboard_summarize` | Anyone (specialist mid-turn, facilitator at synthesis, external Claude joining) | Read-only inspection |
 | `whiteboard_archive` from `on_enter` of Done | Engine, terminal | Strip live state after the artifact ships |
 
@@ -893,6 +949,9 @@ template ships at `0.0.0.0`; prod stays at loopback.
 Every `bro orchestrate run` opens a `bbox_thread(kind=work_item)`. The
 returned `arc_thread_id` is the audit handle.
 
+For direct task supervision without workflow state, use [Bro Runtime](bro-runtime.md).
+For inbox and note hygiene, use [Knowledge Store](knowledge-store.md).
+
 | Surface                                  | What it shows                                                           |
 |------------------------------------------|-------------------------------------------------------------------------|
 | `bro orchestrate peek [<thread-id>]`     | Live in-flight state from the `running_arcs` registry. No id = all.    |
@@ -901,11 +960,11 @@ returned `arc_thread_id` is the audit handle.
 | `bbox_notes(thread_id=<arc>)`            | Every structured note the engine wrote (kind: done / learned / surprise / blocked). |
 | `bbox_inbox`                              | Arcs currently flagged for attention (failed, blocked, etc.).          |
 | `bro_arc_status(arc_id=<id>)`            | Snapshot + pending-wait registrations for one arc.                     |
-| `bro_signals(signal=, since=, outcome=)` | Recent signal-dispatch events as a bounded ring buffer. Each entry: `(timestamp, signal, correlation, outcome, matched_arc_id, idle_pending)`. On `outcome=no_matching_wait` the `idle_pending` snapshot shows what waits were registered with the same signal name but didn't match — the diff between what arrived and what was waiting is one read away. |
+| `bro_signals(signal=, since=, outcome=)` | Recent signal-dispatch events as a bounded ring buffer. Each entry: `(timestamp, signal, correlation, outcome, matched_arc_id, idle_pending)`. On `outcome=no_matching_wait` the `idle_pending` snapshot shows what waits were registered with the same signal name but didn't match - the diff between what arrived and what was waiting is one read away. |
 | `bro_webhook_deliveries(name=, since=, verdict_classification=)` | Recent webhook deliveries (live + replay). Each entry: extracted entity, routing verdict classification, response. Filter by name to focus on one inlet. |
 | `bro_webhook_replay(name, body, headers)` | Replay a synthetic payload through an installed webhook's extractor + routing packet WITHOUT dispatching. Returns the extracted entity + verdict consequent (after `${entity.X}` substitution). Recorded into the same delivery buffer with `source: replay`. |
 | `bro_arc_cancel(arc_id=<id>)`            | Trip an arc's cancellation token. Runner observes between node iterations and inside Wait suspensions, exits with status `cancelled`, runs `on_arc_cancel` + `on_arc_exit`. |
-| HTTP `GET /tail` (SSE)                   | Live event stream from the daemon — every node_dispatch / hook_ok / wait_registered / gate_applied / ... |
+| HTTP `GET /tail` (SSE)                   | Live event stream from the daemon - every node_dispatch / hook_ok / wait_registered / gate_applied / ... |
 
 Compaction anchors: at every node boundary the engine writes a
 rolling `ANCHOR [step N, just-ran='X', next='Y']: completed=[...]
@@ -937,11 +996,11 @@ spawn arc
 - ArcContext (vars / typed outputs / meta / last_signal / history) with full templating including `${env.X}` for credentials
 - Routing verdicts can carry typed correlation tuples + payload via
   `${entity.X}` template substitution (resolved against the
-  extracted entity before verdict parse) — same `${X}` shape the
+  extracted entity before verdict parse) - same `${X}` shape the
   workflow templater uses, applied to a different scope
 - Three convergent event inlets: webhook (signed inbound POST), poller
-  (scheduled HTTP fetch — data rides on the tick), cron (calendar-
-  driven, no fetch — entity is operator-supplied `payload` plus
+  (scheduled HTTP fetch - data rides on the tick), cron (calendar-
+  driven, no fetch - entity is operator-supplied `payload` plus
   synthetic `cron_name` + `tick_at`). All three extract → route →
   dispatch through one shared `dispatch_routed_event` so a workflow
   doesn't care how it was triggered. Pollers reuse `HttpFetchSpec`
@@ -956,16 +1015,16 @@ spawn arc
 - Op catalog: SetVar, IncVar, AppendVar, MergeVar, ParseJson, Shell,
   WorktreeCreate (with smart branch reuse), WorktreeRemove, SetMeta,
   HttpJson (generic HTTP; `response_kind: json|text|auto`),
-  FindFirst (array search by dotted-path equality — composable
+  FindFirst (array search by dotted-path equality - composable
   primitive for idempotent lookups), McpCall (outbound MCP tool
-  call — JSON-RPC over stdio child-process or streamable HTTP;
+  call - JSON-RPC over stdio child-process or streamable HTTP;
   resolves server name through the existing `bro_mcp` registry; lets
   hooks inject deterministic tool results without dispatching a bro).
   Engine carries no platform knowledge; workflow author composes
   generic ops + `${env.X}` + `${vars.X}` to express any code-host
   integration.
 - Hook gating via `when: domain:...` + `on_failure: halt|warn|ignore`
-  (gate-packet errors route through `on_failure` too — no silent skips)
+  (gate-packet errors route through `on_failure` too - no silent skips)
 - Terminal hook `halt` failures rewrite `meta.arc_outcome` to `failed:
   ...` so cleanup failures are visible in the arc summary
 - Wait nodes with `any_of` race + correlation tuples + timeout
@@ -991,7 +1050,7 @@ spawn arc
   adapters) sharing one surface. Phase transitions emit
   `board-transitioned` signals through the same dispatch_routed_event
   pipeline webhooks use, so workflows resume on transitions via the
-  existing `wait` primitive correlated to `(board, target_phase)` —
+  existing `wait` primitive correlated to `(board, target_phase)` -
   no new wait variant needed. Replaces the deprecated `user` actor
   kind: humans-in-the-loop join boards as agents, no special engine
   type for them.
@@ -1010,7 +1069,7 @@ spawn arc
 
 ## Phase-next
 
-- `bro orchestrate resume <thread-id>` — genuine re-entry at the last
+- `bro orchestrate resume <thread-id>` - genuine re-entry at the last
   recorded step for arcs that paused or errored. Needs persistent
   full-output snapshots to survive daemon restarts.
 - Disk-backed `WaitStore` (currently in-memory) so suspended arcs
@@ -1027,20 +1086,20 @@ spawn arc
 
 ## Examples
 
-- [`examples/whiteboard/`](https://github.com/invidious9000/transcript-search/tree/main/examples/whiteboard) — end-to-end:
+- [`examples/whiteboard/`](https://github.com/invidious9000/transcript-search/tree/main/examples/whiteboard) - end-to-end:
   ADR-tagged issue webhook → 3-specialist ensemble posts blind to
   whiteboard → debate (annotate + vote) → facilitator synthesizes ADR
   markdown → PR opens → auto-merge. The reference arc for the
   whiteboard primitive + multi-round durable ensemble.
-- [`examples/sastquatch/`](https://github.com/invidious9000/transcript-search/tree/main/examples/sastquatch) — end-to-end:
+- [`examples/sastquatch/`](https://github.com/invidious9000/transcript-search/tree/main/examples/sastquatch) - end-to-end:
   cron tick → analyzer (mcp_call → biofilter sast_*; executor picks
   a finding cluster) → fixer subworkflow → wait → ensemble reviewer →
   loop on feedback → auto-merge. The reference arc for cron + mcp_call.
-- [`examples/keystone/`](https://github.com/invidious9000/transcript-search/tree/main/examples/keystone) — end-to-end:
+- [`examples/keystone/`](https://github.com/invidious9000/transcript-search/tree/main/examples/keystone) - end-to-end:
   Forgejo webhook → arc → implementer subworkflow → wait → reviewer
   ensemble → wait-loop until merged → cleanup hooks. Real LLM
   dispatch. Full layout + adaptation guide in the example's README.
-- [`examples/workflows/`](https://github.com/invidious9000/transcript-search/tree/main/examples/workflows) — smaller
+- [`examples/workflows/`](https://github.com/invidious9000/transcript-search/tree/main/examples/workflows) - smaller
   shape catalog: linear, gated, ensemble, fork-join, blind-convergence,
   optimistic-review, self-audit.
 
@@ -1048,21 +1107,21 @@ spawn arc
 
 If you don't want to hand-write specs:
 
-- `bro_orchestrate_author(charter, brofile, hint?)` — prose-charter
+- `bro_orchestrate_author(charter, brofile, hint?)` - prose-charter
   to validated spec via an authoring LLM. Auto-retries on compile
   failure with the error appended.
 - Always pair with `bro_orchestrate_run(workflow, dry_run=true)` to
   validate before dispatching.
 
-For runtime debugging — the canonical "an arc is stuck, why?" loop:
+For runtime debugging - the canonical "an arc is stuck, why?" loop:
 
-1. **`bro_arc_status`** — confirm the arc is parked, see which node, see the registered wait correlations.
-2. **`bro_signals(signal=<name>)`** — did the signal the arc is waiting on actually arrive? `outcome=matched` means the wait resolved (arc should have advanced; if it didn't, look at the gate). `outcome=no_matching_wait` means the signal arrived but its correlation didn't match any pending wait — `idle_pending` shows what was waiting at dispatch time, the diff between that and the signal's correlation IS the bug (typed `pr: 24` vs string `pr: "24"` is the classic).
-3. **`bro_webhook_deliveries(name=<webhook>)`** — if the signal never arrived, walk back one step. Did the webhook actually arrive? What did the routing packet classify it as? `verdict_classification` of `ignore` / `no_match` for an event you expected to route reveals a missing or mis-shaped routing rule. `extracted_entity` shows what the extractor projected — useful when the routing rule isn't matching because the event field's actual value differs from what the rule expects (Forgejo sends `action: synchronized` not `synchronize`, etc.).
-4. **`bro_webhook_replay(name, body, headers)`** — once you suspect a routing-rule fix, replay a synthetic payload through the same path the live webhook would take, see the verdict, iterate without needing the upstream to fire a real event.
-5. **`bbox_notes(thread_id=<arc>)`** — the arc's audit trail with structured notes (done / learned / surprise / blocked) and rolling `ANCHOR` compaction summaries.
+1. **`bro_arc_status`** - confirm the arc is parked, see which node, see the registered wait correlations.
+2. **`bro_signals(signal=<name>)`** - did the signal the arc is waiting on actually arrive? `outcome=matched` means the wait resolved (arc should have advanced; if it didn't, look at the gate). `outcome=no_matching_wait` means the signal arrived but its correlation didn't match any pending wait - `idle_pending` shows what was waiting at dispatch time, the diff between that and the signal's correlation IS the bug (typed `pr: 24` vs string `pr: "24"` is the classic).
+3. **`bro_webhook_deliveries(name=<webhook>)`** - if the signal never arrived, walk back one step. Did the webhook actually arrive? What did the routing packet classify it as? `verdict_classification` of `ignore` / `no_match` for an event you expected to route reveals a missing or mis-shaped routing rule. `extracted_entity` shows what the extractor projected - useful when the routing rule isn't matching because the event field's actual value differs from what the rule expects (Forgejo sends `action: synchronized` not `synchronize`, etc.).
+4. **`bro_webhook_replay(name, body, headers)`** - once you suspect a routing-rule fix, replay a synthetic payload through the same path the live webhook would take, see the verdict, iterate without needing the upstream to fire a real event.
+5. **`bbox_notes(thread_id=<arc>)`** - the arc's audit trail with structured notes (done / learned / surprise / blocked) and rolling `ANCHOR` compaction summaries.
 
 Control:
 
-- `bro_arc_cancel(arc_id)` — manually stop a runaway / mis-dispatched / no-longer-relevant arc. Cleanup hooks fire automatically.
-- `cancel_arc` routing verdict — emit from a routing packet to cancel arcs by correlation tuple (e.g. an upstream "PR closed without merge" event cancelling the arc that was waiting on its merge).
+- `bro_arc_cancel(arc_id)` - manually stop a runaway / mis-dispatched / no-longer-relevant arc. Cleanup hooks fire automatically.
+- `cancel_arc` routing verdict - emit from a routing packet to cancel arcs by correlation tuple (e.g. an upstream "PR closed without merge" event cancelling the arc that was waiting on its merge).

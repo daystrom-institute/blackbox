@@ -1,15 +1,18 @@
 # Rule Packets
 
-Rule packets are the blackbox classification mechanism — a reusable,
-deterministic judge that evaluates any entity against a priority-ordered
-rule set. No LLM involved at apply time. Packets are portable: dispatch a
-`packet_id` to sub-agents and every one of them produces bit-identical
-output.
+Use a rule packet when you are about to paste the same rubric into multiple
+prompts.
 
-Packets are the answer to "I'm about to paste this rubric into five
-sub-agent prompts." Compile once, dispatch the `packet_id` instead.
+A packet is a stored deterministic judge. It evaluates one JSON-shaped entity
+against ordered rules and returns the same answer every time. No LLM runs at
+apply time, so a `packet_id` can be handed to five agents and every one of them
+uses the same decision function.
 
-## The workflow: compile → audit → apply
+Packets are good for gates, routing, review findings, surface filtering, and
+repeatable "should this proceed?" decisions. They are not a replacement for
+knowledge entries or prose instructions.
+
+## The Loop: Compile, Audit, Apply
 
 ### 1. Compile (`bbox_compile`)
 
@@ -18,7 +21,7 @@ order), and a rules array. Each rule has an `id`, an `antecedent`
 (predicate AST), and a `consequent` (the output value when the rule
 fires).
 
-Rules are **first-match-wins** — order anomalies before general fallbacks.
+Rules are **first-match-wins**. Put anomalies before general fallbacks.
 
 ```json
 bbox_compile(
@@ -55,7 +58,7 @@ or dispatch it to sub-agents.
 
 **Always run this after compile.** Validates the packet against a known
 dataset of `{entity, expected}` pairs. A fidelity < 1.0 means the packet
-is misgeneralizing — catches rule-ordering bugs, over-broad antecedents,
+is misgeneralizing. This catches rule-ordering bugs, over-broad antecedents,
 and field-name typos before the packet goes live.
 
 ```json
@@ -99,7 +102,7 @@ Before authoring a new packet, check if one already exists for your domain:
 // By domain
 bbox_packet_list(domain = "pr-triage", latest_per_domain = true)
 
-// By concept — when you don't know the domain label
+// By concept, when you don't know the domain label
 bbox_packet_list(query = "breaking", limit = 10)
 
 // Via knowledge search (surfaces packets + system memories)
@@ -108,7 +111,8 @@ bbox_knowledge(category = "packet")
 
 ## Packet composition
 
-Packets can embed other packets via the `Apply` predicate — no re-deriving:
+Packets can embed other packets via the `Apply` predicate. Do not re-derive a
+rule you already compiled:
 
 ```json
 {
@@ -174,8 +178,8 @@ gaps later with `bbox_packet_events(op = "gap")`.
 
 | Symptom | Tool |
 |---|---|
-| "I'm coordinating sub-agents and pasting the same rubric into each prompt" | `bbox_compile` — compile once, dispatch `packet_id` |
-| "I need to classify 100+ entities against the same rubric" | `bbox_apply` — deterministic, no LLM drift |
-| "I want a durable decision function that survives system prompt changes" | `bbox_compile` — packets are stored, not inlined in prompts |
-| "I just need a one-off prose instruction" | Don't compile — use prose in the prompt |
+| "I'm coordinating sub-agents and pasting the same rubric into each prompt" | `bbox_compile`: compile once, dispatch `packet_id` |
+| "I need to classify 100+ entities against the same rubric" | `bbox_apply`: deterministic, no LLM drift |
+| "I want a durable decision function that survives system prompt changes" | `bbox_compile`: packets are stored, not inlined in prompts |
+| "I just need a one-off prose instruction" | Don't compile. Use prose in the prompt. |
 | "I need to remember a convention, not a classification" | `bbox_learn` or `bbox_remember` |

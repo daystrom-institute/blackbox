@@ -1,10 +1,12 @@
 # Agent System
 
-Installed agents are registered, versioned LLM personas that bundle a
-brofile, a prompt template, allow/disallow tool surfaces, and metadata
-like `when_to_use` and `anti_patterns`. They're discoverable by agents
-themselves via `bro_agent_search`, making them the primary mechanism
-for self-delegation.
+Agents are the old reusable-dispatch surface: a named persona, a brofile, a
+prompt template, and search metadata. They still matter because existing
+`bro_agent_*` callers and legacy workflow examples use them.
+
+For new public capabilities, use [Atoms](atoms.md). An atom can still wrap a
+brofile, but it also gives callers schemas, effect limits, child-call rules,
+owned invocation handles, and non-LLM backends.
 
 ## Agent anatomy
 
@@ -25,8 +27,11 @@ An agent artifact carries:
 
 ## Installing agents
 
-Agents are installed as artifacts. The source can be a local JSON file
-or an HTTP URL:
+Agents are installed as artifacts. Blackbox-owned defaults live under
+`system-defaults/agents/`; tutorial and integration examples stay under
+`examples/`.
+
+The source can be a local JSON file or an HTTP URL:
 
 ```json
 // From a local file
@@ -55,9 +60,13 @@ bro_agent_search(query = "security audit", cost_class = "cheap")
 // Get full details for one agent
 bro_agent_get(name = "pr-reviewer")
 
-// Agent describe — full manifest + resolved brofile + merged filters
+// Agent describe - full manifest + resolved brofile + merged filters
 bro_agent_describe(agent = "pr-reviewer@v1.0.0")
 ```
+
+For new capability discovery, prefer `atom_search` / `atom_describe`. Agent
+manifests do not carry effect or composition policy, so they are weaker as a
+public contract.
 
 ## Dispatching an agent
 
@@ -73,28 +82,30 @@ bro_agent_dispatch(
 )
 ```
 
-Returns `{task_id, session_id, agent_label}`. The task is now a regular
-bro task — you can `bro_status`, `bro_wait`, `bro_cancel` it.
+Returns `{task_id, session_id, agent_label}`. The task is now a regular bro
+task; use `bro_status`, `bro_wait`, and `bro_cancel` for lifecycle control.
+
+Agents dispatch one bro task. If you need a reusable operation that can also be
+bound into a workflow, expose the brofile through a profile-backed atom instead.
 
 ## Tool surface (filter merging)
 
-Every dispatched agent has a computed tool surface determined by Deny wins
-merge of three layers:
+Every dispatched agent has a computed tool surface determined by a deny-wins
+merge of four layers:
 
-1. **Global MCP config** (`~/.bro/mcp.json`) — allow/disallow patterns
+1. **Global MCP config** (`~/.bro/mcp.json`) - allow/disallow patterns
    from `bro_mcp action=allow/disallow`
 2. **Project overlay** (`<project>/.bro/mcp.json`)
-3. **Brofile persona** — `allow_tools` / `disallow_tools` on the
+3. **Brofile persona** - `allow_tools` / `disallow_tools` on the
    brofile the agent uses
-4. **Per-dispatch overlay** — `allow_tools` / `disallow_tools` on the
+4. **Per-dispatch overlay** - `allow_tools` / `disallow_tools` on the
    exec call itself
 
-Layer 4 is the most specific and overrides everything. The mechanical
-recursion guard (`bro_*` disallowed by default) applies at argv
-construction for every dispatch-capable provider — translated per
-provider into the native disallow syntax (Claude `--disallowedTools`,
-Codex `-c mcp_servers.blackbox.disabled_tools=[...]`, Gemini
-`--policy <tempfile>`).
+Layer 4 is the most specific and overrides everything. The mechanical recursion
+guard (`bro_*` disallowed by default) applies at argv construction for every
+dispatch-capable provider. Each provider gets its native deny syntax: Claude
+`--disallowedTools`, Codex
+`-c mcp_servers.blackbox.disabled_tools=[...]`, Gemini `--policy <tempfile>`.
 
 ## Lifecycle
 
@@ -119,7 +130,7 @@ non-standard execution path. The built-in ones:
 | Adapter | Purpose |
 |---|---|
 | *(none)* | Standard bro exec via brofile → argv → spawn |
-| `badgey` | Routes through Badgey's consultant wrapper — the agent runs as a Badgey instance with its own thread-of-record and proposal store |
+| `badgey` | Routes through Badgey's consultant wrapper. The agent runs as a Badgey instance with its own thread-of-record and proposal store. |
 
 Custom adapters are added by extending the provider catalog in
 `src/orchestration/providers.rs`.
@@ -133,10 +144,21 @@ Custom adapters are added by extending the provider catalog in
 | "This is a one-off task" | Inline the prompt in `bro exec` |
 | "This is a recurring pattern but the prompt changes each time" | Write a brofile with `bro_brofile` and use `bro exec --brofile` |
 
+## Agent vs. Atom
+
+| Situation | Prefer |
+|---|---|
+| Existing `bro_agent_*` caller or compatibility workflow | Agent |
+| Persona-only dispatch with no stable input/output contract | Agent or brofile |
+| Discoverable capability with schemas, effect limits, and trace handles | Atom |
+| Capability implemented by a workflow, deterministic runner, or adapter | Atom |
+| Workflow wants a reusable capability boundary | Atom plus workflow `atom_bindings` |
+
 ## See also
 
 See also:
 
-- [Rule Packets](rule-packets.md) — agents use packets for deterministic classification
-- [Workflow Engine](workflows.md) — agents are dispatched as workflow nodes
+- [Rule Packets](rule-packets.md): agents use packets for deterministic classification
+- [Workflow Engine](workflows.md): agents are dispatched as actor nodes; atoms are bound through `atom_bindings`
+- [Atoms](atoms.md): use these for new reusable surfaces
 - Design docs: `design/archive/agent-system.md`, `design/archive/agent-system-impl.md`
